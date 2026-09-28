@@ -138,8 +138,9 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     let (_clock, at) = FrozenClockGuard::install();
     wait_ms_probe::take();
     let _override = remaining_override_seam::set(Duration::from_micros(500));
-    let result = super::block_until_exit_or_cancel(id, Some(Duration::from_millis(5)), &cancel);
-    let reached = Instant::now() >= at + Duration::from_millis(5);
+    let deadline = at + Duration::from_millis(5);
+    let result = super::block_until_exit_or_cancel(id, Some(Some(deadline)), &cancel);
+    let reached = Instant::now() >= deadline;
     let arms = wait_ms_probe::take();
     let_child_exit(child);
     assert!(
@@ -169,7 +170,8 @@ fn block_until_exit_or_cancel_never_reports_still_alive_before_the_deadline() {
     wait_ms_probe::take();
     let _override = remaining_override_seam::set(Duration::from_micros(500));
     wait_ms_probe::on_second_arm(move || drop(stdin));
-    let result = super::block_until_exit_or_cancel(id, Some(Duration::from_secs(3600)), &cancel);
+    let deadline = crate::wait::deadline_from(Duration::from_secs(3600));
+    let result = super::block_until_exit_or_cancel(id, deadline, &cancel);
     let arms = wait_ms_probe::take();
     let exited = result.expect("a genuinely-terminated child must not report a wait failure");
     child.wait().expect("reap the child after it exits");
@@ -189,7 +191,8 @@ fn block_until_exit_or_cancel_re_arms_past_a_clamped_timeout() {
     wait_ms_probe::take();
     let _clamp = wait_clamp_seam::set(5);
     wait_ms_probe::on_second_arm(move || drop(stdin));
-    let result = super::block_until_exit_or_cancel(id, Some(Duration::from_secs(3600)), &cancel);
+    let deadline = crate::wait::deadline_from(Duration::from_secs(3600));
+    let result = super::block_until_exit_or_cancel(id, deadline, &cancel);
     let arms = wait_ms_probe::take();
     let exited = result.expect("a genuinely-terminated child must not report a wait failure");
     child.wait().expect("reap the child after it exits");

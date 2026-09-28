@@ -168,6 +168,128 @@ fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
     child.wait().expect("reap");
 }
 
+/// A child that blocks INDEFINITELY — no internal timeout at all, unlike `std_blocker`'s
+/// `ping -n 30`, whose liveness during a probe is only "generous enough," a real subprocess's
+/// own timer a slow/loaded test run could in principle outrun. `cmd /C more` blocks reading
+/// stdin forever with nothing writing to it; it never exits on its own. Kill-FREE cleanup
+/// (RAII, in `Drop`): closing stdin is `more.com`'s own graceful-exit signal, and `cmd.exe`
+/// exits once `more.com` (its child) has — no kill, no timing bet, and no risk of `Drop`
+/// itself hanging forever behind a kill that failed while stdin was still held open.
+#[cfg(windows)]
+struct IndefiniteBlocker(std::process::Child);
+
+#[cfg(windows)]
+impl IndefiniteBlocker {
+    fn spawn() -> Self {
+        // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
+        let _guard = crate::child::spawn::spawn_lock();
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn indefinite blocker (cmd /C more)");
+        Self(child)
+    }
+
+    fn id(&self) -> ProcessId {
+        ProcessId::of(self.0.id()).found().expect("identity of live child")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for IndefiniteBlocker {
+    fn drop(&mut self) {
+        // Close stdin FIRST: EOF is `more.com`'s own exit signal, so the `wait()` below is
+        // bounded by a real, imminent exit already in motion — never by a kill that could fail
+        // and leave this Drop blocked forever still holding the handle.
+        drop(self.0.stdin.take());
+        let _ = self.0.wait();
+    }
+}
+
+// Deadline-armed-once proof (principle 13, "never late by its own choice"): `grace_wait`'s
+// Windows arm must arm the blocking wait from the Instant it computed BEFORE crossing the
+// spawn_blocking boundary, never re-derive a fresh one once inside the blocking closure, and
+// `block_until_exit_or_cancel` must recompute the real Win32 timeout from THAT deadline only
+// after the identity-verification work, never before. Two proofs, both made deterministic —
+// neither depends on two independent clock reads happening to differ:
+//
+// 1. `armed == used.deadline == Some(Some(fake))`: `crate::wait::deadline_from_override_seam`
+//    forces `grace_wait`'s `deadline_from(grace)` call to return a made-up PAST instant
+//    (`fake`) instead of a real one. A callee that only THREADS that value through (correct)
+//    reports the exact same `fake` back; one that RE-DERIVES its own deadline instead (e.g. by
+//    calling `deadline_from`/`Instant::now()` again — on the blocking-pool thread, where the
+//    override does not apply) reports a real, current instant instead, always later than
+//    `fake` and so always unequal to it.
+// 2. `used.used_seq > used.before_identity_seq`: a sequence counter, not an `Instant`,
+//    fetched right after the real `OpenProcess` syscall (`before_identity_seq`) and again
+//    where the loop's `remaining` is actually read (`used_seq`). A mutant that hoists that
+//    read above `windows_open_classified` fetches `used_seq` first, making the comparison
+//    fail deterministically — not "probably, unless two `Instant::now()` reads happen to tie."
+//
+// `try_recv()`, not `recv()`: `blocking_watch` awaits the `spawn_blocking` join before
+// returning, so both channel sends happen-before `grace_wait(..).await` resolves here — a
+// missing notification is then a fast, immediate test failure instead of a hang out to the CI
+// job's own 15-minute timeout. The install guards remove their registry entries on drop, so a
+// finished run of this test cannot leave a sender behind for a later test to trip over.
+//
+// Uses a child that blocks with no internal timeout of its own (`IndefiniteBlocker`, not
+// `std_blocker`'s `ping -n 30`): `assert!(!exited, ..)` below must hold because the child
+// cannot exit on its own, never because 30 real seconds "should be" enough.
+#[cfg(windows)]
+#[tokio::test]
+async fn grace_wait_windows_arms_the_wait_from_a_single_deadline_not_a_re_derived_one() {
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let (used_tx, used_rx) = std::sync::mpsc::channel();
+
+    let child = IndefiniteBlocker::spawn();
+    let id = child.id();
+    let _armed_guard = super::grace_wait_armed_observer::install(id, armed_tx);
+    let _used_guard = crate::wait::backend::deadline_observer::install(id, used_tx);
+
+    let start = std::time::Instant::now();
+    let fake = start - Duration::from_secs(1);
+    let _seam = crate::wait::deadline_from_override_seam::set(fake);
+
+    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
+    assert!(
+        !exited,
+        "a live child (blocked indefinitely on stdin) at ZERO grace must report still-alive"
+    );
+
+    let armed = armed_rx
+        .try_recv()
+        .expect("armed observer must have fired synchronously by the time grace_wait returned");
+    let used = used_rx
+        .try_recv()
+        .expect("used observer must have fired synchronously by the time grace_wait returned");
+
+    assert_eq!(
+        armed,
+        Some(Some(fake)),
+        "grace_wait must arm from the exact deadline it computed (the seam-forced instant), \
+         not a real Instant::now()"
+    );
+    assert_eq!(
+        armed, used.deadline,
+        "the blocking wait must be armed from the SAME deadline grace_wait computed before \
+         spawn_blocking, not one re-derived after crossing into the blocking closure"
+    );
+    assert!(
+        used.used_at >= start,
+        "the 'used_at' instant notify() recorded must not predate this test's own start read"
+    );
+    assert!(
+        used.used_seq > used.before_identity_seq,
+        "remaining() must be computed AFTER windows_open_classified/identity verification \
+         (used_seq = {}, before_identity_seq = {})",
+        used.used_seq,
+        used.before_identity_seq
+    );
+}
+
 // Drive the REAL macOS watch loop through its clear_ready + re-await cycle with genuine
 // kernel events: a DECOY second NOTE_EXIT filter on the same kqueue supplies the first wake;
 // the scripted drain consumes it (keeping the kqueue level low, so clear_ready cannot miss a

@@ -42,8 +42,12 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
     }
 }
 
+/// `deadline` is an absolute `Instant`, computed by the CALLER before ever reaching this
+/// function (see `grace_wait`'s Windows arm) — never a `Duration` re-derived once this closure
+/// is actually running on a blocking-pool thread, which could start counting late if the pool
+/// is saturated (principle 13: never late by cosca's own choice).
 #[cfg(windows)]
-async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, Error> {
+async fn blocking_watch(id: ProcessId, deadline: Option<Option<std::time::Instant>>) -> Result<bool, Error> {
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// returns promptly instead of parking out the grace, and `Runtime::drop` — which joins
     /// blocking tasks — does not stall.
@@ -64,7 +68,7 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _armed_guard = armed_tx.map(crate::wait::backend::armed_probe::install);
-        let result = crate::wait::backend::block_until_exit_or_cancel(id, grace, &cancel);
+        let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
         result
@@ -98,8 +102,12 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
 /// (`INFINITE - 1` ms — `WaitForMultipleObjects` reserves `INFINITE` itself as the "no
 /// timeout" sentinel), but a grace longer than that is still honored correctly: the backend
 /// re-arms past the cap rather than reporting the process still alive once the cap elapses. A
-/// use case needing a genuinely unbounded watch still composes `wait()` (unbounded,
-/// cancellable) with its own escalation instead of a grace.
+/// grace so large it overflows or lands within 1ms of `Instant`'s own ceiling does NOT hit
+/// that clamp — it becomes fully UNBOUNDED instead, via `crate::wait::deadline_from`'s
+/// saturating conversion (`Some(None)`, read by `crate::wait::remaining` the same as an outer
+/// `None`): a use case needing that on purpose composes `wait()` (unbounded, cancellable) with
+/// its own escalation; one that hits it by accident should treat an unbounded watch as a bug,
+/// not rely on the platform clamp bounding it.
 #[cfg(windows)]
 pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
     // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
@@ -107,7 +115,17 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());
     }
-    blocking_watch(id, Some(grace)).await
+    // Armed HERE, before ever calling spawn_blocking — nothing async happens between this and
+    // the call below, so this Instant is the true deadline the caller meant, unaffected by
+    // however long a saturated blocking pool later takes to pick up the closure.
+    let deadline = crate::wait::deadline_from(grace);
+    // Test-only: report the deadline just computed — paired with
+    // `crate::wait::backend::deadline_observer`, which reports what the blocking wait actually
+    // used, to prove the two match (see
+    // `grace_wait_windows_arms_the_wait_from_a_single_deadline_not_a_re_derived_one`).
+    #[cfg(test)]
+    grace_wait_armed_observer::notify(id, deadline);
+    blocking_watch(id, deadline).await
 }
 
 /// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
@@ -132,6 +150,58 @@ pub(crate) async fn wait_exit(id: ProcessId) -> Result<(), Error> {
             return Ok(());
         }
         log::warn!("unbounded watch for {id:?} resolved without an exit; re-watching");
+    }
+}
+
+/// Deliberate test scaffolding: reports the deadline `grace_wait`'s Windows arm computed
+/// BEFORE ever calling `spawn_blocking` — on a channel the TEST owns exclusively, keyed by
+/// the target `ProcessId` (not one shared global slot: plain `cargo test`, unlike nextest,
+/// does not guarantee one process per test, so two `grace_wait` tests running concurrently
+/// must not cross-feed each other's notification). [`install`] returns an [`InstallGuard`]
+/// that removes the entry on drop, so a finished test's sender cannot linger and answer a
+/// later test that happens to reuse the same pid. Paired with
+/// `crate::wait::backend::deadline_observer`, which reports the deadline actually used at the
+/// real Win32 wait call, so a test can prove the two are the SAME value, not independently
+/// derived (principle 13: never armed late by a scheduling gap) — see that module's own doc
+/// for how `crate::wait::deadline_from_override_seam` makes the equality check deterministic.
+#[cfg(all(test, windows))]
+pub(crate) mod grace_wait_armed_observer {
+    use std::collections::HashMap;
+    use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use crate::identity::ProcessId;
+
+    type Deadline = Option<Option<Instant>>;
+
+    static ARMED_TX: Mutex<Option<HashMap<ProcessId, Sender<Deadline>>>> = Mutex::new(None);
+
+    /// Removes its `ProcessId`'s entry from the registry on drop. Returned by [`install`]; the
+    /// test just needs to keep it alive for the test's duration.
+    pub(crate) struct InstallGuard {
+        id: ProcessId,
+    }
+
+    impl Drop for InstallGuard {
+        fn drop(&mut self) {
+            if let Some(map) = ARMED_TX.lock().unwrap().as_mut() {
+                map.remove(&self.id);
+            }
+        }
+    }
+
+    pub(crate) fn install(id: ProcessId, tx: Sender<Deadline>) -> InstallGuard {
+        ARMED_TX.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, tx);
+        InstallGuard { id }
+    }
+
+    pub(crate) fn notify(id: ProcessId, deadline: Deadline) {
+        let guard = ARMED_TX.lock().unwrap();
+        let Some(tx) = guard.as_ref().and_then(|map| map.get(&id)) else {
+            return;
+        };
+        let _ = tx.send(deadline);
     }
 }
 
