@@ -181,9 +181,14 @@ fn now() -> Instant {
 ///
 /// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
+    remaining_at(deadline, now())
+}
+
+/// [`remaining`] at an explicit `now`, so one clock reading can be shared with a test observer.
+fn remaining_at(deadline: Option<Option<Instant>>, now: Instant) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(now())),
+        Some(Some(at)) => Some(at.saturating_duration_since(now)),
     }
 }
 
@@ -196,11 +201,63 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
 /// would panic there instead of waiting. Shared by every `_timeout`/`grace`-style call that
 /// starts a fresh relative wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
+    // Test-only, single-use override: lets a test force this call to return a MADE-UP instant
+    // instead of a real `Instant::now() + duration` — see `deadline_from_override_seam`'s own
+    // doc for why this makes a "was the deadline re-derived instead of threaded through"
+    // mutant provable by exact equality, not by betting two independent `Instant::now()` reads
+    // never happen to coincide at whatever resolution the host's clock actually has.
+    #[cfg(test)]
+    if let Some(at) = deadline_from_override_seam::take() {
+        return Some(Some(at));
+    }
     Some(
         now()
             .checked_add(duration)
             .filter(|at| at.checked_add(Duration::from_millis(1)).is_some()),
     )
+}
+
+/// Test-only, single-use, per-thread override for [`deadline_from`]'s NEXT call: returns a
+/// caller-chosen `Instant` instead of computing one from the real clock. Set on the ARMING
+/// thread (e.g. a `#[tokio::test]`'s own thread, before calling an async fn whose first,
+/// pre-`.await` action is `deadline_from`), it has no effect on any OTHER thread — in
+/// particular not on a `spawn_blocking` closure the armed value is later handed to. A test
+/// picks an instant already in the past (e.g. `start - 1s`, `start` read before arming) so
+/// that a CORRECT callee, which only ever THREADS the armed value through, reports that exact
+/// made-up instant back; a callee that instead RE-DERIVES its own deadline (e.g. by calling
+/// `deadline_from`/`Instant::now()` again on a different thread, where this override does not
+/// apply) reports a real, current instant — always later than the made-up past one, and so
+/// always unequal to it. No clock-resolution assumption either way.
+#[cfg(test)]
+pub(crate) mod deadline_from_override_seam {
+    use std::cell::Cell;
+    use std::time::Instant;
+    thread_local! {
+        static OVERRIDE: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    /// Force the next [`deadline_from`](super::deadline_from) call on THIS thread to return
+    /// `Some(Some(at))`.
+    // Only a Windows-`tokio`-feature test currently installs this (see `tokio::wait_tests`);
+    // dead on any build lacking either, where `deadline_from` still compiles the (never-armed)
+    // check.
+    /// The override is cleared when the returned guard drops, if `deadline_from` has not
+    /// already consumed it (RAII, even mid-panic).
+    #[cfg_attr(not(all(windows, feature = "tokio")), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn set(at: Instant) -> Guard {
+        OVERRIDE.with(|c| c.set(Some(at)));
+        Guard(())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(None));
+        }
+    }
+    /// Consume and return the forced value, if one is armed.
+    pub(crate) fn take() -> Option<Instant> {
+        OVERRIDE.with(|c| c.take())
+    }
 }
 
 /// The largest `Instant` reachable from `start`, found purely through `checked_add`'s own
@@ -268,6 +325,30 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
     }
 }
 
+/// One read of the clock and the time remaining to `deadline` computed from that same reading,
+/// so a test observer can prove which reading a wait was armed from.
+#[cfg(windows)]
+pub(crate) struct Reading {
+    #[cfg(test)]
+    pub(crate) now: Instant,
+    pub(crate) remaining: Option<Duration>,
+    /// Test-only sequence number taken with the read, later than every number handed out before.
+    #[cfg(test)]
+    pub(crate) seq: u64,
+}
+
+#[cfg(windows)]
+fn read_remaining(deadline: Option<Option<Instant>>) -> Reading {
+    let now = now();
+    Reading {
+        remaining: remaining_at(deadline, now),
+        #[cfg(test)]
+        now,
+        #[cfg(test)]
+        seq: backend::deadline_observer::next_seq(),
+    }
+}
+
 /// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other
 /// than `WAIT_TIMEOUT`, or the real `deadline` has passed (`WAIT_TIMEOUT` then). A `WAIT_TIMEOUT`
 /// is never trusted: the remaining time is recomputed from `deadline` each round and the wait
@@ -277,13 +358,25 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
 #[cfg(windows)]
 pub(crate) fn wait_until(
     deadline: Option<Option<Instant>>,
+    wait: impl FnMut(u32) -> windows::Win32::Foundation::WAIT_EVENT,
+) -> windows::Win32::Foundation::WAIT_EVENT {
+    wait_until_observed(deadline, |_| {}, wait)
+}
+
+/// [`wait_until`], calling `observe` with each round's [`Reading`] just before arming the wait.
+#[cfg(windows)]
+pub(crate) fn wait_until_observed(
+    deadline: Option<Option<Instant>>,
+    mut observe: impl FnMut(&Reading),
     mut wait: impl FnMut(u32) -> windows::Win32::Foundation::WAIT_EVENT,
 ) -> windows::Win32::Foundation::WAIT_EVENT {
     use windows::Win32::Foundation::WAIT_TIMEOUT;
     loop {
         #[cfg(test)]
         let call_start = Instant::now();
-        let waited = wait(win32_timeout_ms(remaining(deadline)));
+        let reading = read_remaining(deadline);
+        observe(&reading);
+        let waited = wait(win32_timeout_ms(reading.remaining));
         #[cfg(test)]
         test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
         if waited != WAIT_TIMEOUT || remaining(deadline) == Some(Duration::ZERO) {

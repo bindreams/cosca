@@ -3,7 +3,7 @@
 //! No reaping concept on Windows.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
@@ -113,12 +113,17 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
 }
 
 /// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
-/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within `grace`;
-/// `None` = unbounded.
+/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited within the
+/// deadline; `None`/`Some(None)` = unbounded. `deadline` is an absolute `Instant` the caller
+/// computed before ever reaching this function — every re-arm below recomputes its remaining
+/// time against this SAME absolute instant (via `crate::wait::remaining_at`), so a caller that
+/// hands this off through `spawn_blocking` (as `grace_wait` does) never starts the deadline
+/// counting late just because the blocking pool was slow to pick up the task, and a re-arm
+/// never resets the clock either.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))] // only consumer is tokio::wait::grace_wait
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
-    grace: Option<Duration>,
+    deadline: Option<Option<Instant>>,
     cancel: &OwnedHandle,
 ) -> Result<bool, Error> {
     let handle = match crate::identity::windows_open_classified(
@@ -147,6 +152,13 @@ pub(crate) fn block_until_exit_or_cancel(
             }
         }
     };
+    // Test-only anchor: a sequence number fetched immediately after the real `OpenProcess`
+    // syscall above returns — a fixed point a mutant that hoists the loop's `remaining` read
+    // above this call cannot land after. A counter, not an `Instant`, so the ordering proof
+    // below never depends on two clock reads happening to differ — see
+    // `deadline_observer`'s own doc.
+    #[cfg(test)]
+    let before_identity_seq = deadline_observer::next_seq();
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not.
     match crate::identity::windows_handle_identity(handle, id) {
@@ -167,10 +179,6 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    let deadline: Option<Option<Instant>> = match grace {
-        None => None,
-        Some(g) => crate::wait::deadline_from(g),
-    };
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
     // gated on `is_armed()`.
@@ -201,7 +209,15 @@ pub(crate) fn block_until_exit_or_cancel(
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: both handles are live for the wait's duration.
-    let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&handles, false, ms) });
+    let waited = crate::wait::wait_until_observed(
+        deadline,
+        |_reading| {
+            // Test-only: report what each round actually used (see `deadline_observer`).
+            #[cfg(test)]
+            deadline_observer::notify(id, deadline, _reading, before_identity_seq);
+        },
+        |ms| unsafe { WaitForMultipleObjects(&handles, false, ms) },
+    );
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -400,6 +416,110 @@ pub(crate) mod armed_probe {
             if let Some(tx) = cell.borrow().as_ref() {
                 let _ = tx.send(());
             }
+        });
+    }
+}
+
+/// Deliberate test scaffolding: reports what `block_until_exit_or_cancel` actually used at the
+/// FIRST `remaining` read inside its retry loop — on a channel the TEST owns exclusively,
+/// keyed by the target `ProcessId` (not one shared global slot) so tests running concurrently
+/// in the SAME process under plain `cargo test` — nextest's one-process-per-test isolation is
+/// not guaranteed here — can never cross-feed each other's notifications. [`install`] returns
+/// an [`InstallGuard`] that removes the entry on drop, so a finished test's sender cannot
+/// linger and answer a LATER test that happens to reuse the same pid.
+///
+/// Two things a test can check, both required to prove principle 13 ("never late by cosca's
+/// own choice"):
+/// - `Used::deadline` vs `crate::tokio::wait::grace_wait_armed_observer`'s report: paired,
+///   for EXACT equality, to prove the wait is armed from the single deadline `grace_wait`
+///   computed before ever calling `spawn_blocking`, never a value re-derived after crossing
+///   the blocking-pool boundary. Made deterministic (not a clock-resolution bet) by the
+///   `armed` side using `crate::wait::deadline_from_override_seam` to force a made-up instant:
+///   a callee that only threads the value through reports that same made-up instant back; one
+///   that re-derives it (on a different thread, where the override does not apply) reports a
+///   real, later instant instead — always unequal.
+/// - `Used::used_seq` vs `Used::before_identity_seq`: `used_seq` is fetched where `remaining`
+///   is actually read (first loop iteration); `before_identity_seq`, right after the real
+///   `OpenProcess` syscall, before identity verification. A correct call always has
+///   `used_seq > before_identity_seq` — the sequence counter, not an `Instant`, is what makes
+///   this exact: a mutant that hoists the `remaining` read above `windows_open_classified`
+///   fetches `used_seq` before `before_identity_seq` exists, giving `used_seq < before_identity_seq`
+///   deterministically, not merely "probably, unless two clock reads tie."
+#[cfg(test)]
+pub(crate) mod deadline_observer {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use crate::identity::ProcessId;
+
+    /// What a single `block_until_exit_or_cancel` call reported — see this module's own doc.
+    /// Only ever READ from `crate::tokio::wait_tests` (the `tokio`-feature test that pairs
+    /// this observer with `grace_wait_armed_observer`) — its fields are otherwise dead under
+    /// a `tokio`-less build, even though `notify` below still WRITES them unconditionally.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) struct Used {
+        pub(crate) deadline: Option<Option<Instant>>,
+        pub(crate) used_at: Instant,
+        pub(crate) before_identity_seq: u64,
+        pub(crate) used_seq: u64,
+    }
+
+    static TX: Mutex<Option<HashMap<ProcessId, Sender<Used>>>> = Mutex::new(None);
+    // Global, not per-`ProcessId`: sequence ORDER only needs to be unambiguous within one
+    // `block_until_exit_or_cancel` call, and a single call always runs on a single thread —
+    // a shared counter across calls/threads costs nothing and keeps the anchor/read pairing
+    // trivially correct even if two calls happened to race on the same counter.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// The next sequence number, guaranteed distinct from and greater than every number handed
+    /// out before it (process-wide, not per-thread) — used instead of comparing two
+    /// `Instant::now()` reads so the ordering proof never depends on clock resolution.
+    pub(crate) fn next_seq() -> u64 {
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Removes its `ProcessId`'s entry from the registry on drop, so a finished test's sender
+    /// cannot linger and answer a later test that happens to reuse the same pid. Returned by
+    /// [`install`]; the test just needs to keep it alive for the test's duration.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) struct InstallGuard {
+        id: ProcessId,
+    }
+
+    impl Drop for InstallGuard {
+        fn drop(&mut self) {
+            if let Some(map) = TX.lock().unwrap().as_mut() {
+                map.remove(&self.id);
+            }
+        }
+    }
+
+    // Only caller is `crate::tokio::wait_tests` (the `tokio`-feature test that pairs this
+    // observer with `grace_wait_armed_observer`): dead under a `tokio`-less build.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn install(id: ProcessId, tx: Sender<Used>) -> InstallGuard {
+        TX.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, tx);
+        InstallGuard { id }
+    }
+
+    pub(crate) fn notify(
+        id: ProcessId,
+        deadline: Option<Option<Instant>>,
+        reading: &crate::wait::Reading,
+        before_identity_seq: u64,
+    ) {
+        let guard = TX.lock().unwrap();
+        let Some(tx) = guard.as_ref().and_then(|map| map.get(&id)) else {
+            return;
+        };
+        let _ = tx.send(Used {
+            deadline,
+            used_at: reading.now,
+            before_identity_seq,
+            used_seq: reading.seq,
         });
     }
 }
