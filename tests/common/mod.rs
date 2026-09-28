@@ -196,6 +196,43 @@ pub fn read_report_line(sock: &TcpStream) -> String {
     line
 }
 
+/// A byte no real control-child tag (`R`, `G`, `Z`, `P`, ...) ever sends — see `accept_or_die`.
+const DEATH_SENTINEL: u8 = 0xFF;
+
+/// Blocks until either `listener` gets an incoming connection, or `target` exits first — a plain
+/// blocking `accept()` would hang forever in the latter case instead of failing. Races the two on
+/// a background thread: `target`'s a real, cross-platform, non-polling death-watch (the same
+/// `Process::wait()` this suite already uses for non-reaping foreign-process watches elsewhere),
+/// and if it resolves first, the watcher connects to our own `listener` and sends
+/// `DEATH_SENTINEL` — which unblocks `accept()` with a distinguishable, non-hanging outcome
+/// instead of a real control connection.
+///
+/// The watcher thread is intentionally detached, not joined: in the overwhelmingly common case
+/// (the target is a `control-block`-style wedge that will not exit until the caller releases it,
+/// long after this function has returned), `target.wait()` does not resolve until then — joining
+/// would defeat the very timeout-free, no-polling death-watch this function exists to provide.
+/// Once it does resolve, the watcher's own connect attempt either lands on a listener this
+/// function's caller still has bound (impossible — this function always accepts or panics first)
+/// or fails silently against a closed one; either way it is harmless.
+pub fn accept_or_die(listener: &TcpListener, target: cosca::identity::ProcessId) -> TcpStream {
+    let addr = listener.local_addr().expect("listener has a local addr").to_string();
+    std::thread::spawn(move || {
+        let _ = cosca::Process::from_id(target).wait(); // real exit edge; Err falls through too
+        if let Ok(mut s) = TcpStream::connect(&addr) {
+            let _ = s.write_all(&[DEATH_SENTINEL]);
+        }
+    });
+
+    let (sock, _) = listener.accept().expect("accept a control connection");
+    let mut probe = [0u8; 1];
+    sock.peek(&mut probe)
+        .expect("peek the first byte of the control connection");
+    if probe[0] == DEATH_SENTINEL {
+        panic!("the control target died before it connected");
+    }
+    sock
+}
+
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
@@ -211,7 +248,7 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
         cmd.contain();
     }
     let child = cmd.spawn().expect("spawn control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut sock = accept_or_die(&listener, child.id());
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     (child, sock)
