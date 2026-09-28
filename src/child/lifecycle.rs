@@ -43,21 +43,33 @@ impl Child {
     /// per-call timeout was capped by the ~49.7-day Win32 clamp — a "recheck only when
     /// clamped" mistake (an un-clamped `WAIT_TIMEOUT` can still fire early on real hardware;
     /// see this crate's own `win32_timeout_ms` doc for the Microsoft citation). `shared_child`
-    /// is a third-party dependency (upstream tracking: cosca #237, not filed here) — `test`
-    /// builds can simulate its bug's observable effect via `crate::wait::early_none_seam`.
-    #[cfg(test)]
-    fn wait_deadline_seamed(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        if crate::wait::early_none_seam::take() {
-            return Ok(None);
-        }
-        self.proc.wait_deadline(deadline).map_err(Error::Io)
-    }
-
+    /// is a third-party dependency (upstream tracking: cosca #237, not filed here), so this
+    /// loop is cosca's OWN defensive recheck around EITHER backend's result: a `None` this
+    /// function receives is never trusted until the REAL clock genuinely reaches `deadline`,
+    /// regardless of which backend produced it (harmless, and a no-op extra check, on the
+    /// already-correct `Raw` arm and on non-Windows platforms). `test` builds can simulate the
+    /// std backend's bug's observable effect via `crate::wait::early_none_seam`, since there is
+    /// no seam into the third-party dependency's own internals to force it directly.
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        #[cfg(test)]
-        return self.wait_deadline_seamed(deadline);
-        #[cfg(not(test))]
-        self.proc.wait_deadline(deadline).map_err(Error::Io)
+        loop {
+            #[cfg(test)]
+            let status = if crate::wait::early_none_seam::take() {
+                None
+            } else {
+                self.proc.wait_deadline(deadline).map_err(Error::Io)?
+            };
+            #[cfg(not(test))]
+            let status = self.proc.wait_deadline(deadline).map_err(Error::Io)?;
+
+            if status.is_some() {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            // A `None` this early does not prove `deadline` has genuinely passed (see this
+            // function's doc) — re-arm rather than trust it.
+        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
