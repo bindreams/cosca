@@ -250,11 +250,11 @@ fn is_alive_is_false_for_a_real_zombie() {
         .args(["control-block", &addr, "Z"])
         .spawn()
         .expect("spawn raw child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let p = cosca::Process::from_pid(raw.id()).found().expect("raw child resolves");
+    let mut sock = common::accept_or_die(&listener, p.id());
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
 
-    let p = cosca::Process::from_pid(raw.id()).found().expect("raw child resolves");
     sock.write_all(b"x").expect("trigger exit");
     p.wait().expect("death-watch"); // the OS exit edge — non-reaping, but not yet the zombie edge
     common::block_until_zombie(raw.id()); // the zombie edge, still unreaped
@@ -272,4 +272,23 @@ fn is_alive_is_false_for_a_real_zombie() {
         "a zombie identity still resolves"
     );
     raw.wait().expect("reap the zombie");
+}
+
+/// Regression test for `common::accept_or_die`'s reason to exist: a dead-before-connecting
+/// target must panic, not hang the caller forever.
+#[test]
+fn accept_or_die_panics_loudly_when_the_target_dies_first() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut child = std::process::Command::new(common::testbin())
+        .args(["--not-a-real-mode"]) // testbin exits immediately on an unknown mode
+        .spawn()
+        .expect("spawn a child that exits immediately");
+    let id = cosca::Process::from_pid(child.id()).found().expect("resolves").id();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| common::accept_or_die(&listener, id)));
+    assert!(
+        result.is_err(),
+        "accept_or_die must panic, not hang, when the target dies before connecting"
+    );
+    child.wait().expect("reap the already-exited child");
 }
