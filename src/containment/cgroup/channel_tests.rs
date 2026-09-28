@@ -118,8 +118,6 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
     let gate = gate_read.as_raw_fd();
     // Inherits the child's end, and keeps it until released through the gate.
     let holder = fork_running(move || block_on(gate));
-    // `child`'s body is empty, so it exits right after the fork — a panic before this guard's own
-    // drop leaves a zombie to reap here, not a blocked orphan holding fds open like `holder`'s would.
     let child = fork_running(|| {});
 
     assert_eq!(
