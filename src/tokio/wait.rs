@@ -371,16 +371,26 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 );
                 listener.await
             }
-            // A timeout is looked at by the next step, which reads the leaf once more.
+            // A timeout is looked at by the next step, which reads the leaf once more. Reporting
+            // `sleep.deadline()` — read back from the `Sleep` itself, after construction —
+            // rather than `at` a second time means a test can tell this apart from a version
+            // that armed some other instant: the reported value is whatever the primitive
+            // actually holds, not a separate copy a change to its own argument could leave stale.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),
             } => {
+                let sleep = ::tokio::time::sleep_until(::tokio::time::Instant::from_std(at));
                 #[cfg(test)]
                 crate::containment::cgroup::fault::notify_tokio_wait_site_park(
-                    crate::containment::cgroup::fault::TokioWaitSitePark { deadline: Some(at) },
+                    crate::containment::cgroup::fault::TokioWaitSitePark {
+                        deadline: Some(sleep.deadline().into_std()),
+                    },
                 );
-                drop(::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), listener).await)
+                ::tokio::select! {
+                    _ = listener => {}
+                    _ = sleep => {}
+                }
             }
         }
     }

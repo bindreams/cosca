@@ -364,8 +364,8 @@ async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
 }
 
 /// The async wait site (`cgroup_wait_tree_drained`'s own `Block` arm) is armed with the caller's
-/// deadline instant exactly — structural, no timing: the future is cancelled the moment the seam
-/// fires, never letting `timeout_at` actually run.
+/// deadline instant exactly — structural, no timing: `sleep_until` is built and polled once, and
+/// its timer is never allowed to elapse.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_instant() {
@@ -378,36 +378,64 @@ async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_i
 
     let (park_tx, park_rx) = std::sync::mpsc::channel();
     fault::set_tokio_wait_site_park_notifier(park_tx);
-    let (cancel_tx, cancel_rx) = ::tokio::sync::oneshot::channel::<()>();
-
-    // A real rendezvous on its own OS thread, independent of the tokio runtime driving the
-    // future below: once the wait site arms a park, cancel that future — nothing here needs
-    // `timeout_at` to actually run.
-    let watcher = std::thread::spawn(move || {
-        let park = park_rx
-            .recv()
-            .expect("the wait site must arm a park before this call returns");
-        fault::take_tokio_wait_site_park_notifier();
-        let _ = cancel_tx.send(());
-        park
-    });
 
     // Far enough out that a populated fake leaf never takes the zero-remaining shortcut; how far
-    // is irrelevant, since the future is cancelled before it ever waits that long.
+    // is irrelevant, since the future below is polled only once.
     let at = Instant::now() + Duration::from_secs(3600);
     let fut = super::cgroup_wait_tree_drained(&leaf, Some(Some(at)));
+    ::tokio::pin!(fut);
+    // A single poll, on this task, in `select!`'s declared (`biased`) order: `&mut fut` first,
+    // so a mutant that resolves it on this very poll is still caught by the panic, not masked by
+    // `ready(())` completing first. No thread and no rendezvous, so a mutant that drops the seam
+    // entirely fails the `try_recv` below instead of hanging anything.
     ::tokio::select! {
-        _ = fut => panic!(
-            "the fake leaf never drains and the deadline is an hour out; this must not resolve"
+        biased;
+        _ = &mut fut => panic!(
+            "the fake leaf never drains and the deadline is an hour out; a single poll must not \
+             resolve this"
         ),
-        _ = cancel_rx => {}
+        _ = std::future::ready(()) => {}
     }
 
-    let park = watcher.join().expect("watcher thread must not panic");
+    fault::take_tokio_wait_site_park_notifier();
+    let park = park_rx
+        .try_recv()
+        .expect("the wait site must arm a park on its first poll");
     assert_eq!(
         park.deadline,
         Some(at),
-        "the tokio wait site must arm `timeout_at` with the caller's own deadline instant \
-         exactly, got {park:?}"
+        "the tokio wait site must arm its wait with the caller's own deadline instant exactly, \
+         got {park:?}"
+    );
+}
+
+/// The async wait site's unbounded arm fires the same seam, with no deadline armed.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_arms_the_wait_site_unbounded_with_no_deadline() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-async-wait-site-unbounded", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    let (park_tx, park_rx) = std::sync::mpsc::channel();
+    fault::set_tokio_wait_site_park_notifier(park_tx);
+
+    let fut = super::cgroup_wait_tree_drained(&leaf, None);
+    ::tokio::pin!(fut);
+    ::tokio::select! {
+        biased;
+        _ = &mut fut => panic!("the fake leaf never drains; a single poll must not resolve this"),
+        _ = std::future::ready(()) => {}
+    }
+
+    fault::take_tokio_wait_site_park_notifier();
+    let park = park_rx
+        .try_recv()
+        .expect("the wait site must arm a park on its first poll");
+    assert_eq!(
+        park.deadline, None,
+        "the unbounded wait site must arm with no deadline, got {park:?}"
     );
 }
