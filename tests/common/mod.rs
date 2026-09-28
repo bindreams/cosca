@@ -23,7 +23,10 @@ pub(crate) use cosca::test_spawn_lock;
 #[path = "../../src/test_isolation.rs"]
 mod isolation;
 #[cfg(unix)]
-pub use isolation::{alone, alone_capturing, require_process_per_test, RestoreRlimitNofile, RestoreStdio, ALONE_ARGS};
+pub(crate) use isolation::{
+    alone, alone_capturing, fixture_path, require_process_per_test, spawn_without_alone_shape, RestoreRlimitNofile,
+    RestoreStdio, ALONE_ARGS,
+};
 
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")

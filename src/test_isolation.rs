@@ -40,7 +40,7 @@ macro_rules! fixture_path {
         }
     }};
 }
-use fixture_path;
+pub(crate) use fixture_path;
 
 /// The re-exec args [`alone`]/[`alone_capturing`] pass after the test name; [`alone_marker_matches`]
 /// demands this process's own argv match this shape before trusting a `COSCA_TEST_ALONE` env var.
@@ -587,6 +587,39 @@ fn wait_bounded(
     wait_on_channel(child, timeout, rx, own_process_group)
 }
 
+/// Spawn a fresh copy of this test binary directly against `fixture` — WITHOUT `alone()`'s own
+/// isolated shape (`COSCA_TEST_ALONE` per `alone_env`, argv NOT [`ALONE_ARGS`]) — with `extra_env`
+/// also set, and return its captured output. Shared by every prover of a gate that must reject
+/// exactly this non-isolated shape, not the isolated one every other caller uses (both in this
+/// file's own tests and in #210's `spawn_with_std_slots_closed` provers).
+pub fn spawn_without_alone_shape(
+    fixture: &str,
+    alone_env: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let child = {
+        let _guard = super::test_spawn_lock();
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        cmd.args([fixture, "--exact", "--nocapture", "--test-threads=1"]);
+        match alone_env {
+            Some(name) => {
+                cmd.env("COSCA_TEST_ALONE", name);
+            }
+            None => {
+                cmd.env_remove("COSCA_TEST_ALONE");
+            }
+        }
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the probe")
+    };
+    wait_bounded(child, PROBE_TIMEOUT, false)
+}
+
 #[cfg(test)]
 mod isolation_tests {
     use super::{alone_capturing, kill_and_reap, wait_bounded, wait_on_channel, RestoreRlimitNofile, RestoreStdio};
@@ -595,38 +628,7 @@ mod isolation_tests {
     // item.
     #[allow(unused_imports)]
     use super::fixture_path;
-
-    /// Spawn a fresh copy of this test binary directly against `fixture` — WITHOUT `alone()`'s own
-    /// isolated shape (`COSCA_TEST_ALONE` per `alone_env`, argv NOT [`super::ALONE_ARGS`]) — with
-    /// `extra_env` also set, and return its captured output. Shared by every prover of a gate that
-    /// must reject exactly this non-isolated shape, not the isolated one every other caller uses.
-    fn spawn_without_alone_shape(
-        fixture: &str,
-        alone_env: Option<&str>,
-        extra_env: &[(&str, &str)],
-    ) -> std::process::Output {
-        let child = {
-            let _guard = super::super::test_spawn_lock();
-            let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-            cmd.args([fixture, "--exact", "--nocapture", "--test-threads=1"]);
-            match alone_env {
-                Some(name) => {
-                    cmd.env("COSCA_TEST_ALONE", name);
-                }
-                None => {
-                    cmd.env_remove("COSCA_TEST_ALONE");
-                }
-            }
-            for &(k, v) in extra_env {
-                cmd.env(k, v);
-            }
-            cmd.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn the probe")
-        };
-        wait_bounded(child, super::PROBE_TIMEOUT, false)
-    }
+    use super::spawn_without_alone_shape;
 
     // Overlap contract: a hard assert, before anything is closed =====
 
