@@ -1338,7 +1338,7 @@ fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
     );
 }
 
-/// A real leaf whose one member, a `sleep`, entered it. For the lane tests.
+/// A real leaf whose one member, a `cat`, entered it. For the lane tests.
 #[cfg(target_os = "linux")]
 fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process::Child) {
     use std::os::unix::process::CommandExt;
@@ -1354,7 +1354,11 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     // it. A `sleep`-based member has its own 300s timer completely independent of that kill, so
     // a caller whose assertion is merely "the leaf is gone" (not "gone because it was signalled")
     // would still pass once that timer alone drains the leaf — the same vacuous-pass shape
-    // measured directly (300.01s) in this file's other group-kill tests.
+    // measured directly (300.01s) in this file's other group-kill tests. The real protection each
+    // caller below actually applies is one of: asserting the member's exit status carries
+    // `SIGKILL` (e.g. `:1239`, `:1279`), or reading whether the leaf directory was removed BEFORE
+    // ever calling the blocking `member.wait()` (`:1300`) — either one only holds if the kill,
+    // not the fixture's own end, is what happened.
     let mut cmd = std::process::Command::new("cat");
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null());
