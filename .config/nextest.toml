@@ -20,6 +20,20 @@ filter = 'binary(windows_shell_resolution)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
+# `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`
+# (`src/tokio/child/graceful_tests.rs`) arms its grace with Win32's own `INFINITE - 1` ms cap
+# (~49.7 days) deliberately: the test's structural assertion (`real_wait_probe`) only observes
+# ONE specific regression shape (a real Windows wait call returning `WAIT_TIMEOUT`), so making
+# the grace itself effectively unbounded means ANY mechanism that ends up genuinely spending it
+# — not just that one — hangs instead of silently completing within a small window. This
+# override is the failure bound that turns such a hang into a reported test failure instead of
+# an indefinite CI stall (the one sanctioned use of a timeout — docs/principles.md §8). With
+# correct code the test resolves in well under a second (the root is already exited by the time
+# the wait is reached), so 120s is pure headroom, never load-bearing in the passing case.
+filter = 'binary(cosca) & test(=windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
 # `windows_elevation_routes.rs`'s `wait_for` bounds a spawned child's exit with
 # `CHILD_EXIT_BOUND_MS`/`GRANDCHILD_EXIT_BOUND_MS` (120s). This override is a second, redundant
 # safety net on top of that in-process bound, for whatever it cannot cover — same reasoning as
@@ -60,3 +74,9 @@ test-group = 'windows-shell-execute'
 [[profile.default.overrides]]
 filter = 'binary(windows_elevation_routes)'
 test-group = 'windows-elevation-routes'
+
+[[profile.default.overrides]]
+# Same failure-bound rationale as the `profile.ci` override above — this test's grace is
+# deliberately near-unbounded, so a local `cargo nextest run` needs the same backstop CI gets.
+filter = 'binary(cosca) & test(=windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
+slow-timeout = { period = "60s", terminate-after = 2 }

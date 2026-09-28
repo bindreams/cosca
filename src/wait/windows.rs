@@ -82,7 +82,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     // must watch for.
     #[cfg(test)]
     if waited == WAIT_TIMEOUT {
-        real_wait_probe::note_timeout();
+        real_wait_probe::note_timeout(id);
     }
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
@@ -205,7 +205,7 @@ pub(crate) fn block_until_exit_or_cancel(
     // must watch for.
     #[cfg(test)]
     if waited == WAIT_TIMEOUT {
-        real_wait_probe::note_timeout();
+        real_wait_probe::note_timeout(id);
     }
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
@@ -321,28 +321,51 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 /// that the call blocked for (approximately) its whole timeout with nothing becoming signaled —
 /// the actual shape of "a root-only watch that waits out the grace."
 ///
-/// A GLOBAL atomic, not a `thread_local!` — the one place in this module that must be, and this
-/// is the justification: both instrumented calls run inside a `spawn_blocking` closure
-/// (`crate::tokio::wait::blocking_watch`), dispatched to a tokio blocking-pool thread distinct
-/// from the async task that later asserts on the counter. A thread-local counter would never be
-/// visible there.
+/// Keyed by [`ProcessId`], not a single shared counter. `note_timeout`/`timeouts_for` run for
+/// EVERY caller of `block_until_exit`/`block_until_exit_or_cancel` in the whole binary — the
+/// sync API's own timed waits go through the same backend — so a process-wide counter, even
+/// sampled as a before/after delta, can be ticked by an UNRELATED test's own live child on
+/// another thread landing inside the narrow window between a test's two samples. That is not
+/// hypothetical: `grace_wait_false_for_live_child_at_zero_grace`
+/// (`src/tokio/wait_tests.rs`) deliberately drives a live child to a real `WAIT_TIMEOUT` at
+/// `Duration::ZERO` as its own correct, expected outcome, and it can run concurrently with any
+/// other test under plain `cargo test`'s shared-process model. Keying by the identity under
+/// test makes that impossible: no other process can ever share a `ProcessId` — the same
+/// anti-pid-reuse pairing (`identity.rs`) this crate already relies on everywhere else. A test
+/// therefore reads its OWN child's count, which starts at zero (a freshly spawned test child's
+/// `ProcessId` has never been seen before) and needs no before/after sampling at all.
 ///
-/// Callers MUST sample [`timeouts`] immediately before and after the call under test and assert
-/// the delta, never an absolute count: this counter is shared by every test in the binary. Under
-/// `cargo nextest`'s one-process-per-test model that is moot, but under plain `cargo test` many
-/// `#[tokio::test]`s share one process and may tick it concurrently on their own threads (see
-/// `tests/common/mod.rs`'s identical caveat about process-wide test state).
+/// Entries are never removed — append-only, like `log_capture.rs`'s records — negligible growth
+/// over one test run, and removal would only reintroduce a cross-test race.
+///
+/// A GLOBAL `OnceLock`, not a `thread_local!` — the one place in this module that must be, and
+/// this is the justification: both instrumented calls run inside a `spawn_blocking` closure
+/// (`crate::tokio::wait::blocking_watch`), dispatched to a tokio blocking-pool thread distinct
+/// from the async task that later asserts on the count. A thread-local counter would never be
+/// visible there.
 #[cfg(test)]
 pub(crate) mod real_wait_probe {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
 
-    static REAL_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    use crate::identity::ProcessId;
 
-    pub(crate) fn note_timeout() {
-        REAL_WAIT_TIMEOUTS.fetch_add(1, Ordering::SeqCst);
+    static REAL_WAIT_TIMEOUTS: OnceLock<Mutex<HashMap<ProcessId, u32>>> = OnceLock::new();
+
+    fn map() -> &'static Mutex<HashMap<ProcessId, u32>> {
+        REAL_WAIT_TIMEOUTS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    pub(crate) fn timeouts() -> u32 {
-        REAL_WAIT_TIMEOUTS.load(Ordering::SeqCst)
+    pub(crate) fn note_timeout(id: ProcessId) {
+        *map().lock().unwrap().entry(id).or_insert(0) += 1;
+    }
+
+    // The only consumer is the tokio TreeWalk fast-path test
+    // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`), so this is
+    // dead code in a `--no-default-features` (no `tokio`) build — same shape as
+    // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn timeouts_for(id: ProcessId) -> u32 {
+        map().lock().unwrap().get(&id).copied().unwrap_or(0)
     }
 }
