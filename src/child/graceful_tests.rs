@@ -36,12 +36,21 @@ fn blocker() -> (crate::Child, std::io::PipeWriter) {
 }
 
 /// Proves a [`blocker`] is genuinely still running, not merely still resolvable — see
-/// [`blocker`]'s own doc for why `Existence::Present` cannot tell those apart. On Unix, round-trips
-/// a byte through `cat`'s piped stdout, over the same stdin writer [`blocker`]'s caller already
-/// holds; a killed-but-unreaped `cat` cannot produce an echo. On Windows, `findstr` does not echo,
-/// so this reads `is_alive()` instead and ignores the stdin writer.
-#[cfg_attr(windows, allow(unused_variables))]
-fn assert_still_running(child: &mut crate::Child, stdin: &mut std::io::PipeWriter) {
+/// [`blocker`]'s own doc for why `Existence::Present` cannot tell those apart. On Unix,
+/// round-trips a byte through `cat`'s piped stdout, over the same stdin writer [`blocker`]'s
+/// caller already holds; a killed-but-unreaped `cat` cannot produce an echo.
+///
+/// On Windows, `findstr` does not echo, and `is_alive()` cannot reliably detect a kill either:
+/// `TerminateProcess` is asynchronous, so a check that races it can still observe `Alive` for a
+/// window after the call returns — measured letting a spurious `self.kill()` (the fail-fast
+/// mutant this assertion exists to catch) through undetected. Instead: write a line containing
+/// `x`, close stdin (EOF — `findstr` can only finish reading and exit once its input ends), then
+/// require BOTH a clean exit (`status.success()`, `findstr`'s own "a match was found" code) AND
+/// the echoed match on stdout — a killed process can produce neither. This consumes `stdin` and
+/// reaps the child; callers on Windows must not also `wait()` a *different* status from it
+/// afterward (`Child::wait()`'s SharedChild-backed caching still permits a redundant `wait()`
+/// call, just not one expecting a fresh status).
+fn assert_still_running(child: &mut crate::Child, mut stdin: std::io::PipeWriter) {
     #[cfg(unix)]
     {
         use std::io::{Read as _, Write as _};
@@ -54,11 +63,26 @@ fn assert_still_running(child: &mut crate::Child, stdin: &mut std::io::PipeWrite
         assert_eq!(&echo, b"x");
     }
     #[cfg(windows)]
-    assert_eq!(
-        child.id().is_alive(),
-        crate::identity::Liveness::Alive,
-        "the blocker must still be running"
-    );
+    {
+        use std::io::{Read as _, Write as _};
+        stdin.write_all(b"x\r\n").expect("write to the blocker");
+        drop(stdin); // EOF: findstr can now finish reading and exit
+        let mut output = Vec::new();
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_to_end(&mut output)
+            .expect("read stdout to EOF");
+        let status = child.wait().expect("the blocker must exit after stdin closes");
+        assert!(
+            status.success(),
+            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
+        );
+        assert!(
+            output.windows(1).any(|w| w == b"x"),
+            "the blocker's stdout must contain the echoed match, got {output:?}"
+        );
+    }
 }
 
 // A watch failure must not strand the tree between the soft signal and the hard sweep: the
@@ -262,7 +286,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 // underlying error.
 #[test]
 fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
-    let (mut child, mut stdin) = blocker();
+    let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
@@ -273,7 +297,7 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
     );
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE — same
     // assertion shape as the pre-existing NoConsole/Unsupported fail-fast test below.
-    assert_still_running(&mut child, &mut stdin);
+    assert_still_running(&mut child, stdin);
     // Clean up: the child is still running by design (no sweep happened above).
     let _ = child.kill_tree();
     let _ = child.wait();
@@ -399,18 +423,24 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // `MembersRemain` branch requires the root to have ALREADY exited by the time it is called, and
 // betting that `exit 0` always beats the 2-second grace is exactly the timed-fixture hazard this
 // crate's tests avoid elsewhere: measured with a deliberately slow root (`sleep 3` before
-// `exit 0`) this bet fails at 2.01s. So the test blocks a second time, on `child.wait()` — a
-// real happens-before edge on the root's exit, not a sleep or a grace-duration guess.
+// `exit 0`) this bet fails at 2.01s.
 //
-// `child.wait()`, not a raw `waitid` on the bare pid: `SharedChild::new` (which every sync
-// `crate::Child` is backed by) can itself reap a fast-exiting child from inside `spawn()` —
-// this fixture's shell is trivial enough to race that internal probe and lose (measured:
-// intermittent `ECHILD` from a hand-rolled `waitid`, gone once `child.wait()` replaced it).
-// `wait()` is safe here for the SAME reason it is safe to call from more than one place at
-// all — `SharedChild` caches the exit status the first time anything observes it, so this
-// call and `graceful_shutdown_tree`'s own later one both return the same status; the function
-// under test still runs its own best-effort-reap code path and still exercises it, regardless
-// of which caller's `wait()` was the one the kernel actually serviced.
+// The root's `exit 0` is instead gated on a byte THIS TEST writes to fd 4 (`read _ <&4`), so
+// nothing about the shell's own scheduling can let it exit before `cmd.spawn()` has already
+// returned here — `SharedChild::new` (which every sync `crate::Child` is backed by) can itself
+// reap a fast-exiting child from inside `spawn()`, and a root free to exit immediately after
+// `echo r` is trivial enough to race that internal probe and lose (measured: intermittent
+// `ECHILD` from a hand-rolled `waitid` used here in an earlier version of this fix). Gating the
+// exit closes that race at its source instead of working around it.
+//
+// After releasing fd 4, the test blocks on `crate::wait::block_until_exit` — non-reaping, unlike
+// `child.wait()` — so the root is a genuine, UNREAPED zombie when `graceful_shutdown_tree` runs:
+// `child.wait()` here would reap it first, leaving nothing for `graceful_shutdown_tree`'s own
+// best-effort reap to do, which a mutant that skips that reap (`Ok(exited) => (false, false,
+// None)` at `graceful.rs`, discarding the real `exited` value) would then pass anyway, since
+// `id.exists()` already reads `Gone` from this test's own earlier reap regardless of whether the
+// function under test did its job. Measured RED against that exact mutant before this fix,
+// GREEN after.
 //
 // `exec 3<&0` duplicates the shell's OWN stdin (our pipe) to fd 3 while it is still the
 // foreground command — POSIX has a non-interactive shell give an asynchronous (`&`) command
@@ -429,19 +459,23 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::Read;
 
+    use std::io::Write;
+
     let mut cmd = crate::Command::new();
     cmd.args([
         "sh",
         "-c",
-        "trap '' TERM; exec 3<&0; cat <&3 >/dev/null 3<&- & echo r; exit 0",
+        "trap '' TERM; exec 3<&0; cat <&3 >/dev/null 3<&- & echo r; read _ <&4; exit 0",
     ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
     // Held for the test's whole body: dropping it closes the pipe, delivering EOF to the
     // backgrounded `cat` and letting it exit on its own — defeating the MembersRemain fixture.
     let _stdin = child.stdin().expect("piped stdin");
+    let mut exit_gate = child.fd_write_end(4.into()).expect("exit-gate write end");
     let mut readiness = [0u8; 1];
     child
         .stdout()
@@ -449,10 +483,15 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         .read_exact(&mut readiness)
         .expect("readiness byte");
     let id = child.id();
-    // Block until the root has genuinely exited — see this test's own doc for why the
-    // readiness byte alone does not prove the root's own `exit 0` has completed, and why this
-    // is `child.wait()` rather than a raw `waitid` on the bare pid.
-    child.wait().expect("the root must exit on its own");
+    // `spawn()` has already returned, and the root is provably still alive (blocked on `read
+    // _ <&4`) — see this test's own doc for why the exit is gated here rather than left to the
+    // shell's own scheduling. Release it, then block for its exit WITHOUT reaping.
+    exit_gate.write_all(b"x").expect("release the root's exit 0");
+    drop(exit_gate);
+    assert!(
+        crate::wait::block_until_exit(id, None).expect("the root must exit"),
+        "block_until_exit must observe the exit, not a timeout (None means unbounded)"
+    );
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
@@ -554,14 +593,14 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 // the requested grace, so there is nothing to synchronize on.
 #[test]
 fn graceful_tree_non_containment_terminate_error_fails_fast() {
-    let (mut child, mut stdin) = blocker();
+    let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("the forced Unsupported error must surface immediately");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
-    assert_still_running(&mut child, &mut stdin);
+    assert_still_running(&mut child, stdin);
     // Clean up: the child is still running by design (no sweep happened above).
     let _ = child.kill_tree();
     let _ = child.wait();
