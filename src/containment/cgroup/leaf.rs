@@ -86,10 +86,16 @@ fn proc_state(pid: u32) -> Option<char> {
 pub(crate) enum DrainStep {
     /// The wait's answer.
     Done(crate::containment::TreeDrain),
-    /// Block on `listener` for `left` (`None`: unbounded), then step again.
+    /// Block on `listener` until `deadline` (`None`: unbounded), then step again. Carries the
+    /// caller's own absolute instant, not a duration computed from it: a duration goes stale by
+    /// however long elapses between computing it and starting the wait, making the wait choose
+    /// to run past the caller's own deadline by that much. Waiting on the instant directly —
+    /// `event_listener::Listener::wait_deadline` and `tokio::time::timeout_at` both take it —
+    /// means the wait's own wake time is always the caller's deadline, not something later that
+    /// this step chose.
     Block {
         listener: event_listener::EventListener,
-        left: Option<std::time::Duration>,
+        deadline: Option<std::time::Instant>,
     },
 }
 
@@ -529,12 +535,17 @@ impl CgroupLeaf {
         loop {
             match self.drain_step(deadline)? {
                 DrainStep::Done(drain) => return Ok(drain),
-                DrainStep::Block { listener, left: None } => listener.wait(),
-                // A timeout is looked at by the next step, which reads the leaf once more.
                 DrainStep::Block {
                     listener,
-                    left: Some(left),
-                } => drop(listener.wait_timeout(left)),
+                    deadline: None,
+                } => listener.wait(),
+                // `wait_deadline` takes the caller's own instant directly as its wake time: how
+                // long it took to get from `drain_step`'s entry to here changes nothing about
+                // when this wait wakes.
+                DrainStep::Block {
+                    listener,
+                    deadline: Some(at),
+                } => drop(listener.wait_deadline(at)),
             }
         }
     }
@@ -542,10 +553,13 @@ impl CgroupLeaf {
     /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
     /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
     /// (which can itself take real time — spawning its thread), and read it again: a change after
-    /// that read is always heard, so the caller may block on the returned listener for the time
-    /// left, then take another step. `left` is recomputed fresh at that point, not carried over
-    /// from before `listen()`: a `Block`'s caller times its wait against now, never against a
-    /// value `listen()`'s own setup time has already eaten into.
+    /// that read is always heard, so the caller may block on the returned listener until
+    /// `deadline`, then take another step. `Block` carries `deadline`'s own absolute instant
+    /// unchanged, never a duration computed from it here: a duration would go stale by however
+    /// long `listen()`'s own setup time — or anything else between this step and the caller's
+    /// wait — eats into it, making the wait choose to run past the caller's own deadline by that
+    /// much. Carrying the instant instead means the wait's wake time is always the caller's
+    /// deadline itself.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -555,8 +569,7 @@ impl CgroupLeaf {
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        let left = crate::wait::remaining(deadline);
-        if left == Some(std::time::Duration::ZERO) {
+        if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
             #[cfg(test)]
             fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
@@ -567,20 +580,12 @@ impl CgroupLeaf {
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        // `listen()` may have just started the pump thread, and the test-only hook above stands
-        // in for whatever else can take real time here: recompute `left` fresh rather than hand
-        // `Block`'s caller the value from this function's entry, which `wait_timeout`/`timeout`
-        // would then block on all over again, overrunning the caller's deadline by however long
-        // this step took.
-        let left = crate::wait::remaining(deadline);
-        if left == Some(std::time::Duration::ZERO) {
-            #[cfg(test)]
-            fault::notify_drain_zero_remaining();
-            return Ok(DrainStep::Done(TreeDrain::MembersRemain));
-        }
         #[cfg(test)]
         fault::notify_drain_blocking();
-        Ok(DrainStep::Block { listener, left })
+        Ok(DrainStep::Block {
+            listener,
+            deadline: deadline.flatten(),
+        })
     }
 
     /// `Some(AllMembersExited)` if the leaf has drained or is gone; `None` if it still holds a

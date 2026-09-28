@@ -37,92 +37,53 @@ fn unrelated_errnos_are_not_removed_after_drain() {
     }
 }
 
-// drain_step's `left` must be fresh, not stale from before `listen()` -----
-// A `FakeLeaf`, no COSCA_TEST_CGROUP needed: `listen()` starts a real pump thread against a real
-// (if synthetic) `cgroup.events` file, which is all this needs.
+// drain_step's Block carries the caller's own deadline, not a computed duration -----
+// A `FakeLeaf`, no COSCA_TEST_CGROUP needed.
 
-/// `drain_step` used to compute `left` once, before `Watcher::listen()` (which may start the pump
-/// thread) and before its own second `drain_seen()` re-read, then hand that same, now-stale
-/// `left` to `wait_drained`'s `listener.wait_timeout(left)`. Any real time spent between the two
-/// points — a slow thread spawn, say — meant `wait_timeout` blocked for the ORIGINAL `left` all
-/// over again once released, overrunning the caller's deadline by however long that gap was.
+/// `drain_step` used to compute a `left: Duration` once, before `Watcher::listen()` (which may
+/// start the pump thread) and before its own second `drain_seen()` re-read, then hand that same
+/// duration to `wait_drained`'s `listener.wait_timeout(left)`. Any real time spent between the
+/// two points — a slow thread spawn, say — meant the wait chose to run for the ORIGINAL `left`
+/// all over again once started, past the caller's own deadline by however long that gap was: the
+/// wait's wake time was no longer the caller's deadline, but something later this step chose.
 ///
-/// `fault::set_after_listen_hook` reproduces that gap deterministically: it pauses THIS call to
-/// `drain_step` right after `listen()` returns, released only once the deadline this test set has
-/// genuinely passed — a real rendezvous and a real clock comparison, never a sleep. Proof is two
-/// fault seams, not timing: `fault::set_drain_blocking_notifier` must NOT fire (this call must
-/// not reach `Block`, which would hand `wait_drained` the stale `left` to block on all over
-/// again), and `fault::set_drain_zero_remaining_notifier` MUST fire (this call must instead
-/// recompute `left`, see it already spent, and take the zero-remaining shortcut).
+/// `Block` now carries `deadline`'s own instant unchanged instead, for `wait_deadline`/
+/// `timeout_at` to wait against directly — there is no duration to go stale, so this is a
+/// structural property of the returned value, not a timing one: proof needs no clock, no
+/// rendezvous and no thread at all, just calling `drain_step` and reading what it returned.
 #[cfg(target_os = "linux")]
 #[test]
-fn drain_step_recomputes_left_after_listen_so_it_never_overruns() {
-    use crate::containment::cgroup::fault;
+fn drain_step_block_carries_the_original_deadline_instant() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
-    use crate::containment::TreeDrain;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    let fake = FakeLeaf::new("cosca-drain-step-fresh-left", true);
+    let fake = FakeLeaf::new("cosca-drain-step-block-deadline", true);
     let leaf = entered_leaf_at(fake.leaf.clone());
     // This test never flips the fake leaf's `populated` bit, so an armed `Drop`'s own kill-and-
     // wait-for-drain teardown would block forever once `leaf` goes out of scope: disarm it, since
     // this test is only about `drain_step`'s own return value, not the leaf's teardown.
     leaf.disarm();
 
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let (block_tx, block_rx) = mpsc::channel();
-    let (zero_tx, zero_rx) = mpsc::channel();
-
-    let deadline = Instant::now() + Duration::from_millis(20);
-    let handle = std::thread::spawn(move || {
-        fault::set_after_listen_hook(ready_tx, release_rx);
-        fault::set_drain_blocking_notifier(block_tx);
-        fault::set_drain_zero_remaining_notifier(zero_tx);
-        let result = leaf.drain_step(Some(Some(deadline)));
-        fault::take_drain_blocking_notifier();
-        fault::take_drain_zero_remaining_notifier();
-        result
-    });
-
-    // A real rendezvous: block until `drain_step` proves it reached the point right after
-    // `listen()`, not a guess about how long that would take.
-    ready_rx
-        .recv()
-        .expect("drain_step must reach the post-listen hook before it returns");
-
-    // Let the deadline genuinely pass while `drain_step` is paused there. A real clock
-    // comparison against the deadline this test itself set, re-checked in a loop — not a fixed
-    // sleep hoping it is "long enough".
-    while Instant::now() < deadline {
-        std::thread::yield_now();
+    // Far enough out that a populated fake leaf never takes the zero-remaining shortcut; how far
+    // is irrelevant, since nothing here ever waits for it to elapse.
+    let at = Instant::now() + Duration::from_secs(3600);
+    let step = leaf.drain_step(Some(Some(at))).expect("drain_step");
+    match step {
+        DrainStep::Block { deadline, .. } => assert_eq!(
+            deadline,
+            Some(at),
+            "Block must carry the caller's own deadline instant unchanged, not a duration \
+             recomputed from it here: a recomputed duration goes stale by however long elapses \
+             between this step returning and the caller actually starting its wait, making the \
+             wait choose a wake time later than the caller's own deadline. Carrying the instant \
+             itself, for `wait_deadline`/`timeout_at` to wait against directly, keeps the wait's \
+             wake time exactly the caller's deadline regardless of any such delay — no timing \
+             needed to prove it, since the value is asserted structurally"
+        ),
+        DrainStep::Done(_) => {
+            panic!("expected Block: a populated fake leaf with an hour left must not shortcut to Done")
+        }
     }
-    release_tx.send(()).expect("release drain_step");
-
-    let step = handle
-        .join()
-        .expect("drain_step thread must not panic")
-        .expect("drain_step");
-    let step_name = match step {
-        DrainStep::Done(TreeDrain::MembersRemain) => "Done(MembersRemain)",
-        DrainStep::Done(_) => "Done(other)",
-        DrainStep::Block { .. } => "Block",
-    };
-    assert_eq!(
-        step_name, "Done(MembersRemain)",
-        "a fresh `left`, recomputed after the pause, must find the deadline already spent and \
-         answer MembersRemain directly"
-    );
-    assert!(
-        block_rx.try_recv().is_err(),
-        "this call must not have reached Block: that would hand `wait_drained` the stale `left` \
-         from before the pause, to block on all over again"
-    );
-    assert!(
-        zero_rx.try_recv().is_ok(),
-        "the answer above must have come from the zero-remaining shortcut, not some other path"
-    );
 }
 
 // CgroupLeaf::wait_drained real-mechanism test -----
