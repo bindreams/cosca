@@ -612,167 +612,94 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     child.wait().expect("reap");
 }
 
-/// SIGKILLs a whole process group on drop, however the scope is left — including a panic
-/// partway through. This test's writer pipeline (`yes | head`) is a PIPELINE of processes, not
-/// a single child: an earlier version of this test froze that pipeline with `SIGSTOP` to check
-/// its state and, when the check panicked, measured leaving the frozen processes running on the
-/// host (see this test's own doc below) — the exact hazard this guard exists to close, for any
-/// panic anywhere in the scope, not just the one that was actually hit. `pgid` must be the
-/// group's own leader pid (`process_group(0)` at spawn — see `wait_until_pipe_stops_growing`'s
-/// caller below), never a group this process merely happens to belong to.
+/// Fills the marker pipe's write end `w` to the kernel's TRUE capacity, synchronously, in THIS
+/// process — no separate writer process to race, so no growth can ever happen after this
+/// returns. Marks `w` non-blocking and writes until `EAGAIN`, with a first write of 1 MiB
+/// (comfortably past any plausible pipe capacity) so XNU grows the buffer to its maximum inside
+/// that ONE syscall: `head`'s own several-small-writes approach (the earlier version of this
+/// test) let the buffer's growth straddle two writes, which is exactly why a `FIONREAD` reading
+/// taken between them could climb further right after — measured 16384, then 65536. Returns the
+/// `FIONREAD` count once full.
 #[cfg(feature = "tokio")]
-struct KillProcessGroup(Option<i32>);
-
-#[cfg(feature = "tokio")]
-impl Drop for KillProcessGroup {
-    fn drop(&mut self) {
-        if let Some(pgid) = self.0.take() {
-            // SAFETY: a plain signal-delivery syscall; `pgid` names a process group this
-            // process created as a leader (never reused for anything else), so this can never
-            // reach an unrelated group.
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-/// Blocks (each wait on a real kqueue/`poll(2)` event, never a clock) until the marker pipe
-/// behind `fd` has stopped growing: two consecutive low-water-armed readiness checks report the
-/// identical `FIONREAD` count. XNU grows a pipe's buffer under sustained write pressure — this
-/// measured 16 KiB, then 65536 once grown — so the FIRST `NOTE_LOWAT` edge can fire against the
-/// smaller, not-yet-grown capacity; a caller that trusts that first edge alone can capture a
-/// `FIONREAD` reading that keeps climbing even after acting on it (the flake this test used to
-/// have: `queued_before` read 16384, then grew to 65536 during the bounded wait that followed).
-/// Never hardcodes either number — the loop just keeps re-arming a FRESH probe kqueue (a fresh
-/// `EV_ADD` checks CURRENT state immediately, so no growth in between two checks is ever missed)
-/// and comparing, however many rounds of growth actually happen on this kernel.
-#[cfg(feature = "tokio")]
-fn wait_until_pipe_stops_growing(fd: BorrowedFd<'_>) -> libc::c_int {
-    let mut previous: Option<libc::c_int> = None;
+fn fill_pipe_to_capacity(w: &std::io::PipeWriter) -> i32 {
+    let fd = w.as_raw_fd();
+    // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
+    // well-formed pair on it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "fcntl F_SETFL O_NONBLOCK failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let buf = vec![0u8; 1 << 20];
     loop {
-        let probe_kq = super::arm(fd, true).expect("arm probe kqueue");
-        let mut pfd = libc::pollfd {
-            fd: probe_kq.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only
-            // within its bounds, and the `1` count matches the slice length passed. An infinite
-            // timeout blocks in the kernel until genuinely ready — no busy-spin, no chosen wait
-            // duration.
-            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
-            if rc >= 0 {
-                break;
-            }
-            let err = std::io::Error::last_os_error();
-            assert_eq!(err.raw_os_error(), Some(libc::EINTR), "poll failed: {err}");
+        match nix::unistd::write(w, &buf) {
+            Ok(_) => continue,
+            Err(nix::errno::Errno::EAGAIN) => break,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("write failed: {e}"),
         }
-        // `poll` readiness alone does not distinguish a genuinely crossed low-water mark from
-        // `EV_EOF` (the writer having already exited) — both make the kqueue's own fd pollable.
-        // Retrieve and interpret the actual event so a dead writer can never be mistaken for one
-        // still genuinely blocked past the clamp.
-        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let mut events = [nix::sys::event::KEvent::new(
-            0,
-            nix::sys::event::EventFilter::EVFILT_READ,
-            nix::sys::event::EvFlags::empty(),
-            nix::sys::event::FilterFlag::empty(),
-            0,
-            0,
-        )];
-        let n = loop {
-            match probe_kq.kevent(&[], &mut events, Some(zero)) {
-                Ok(n) => break n,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => panic!("kevent failed: {e}"),
-            }
-        };
-        assert_eq!(n, 1, "poll(2) reported ready but kevent found nothing pending");
-        assert!(
-            !events[0].flags().contains(nix::sys::event::EvFlags::EV_EOF),
-            "the writer already exited before crossing the low-water mark — a dead writer must \
-             not be mistaken for one still genuinely blocked past the clamp"
-        );
-        drop(probe_kq);
-
-        let queued = fionread(fd.as_raw_fd());
-        assert!(
-            queued > 0,
-            "poll/kevent confirmed readiness but FIONREAD reports 0 bytes queued"
-        );
-        if previous == Some(queued) {
-            return queued;
-        }
-        previous = Some(queued);
     }
+    fionread(w.as_fd())
 }
 
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
-    use std::os::unix::process::CommandExt as _;
-
     // The async counterpart to the sync past-the-clamp test above — but with the OPPOSITE
     // expectation, because `wait_tree_drained` has no deadline at all (see its doc): draining on
     // a stuck writer's behalf forever is exactly the unbounded CPU spin this primitive must not
-    // have, so past the clamp it does not drain and the writer's own `write()` blocks instead
-    // (the marker fd's documented misuse contract). `head -c 200000` writes far past any
-    // plausible pipe capacity, so the writer never reaches its own `exec 3>&-` on its own.
+    // have, so past the clamp it does not drain.
     //
-    // Not `spawn_marker_holder`: that helper's child is a bare `/bin/sh`, in THIS process's own
-    // process group, so a plain `child.kill()` cannot reach `yes`/`head` if this test ends
-    // before its own explicit cleanup runs — exactly what happened when an earlier version of
-    // this test froze that pipeline with `SIGSTOP` to inspect it and the inspection itself
-    // panicked, leaking the frozen processes on the host. This spawn instead makes the shell its
-    // own process-group leader (`process_group(0)`, pgid == its own pid) so `KillProcessGroup`'s
-    // drop guard can `killpg` the whole pipeline — shell, `yes`, and `head` together — no matter
-    // how this test exits, panic included.
+    // THIS process fills the pipe itself (`fill_pipe_to_capacity`) instead of racing a separate
+    // writer process across several partial writes — by the time the child below ever sees fd
+    // 3, the pipe is ALREADY at the kernel's true, final capacity, so nobody can grow it
+    // further. The child is a single `cat`, spawned through `crate::Command` exactly like every
+    // other fixture in this file, and NEVER itself writes to the marker (`exec cat >/dev/null`,
+    // blocked on a stdin the test holds open) — it exists only to hold the write end past
+    // `fill_pipe_to_capacity` returning, so the wait below has a live holder to observe. A
+    // single child killed through the `Child` handle cosca returned, before that handle reaps
+    // it, is `docs/principles.md` §10's own exemption from the sandbox-only rule — unlike an
+    // earlier version of this test, which piped a `yes | head` pipeline through a process group
+    // it had to `killpg` by a PID it computed itself.
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
-    let marker_w_fd = marker_w.as_raw_fd();
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.args(["-c", "yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null"]);
-    cmd.process_group(0); // leader: pgid == pid — see `containment/unix.rs`'s own `process_group(0)`
-                          // SAFETY: the closure runs only between `fork` and `exec`, and calls only the
-                          // async-signal-safe `dup2` on a descriptor (`marker_w_fd`) valid for the whole spawn.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(marker_w_fd, 3) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn().expect("spawn /bin/sh");
-    drop(marker_w); // this process's own copy; the child's dup'd fd 3 keeps the pipe's write end open
-    let pgid = child.id() as i32;
-    let _kill_group = KillProcessGroup(Some(pgid));
-    let fd = marker_r.as_fd();
+    let queued_before = fill_pipe_to_capacity(&marker_w);
+    assert!(
+        queued_before >= 16384,
+        "the pipe must be filled to at least its un-grown 16 KiB capacity, got {queued_before}"
+    );
 
-    // Prove the precondition deterministically BEFORE trusting anything downstream: nothing
-    // here establishes that the writer has actually reached — and stayed at — the pipe's true
-    // capacity merely by having spawned it. See `wait_until_pipe_stops_growing`'s own doc for
-    // why one edge is not enough on this kernel.
-    let queued_before = wait_until_pipe_stops_growing(fd);
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    // Moves `marker_w` in — this test's own copy is gone from here on, before `arm` ever runs.
+    cmd.fd(
+        3,
+        crate::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(marker_w))),
+    )
+    .expect("marker pipe");
+    let child = cmd.spawn().expect("spawn /bin/sh");
+    let fd = marker_r.as_fd();
     assert_eq!(
         child.try_wait().expect("try_wait"),
         None,
-        "the writer already exited before its pipe stabilized — a dead writer must not be \
-         mistaken for one still genuinely blocked past the clamp"
+        "the holder already exited before this test could observe it"
     );
 
-    // Drive `wait_tree_drained` with no clock anywhere in this check: a `#[cfg(test)]` seam
-    // (`declined`) reports every time the watch loop sees real kqueue readiness and still does
-    // not resolve (see `watch_readable`'s own doc) — the exact "saw readiness, declined to
-    // drain" edge that proves the race below has genuinely reached and passed judgment on a
-    // real event, not merely raced a future that has not been polled far enough to register
-    // anything yet. `tokio::select!` polls both branches with the REAL task waker — not a
-    // hand-rolled one — so the reactor registration and wake-up are exactly what any other
-    // caller of this future gets, not a synthetic substitute this test would have to trust on
-    // faith. `armed_rx` is unused past the handshake, kept only so the channel doesn't fill;
-    // this test does not need to synchronize on it separately; the future's own first poll,
-    // inside `select!` below, is what arms it.
+    // Drive `wait_tree_drained` with no clock anywhere in this check: a seam (`declined`)
+    // reports every time the watch loop sees a GENUINE, interpreted non-EOF event and still
+    // does not resolve — never a spurious wakeup with nothing pending at all, which
+    // `interpret_read_event` never even ran against (see `DrainOutcome`'s own doc in
+    // `marker_eof.rs`) — the exact "saw readiness, declined to drain" edge that proves the race
+    // below has genuinely reached and passed judgment on a real event. `tokio::select!` polls
+    // both branches with the REAL task waker — not a hand-rolled one — so the reactor
+    // registration and wake-up are exactly what any other caller of this future gets, not a
+    // synthetic substitute this test would have to trust on faith. `armed_rx` is unused past
+    // the handshake, kept only so the channel doesn't fill; this test does not need to
+    // synchronize on it separately; the future's own first poll, inside `select!` below, is
+    // what arms it.
     let (armed_tx, _armed_rx) = std::sync::mpsc::channel();
     let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
     let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(
@@ -783,14 +710,14 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     ::tokio::select! {
         biased;
         res = &mut fut => panic!(
-            "a writer proven past the low-water clamp resolved the wait anyway — \
+            "a pipe proven at its low-water clamp resolved the wait anyway — \
              it must never be drained: {res:?}"
         ),
         _ = declined_rx.recv() => {} // provably saw the real readiness edge and declined to drain on it
     }
     // Catches a mutant that drained SOME bytes before declining — a bare "never resolved" cannot
     // tell that apart from the correct, fully-unbounded, never-drains behavior.
-    let queued_after = fionread(fd.as_raw_fd());
+    let queued_after = fionread(fd);
     assert_eq!(
         queued_after, queued_before,
         "the marker pipe's buffered byte count changed across the clock-free wait — \
@@ -799,14 +726,11 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     assert_eq!(
         child.try_wait().expect("try_wait"),
         None,
-        "the writer must still be blocked in its own write(), not exited"
+        "the holder must still be alive, not exited"
     );
 
-    // SAFETY: `pgid` is this same child's own process-group leader pid, set at spawn above.
-    assert_eq!(
-        unsafe { libc::killpg(pgid, libc::SIGKILL) },
-        0,
-        "kill the writer's whole group"
-    );
-    child.wait().expect("reap the shell");
+    // A single child, killed through the `Child` handle cosca returned, before that handle
+    // reaps it — `docs/principles.md` §10's own exemption.
+    child.kill().expect("kill the holder");
+    child.wait().expect("reap");
 }
