@@ -75,18 +75,16 @@ fn posix_child_self_detects_elevation() {
 #[cfg(all(target_os = "linux", feature = "pty"))]
 #[test]
 fn controlling_terminal_probe_consults_ctty_not_stdin() {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, OwnedFd};
 
-    fn is_cloexec(fd: &impl AsRawFd) -> bool {
-        // SAFETY: F_GETFD only reads the descriptor's flags.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(flags, -1, "F_GETFD failed");
+    fn is_cloexec(fd: &impl AsFd) -> bool {
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD failed");
         flags & libc::FD_CLOEXEC != 0
     }
 
-    // A real pty pair, opened close-on-exec: unlike `openpty` (used until this test was
-    // fixed — its fds always lack CLOEXEC), `posix_openpt`/the slave `open` both take an
-    // explicit O_CLOEXEC. This binary runs tests on parallel threads, so a child spawned
+    // A real pty pair, opened close-on-exec: `openpty` gives no way to request CLOEXEC, so
+    // `posix_openpt`/the slave `open` are used instead, both with an explicit O_CLOEXEC.
+    // This binary runs tests on parallel threads, so a child spawned
     // concurrently by another test must not inherit either end: a stray master keeps this
     // pty's read side open past this test, and a stray slave keeps a spurious
     // controlling-terminal candidate alive. Keep the master alive for the child's session
@@ -118,7 +116,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
     c.fd(3, cosca::Stdio::from_file(slave_file)).unwrap();
     let mut ch = c.spawn().expect("spawn");
     let out = ch.communicate(None).expect("communicate");
-    let _ = master.as_raw_fd(); // keep master owned until here
+    let _ = &master; // keep master owned until here
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "1",
