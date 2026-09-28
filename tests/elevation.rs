@@ -75,35 +75,35 @@ fn posix_child_self_detects_elevation() {
 #[cfg(all(target_os = "linux", feature = "pty"))]
 #[test]
 fn controlling_terminal_probe_consults_ctty_not_stdin() {
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
     fn is_cloexec(fd: &impl AsFd) -> bool {
         let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD failed");
         flags & libc::FD_CLOEXEC != 0
     }
 
-    // A real pty pair, opened close-on-exec: `openpty` gives no way to request CLOEXEC, so
-    // `posix_openpt`/the slave `open` are used instead, both with an explicit O_CLOEXEC.
-    // This binary runs tests on parallel threads, so a child spawned
-    // concurrently by another test must not inherit either end: a stray master keeps this
-    // pty's read side open past this test, and a stray slave keeps a spurious
-    // controlling-terminal candidate alive. Keep the master alive for the child's session
-    // lifetime.
+    // A real pty pair, close-on-exec: tests run on parallel threads, and a child spawned by another
+    // test must not inherit either end. Keep the master alive for the child's session lifetime.
     let master =
         nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC)
             .expect("posix_openpt");
     nix::pty::grantpt(&master).expect("grantpt");
     nix::pty::unlockpt(&master).expect("unlockpt");
-    let slave_name = nix::pty::ptsname_r(&master).expect("ptsname_r");
-    let slave: OwnedFd = nix::fcntl::open(
-        slave_name.as_str(),
-        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC,
-        nix::sys::stat::Mode::empty(),
-    )
-    .expect("open pty slave");
     let master: OwnedFd = master.into();
-    assert!(is_cloexec(&master), "pty master fd must be close-on-exec");
-    assert!(is_cloexec(&slave), "pty slave fd must be close-on-exec");
+    // TIOCGPTPEER takes the slave from the master fd, not a devpts path lookup (ptsname + open):
+    // a path can resolve to the wrong devpts instance in a mount namespace (Linux 4.13+).
+    let raw = unsafe {
+        libc::ioctl(
+            master.as_raw_fd(),
+            libc::TIOCGPTPEER,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    assert!(raw >= 0, "TIOCGPTPEER: {}", std::io::Error::last_os_error());
+    // SAFETY: TIOCGPTPEER returned a fresh, owned descriptor above.
+    let slave: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+    assert!(is_cloexec(&master));
+    assert!(is_cloexec(&slave));
     let slave_file = std::fs::File::from(slave);
 
     let exe = testbin();
@@ -116,7 +116,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
     c.fd(3, cosca::Stdio::from_file(slave_file)).unwrap();
     let mut ch = c.spawn().expect("spawn");
     let out = ch.communicate(None).expect("communicate");
-    let _ = &master; // keep master owned until here
+    let _ = &master;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "1",
