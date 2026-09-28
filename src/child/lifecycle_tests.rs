@@ -31,10 +31,10 @@ fn quick_contained_child() -> crate::Child {
 
 /// A contained child that blocks reading from a piped stdin this function's caller holds open —
 /// never via a chosen sleep duration, for the deadline-not-met case. `cat`/`findstr x` unblock
-/// only on EOF (the pipe dropped) or a real kill, so `MembersRemain` cannot pass vacuously just
-/// because a fixed-duration sleep hadn't finished yet. Returns the child AND its stdin writer:
-/// the caller MUST keep the writer alive for exactly as long as it needs the child to stay
-/// running.
+/// only on EOF (the pipe dropped) or a real kill, so the `MembersRemain` assertion below cannot
+/// spuriously fail just because a fixed-duration sleep happened to finish before the check ran.
+/// Returns the child AND its stdin writer: the caller MUST keep the writer alive for exactly as
+/// long as it needs the child to stay running.
 fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();
     #[cfg(unix)]

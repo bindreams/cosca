@@ -11,8 +11,8 @@ use crate::identity::ProcessId;
 
 // A long-lived std child (leak-proof: killed + reaped by each test), blocked reading its own
 // piped stdin — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF or a
-// real kill, so an `is_alive()`/exit-state check taken before either of those cannot pass
-// vacuously just because a fixed-duration sleep hadn't finished yet.
+// real kill, so an `is_alive()`/exit-state check taken before either of those cannot spuriously
+// fail just because a fixed-duration sleep happened to finish before the check ran.
 //
 // **`std::process::Child::wait()` itself closes the piped stdin before it waits** — not just an
 // explicit `.take()`/`drop()` (verified: a bare `child.wait()` with nothing else touching stdin
