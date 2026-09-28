@@ -671,10 +671,20 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
         ),
         "got {err:?}"
     );
+    // The leaf path, not the generic message text, is the marker: it is unique to this test's
+    // own `tempfile::tempdir()`, so a concurrently running sibling test (e.g. the async twin,
+    // which logs the identical generic text) cannot be miscounted as this test's own record.
+    let marker = leaf_path.join("cgroup.kill").display().to_string();
+    let records = crate::log_capture::records_since(mark, &marker);
     assert_eq!(
-        crate::log_capture::levels_since(mark, "tree teardown could not complete"),
+        crate::log_capture::levels_since(mark, &marker),
         [log::Level::Warn],
-        "a forced tree-kill failure must be logged at warn, naming what failed"
+        "a forced tree-kill failure must be logged at warn, naming what failed, got {records:?}"
+    );
+    let errno_text = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+    assert!(
+        records.iter().any(|r| r.contains(&errno_text)),
+        "the warning must name the OS reason the write failed, got {records:?}"
     );
 }
 

@@ -530,7 +530,9 @@ impl CgroupLeaf {
             }
             Err(e) => {
                 self.kill_attempt_failed.store(true, Ordering::Relaxed);
-                Err(crate::error::Error::Io(e))
+                Err(crate::error::Error::Containment {
+                    detail: format!("{} could not be written ({e})", path.display()),
+                })
             }
         }
     }
