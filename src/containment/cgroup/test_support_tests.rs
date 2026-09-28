@@ -110,10 +110,15 @@ fn drop_reports_a_kill_failure_without_blocking() {
     let probe = rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty()).expect("open a probe pidfd");
 
     crate::containment::cgroup::fault::set_force_kill_on_drop_kill_failure(true);
-    // Not already unwinding, so the failure's contract (`debug_assert!`) fires: this must panic,
-    // not silently pass.
+    // Not already unwinding, so the failure's contract (`debug_assert!`) fires — but only where
+    // debug_assertions are compiled in: CI's release lane runs this same test with them off,
+    // where the calm (non-panicking, still-reported) arm is the one under test instead.
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
-    assert!(unwound.is_err(), "a failed kill must still assert its contract");
+    assert_eq!(
+        unwound.is_err(),
+        cfg!(debug_assertions),
+        "a failed kill should panic on its asserted contract only with debug_assertions on"
+    );
     assert!(
         !crate::containment::cgroup::fault::take_force_kill_on_drop_kill_failure(),
         "the fault must be consumed by the failed kill"
