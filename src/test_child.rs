@@ -249,11 +249,14 @@ pub(crate) fn run_fixture(fixture: &str) {
     {
         // The whole open-to-spawn window is under `spawn_lock()`, not just the spawn: `fd` is
         // opened `O_CLOEXEC` (so an ordinary `fork`+`exec` anywhere else in this process never
-        // inherits it), but a BARE `fork()` from another concurrently running test — this test
-        // binary does that elsewhere for process-group tests — copies the whole fd table
-        // regardless of `O_CLOEXEC`, which only takes effect at `exec`. Serializing against every
-        // other cosca-originated fork in this binary (the same lock they all use) closes that
-        // window too, not just the exec-time one `O_CLOEXEC` alone would cover.
+        // inherits it), but a BARE `fork()` from another concurrently running test — cosca's own
+        // cgroup test support, `fork_running` in `containment/cgroup/test_support.rs`, does that —
+        // copies the whole fd table regardless of `O_CLOEXEC`, which only takes effect at `exec`.
+        // Serializing against every OTHER cosca-originated fork that ALSO takes `spawn_lock()`
+        // closes the window against those. It does NOT close it against `fork_running` itself:
+        // that helper does not take `spawn_lock()` today, so a cgroup test's own bare fork can
+        // still race this window. Making `fork_running` take it too belongs to
+        // `test_support.rs`, owned by a separate PR stack — not fixed here.
         let child = {
             let _guard = crate::child::spawn::spawn_lock();
             let fd = open_scratch_fd(scratch.path());
@@ -308,10 +311,13 @@ pub(crate) fn run_fixture(fixture: &str) {
                 );
             }
             // `current_exe()`'s own path is not necessarily reachable by the dropped identity
-            // either — measured under `sudo` on macOS CI, where it resolves under the invoking
-            // user's own `$HOME`, `chmod 0750`. Copying it to a directory this driver creates and
-            // chmods itself, directly under `/tmp`, is what #204's own root-precondition tests do
-            // for the identical reason; see `copy_exe_to_traversable_scratch`'s doc.
+            // either: under `cargo-nextest --archive-file` (this lane's own mechanism), it resolves
+            // inside nextest's OWN archive-extraction directory — measured on the real macOS root
+            // lane, `/private/tmp/nextest-archive-<...>/...` — which nextest creates and owns
+            // itself, with no guarantee of a mode the post-drop uid can enter. Copying the running
+            // binary to a directory THIS driver creates and chmods itself, directly under `/tmp`,
+            // sidesteps trusting nextest's own directory shape at all; see
+            // `copy_exe_to_traversable_scratch`'s doc.
             let (dir, exe) = copy_exe_to_traversable_scratch();
             let mut root_cmd = std::process::Command::new(&exe);
             configure_fixture_command(&mut root_cmd, fixture);
@@ -412,75 +418,97 @@ pub(crate) const FIXTURE_SCRATCH_ROOT_ENV: &str = "COSCA_FIXTURE_SCRATCH_ROOT";
 /// one case an already-successful `tempfile::tempdir()` call does NOT already prove the ambient
 /// `TMPDIR` usable post-drop, since an unprivileged driver's own uid never changes, so ITS
 /// successful call already is that proof.
-///
-/// Checks EVERY ancestor of `TMPDIR`, not just `TMPDIR` itself: a path lookup needs search
-/// permission on each directory component it walks through, so a `TMPDIR` that is itself wide
-/// open but sits under, say, a `chmod 0750` home directory is just as unreachable as a `TMPDIR`
-/// that is `chmod 0700` directly. Measured under `sudo` on a real macOS runner: `TMPDIR` itself is
-/// usually fine, but `std::env::current_exe()`'s own path resolves under the invoking user's
-/// `$HOME` (also checked — see [`run_fixture`]'s `copy_exe_to_traversable_scratch` call), whose
-/// default mode denies every other uid outright.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn assert_dropped_identity_can_traverse_tmpdir() {
     let tmpdir = std::env::temp_dir();
-    let uid = crate::test_privilege::UNPRIVILEGED;
-    if let Err(e) = check_path_traversable_by(&tmpdir, uid, uid) {
+    if let Err(e) = check_path_traversable_by(&tmpdir) {
         panic!("{e}");
     }
 }
 
-/// The pure check [`assert_dropped_identity_can_traverse_tmpdir`] panics on — split out so the
-/// logic is checkable against an arbitrary path and uid/gid, not just this process's real
-/// `TMPDIR` and [`crate::test_privilege::UNPRIVILEGED`]. Also used by
-/// [`copy_exe_to_traversable_scratch`] to confirm its OWN construction is actually reachable,
-/// rather than trusting that constructing it correctly is enough.
+/// Whether [`crate::test_privilege::UNPRIVILEGED`] can actually reach `path` on disk. Forks, drops
+/// the CHILD to that uid/gid when this process is root — a no-op otherwise, mirroring
+/// [`crate::test_privilege::drop_root_uid`]'s own "nothing to drop" case, so this call never fails
+/// to drop; there is simply nothing to drop when the caller is not root — and `open`s `path`
+/// there, asking the kernel directly rather than modelling its permission rules by hand.
 ///
-/// Walks every ancestor of `path`, root first, checking each one for SEARCH (execute) permission
-/// by `(uid, gid)` — owner bits if `uid` matches that ancestor's own owner, group bits if `gid`
-/// matches its group, else other bits. `path` itself is checked the same way if it is a directory
-/// (the final `TMPDIR` component itself must also grant entry), or for READ+EXECUTE if it is a
-/// regular file (an exec target's ancestors need search permission, but the file itself needs to
-/// be openable and executable, which search permission alone does not grant).
+/// **Act and fail, don't model.** An earlier version walked every ancestor's own mode/owner/group
+/// bits in Rust. That missed a symlink resolved along the way: it checked the SYMLINK's own
+/// (conventionally always-permissive) mode rather than its target's, since the kernel always
+/// follows a symlink at an intermediate path component with no way to opt out (unlike the final
+/// component's `O_NOFOLLOW`) — see `a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled` in
+/// `test_child_tests.rs` for the reviewer's repro shape (`/tmp/base/link` -> `/tmp/base/real/inner`,
+/// `real` at `0700`). A hand-rolled model also has no way to know about any OTHER kernel-side rule
+/// (ACLs, mount options, a MAC policy). Letting the kernel itself resolve `path` end to end, under
+/// the real dropped identity, cannot be wrong about anything a model could miss.
+///
+/// `open`, not `stat`: `stat` only requires SEARCH permission on `path`'s ANCESTORS, never any
+/// permission on `path` itself — which would silently pass the exact bug this precondition exists
+/// to catch (a `TMPDIR` that is ITSELF `chmod 0700`, with perfectly traversable ancestors above
+/// it — measured on `resolve_root_lane_macos`'s first real run). `open`'s own permission check on
+/// the final component is what closes that gap.
+///
+/// No `spawn_lock()`: that lock exists to keep another thread's transient, still-open, non-`CLOEXEC`
+/// fd (a script mid-write, an about-to-be-`exec`'d fixture's scratch fd) from being inherited into
+/// a DIFFERENT thread's fork-then-exec child. This fork never execs and opens nothing but `path`
+/// itself `O_RDONLY`, closed automatically at `_exit` — there is no write-fd to race and no
+/// `exec`'d child for an inherited fd to matter to.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn check_path_traversable_by(path: &std::path::Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let mut ancestors: Vec<&std::path::Path> = path.ancestors().collect();
-    ancestors.reverse(); // root first, `path` itself last
-    for (i, component) in ancestors.iter().enumerate() {
-        // `metadata`, not `symlink_metadata`: the kernel ALWAYS follows a symlink at an
-        // intermediate path component during real path resolution (there is no way to opt out of
-        // that, unlike the final component with `O_NOFOLLOW`) — checking the SYMLINK's own mode
-        // instead of its target's would report on the wrong inode. `/tmp` itself is exactly this
-        // on macOS (`-> /private/tmp`); its permissive symlink mode happening to agree with its
-        // target's real one there is coincidence, not something to rely on in general.
-        let meta = std::fs::metadata(component).map_err(|e| format!("stat {component:?}: {e}"))?;
-        let is_leaf_file = i + 1 == ancestors.len() && meta.is_file();
-        let required: u32 = if is_leaf_file { 0o5 } else { 0o1 }; // r+x for a final file, x (search) for a directory
-        let mode = meta.permissions().mode();
-        let granted = if meta.uid() == uid {
-            (mode >> 6) & required == required
-        } else if meta.gid() == gid {
-            (mode >> 3) & required == required
-        } else {
-            mode & required == required
-        };
-        if !granted {
-            let access = if is_leaf_file { "read+execute" } else { "search" };
-            return Err(format!(
-                "precondition: {component:?} (mode {mode:o}, owner uid {}, gid {}) does not \
-                 grant uid {uid}/gid {gid} the {access} access needed to reach {path:?}",
-                meta.uid(),
-                meta.gid(),
-            ));
+fn check_path_traversable_by(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| format!("{path:?} has an interior NUL"))?;
+
+    // SAFETY: a plain `fork()` from this (multithreaded) test binary. The child below touches no
+    // shared mutable state the fork could have raced (`c_path` is read-only and already fully
+    // built) and takes no lock another thread might be holding across the fork, because it never
+    // allocates — every call past this point is a raw, async-signal-safe libc syscall — and it
+    // always terminates via `_exit`, never by returning into this stack frame or running Rust's
+    // normal shutdown path (which would rerun the PARENT's own destructors a second time).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        // SAFETY: async-signal-safe libc calls only, in the freshly forked child, before it
+        // `_exit`s — no allocation, no Rust panic/unwind machinery.
+        unsafe {
+            if libc::geteuid() == 0 {
+                let uid = crate::test_privilege::UNPRIVILEGED;
+                if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(uid) != 0 || libc::setuid(uid) != 0 {
+                    libc::_exit(126); // distinct from any real errno below
+                }
+            }
+            if libc::open(c_path.as_ptr(), libc::O_RDONLY) >= 0 {
+                libc::_exit(0);
+            }
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(125);
+            libc::_exit(errno.clamp(1, 125));
         }
     }
-    Ok(())
+    let mut status: libc::c_int = 0;
+    // SAFETY: `pid` is this call's own freshly forked child, reaped exactly once, here.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return Err(format!("waitpid: {}", std::io::Error::last_os_error()));
+    }
+    if !libc::WIFEXITED(status) {
+        return Err(format!(
+            "check-traversal child for {path:?} did not exit normally (raw status {status:#x})"
+        ));
+    }
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        126 => Err(format!(
+            "check-traversal child for {path:?} could not drop to UNPRIVILEGED even though the parent is root"
+        )),
+        code => Err(format!("{path:?}: {}", std::io::Error::from_raw_os_error(code))),
+    }
 }
 
 /// A directory this driver creates and `chmod`s itself, directly under `/tmp` — the one path
 /// every platform this crate targets guarantees world-traversable regardless of the invoking
-/// user's own `$HOME` or `$TMPDIR`, matching #204's own root-precondition tests, which hit the
-/// identical problem for the identical reason. Holds a COPY of this test binary, `chmod`'d
+/// user's own `$HOME`, `$TMPDIR`, or (per `run_fixture`'s own doc) `cargo-nextest`'s own
+/// archive-extraction directory. Holds a COPY of this test binary, `chmod`'d
 /// world-readable+executable, for a root driver to re-exec the fixture from instead of
 /// `std::env::current_exe()`'s own (possibly unreachable post-drop) path.
 ///
@@ -500,8 +528,7 @@ fn copy_exe_to_traversable_scratch() -> (tempfile::TempDir, std::path::PathBuf) 
     std::fs::copy(&src, &dest).expect("copy the test binary into the traversable scratch dir");
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
         .expect("chmod the exe copy world-readable+executable");
-    let uid = crate::test_privilege::UNPRIVILEGED;
-    if let Err(e) = check_path_traversable_by(&dest, uid, uid) {
+    if let Err(e) = check_path_traversable_by(&dest) {
         panic!("copied fixture exe is still not traversable by the post-drop identity: {e}");
     }
     (dir, dest)
