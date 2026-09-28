@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "libc::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently by other tests can inherit them and see delayed EOFs (#216); use std::io::pipe() (sets close-on-exec on both ends), or on Unix pipe2(O_CLOEXEC) where a raw pipe is required" },
+]
