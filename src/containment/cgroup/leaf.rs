@@ -534,12 +534,28 @@ impl CgroupLeaf {
                 DrainStep::Block {
                     listener,
                     deadline: None,
-                } => listener.wait(),
+                } => {
+                    listener.wait();
+                    // No deadline to arm: this only ever returns because it was woken.
+                    #[cfg(test)]
+                    fault::notify_wait_site_park(fault::WaitSitePark {
+                        deadline: None,
+                        woken: true,
+                    });
+                }
                 // A timeout is looked at by the next step, which reads the leaf once more.
                 DrainStep::Block {
                     listener,
                     deadline: Some(at),
-                } => drop(listener.wait_deadline(at)),
+                } => {
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let woken = listener.wait_deadline(at).is_some();
+                    #[cfg(test)]
+                    fault::notify_wait_site_park(fault::WaitSitePark {
+                        deadline: Some(at),
+                        woken,
+                    });
+                }
             }
         }
     }
@@ -560,6 +576,8 @@ impl CgroupLeaf {
             return Ok(DrainStep::Done(drain));
         }
         if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+            #[cfg(test)]
+            fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         let listener = self.watch.listen().map_err(crate::error::Error::Io)?;

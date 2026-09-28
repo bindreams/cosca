@@ -24,6 +24,8 @@ thread_local! {
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitSitePark>>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -97,6 +99,76 @@ pub(crate) fn notify_drain_blocking() {
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
             let _ = notify.send(());
+        }
+    });
+}
+
+/// Send on `notify` each time a leaf's drain step on this thread takes its zero-remaining
+/// shortcut — answers `MembersRemain` from a step that arms no listener. Kept until
+/// [`take_drain_zero_remaining_notifier`].
+pub(crate) fn set_drain_zero_remaining_notifier(notify: std::sync::mpsc::Sender<()>) {
+    DRAIN_ZERO_REMAINING.with(|d| *d.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_drain_zero_remaining_notifier() {
+    DRAIN_ZERO_REMAINING.with(|d| d.borrow_mut().take());
+}
+pub(crate) fn notify_drain_zero_remaining() {
+    DRAIN_ZERO_REMAINING.with(|d| {
+        if let Some(notify) = d.borrow().as_ref() {
+            let _ = notify.send(());
+        }
+    });
+}
+
+/// The instant `wait_drained`'s own `Block` arm actually armed a bounded park with — `None` for
+/// an unbounded one, which has no instant to arm. Carries the armed value itself, not merely
+/// whether one existed, so a test can assert it against the caller's own deadline exactly: a
+/// primitive armed with the wrong instant is a structural defect, not a timing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WaitSitePark {
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) woken: bool,
+}
+
+/// Send on `notify` each time `wait_drained`'s own `Block` arm makes a real park on the leaf
+/// watcher's `event_listener` — proof of the actual wait, not merely that `drain_step` armed a
+/// listener for one. Kept until [`take_wait_site_park_notifier`].
+pub(crate) fn set_wait_site_park_notifier(notify: std::sync::mpsc::Sender<WaitSitePark>) {
+    WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_wait_site_park_notifier() {
+    WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
+}
+pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
+    WAIT_SITE_PARK.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            let _ = notify.send(park);
+        }
+    });
+}
+
+/// The instant the tokio twin (`cgroup_wait_tree_drained`) actually armed a bounded park with —
+/// `None` for an unbounded one. Same shape and purpose as [`WaitSitePark`], for the async wait
+/// site `timeout_at` runs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokioWaitSitePark {
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+thread_local! {
+    static TOKIO_WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<TokioWaitSitePark>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_tokio_wait_site_park_notifier(notify: std::sync::mpsc::Sender<TokioWaitSitePark>) {
+    TOKIO_WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_tokio_wait_site_park_notifier() {
+    TOKIO_WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
+}
+pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
+    TOKIO_WAIT_SITE_PARK.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            let _ = notify.send(park);
         }
     });
 }

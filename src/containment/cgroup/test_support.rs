@@ -330,6 +330,24 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
     }
 }
 
+/// A real, long-lived child placed in a leaf, guarded so a panic anywhere after it spawns cannot
+/// leak the process (or, transitively, the leaf its `Drop` may wait to remove): `Drop` kills and
+/// reaps it. Declare it after the leaf it's placed in, so it drops — and its process is gone —
+/// before the leaf itself tries to.
+#[cfg(target_os = "linux")]
+pub(crate) struct Member(
+    pub(crate) std::process::Child,
+    #[allow(dead_code)] pub(crate) std::process::ChildStdin,
+);
+
+#[cfg(target_os = "linux")]
+impl Drop for Member {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
 mod test_support_tests;

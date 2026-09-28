@@ -120,17 +120,20 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
-/// full mechanism: the read-before-arm check, the `wait_deadline` block-then-timeout path (a
-/// bounded deadline, not `Duration::ZERO`, so the call actually reaches it), and the real kernel
-/// `populated` 1→0 transition once both members are gone.
+/// full mechanism: a real park on the leaf watcher's `event_listener`, proven at the actual wait
+/// site — `wait_drained`'s own `Block` arm (`fault::set_wait_site_park_notifier`), not merely that
+/// `drain_step` reached some intermediate state — and the real kernel `populated` 1→0 transition
+/// once both members are gone.
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::Member;
+    use crate::containment::TreeDrain;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
-
-    use crate::containment::TreeDrain;
 
     if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
         // Unprovisioned: not a CI-cgroup environment — true no-op, never a false "ok".
@@ -146,13 +149,18 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 
     // Each member reports through its OWN channel. The leaf's channel carries one report for the whole
     // leaf (see `ReportChannel`), so two members sharing it would read as whichever wrote first.
+    //
+    // Each member is `cat` reading from a pipe this test holds open and never writes to or closes
+    // until it explicitly kills the member (below): no fixed lifetime of its own, so the "still
+    // alive" assertions below cannot accidentally hold just because a member happened to still be
+    // within some timer.
     let spawn_member = |leaf: &crate::containment::cgroup::CgroupLeaf,
                         channel: &crate::containment::cgroup::ReportChannel|
-     -> std::process::Child {
+     -> Member {
         let procs_fd = leaf.procs_fd();
         let slot = channel.slot();
-        let mut cmd = Command::new("sleep");
-        cmd.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
         // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
         // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
@@ -162,7 +170,9 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         unsafe {
             cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
         }
-        cmd.spawn().expect("spawn a real long-lived cgroup leaf member")
+        let mut child = cmd.spawn().expect("spawn a real long-lived cgroup leaf member");
+        let stdin = child.stdin.take().expect("cat's stdin must be piped");
+        Member(child, stdin)
     };
 
     let channel_a = crate::containment::cgroup::ReportChannel::new().expect("open member a's report channel");
@@ -170,36 +180,128 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     let mut a = spawn_member(&leaf, &channel_a);
     let mut b = spawn_member(&leaf, &channel_b);
 
-    // A real bounded wait with both members alive: must report MembersRemain. The 250ms bound
-    // is not a synchronization guess — it is the deadline `wait_drained` itself blocks on via a
-    // real `wait_deadline` call (never expiring early, since neither member exits during it), so
-    // this doubles as the settling time for the two `pre_exec` writes above before the
-    // membership checks below.
-    let bounded = || Some(Some(Instant::now() + Duration::from_millis(250)));
-    assert_eq!(
-        leaf.wait_drained(bounded())
-            .expect("wait_drained with two live members"),
-        TreeDrain::MembersRemain,
-        "both members are alive; must report MembersRemain"
-    );
-    let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
+    // Placement, proven through a real signal — not implied by `spawn()`'s return. Per
+    // `ReportChannel`'s own module doc ("When the report is final"), `spawn` returns once std's
+    // own CLOEXEC channel reads EOF, which can happen before the child's `pre_exec` even runs if
+    // two of this process's fds 0, 1 and 2 are already closed, letting std's own channel land in
+    // one of those slots for this test's `Stdio::null()`/`Stdio::piped()` `dup2` to close early —
+    // it only avoids that here because this process's fds 0-2 are open. The report
+    // `ReportChannel::wait` waits for, by contrast, is sent only after
+    // `place_self_in_cgroup_pre_exec`'s `cgroup.procs` write itself returns, so `Placed` here is
+    // real proof both members are already in the leaf — checked, for both members, before
+    // `cgroup.procs` is read below, and before either bounded `wait_drained` call relies on it.
     for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
-        assert!(
-            procs.lines().any(|line| line.trim() == member.id().to_string()),
-            "member {name} must actually be placed in the leaf; cgroup.procs is {procs:?}"
-        );
         assert_eq!(
-            channel.wait(member.id()).expect("open a pidfd"),
+            channel.wait(member.0.id()).expect("open a pidfd"),
             PlacementReport::Placed,
             "member {name}'s own report must survive the other member's spawn"
         );
     }
+    let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
+    for (name, member) in [("a", &a), ("b", &b)] {
+        assert!(
+            procs.lines().any(|line| line.trim() == member.0.id().to_string()),
+            "member {name} must actually be placed in the leaf; cgroup.procs is {procs:?}"
+        );
+    }
+
+    // A bounded call concludes exactly once through the zero-remaining shortcut: that is the
+    // only path that answers `MembersRemain`, and it never fires before the caller's own
+    // deadline (never early), though nothing here bounds how much later the wake actually runs
+    // (no upper bound on scheduler lateness). Each time `drain_step` announced it was about to
+    // block, a real park at the wait site (`fault::set_wait_site_park_notifier`) must follow, so
+    // the two counts must match. At most one park can genuinely time out — `event_listener`
+    // 5.4.2's `wait_with_parker` reports "not woken" only at or after its deadline — and once
+    // that happens, `drain_step`'s very next entry finds the deadline already spent and
+    // concludes without parking again, so a timed-out park, if any, must be the last one. An
+    // earlier park CAN be `woken: true` on a real cgroup — the kernel's own `cgroup.events`
+    // writes are not guaranteed to imply a membership change. Zero parks is legitimate too: if
+    // enough real time passes before `drain_step`'s own first check, it takes the zero-remaining
+    // shortcut without ever arming a listener — this never happened in practice across the runs
+    // that shaped this test, but nothing here rules it out for correct code, so the assertions
+    // below do not require at least one park.
+    fn assert_bounded_conclusion(
+        parks: &[fault::WaitSitePark],
+        blocks: usize,
+        zero_remainings: usize,
+        expected_deadline: Instant,
+    ) {
+        assert_eq!(
+            zero_remainings, 1,
+            "a bounded call that finds a member still alive must conclude exactly once through \
+             the zero-remaining shortcut, got {zero_remainings}"
+        );
+        assert_eq!(
+            blocks,
+            parks.len(),
+            "drain_step announced blocking {blocks} times, but {} real parks were seen at the \
+             wait site — every announced block must be a real park",
+            parks.len()
+        );
+        // Structural, not timing: every park must be armed with the caller's own deadline
+        // instant exactly. A mutant that arms `wait_deadline`/`timeout_at` with some other
+        // instant (e.g. `at + 50ms`) cannot be told apart from correct code by elapsed time
+        // alone — elapsed time can only prove "not early", never "armed with the right instant".
+        assert!(
+            parks.iter().all(|p| p.deadline == Some(expected_deadline)),
+            "every park in a bounded call must be armed with the caller's own deadline instant \
+             ({expected_deadline:?}) exactly, got {parks:?}"
+        );
+        let timed_out = parks.iter().filter(|p| !p.woken).count();
+        assert!(
+            timed_out <= 1,
+            "at most one park can genuinely time out before the call concludes, got {parks:?}"
+        );
+        if let Some(pos) = parks.iter().rposition(|p| !p.woken) {
+            assert_eq!(
+                pos,
+                parks.len() - 1,
+                "a park that timed out must be the last one — nothing starts a further park \
+                 once the deadline it timed out against has already passed, got {parks:?}"
+            );
+        }
+    }
+
+    const BOUND: Duration = Duration::from_millis(250);
+    let wait_drained_through_the_block_step = || {
+        let (park_tx, park_rx) = mpsc::channel();
+        let (block_tx, block_rx) = mpsc::channel();
+        let (zero_tx, zero_rx) = mpsc::channel();
+        fault::set_wait_site_park_notifier(park_tx);
+        fault::set_drain_blocking_notifier(block_tx);
+        fault::set_drain_zero_remaining_notifier(zero_tx);
+        let start = Instant::now();
+        let deadline = start + BOUND;
+        let result = leaf.wait_drained(Some(Some(deadline))).expect("wait_drained");
+        let elapsed = start.elapsed();
+        fault::take_wait_site_park_notifier();
+        fault::take_drain_blocking_notifier();
+        fault::take_drain_zero_remaining_notifier();
+        let parks: Vec<_> = park_rx.try_iter().collect();
+        let blocks = block_rx.try_iter().count();
+        let zero_remainings = zero_rx.try_iter().count();
+        assert_bounded_conclusion(&parks, blocks, zero_remainings, deadline);
+        // Never early: the deadline is the wait's own wake time, so it cannot answer before
+        // `start + BOUND`. No upper bound is asserted — how much later the wake actually runs is
+        // scheduler lateness, which this contract makes no promise about.
+        assert!(
+            elapsed >= BOUND,
+            "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+        );
+        result
+    };
+
+    assert_eq!(
+        wait_drained_through_the_block_step(),
+        TreeDrain::MembersRemain,
+        "both members are alive; must report MembersRemain"
+    );
 
     // One survivor: `populated` never flips (still nonzero), so the verdict must not change.
-    a.kill().expect("kill member a");
-    a.wait().expect("reap member a");
+    a.0.kill().expect("kill member a");
+    a.0.wait().expect("reap member a");
     assert_eq!(
-        leaf.wait_drained(bounded()).expect("wait_drained with one live member"),
+        wait_drained_through_the_block_step(),
         TreeDrain::MembersRemain,
         "one member is still alive; must still report MembersRemain"
     );
@@ -208,12 +310,42 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     // chosen interval — the "external event that might never happen" case the crate's no-sleep-
     // sync rule allows a real wait for. A bug here hangs the test, surfaced by the CI job's own
     // timeout, not a duration this test invented.
-    b.kill().expect("kill member b");
-    b.wait().expect("reap member b");
+    b.0.kill().expect("kill member b");
+    b.0.wait().expect("reap member b");
+    let (park_tx, park_rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::channel();
+    let (zero_tx, zero_rx) = mpsc::channel();
+    fault::set_wait_site_park_notifier(park_tx);
+    fault::set_drain_blocking_notifier(block_tx);
+    fault::set_drain_zero_remaining_notifier(zero_tx);
+    let result = leaf.wait_drained(None).expect("wait_drained once both are gone");
+    fault::take_wait_site_park_notifier();
+    fault::take_drain_blocking_notifier();
+    fault::take_drain_zero_remaining_notifier();
+    let parks: Vec<_> = park_rx.try_iter().collect();
+    let blocks = block_rx.try_iter().count();
+    let zero_remainings = zero_rx.try_iter().count();
     assert_eq!(
-        leaf.wait_drained(None).expect("wait_drained once both are gone"),
+        result,
         TreeDrain::AllMembersExited,
         "both members exited; must report AllMembersExited"
+    );
+    assert_eq!(
+        zero_remainings, 0,
+        "an unbounded call has no deadline to shortcut on, so the zero-remaining seam must never \
+         fire, got {zero_remainings}"
+    );
+    assert_eq!(
+        blocks,
+        parks.len(),
+        "drain_step announced blocking {blocks} times, but {} real parks were seen at the wait \
+         site — every announced block must be a real park",
+        parks.len()
+    );
+    assert!(
+        parks.iter().all(|p| p.deadline.is_none() && p.woken),
+        "every park in an unbounded call is armed with no deadline and can only conclude by \
+         being woken — it has no timeout to elapse, got {parks:?}"
     );
 }
 
