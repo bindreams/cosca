@@ -76,10 +76,36 @@ fn posix_child_self_detects_elevation() {
 #[test]
 fn controlling_terminal_probe_consults_ctty_not_stdin() {
     use std::os::fd::{AsRawFd, OwnedFd};
-    // A real pty pair. Keep the master alive for the child's session lifetime.
-    let pty = nix::pty::openpty(None, None).expect("openpty");
-    let master: OwnedFd = pty.master;
-    let slave: OwnedFd = pty.slave;
+
+    fn is_cloexec(fd: &impl AsRawFd) -> bool {
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "F_GETFD failed");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    // A real pty pair, opened close-on-exec: unlike `openpty` (used until this test was
+    // fixed — its fds always lack CLOEXEC), `posix_openpt`/the slave `open` both take an
+    // explicit O_CLOEXEC. This binary runs tests on parallel threads, so a child spawned
+    // concurrently by another test must not inherit either end: a stray master keeps this
+    // pty's read side open past this test, and a stray slave keeps a spurious
+    // controlling-terminal candidate alive. Keep the master alive for the child's session
+    // lifetime.
+    let master =
+        nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC)
+            .expect("posix_openpt");
+    nix::pty::grantpt(&master).expect("grantpt");
+    nix::pty::unlockpt(&master).expect("unlockpt");
+    let slave_name = nix::pty::ptsname_r(&master).expect("ptsname_r");
+    let slave: OwnedFd = nix::fcntl::open(
+        slave_name.as_str(),
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .expect("open pty slave");
+    let master: OwnedFd = master.into();
+    assert!(is_cloexec(&master), "pty master fd must be close-on-exec");
+    assert!(is_cloexec(&slave), "pty slave fd must be close-on-exec");
     let slave_file = std::fs::File::from(slave);
 
     let exe = testbin();
