@@ -34,18 +34,11 @@ pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     child::spawn::spawn_lock()
 }
 
-// Self-referential alias: `tests/common/isolation.rs` is included from both this crate's own
-// `#[cfg(test)]` unit tests (below, mounted at `crate::test_isolation`) and every integration
-// test binary in `tests/*.rs` (mounted via `tests/common/mod.rs`'s `mod isolation;`). `crate::`
-// means something different at each mount point, so that shared file names this crate's own
-// public API through the crate name `cosca` uniformly; this alias is what makes `cosca::` resolve
-// from inside the crate too.
+/// Test isolation shared with every integration test binary (`tests/common/mod.rs`
+/// `#[path]`-includes this same file) — see its own module doc. Lives under `src/`, not
+/// `tests/`, so `cargo test --lib` still works on the crate as packaged for crates.io (`tests/`
+/// is excluded from the package; a `src/lib.rs` `#[path]` into it would break that build).
 #[cfg(all(unix, test))]
-extern crate self as cosca;
-
-/// The lib's own copy of `tests/common/isolation.rs` — see that file's module doc.
-#[cfg(all(unix, test))]
-#[path = "../tests/common/isolation.rs"]
 pub(crate) mod test_isolation;
 
 mod command;
