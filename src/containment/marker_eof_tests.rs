@@ -516,7 +516,7 @@ async fn async_wait_resolves_when_the_last_member_exits() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     let fd = marker.as_fd();
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
-    let watch = crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx, None);
+    let watch = crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx);
     let end = async move {
         ::tokio::task::spawn_blocking(move || armed_rx.recv().expect("watch armed"))
             .await
@@ -544,8 +544,8 @@ async fn two_concurrent_async_waiters_both_observe_the_drain() {
     let fd = marker.as_fd();
     let (a_armed_tx, a_armed_rx) = std::sync::mpsc::channel();
     let (b_armed_tx, b_armed_rx) = std::sync::mpsc::channel();
-    let a = crate::tokio::wait::wait_tree_drained_for_test(fd, a_armed_tx, None);
-    let b = crate::tokio::wait::wait_tree_drained_for_test(fd, b_armed_tx, None);
+    let a = crate::tokio::wait::wait_tree_drained_for_test(fd, a_armed_tx);
+    let b = crate::tokio::wait::wait_tree_drained_for_test(fd, b_armed_tx);
     let end = async move {
         ::tokio::task::spawn_blocking(move || {
             a_armed_rx.recv().expect("waiter a armed");
@@ -612,20 +612,19 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     child.wait().expect("reap");
 }
 
-/// Fills the marker pipe's write end `w` to the kernel's TRUE capacity, synchronously, in THIS
+/// Fills a marker pipe's write end `w` to the kernel's TRUE capacity, synchronously, in THIS
 /// process — no separate writer process to race, so no growth can ever happen after this
 /// returns. Marks `w` non-blocking and writes until `EAGAIN`, with a first write of 1 MiB
 /// (comfortably past any plausible pipe capacity) so XNU grows the buffer to its maximum inside
-/// that ONE syscall: `head`'s own several-small-writes approach (the earlier version of this
-/// test) let the buffer's growth straddle two writes, which is exactly why a `FIONREAD` reading
-/// taken between them could climb further right after — measured 16384, then 65536. Returns the
-/// `FIONREAD` count once full.
-#[cfg(feature = "tokio")]
-/// `r` is the SAME pipe's read end, used only to query `FIONREAD` — on macOS that ioctl reads 0
-/// on the write end of a pipe regardless of how much is actually buffered (measured: the write
-/// end alone reported 0 right after filling it to capacity), so the byte count must come from
-/// the read end even though nothing here ever reads from it.
-fn fill_pipe_to_capacity(r: &std::io::PipeReader, w: &std::io::PipeWriter) -> i32 {
+/// that ONE syscall: several-small-writes (an earlier version of this helper, via `head`) let
+/// the buffer's growth straddle two writes, which is exactly why a `FIONREAD` reading taken
+/// between them could climb further right after — measured 16384, then 65536. `r` is the SAME
+/// pipe's read end, used only to query `FIONREAD` — on macOS that ioctl reads 0 on the write end
+/// of a pipe regardless of how much is actually buffered (measured: the write end alone reported
+/// 0 right after filling it to capacity), so the byte count must come from the read end even
+/// though nothing here ever reads from it. Returns the `FIONREAD` count once full. Shared by
+/// this module's own tests and by `deadline`'s.
+fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
     let fd = w.as_raw_fd();
     // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
     // well-formed pair on it.
@@ -646,7 +645,45 @@ fn fill_pipe_to_capacity(r: &std::io::PipeReader, w: &std::io::PipeWriter) -> i3
             Err(e) => panic!("write failed: {e}"),
         }
     }
-    fionread(r.as_fd())
+    fionread(r)
+}
+
+/// Whether `kq_fd` — assumed to be a kqueue's own fd, itself pollable — is ALREADY readable,
+/// checked with a zero-timeout `kevent` on a brand-new, separate probe kqueue registered for
+/// `EVFILT_READ` on it. Non-consuming: this touches only the probe kqueue's own queue, never
+/// `kq_fd`'s pending events or registrations.
+#[cfg(feature = "tokio")]
+fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let probe_kq = Kqueue::new().expect("probe kqueue");
+    let change = KEvent::new(
+        kq_fd as usize,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    let add_result = crate::wait::backend::add_with_receipt(&probe_kq, change).expect("register the probe knote");
+    assert_eq!(
+        add_result, 0,
+        "registering EVFILT_READ on the watched kqueue's own fd failed: errno {add_result}"
+    );
+
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    let n = probe_kq
+        .kevent(&[], &mut events, Some(zero))
+        .expect("zero-timeout poll of the probe kqueue");
+    n > 0
 }
 
 #[cfg(feature = "tokio")]
@@ -665,11 +702,9 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // blocked on a stdin the test holds open) — it exists only to hold the write end past
     // `fill_pipe_to_capacity` returning, so the wait below has a live holder to observe. A
     // single child killed through the `Child` handle cosca returned, before that handle reaps
-    // it, is `docs/principles.md` §10's own exemption from the sandbox-only rule — unlike an
-    // earlier version of this test, which piped a `yes | head` pipeline through a process group
-    // it had to `killpg` by a PID it computed itself.
+    // it, is `docs/principles.md` §10's own exemption from the sandbox-only rule.
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
-    let queued_before = fill_pipe_to_capacity(&marker_r, &marker_w);
+    let queued_before = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
     assert!(
         queued_before >= 16384,
         "the pipe must be filled to at least its un-grown 16 KiB capacity, got {queued_before}"
@@ -692,27 +727,56 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
         "the holder already exited before this test could observe it"
     );
 
-    // Drive `wait_tree_drained` with no clock anywhere in this check: a seam (`declined`)
-    // reports every time the watch loop sees a GENUINE, interpreted non-EOF event and still
-    // does not resolve — never a spurious wakeup with nothing pending at all, which
-    // `interpret_read_event` never even ran against (see `DrainOutcome`'s own doc in
-    // `marker_eof.rs`) — the exact "saw readiness, declined to drain" edge that proves the race
-    // below has genuinely reached and passed judgment on a real event. `tokio::select!` polls
+    // Drive `wait_tree_drained` with no clock anywhere in this check. `declined_hook` (a
+    // `#[cfg(test)]` thread-local, installed by its own RAII guard — never a parameter on
+    // `wait_tree_drained_inner`'s production signature) fires every time the watch loop sees a
+    // GENUINE, interpreted non-EOF event and still does not resolve — never a spurious wakeup
+    // with nothing pending at all, which `interpret_read_event` never even ran against (see
+    // `DrainOutcome`'s own doc in `marker_eof.rs`) — the exact "saw readiness, declined to
+    // drain" edge that proves the race below has genuinely reached and passed judgment on a
+    // real event. `#[tokio::test]` defaults to a current-thread runtime, so this thread-local,
+    // set before `fut` is ever polled, is visible from inside that poll. `tokio::select!` polls
     // both branches with the REAL task waker — not a hand-rolled one — so the reactor
     // registration and wake-up are exactly what any other caller of this future gets, not a
-    // synthetic substitute this test would have to trust on faith. `armed_tx` exists only
-    // because `wait_tree_drained_for_test`'s signature requires it (other callers, like the
-    // two-concurrent-waiters test above, DO need to synchronize on it); `_armed_rx` is bound and
-    // immediately unused here — `std::sync::mpsc::channel` is unbounded, and the send inside
-    // `wait_tree_drained_inner` discards its own result either way, so this test simply has no
-    // reason to read it.
-    let (armed_tx, _armed_rx) = std::sync::mpsc::channel();
+    // synthetic substitute this test would have to trust on faith.
     let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
-    let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(
-        fd,
-        armed_tx,
-        Some(declined_tx)
-    ));
+    let _declined_guard = crate::tokio::wait::declined_hook::DeclinedGuard::install(declined_tx);
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx));
+
+    // One manual poll, deterministic rather than raced: it runs exactly through `arm` (which
+    // reports the newly armed kqueue's own fd on `armed_tx`, synchronously, before this call
+    // returns) and no further — the very next thing the future does is register with the
+    // reactor and await its readiness, which cannot resolve within THIS SAME poll call, so
+    // `Poll::Pending` is the only outcome a correct implementation can produce here.
+    // `Waker::noop` is fine: nothing schedules a wakeup for this poll, and nothing needs one —
+    // the future is driven again, for real, by the `select!` below.
+    match std::future::Future::poll(
+        fut.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) {
+        std::task::Poll::Pending => {}
+        std::task::Poll::Ready(res) => panic!(
+            "wait_tree_drained_for_test resolved on its very first poll, before this test could \
+             even check the armed knote's own readiness: {res:?}"
+        ),
+    }
+    let armed_kq_fd = armed_rx.recv().expect("watch armed");
+
+    // The pipe was already filled to its clamp (above) BEFORE `arm` ever ran, so a knote armed
+    // correctly (without `EV_DISABLE`) must be immediately ready — checked with a zero-timeout
+    // `kevent` on a separate, freshly created probe kqueue registered for `EVFILT_READ` on the
+    // watched kqueue's own fd (kqueues are themselves pollable). Non-consuming: this touches
+    // only the probe kqueue's own queue, never the real one `fut` owns or its reactor
+    // registration. Catches an `EV_DISABLE`-shaped mutant right here instead of only via the
+    // `.config/nextest.toml` backstop below, which exists solely for the case nothing
+    // in-process can catch: both `select!` arms left pending forever.
+    assert!(
+        kqueue_fd_is_already_readable(armed_kq_fd),
+        "a knote armed without EV_DISABLE on a pipe already at its low-water clamp must be \
+         immediately readable, but the probe kqueue reported it as not-readable"
+    );
+
     ::tokio::select! {
         biased;
         res = &mut fut => panic!(

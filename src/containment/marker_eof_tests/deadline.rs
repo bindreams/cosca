@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
-use super::{fionread, marker_pipe, spawn_marker_holder};
+use super::{fill_pipe_to_capacity, fionread, marker_pipe, spawn_marker_holder};
 use crate::containment::marker_eof::{arm, block_until_drained, drain_test_hooks, interpret_read_event, probe};
 use crate::containment::TreeDrain;
 use crate::wait::backend::test_hooks;
@@ -58,38 +58,6 @@ fn pipe_blksize(fd: BorrowedFd<'_>) -> isize {
     let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
     assert_eq!(rc, 0, "fstat failed: {}", std::io::Error::last_os_error());
     st.st_blksize as isize
-}
-
-/// Fill `w` to the kernel's TRUE capacity, synchronously, in THIS process — no separate writer
-/// process to race. A first write of 1 MiB (comfortably past any plausible pipe capacity)
-/// forces XNU to grow the buffer to its maximum within that ONE syscall: writing in several
-/// smaller chunks can let growth straddle two writes, making a `FIONREAD` taken in between
-/// unstable. Returns the `FIONREAD` count (read via `r`, the SAME pipe's read end — on macOS
-/// `FIONREAD` on a pipe's WRITE end always reads 0) once full.
-fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
-    // SAFETY: `w` is a valid, open descriptor for the whole call; F_GETFL/F_SETFL is a
-    // well-formed pair on it.
-    unsafe {
-        let flags = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
-        assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
-        let rc = libc::fcntl(w.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        assert_eq!(
-            rc,
-            0,
-            "fcntl F_SETFL O_NONBLOCK failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    let buf = vec![0u8; 1 << 20];
-    loop {
-        match nix::unistd::write(w, &buf) {
-            Ok(_) => continue,
-            Err(nix::errno::Errno::EAGAIN) => break,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => panic!("write failed: {e}"),
-        }
-    }
-    fionread(r)
 }
 
 /// Block (real, event-driven, no timer) until `fd` becomes ready again on a FRESH,

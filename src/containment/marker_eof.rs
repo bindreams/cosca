@@ -249,10 +249,11 @@ fn interpret_read_event(
 /// distinct rather than collapsed to `Option<TreeDrain>`: a caller that needs to know whether a
 /// REAL, interpreted event occurred (a test proving a watch loop "saw readiness and declined to
 /// drain", as opposed to a spurious wakeup with nothing pending at all) cannot tell those two
-/// `None`-shaped cases apart otherwise. `probe` (the only production caller of `drain_kqueue`
-/// itself — `block_until_drained` calls `interpret_read_event` directly, through
-/// `wait::backend::block_on_kqueue`) doesn't need the distinction and folds `Declined` and
-/// `Spurious` back together.
+/// `None`-shaped cases apart otherwise. `drain_kqueue` has two production callers: `probe`, which
+/// doesn't need the distinction and folds `Declined` and `Spurious` back together, and
+/// `crate::tokio::wait`'s `wait_tree_drained_inner`, which DOES distinguish them — only
+/// `Declined` fires its `#[cfg(test)]` seam. `block_until_drained` calls `interpret_read_event`
+/// directly, through `wait::backend::block_on_kqueue`, never `drain_kqueue` itself.
 pub(crate) enum DrainOutcome {
     /// `EV_EOF` — a terminal verdict.
     Drained(TreeDrain),
