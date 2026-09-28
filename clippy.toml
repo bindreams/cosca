@@ -1,3 +1,13 @@
+# Every function reachable in this crate's dependency graph that creates a pipe without
+# close-on-exec set. `nix::unistd::pipe` is ungated in nix 0.31.3 and calls `libc::pipe`
+# internally. `rustix::pipe::pipe` is marked `allow-invalid = true`: this crate does not enable
+# rustix's `pipe` feature today, so on the one target that links rustix (Linux) the path is
+# unreachable — confirmed a missing-feature gap, not a typo, by checking rustix's feature list.
+# `allow-invalid` suppresses clippy's "does not refer to a reachable function" warning for exactly
+# that case; a target that never links rustix at all (macOS, Windows) skips the path silently
+# regardless.
 disallowed-methods = [
-    { path = "libc::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently by other tests can inherit them and see delayed EOFs (#216); use std::io::pipe() (sets close-on-exec on both ends), or on Unix pipe2(O_CLOEXEC) where a raw pipe is required" },
+    { path = "libc::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required." },
+    { path = "nix::unistd::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required." },
+    { path = "rustix::pipe::pipe", reason = "fds from libc::pipe lack close-on-exec, so children spawned concurrently can inherit them and delay EOFs (#216). Use std::io::pipe() (close-on-exec on both ends; atomic via pipe2 on Linux/BSDs, pipe()+FD_CLOEXEC on macOS), or pipe2(O_CLOEXEC) where the platform has it and a raw pipe is required.", allow-invalid = true },
 ]
