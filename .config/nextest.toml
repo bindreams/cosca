@@ -78,3 +78,12 @@ slow-timeout = { period = "20s", terminate-after = 1 }
 # local run is bounded the same way CI is.
 filter = 'test(=containment::marker_eof::marker_eof_tests::async_wait_never_drains_past_the_low_water_clamp)'
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# THROWAWAY, PR #215 round-6 CI mutant proof only — never meant to land. The EV_DISABLE mutant
+# introduced alongside this override (also throwaway) disables every knote `arm()` produces, so
+# EVERY other unbounded wait in this module (not just the one test's own override above) would
+# otherwise hang until the darwin job's 15-minute CI timeout. Bounds the whole module instead, so
+# this proof run finishes fast with clearly reported per-test failures.
+filter = 'test(marker_eof_tests)'
+slow-timeout = { period = "20s", terminate-after = 1 }

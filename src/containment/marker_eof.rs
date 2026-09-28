@@ -162,7 +162,11 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
     let change = KEvent::new(
         read_end.as_raw_fd() as usize,
         EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
+        // THROWAWAY MUTANT for PR #215 round-6 CI proof: EV_DISABLE must make the knote never
+        // deliver ANY event, which async_wait_never_drains_past_the_low_water_clamp's own
+        // kqueue-readiness precheck must catch immediately (RED) rather than only via the
+        // nextest slow-timeout backstop. This commit is never meant to land.
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR | EvFlags::EV_DISABLE,
         FilterFlag::NOTE_LOWAT,
         LOW_WATER_MARK,
         0,
