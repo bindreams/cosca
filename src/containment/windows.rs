@@ -786,6 +786,7 @@ pub(crate) fn wait_drained_raw(
     use crate::error::Error;
 
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
+    let hoisted_remaining = crate::wait::remaining(deadline); // MUTANT (hoisted): computed ONCE
     loop {
         // Cancellation is checked BEFORE any work this round, including the very first — a
         // deliberate asymmetry with the deadline check below. Cancellation is a genuine "stop
@@ -918,7 +919,7 @@ pub(crate) fn wait_drained_raw(
         // opened above — the ZERO-probe semantics fall out of the real API rather than a
         // pre-emptive return, so this round's `handles` (real, live members) still get one
         // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
-        let ms: u32 = crate::wait::win32_timeout_ms(remaining);
+        let ms: u32 = crate::wait::win32_timeout_ms(hoisted_remaining); // MUTANT (hoisted)
 
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the

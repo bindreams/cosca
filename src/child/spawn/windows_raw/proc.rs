@@ -101,9 +101,10 @@ impl RawChild {
     /// iteration, rather than trusting a clamped timeout as proof the real deadline passed) —
     /// see docs/principles.md #13 (PR #233, not yet merged).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+        // MUTANT (hoisted): computed ONCE, reused every iteration.
+        let hoisted_remaining = deadline.saturating_duration_since(Instant::now());
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let millis = crate::wait::win32_timeout_ms(Some(remaining));
+            let millis = crate::wait::win32_timeout_ms(Some(hoisted_remaining));
             // SAFETY: `handle` is our live, owned process handle.
             let r = unsafe { WaitForSingleObject(self.handle(), millis) };
             if r == WAIT_OBJECT_0 {

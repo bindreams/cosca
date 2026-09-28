@@ -74,8 +74,9 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
     // every iteration (never hoisted above the loop) and a clamped timeout is rechecked
     // against the real deadline and re-armed rather than trusted — see docs/principles.md #13
     // (PR #233, not yet merged).
+    let hoisted_remaining = crate::wait::remaining(deadline); // MUTANT (hoisted): computed ONCE
     let waited = loop {
-        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
+        let ms = crate::wait::win32_timeout_ms(hoisted_remaining);
         // SAFETY: `handle` is a live process handle held for the wait's duration.
         let w = unsafe { WaitForSingleObject(handle, ms) };
         if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
@@ -194,8 +195,9 @@ pub(crate) fn block_until_exit_or_cancel(
     // the loop) and a clamped timeout is rechecked against the real deadline and re-armed
     // rather than trusted, so a grace longer than the clamp is still honored correctly instead
     // of being silently capped — see docs/principles.md #13 (PR #233, not yet merged).
+    let hoisted_remaining = crate::wait::remaining(deadline); // MUTANT (hoisted): computed ONCE
     let waited = loop {
-        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
+        let ms = crate::wait::win32_timeout_ms(hoisted_remaining);
         // SAFETY: both handles are live for the wait's duration.
         let w = unsafe { WaitForMultipleObjects(&handles, false, ms) };
         if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
