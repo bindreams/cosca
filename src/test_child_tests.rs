@@ -33,16 +33,22 @@ fn fixture_command_removes_rust_test_nocapture_from_its_env() {
 /// ambient `TMPDIR` (or exec path — see [`super::copy_exe_to_traversable_scratch`]) the post-drop
 /// identity could not otherwise reach.
 ///
-/// The function now acts and fails (forks, drops to `UNPRIVILEGED`, `open`s the path, reports the
-/// real errno) rather than modelling permission bits in Rust — see its own doc for why. That
-/// means a REAL denial can only be observed by a process that can actually BECOME a different,
-/// unprivileged identity, which needs root. Both tests below run unconditionally and assert
-/// something true in either environment: as root, the fork really drops to `UNPRIVILEGED` and the
-/// kernel really denies it; as a non-root, already-unprivileged caller, the drop is the
-/// documented no-op (same shape as [`crate::test_privilege::drop_root_uid`]'s own), so the check
-/// runs as the CURRENT identity — which owns the directories these tests build, and so can always
-/// reach them, `0700` or not. Neither branch skips the check; each asserts the outcome that
-/// identity actually produces.
+/// The function now acts and fails (forks, drops to `UNPRIVILEGED`, `access(path, X_OK)`s it,
+/// reports the real errno) rather than modelling permission bits in Rust — see its own doc for
+/// why. That drop only really happens as root: as a non-root, already-unprivileged caller, it
+/// no-ops (same shape as [`crate::test_privilege::drop_root_uid`]'s own), so the check runs as
+/// the CURRENT identity — which owns every directory these tests build.
+///
+/// Most tests below are written to be IDENTITY-INDEPENDENT: their mode is chosen so the owner
+/// class (what a non-root run checks, since the test process owns what it builds) and the other
+/// class (what a root run checks, since `UNPRIVILEGED` is neither the owner nor, after
+/// `setgroups(0, ..)`, in the owning group) agree on the answer — `0o101` and `0o701` both give
+/// the `x` bit to owner AND other, so both are `Ok` either way; `0o404` gives NEITHER class `x`,
+/// so both are `Err` either way. `a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled`
+/// instead sets `real` to `0o000` specifically so NEITHER class has `x` there either — the same
+/// identity-independent trick, applied to the symlink-following regression itself, so the denial
+/// is asserted unconditionally rather than only under a `geteuid() == 0` branch (which no CI lane
+/// exercised: `resolve_root_lane_macos`'s own `-E` filter did not select this module).
 #[cfg(all(unix, not(target_os = "linux")))]
 mod check_path_traversable_by_tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -51,37 +57,70 @@ mod check_path_traversable_by_tests {
         super::super::check_path_traversable_by(path)
     }
 
+    fn chmod(path: &std::path::Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     #[test]
     fn a_reachable_directory_is_ok() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        chmod(dir.path(), 0o755);
         assert!(check(dir.path()).is_ok());
     }
 
-    /// The reviewer's own repro shape: `real` (`0700`) sits behind a symlink, so a check that
-    /// only inspected the symlink's own (conventionally always-permissive) mode — rather than
-    /// letting the kernel resolve through it, as `open` does — would miss the denial entirely.
+    /// `0o101`: owner `--x`, other `--x` — search-only for both classes `check_path_traversable_by`
+    /// can end up testing, identity-independent (see the module doc).
+    #[test]
+    fn search_only_for_owner_and_other_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o101);
+        assert!(check(dir.path()).is_ok());
+    }
+
+    /// `0o404`: owner `r--`, other `r--` — read, but no execute/search bit anywhere. The exact
+    /// shape `open(O_RDONLY)` (this function's earlier, wrong mechanism) would have falsely
+    /// PASSED, and the exact shape a root-owned `0711`/`0701` directory — search-only, no read —
+    /// would have falsely REFUSED under it. `access(path, X_OK)` gets both right; this case pins
+    /// the refusal half.
+    #[test]
+    fn read_only_with_no_execute_bit_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o404);
+        assert!(check(dir.path()).is_err());
+    }
+
+    /// `0o701`: owner `rwx`, other `--x` — restored from the pre-rewrite suite (then testing an
+    /// arbitrary "some other uid" directly against the modelled bits; now identity-independent
+    /// the same way as the two cases above, since owner and other both carry `x`).
+    #[test]
+    fn world_searchable_only_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        chmod(dir.path(), 0o701);
+        assert!(check(dir.path()).is_ok());
+    }
+
+    /// The reviewer's own repro shape: `real` sits behind a symlink, so a check that only
+    /// inspected the symlink's own (conventionally always-permissive) mode — rather than letting
+    /// the kernel resolve through it, as `access` does — would miss the denial entirely. `real` is
+    /// `0o000`, not `0o700`: identity-independent (see the module doc), so this asserts `Err`
+    /// unconditionally, with no `geteuid()` branch — no CI lane exercised the root branch here
+    /// before (`resolve_root_lane_macos`'s `-E` filter selected `resolve_base_tests`/
+    /// `exact_posix_tests` only, never this module), so a version that only checked under
+    /// `geteuid() == 0` was never actually run as root anywhere in CI.
     #[test]
     fn a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled() {
         let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let real = base.path().join("real");
         std::fs::create_dir(&real).unwrap();
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
         let inner = real.join("inner");
         std::fs::create_dir(&inner).unwrap();
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Locked last: creating `inner` under `real` needs the OWNER's own write+execute first —
+        // mode bits bind the owner too, not just other callers.
+        chmod(&real, 0o000);
 
-        let result = check(&link.join("inner"));
-        if unsafe { libc::geteuid() } == 0 {
-            // Root: the fork really becomes UNPRIVILEGED, which does not own `real` — denied.
-            let err = result.unwrap_err();
-            assert!(err.contains("link"), "{err}");
-        } else {
-            // Not root: the drop no-ops, so the check runs as THIS test's own identity — which
-            // owns `real`, and so can always enter its own `0700` directory. Still exercises the
-            // same fork+open path through the symlink, just without an identity that gets denied.
-            assert!(result.is_ok(), "{result:?}");
-        }
+        let err = check(&link.join("inner")).unwrap_err();
+        assert!(err.contains("link"), "{err}");
     }
 }
