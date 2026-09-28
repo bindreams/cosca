@@ -339,12 +339,9 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
 
     const NAME: &str =
         "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
-    const INNER: &str = "COSCA_TEST_FAILED_CLOSED_STDIO_INNER";
-    // Isolates the whole test (this outer call, and the INNER-gated re-exec below, which
-    // inherits `COSCA_TEST_ALONE` and already uses this exact re-exec shape) from the rest of
-    // the suite before it can reach its own real fd 1/2 close, gated by `require_process_per_test`
-    // just above that close below. Without this, `COSCA_TEST_FAILED_CLOSED_STDIO_INNER` alone (a
-    // plain env var, no argv verification) was the only gate on that mutation.
+    // `alone()` already isolates this whole test (and, transitively, `RestoreStdio::close` below,
+    // which reasserts it via `require_process_per_test`) in its own process — a second, INNER
+    // re-exec layer with the same `ALONE_ARGS` shape predates that and is now pure duplication.
     if !crate::test_isolation::alone(NAME) {
         return;
     }
@@ -352,21 +349,6 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    if std::env::var_os(INNER).is_none() {
-        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args(std::iter::once(NAME).chain(crate::test_isolation::ALONE_ARGS))
-            .env(INNER, "1")
-            .output()
-            .expect("run the case");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
 
     let mut file = tempfile::tempfile().expect("tempfile");
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
@@ -402,28 +384,16 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
         };
         seen.set(Some(exited.exit_status()));
     });
-    crate::test_isolation::require_process_per_test("closes process-wide fds 1, 2");
-    // SAFETY: this process's own std slots, closed only across the spawn and restored from copies
-    // above 2 before anything else runs.
-    let saved: Vec<(i32, i32)> = [1, 2]
-        .into_iter()
-        .map(|slot| unsafe { (slot, libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3)) })
-        .collect();
-    for &(slot, _) in &saved {
-        // SAFETY: as above.
-        unsafe { libc::close(slot) };
-    }
+    // Closed only across the spawn, and restored right after: `RestoreStdio::close` asserts
+    // `require_process_per_test`, checks every dup/close/restore result (the hand-rolled version
+    // this replaces left `dup2`'s own result unchecked), and its `Drop` restores even a partial
+    // set if a later fd fails partway through.
+    let restore_stdio = crate::test_isolation::RestoreStdio::close(&[1, 2]);
     // Inherited by the child, which waits on it at its hook; this thread's copy is cleared.
     cgroup_fault::set_hook_gate(gate_read.as_raw_fd());
     let spawned = cmd.spawn();
     let _ = cgroup_fault::take_hook_gate();
-    for &(slot, saved) in &saved {
-        // SAFETY: as above.
-        unsafe {
-            libc::dup2(saved, slot);
-            libc::close(saved);
-        }
-    }
+    drop(restore_stdio);
     // Released whatever happened, before any assert: a child held forever holds this process's
     // stdout, and would hang the outer run.
     gate_write.write_all(b"x").expect("release the child");
