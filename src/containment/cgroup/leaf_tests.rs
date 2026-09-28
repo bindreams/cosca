@@ -1,5 +1,5 @@
 use crate::containment::cgroup::test_support::{block_on, childs_copy, entered_leaf_at, fork_running, reap};
-use crate::containment::cgroup::{LeafError, NotEntered, NotPlaced, PlacementReport};
+use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport};
 
 // removed_after_drain tests -----
 // Linux-only: the function itself is `#[cfg(target_os = "linux")]` (it interprets raw kernel
@@ -37,6 +37,81 @@ fn unrelated_errnos_are_not_removed_after_drain() {
     }
 }
 
+// drain_step's Block carries the caller's own deadline, not a computed duration -----
+// A `FakeLeaf`, no COSCA_TEST_CGROUP needed.
+
+/// `Block` carries the caller's deadline instant unchanged, so the wait can arm against it
+/// directly. Structural: no clock or thread needed.
+#[cfg(target_os = "linux")]
+#[test]
+fn drain_step_block_carries_the_original_deadline_instant() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-drain-step-block-deadline", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    // Disarmed: the fake never drains, so an armed Drop would block forever.
+    leaf.disarm();
+
+    // An hour out: a populated leaf never takes the zero-remaining shortcut.
+    let at = Instant::now() + Duration::from_secs(3600);
+    for (deadline, expected) in [(Some(Some(at)), Some(at)), (Some(None), None), (None, None)] {
+        match leaf.drain_step(deadline).expect("drain_step") {
+            DrainStep::Block { deadline, .. } => {
+                assert_eq!(
+                    deadline, expected,
+                    "Block must carry the caller's deadline instant unchanged"
+                )
+            }
+            DrainStep::Done(_) => {
+                panic!("expected Block for {deadline:?}: a populated fake leaf must not shortcut to Done")
+            }
+        }
+    }
+
+    // Already past: the zero-remaining shortcut, not a `Block` carrying a stale instant.
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    match leaf.drain_step(Some(Some(past))).expect("drain_step") {
+        DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
+        DrainStep::Done(other) => {
+            panic!("expected Done(MembersRemain) for an already-expired deadline, got Done({other:?})")
+        }
+        DrainStep::Block { .. } => {
+            panic!("expected Done(MembersRemain) for an already-expired deadline, got Block")
+        }
+    }
+}
+
+/// `wait_drained`'s bounded arm, driven end to end on a `FakeLeaf` (no cgroup needed): a
+/// populated leaf that never drains must answer `MembersRemain` no earlier than the caller's own
+/// deadline. No upper bound is asserted — only that it never answers early.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_drained_through_wait_deadline_never_answers_early() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::TreeDrain;
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-wait-drained-fakeleaf-bounded", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    const BOUND: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+    let result = leaf.wait_drained(Some(Some(start + BOUND))).expect("wait_drained");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        result,
+        TreeDrain::MembersRemain,
+        "a populated leaf that never drains must report MembersRemain once its deadline passes"
+    );
+    assert!(
+        elapsed >= BOUND,
+        "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+    );
+}
+
 // CgroupLeaf::wait_drained real-mechanism test -----
 // Linux + cgroup-v2 only, and only when CI provisions a delegated leaf (COSCA_TEST_CGROUP=1) —
 // the same gating convention `tests/spawn_io.rs`'s `linux_cgroup_v2_*` tests already use: a true
@@ -45,8 +120,8 @@ fn unrelated_errnos_are_not_removed_after_drain() {
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
-/// full mechanism: the read-before-arm check, the `poll(2)` block-then-timeout path (a bounded
-/// deadline, not `Duration::ZERO`, so the call actually reaches `poll`), and the real kernel
+/// full mechanism: the read-before-arm check, the `wait_deadline` block-then-timeout path (a
+/// bounded deadline, not `Duration::ZERO`, so the call actually reaches it), and the real kernel
 /// `populated` 1→0 transition once both members are gone.
 #[cfg(target_os = "linux")]
 #[test]
@@ -97,9 +172,9 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 
     // A real bounded wait with both members alive: must report MembersRemain. The 250ms bound
     // is not a synchronization guess — it is the deadline `wait_drained` itself blocks on via a
-    // real `poll(2)` call (never expiring early, since neither member exits during it), so this
-    // doubles as the settling time for the two `pre_exec` writes above before the membership
-    // checks below.
+    // real `wait_deadline` call (never expiring early, since neither member exits during it), so
+    // this doubles as the settling time for the two `pre_exec` writes above before the
+    // membership checks below.
     let bounded = || Some(Some(Instant::now() + Duration::from_millis(250)));
     assert_eq!(
         leaf.wait_drained(bounded())

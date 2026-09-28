@@ -88,10 +88,36 @@ pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
 /// Convert a relative `duration` into the crate's `deadline` convention
 /// (`Option<Option<Instant>>`, the inverse of [`remaining`]): `Instant::now() + duration`,
 /// saturating to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on
-/// overflow rather than panicking. Shared by every `_timeout`/`grace`-style call that starts
-/// a fresh relative wait from "now".
+/// overflow rather than panicking. Also saturates when the result lands within a millisecond of
+/// `Instant`'s own ceiling: tokio's timer wheel rounds a deadline up by just under that much
+/// (unchecked) when arming `sleep_until`/`timeout_at`, so a `Block` carrying an instant this
+/// close to the ceiling would panic there instead of waiting. Shared by every `_timeout`/
+/// `grace`-style call that starts a fresh relative wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
-    Some(Instant::now().checked_add(duration))
+    Some(
+        Instant::now()
+            .checked_add(duration)
+            .filter(|at| at.checked_add(Duration::from_millis(1)).is_some()),
+    )
+}
+
+/// The largest `Instant` reachable from `start`, found purely through `checked_add`'s own
+/// overflow signal — no assumption about where a platform's `Instant` ceiling actually is.
+/// Shared by tests (here and in `tokio::wait_tests`) that need an instant genuinely close to
+/// that ceiling, not a platform-specific guess.
+#[cfg(test)]
+pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
+    let mut at = start;
+    let mut step = Duration::from_secs(1 << 62);
+    loop {
+        while let Some(next) = at.checked_add(step) {
+            at = next;
+        }
+        if step <= Duration::from_nanos(1) {
+            return at;
+        }
+        step /= 2;
+    }
 }
 
 #[cfg(test)]
