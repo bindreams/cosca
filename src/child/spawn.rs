@@ -96,6 +96,9 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         return Ok(child);
     };
     let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
+    if let Some(Err(e)) = &tree {
+        log::warn!("a failed password write's tree teardown could not complete: {e}");
+    }
     let root_note = match child.kill() {
         Ok(()) => {
             let _ = child.wait();

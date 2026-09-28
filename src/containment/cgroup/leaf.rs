@@ -510,7 +510,14 @@ impl CgroupLeaf {
     /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        match self.dir.write("cgroup.kill", b"1") {
+        #[cfg(test)]
+        let result = match fault::take_force_hard_kill_write_errno() {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => self.dir.write("cgroup.kill", b"1"),
+        };
+        #[cfg(not(test))]
+        let result = self.dir.write("cgroup.kill", b"1");
+        match result {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());

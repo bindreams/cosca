@@ -437,6 +437,9 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         return Ok(child);
     };
     let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
+    if let Some(Err(e)) = &tree {
+        log::warn!("a failed password write's tree teardown could not complete: {e}");
+    }
     let root_note = match child.kill() {
         Ok(()) => {
             child.wait_and_reap_blocking();

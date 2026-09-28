@@ -590,6 +590,47 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// Async twin of the sync `a_failed_password_write_warns_when_the_tree_kill_fails` (see there): a
+/// tree-teardown failure during a failed password write must be logged at `warn`, not only
+/// embedded in the returned error's `detail`. Before this, a real (e.g. transient) failure here
+/// left no trace to diagnose a flake from.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-password-kill-fail-leaf");
+    attach_entered_leaf(&leaf_path);
+    let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    child.detach();
+
+    // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
+    // real teardown-mechanism-failure arm.
+    crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    assert!(
+        crate::containment::cgroup::fault::take_force_hard_kill_write_errno().is_none(),
+        "the fault must be consumed by the forced write"
+    );
+    assert!(
+        matches!(
+            err,
+            Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "tree teardown could not complete"),
+        [log::Level::Warn],
+        "a forced tree-kill failure must be logged at warn, naming what failed"
+    );
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {

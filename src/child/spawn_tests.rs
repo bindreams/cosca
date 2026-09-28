@@ -632,6 +632,52 @@ fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// A tree-teardown failure during a failed password write is not swallowed silently: it is
+/// logged at `warn`, naming the failure — matching every other teardown-mechanism failure's own
+/// convention elsewhere in this crate (e.g. `warn_leaf_left_behind`). Before this, the returned
+/// `Error::Elevation`'s `detail` noted it, but nothing routed it through the log, so a real (e.g.
+/// transient) failure here left no diagnosable trace — exactly what made an earlier CI flake of
+/// the async twin of this test (`a_failed_password_write_kills_the_contained_tree`) unexplainable
+/// from its own output.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_warns_when_the_tree_kill_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-password-kill-fail-leaf");
+    attach_entered_leaf(&leaf_path);
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    child.attached.disarm();
+
+    // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
+    // real teardown-mechanism-failure arm.
+    crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    assert!(
+        crate::containment::cgroup::fault::take_force_hard_kill_write_errno().is_none(),
+        "the fault must be consumed by the forced write"
+    );
+    assert!(
+        matches!(
+            err,
+            Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "tree teardown could not complete"),
+        [log::Level::Warn],
+        "a forced tree-kill failure must be logged at warn, naming what failed"
+    );
+}
+
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.
 #[cfg(target_os = "linux")]
 fn reaped(pid: u32) -> bool {
