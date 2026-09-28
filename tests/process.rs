@@ -280,6 +280,8 @@ fn is_alive_is_false_for_a_real_zombie() {
 /// Regression test for `common::accept_or_die`'s reason to exist: a dead-before-connecting
 /// target must panic, not hang the caller forever — and specifically on the "died" message, not
 /// merely on ANY panic (a wrongly-classified I/O error would still make this pass otherwise).
+/// `accept_or_die` itself is unix-only (see its own doc).
+#[cfg(unix)]
 #[test]
 fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     use std::net::TcpListener;
