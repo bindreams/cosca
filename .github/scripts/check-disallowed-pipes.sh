@@ -21,7 +21,7 @@ expected_paths=(
 
 json_output="$(mktemp)"
 fixture_target="$(mktemp -d)"
-trap 'rm -f "${json_output}"; rm -rf "${fixture_target}"' EXIT
+trap 'rm -f "${json_output}"; rm -rf "${fixture_target:?}"' EXIT
 
 # clippy exits non-zero when disallowed_methods fires (that's the point, under -D warnings) — the
 # JSON diagnostics below are the pass/fail signal here, not this exit status. Not --locked: the
