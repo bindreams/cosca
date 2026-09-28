@@ -1420,16 +1420,32 @@ fn mount_a_tmpfs_over(over: &std::path::Path) {
 /// Drop `leaf` on a thread of its own mount namespace, private to it, with a tmpfs mounted over
 /// `over`, and return the levels and texts of the records its `Drop` made about `marker`. The mount is
 /// gone with the thread.
+///
+/// `member_stdin` (the real member's piped stdin, if the caller still holds it) is released —
+/// written to once and dropped — the moment the drop's drain wait is about to block, via
+/// [`on_each_drain_block`], which fires strictly after `Drop`'s own `hard_kill()` already ran. A
+/// real kill makes this write/drop a no-op past a dead pipe (EPIPE, ignored); a `hard_kill()`
+/// mutated away leaves the member (a `cat`) alive to receive this EOF and exit on its own —
+/// either way `drop(leaf)` below returns deterministically, bounded by a real process exit, never
+/// by nextest's slow-timeout bound.
 #[cfg(target_os = "linux")]
 fn drop_under_a_mount(
     leaf: crate::containment::cgroup::CgroupLeaf,
     over: std::path::PathBuf,
     marker: String,
+    member_stdin: Option<std::process::ChildStdin>,
 ) -> (Vec<log::Level>, Vec<String>) {
     crate::log_capture::install();
     std::thread::spawn(move || {
         enter_a_private_mount_namespace();
         mount_a_tmpfs_over(&over);
+        let mut stdin = member_stdin;
+        let _guard = on_each_drain_block(move |_| {
+            if let Some(mut s) = stdin.take() {
+                use std::io::Write as _;
+                let _ = s.write_all(b"x");
+            }
+        });
         let mark = crate::log_capture::mark();
         drop(leaf);
         (
@@ -1453,8 +1469,9 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
     let (leaf, mut member) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+    let stdin = member.stdin.take();
 
-    let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name);
+    let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name, stdin);
     let status = member.wait().expect("reap the member");
     // Outside the dropping thread's namespace nothing is mounted over the leaf.
     std::fs::remove_dir(&leaf_path).expect("remove the drained leaf");
@@ -1480,10 +1497,21 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
     crate::log_capture::install();
     let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
         enter_a_private_mount_namespace();
-        let (leaf, member) = entered_real_leaf();
+        let (leaf, mut member) = entered_real_leaf();
         let leaf_path = leaf.leaf_path.clone();
         let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
         mount_a_tmpfs_over(&leaf_path);
+        // Released the moment the drain wait is about to block (strictly after Drop's own
+        // `hard_kill()`) — see `drop_under_a_mount`'s doc for why: a real kill makes this a no-op
+        // past a dead pipe, while a `hard_kill()` mutated away lets the member exit on its own,
+        // so `drop(leaf)` below is never a hang against nextest's slow-timeout bound.
+        let mut stdin = member.stdin.take();
+        let _guard = on_each_drain_block(move |_| {
+            if let Some(mut s) = stdin.take() {
+                use std::io::Write as _;
+                let _ = s.write_all(b"x");
+            }
+        });
         let mark = crate::log_capture::mark();
         drop(leaf);
         (
@@ -1514,22 +1542,26 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
+    use std::os::unix::process::ExitStatusExt as _;
+
     let (leaf, mut member) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
     let parent = leaf_path.parent().expect("a parent").to_path_buf();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
+    let stdin = member.stdin.take();
 
-    let (levels, _) = drop_under_a_mount(leaf, parent, name);
+    let (levels, _) = drop_under_a_mount(leaf, parent, name, stdin);
     let removed = !leaf_path.exists();
-    if !removed {
-        member.kill().expect("kill the member");
-    }
-    member.wait().expect("reap the member");
+    // `drop_under_a_mount` only returns once the member has actually exited (via the real kill
+    // or its stdin-EOF release valve — see its own doc), so this is never a hang: no defensive
+    // fallback kill is needed before reaping it.
+    let status = member.wait().expect("reap the member");
     if !removed {
         crate::containment::cgroup::test_support::remove_drained_leaf(&leaf_path);
     }
 
     assert!(removed, "the real leaf must be killed through and removed");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the real tree must be killed");
     assert!(
         !levels.contains(&log::Level::Warn),
         "nothing was left behind, got {levels:?}"
@@ -2251,7 +2283,7 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
     use crate::containment::TreeDrain;
 
@@ -2274,8 +2306,12 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
     let mut member = cmd.spawn().expect("spawn the member");
-    // Held past `hard_kill()`/`wait_drained` below: only `hard_kill()`'s own real signal may end
-    // this member.
+    // Held past `hard_kill()` below: only `hard_kill()`'s own real signal may end this member
+    // before the drop past it. Dropped right after `hard_kill()` returns, not held past
+    // `member.wait()`: an unbounded `wait_drained(None)` with a broken `hard_kill()` would
+    // otherwise hang on this same held pipe, proving nothing except nextest's bound — dropping it
+    // here instead makes `member.wait()` deterministic either way, and its signal (SIGKILL vs a
+    // plain EOF exit) is what distinguishes a real kill from a no-op one.
     let _stdin = member.stdin.take().expect("piped stdin");
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
@@ -2284,8 +2320,14 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     assert!(leaf.leaf_path.exists(), "a contained child's leaf must not be removed");
 
     leaf.hard_kill().expect("kill through the leaf");
+    drop(_stdin);
+    let status = member.wait().expect("reap the member");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the member must be SIGKILLed by hard_kill, got {status:?}"
+    );
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
-    member.wait().expect("reap the member");
 }
 
 /// A real leaf occupied by something other than the child can be neither waited on nor closed,
@@ -2865,6 +2907,8 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
+    use std::io::{Read, Write};
+
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-no-handle-spawn");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -2873,14 +2917,16 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(true);
     // `cat`, blocked reading a piped stdin this test holds open (never via a chosen sleep
-    // duration): the `try_wait().is_none()` check below needs the child genuinely still alive,
-    // not merely for as long as a `sleep 300` happens to outlast it.
+    // duration): the echo round trip below needs the child genuinely still alive, not merely
+    // still-unreaped — `try_wait().is_none()` alone races a real SIGKILL (measured: a mutant that
+    // signals when it must not still passes 163/200 runs), since a just-killed-but-not-yet-reaped
+    // child also reports `None`.
     let mut child = spawn_placing(
         &leaf,
         &["cat"],
         true,
         std::process::Stdio::piped(),
-        std::process::Stdio::null(),
+        std::process::Stdio::piped(),
     );
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
@@ -2890,10 +2936,19 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
         crate::containment::cgroup::Abandoned::OutOfReach
     );
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
-    assert!(
-        child.try_wait().expect("try_wait").is_none(),
-        "the child was not signalled"
-    );
+    let mut echo = [0u8; 1];
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"x")
+        .expect("write to the child");
+    child
+        .stdout
+        .as_mut()
+        .expect("stdout")
+        .read_exact(&mut echo)
+        .expect("the child must be alive to echo");
     child.kill().expect("kill the child");
     child.wait().expect("reap the child");
 }
@@ -2985,27 +3040,33 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
+    use std::io::{Read, Write};
+
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-refuses");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     // Its placement write fails, so the leaf does not hold it either.
     // `cat`, blocked reading a piped stdin held open below (never via a chosen sleep duration):
-    // the `!reaped(&pidfd)` check needs the child genuinely still alive, not merely for as long
-    // as a `sleep 300` happens to outlast it.
+    // the echo round trip below needs the child genuinely still alive, not merely still-unreaped
+    // — `!reaped(&pidfd)` alone races a real kill landing late (measured: a mutant that fails to
+    // deny the kill still passes it 198/200 runs, since reaping takes a moment after a real
+    // SIGKILL is delivered).
     let mut child = spawn_placing(
         &leaf,
         &["cat"],
         true,
         std::process::Stdio::piped(),
-        std::process::Stdio::null(),
+        std::process::Stdio::piped(),
     );
     let pid = child.id();
     let pidfd = pidfd_of(pid);
     // Taken out and held independently of `child` (dropped next): `Child`'s own `Drop` does not
-    // kill the OS process, but it WOULD close this pipe's write end were it left inside — EOF
-    // would unblock `cat` immediately, defeating the fixture.
-    let _stdin = child.stdin.take().expect("piped stdin");
+    // kill the OS process, but it WOULD close these pipes' write/read ends were they left inside
+    // — EOF on stdin would unblock `cat` immediately, defeating the fixture, and losing stdout
+    // would remove the only deterministic way to prove liveness below.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
     drop(child);
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     crate::containment::cgroup::fault::set_force_child_kill_denied(true);
@@ -3015,6 +3076,9 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
         leaf.abandon_before_verdict(),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
+    let mut echo = [0u8; 1];
+    stdin.write_all(b"x").expect("write to the child");
+    stdout.read_exact(&mut echo).expect("the child must be alive to echo");
     assert!(!reaped(&pidfd), "the child refused the kill and is still running");
 
     // Its pid is pinned while it is unreaped.
@@ -3034,11 +3098,16 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 /// a `sleep`-based descendant has its own 300s timer completely independent of any real kill, so
 /// a broken group-kill still lets the shell's `wait` (and thus this read) unblock once that
 /// timer alone runs out — measured passing in exactly 300.01s with the group kill mutated away,
-/// proving nothing. `cat` has no such timer: it can only die from a real signal.
+/// proving nothing. `cat` has no such timer: it can only die from a real signal. A hang-until-
+/// nextest's-bound read has the same problem in a different shape — it proves nothing
+/// deterministically, it just times out — so after `drop(leaf)` a byte is written to the
+/// descendant's stdin and the write end dropped: a real kill leaves the write/drop a no-op past
+/// a dead pipe (EPIPE, ignored), while a mutated-away kill lets the still-alive `cat` echo the
+/// byte before exiting on its own EOF, making `rest` non-empty — a fast, deterministic failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
-    use std::io::{BufRead, Read};
+    use std::io::{BufRead, Read, Write as _};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-group");
@@ -3051,10 +3120,10 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
         std::process::Stdio::piped(),
         std::process::Stdio::piped(),
     );
-    // Taken out and held past the EOF read below: `child`'s own `drop` must not be what ends
-    // the descendant (that would prove nothing about the real group kill under test — see this
-    // test's own doc).
-    let _stdin = child.stdin.take().expect("piped stdin");
+    // Held until after `drop(leaf)`, then written to and dropped (see this function's own doc):
+    // `child`'s own `drop` must not be what ends the descendant (that would prove nothing about
+    // the real group kill under test).
+    let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the child's line");
@@ -3066,25 +3135,37 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 
     drop(leaf);
 
+    let _ = stdin.write_all(b"x"); // EPIPE (a dead descendant) is expected and ignored
+    drop(stdin);
     let mut rest = Vec::new();
     stdout
         .read_to_end(&mut rest)
         .expect("read to EOF: every process holding stdout is dead");
+    assert!(
+        rest.is_empty(),
+        "the descendant echoed a byte written after drop(leaf) — the group kill failed to reach \
+         it in time, got {rest:?}"
+    );
 }
 
 /// A child cosca gives up on is killed as a group: between the last look at its report and the
 /// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
 /// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
-/// A regression hangs this test on the read (never a chosen wait duration) — the descendant is a
-/// `cat` blocked on a piped stdin this test holds, not `sleep 300`: see
+/// The descendant is a `cat` blocked on a piped stdin this test holds, not `sleep 300`: see
 /// `an_abandoned_child_is_killed_with_the_group_it_leads`'s doc for why a `sleep`-based
 /// descendant's own timer lets this test pass — measured at exactly 300.01s — even with the
-/// group kill under test mutated away, proving nothing.
+/// group kill under test mutated away, proving nothing. A hang-until-nextest's-bound read would
+/// have the same problem in a different shape: it proves nothing deterministically, it just
+/// times out. So after `take_placement` returns, a byte is written to the descendant's stdin and
+/// the write end dropped: if the group kill actually ran, the descendant is already dead and the
+/// write/drop is a no-op past a dead pipe (EPIPE, ignored); if the group kill was mutated away,
+/// the still-alive `cat` echoes the byte before exiting on its own EOF, so `rest` is non-empty —
+/// a fast, deterministic failure instead of a hang.
 #[cfg(target_os = "linux")]
 #[test]
 fn fail_closed_kills_the_childs_whole_process_group() {
-    use std::io::{BufRead, Read};
-    use std::os::unix::process::CommandExt;
+    use std::io::{BufRead, Read, Write as _};
+    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandon-group");
@@ -3099,11 +3180,12 @@ fn fail_closed_kills_the_childs_whole_process_group() {
         .process_group(0)
         .spawn()
         .expect("spawn");
-    // Taken out and held past the EOF read below: `child`'s own `wait()` (which closes its
-    // piped stdin before it waits — see `containment::unix::group_tests::leader_command`'s doc
-    // for why that alone is enough to end a `cat` blocker with no real signal involved) must not
-    // be what ends the descendant.
-    let _stdin = child.stdin.take().expect("piped stdin");
+    // Held until after `take_placement` returns, then written to and dropped (see this
+    // function's own doc): `child`'s own `wait()` closes its piped stdin before it waits (see
+    // `containment::unix::group_tests::leader_command`'s doc for why that alone is enough to end
+    // a `cat` blocker with no real signal involved), so this must not be what ends the
+    // descendant, and letting `wait()` run first would make the write's result meaningless.
+    let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the child's line");
@@ -3114,11 +3196,23 @@ fn fail_closed_kills_the_childs_whole_process_group() {
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
+    let _ = stdin.write_all(b"x"); // EPIPE (a dead descendant) is expected and ignored
+    drop(stdin);
     let mut rest = Vec::new();
     stdout
         .read_to_end(&mut rest)
         .expect("read to EOF: every process holding stdout is dead");
-    child.wait().expect("reap the child");
+    assert!(
+        rest.is_empty(),
+        "the descendant echoed a byte written after take_placement — the group kill failed to \
+         reach it in time, got {rest:?}"
+    );
+    let status = child.wait().expect("reap the child");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the child itself must be SIGKILLed by the group kill, got {status:?}"
+    );
 }
 
 /// A child cosca may not signal — it exec'd a setuid program — cannot be waited out: `fail_closed`

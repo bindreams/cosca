@@ -663,7 +663,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     // Taken out and held past the EOF read below: `child.wait()` (which closes its OWN piped
     // stdin before it waits — see `containment::unix::group_tests::leader_command`'s doc) must
     // not be what ends the orphan; only `hard_kill()`'s own real signal may.
-    let _stdin = child.stdin.take().expect("piped stdin");
+    let mut stdin = child.stdin.take().expect("piped stdin");
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     out.read_line(&mut line).expect("read orphan pid");
@@ -678,12 +678,16 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
+    // Written and dropped before the read below, deterministically instead of racing a hang
+    // against nextest's bound: `cat` DOES echo its stdin to stdout, so if `hard_kill()` failed to
+    // reach the orphan, the still-alive `cat` echoes this byte before exiting on its own EOF,
+    // making `rest` non-empty — a fast, deterministic failure. If the kill landed, the write/drop
+    // is a no-op past a dead pipe (EPIPE, ignored).
+    let _ = std::io::Write::write_all(&mut stdin, b"x");
+    drop(stdin);
+
     // The proof: `cat` is the pipe's sole remaining writer, so EOF fires exactly on its
-    // death — a real event, not a timer. This DOES block until then, unlike `Member::assert_dead`
-    // in Task 7: there is no alive/dead round trip available on a plain, un-echoing `cat`, so
-    // there is no way to fail non-blockingly on the "still alive" branch here. Accepted
-    // deliberately for this one unit test (the integration tests in Task 7 use control sockets
-    // precisely to avoid this tradeoff at the suite's more expensive layer).
+    // death — a real event, not a timer.
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut out, &mut rest).expect("read to EOF on the orphan's stdout");
     assert!(rest.is_empty(), "unexpected trailing output from the orphan: {rest:?}");
