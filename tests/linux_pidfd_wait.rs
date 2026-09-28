@@ -23,10 +23,15 @@ use common::testbin;
 /// Mutant: "treat EINVAL/ENOENT as gone without the exists() check". Without the `exists()`
 /// fallback in `open_verified` (`src/wait/linux.rs`), `pidfd_open`'s `EINVAL`/`ENOENT` on this
 /// live non-leader tid would be read as "already gone", and `Process::wait` would return `Ok(())`
-/// for a task that is still running. Asserts only `Err`, never a particular errno: which of
-/// `EINVAL`/`ENOENT` the kernel returns depends on the kernel version (see this file's and
-/// `src/wait/linux.rs`'s module docs), and coupling the assertion to one would make the test
-/// kernel-specific.
+/// for a task that is still running.
+///
+/// Asserts on the error's KIND and MESSAGE (`live_non_leader_error`'s cause text), not merely
+/// that it is `Err`: the bare errno alone — `NotFound` from `ENOENT` on 6.16+ — reads as a
+/// plain "gone" that a careless caller could misinterpret, which is exactly what this whole
+/// bug was about at the other end of the same arm; `open_verified` deliberately does not
+/// forward it as-is. Never asserts on which of `EINVAL`/`ENOENT` the kernel itself returned:
+/// that depends on the kernel version (see this file's and `src/wait/linux.rs`'s module docs),
+/// and both must map to the identical, kernel-independent cause below.
 #[test]
 fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -54,10 +59,20 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
         .found()
         .expect("the live worker thread's tid resolves to an identity");
     let result = p.wait();
-    assert!(
-        result.is_err(),
-        "block_until_exit on a live non-leader tid must be Err on every kernel, got {result:?}"
-    );
+    match result {
+        Err(cosca::error::Error::Io(e)) => {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "wrong error kind for a live non-leader tid: {e}"
+            );
+            assert!(
+                e.to_string().contains("not a thread-group leader"),
+                "the error must name the real cause, got: {e}"
+            );
+        }
+        other => panic!("block_until_exit on a live non-leader tid must be a descriptive Io error, got {other:?}"),
+    }
 
     // Cleanup: EOF the child's blocking stdin read (a real event, not a signal to a group), then
     // reap it normally.
