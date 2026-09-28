@@ -151,6 +151,20 @@ pub(crate) struct CgroupLeaf {
 #[cfg(target_os = "linux")]
 const RELEASED: &str = "the leaf's spawn-side resources are released once its placement verdict is taken";
 
+/// `listener.wait_deadline(at)` — the only call site for it, so the seam that records `at` (test
+/// builds only) can never drift from what's actually passed: both come from the same parameter,
+/// in the same function, with nothing between them to retarget one without the other. Closes
+/// `event_listener::Listener::wait_deadline`'s own gap — it consumes the listener and exposes no
+/// way to read back what it was armed with — from the caller's side instead.
+#[cfg(target_os = "linux")]
+fn wait_deadline_seamed(listener: event_listener::EventListener, at: std::time::Instant) -> bool {
+    use event_listener::Listener as _;
+
+    #[cfg(test)]
+    fault::notify_wait_deadline_arg(at);
+    listener.wait_deadline(at).is_some()
+}
+
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
@@ -550,7 +564,7 @@ impl CgroupLeaf {
                     #[cfg(test)]
                     let call_start = std::time::Instant::now();
                     #[cfg_attr(not(test), allow(unused_variables))]
-                    let woken = listener.wait_deadline(at).is_some();
+                    let woken = wait_deadline_seamed(listener, at);
                     // Bounds what would otherwise be an unbounded spin under a mock clock a test
                     // forgot to advance: `at` is a real `Instant`, so once real time passes it
                     // this returns immediately every iteration, and only a frozen `remaining()`

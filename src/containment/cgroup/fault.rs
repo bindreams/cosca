@@ -26,6 +26,7 @@ thread_local! {
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitSitePark>>> = const { std::cell::RefCell::new(None) };
+    static WAIT_DEADLINE_ARG: std::cell::RefCell<Option<std::sync::mpsc::Sender<std::time::Instant>>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -156,6 +157,30 @@ pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
             // result, not the call, is what `debug_assert!` gates.
             let sent = notify.send(park);
             debug_assert!(sent.is_ok(), "wait-site-park notifier's receiver was dropped");
+        }
+    });
+}
+
+/// Send on `notify` the exact instant about to be passed to `listener.wait_deadline(at)`, from
+/// `CgroupLeaf::wait_deadline_seamed` — the ONLY place this seam fires, one line above the real
+/// call, from the same `at` binding the call itself receives. Closes the sync side's own gap
+/// (`wait_deadline` consumes the listener and exposes no way to read back what it actually
+/// armed): `wait_deadline_seamed` exists so there is exactly one call site for the real
+/// `wait_deadline`, with this notify built in, rather than two separately-maintained lines a
+/// mutant could edit one of without the other. Kept until [`take_wait_deadline_arg_notifier`].
+pub(crate) fn set_wait_deadline_arg_notifier(notify: std::sync::mpsc::Sender<std::time::Instant>) {
+    WAIT_DEADLINE_ARG.with(|p| *p.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_wait_deadline_arg_notifier() {
+    WAIT_DEADLINE_ARG.with(|p| p.borrow_mut().take());
+}
+pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
+    WAIT_DEADLINE_ARG.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(at);
+            debug_assert!(sent.is_ok(), "wait-deadline-arg notifier's receiver was dropped");
         }
     });
 }

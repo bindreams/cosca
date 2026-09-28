@@ -124,7 +124,7 @@ fn drain_step_pins_the_exact_zero_remaining_boundary() {
 #[cfg(target_os = "linux")]
 #[test]
 fn wait_drained_through_wait_deadline_never_answers_early() {
-    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf, WaitDeadlineArgGuard};
     use crate::containment::TreeDrain;
     use std::time::{Duration, Instant};
 
@@ -134,7 +134,9 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 
     const BOUND: Duration = Duration::from_millis(50);
     let start = Instant::now();
-    let result = leaf.wait_drained(Some(Some(start + BOUND))).expect("wait_drained");
+    let deadline = start + BOUND;
+    let (_guard, armed_rx) = WaitDeadlineArgGuard::install();
+    let result = leaf.wait_drained(Some(Some(deadline))).expect("wait_drained");
     let elapsed = start.elapsed();
 
     assert_eq!(
@@ -145,6 +147,16 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
     assert!(
         elapsed >= BOUND,
         "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+    );
+    let armed: Vec<Instant> = armed_rx.try_iter().collect();
+    assert!(
+        !armed.is_empty(),
+        "a bounded wait with no deadline passed yet must arm `wait_deadline` at least once"
+    );
+    assert!(
+        armed.iter().all(|&at| at == deadline),
+        "wait_deadline must be armed with exactly the caller's own requested deadline \
+         ({deadline:?}), got {armed:?}"
     );
 }
 
@@ -164,7 +176,9 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 #[test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::{assert_bounded_conclusion, Member, WaitObserver};
+    use crate::containment::cgroup::test_support::{
+        assert_bounded_conclusion, Member, WaitDeadlineArgGuard, WaitObserver,
+    };
     use crate::containment::TreeDrain;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -250,6 +264,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         const BOUND: Duration = Duration::from_millis(250);
         let start = Instant::now();
         let deadline = start + BOUND;
+        let (_deadline_arg_guard, armed_rx) = WaitDeadlineArgGuard::install();
         let (result, parks, blocks, zero_remainings) =
             WaitObserver::run(|| leaf.wait_drained(Some(Some(deadline))).expect("wait_drained"));
         let elapsed = start.elapsed();
@@ -258,6 +273,12 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
         assert!(
             elapsed >= BOUND,
             "wait_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+        );
+        let armed: Vec<Instant> = armed_rx.try_iter().collect();
+        assert!(
+            armed.iter().all(|&at| at == deadline),
+            "wait_deadline must always be armed with exactly the caller's own requested \
+             deadline ({deadline:?}), got {armed:?}"
         );
         total_woken += parks.iter().filter(|p| p.woken).count();
         result

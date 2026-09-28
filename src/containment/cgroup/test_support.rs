@@ -449,6 +449,31 @@ impl Drop for TokioWaitSiteParkGuard {
     }
 }
 
+/// Installs `set_wait_deadline_arg_notifier` on construction, uninstalling it on drop —
+/// panic-safe, same pattern as `WaitObserverGuard`. Separate from `WaitObserver` itself: this
+/// seam is for the one property `WaitSitePark`'s own `deadline` field can't prove (that a
+/// bounded park was armed with the caller's own requested instant, not merely returns it back
+/// unread), not something every sync-wait test needs.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(crate) struct WaitDeadlineArgGuard;
+
+#[cfg(target_os = "linux")]
+impl WaitDeadlineArgGuard {
+    pub(crate) fn install() -> (Self, std::sync::mpsc::Receiver<std::time::Instant>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::containment::cgroup::fault::set_wait_deadline_arg_notifier(tx);
+        (Self, rx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WaitDeadlineArgGuard {
+    fn drop(&mut self) {
+        crate::containment::cgroup::fault::take_wait_deadline_arg_notifier();
+    }
+}
+
 /// A bounded call concludes exactly once via the zero-remaining shortcut, and every announced
 /// block must show up as a wait-site return (see `WaitSitePark`'s own doc for what that does and
 /// doesn't prove — on its own, it does not prove a real park happened; pair this with a real
