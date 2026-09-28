@@ -657,14 +657,13 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     child.attached.disarm();
 
     // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
-    // real teardown-mechanism-failure arm.
-    let _errno_guard = crate::containment::cgroup::fault::set_force_hard_kill_write_errno(libc::EACCES);
+    // real teardown-mechanism-failure arm. No test-only seam needed: `open(O_WRONLY)` on a real
+    // directory always fails EISDIR, the same technique
+    // `hard_kill_propagates_a_kill_the_kernel_refused` (`leaf_tests.rs`) uses.
+    std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
-    assert!(
-        crate::containment::cgroup::fault::take_force_hard_kill_write_errno().is_none(),
-        "the fault must be consumed by the forced write"
-    );
     assert!(
         matches!(
             err,
@@ -685,7 +684,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
         [log::Level::Warn],
         "a forced tree-kill failure must be logged at warn, naming what failed, got {records:?}"
     );
-    let errno_text = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+    let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
     assert!(
         records.iter().any(|r| r.contains(&errno_text)),
         "the warning must name the OS reason the write failed, got {records:?}"

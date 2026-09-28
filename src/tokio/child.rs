@@ -9,7 +9,7 @@ mod proc_source;
 pub(crate) use proc_source::ProcSource;
 
 #[path = "child/reaper.rs"]
-mod reaper;
+pub(super) mod reaper;
 
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
