@@ -196,41 +196,66 @@ pub fn read_report_line(sock: &TcpStream) -> String {
     line
 }
 
-/// A byte no real control-child tag (`R`, `G`, `Z`, `P`, ...) ever sends — see `accept_or_die`.
-const DEATH_SENTINEL: u8 = 0xFF;
-
-/// Blocks until either `listener` gets an incoming connection, or `target` exits first — a plain
-/// blocking `accept()` would hang forever in the latter case instead of failing. Races the two on
-/// a background thread: `target`'s a real, cross-platform, non-polling death-watch (the same
-/// `Process::wait()` this suite already uses for non-reaping foreign-process watches elsewhere),
-/// and if it resolves first, the watcher connects to our own `listener` and sends
-/// `DEATH_SENTINEL` — which unblocks `accept()` with a distinguishable, non-hanging outcome
-/// instead of a real control connection.
+/// Blocks until either `listener` gets an incoming connection, or `dead_watch` (a pipe the
+/// target's stdout was redirected to, which it never writes to) reaches EOF or errors — meaning
+/// the target died before connecting. A plain blocking `accept()` would hang forever in that case
+/// instead of failing.
 ///
-/// The watcher thread is intentionally detached, not joined: in the overwhelmingly common case
-/// (the target is a `control-block`-style wedge that will not exit until the caller releases it,
-/// long after this function has returned), `target.wait()` does not resolve until then — joining
-/// would defeat the very timeout-free, no-polling death-watch this function exists to provide.
-/// Once it does resolve, the watcher's own connect attempt either lands on a listener this
-/// function's caller still has bound (impossible — this function always accepts or panics first)
-/// or fails silently against a closed one; either way it is harmless.
-pub fn accept_or_die(listener: &TcpListener, target: cosca::identity::ProcessId) -> TcpStream {
-    let addr = listener.local_addr().expect("listener has a local addr").to_string();
-    std::thread::spawn(move || {
-        let _ = cosca::Process::from_id(target).wait(); // real exit edge; Err falls through too
-        if let Ok(mut s) = TcpStream::connect(&addr) {
-            let _ = s.write_all(&[DEATH_SENTINEL]);
-        }
-    });
+/// No thread, no reconnect: both the listener and the pipe are polled directly as the file
+/// descriptors this process already owns. An earlier revision used a background thread that
+/// death-watched the target and, on death, RECONNECTED to `listener`'s own address to signal it —
+/// measured to be unsound: after the real target's own process (and this function) have moved on,
+/// nothing keeps that port reserved, and the OS can and does reissue it (observed on macOS) to a
+/// completely unrelated later listener, which then sees a spurious, wrongly-attributed connection.
+/// A pipe already held open by both ends has no such window.
+///
+/// Checks the listener before the death signal when both are ready: a target that manages to
+/// connect and then immediately exits (an ordinary, successful run for most callers) must not be
+/// misreported as having died before connecting.
+#[cfg(unix)]
+pub fn accept_or_die(
+    listener: &TcpListener,
+    dead_watch: &mut (impl std::io::Read + std::os::fd::AsRawFd),
+) -> TcpStream {
+    use std::os::fd::AsRawFd;
 
-    let (sock, _) = listener.accept().expect("accept a control connection");
-    let mut probe = [0u8; 1];
-    sock.peek(&mut probe)
-        .expect("peek the first byte of the control connection");
-    if probe[0] == DEATH_SENTINEL {
-        panic!("the control target died before it connected");
+    let mut fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: dead_watch.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("poll while waiting for a control connection: {e}");
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            return listener.accept().expect("accept a control connection").0;
+        }
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let mut buf = [0u8; 1];
+            match dead_watch.read(&mut buf) {
+                Ok(0) => panic!("the control target died before it connected"),
+                Ok(n) => panic!("the control target wrote {n} unexpected byte(s) to stdout before connecting"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // spurious wakeup
+                // A read error is reported as exactly that error — never folded into "died",
+                // which would misattribute (say) an EIO on the pipe itself to the target.
+                Err(e) => panic!("reading the control target's death-watch pipe: {e}"),
+            }
+        }
     }
-    sock
 }
 
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
@@ -247,8 +272,16 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn control child");
-    let mut sock = accept_or_die(&listener, child.id());
+    #[cfg(unix)]
+    cmd.stdout(cosca::Stdio::pipe()).expect("configure a piped stdout");
+    let mut child = cmd.spawn().expect("spawn control child");
+    #[cfg(unix)]
+    let mut sock = {
+        let mut dead_watch = child.stdout().expect("child was spawned with a piped stdout");
+        accept_or_die(&listener, &mut dead_watch)
+    };
+    #[cfg(windows)]
+    let (mut sock, _) = listener.accept().expect("accept");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     (child, sock)
@@ -316,11 +349,18 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn tree");
+    #[cfg(unix)]
+    cmd.stdout(cosca::Stdio::pipe()).expect("configure a piped stdout");
+    let mut child = cmd.spawn().expect("spawn tree");
+    #[cfg(unix)]
+    let mut dead_watch = child.stdout().expect("child was spawned with a piped stdout");
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
     // duplicate or foreign tag is a harness bug worth failing loudly on).
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
+        #[cfg(unix)]
+        let mut s = accept_or_die(&listener, &mut dead_watch);
+        #[cfg(windows)]
         let (mut s, _) = listener.accept().expect("accept");
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
