@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateEventW, GetCurrentProcess, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
@@ -131,7 +131,12 @@ pub(crate) fn block_until_exit_or_cancel(
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
     ) {
         Opened::Found(h) => h,
-        Opened::Gone => return Ok(true), // no such pid => exited
+        // MUTANT (throwaway, induced for CI verification — see PR description): the identity
+        // fast path this test exists to prove now falls through to a real blocking wait
+        // instead of returning early. A pseudo-handle to the current process stands in for the
+        // dead pid's handle so the rest of the function still compiles and runs — it is never
+        // signaled, so the wait genuinely spends the whole grace.
+        Opened::Gone => unsafe { GetCurrentProcess() }, // no such pid => exited
         // Denied on a LIVE process => a real failure: reporting "exited" would let a
         // supervisor conclude a healthy service had died. The error comes from the
         // classifier, not `last_os_error()`: `is_alive()` below runs a whole
@@ -156,10 +161,8 @@ pub(crate) fn block_until_exit_or_cancel(
     // lookup would not.
     match crate::identity::windows_handle_identity(handle, id) {
         HandleIdentity::Same => {}
-        HandleIdentity::Different => {
-            close(handle);
-            return Ok(true); // recycled before open - the original is gone
-        }
+        // MUTANT (throwaway): fall through instead of returning early on a recycled pid.
+        HandleIdentity::Different => {}
         HandleIdentity::Unreadable(e) => {
             log::warn!(
                 "wait: pid {} opened but its identity could not be verified ({e})",
