@@ -2,12 +2,15 @@
 //! `pub(crate)`. Nothing here sleeps: every "the tree drained" event is caused by closing a
 //! descriptor a child is blocked on, and every "the tree has not drained" assertion is a
 //! ZERO-deadline check, which is exact rather than timed. Where a deadline needs to be seen as
-//! ELAPSED without waiting for real time to pass, a `#[cfg(test)]` mock clock
-//! (`crate::wait::test_clock`) is advanced directly instead — see
+//! ELAPSED without waiting for real time to pass, a `#[cfg(test)]` frozen mock clock
+//! (`crate::wait::test_clock::FrozenClockGuard`) is advanced directly instead — see
 //! `a_sustained_writer_is_checked_against_the_deadline_every_round`. Where "genuinely blocked,
 //! not busy-polling" needs proof, it comes from counting the real `kevent` syscalls
 //! `block_on_kqueue` issued (`crate::wait::backend::test_hooks::kevent_calls`), not from
-//! sampling CPU time over a fixed wall-clock window.
+//! sampling CPU time over a fixed wall-clock window. Every test that installs a round hook does
+//! so through `test_hooks::HookGuard`, which resets the hook and every counter on `Drop` —
+//! including on a panic mid-test, e.g. from a hook's own `assert!` — so one test's seam state
+//! can never leak into whatever runs on this thread next.
 //!
 //! Every test that opens a `marker_pipe()` write end holds `test_spawn_lock()` for its WHOLE
 //! body, whether or not that test itself spawns — the same rule `fdmarker_tests.rs` documents:
@@ -21,6 +24,8 @@
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
+
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::{block_until_drained, probe};
 use crate::containment::TreeDrain;
@@ -71,6 +76,76 @@ fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std:
     let marker = child.fd_read_end(3.into()).expect("marker read end");
     let stdin = child.fd_write_end(crate::Fd::STDIN).expect("stdin write end");
     (child, marker, stdin)
+}
+
+/// The `FIONREAD` ioctl: how many bytes are currently buffered and unread on `fd`. Exact,
+/// kernel-reported — used to prove a drain did or did not happen, rather than inferring it
+/// from a verdict that reports the same thing (`MembersRemain`) either way.
+fn fionread(fd: BorrowedFd<'_>) -> i32 {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD via ioctl writes exactly one `c_int`; `fd` is a valid, open descriptor
+    // for the duration of this call.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut n) };
+    assert_eq!(rc, 0, "FIONREAD ioctl failed: {}", std::io::Error::last_os_error());
+    n
+}
+
+/// This system's real pipe buffer capacity, MEASURED rather than assumed (the module doc's own
+/// "~64 KiB" is a description of what was once observed on one host, not a portable constant):
+/// fill a throwaway, non-blocking, in-process pipe until `write` reports `EAGAIN`, and sum what
+/// fit. `NOTE_LOWAT`'s clamp (see the module doc) is exactly this number, so a writer told to
+/// write precisely this many bytes, then stop, fills the marker pipe to exactly the ready
+/// threshold — no more, no less, and no concurrent reader required to avoid deadlock.
+fn measure_pipe_capacity() -> usize {
+    let (_r, w) = marker_pipe();
+    // SAFETY: fcntl(F_GETFL/F_SETFL) on a live, owned fd; no pointer args beyond the flags.
+    unsafe {
+        let flags = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
+        let rc = libc::fcntl(w.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        assert_eq!(
+            rc,
+            0,
+            "fcntl F_SETFL O_NONBLOCK failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let chunk = [0u8; 4096];
+    let mut total = 0usize;
+    loop {
+        match nix::unistd::write(&w, &chunk) {
+            Ok(got) => total += got,
+            Err(nix::errno::Errno::EAGAIN) => return total, // full — this is the capacity
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("scratch pipe write failed: {e}"),
+        }
+    }
+}
+
+/// Block (real, event-driven, no timer) until `fd` becomes ready again on a FRESH,
+/// independently-armed kqueue — used from inside a round hook to know, deterministically, that
+/// the pipe has crossed the low-water mark again (e.g. after an earlier round drained it),
+/// without racing the writer's own real-time refill speed. A private kqueue composes with
+/// `block_on_kqueue`'s own (see `arm`'s doc: "one kqueue per waiter"), so this never disturbs
+/// the wait under test.
+fn block_until_marker_ready_again(fd: BorrowedFd<'_>) {
+    let kq = super::arm(fd, false).expect("arm auxiliary kqueue");
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    loop {
+        match kq.kevent(&[], &mut events, None) {
+            Ok(n) if n > 0 => return,
+            Ok(_) => continue,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("auxiliary kevent failed: {e}"),
+        }
+    }
 }
 
 #[test]
@@ -573,35 +648,62 @@ fn block_until_drained_never_returns_before_a_real_deadline() {
 #[test]
 fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
     // The structural half of the deadline contract, proven without any wall-clock upper-bound
-    // assertion (cosca promises none): `block_until_drained` (via `block_on_kqueue`) checks
-    // `remaining(deadline)` before EVERY `kevent` call, so a continuously-ready descriptor (a
-    // sustained writer, same as the never-early test above) cannot keep it looping past the
-    // deadline. Proven by:
+    // assertion (cosca promises none) and without any dependence on real elapsed time:
+    // `block_until_drained` (via `block_on_kqueue`) checks `remaining(deadline)` before EVERY
+    // `kevent` call, so a continuously-ready descriptor (a sustained writer) cannot keep it
+    // looping past the deadline. Proven by:
+    //
     //   (a) the verdict is still `MembersRemain`;
-    //   (b) the real `kevent`-call counter is EXACTLY 2, empirically confirmed by running this
-    //       test: round 0 sees the deadline as still open (the writer is continuously ready, so
-    //       this round returns an event rather than a genuine timeout) and does not conclude;
-    //       round 1's `remaining(deadline)` — recomputed fresh, not cached from round 0 — reads
-    //       the deadline as elapsed (because the mock clock was advanced past it, deterministically,
-    //       no real sleep) and its `already_elapsed` check stops the loop right there. No third
-    //       round ever starts.
-    //   (c) round 0's requested `kevent` timeout is a large, real positive duration (derived
-    //       from the REAL, still-far deadline), while round 1's is `Duration::ZERO` (derived
-    //       from the MOCK-advanced deadline) — proof the timeout comes from a live
-    //       `remaining(deadline)` call each round, not a duration computed once before the loop.
+    //   (b) round 0's requested `kevent` timeout is EXACTLY one year (not "some real value
+    //       over 1s", which a slow test-setup could satisfy by accident even under a spin
+    //       mutant — see `a_quiet_live_holder_blocks_without_spending_cpu`'s own mutant note):
+    //       the mock clock is FROZEN, not merely offset, from before the deadline is even
+    //       computed, so round 0 sees exactly `frozen_now + 1yr - frozen_now = 1yr`, with zero
+    //       dependence on how long spawning `yes` or setting up this test actually took;
+    //   (c) round 1's requested timeout is EXACTLY `Duration::ZERO`, because the round-1 hook
+    //       advances the SAME frozen clock past the deadline before round 1's own
+    //       `remaining(deadline)` is computed;
+    //   (d) the round hook itself asserts `round <= 1` on EVERY firing, so a third round (the
+    //       extra-round mutant: removing the `already_elapsed` early return) fails immediately,
+    //       from inside the hook, the INSTANT it starts — not eventually, after however many
+    //       iterations it takes the call count to look wrong;
+    //   (e) round 1 performs NO drain (owner decision #233: once elapsed, the final check looks
+    //       for `EV_EOF` only) — proven by comparing `FIONREAD` right when the round-1 hook
+    //       confirms the pipe is ready again to `FIONREAD` right after the whole wait concludes;
+    //       nothing else touches the pipe in between (the writer is blocked, full, and nothing
+    //       is reading), so any difference would mean round 1 drained.
+    //
+    // The round-1 hook blocks (event-driven, no timer) on its OWN independently-armed kqueue
+    // until the pipe is ready again, rather than assuming `yes` has refilled it by some
+    // particular real-time instant — removing the last real-time dependency this test used to
+    // have (an earlier draft's `kevent_calls == 2` assumed `yes` would refill in time to be
+    // re-observed; decision #233 makes round 1 conclude either way, so that assumption is no
+    // longer load-bearing, but the auxiliary wait still removes it as a possibility entirely).
     let mut cmd = crate::Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
     let mut child = cmd.spawn().expect("spawn yes");
     let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let raw_fd = marker.as_raw_fd();
 
-    // Tens of seconds out and NEVER reached by real elapsed time in this test — only the mock
-    // clock (advanced below, from inside the round hook) pushes this into the past.
-    let deadline = Instant::now().checked_add(Duration::from_secs(60)).expect("deadline");
+    let (_clock_guard, frozen_now) = crate::wait::test_clock::FrozenClockGuard::install();
+    let one_year = Duration::from_secs(365 * 24 * 3600);
+    let deadline = frozen_now.checked_add(one_year).expect("deadline");
 
-    crate::wait::backend::test_hooks::set_round_hook(|round| {
+    let bytes_at_ready = std::rc::Rc::new(std::cell::Cell::new(-1i32));
+    let bytes_at_ready_for_hook = std::rc::Rc::clone(&bytes_at_ready);
+    let _hook_guard = crate::wait::backend::test_hooks::HookGuard::install(move |round, _kq| {
+        assert!(
+            round <= 1,
+            "must not start a third round after the deadline has elapsed — extra-round mutant, \
+             round={round}"
+        );
         if round == 1 {
-            crate::wait::test_clock::advance(Duration::from_secs(120));
+            // SAFETY: `raw_fd` is `marker`'s descriptor, open for this whole test.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            block_until_marker_ready_again(fd);
+            bytes_at_ready_for_hook.set(fionread(fd));
+            crate::wait::test_clock::advance(one_year + Duration::from_secs(86_400));
         }
     });
 
@@ -617,15 +719,17 @@ fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
     assert_eq!(
         calls, 2,
         "exactly two real kevent calls: one round that saw the deadline as still open, then one \
-         more round whose already_elapsed check (from the mock-advanced clock) stops the loop — \
-         never a third round"
+         more round whose already_elapsed check (from the frozen, mock-advanced clock) stops \
+         the loop — never a third round"
     );
 
     let requested = crate::wait::backend::test_hooks::requested_timeouts();
     assert_eq!(requested.len(), 2, "one requested timeout recorded per kevent call");
-    assert!(
-        requested[0].expect("round 0 has a bounded, positive timeout") > Duration::from_secs(1),
-        "round 0's requested timeout must reflect the real, still-far deadline, got {:?}",
+    assert_eq!(
+        requested[0],
+        Some(one_year),
+        "round 0's requested timeout must be EXACTLY the frozen deadline's remaining duration, \
+         got {:?}",
         requested[0]
     );
     assert_eq!(
@@ -634,6 +738,16 @@ fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
         "round 1's requested timeout must reflect the mock-advanced (already past) deadline, \
          proving it is derived from remaining(deadline) freshly each round, not cached once \
          before the loop"
+    );
+
+    assert!(
+        bytes_at_ready.get() >= 0,
+        "the round-1 hook must have run and recorded FIONREAD"
+    );
+    assert_eq!(
+        fionread(marker.as_fd()),
+        bytes_at_ready.get(),
+        "round 1 must not have drained any bytes once the deadline had elapsed (decision #233)"
     );
 
     child.kill().expect("kill the sustained writer");
@@ -649,31 +763,82 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     // writer's own `write()` blocks against the full pipe instead, and the wait genuinely
     // blocks in the kernel rather than busy-looping `kevent`-drain-repeat forever.
     //
-    // No fixed measurement window and no sleep. An earlier version of this test killed the
-    // writer from a SEPARATE thread once an `mpsc` notification from the round hook arrived —
-    // real synchronization, but it left a genuine (if rare) race against `yes`'s OWN
-    // scheduling: whether `yes` had already written enough to cross the low-water clamp
-    // BEFORE that second thread's `kill` landed was a race between two independently
-    // scheduled OS entities, and it flaked under heavy system load. This version kills the
-    // writer FROM INSIDE the round hook itself, which `block_on_kqueue` calls synchronously,
-    // on the SAME thread, strictly before round 0's own `kevent` call is issued — no second
-    // thread, no cross-process race at all. `interpret_read_event` checks `EV_EOF`
-    // unconditionally, ahead of any buffered-bytes branch, so it does not matter how many
-    // bytes `yes` produced before the kill: once the hook returns (after `child.wait()` has
-    // reaped it, guaranteeing the kernel has already torn down its fd table), round 0's
-    // `kevent` call can only ever observe `EV_EOF`. Confirmed deterministic (not flaky) by
-    // running this test 200 times in a row.
+    // An earlier draft killed the writer from inside round 0's own hook, before round 0's
+    // first real `kevent` call — which meant round 0 always resolved via `EV_EOF` directly,
+    // NEVER via a non-EOF, undrained event. Two mutants stayed green as a result: dropping the
+    // `if !unbounded_wait` guard (draining unconditionally) and dropping `EV_CLEAR` from `arm`
+    // — neither ever got exercised, because there was never a non-terminal round for either to
+    // matter in. This version instead uses a writer that writes EXACTLY the measured pipe
+    // capacity via `head -c`, then PARKS (holds the descriptor, writes nothing more) — so
+    // round 0 genuinely observes a non-EOF, ready event with real buffered bytes, and only
+    // round 1's hook (not round 0's) ends the wait. Between the two rounds, the round-1 hook
+    // directly proves both properties the mutants would break:
+    //   - `FIONREAD` still equals round 0's own recorded `event.data()` — nothing was drained;
+    //   - a manual, zero-timeout `kevent` on the SAME kqueue (passed into the hook) returns ZERO
+    //     events, even though the level condition (bytes still at/above the clamp) is
+    //     unchanged — proof `EV_CLEAR` is actually armed, not merely level-triggered.
+    // Only after both checks does the hook kill and reap the writer, ending the wait via a real
+    // `EV_EOF` on round 1's own (real) `kevent` call — checked unconditionally, ahead of any
+    // buffered-bytes branch, so it does not matter that bytes are still sitting there.
+    let cap = measure_pipe_capacity();
+    let script = format!("yes | head -c {cap} >&3; exec cat >/dev/null");
     let mut cmd = crate::Command::new();
-    cmd.executable("/bin/sh").args(["sh", "-c", "exec yes >&3"]);
+    cmd.executable("/bin/sh").args(["sh", "-c", &script]);
     cmd.fd(3, crate::Stdio::pipe_out()).expect("marker pipe");
-    let mut child = cmd.spawn().expect("spawn yes");
+    let mut child = cmd.spawn().expect("spawn writer");
     let marker = child.fd_read_end(3.into()).expect("marker read end");
+    let raw_fd = marker.as_raw_fd();
 
-    crate::wait::backend::test_hooks::set_round_hook(move |round| {
-        if round == 0 {
-            child.kill().expect("kill the sustained writer");
-            child.wait().expect("reap");
+    let mut child_opt = Some(child);
+    let _hook_guard = crate::wait::backend::test_hooks::HookGuard::install(move |round, kq| {
+        assert!(
+            round <= 1,
+            "the wait should have concluded by round 1, got round={round}"
+        );
+        if round != 1 {
+            return;
         }
+        // SAFETY: `raw_fd` is `marker`'s descriptor, open for this whole test.
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+
+        let round0_data = crate::wait::backend::test_hooks::last_event_data()
+            .expect("round 0 must have recorded a non-EOF event's data");
+        assert_eq!(
+            round0_data, cap as isize,
+            "round 0's event must report the full measured capacity, got {round0_data}"
+        );
+        assert_eq!(
+            fionread(fd) as isize,
+            round0_data,
+            "an unbounded wait must not drain any bytes in round 0 (decision: unbounded never \
+             drains) — FIONREAD dropped below round 0's own reported byte count"
+        );
+
+        // EV_CLEAR proof: the SAME level condition (bytes still at/above the clamp, nothing
+        // read, nothing newly written since `yes` is now blocked in its own `write()`) must NOT
+        // re-fire on a second, independent zero-timeout poll of the wait's OWN kqueue —
+        // EV_CLEAR resets per-knote readiness after each delivery, requiring a fresh crossing.
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut events = [KEvent::new(
+            0,
+            EventFilter::EVFILT_READ,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
+        )];
+        let n = kq
+            .kevent(&[], &mut events, Some(zero))
+            .expect("zero-timeout poll on the wait's own kqueue");
+        assert_eq!(
+            n, 0,
+            "EV_CLEAR must suppress a re-poll of the SAME unchanged level — got {n} events, \
+             EV_CLEAR appears unset on the armed knote"
+        );
+
+        let child = child_opt.take().expect("round 1 fires exactly once");
+        child.kill().expect("kill the sustained writer");
+        child.wait().expect("reap");
     });
 
     let verdict = block_until_drained(marker.as_fd(), None).expect("unbounded wait against a sustained writer");
@@ -685,10 +850,92 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     );
     assert_eq!(
         crate::wait::backend::test_hooks::kevent_calls(),
-        1,
-        "an unbounded wait against a sustained writer must resolve in exactly one real, blocking \
-         kevent call — more would mean a busy-poll, not a genuine kernel block"
+        2,
+        "round 0 (the undrained, non-EOF event) plus round 1 (the EOF that ends the wait) — \
+         exactly two real kevent calls, not a busy-poll"
     );
+}
+
+#[test]
+fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
+    // Direct, white-box proof that `arm` requests `EV_CLEAR` (module doc: "arm once per
+    // genuinely new edge, not once per `kevent` call while the condition merely holds") —
+    // distinct from `note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp` above, which
+    // proves `NOTE_LOWAT` suppresses a wakeup for bytes that never CROSS the clamp at all; this
+    // proves `EV_CLEAR` suppresses a REPEATED wakeup for a level that crossed the clamp once
+    // and has stayed there ever since, unchanged and undrained.
+    let cap = measure_pipe_capacity();
+    let (child, marker, _stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
+    let kq = super::arm(marker.as_fd(), false).expect("arm");
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+
+    // Real, blocking (no timeout) first poll: the writer already wrote exactly `cap` bytes
+    // before this arms (or finishes doing so shortly after), so this must report the crossing.
+    let n = kq.kevent(&[], &mut events, None).expect("initial blocking poll");
+    assert_eq!(n, 1, "expected the initial crossing to be ready");
+    assert!(
+        !events[0].flags().contains(EvFlags::EV_EOF),
+        "the writer is still alive and holding the descriptor — this must not be EOF"
+    );
+
+    // Second poll, WITHOUT reading or draining anything in between: the level condition (bytes
+    // still at/above the clamp) is UNCHANGED, so only `EV_CLEAR` being unset would make this
+    // report ready again.
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let n2 = kq
+        .kevent(&[], &mut events, Some(zero))
+        .expect("second, zero-timeout poll");
+    assert_eq!(
+        n2, 0,
+        "EV_CLEAR must suppress a re-poll of an unchanged level — got {n2} events"
+    );
+
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+}
+
+#[test]
+fn interpret_read_event_suppresses_drain_when_told_to() {
+    // White-box: `suppress_drain = true` must never consume bytes, regardless of WHY it was
+    // requested — an unbounded wait, or a bounded wait whose deadline already elapsed; owner
+    // decision #233 unifies both reasons under the same flag, and this pins the shared
+    // mechanics directly rather than through either caller. Exercises the real, non-EOF branch
+    // with a REAL event obtained from a REAL writer (not a hand-rolled `KEvent`, which could
+    // never expose a bug in how `arm`/`kevent` actually populate `data`).
+    let cap = measure_pipe_capacity();
+    let (child, marker, _stdin) = spawn_marker_holder(&format!("yes | head -c {cap} >&3; exec cat >/dev/null"));
+    let kq = super::arm(marker.as_fd(), true).expect("arm");
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    let n = kq.kevent(&[], &mut events, None).expect("blocking poll");
+    assert_eq!(n, 1, "expected the crossing to be ready");
+
+    let before = fionread(marker.as_fd());
+    let verdict =
+        super::interpret_read_event(&events[0], marker.as_fd(), true).expect("interpret with suppress_drain=true");
+    let after = fionread(marker.as_fd());
+
+    assert_eq!(
+        verdict, None,
+        "a non-EOF event with drain suppressed must stay inconclusive"
+    );
+    assert_eq!(after, before, "suppress_drain=true must never consume any bytes");
+
+    child.kill().expect("kill");
+    child.wait().expect("reap");
 }
 
 #[cfg(feature = "tokio")]

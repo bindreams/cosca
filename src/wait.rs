@@ -75,37 +75,83 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
     backend::terminate(id)
 }
 
-/// A mock clock offset for deadline arithmetic, test-only. `remaining` adds this on top of the
-/// real `Instant::now()` so a test can push the deadline check from "still open" to "elapsed"
-/// deterministically, with no real sleep — e.g. to prove a loop stops taking new rounds once a
-/// deadline has passed, without waiting out a real deadline to observe it.
+/// A mock clock, test-only: once frozen, `remaining` reads THIS instant instead of the real
+/// `Instant::now()`, so a test can drive deadline arithmetic to an exact, deterministic value
+/// (including "past the deadline") with no real sleep and no dependence on how much real wall
+/// time a test's own setup happened to take.
 ///
 /// Thread-local, not global: the test harness runs each test on its own OS thread by default,
-/// so the offset starts at `Duration::ZERO` for every test with nothing to reset. A test that
-/// needs to advance the clock from WITHIN a call already in progress (rather than before
-/// making it) does so through a `#[cfg(test)]` hook invoked on the same thread mid-call — see
-/// `wait::macos::test_hooks::set_round_hook`.
+/// so the clock starts unfrozen for every test with nothing to reset — but [`FrozenClockGuard`]
+/// resets it explicitly regardless (including on panic), since a thread-local alone doesn't
+/// protect against reuse if the harness or a future test ever runs multiple cases on one
+/// thread. A test that needs to advance the clock from WITHIN a call already in progress
+/// (rather than before making it) does so through a `#[cfg(test)]` hook invoked on the same
+/// thread mid-call — see `wait::macos::test_hooks::set_round_hook`.
 #[cfg(test)]
+// `advance`, `FrozenClockGuard` and friends are exercised only by macOS's `marker_eof_tests`
+// today (the only current caller across the crate's platforms) — genuinely dead code
+// everywhere else, same pattern as `containment::cgroup::parse`'s Linux-only helpers. `now`
+// itself stays used everywhere via `remaining`, so this is a no-op for it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod test_clock {
     use std::cell::Cell;
     use std::time::{Duration, Instant};
 
     thread_local! {
-        static OFFSET: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static FROZEN: Cell<Option<Instant>> = const { Cell::new(None) };
     }
 
-    /// The mock "now": real `Instant::now()` plus this thread's accumulated offset.
-    pub(crate) fn now() -> Instant {
-        Instant::now() + OFFSET.with(Cell::get)
+    /// Freeze this thread's mock clock at the real "now", and return that instant. Until
+    /// [`reset`] (or the end of a [`FrozenClockGuard`]'s scope), [`now`] returns exactly this
+    /// value — not real elapsed time — so a test's own setup latency can never change what a
+    /// deadline computed from it means.
+    fn freeze_now() -> Instant {
+        let at = Instant::now();
+        FROZEN.with(|f| f.set(Some(at)));
+        at
     }
 
-    /// Advance this thread's offset by `by`, moving the mock "now" further into the future.
-    /// Exercised only by macOS's `marker_eof_tests` today (the only current caller across the
-    /// crate's platforms), so this is genuinely dead code everywhere else — same pattern as
-    /// `containment::cgroup::parse`'s Linux-only helpers.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Advance the frozen instant by `by`. Panics if the clock isn't frozen — silently doing
+    /// nothing (advancing an unfrozen clock that's about to be overridden by real time anyway)
+    /// would hide a test bug rather than fail it loudly.
     pub(crate) fn advance(by: Duration) {
-        OFFSET.with(|o| o.set(o.get() + by));
+        FROZEN.with(|f| {
+            let cur = f.get().expect("test_clock::advance called before the clock was frozen");
+            f.set(Some(cur + by));
+        });
+    }
+
+    /// The mock "now": the frozen instant if [`FrozenClockGuard::install`] is active on this
+    /// thread, else real `Instant::now()` (this module's unfrozen default, matching production
+    /// behavior exactly).
+    pub(crate) fn now() -> Instant {
+        FROZEN.with(|f| f.get()).unwrap_or_else(Instant::now)
+    }
+
+    fn reset() {
+        FROZEN.with(|f| f.set(None));
+    }
+
+    /// RAII installer for the frozen clock: freezes on construction, resets to unfrozen on
+    /// `Drop` — including during unwinding, so a test that panics mid-assertion never leaks a
+    /// frozen clock into whatever runs on this thread next.
+    #[must_use]
+    pub(crate) struct FrozenClockGuard {
+        _private: (),
+    }
+
+    impl FrozenClockGuard {
+        /// Freeze the clock and return the guard plus the frozen instant.
+        pub(crate) fn install() -> (Self, Instant) {
+            let at = freeze_now();
+            (Self { _private: () }, at)
+        }
+    }
+
+    impl Drop for FrozenClockGuard {
+        fn drop(&mut self) {
+            reset();
+        }
     }
 }
 
@@ -123,9 +169,10 @@ fn now() -> Instant {
 /// that overflowed `Instant` ⇒ unbounded). Saturates to ZERO once past. Shared by the
 /// backends to recompute the per-syscall timeout after an `EINTR` retry.
 ///
-/// Reads the clock through [`now`], which in test builds is the real clock plus a per-thread
-/// mock offset (see [`test_clock`]); in non-test builds `now` is `Instant::now()` with zero
-/// indirection, so this function's behavior outside tests is unchanged.
+/// Reads the clock through [`now`], which in test builds returns a frozen mock instant when
+/// one is installed (see [`test_clock`]) and real `Instant::now()` otherwise; in non-test
+/// builds `now` is `Instant::now()` with zero indirection, so this function's behavior outside
+/// tests is unchanged.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,

@@ -147,13 +147,17 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 /// read happens in this branch. `Ok(None)` = readable without `EV_EOF`, which with
 /// `NOTE_LOWAT` armed only happens once buffered bytes reach the clamp — i.e. the pipe is at
 /// capacity, so a writer that keeps writing is, at that exact instant, already blocked in its
-/// own `write()`. `unbounded_wait` decides what happens next:
+/// own `write()`. `suppress_drain` decides what happens next:
 ///
-/// - **Bounded** (a real deadline bounds the caller's wait): `event.data()` bytes are discarded
-///   via `drain_pending`, in one round bounded by the count the kernel itself reported — the
-///   crate's accommodation for a misbehaving-but-eventually-cooperative writer, paid for by the
-///   caller's own deadline.
-/// - **Unbounded**: nothing is read. The armed knote carries `EV_CLEAR` (see `arm`), so with no
+/// - **`false`** (a bounded wait with deadline funding left): `event.data()` bytes are
+///   discarded via `drain_pending`, in one round bounded by the count the kernel itself
+///   reported — the crate's accommodation for a misbehaving-but-eventually-cooperative writer,
+///   paid for by the caller's own deadline.
+/// - **`true`**: nothing is read. Two DISTINCT callers ask for this, unified under one flag by
+///   owner decision (#233): an unbounded wait (no deadline exists to fund a drain), and a
+///   bounded wait whose deadline has ALREADY elapsed for this round (no deadline is left to
+///   fund one, even though one existed a moment ago) — once elapsed, the final check looks for
+///   `EV_EOF` only and never drains. The armed knote carries `EV_CLEAR` (see `arm`), so with no
 ///   bytes drained there is no new edge to refire on until the writer's OWN blocked `write()`
 ///   unblocks (impossible while the pipe stays full) or the descriptor closes (`EV_EOF`,
 ///   unconditional of buffered bytes). The wait genuinely blocks in the kernel rather than
@@ -166,7 +170,7 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
 fn interpret_read_event(
     event: &KEvent,
     read_end: BorrowedFd<'_>,
-    unbounded_wait: bool,
+    suppress_drain: bool,
 ) -> Result<Option<TreeDrain>, Error> {
     if event.flags().contains(EvFlags::EV_ERROR) {
         return Err(Error::Io(std::io::Error::from_raw_os_error(event.data() as i32)));
@@ -192,7 +196,7 @@ fn interpret_read_event(
         "EVFILT_READ data must be non-negative per kernel contract, got {}",
         event.data()
     );
-    if !unbounded_wait {
+    if !suppress_drain {
         drain_pending(read_end, event.data().max(0) as usize)?;
     }
     Ok(None) // holders remain (EV_EOF was clear)
@@ -266,15 +270,17 @@ pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
 /// A genuinely unbounded wait (`None`, or `Some(None)`) never drains bytes past the low-water
 /// clamp on a sustained writer — see the module doc for why, and `interpret_read_event` for
 /// where that decision is made. A bounded wait (`Some(Some(_))`, including one already past)
-/// keeps draining as before.
+/// keeps draining as long as its deadline has funding left; once a round starts with the
+/// deadline already elapsed, that round stops draining too (decision #233) — same
+/// `suppress_drain` flag, just also true for that reason.
 pub(crate) fn block_until_drained(
     read_end: BorrowedFd<'_>,
     deadline: Option<Option<Instant>>,
 ) -> Result<TreeDrain, Error> {
     let unbounded_wait = crate::wait::remaining(deadline).is_none();
     let kq = arm(read_end, unbounded_wait)?;
-    crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event| {
-        interpret_read_event(event, read_end, unbounded_wait)
+    crate::wait::backend::block_on_kqueue(&kq, deadline, TreeDrain::MembersRemain, |event, already_elapsed| {
+        interpret_read_event(event, read_end, unbounded_wait || already_elapsed)
     })
 }
 
