@@ -163,7 +163,9 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     crate::wait::remaining_override_seam::take(); // defensive: consume any unused override
     let_member_exit(child);
     verdict.expect("a live never-exiting member must not report a wait failure");
-    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    let &(first_ms, first_remaining) = probed
+        .first()
+        .expect("expected at least one recorded (ms, remaining) pair");
     assert_eq!(first_remaining, std::time::Duration::from_micros(500));
     assert_eq!(
         first_ms, 1,

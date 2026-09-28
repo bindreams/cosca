@@ -88,7 +88,9 @@ fn block_until_exit_arms_the_ceiling_of_the_remaining_duration() {
     remaining_override_seam::take(); // defensive: consume any unused override before it leaks
     let_child_exit(child);
     result.expect("a live never-exiting child must not report a wait failure");
-    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    let &(first_ms, first_remaining) = probed
+        .first()
+        .expect("expected at least one recorded (ms, remaining) pair");
     assert_eq!(
         first_remaining,
         Duration::from_micros(500),
@@ -194,7 +196,9 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     remaining_override_seam::take();
     let_child_exit(child);
     result.expect("a live never-exiting child must not report a wait failure");
-    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    let &(first_ms, first_remaining) = probed
+        .first()
+        .expect("expected at least one recorded (ms, remaining) pair");
     assert_eq!(first_remaining, Duration::from_micros(500));
     assert_eq!(
         first_ms, 1,

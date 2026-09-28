@@ -120,8 +120,13 @@ fn wait_deadline_arms_the_ceiling_of_the_remaining_duration() {
     let probed = crate::wait::wait_ms_probe::take();
     crate::wait::remaining_override_seam::take(); // defensive: consume any unused override
     let status = result.expect("a live long-lived child must not report a wait failure");
-    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
-    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    assert!(
+        status.is_none(),
+        "a long-lived child must not be reported as exited this soon"
+    );
+    let &(first_ms, first_remaining) = probed
+        .first()
+        .expect("expected at least one recorded (ms, remaining) pair");
     assert_eq!(first_remaining, Duration::from_micros(500));
     assert_eq!(
         first_ms, 1,
@@ -142,7 +147,10 @@ fn wait_deadline_never_reports_still_running_before_the_deadline() {
     let status = child
         .wait_deadline(deadline)
         .expect("a live long-lived child must not report a wait failure");
-    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
+    assert!(
+        status.is_none(),
+        "a long-lived child must not be reported as exited this soon"
+    );
     assert!(
         Instant::now() >= deadline,
         "reported still-running strictly before the deadline actually passed"
@@ -173,7 +181,10 @@ fn wait_deadline_re_arms_past_a_clamped_timeout() {
     crate::wait::wait_clamp_seam::set(None);
     let probed = crate::wait::wait_ms_probe::take();
     let status = result.expect("a live long-lived child must not report a wait failure");
-    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
+    assert!(
+        status.is_none(),
+        "a long-lived child must not be reported as exited this soon"
+    );
     assert!(
         Instant::now() >= deadline,
         "a clamped wait must re-arm and keep waiting, not report still-running at the clamp"

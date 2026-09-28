@@ -94,8 +94,16 @@ fn win32_timeout_ms_ceils_rather_than_truncates() {
 fn win32_timeout_ms_never_returns_the_infinite_sentinel_for_a_finite_remaining() {
     let huge = Duration::from_millis(u64::from(u32::MAX));
     let ms = win32_timeout_ms(Some(huge));
-    assert_ne!(ms, u32::MAX, "a finite remaining must never collide with the INFINITE sentinel");
-    assert_eq!(ms, u32::MAX - 1, "must clamp to the production cap, not silently truncate");
+    assert_ne!(
+        ms,
+        u32::MAX,
+        "a finite remaining must never collide with the INFINITE sentinel"
+    );
+    assert_eq!(
+        ms,
+        u32::MAX - 1,
+        "must clamp to the production cap, not silently truncate"
+    );
 }
 
 #[test]
@@ -114,7 +122,11 @@ fn win32_timeout_ms_honors_the_clamp_seam() {
 #[test]
 fn remaining_override_seam_is_consumed_exactly_once() {
     remaining_override_seam::set(Duration::from_millis(3));
-    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(999))), 3, "the forced value must win the first call");
+    assert_eq!(
+        win32_timeout_ms(Some(Duration::from_millis(999))),
+        3,
+        "the forced value must win the first call"
+    );
     assert_eq!(
         win32_timeout_ms(Some(Duration::from_millis(999))),
         999,
