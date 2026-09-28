@@ -1,4 +1,5 @@
 use std::os::windows::ffi::OsStrExt;
+use std::time::{Duration, Instant};
 
 use windows::Win32::System::Threading::{EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
 
@@ -15,6 +16,16 @@ fn spawn_long_lived_runas() -> RawChild {
     let (proc, pid) =
         create_process(None, &mut cmdline, &mut si, None, &None, EXTENDED_STARTUPINFO_PRESENT.0).expect("spawn");
     RawChild::new_runas(proc, pid)
+}
+
+/// A real, non-elevated, long-lived (~4s) child — long enough to outlast every deadline the
+/// `wait_deadline` tests below use (<=200ms), with no stdin pipe to manage.
+fn spawn_long_lived() -> RawChild {
+    let mut cmdline: Vec<u16> = "ping -n 5 127.0.0.1\0".encode_utf16().collect();
+    let mut si = STARTUPINFOEXW::default();
+    let (proc, pid) =
+        create_process(None, &mut cmdline, &mut si, None, &None, EXTENDED_STARTUPINFO_PRESENT.0).expect("spawn");
+    RawChild::new(proc, pid)
 }
 
 #[test]
@@ -79,4 +90,115 @@ fn a_refused_cwd_is_reported_as_its_win32_code() {
     };
     assert_eq!(err.raw_os_error(), Some(267), "{err:?}");
     assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err:?}");
+}
+
+// Deadline-contract tests for `RawChild::wait_deadline` (site 4 of the
+// "deadline-windows-never-early" bug this PR fixes; see docs/principles.md #13 — PR #233, not
+// yet merged): never report "still running" before the caller's real deadline. Same seams and
+// rationale as `src/wait/windows_tests.rs`'s module doc (`wait_ms_probe`, `wait_clamp_seam`,
+// `remaining_override_seam`) — this site shares `crate::wait::win32_timeout_ms` with the other
+// three.
+
+fn expected_ms_unclamped(remaining: Duration) -> u32 {
+    u32::try_from(remaining.as_nanos().div_ceil(1_000_000)).expect("well under u32::MAX for these tests' durations")
+}
+
+/// Ceiling, not truncation, and no added slack, for `wait_deadline`'s own `ms` computation:
+/// the FIRST armed wait must use EXACTLY `ceil_millis` of a seam-forced sub-millisecond
+/// `remaining` — deterministic, not dependent on landing on a sub-millisecond remainder by
+/// real OS-clock chance (which real Windows wait-timer coarseness can otherwise mask).
+///
+/// Mutant: this site's pre-fix expression, `u32::try_from(remaining.as_millis()).unwrap_or(...)`
+/// -> fails: 500µs would truncate (via `as_millis()`'s own flooring) to `0`, not ceil to `1`.
+#[test]
+fn wait_deadline_arms_the_ceiling_of_the_remaining_duration() {
+    let child = spawn_long_lived();
+    crate::wait::wait_ms_probe::take();
+    crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    let deadline = Instant::now() + Duration::from_millis(5);
+    let result = child.wait_deadline(deadline);
+    let probed = crate::wait::wait_ms_probe::take();
+    crate::wait::remaining_override_seam::take(); // defensive: consume any unused override
+    let status = result.expect("a live long-lived child must not report a wait failure");
+    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
+    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    assert_eq!(first_remaining, Duration::from_micros(500));
+    assert_eq!(
+        first_ms, 1,
+        "500µs must ceil to 1ms exactly (not truncate to 0, not slack up to >1); got ms={first_ms}"
+    );
+    child.kill().expect("cleanup: kill the long-lived fixture");
+    let _ = child.wait();
+}
+
+/// Never-early: once `wait_deadline` reports `None` ("still running") against a deadline, the
+/// real clock must already be at or past that deadline. An end-to-end regression check for the
+/// ORIGINAL bug as a whole (see `src/wait/windows_tests.rs`'s module doc for why this does not
+/// pin a mutant distinct from the ceiling and re-arm tests here).
+#[test]
+fn wait_deadline_never_reports_still_running_before_the_deadline() {
+    let child = spawn_long_lived();
+    let deadline = Instant::now() + Duration::from_millis(5);
+    let status = child
+        .wait_deadline(deadline)
+        .expect("a live long-lived child must not report a wait failure");
+    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
+    assert!(
+        Instant::now() >= deadline,
+        "reported still-running strictly before the deadline actually passed"
+    );
+    child.kill().expect("cleanup: kill the long-lived fixture");
+    let _ = child.wait();
+}
+
+/// The recheck loop's job: a wait capped below the real deadline (in production, the
+/// `INFINITE - 1` / ~49.7-day clamp) must not be trusted as proof the deadline passed — the
+/// loop must `continue` (re-arm, recomputing `remaining` FRESH every iteration), not return
+/// `None` early. `wait_clamp_seam` substitutes a tiny clamp for the real one so this is
+/// provable in milliseconds, not days.
+///
+/// Mutant: replace the deadline-recheck-and-`continue` on `WAIT_TIMEOUT` with an unconditional
+/// `return Ok(None)` -> fails deterministically: `wait_deadline` would report "still running"
+/// after only the clamped interval (a few ms), long before the real (200ms) deadline, AND only
+/// one `(ms, remaining)` pair would be recorded.
+/// Mutant: hoist the loop's `remaining` computation so it is not recomputed fresh each
+/// iteration -> fails the strictly-decreasing-`remaining` assertion below.
+#[test]
+fn wait_deadline_re_arms_past_a_clamped_timeout() {
+    let child = spawn_long_lived();
+    crate::wait::wait_ms_probe::take();
+    crate::wait::wait_clamp_seam::set(Some(5));
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let result = child.wait_deadline(deadline);
+    crate::wait::wait_clamp_seam::set(None);
+    let probed = crate::wait::wait_ms_probe::take();
+    let status = result.expect("a live long-lived child must not report a wait failure");
+    assert!(status.is_none(), "a long-lived child must not be reported as exited this soon");
+    assert!(
+        Instant::now() >= deadline,
+        "a clamped wait must re-arm and keep waiting, not report still-running at the clamp"
+    );
+    assert!(
+        probed.len() >= 2,
+        "a 5ms-clamped wait against a 200ms deadline must re-arm (>=2 recorded arms), got {}",
+        probed.len()
+    );
+    for (ms, remaining) in &probed {
+        assert_eq!(
+            *ms,
+            expected_ms_unclamped(*remaining).min(5),
+            "every armed ms must equal exactly min(ceil_millis(remaining), clamp)"
+        );
+    }
+    for pair in probed.windows(2) {
+        assert!(
+            pair[1].1 < pair[0].1,
+            "remaining must strictly decrease across re-arms (recomputed fresh every \
+             iteration, not hoisted and reused): {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    child.kill().expect("cleanup: kill the long-lived fixture");
+    let _ = child.wait();
 }

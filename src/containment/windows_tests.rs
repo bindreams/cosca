@@ -110,10 +110,11 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 }
 
 // Deadline-contract tests for `wait_drained_raw` (site 3 of the "deadline-windows-never-early"
-// bug this PR fixes; see docs/principles.md #13, landing separately in #233): never report
-// `MembersRemain` before the caller's real deadline. Same two seams as
-// `src/wait/windows_tests.rs` (`crate::wait::wait_ms_probe`, `crate::wait::wait_clamp_seam`),
-// same "no upper bound on elapsed time, only a lower bound" rule.
+// bug this PR fixes; see docs/principles.md #13 — PR #233, not yet merged): never report
+// `MembersRemain` before the caller's real deadline. Same seams as `src/wait/windows_tests.rs`
+// (`crate::wait::wait_ms_probe`, `crate::wait::wait_clamp_seam`,
+// `crate::wait::remaining_override_seam`), same "no upper bound on elapsed time, only a lower
+// bound" rule; see that file's module doc for what each seam proves and why.
 
 /// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
 /// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
@@ -136,38 +137,48 @@ fn let_member_exit(mut child: std::process::Child) {
     child.wait().expect("wait for cmd /C more to exit");
 }
 
-/// Ceiling, not truncation, for `wait_drained_raw`'s own `ms` computation. Structural
-/// (`armed >= remaining`, from the probe's recorded pair), so it is immune to OS/syscall
-/// jitter around the job re-enumeration this function does every round.
+/// The expected `win32_timeout_ms` output for a `remaining` far below the production clamp.
+fn expected_ms_unclamped(remaining: std::time::Duration) -> u32 {
+    u32::try_from(remaining.as_nanos().div_ceil(1_000_000)).expect("well under u32::MAX for these tests' durations")
+}
+
+/// Ceiling, not truncation, and no added slack, for `wait_drained_raw`'s own `ms` computation:
+/// the FIRST armed wait must use EXACTLY `ceil_millis` of a seam-forced sub-millisecond
+/// `remaining` — deterministic, immune to OS/syscall jitter around the job re-enumeration this
+/// function does every round (which can otherwise mask a truncation bug measured only by
+/// wall-clock elapsed time).
 ///
-/// Mutant: revert the ceiling conversion at this call site back to `d.as_millis()` -> fails
-/// whenever `remaining` has a nonzero sub-millisecond remainder.
+/// Mutant: revert the ceiling conversion at this call site (inside `win32_timeout_ms`) back to
+/// `d.as_millis()` -> fails: 500µs would floor to `0`. Mutant: add slack -> fails the
+/// exact-equality check.
 #[test]
 fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     let (child, job) = spawn_job_member();
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
     crate::wait::wait_ms_probe::take();
+    crate::wait::remaining_override_seam::set(std::time::Duration::from_micros(500));
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
     let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
     let probed = crate::wait::wait_ms_probe::take();
+    crate::wait::remaining_override_seam::take(); // defensive: consume any unused override
     let_member_exit(child);
     verdict.expect("a live never-exiting member must not report a wait failure");
-    assert!(
-        !probed.is_empty(),
-        "expected at least one recorded (ms, remaining) pair"
+    let &(first_ms, first_remaining) = probed.first().expect("expected at least one recorded (ms, remaining) pair");
+    assert_eq!(first_remaining, std::time::Duration::from_micros(500));
+    assert_eq!(
+        first_ms, 1,
+        "500µs must ceil to 1ms exactly (not truncate to 0, not slack up to >1); got ms={first_ms}"
     );
-    for (ms, remaining) in &probed {
-        let armed = std::time::Duration::from_millis(u64::from(*ms));
-        assert!(
-            armed >= *remaining,
-            "ms={ms} (={armed:?}) must be >= the measured remaining {remaining:?} — a \
-             truncating floor would arm less time than is actually left, an early report"
-        );
-    }
 }
 
 /// Never-early: once `wait_drained_raw` reports `MembersRemain` against a deadline, the real
-/// clock must already be at or past that deadline.
+/// clock must already be at or past that deadline. This is an end-to-end regression check for
+/// the ORIGINAL bug as a whole (both the truncating `ms` and the return-immediately-on-
+/// `WAIT_TIMEOUT` behavior together); it does not pin a single-line mutant distinct from
+/// `wait_drained_raw_arms_the_ceiling_of_the_remaining_duration` (ceiling) and
+/// `wait_drained_raw_re_arms_past_a_clamped_timeout` (the recheck-and-continue) below — see
+/// `src/wait/windows_tests.rs`'s module doc for why a ceiling-only or recheck-only fix, with
+/// the other already in place, does not make an assertion like this one fail on its own.
 #[test]
 fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     let (child, job) = spawn_job_member();
@@ -185,24 +196,28 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     );
 }
 
-/// The recheck loop's OTHER job: a wait capped below the real deadline (in production, the
+/// The recheck loop's job: a wait capped below the real deadline (in production, the
 /// `INFINITE - 1` / ~49.7-day clamp) must not be trusted as proof the deadline passed — the
-/// existing round-loop must `continue` (re-enumerate and re-arm), not return early.
-/// `wait_clamp_seam` substitutes a tiny clamp for the real one so this is provable in
-/// milliseconds, not days.
+/// existing round-loop must `continue` (re-enumerate and re-arm, recomputing `remaining` FRESH
+/// every round), not return early. `wait_clamp_seam` substitutes a tiny clamp for the real one
+/// so this is provable in milliseconds, not days.
 ///
 /// Mutant: replace the deadline-recheck-and-`continue` on `WAIT_TIMEOUT` with an unconditional
 /// `return Ok(TreeDrain::MembersRemain)` (the original bug) -> fails deterministically: the
 /// wait would report `MembersRemain` after only the clamped interval (a few ms), long before
-/// the real (200ms) deadline.
+/// the real (200ms) deadline, AND only one `(ms, remaining)` pair would be recorded.
+/// Mutant: hoist the outer loop's `remaining` computation so it is not recomputed fresh each
+/// round -> fails the strictly-decreasing-`remaining` assertion below.
 #[test]
 fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     let (child, job) = spawn_job_member();
     let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    crate::wait::wait_ms_probe::take();
     crate::wait::wait_clamp_seam::set(Some(5));
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
     crate::wait::wait_clamp_seam::set(None);
+    let probed = crate::wait::wait_ms_probe::take();
     let_member_exit(child);
     assert_eq!(
         verdict.expect("a live never-exiting member must not report a wait failure"),
@@ -212,6 +227,27 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
         std::time::Instant::now() >= deadline,
         "a clamped wait must re-arm and keep waiting, not report MembersRemain at the clamp"
     );
+    assert!(
+        probed.len() >= 2,
+        "a 5ms-clamped wait against a 200ms deadline must re-arm (>=2 recorded arms), got {}",
+        probed.len()
+    );
+    for (ms, remaining) in &probed {
+        assert_eq!(
+            *ms,
+            expected_ms_unclamped(*remaining).min(5),
+            "every armed ms must equal exactly min(ceil_millis(remaining), clamp)"
+        );
+    }
+    for pair in probed.windows(2) {
+        assert!(
+            pair[1].1 < pair[0].1,
+            "remaining must strictly decrease across re-arms (recomputed fresh every round, \
+             not hoisted and reused): {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
 }
 
 /// Live coverage of the `Ok(true)` arm against a real console. `Ok(false)` needs the DETACHED
