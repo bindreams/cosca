@@ -205,14 +205,14 @@ child is unreaped.
 
 Every group this principle covers declares its own `COSCA_TEST_<GROUP>` (principle 9), even where
 host support doesn't vary: `=0` says this host can't support or run the group. Consent is a
-separate gate, `COSCA_TEST_<GROUP>_CONSENT`, checked once the group itself is enabled: only an
-explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent, and `=0` on the group variable is not a way
-around it. Any other value, unset included, is no consent and fails the test rather than running
-it; the check may be a skuld fixture, but either way a missing consent is a hard failure (a panic
-or an assertion), never a return. For example, a CI step that cannot run the group sets
-`COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and `COSCA_TEST_ROOT_CONSENT=1`. No
-consent variable exists yet, and some system-affecting groups have no `COSCA_TEST_<GROUP>` at all;
-see [#234].
+separate gate, `COSCA_TEST_<GROUP>_CONSENT`: disabling a group with `=0` is itself an explicit
+decision, so consent is only asked of an enabled group, and nothing else stands in for it. Only an
+explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent; any other value, unset included, fails the
+test rather than running it. The check may be a skuld fixture, but either way a missing consent is
+a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
+the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
+`COSCA_TEST_ROOT_CONSENT=1`. No consent variable exists yet, and some system-affecting groups have
+no `COSCA_TEST_<GROUP>` at all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
