@@ -139,9 +139,10 @@ impl DrainWatch {
     }
 
     /// Block until the leaf drains — `populated` reads 0, or the leaf is removed. Unbounded: its
-    /// one caller (`CgroupLeaf::block_until_drained`, an armed `Drop`'s own teardown) never has a
-    /// deadline to honor. A bounded wait goes through `CgroupLeaf::wait_drained`'s own `Block`
-    /// arm instead (`event_listener::Listener::wait_deadline`), which this type never sees.
+    /// one caller (`CgroupLeaf::block_until_drained`, `Drop`'s own teardown — both the armed path
+    /// and the disarmed-but-killed path use it) never has a deadline to honor. A bounded wait
+    /// goes through `CgroupLeaf::wait_drained`'s own `Block` arm instead
+    /// (`event_listener::Listener::wait_deadline`), which this type never sees.
     pub(crate) fn wait(&mut self) -> Result<TreeDrain, Error> {
         use rustix::event::{poll, PollFd, PollFlags};
 
