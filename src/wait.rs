@@ -40,6 +40,42 @@ pub(crate) mod fault {
     }
 }
 
+/// Test-only seam for `Child::wait_deadline`'s (std-backend) recheck loop: forces its FIRST
+/// iteration to receive a synthetic "still running" (`None`) WITHOUT calling the real
+/// underlying `shared_child::SharedChild::wait_deadline` at all. There is no seam into that
+/// third-party dependency's own Windows implementation
+/// (`shared_child::sys::windows::wait_deadline_noreap`, tracked upstream separately in cosca
+/// #237) to force ITS early-`WAIT_TIMEOUT` bug deterministically, so this fakes the
+/// OBSERVABLE effect instead — a `None` before the real deadline — at the one seam this crate
+/// does own: its own wrapping loop. Fires an optional one-shot hook the instant the forced
+/// value is consumed, so a test can end the wait via a real event (e.g. closing a fixture's
+/// stdin) exactly when the loop's second, REAL iteration is about to run.
+#[cfg(test)]
+pub(crate) mod early_none_seam {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static ON_CONSUMED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    /// Arm the seam and register the hook to run when it is consumed.
+    pub(crate) fn arm(on_consumed: impl FnOnce() + 'static) {
+        ARMED.with(|a| a.set(true));
+        ON_CONSUMED.with(|h| *h.borrow_mut() = Some(Box::new(on_consumed)));
+    }
+    /// If armed, disarm, run the registered hook, and report `true` (the caller should treat
+    /// this iteration as having received a synthetic `None`). Otherwise report `false` and do
+    /// nothing.
+    pub(crate) fn take() -> bool {
+        let was_armed = ARMED.with(|a| a.replace(false));
+        if was_armed {
+            if let Some(hook) = ON_CONSUMED.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
+        }
+        was_armed
+    }
+}
+
 /// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
 /// = the timeout elapsed while it was still alive; `Err` = a wait failure (incl.
 /// `Unsupported` on Linux kernels < 5.3). `None` = block until exit; `Some(ZERO)` =

@@ -33,7 +33,30 @@ impl Child {
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
+    ///
+    /// A FIFTH site sharing the "deadline windows never early" bug shape (see
+    /// docs/principles.md #13 — PR #233, not yet merged): the Windows-backend (`Raw`) arm of
+    /// `self.proc.wait_deadline` is `RawChild::wait_deadline`, cosca's own code (fixed
+    /// separately). The std-backend (`Std`) arm forwards to
+    /// `shared_child::SharedChild::wait_deadline`, which on Windows
+    /// (`shared_child::sys::windows::wait_deadline_noreap`) recheck-loops only while ITS OWN
+    /// per-call timeout was capped by the ~49.7-day Win32 clamp — a "recheck only when
+    /// clamped" mistake (an un-clamped `WAIT_TIMEOUT` can still fire early on real hardware;
+    /// see this crate's own `win32_timeout_ms` doc for the Microsoft citation). `shared_child`
+    /// is a third-party dependency (upstream tracking: cosca #237, not filed here) — `test`
+    /// builds can simulate its bug's observable effect via `crate::wait::early_none_seam`.
+    #[cfg(test)]
+    fn wait_deadline_seamed(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
+        if crate::wait::early_none_seam::take() {
+            return Ok(None);
+        }
+        self.proc.wait_deadline(deadline).map_err(Error::Io)
+    }
+
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
+        #[cfg(test)]
+        return self.wait_deadline_seamed(deadline);
+        #[cfg(not(test))]
         self.proc.wait_deadline(deadline).map_err(Error::Io)
     }
 
