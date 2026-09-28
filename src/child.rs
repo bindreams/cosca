@@ -509,6 +509,12 @@ impl Child {
 /// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
 /// statement about any member or any input — so it, alone, is treated as a mechanism failure
 /// here.
+// Both `Drop` impls used to call this directly, in a `debug_assert!` principle 7 forbids
+// (asserting on a real OS outcome) — now removed in favor of the existing `log::warn!` path. On
+// Linux/Windows its only remaining non-test caller is macOS-only (`fdmarker.rs`'s
+// `combine_group_errors`), so this warns as dead code there without the allowance below. Still
+// unit-tested everywhere (`child_tests.rs`, `tokio/child_drop_tests.rs`).
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
     matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
 }
@@ -525,12 +531,10 @@ impl Drop for Child {
         if let Err(e) = &tree {
             // A live member refused, or couldn't be confirmed — visible, not silently
             // discarded, on the RAII teardown path most callers actually hit. A genuine
-            // mechanism failure (is_teardown_mechanism_failure) is a debug_assert instead,
-            // matching the async twin's disposition for the identical condition.
-            debug_assert!(
-                !is_teardown_mechanism_failure(e),
-                "contained-tree teardown failed on sync Drop: {e:?}"
-            );
+            // mechanism failure (`is_teardown_mechanism_failure`) is a REAL OS outcome (an
+            // `EACCES`/`EIO` on `cgroup.kill`, say) principle 7 forbids asserting on — it is
+            // handled and logged here, at `warn`, in every build, not only when
+            // `debug_assertions` happen to be off.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns

@@ -198,3 +198,53 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
     // `Command::kill_on_drop(false)` on a plain tokio child, which the runtime's own orphan
     // handling reaps in the background — nothing further to release here.
 }
+
+/// Async twin of the sync `drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure`
+/// (`child_tests.rs`): a failed `cgroup.kill` write reached during `Child::drop`'s OWN teardown
+/// is a real OS outcome principle 7 forbids asserting on — it must warn and return normally, in
+/// every build, never a `debug_assert!` that panics only when `debug_assertions` happen to be on.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-async-drop-kill-fail-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("occupant"), "").expect("keep the leaf unremovable");
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
+    crate::child::spawn::fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(["sleep", "30"]);
+    // `kill_on_drop` defaults to true, and the override above is consumed on THIS spawn — `Drop`
+    // below takes the armed path this test targets, through the real public API. The tree-kill
+    // call in that path runs synchronously on the dropping thread, before any reaper-pool
+    // hand-off, so no probe is needed to observe it.
+    let child = cmd.spawn().expect("spawn");
+
+    let mark = crate::log_capture::mark();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child)));
+    assert!(
+        unwound.is_ok(),
+        "Child::drop must not panic on a real teardown-mechanism failure: {unwound:?}"
+    );
+
+    // Not leaf-path-scoped (unlike other tests in this crate that force a cgroup-leaf failure):
+    // `Child::drop`'s own message here doesn't carry the path, only the OS reason, so the
+    // narrowest available marker is the message's own constant prefix. The window between `mark`
+    // above and this check is one `drop` call, on this thread — narrow enough that a colliding
+    // record from an unrelated concurrently-running test is not a realistic risk in practice.
+    let marker = "Child::drop: contained-tree teardown did not fully succeed";
+    let records = crate::log_capture::records_since(mark, marker);
+    assert_eq!(
+        crate::log_capture::levels_since(mark, marker),
+        [log::Level::Warn],
+        "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
+    );
+}
