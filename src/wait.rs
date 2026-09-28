@@ -80,11 +80,6 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 /// real sleep. Thread-local; `FrozenClockGuard` resets it on `Drop`, including during
 /// unwinding.
 #[cfg(test)]
-// `advance`, `FrozenClockGuard` and friends are exercised only by macOS's `marker_eof_tests`
-// today (the only current caller across the crate's platforms) — genuinely dead code
-// everywhere else, same pattern as `containment::cgroup::parse`'s Linux-only helpers. `now`
-// itself stays used everywhere via `remaining`, so this is a no-op for it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod test_clock {
     use std::cell::Cell;
     use std::time::{Duration, Instant};
@@ -129,6 +124,10 @@ pub(crate) mod test_clock {
     /// blocked in the kernel, turning what would otherwise be an unbounded spin under a
     /// never-advancing mock clock into, at worst, a wait bounded by the real timeouts genuinely
     /// requested — never a true infinite loop.
+    ///
+    /// Called only from `wait/macos.rs`'s `block_on_kqueue` today — genuinely dead code on other
+    /// platforms, same pattern as `containment::cgroup::parse`'s Linux-only helpers.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
         FROZEN.with(|f| {
             if let Some(cur) = f.get() {

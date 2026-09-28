@@ -359,7 +359,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
     use crate::containment::cgroup::DrainStep;
 
     loop {
-        match leaf.drain_step(deadline, std::time::Instant::now())? {
+        match leaf.drain_step(deadline)? {
             DrainStep::Done(drain) => return Ok(drain),
             DrainStep::Block {
                 listener,

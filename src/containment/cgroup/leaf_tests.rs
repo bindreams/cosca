@@ -56,7 +56,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
     // An hour out: a populated leaf never takes the zero-remaining shortcut.
     let at = Instant::now() + Duration::from_secs(3600);
     for (deadline, expected) in [(Some(Some(at)), Some(at)), (Some(None), None), (None, None)] {
-        match leaf.drain_step(deadline, Instant::now()).expect("drain_step") {
+        match leaf.drain_step(deadline).expect("drain_step") {
             DrainStep::Block { deadline, .. } => {
                 assert_eq!(
                     deadline, expected,
@@ -71,7 +71,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 
     // Already past: the zero-remaining shortcut, not a `Block` carrying a stale instant.
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    match leaf.drain_step(Some(Some(past)), Instant::now()).expect("drain_step") {
+    match leaf.drain_step(Some(Some(past))).expect("drain_step") {
         DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
         DrainStep::Done(other) => {
             panic!("expected Done(MembersRemain) for an already-expired deadline, got Done({other:?})")
@@ -83,31 +83,31 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 }
 
 /// The zero-remaining shortcut's own boundary, pinned exactly through `drain_step` itself (not
-/// just `remaining_at` in isolation, which does not prove this consumer reads it the same way):
-/// `now` one nanosecond before the deadline still takes `Block`; `now` at the deadline takes the
-/// shortcut.
+/// just `remaining` in isolation, which does not prove this consumer reads it the same way), via
+/// the frozen test clock rather than a real one: one nanosecond before the deadline still takes
+/// `Block`; at the deadline takes the shortcut.
 #[cfg(target_os = "linux")]
 #[test]
 fn drain_step_pins_the_exact_zero_remaining_boundary() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let fake = FakeLeaf::new("cosca-drain-step-zero-boundary", true);
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.disarm();
 
-    let at = Instant::now() + Duration::from_secs(3600);
+    let (_guard, t0) = crate::wait::test_clock::FrozenClockGuard::install();
+    let at = t0 + Duration::from_secs(3600);
     let deadline = Some(Some(at));
 
-    match leaf
-        .drain_step(deadline, at - Duration::from_nanos(1))
-        .expect("drain_step")
-    {
+    crate::wait::test_clock::advance(Duration::from_secs(3600) - Duration::from_nanos(1));
+    match leaf.drain_step(deadline).expect("drain_step") {
         DrainStep::Block { .. } => {}
         DrainStep::Done(_) => panic!("1ns before the deadline must still take Block, not the shortcut"),
     }
 
-    match leaf.drain_step(deadline, at).expect("drain_step") {
+    crate::wait::test_clock::advance(Duration::from_nanos(1));
+    match leaf.drain_step(deadline).expect("drain_step") {
         DrainStep::Done(crate::containment::TreeDrain::MembersRemain) => {}
         DrainStep::Done(other) => {
             panic!("at the deadline exactly, expected Done(MembersRemain), got Done({other:?})")
