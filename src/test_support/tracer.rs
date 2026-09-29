@@ -450,7 +450,8 @@ pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) ->
         ])
         .env("COSCA_UH_ROLE", "tracee")
         .env("COSCA_UH_CATCH", catch)
-        .env("COSCA_UH_IGNORE", ignore);
+        .env("COSCA_UH_IGNORE", ignore)
+        .env("COSCA_UH_SLOW_TSTP", std::env::var("COSCA_UH_SLOW_TSTP").unwrap_or_default());
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     let stdout = if pipe_stdout {
         crate::Stdio::pipe()
@@ -474,7 +475,24 @@ fn uh_tracee_fixture() {
         // SAFETY: `_exit` is async-signal-safe.
         unsafe { libc::_exit(SIGTERM_EXIT) }
     }
+    // THROWAWAY (PR #377 review): with COSCA_UH_SLOW_TSTP=1 the handler finishes only at stdin
+    // EOF, so the test's SIGSTOP always lands before the handler's write.
+    static SLOW_TSTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    SLOW_TSTP.store(
+        std::env::var("COSCA_UH_SLOW_TSTP").as_deref() == Ok("1"),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     extern "C" fn note_sigtstp(_: libc::c_int) {
+        if SLOW_TSTP.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut byte = 0u8;
+            loop {
+                // SAFETY: `byte` is a valid one-byte buffer; read(2) is async-signal-safe.
+                let n = unsafe { libc::read(0, (&raw mut byte).cast(), 1) };
+                if n == 0 || (n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)) {
+                    break;
+                }
+            }
+        }
         write_stdout(TRACEE_HANDLED_SIGTSTP.as_bytes());
     }
     let install = |name: &str, action: libc::sighandler_t| {
