@@ -431,7 +431,8 @@ impl Child {
         self.proc_mut().try_wait()
     }
 
-    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid.
+    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid, and a
+    /// refused Linux `pidfd_open` cannot fail it.
     /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.

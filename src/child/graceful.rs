@@ -49,7 +49,8 @@ impl Child {
     /// that case out: absence from its console list is equally the answer for a healthy child.
     /// Each such call also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error means nothing was sent and nothing was killed.**
+    /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
+    /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
@@ -190,6 +191,9 @@ impl Child {
     /// I/O `source`) is not held — like `NoConsole`/`Unsupported`/`Io`, it returns
     /// immediately: no signal is confirmed sent, so there is nothing for a grace wait or
     /// sweep to act on yet.
+    ///
+    /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
+    /// watch failure, so the sweep still runs.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
         // Fail fast before sending any signal. terminate_tree/kill_tree re-check this guard
         // internally; the redundancy is intentional so an uncontained child errors up front.
