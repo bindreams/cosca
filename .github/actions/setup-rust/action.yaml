@@ -33,17 +33,7 @@ runs:
 
     - name: Enable sccache for cargo
       shell: bash
-      run: |
-        # A cache-backend outage (e.g. a 503 at server startup) must degrade to an uncached build, not fail the job; SCCACHE_IDLE_TIMEOUT=0 keeps the probed server alive so it never restarts unprotected.
-        export SCCACHE_GHA_ENABLED=true SCCACHE_IDLE_TIMEOUT=0
-        if sccache --start-server; then
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
-          echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-        else
-          echo "::warning title=sccache unavailable::sccache server failed to start; building without the compile cache"
-        fi
+      run: bash "${{ github.action_path }}/enable-sccache.sh"
 
     - name: Log toolchain versions
       shell: bash

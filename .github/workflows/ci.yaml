@@ -54,6 +54,10 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-script-tests.sh
 
+      - name: Test sccache fallback script
+        shell: bash
+        run: bash .github/scripts/enable-sccache-tests.sh
+
       # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
       # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
       # against the real clippy.toml, and asserts the diagnostic actually fires for each —
