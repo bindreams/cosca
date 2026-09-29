@@ -19,10 +19,11 @@ jobs:
           cargo test --locked --lib --no-run
           pass=0; fail=0
           for i in $(seq 1 40); do
-            if cargo test --locked --lib -- --exact child::shared::shared_tests::windows::a_deadline_wait_for_single_object_arms_the_remaining_time child::lifecycle_tests::std_child_consecutive_frozen_waits_never_return_early > "out_$i.txt" 2>&1; then
+            if cargo test --locked --lib -- --exact child::shared::shared_tests::windows::a_deadline_wait_for_single_object_arms_the_remaining_time child::lifecycle::lifecycle_tests::std_child_consecutive_frozen_waits_never_return_early > "out_$i.txt" 2>&1; then
               pass=$((pass+1))
             else
               fail=$((fail+1)); tail -25 "out_$i.txt"
             fi
           done
           echo "MUTANT_RESULT pass=$pass fail=$fail"
+          grep -h "test result" out_1.txt
