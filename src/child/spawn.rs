@@ -1,12 +1,11 @@
 //! std-only spawn: resolve the crate's `Stdio` model onto `std::process::Command`,
-//! wire the program/args via the `quote` module, and spawn through `shared_child`.
+//! wire the program/args via the `quote` module, and adopt the child into a `SharedChild`.
 
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
-use shared_child::SharedChild;
-
 use crate::child::proc_handle::ProcHandle;
+use crate::child::shared::SharedChild;
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
 use crate::error::Error;
@@ -336,14 +335,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(e);
         }
     };
-    // Read identity BEFORE adopting into SharedChild. `SharedChild::new` calls
-    // `try_wait()`, which REAPS an already-exited child — and a short-lived child
-    // (e.g. `exit 0`, `sid-report`) can exit before we reach this point. Once
-    // reaped, /proc/<pid> is gone and the identity is unresolvable (observed as a
-    // load-dependent "vanished" race under parallel spawns). While we still own
-    // the un-reaped `std::process::Child`, the child is at worst a zombie — on
-    // Unix its /proc entry persists; on Windows the std Child pins the process
-    // handle so the pid cannot be reused — so this read is race-free.
+    // Read the identity while we still own the un-reaped `std::process::Child`: the child is at
+    // worst a zombie, so on Unix its /proc entry persists, and on Windows the std Child pins the
+    // process handle so the pid cannot be reused. `SharedChild::adopt` reaps nothing, so this is
+    // also the identity it takes.
     let id = match resolve_identity(child.id()) {
         crate::identity::Resolved::Found(id) => id,
         // Same teardown for both arms (never leak the spawned child), different diagnosis:
@@ -356,9 +351,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(spawn_identity_error(other));
         }
     };
-    // Adopt AFTER the identity read (and after the containment resume) so
-    // SharedChild's internal try_wait can reap-or-track without losing the identity.
-    let shared = SharedChild::new(child).map_err(Error::Io)?;
+    let shared = match SharedChild::adopt(child, id) {
+        Ok(shared) => shared,
+        Err((error, child)) => return Err(teardown_after_failed_adoption(child, error)),
+    };
 
     Ok(Child::from_parts(
         ProcHandle::Std(shared),
@@ -367,6 +363,23 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         kill_on_drop,
         attachment,
     ))
+}
+
+/// The spawned `child` could not be adopted: on Linux its pidfd could not be opened (a refusal,
+/// or `EMFILE`, `ENFILE`, `ENOMEM`), on Windows its process handle could not be duplicated.
+/// Tears it down and answers `error`.
+///
+/// **OPEN OWNER QUESTION.** On Linux std has already forked, so a child exists with no pidfd, and
+/// killing and reaping it by pid is the race the owner rejected. The coordinator's recommendation,
+/// not yet decided: probe `pidfd_open(getpid())` before forking (`Unsupported` with no child), and
+/// hold the child at a `pre_exec` handshake until the parent has its pidfd. Until the owner
+/// answers, this leaves the child exactly as main does for any failed adoption: the by-pid
+/// teardown of [`teardown_unadopted`].
+fn teardown_after_failed_adoption(child: std::process::Child, error: Error) -> Error {
+    #[cfg(test)]
+    fault::capture(ProcessId::of(child.id()));
+    teardown_unadopted(child);
+    error
 }
 
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std

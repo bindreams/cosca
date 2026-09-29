@@ -44,6 +44,53 @@ pub(crate) fn open_verified(
     }
 }
 
+/// Open a pidfd for `pid`, a child this process spawned, and confirm it names that child.
+/// `Ok(None)` means the child is gone: something else reaped it, so there is nothing to wait on.
+///
+/// This never goes through [`open_verified`], whose `EINVAL`/`ENOENT` arm applies foreign-process
+/// semantics: for a child we forked the number is a thread-group leader, so `ESRCH`, `EINVAL` and
+/// `ENOENT` alike mean it is gone (before 6.16 an `EINVAL` covers a reaped leader whose number
+/// lives on as a PGID or SID; from 6.16 an `ESRCH` does, and `ENOENT` covers a number reused by a
+/// non-leader thread). `ENOSYS`, `EPERM` and `ENODEV` are [`Error::Unsupported`], with no
+/// fallback; any other errno is `Io`.
+///
+/// - With `Some(id)`, and only when the checked `/proc` view is [`ProcView::Same`], the identity
+///   is checked too: `Gone` is gone, and `Unknown` skips the check (never a release). A diverged
+///   or unassessable view skips it: a live child is never released as foreign because of the
+///   view, and the confirmation below decides.
+/// - Then, on every view, `waitid(P_PIDFD, WEXITED | WNOHANG | WNOWAIT)` confirms the pidfd names
+///   our child: `ECHILD` is gone. A pid reused by a process that is not our child answers it,
+///   even if its start time matched.
+pub(crate) fn open_own_child(pid: u32, id: Option<ProcessId>) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    use crate::wait::exit_only::{self, Foreign, Peek, Target};
+
+    debug_assert!(
+        pid <= i32::MAX as u32,
+        "pid {pid} exceeds i32::MAX; pidfd cast would truncate"
+    );
+    let raw = Pid::from_raw(pid as i32).expect("a spawned child's pid is never 0");
+    let pidfd = match pidfd_open_checked(raw) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e @ (rustix::io::Errno::NOSYS | rustix::io::Errno::PERM | rustix::io::Errno::NODEV)) => {
+            return Err(pidfd_open_unsupported("spawn adoption", e));
+        }
+        Err(e) => return Err(Error::Io(std::io::Error::from(e))),
+    };
+    if let Some(id) = id {
+        if let ProcView::Same(proc_dir) = crate::identity::proc_view() {
+            if exists_checked(id, &proc_dir) == Existence::Gone {
+                return Ok(None);
+            }
+        }
+    }
+    match exit_only::peek(&Target::PidFd(pidfd.as_fd())) {
+        Ok(Peek::Foreign(Foreign::Gone)) => Ok(None),
+        Ok(_) => Ok(Some(pidfd)),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 /// The [`Error::Unsupported`] for a `pidfd_open` that answered `errno` (`ENOSYS`, `EPERM` or
 /// `ENODEV`): the environment cannot provide a pidfd at all, so there is no fallback. `op` names
 /// the caller. `pidfd_open(2)` documents no `EPERM`, so an `EPERM` is a sandbox filter's.

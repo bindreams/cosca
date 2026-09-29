@@ -42,8 +42,9 @@ pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
 /// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
-// Gated with its consumers: `tokio::wait_tests`, and the Unix-only cgroup and kqueue tests.
-#[cfg(any(unix, feature = "tokio"))]
+// Gated with its consumers: `tokio::wait_tests`, the Unix-only cgroup and kqueue tests, and the
+// `SharedChild` tests.
+#[cfg(any(unix, feature = "tokio", windows))]
 pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
     let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
     cmd.args(&BLOCKER_ARGV[1..])
@@ -457,6 +458,48 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
         cmd.spawn().expect("spawn fixture child")
     };
     child.wait_with_output().expect("wait for fixture child")
+}
+
+/// [`run_fixture_output`] for a fixture that must pass, with the case it should run in
+/// `case_env`: for a fixture that changes process-wide state (a signal disposition, say) and so
+/// runs one case per re-exec. Panics with the fixture's output unless it passes and wrote its gate
+/// line. Build `fixture` with [`fixture_path!`].
+#[cfg(target_os = "macos")]
+pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, case: &str) {
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, std::process::id().to_string()).env(case_env, case);
+    cmd.env_remove("RUST_TEST_NOCAPTURE");
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn fixture child")
+    };
+    let output = child.wait_with_output().expect("wait for fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
+        "fixture {fixture} case {case:?} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains(FIXTURE_GATE_PASSED_LINE),
+        "fixture {fixture} case {case:?} never wrote {FIXTURE_GATE_PASSED_LINE:?}:\n{stderr}",
+    );
+}
+
+/// Set `SIGCHLD`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a
+/// fixture re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_sigchld_ignored(ignore: bool) {
+    let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+    // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` installs no handler code.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, handler) };
+    assert_ne!(
+        previous,
+        libc::SIG_ERR,
+        "signal(SIGCHLD): {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// The directory [`run_fixture_with_cwd`]'s caller prepared, read from `marker_env`; `None` when it

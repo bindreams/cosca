@@ -104,6 +104,16 @@ filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
 slow-timeout = { period = "20s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# Every `SharedChild` test that `recv()`s or `join()`s waits on our own code: a mutant that strands
+# a waiter (a state write without `notify_all`, a holder that leaves `W`) hangs instead of failing.
+# The bound turns that hang into a bounded failure, and never synchronises anything: with the
+# correct code every one of these returns at once. Under `profile.default`, so `profile.ci` and
+# local runs both inherit it. The macOS wait's tests (`wait::backend::macos_tests::await_reapable`)
+# block on a real kqueue in the same way.
+filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_tests::await_reapable/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+[[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
 # stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
 # detect that themselves; this bound only stops a hang from stalling the job. It covers the whole

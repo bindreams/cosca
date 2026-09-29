@@ -916,3 +916,65 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         "the tree's failure is reported, got {detail}"
     );
 }
+
+// A failed adoption tears the child down like any other failed spawn step =====
+
+/// Linux: a filter that answers `EPERM` to `pidfd_open` makes the spawn fail with `Unsupported`,
+/// naming the adoption, after the child is killed and reaped. There is no fallback.
+///
+/// Mutant: `EPERM` read as gone (the spawn succeeds with a handle that answers `ECHILD`).
+#[cfg(target_os = "linux")]
+#[test]
+fn adopt_on_eperm_is_unsupported_and_tears_the_child_down() {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    match err.expect("a refused pidfd_open must fail the spawn") {
+        Error::Unsupported { op, platform, detail } => {
+            assert_eq!(op, "spawn adoption");
+            assert_eq!(platform, "linux");
+            assert!(detail.contains("pidfd_open") && detail.contains("EPERM"), "{detail}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}
+
+/// Linux: an `EMFILE` from `pidfd_open` fails the spawn with `Io`, and the child is torn down.
+///
+/// Mutant: a pidfd-less fallback (the spawn succeeds).
+#[cfg(target_os = "linux")]
+#[test]
+fn adopt_on_emfile_tears_the_child_down() {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    match err.expect("a failed pidfd_open must fail the spawn") {
+        Error::Io(e) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE)),
+        other => panic!("expected Io, got {other:?}"),
+    }
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}
+
+/// Windows: a failed `DuplicateHandle` fails the spawn, and the child is torn down.
+///
+/// Mutant: an `adopt` that `.expect()`s the duplication (the test panics instead of getting
+/// `Err((e, child))` and a torn-down child).
+#[cfg(windows)]
+#[test]
+fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::child::shared::seams::force_duplicate_handle_error_once();
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}
