@@ -58,6 +58,10 @@ impl Target for Helper {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: the spawn holds cosca::test_spawn_lock explicitly"
+)]
 fn run(case: &Case, seam: &str) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();

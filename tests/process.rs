@@ -569,6 +569,10 @@ fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
 // The testbin's ack seam (`testbin/ack.rs`) =====
 
 /// Spawns `control-block` with the seam set to `seam` and, when `opted_in`, the accept opt-in.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: the spawn holds cosca::test_spawn_lock explicitly"
+)]
 fn seamed_control_block(seam: &str, opted_in: bool) -> (std::process::Child, std::net::TcpListener) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
