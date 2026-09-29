@@ -234,7 +234,7 @@ pub(crate) mod fault_observer {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            RELEASE_TX.with(|cell| *cell.borrow_mut() = self.0.take());
+            let _ = &self.0;
         }
     }
 
