@@ -1,6 +1,6 @@
 use super::{
     ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, remaining,
-    remaining_override_seam, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
+    remaining_override_seam, rearm_until, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
 };
 use std::time::{Duration, Instant};
 
@@ -186,4 +186,76 @@ fn deadline_from_applies_deadline_at_on_the_test_clock() {
     assert_eq!(deadline_from(edge), Some(Some(t0 + edge)));
     assert_eq!(deadline_from(edge + Duration::from_nanos(1)), Some(None));
     assert_eq!(deadline_from(Duration::MAX), Some(None));
+}
+
+// rearm_until =====
+
+/// Each round after a real wait sees a frozen clock that has moved on, so a finite deadline ends.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call -> the second round sees the same instant.
+#[test]
+fn rearm_until_advances_the_frozen_clock_by_each_round() {
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    let deadline = Some(Some(at + Duration::from_millis(30)));
+    let mut previous: Option<Instant> = None;
+    let out = rearm_until(deadline, |remaining| {
+        let seen = super::now();
+        if let Some(previous) = previous {
+            assert!(seen > previous, "the frozen clock did not advance across a real wait");
+        }
+        previous = Some(seen);
+        std::thread::park_timeout(remaining.expect("finite deadline"));
+        Ok::<Option<()>, ()>(None)
+    });
+    assert_eq!(out, Ok(None));
+}
+
+/// Every round is armed with the frozen remaining, even when real time is ahead of the frozen
+/// clock.
+///
+/// Mutant: derive the round's remaining from the real clock.
+#[test]
+fn rearm_until_hands_a_round_the_frozen_remaining() {
+    let (_clock, at) = test_clock::FrozenClockGuard::install_lagging(Duration::from_secs(1));
+    let deadline = Some(Some(at + Duration::from_millis(50)));
+    let mut seen = None;
+    let out = rearm_until(deadline, |remaining| {
+        seen = Some(remaining);
+        Ok::<_, ()>(Some(()))
+    });
+    assert_eq!(out, Ok(Some(())));
+    assert_eq!(seen, Some(Some(Duration::from_millis(50))));
+}
+
+/// A deadline already past still runs one round, armed with zero, and reports its `None`.
+///
+/// Mutant: check `remaining` before the first round.
+#[test]
+fn rearm_until_polls_once_for_a_past_deadline() {
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let mut rounds = Vec::new();
+    let out = rearm_until(Some(Some(past)), |remaining| {
+        rounds.push(remaining);
+        Ok::<Option<()>, ()>(None)
+    });
+    assert_eq!(out, Ok(None));
+    assert_eq!(rounds, [Some(Duration::ZERO)]);
+}
+
+/// A round's error ends the loop at once.
+///
+/// Mutant: treat `Err` as `None`.
+#[test]
+fn rearm_until_stops_at_a_round_error() {
+    let mut rounds = 0;
+    let out = rearm_until(Some(None), |_| -> Result<Option<()>, &str> {
+        rounds += 1;
+        if rounds == 2 {
+            Err("boom")
+        } else {
+            Ok(None)
+        }
+    });
+    assert_eq!(out, Err("boom"));
+    assert_eq!(rounds, 2);
 }
