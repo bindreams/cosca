@@ -465,8 +465,6 @@ async fn wait_exit_cancel_leaves_child_untouched() {
 async fn wait_exit_drop_releases_the_windows_watcher() {
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
-    // `blocking_watch` reads THIS thread's installed observer before dispatching to its
-    // blocking-pool thread — see `fault_observer`'s own doc.
     let guard = super::fault_observer::install(tx);
     let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -476,8 +474,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
-        // The relay has already cloned the sender into the blocking closure; releasing ours
-        // means `recv()` can only return `Ok` from that closure's notification.
+        // Release our sender so `recv()` returns Ok only from the blocking closure's notification.
         drop(guard);
     } // <- drop signals the cancel event
     rx.recv()
@@ -486,21 +483,78 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     kill_and_reap(&mut child);
 }
 
-// The observer's guard uninstalls on drop even when unwinding.
-//
-// Mutant: make `fault_observer::Guard::drop` a no-op -> the slot stays installed after the panic.
+// Mutant: make `fault_observer::Guard::drop` a no-op -> the slot stays installed after the scope.
 #[cfg(windows)]
 #[test]
-fn fault_observer_guard_uninstalls_on_drop_even_when_unwinding() {
+fn fault_observer_guard_uninstalls_on_drop() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    {
         let _guard = super::fault_observer::install(tx);
-        panic!("unwind with the observer installed");
-    }));
-    assert!(unwound.is_err());
+    }
     super::fault_observer::notify_released();
     assert_eq!(rx.try_iter().count(), 0);
     assert!(super::fault_observer::current().is_none());
+}
+
+// Mutant: delete the `debug_assert!` in `fault_observer::install` -> no panic.
+#[cfg(all(windows, debug_assertions))]
+#[test]
+#[should_panic(expected = "nested on the same thread")]
+fn fault_observer_install_panics_when_nested() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _outer = super::fault_observer::install(tx.clone());
+    let _inner = super::fault_observer::install(tx);
+}
+
+// The relay's pool-thread guard must not outlive the closure: on a pool pinned to ONE thread, a
+// watch without an observer that runs after one with an observer must not reach the first's
+// channel, and the pool thread's slot must be empty afterwards.
+//
+// Mutant: `mem::forget` the `_released_guard` in `blocking_watch`'s closure -> the second
+// watch's release reaches the first's channel.
+#[cfg(windows)]
+#[test]
+fn the_relayed_observer_does_not_outlive_its_blocking_call() {
+    let rt = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        // The same pool thread must serve every call below; asserted via its id.
+        .thread_keep_alive(Duration::from_secs(3600))
+        .build()
+        .expect("build a runtime with a one-thread blocking pool");
+    rt.block_on(async {
+        let pool_thread = ::tokio::task::spawn_blocking(|| std::thread::current().id())
+            .await
+            .expect("probe the pool thread");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let mut first = std_blocker();
+        let first_id = ProcessId::of(first.id()).found().expect("identity of live child");
+        first.kill().expect("kill");
+        let guard = super::fault_observer::install(tx);
+        wait_exit(first_id).await.expect("first watch");
+        drop(guard);
+        first.wait().expect("reap");
+        assert_eq!(rx.try_iter().count(), 1, "the first watch releases exactly once");
+
+        let mut second = std_blocker();
+        let second_id = ProcessId::of(second.id()).found().expect("identity of live child");
+        second.kill().expect("kill");
+        wait_exit(second_id).await.expect("second watch");
+        second.wait().expect("reap");
+        assert_eq!(
+            rx.try_iter().count(),
+            0,
+            "a watch with no observer must not notify the previous watch's"
+        );
+
+        let (thread, empty) =
+            ::tokio::task::spawn_blocking(|| (std::thread::current().id(), super::fault_observer::current().is_none()))
+                .await
+                .expect("probe the pool thread");
+        assert_eq!(thread, pool_thread, "the pool must have reused its one thread");
+        assert!(empty, "the pool thread's slot must be empty after the call");
+    });
 }
 
 // `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
@@ -542,13 +596,12 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     child.wait().expect("reap");
 }
 
-// `fault_observer` is thread-local (installed below, held across everything that follows) —
-// an UNRELATED watch on another thread must not be able to notify THIS thread's observer (the
-// shape that made `wait_exit_drop_releases_the_windows_watcher` above a vacuous pass before the
-// fix: its `rx.recv()` would have returned on ANY watcher's release, not necessarily its own,
-// under a process-global slot). Deterministic, not a race: the other watch is fully joined —
-// awaited to completion, on a dedicated OS thread's own runtime — before this thread's channel
-// is checked, so there is no window in which a notification could still be in flight.
+// `fault_observer` is thread-local: a watch on another thread must not notify this thread's
+// observer. Deterministic: the other watch is joined on its own OS thread and runtime before the
+// channel is checked.
+//
+// Mutant: make the slot process-global -> this thread's channel receives the other's release.
+// Mutant: skip `notify_released` in `blocking_watch` -> the other thread's channel is empty.
 #[cfg(windows)]
 #[tokio::test]
 async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
@@ -558,21 +611,25 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
     let mut other = std_blocker();
     let other_id = ProcessId::of(other.id()).found().expect("identity of live child");
     other.kill().expect("kill");
-    // A genuinely different OS thread, with its OWN runtime — not another task on this
-    // thread's own runtime, which would poll on this same OS thread.
+    // A separate OS thread with its own runtime; a task on this runtime would poll on this thread.
     let handle = std::thread::spawn(move || {
+        let (other_tx, other_rx) = std::sync::mpsc::channel();
+        let _guard = super::fault_observer::install(other_tx);
         let rt = ::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build a current-thread runtime for the other thread");
-        rt.block_on(wait_exit(other_id))
+        rt.block_on(wait_exit(other_id)).expect("other thread's watch");
+        other_rx
     });
-    handle
-        .join()
-        .expect("other thread panicked")
-        .expect("other thread's watch");
+    let other_rx = handle.join().expect("other thread panicked");
     other.wait().expect("reap");
 
+    assert_eq!(
+        other_rx.try_iter().count(),
+        1,
+        "the other thread's own observer receives exactly its own release"
+    );
     assert!(
         own_rx.try_recv().is_err(),
         "an unrelated watch's release on another thread must never notify this thread's observer"
