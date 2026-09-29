@@ -259,11 +259,12 @@ fn an_unobservable_watch_reports_nothing() {
 fn a_process_watch_reports_the_process_exit_once_it_is_armed() {
     use std::process::{Command, Stdio};
     let (l, _addr) = listener();
-    let mut child = Command::new(common::testbin())
-        .arg("hold-until-stdin-eof")
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("spawn a process that outlives the watch's arming");
+    let mut child = common::spawn_locked(
+        Command::new(common::testbin())
+            .arg("hold-until-stdin-eof")
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn a process that outlives the watch's arming");
     // `start` returns only once the watch is armed, so the exit below is one it must report.
     let sources = Sources::start(l, ExitWatch::Process(child.id()));
     assert!(sources.armed(), "start returned before the process watch was armed");
