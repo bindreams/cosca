@@ -188,8 +188,9 @@ fn report(line: &str) {
 /// directory. The fixture starts without DAC bypass, so `p` binds a root driver too. Returns the
 /// fixture's exit code, and its stderr prefixed with the gate write's result.
 ///
-/// Root, `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the fixture
-/// is not their owner. `p` needs no mode: it is `0o000` before the dropped uid looks at it.
+/// `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the fixture is not
+/// their owner. `root` and `p` need no mode: the fixture's cwd is entered before it drops uid, and
+/// `p` is `0o000` before it looks at anything.
 ///
 /// The write can fail: a fixture that refused a precondition has exited before reading it. Its exit
 /// code and stderr then say why, so the write result is reported rather than panicked on.
@@ -198,9 +199,7 @@ fn report(line: &str) {
 fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_elevated: bool) -> (Option<i32>, String) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    // `tempdir` creates 0o700, so the chmod is what makes `root` traversable to a dropped uid.
     let root = tempfile::tempdir().expect("tempdir");
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     std::fs::create_dir(&p).expect("mkdir p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
