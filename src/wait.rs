@@ -497,7 +497,13 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
 ///
 /// Owns the frozen-clock advance: a round must not advance it itself. Under a frozen clock a
 /// round that follows one with no advance panics ([`test_clock::RoundCheck`]).
-#[cfg_attr(not(any(test, target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "called only by the Windows `wait_until` and the Linux holder's poll; macOS blocks on kqueue"
+    )
+)]
 pub(crate) fn rearm_until<T, E>(
     deadline: Option<Option<Instant>>,
     mut round: impl FnMut(Option<Duration>) -> Result<Option<T>, E>,
