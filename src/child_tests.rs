@@ -7,9 +7,9 @@
 
 use crate::identity::{Liveness, ProcessId, Resolved};
 
-#[cfg(target_os = "macos")]
-use super::is_teardown_mechanism_failure;
 use super::root_pid_was_recycled;
+#[cfg(target_os = "macos")]
+use crate::containment::fdmarker::is_teardown_mechanism_failure;
 
 fn id(pid: u32, token: u64) -> ProcessId {
     ProcessId::from_parts_for_test(pid, token)
@@ -76,8 +76,8 @@ fn recycled_root_pid_a_different_live_identity_is_recycled() {
 /// Regression test: the group-signal step's ordinary refusal outcomes (`Error::Containment` /
 /// `Error::Unassessable { source: None, .. }`, distinguished from a genuine teardown-mechanism
 /// failure since #61) were being stringified into an opaque `Error::Io` on the way out of
-/// `Marker::sweep`, which made `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-/// ...)` fire on an entirely ordinary outcome — reintroducing the bug #61 fixed.
+/// `Marker::sweep`, so an entirely ordinary outcome classified as a teardown-mechanism failure
+/// — reintroducing the bug #61 fixed.
 ///
 /// `fdmarker_tests.rs` calls `Marker::hard_kill`/`terminate` DIRECTLY, bypassing
 /// `dispatch.rs`'s `Attached::FdMarker` arm where the laundering sat, so none of those tests
@@ -116,9 +116,8 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
          failure — got {err:?}"
     );
 
-    // The forced pgid persists into `Drop` (`kill_on_drop` defaults to true) — this is the
-    // literal reported bug: `Child::drop`'s `debug_assert!(!is_teardown_mechanism_failure(e),
-    // ...)` must not fire here. If the laundering regresses, this line panics.
+    // `Drop` (`kill_on_drop` defaults to true) re-runs the teardown with the forced pgid: it must
+    // return normally. The classification assert above is the sole guard for the laundering bug.
     drop(child);
 }
 
@@ -152,22 +151,35 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     // below takes the armed path this test targets, through the real public API.
     let child = cmd.spawn().expect("spawn");
 
+    // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
+    // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
+    // stops reaching the kill.
+    let forced = child
+        .kill_tree()
+        .expect_err("the forced cgroup.kill failure must surface from kill_tree");
+    assert!(
+        matches!(&forced, crate::error::Error::Io(io) if io.raw_os_error() == Some(libc::EISDIR)),
+        "the forced failure must be a mechanism-class Error::Io(EISDIR), got {forced:?}"
+    );
+
     let mark = crate::log_capture::mark();
+    // A same-text record from ANOTHER thread, fixed before the drop by the join: the thread-filtered
+    // scan below must not count it (a concurrent test's identical record would look the same).
+    let marker = "Child::drop: contained-tree teardown did not fully succeed";
+    std::thread::spawn(move || log::warn!("{marker}: from another thread"))
+        .join()
+        .expect("emit from another thread");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child)));
     assert!(
         unwound.is_ok(),
         "Child::drop must not panic on a real teardown-mechanism failure: {unwound:?}"
     );
 
-    // Not leaf-path-scoped (unlike other tests in this crate that force a cgroup-leaf failure):
-    // `Child::drop`'s own message here doesn't carry the path, only the OS reason, so the
-    // narrowest available marker is the message's own constant prefix. The window between `mark`
-    // above and this check is one `drop` call, on this thread — narrow enough that a colliding
-    // record from an unrelated concurrently-running test is not a realistic risk in practice.
-    let marker = "Child::drop: contained-tree teardown did not fully succeed";
-    let records = crate::log_capture::records_since(mark, marker);
+    // `Drop` logs on the dropping thread (the tree kill runs there before any reaper hand-off),
+    // so the current-thread scan sees exactly its record.
+    let records = crate::log_capture::records_since_on_current_thread(mark, marker);
     assert_eq!(
-        crate::log_capture::levels_since(mark, marker),
+        records.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
         [log::Level::Warn],
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
     );

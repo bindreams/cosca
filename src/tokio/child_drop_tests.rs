@@ -1,35 +1,3 @@
-// Exercises the ACTUAL shared classifier both Drop impls call (crate::child::
-// is_teardown_mechanism_failure), not a hand-copied duplicate — a future edit to the real
-// condition is caught here automatically. Cannot force a REAL Containment through a live
-// Drop without root (same constraint as the rest of this plan), so this drives the
-// classifier directly with constructed Error values. Both Unassessable shapes are exercised
-// because they classify oppositely: `source: None` (an ordinary "member unconfirmed" outcome
-// from group::decide) is NOT a mechanism failure; `source: Some(_)` (group::state's listing
-// itself failed) IS one.
-#[test]
-fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable() {
-    use crate::child::is_teardown_mechanism_failure;
-    assert!(!is_teardown_mechanism_failure(&crate::error::Error::Containment {
-        detail: "refused".into()
-    }));
-    assert!(!is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
-        detail: "unknown".into(),
-        source: None
-    }));
-    assert!(is_teardown_mechanism_failure(&crate::error::Error::Io(
-        std::io::Error::other("mechanism failure")
-    )));
-}
-
-#[test]
-fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
-    use crate::child::is_teardown_mechanism_failure;
-    assert!(is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
-        detail: "process group 372 could not be listed after SIGKILL".into(),
-        source: Some(std::io::Error::other("sysctl KERN_PROC_PGRP failed"))
-    }));
-}
-
 // #194 follow-up: a disarmed-but-killed drop's leaf can still block waiting for a drain (this
 // handle's own `kill_tree()`/`hard_kill()` already fired) — that wait must run on a reaper
 // thread, not whichever thread called `drop`, exactly like the armed path's own kill-then-wait.
@@ -226,24 +194,37 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
     // below takes the armed path this test targets, through the real public API. The tree-kill
     // call in that path runs synchronously on the dropping thread, before any reaper-pool
     // hand-off, so no probe is needed to observe it.
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+
+    // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
+    // the `cgroup.kill` write, surfaced as `Error::Io`), so it cannot go vacuous if the forcing
+    // stops reaching the kill.
+    let forced = child
+        .kill_tree()
+        .expect_err("the forced cgroup.kill failure must surface from kill_tree");
+    assert!(
+        matches!(&forced, crate::error::Error::Io(io) if io.raw_os_error() == Some(libc::EISDIR)),
+        "the forced failure must be a mechanism-class Error::Io(EISDIR), got {forced:?}"
+    );
 
     let mark = crate::log_capture::mark();
+    // A same-text record from ANOTHER thread, fixed before the drop by the join: the thread-filtered
+    // scan below must not count it (a concurrent test's identical record would look the same).
+    let marker = "Child::drop: contained-tree teardown did not fully succeed";
+    std::thread::spawn(move || log::warn!("{marker}: from another thread"))
+        .join()
+        .expect("emit from another thread");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child)));
     assert!(
         unwound.is_ok(),
         "Child::drop must not panic on a real teardown-mechanism failure: {unwound:?}"
     );
 
-    // Not leaf-path-scoped (unlike other tests in this crate that force a cgroup-leaf failure):
-    // `Child::drop`'s own message here doesn't carry the path, only the OS reason, so the
-    // narrowest available marker is the message's own constant prefix. The window between `mark`
-    // above and this check is one `drop` call, on this thread — narrow enough that a colliding
-    // record from an unrelated concurrently-running test is not a realistic risk in practice.
-    let marker = "Child::drop: contained-tree teardown did not fully succeed";
-    let records = crate::log_capture::records_since(mark, marker);
+    // `Drop` logs on the dropping thread (the tree kill runs there before any reaper hand-off),
+    // so the current-thread scan sees exactly its record.
+    let records = crate::log_capture::records_since_on_current_thread(mark, marker);
     assert_eq!(
-        crate::log_capture::levels_since(mark, marker),
+        records.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
         [log::Level::Warn],
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
     );
