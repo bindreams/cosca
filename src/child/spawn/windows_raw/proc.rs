@@ -156,7 +156,7 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => {
-                let _ = self.reap();
+                let _ = ();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
