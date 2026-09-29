@@ -333,14 +333,8 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     }
 }
 
-// Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` — see there
-// for the full rationale: the readiness handshake that closes the root's own trap-installation
-// race, why the backgrounded `cat` needs `exec 3<&0; cat <&3 ... 3<&-` rather than a bare `cat
-// &`, why the root's `exit 0` is gated on a byte this test writes to fd 4 rather than left to
-// the shell's own scheduling, and why this then blocks on `wait_exit` (non-reaping) rather than
-// `child.wait()` (which would reap the root itself, leaving nothing for
-// `graceful_shutdown_tree`'s own best-effort reap to do — a mutant that skips it would then
-// pass anyway).
+// Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root`; see there for the
+// fixture's rationale (`wait_exit`, like `block_until_exit`, does not reap).
 #[cfg(unix)]
 #[tokio::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
@@ -368,12 +362,16 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
         .await
         .expect("readiness byte");
     let id = child.id();
-    // `spawn()` has already returned, and the root is provably still alive (blocked on `read
-    // _ <&4`) — see this test's sync twin's own doc for why the exit is gated rather than left
-    // to the shell's own scheduling. Release it, then block for its exit WITHOUT reaping.
-    exit_gate.write_all(b"x").await.expect("release the root's exit 0");
+    // The root is still blocked on `read _ <&4`: release it, then wait for its exit WITHOUT
+    // reaping.
+    exit_gate.write_all(b"x\n").await.expect("release the root's exit 0");
     drop(exit_gate);
     crate::tokio::wait::wait_exit(id).await.expect("the root must exit");
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "the exited root must still be an unreaped zombie before graceful_shutdown_tree runs"
+    );
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
@@ -395,9 +393,9 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
-    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
-    // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    let _ = child.kill_tree();
+    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
+    // real sweep now (the seam is consumed) kills it.
+    child.kill_tree().expect("cleanup sweep");
 }
 
 // Async twin of `windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure` — see

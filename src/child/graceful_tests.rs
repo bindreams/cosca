@@ -381,58 +381,25 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     }
 }
 
-// Regression test: on the `MembersRemain` branch — a drain-observable
-// mechanism whose tree does NOT fully drain within `grace` — `root_exited` must be freshly
-// computed by its own zero-duration probe of the root, not hardcoded `false`. Otherwise an
-// already-exited-but-unreaped root is stranded as a zombie when the subsequent hard sweep
-// also fails, because the best-effort reap below is gated on `root_exited`.
+// Regression test: on the `MembersRemain` branch (a drain-observable mechanism whose tree does
+// NOT fully drain within `grace`), `root_exited` must come from its own zero-duration probe of the
+// root, not be hardcoded `false`. Otherwise an already-exited-but-unreaped root is stranded as a
+// zombie when the hard sweep also fails, because the best-effort reap is gated on `root_exited`.
 //
-// Fixture: the root shell installs `trap '' TERM`, backgrounds a `cat` blocked reading a piped
-// stdin THIS TEST holds open (never via a chosen sleep duration — see this module's `blocker`
-// doc; `trap ''` here is what makes it TERM-immune, since an ignored disposition survives an
-// `exec`, keeping the tree from fully draining and forcing `MembersRemain` specifically),
-// writes a single readiness byte, then exits on its own. The test blocks on that byte before
-// doing anything else — a genuine happens-before edge from a real pipe event, not a sleep or a
-// bet that the runner is fast: the root's own `trap` installation has nothing else
-// synchronizing it against `spawn()` returning, and the byte cannot be written until both the
-// trap and the background job are already in place.
+// Fixture: the root shell ignores TERM (`trap ''` survives `exec`) and backgrounds a `cat` blocked
+// on a stdin this test holds open, so the tree cannot drain. It then writes a readiness byte (the
+// trap and background job are in place) and waits for a line on fd 4 before `exit 0`. The gate
+// keeps the exit from racing `spawn()`, where `SharedChild::new` can reap a fast-exiting child.
+// The test releases it with `x\n`: `read` returns on the newline, so the release does not depend
+// on EOF, which a concurrent fork inheriting the write end would withhold. It then waits with
+// `block_until_exit`, which does not reap, so the root is an unreaped zombie when
+// `graceful_shutdown_tree` runs. Asserting `Present` at that point keeps the final `Gone` from
+// passing vacuously: had the test reaped the root itself, a mutant that skips the function's own
+// reap would still read `Gone`.
 //
-// The byte alone only proves the shell reached `echo r`; it says nothing about how long the
-// shell's OWN subsequent `exit 0` then takes to actually complete. `graceful_shutdown_tree`'s
-// `MembersRemain` branch requires the root to have ALREADY exited by the time it is called, and
-// betting that `exit 0` always beats the 2-second grace is exactly the timed-fixture hazard this
-// crate's tests avoid elsewhere: measured with a deliberately slow root (`sleep 3` before
-// `exit 0`) this bet fails at 2.01s.
-//
-// The root's `exit 0` is instead gated on a byte THIS TEST writes to fd 4 (`read _ <&4`), so
-// nothing about the shell's own scheduling can let it exit before `cmd.spawn()` has already
-// returned here — `SharedChild::new` (which every sync `crate::Child` is backed by) can itself
-// reap a fast-exiting child from inside `spawn()`, and a root free to exit immediately after
-// `echo r` is trivial enough to race that internal probe and lose (measured: intermittent
-// `ECHILD` from a hand-rolled `waitid` used here in an earlier version of this fix). Gating the
-// exit closes that race at its source instead of working around it.
-//
-// After releasing fd 4, the test blocks on `crate::wait::block_until_exit` — non-reaping, unlike
-// `child.wait()` — so the root is a genuine, UNREAPED zombie when `graceful_shutdown_tree` runs:
-// `child.wait()` here would reap it first, leaving nothing for `graceful_shutdown_tree`'s own
-// best-effort reap to do, which a mutant that skips that reap (`Ok(exited) => (false, false,
-// None)` at `graceful.rs`, discarding the real `exited` value) would then pass anyway, since
-// `id.exists()` already reads `Gone` from this test's own earlier reap regardless of whether the
-// function under test did its job. Measured RED against that exact mutant before this fix,
-// GREEN after.
-//
-// `exec 3<&0` duplicates the shell's OWN stdin (our pipe) to fd 3 while it is still the
-// foreground command — POSIX has a non-interactive shell give an asynchronous (`&`) command
-// `/dev/null` on stdin UNLESS that command's own stdin is explicitly redirected, so a bare
-// `cat &` here would get `/dev/null`, see EOF immediately, and exit right away — not a
-// documentation nuance but a measured failure: `cat >/dev/null &` reaches this branch's
-// `MembersRemain` in 0.01s, i.e. never, in a real cgroup v2 environment (verified in the
-// `--nocapture` cgroup lane; see this crate's own no-timed-fixtures history). Redirecting the
-// backgrounded `cat`'s stdin explicitly to `<&3` (a dup of the real pipe) opts it out of that
-// rule; `3<&-` then closes the now-redundant fd 3 once `cat`'s own fd 0 already aliases it.
-// On a mechanism with no kernel drain edge, this same fixture still exercises the pre-existing
-// root-only watch, which already computes `root_exited` correctly — asserted separately below
-// rather than skipped, per this crate's "never silently skip" testing convention.
+// `exec 3<&0; cat <&3 3<&-`: a non-interactive shell gives a backgrounded command `/dev/null` as
+// stdin unless it is redirected explicitly, so a bare `cat &` would see EOF and exit at once.
+// Without a kernel drain edge, the fixture still exercises the root-only watch, asserted below.
 #[cfg(unix)]
 #[test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
@@ -451,8 +418,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
-    // Held for the test's whole body: dropping it closes the pipe, delivering EOF to the
-    // backgrounded `cat` and letting it exit on its own — defeating the MembersRemain fixture.
+    // Held for the test's whole body: dropping it delivers EOF to the backgrounded `cat`.
     let _stdin = child.stdin().expect("piped stdin");
     let mut exit_gate = child.fd_write_end(4.into()).expect("exit-gate write end");
     let mut readiness = [0u8; 1];
@@ -462,14 +428,18 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         .read_exact(&mut readiness)
         .expect("readiness byte");
     let id = child.id();
-    // `spawn()` has already returned, and the root is provably still alive (blocked on `read
-    // _ <&4`) — see this test's own doc for why the exit is gated here rather than left to the
-    // shell's own scheduling. Release it, then block for its exit WITHOUT reaping.
-    exit_gate.write_all(b"x").expect("release the root's exit 0");
+    // The root is still blocked on `read _ <&4`: release it, then wait for its exit WITHOUT
+    // reaping.
+    exit_gate.write_all(b"x\n").expect("release the root's exit 0");
     drop(exit_gate);
     assert!(
         crate::wait::block_until_exit(id, None).expect("the root must exit"),
         "block_until_exit must observe the exit, not a timeout (None means unbounded)"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "the exited root must still be an unreaped zombie before graceful_shutdown_tree runs"
     );
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
@@ -491,9 +461,9 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
-    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
-    // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    let _ = child.kill_tree();
+    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
+    // real sweep now (the seam is consumed) kills it.
+    child.kill_tree().expect("cleanup sweep");
 }
 
 // Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above,
