@@ -29,6 +29,10 @@ pub(crate) fn fork_running_locked(guard: &crate::child::spawn::SpawnLockGuard, b
 
 /// The `spawn_lock` a fork runs under: taken by [`fork_running`], or the caller's.
 #[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "held only for their Drop / as proof the lock is held; never read"
+)]
 enum Held<'a> {
     Owned(crate::child::spawn::SpawnLockGuard),
     Borrowed(&'a crate::child::spawn::SpawnLockGuard),
