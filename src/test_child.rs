@@ -466,10 +466,7 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
     // fixture that dies can prove. `RUST_TEST_THREADS` is overridden by `--test-threads=1`; the
     // time and shuffle variables cannot matter to one exact test.
     cmd.env_remove("RUST_TEST_NOCAPTURE");
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn fixture child")
-    };
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     child.wait_with_output().expect("wait for fixture child")
 }
 

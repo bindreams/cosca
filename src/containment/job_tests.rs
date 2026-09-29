@@ -15,13 +15,14 @@ use super::Job;
 /// `cmd /C more`: blocks reading its stdin until EOF, then exits. No new external dependency —
 /// this is the OS shell, exactly like `windows_tests.rs`'s fixture.
 fn spawn_blocker() -> std::process::Child {
-    std::process::Command::new("cmd")
-        .args(["/C", "more"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn cmd /C more")
+    crate::test_spawn::spawn(
+        &mut std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more")
 }
 
 #[test]

@@ -125,7 +125,7 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
         std::process::exit(PRECONDITION_FAILED);
     }
     // The control: std runs `./tool` here.
-    let std_code = std::process::Command::new("./tool").status().map(|s| s.code());
+    let std_code = crate::test_spawn::status(&mut std::process::Command::new("./tool")).map(|s| s.code());
     if !matches!(std_code, Ok(Some(CWD_TOOL_EXIT))) {
         report(&format!("precondition: std's ./tool gave {std_code:?}"));
         std::process::exit(PRECONDITION_FAILED);

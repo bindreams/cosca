@@ -27,7 +27,7 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
     let report = channel.wait(child.id()).expect("open a pidfd");
     let status = child.wait().expect("wait");
     assert!(status.success(), "the failed placement must not abort the spawn");
@@ -62,7 +62,7 @@ fn placement_report_records_a_successful_write() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
     assert_eq!(channel.wait(child.id()).expect("open a pidfd"), PlacementReport::Placed);
     child.wait().expect("wait");
     // SAFETY: the parent's own copy of the descriptor, closed exactly once.

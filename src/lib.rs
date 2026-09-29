@@ -76,6 +76,9 @@ mod test_privilege;
 #[cfg(all(test, target_os = "macos"))]
 mod test_support;
 
+#[cfg(test)]
+mod test_spawn;
+
 pub mod process;
 pub use process::{Process, Recursive};
 
