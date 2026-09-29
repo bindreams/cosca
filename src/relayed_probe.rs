@@ -92,6 +92,7 @@ pub(crate) fn capture() -> Relay {
         slots
             .borrow()
             .iter()
+            .filter(|(id, _)| **id != TypeId::of::<crate::wait::read_probe::Log>())
             .map(|(id, entry)| (*id, entry.clone_entry()))
             .collect()
     }))
