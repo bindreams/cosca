@@ -150,6 +150,7 @@ pub(crate) fn block_until_exit_or_cancel(
     };
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not.
+    let _ = crate::wait::remaining(deadline.map(Some));
     match crate::identity::windows_handle_identity(handle, id) {
         HandleIdentity::Same => {}
         HandleIdentity::Different => {
