@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::process::exit;
 
 /// The accept handshake (see the module doc).
+// Also loaded by `accept` below, which includes `tests/common/accept.rs` and so this file.
+#[cfg_attr(windows, allow(clippy::duplicate_mod))]
 #[path = "ack.rs"]
 mod ack;
 
@@ -16,6 +18,13 @@ mod ack;
 #[cfg(windows)]
 #[path = "console_identity.rs"]
 mod console_identity;
+
+/// The death-watched accept shared with `tests/`: a plain `accept()` on a child's ack socket would
+/// hang forever if that child died before connecting.
+#[cfg(windows)]
+#[allow(dead_code, unused_imports)] // shared with tests/, which uses the parts this binary does not
+#[path = "../tests/common/accept.rs"]
+mod accept;
 
 /// The `report-breakaway` mode: job-object shapes and the three spawn vehicles.
 #[cfg(windows)]
@@ -832,11 +841,12 @@ fn main() {
             let mut cmd = cosca::Command::new();
             cmd.executable(&exe)
                 .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "G"])
+                .env(ack::ACK_ENV, "1")
                 .contain();
-            let child = cmd.spawn().expect("spawn nested delegated child");
+            let mut child = cmd.spawn().expect("spawn nested delegated child");
             // The tag proves the child is alive AND has completed console registration — it is
             // written after its ctrl handler is installed — before anything is signalled.
-            let (mut ack, _) = listener.accept().expect("accept ack socket");
+            let mut ack = accept::accept_or_die(&listener, &mut child);
             let mut t = [0u8; 1];
             ack.read_exact(&mut t).expect("read ack tag");
             assert_eq!(&t, b"G", "wrong ack tag");
@@ -1055,9 +1065,10 @@ fn main() {
             let mut cmd = cosca::Command::new();
             cmd.executable(&exe)
                 .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "R"])
+                .env(ack::ACK_ENV, "1")
                 .contain();
-            let child = cmd.spawn().expect("spawn contained root");
-            let (mut ack, _) = listener.accept().expect("accept ack socket");
+            let mut child = cmd.spawn().expect("spawn contained root");
+            let mut ack = accept::accept_or_die(&listener, &mut child);
             let mut t = [0u8; 1];
             ack.read_exact(&mut t).expect("read ack tag");
             assert_eq!(&t, b"R", "wrong ack tag");
@@ -1217,9 +1228,10 @@ fn main() {
                 let mut cmd = cosca::Command::new();
                 cmd.executable(&exe)
                     .args(["cosca_testbin", "control-block-ack-break", &ack_addr, tag])
+                    .env(ack::ACK_ENV, "1")
                     .contain();
-                let child = cmd.spawn().expect("spawn contained root");
-                let (mut sock, _) = listener.accept().expect("accept ack socket");
+                let mut child = cmd.spawn().expect("spawn contained root");
+                let mut sock = accept::accept_or_die(&listener, &mut child);
                 let mut t = [0u8; 1];
                 sock.read_exact(&mut t).expect("read ack tag");
                 assert_eq!(&t, tag.as_bytes(), "wrong ack tag");
