@@ -911,6 +911,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         true,
+        true,
     );
     drop(pass1_marker); // its scratch handle has no further use.
 
@@ -965,6 +966,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         false,
+        true,
     );
 
     // Keyed on THIS marker's handle, per the module docs' rule: the bare sentence is emitted by
@@ -1089,4 +1091,70 @@ fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
         detail: "process group 372 could not be listed after SIGKILL".into(),
         source: Some(std::io::Error::other("sysctl KERN_PROC_PGRP failed"))
     }));
+}
+
+// Holders-only sweeps (a reaped root) =====
+
+/// A marker nothing was spawned under, its write end closed with the command.
+fn marker_without_holders(
+    root: Option<crate::identity::ProcessId>,
+    pgid: Option<i32>,
+    root_denied: bool,
+) -> super::Marker {
+    let mut cmd = std::process::Command::new("true");
+    let prepared = super::install(&mut cmd, &[]).expect("install a scratch marker");
+    drop(cmd);
+    super::Marker::new(prepared, root, pgid, root_denied)
+}
+
+/// `root_denied` is a gap in the channel that names the root, which a holders-only sweep does not
+/// run. Mutant: the fold is not gated on `by_root_number`.
+#[test]
+fn a_holders_only_sweep_does_not_report_a_denied_root_as_a_gap() {
+    let _serialize = test_spawn_lock();
+    let marker = marker_without_holders(None, None, true);
+    assert!(
+        marker.hard_kill().is_err(),
+        "control: a full sweep reports the denied root as a gap"
+    );
+    marker
+        .hard_kill_holders_only()
+        .expect("no holders, and the root's channel is not run");
+}
+
+/// The drop's skip names only what the marker would have done by the root's number. A marker with
+/// neither a group nor a root (it exited before attach, in `TreeWalk` mode) would have done
+/// nothing, so it warns of nothing. Mutant: the rule ignores the root.
+#[test]
+fn a_marker_with_neither_a_group_nor_a_root_is_not_named_by_the_roots_number() {
+    let _serialize = test_spawn_lock();
+    crate::log_capture::install();
+    let view = crate::containment::DropView {
+        root_pid: 4242,
+        root_reaped: true,
+        tree_killed: false,
+    };
+    let text = |marker| {
+        let attached = crate::containment::Attached::FdMarker(marker);
+        let mark = crate::log_capture::mark();
+        attached.hard_kill_for_drop(view).expect("the holders-only sweep");
+        crate::log_capture::records_since_on_current_thread(mark, "Child::drop: the root is already reaped")
+    };
+
+    assert_eq!(text(marker_without_holders(None, None, false)), []);
+
+    let root = crate::identity::ProcessId::from_parts_for_test(4242, 1);
+    let rooted = text(marker_without_holders(Some(root), None, false));
+    assert_eq!(rooted.len(), 1, "{rooted:?}");
+    assert!(
+        rooted[0].1.contains("root pid 4242") && !rooted[0].1.contains("pgid"),
+        "{rooted:?}"
+    );
+
+    let grouped = text(marker_without_holders(None, Some(4242), false));
+    assert_eq!(grouped.len(), 1, "{grouped:?}");
+    assert!(
+        grouped[0].1.contains("pgid 4242") && !grouped[0].1.contains("root pid"),
+        "{grouped:?}"
+    );
 }

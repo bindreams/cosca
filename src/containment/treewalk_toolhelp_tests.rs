@@ -22,7 +22,7 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     type Walk = fn(ProcessId) -> Result<(), Error>;
     let walks: [(&str, Walk); 2] = [
-        ("hard_kill", |id| super::hard_kill(id)),
+        ("hard_kill", |id| super::hard_kill(id).map(|_| ())),
         ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
     ];
     for (name, walk) in walks {

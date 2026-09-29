@@ -1,5 +1,6 @@
 //! Test-only support shared across the crate's unit tests.
 
+#[cfg(target_os = "macos")]
 pub(crate) mod tracer;
 
 /// Whether test group `group` (for example `"TRACER"`) runs. `COSCA_TEST_<group>=0` turns it

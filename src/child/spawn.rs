@@ -95,7 +95,10 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
+    let tree = child
+        .containment()
+        .can_teardown()
+        .then(|| child.attached.hard_kill_marking(&child.tree_killed));
     let tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     let root_note = match child.kill() {
         Ok(()) => {
@@ -389,7 +392,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let shared = SharedChild::new(child).map_err(Error::Io)?;
 
     Ok(Child::from_parts(
-        ProcHandle::Std(shared),
+        ProcHandle::std(shared),
         id,
         parent_ends,
         kill_on_drop,

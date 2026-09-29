@@ -345,7 +345,12 @@ pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
 /// identity cannot be read after it. Nothing is killed, the root included: killing the root
 /// first would reparent its descendants out of the ppid walk, so a retry could no longer find
 /// them. A root that no longer holds its pid is `Ok`, with nothing killed.
-pub(crate) fn hard_kill(root: ProcessId) -> Result<(), Error> {
+///
+/// `Ok(false)`: the walk ran but was not complete, because an identity it resolved refused the
+/// kill, so members may be left running.
+pub(crate) fn hard_kill(root: ProcessId) -> Result<bool, Error> {
+    #[cfg(test)]
+    fault::note_walk(root.pid());
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
@@ -353,30 +358,35 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<(), Error> {
     let skip_root = false;
     let parents = crate::containment::enumerate::process_parents()?;
     if !anchor_present(root)? {
-        return Ok(());
+        return Ok(true);
+    }
+    let mut complete = true;
+    #[cfg(test)]
+    if fault::take_force_incomplete() {
+        complete = false;
     }
     let descendants = descendants(root, &parents);
     #[cfg(unix)]
     {
         if !skip_root {
-            let _ = kill_by_identity(root, Signal::SIGKILL);
+            complete &= kill_by_identity(root, Signal::SIGKILL) != KillOutcome::NotAttempted;
         }
         for id in descendants {
-            let _ = kill_by_identity(id, Signal::SIGKILL);
+            complete &= kill_by_identity(id, Signal::SIGKILL) != KillOutcome::NotAttempted;
         }
     }
     #[cfg(windows)]
     {
         if !skip_root {
-            let _ = kill_by_identity(root);
+            complete &= kill_by_identity(root) != KillOutcome::NotAttempted;
         }
         for id in descendants {
-            let _ = kill_by_identity(id);
+            complete &= kill_by_identity(id) != KillOutcome::NotAttempted;
         }
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (root, descendants, skip_root);
-    Ok(())
+    Ok(complete)
 }
 
 /// Test-only: force the NEXT `hard_kill` on THIS thread to skip the root's identity kill
@@ -384,9 +394,58 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<(), Error> {
 /// flag — arm and call on one thread; assert consumption via [`armed`].
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     thread_local! {
         static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
+        static WALKS: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+        static FORCE_INCOMPLETE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the NEXT `hard_kill` on THIS thread report an incomplete walk, as an unreadable
+    /// process table or a refused kill would. Take semantics.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(crate) fn force_incomplete_once() {
+        FORCE_INCOMPLETE.with(|f| f.set(true));
+    }
+
+    pub(super) fn take_force_incomplete() -> bool {
+        FORCE_INCOMPLETE.with(|f| f.replace(false))
+    }
+
+    /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill`, a
+    /// macOS fd marker's channel 1+2) records that pid, so a test can tell a walk ran without a
+    /// process having to die. The walk itself still runs.
+    #[cfg(unix)]
+    pub(crate) fn record_walks() -> WalkRecorder {
+        WALKS.with(|w| *w.borrow_mut() = Some(Vec::new()));
+        WalkRecorder(())
+    }
+
+    #[cfg(unix)]
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct WalkRecorder(());
+
+    #[cfg(unix)]
+    impl WalkRecorder {
+        /// The root pids walked since the recorder was made.
+        pub(crate) fn walked(&self) -> Vec<u32> {
+            WALKS.with(|w| w.borrow().clone().expect("the recorder is live"))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WalkRecorder {
+        fn drop(&mut self) {
+            WALKS.with(|w| *w.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn note_walk(root_pid: u32) {
+        WALKS.with(|w| {
+            if let Some(walked) = w.borrow_mut().as_mut() {
+                walked.push(root_pid);
+            }
+        });
     }
     // On macOS, `Attached::TreeWalk` (and so `hard_kill`) is only reached when the fd marker
     // failed to install or is suppressed (decision 2: the marker otherwise takes priority) —

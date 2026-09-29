@@ -22,6 +22,7 @@ fn a_child_without_a_process() -> Child {
         id: ProcessId::from_parts_for_test(1, 0),
         kill_on_drop: false,
         containment: Containment::None,
+        tree_killed: Default::default(),
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
     }

@@ -5,6 +5,7 @@
 
 use std::io;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use shared_child::SharedChild;
@@ -15,18 +16,45 @@ use super::spawn::windows_raw::RawChild;
 /// The process backend behind an owned [`Child`](super::Child).
 #[derive(Debug)]
 pub(crate) enum ProcHandle {
-    /// std-spawned child, adopted into `shared_child` for concurrent wait/kill.
-    Std(SharedChild),
+    /// std-spawned child, adopted into `shared_child` for concurrent wait/kill. The flag is
+    /// [`ProcHandle::has_reaped`]'s.
+    Std(SharedChild, AtomicBool),
     /// Raw `CreateProcessW` child owning the process handle directly.
     #[cfg(windows)]
     Raw(RawChild),
 }
 
 impl ProcHandle {
+    /// Adopt a std-spawned child. `SharedChild::new` reaps a root that has already exited; the flag
+    /// reads that back from a `try_wait`.
+    pub(crate) fn std(shared: SharedChild) -> ProcHandle {
+        let reaped = matches!(shared.try_wait(), Ok(Some(_)));
+        ProcHandle::Std(shared, AtomicBool::new(reaped))
+    }
+
+    /// Whether this handle itself has reaped the root: adoption, [`wait`](Self::wait),
+    /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) returned its status.
+    /// Exact, unlike a read of the pid, which an OS refusal turns into a guess. A reap by someone
+    /// else is not seen here.
+    #[cfg(unix)]
+    pub(crate) fn has_reaped(&self) -> bool {
+        match self {
+            ProcHandle::Std(_, reaped) => reaped.load(Ordering::Acquire),
+        }
+    }
+
+    /// Record the outcome of a wait: `Some` status means the root is reaped.
+    fn note<T>(reaped: &AtomicBool, status: io::Result<T>, is_status: impl Fn(&T) -> bool) -> io::Result<T> {
+        if matches!(&status, Ok(v) if is_status(v)) {
+            reaped.store(true, Ordering::Release);
+        }
+        status
+    }
+
     /// Block until the child exits.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match self {
-            ProcHandle::Std(s) => s.wait(),
+            ProcHandle::Std(s, reaped) => Self::note(reaped, s.wait(), |_| true),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait(),
         }
@@ -35,7 +63,7 @@ impl ProcHandle {
     /// The exit status if the child has already exited, else `None`.
     pub(crate) fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         match self {
-            ProcHandle::Std(s) => s.try_wait(),
+            ProcHandle::Std(s, reaped) => Self::note(reaped, s.try_wait(), Option::is_some),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.try_wait(),
         }
@@ -45,12 +73,16 @@ impl ProcHandle {
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         match self {
             // The Raw arm rechecks inside `wait_until`, which advances the frozen clock itself.
-            ProcHandle::Std(s) => crate::wait::rearm_until(Some(Some(deadline)), |remaining| {
-                let armed = remaining
-                    .and_then(|r| Instant::now().checked_add(r))
-                    .unwrap_or(deadline);
-                std_wait_deadline(s, armed)
-            }),
+            ProcHandle::Std(s, reaped) => Self::note(
+                reaped,
+                crate::wait::rearm_until(Some(Some(deadline)), |remaining| {
+                    let armed = remaining
+                        .and_then(|r| Instant::now().checked_add(r))
+                        .unwrap_or(deadline);
+                    std_wait_deadline(s, armed)
+                }),
+                Option::is_some,
+            ),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait_deadline(deadline),
         }
@@ -59,7 +91,7 @@ impl ProcHandle {
     /// Hard-kill the process (already-exited is success).
     pub(crate) fn kill(&self) -> io::Result<()> {
         match self {
-            ProcHandle::Std(s) => s.kill(),
+            ProcHandle::Std(s, _) => s.kill(),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.kill(),
         }
@@ -68,7 +100,7 @@ impl ProcHandle {
     /// The OS process id.
     pub(crate) fn id(&self) -> u32 {
         match self {
-            ProcHandle::Std(s) => s.id(),
+            ProcHandle::Std(s, _) => s.id(),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.id(),
         }
@@ -82,8 +114,10 @@ impl ProcHandle {
     /// keying on a request flag would take the blocking `wait()` and hang Drop forever.
     /// The Windows `Raw` arm handles its own higher-integrity runas case via its flag.
     pub(crate) fn teardown_on_drop(&self) {
+        #[cfg(all(test, unix))]
+        crate::child::fault::note_root_teardown();
         match self {
-            ProcHandle::Std(s) => {
+            ProcHandle::Std(s, _) => {
                 let kill_result = s.kill();
                 match std_teardown_action(&kill_result) {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL

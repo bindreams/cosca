@@ -10,6 +10,24 @@ pub fn require_lane() {
     );
 }
 
+/// Whether the cgroup drop group runs: `COSCA_TEST_CGROUP_DROP=0` turns it off (the caller returns
+/// early), and otherwise it needs `COSCA_TEST_CGROUP_DROP_CONSENT=1` and panics without. The cgroup
+/// lane gives consent; every other lane turns the group off. Mirrors the crate's own
+/// `test_support::require_group`, which an integration test cannot reach.
+pub fn require_drop_group() -> bool {
+    if std::env::var("COSCA_TEST_CGROUP_DROP").as_deref() == Ok("0") {
+        return false;
+    }
+    assert_eq!(
+        std::env::var("COSCA_TEST_CGROUP_DROP_CONSENT").as_deref(),
+        Ok("1"),
+        "CGROUP_DROP tests need a delegated cgroup and run only in a sandbox; set \
+         COSCA_TEST_CGROUP_DROP_CONSENT=1 there to consent, or COSCA_TEST_CGROUP_DROP=0 to turn the \
+         group off"
+    );
+    true
+}
+
 /// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
 /// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
 /// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.

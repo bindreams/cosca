@@ -39,6 +39,9 @@ async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root()
     let mark = crate::log_capture::mark();
     let (child, _stdin) = treewalk_blocker();
     let id = child.id();
+    // The drop reads the root's number first, which would consume the one-shot forced view before
+    // the tree kill sees it: pin that read to "still this root".
+    let _root_read = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(id));
     let forced = force_proc_view_once(ForcedView::Diverged);
     drop(child);
     drop(forced);

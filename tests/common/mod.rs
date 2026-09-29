@@ -478,11 +478,23 @@ pub async fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
 /// [`spawn_echo_tree_async`] over any echo-tree testbin `mode`.
 #[cfg(feature = "tokio")]
 pub async fn spawn_echo_tree_async_mode(mode: &str, kill_on_drop: bool) -> AsyncEchoTree {
+    spawn_echo_tree_async_configured(mode, |cmd| {
+        cmd.contain();
+        cmd.kill_on_drop(kill_on_drop);
+    })
+    .await
+}
+
+/// [`spawn_echo_tree_async_mode`] with the containment and `kill_on_drop` set by `configure`.
+#[cfg(feature = "tokio")]
+pub async fn spawn_echo_tree_async_configured(
+    mode: &str,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> AsyncEchoTree {
     let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
-    cmd.contain();
-    cmd.kill_on_drop(kill_on_drop);
+    configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async echo tree");
