@@ -7,9 +7,10 @@
 //! assertion, and no test can erase another's records.
 
 use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 struct CaptureLog;
-static RECORDS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+static RECORDS: Mutex<Vec<(log::Level, String, ThreadId)>> = Mutex::new(Vec::new());
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
 impl log::Log for CaptureLog {
@@ -20,7 +21,7 @@ impl log::Log for CaptureLog {
         RECORDS
             .lock()
             .unwrap()
-            .push((record.level(), record.args().to_string()));
+            .push((record.level(), record.args().to_string(), std::thread::current().id()));
     }
     fn flush(&self) {}
 }
@@ -40,15 +41,17 @@ pub(crate) fn mark() -> usize {
 /// True if any record emitted at or after `mark` contains `marker`. Never panics:
 /// records are append-only, so `mark` (a past length) is always in bounds.
 pub(crate) fn contains_since(mark: usize, marker: &str) -> bool {
-    RECORDS.lock().unwrap()[mark..].iter().any(|(_, m)| m.contains(marker))
+    RECORDS.lock().unwrap()[mark..]
+        .iter()
+        .any(|(_, m, _)| m.contains(marker))
 }
 
 /// The text of every record emitted at or after `mark` that contains `marker`.
 pub(crate) fn records_since(mark: usize, marker: &str) -> Vec<String> {
     RECORDS.lock().unwrap()[mark..]
         .iter()
-        .filter(|(_, m)| m.contains(marker))
-        .map(|(_, m)| m.clone())
+        .filter(|(_, m, _)| m.contains(marker))
+        .map(|(_, m, _)| m.clone())
         .collect()
 }
 
@@ -61,8 +64,21 @@ pub(crate) fn records_since(mark: usize, marker: &str) -> Vec<String> {
 pub(crate) fn levels_since(mark: usize, marker: &str) -> Vec<log::Level> {
     RECORDS.lock().unwrap()[mark..]
         .iter()
-        .filter(|(_, m)| m.contains(marker))
-        .map(|(level, _)| *level)
+        .filter(|(_, m, _)| m.contains(marker))
+        .map(|(level, _, _)| *level)
+        .collect()
+}
+
+/// Like [`records_since`], but only records emitted by the CALLING thread. For a marker that is
+/// a constant message prefix shared by every test in the process, this is what keeps a
+/// concurrently-running test's identical record from satisfying (or breaking) the assertion.
+#[cfg(test)]
+pub(crate) fn records_since_on_current_thread(mark: usize, marker: &str) -> Vec<(log::Level, String)> {
+    let me = std::thread::current().id();
+    RECORDS.lock().unwrap()[mark..]
+        .iter()
+        .filter(|(_, m, t)| *t == me && m.contains(marker))
+        .map(|(level, m, _)| (*level, m.clone()))
         .collect()
 }
 

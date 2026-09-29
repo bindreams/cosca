@@ -32,3 +32,26 @@ fn pre_mark_records_never_satisfy_a_post_mark_scan() {
         "a record emitted after the mark must be found"
     );
 }
+
+/// A record with the same text emitted by ANOTHER thread after the mark is invisible to the
+/// current-thread scan; this thread's own record is found. The other thread is joined before the
+/// scan, so the order is fixed by the join, not by timing.
+#[test]
+fn current_thread_scan_ignores_identical_records_from_other_threads() {
+    super::install();
+    let mark = super::mark();
+    std::thread::spawn(|| log::warn!("log_capture thread-probe 3ad9"))
+        .join()
+        .expect("other thread");
+    log::warn!("log_capture thread-probe 3ad9");
+    assert_eq!(
+        super::records_since_on_current_thread(mark, "log_capture thread-probe 3ad9").len(),
+        1,
+        "only this thread's record counts"
+    );
+    assert_eq!(
+        super::records_since(mark, "log_capture thread-probe 3ad9").len(),
+        2,
+        "the unfiltered scan still sees both"
+    );
+}

@@ -822,10 +822,37 @@ fn pid_is_live_group_member(pid: RawPid, pgid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —
+/// as opposed to `Error::Containment` (a live member refused the signal), both ORDINARY,
+/// expected outcomes after #61's fix and specifically the scenario it exists to report
+/// honestly, not bugs. Used by `combine_group_errors` so the merged variant follows
+/// this one classification.
+///
+/// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
+/// `group::decide` produces `source: None` when the group WAS listed successfully but one or
+/// more of its individual members could not be confirmed cleared (`check_or_signal` /
+/// `check_or_signal_linux_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
+/// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
+/// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
+/// reason: a directly and deliberately TESTED input-validation refusal
+/// (`kill_group_and_term_group_reject_non_positive_pgid`, Task 5), not a "should never
+/// happen" internal contract violation — this function never got as far as attempting
+/// anything, the same way `group::decide`'s per-member case never got a confirmable answer.
+/// Neither provenance indicates the teardown MECHANISM'S OWN plumbing broke, which is the
+/// actual line this classifier draws. `group::state` produces `source: Some(io_error)` when
+/// `converge` itself returned `Err` — the listing syscall (`members()`'s `sysctl`/`/proc`
+/// scan) failed outright, before any member was even examined. THAT is a failure of the
+/// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
+/// statement about any member or any input — so it, alone, is treated as a mechanism failure
+/// here.
+pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
+    matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
+}
+
 /// Fold two `Error`s from different `sweep` passes (or a pass's group-signal result against
 /// the `incomplete` summary) into one, choosing the merged VARIANT by severity rather than by
 /// which side happened to be checked first. `is_teardown_mechanism_failure`
-/// (`src/child.rs`) is the single source of truth for "is this a genuine mechanism failure,
+/// (above) is the single source of truth for "is this a genuine mechanism failure,
 /// or an ordinary refusal" — reused here rather than re-derived, so this function and the
 /// classifier can never quietly drift apart on what counts as which.
 ///
@@ -838,7 +865,7 @@ fn pid_is_live_group_member(pid: RawPid, pgid: i32) -> bool {
 /// which `Error` happened to already exist when the second one arrived.
 fn combine_group_errors(first: Error, latest: Error) -> Error {
     let detail = format!("{first}; {latest}");
-    if crate::child::is_teardown_mechanism_failure(&first) || crate::child::is_teardown_mechanism_failure(&latest) {
+    if is_teardown_mechanism_failure(&first) || is_teardown_mechanism_failure(&latest) {
         Error::Io(io::Error::other(detail))
     } else {
         Error::Containment { detail }
@@ -941,7 +968,7 @@ impl Marker {
     /// the signal, or could not be fully assessed/reached (`Error::Containment` /
     /// `Error::Unassessable { source: None, .. }`) — the same distinction #61 established
     /// for `ProcessGroup`/`Session` (`src/containment/unix.rs`'s `verify`). Callers, in
-    /// particular `is_teardown_mechanism_failure` (`src/child.rs`), rely on that distinction
+    /// particular `is_teardown_mechanism_failure` (this file), rely on that distinction
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
     pub(crate) fn hard_kill(&self) -> Result<(), Error> {
