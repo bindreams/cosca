@@ -145,6 +145,8 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => {
+                #[cfg(test)]
+                fault::run_between_kill_and_wait();
                 let _ = self.wait();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
@@ -263,6 +265,43 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> io::Error {
         io::Error::from_raw_os_error((code & 0xFFFF) as i32)
     } else {
         io::Error::from_raw_os_error(code as i32)
+    }
+}
+
+/// Test-only seam inside [`RawChild::teardown_on_drop`].
+#[cfg(test)]
+pub(crate) mod fault {
+    thread_local! {
+        static BETWEEN_KILL_AND_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` in the NEXT `teardown_on_drop` on this thread, once its `TerminateProcess` has
+    /// returned `Ok` and before its blocking wait. A fixture that never exits on its own would
+    /// hang that wait if the terminate were a no-op; the hook ends it another way, so the test
+    /// fails on how the child died instead.
+    ///
+    /// The returned guard clears the slot on drop, so a hook whose fire point was never reached
+    /// cannot leak into a later test on this thread. Arming over a live hook is a test bug.
+    pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
+        let previous = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().replace(Box::new(hook)));
+        debug_assert!(previous.is_none(), "a between-kill-and-wait hook is already armed");
+        ArmedBetweenKillAndWait
+    }
+    pub(crate) fn run_between_kill_and_wait() {
+        let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    /// Clears the [`set_between_kill_and_wait`] slot on drop.
+    #[must_use]
+    pub(crate) struct ArmedBetweenKillAndWait;
+    impl Drop for ArmedBetweenKillAndWait {
+        fn drop(&mut self) {
+            let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
+            drop(hook);
+        }
     }
 }
 
