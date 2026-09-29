@@ -121,7 +121,7 @@ impl RawChild {
             if r == WAIT_OBJECT_0 {
                 return Ok(Some(exit_status(self.handle())?));
             } else if r == WAIT_TIMEOUT {
-                if Instant::now() >= deadline {
+                if millis != u32::MAX - 1 || Instant::now() >= deadline {
                     return Ok(None);
                 }
                 continue; // WAIT_TIMEOUT fired before the real deadline (clamped or not); re-arm
