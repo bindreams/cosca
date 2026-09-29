@@ -62,7 +62,18 @@ impl RawChild {
     fn can_terminate(&self) -> bool {
         // SAFETY: our live owned handle pins the process object, so `self.pid` still names
         // THIS process; OpenProcess tolerates failure (returns Err).
+        #[cfg(test)]
+        if fault::probe_forced_unterminable() {
+            return false;
+        }
         super::can_terminate(self.pid)
+    }
+
+    /// Block on the exit that a denied or accepted `TerminateProcess` has set in motion.
+    fn reap(&self) -> io::Result<ExitStatus> {
+        #[cfg(test)]
+        fault::before_blocking_wait();
+        self.wait()
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -129,7 +140,7 @@ impl RawChild {
                     // (a) Our own CreateProcessW child, or a runas child we DO have terminate
                     // rights on: the denial means exit is already underway. BLOCK on that real
                     // event (never a timer) to confirm it.
-                    self.wait()?;
+                    self.reap()?;
                     Ok(())
                 }
             }
@@ -145,9 +156,7 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => {
-                #[cfg(test)]
-                fault::run_between_kill_and_wait();
-                _ = self.wait();
+                _ = self.reap();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
@@ -156,7 +165,7 @@ impl RawChild {
                         self.pid
                     );
                 } else {
-                    _ = self.wait();
+                    _ = self.reap();
                 }
             }
             Err(e) => log::warn!("terminating child {} on drop failed: {e:?}", self.pid),
@@ -268,39 +277,78 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> io::Error {
     }
 }
 
-/// Test-only seam inside [`RawChild::teardown_on_drop`].
+/// Seam for [`RawChild::kill`] and [`RawChild::teardown_on_drop`].
 #[cfg(test)]
 pub(crate) mod fault {
-    thread_local! {
-        static BETWEEN_KILL_AND_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct State {
+        armed: bool,
+        on_wait: Option<Box<dyn FnMut()>>,
+        waits: u32,
+        unterminable: bool,
     }
 
-    /// Run `hook` in the NEXT `teardown_on_drop` on this thread, once its `TerminateProcess` has
-    /// returned `Ok` and before its blocking wait. A fixture that never exits on its own would
-    /// hang that wait if the terminate were a no-op; the hook ends it another way, so the test
-    /// fails on how the child died instead.
-    ///
-    /// The returned guard clears the slot on drop, so a hook whose fire point was never reached
-    /// cannot leak into a later test on this thread. Arming over a live hook is a test bug.
-    pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
-        let previous = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().replace(Box::new(hook)));
-        debug_assert!(previous.is_none(), "a between-kill-and-wait hook is already armed");
-        ArmedBetweenKillAndWait
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
     }
-    pub(crate) fn run_between_kill_and_wait() {
-        let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
-        if let Some(hook) = hook {
+
+    /// Run `on_wait` before every blocking reap on this thread and count them. Lets a test end a
+    /// never-exiting fixture a second way, so a no-op terminate fails on exit code, not by hanging.
+    ///
+    /// The guard resets the state on drop. Arming over a live guard is a test bug.
+    pub(crate) fn observe_waits(on_wait: impl FnMut() + 'static) -> Observer {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            debug_assert!(!s.armed, "the wait observer is already armed");
+            *s = State {
+                armed: true,
+                on_wait: Some(Box::new(on_wait)),
+                ..State::default()
+            };
+        });
+        Observer
+    }
+
+    pub(crate) fn before_blocking_wait() {
+        let hook = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            if !s.armed {
+                return None;
+            }
+            s.waits += 1;
+            s.on_wait.take()
+        });
+        if let Some(mut hook) = hook {
             hook();
+            STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
         }
     }
-    /// Clears the [`set_between_kill_and_wait`] slot on drop.
+
+    pub(crate) fn probe_forced_unterminable() -> bool {
+        STATE.with(|s| s.borrow().unterminable)
+    }
+
     #[must_use]
-    pub(crate) struct ArmedBetweenKillAndWait;
-    impl Drop for ArmedBetweenKillAndWait {
+    pub(crate) struct Observer;
+
+    impl Observer {
+        /// Blocking reaps started since arming.
+        pub(crate) fn waits(&self) -> u32 {
+            STATE.with(|s| s.borrow().waits)
+        }
+
+        /// Make `can_terminate` answer `false`, as for a higher-integrity child.
+        pub(crate) fn force_unterminable(&self) {
+            STATE.with(|s| s.borrow_mut().unterminable = true);
+        }
+    }
+
+    impl Drop for Observer {
         fn drop(&mut self) {
-            let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
-            drop(hook);
+            let state = STATE.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            drop(state);
         }
     }
 }
