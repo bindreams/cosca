@@ -762,6 +762,7 @@ impl Drop for Child {
 
 /// The signals of a kill-on-drop drop: the tree, then the root.
 fn signal_on_drop(id: ProcessId, os: &mut OsResources) {
+    _ = os.attached.wait_drained(None);
     let pid = id.pid();
     let reaped = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
     // A `killpg` names its group by the root's number. Once the root is reaped, that number may
