@@ -101,12 +101,17 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         Ok(()) => {
             #[cfg(test)]
             fault::run_between_kill_and_wait();
-            let _waited = child.wait();
-            #[cfg(test)]
-            if let Ok(status) = &_waited {
-                fault::record_teardown_reap(child.id().pid(), *status);
+            match wait_killed_elevated(&child) {
+                Ok(_status) => {
+                    #[cfg(test)]
+                    fault::record_teardown_reap(child.id().pid(), _status);
+                    "the elevated child was terminated".to_string()
+                }
+                Err(e) => {
+                    log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
+                    format!("the elevated child was killed but could not be reaped ({e})")
+                }
             }
-            "the elevated child was terminated".to_string()
         }
         Err(e) => {
             _ = child.try_wait();
@@ -117,6 +122,18 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),
     })
+}
+
+/// `child.wait()` after the root's kill, which a test can force to fail. The forced failure still
+/// REAPS first, so the test that asks for it leaks nothing.
+#[cfg(unix)]
+fn wait_killed_elevated(child: &Child) -> Result<std::process::ExitStatus, Error> {
+    let waited = child.wait();
+    #[cfg(test)]
+    if let Some(marker) = fault::take_force_reap_failure() {
+        return waited.and(Err(Error::Io(std::io::Error::other(marker))));
+    }
+    waited
 }
 
 /// The head of the `warn` line [`report_tree_teardown`] logs.
@@ -1203,11 +1220,11 @@ pub(crate) mod fault {
         CAPTURED.with(|c| c.take())
     }
 
-    /// Run `hook` in the NEXT `teardown_unadopted` on this thread, once `kill_unadopted` has
-    /// already returned `Ok` and before `reap_unadopted`'s blocking `wait()`. A fixture that
-    /// would otherwise have nothing to end it if that kill were a no-op (the blocking wait would
-    /// then hang) is released here instead, so a no-kill mutant fails an assertion on how the
-    /// child died (see [`record_teardown_reaps`]) rather than hanging.
+    /// Run `hook` at the next kill-then-blocking-wait teardown on this thread, once the kill has
+    /// returned `Ok` and before the wait: `teardown_unadopted`, the sync `finish_elevated`, or the
+    /// async `wait_and_reap`. A fixture that only that kill would end is released here, so a
+    /// no-kill mutant fails an assertion on how the child died (see [`record_teardown_reaps`])
+    /// instead of hanging the wait.
     pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
         crate::oneshot_hook::arm(&BETWEEN_KILL_AND_WAIT, hook)
     }
@@ -1219,8 +1236,9 @@ pub(crate) mod fault {
     /// A reaped teardown child's pid and exit status.
     type TeardownReap = (u32, std::process::ExitStatus);
 
-    /// Record the pid and status of every child `reap_unadopted` waits on for real on this
-    /// thread until the returned guard drops.
+    /// Record the pid and status of every child those three teardowns (see
+    /// [`set_between_kill_and_wait`]) wait on for real on this thread until the returned guard
+    /// drops. A failed wait records nothing.
     pub(crate) fn record_teardown_reaps() -> TeardownReaps {
         let previous = TEARDOWN_REAPS.with(|r| r.borrow_mut().replace(Vec::new()));
         debug_assert!(previous.is_none(), "teardown reaps are already being recorded");
@@ -1249,41 +1267,86 @@ pub(crate) mod fault {
         }
     }
 
-    /// A stdin for a child that only a kill ends, plus the guard that makes a no-kill mutant fail
-    /// fast: the stdin's writer is released BETWEEN the code under test's kill and its blocking
-    /// wait ([`set_between_kill_and_wait`]), so a kill that did nothing lets the child exit 0 by
-    /// itself and [`TeardownBlocker::assert_killed`] fails, instead of the wait hanging. Keep the
-    /// guard alive through the assertion: dropping it clears the hook and the recorder.
+    /// A stdin for a child only a kill ends. Its writer is released between the code under test's
+    /// kill and its blocking wait ([`set_between_kill_and_wait`]), so a no-kill mutant lets the
+    /// child exit 0 and fails [`TeardownBlocker::assert_killed`] rather than hanging the wait. Keep
+    /// the guard alive through the assertion: dropping it clears the hook and recorder.
     ///
     /// The child must exit 0 on stdin EOF: `cat` on Unix, `more.com` on Windows (whose `findstr x`
-    /// exits 1, which is what a kill reports) with a null stdout, because `more` echoes.
+    /// exits 1, which is what a kill reports) with a null stdout, because `more` echoes. Use
+    /// [`teardown_blocker_parts`] to get the whole child.
     pub(crate) fn teardown_blocker_stdin() -> (crate::stdio::Stdio, TeardownBlocker) {
         let (reader, writer) = std::io::pipe().expect("pipe");
         #[cfg(unix)]
         let reader = std::os::fd::OwnedFd::from(reader);
         #[cfg(windows)]
         let reader = std::os::windows::io::OwnedHandle::from(reader);
-        let release = set_between_kill_and_wait(move || drop(writer));
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let release = set_between_kill_and_wait({
+            let fired = std::rc::Rc::clone(&fired);
+            move || {
+                drop(writer);
+                fired.set(true);
+            }
+        });
         let reaps = record_teardown_reaps();
         (
             crate::stdio::Stdio::from_file(std::fs::File::from(reader)),
             TeardownBlocker {
                 _release: release,
+                fired,
                 reaps,
             },
         )
+    }
+
+    /// Everything a test needs to configure a [`teardown_blocker_stdin`] child on either
+    /// `Command` type: apply `argv`, `stdin`, and `stdout` when it is `Some`.
+    pub(crate) struct TeardownBlockerParts {
+        pub(crate) argv: Vec<std::ffi::OsString>,
+        pub(crate) stdin: crate::stdio::Stdio,
+        pub(crate) stdout: Option<crate::stdio::Stdio>,
+        pub(crate) guard: TeardownBlocker,
+    }
+
+    /// The argv and stdio of a [`teardown_blocker_stdin`] child, for the sync and async `Command`.
+    pub(crate) fn teardown_blocker_parts() -> TeardownBlockerParts {
+        let (stdin, guard) = teardown_blocker_stdin();
+        #[cfg(unix)]
+        let (argv, stdout) = (crate::test_child::BLOCKER_ARGV.iter().map(Into::into).collect(), None);
+        #[cfg(windows)]
+        let (argv, stdout) = (
+            vec![crate::test_child::windows_more().into_os_string()],
+            Some(crate::stdio::Stdio::null()),
+        );
+        TeardownBlockerParts {
+            argv,
+            stdin,
+            stdout,
+            guard,
+        }
     }
 
     /// See [`teardown_blocker_stdin`].
     #[must_use]
     pub(crate) struct TeardownBlocker {
         _release: ArmedBetweenKillAndWait,
+        fired: std::rc::Rc<std::cell::Cell<bool>>,
         reaps: TeardownReaps,
     }
     impl TeardownBlocker {
-        /// Every child the teardown reaped was killed by its kill (`SIGKILL` on Unix, exit code 1 on
-        /// Windows), not merely reaped once it exited on its own.
+        /// The `(pid, status)` of each reap the teardown recorded so far.
+        pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
+            self.reaps.recorded()
+        }
+
+        /// The teardown's kill fired the release hook, and every child it reaped died of
+        /// `SIGKILL` (Unix) or exit code 1 (Windows).
         pub(crate) fn assert_killed(&self) {
+            assert!(
+                self.fired.get(),
+                "the teardown must have reached its between-kill-and-wait hook"
+            );
             let reaps = self.reaps.recorded();
             assert!(!reaps.is_empty(), "the teardown must have reaped the child");
             for (pid, status) in reaps {

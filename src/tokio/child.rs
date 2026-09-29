@@ -889,7 +889,6 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
         );
         return;
     }
-    // The caller's kill has succeeded: a test releases a fixture only that kill would end.
     #[cfg(test)]
     crate::child::spawn::fault::run_between_kill_and_wait();
     #[cfg(unix)]
@@ -899,22 +898,24 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
         // target and the identical syscall.
         debug_assert!(pid <= i32::MAX as u32, "pid {pid} exceeds i32::MAX");
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
+        let _waited = loop {
             // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed `siginfo_t` the
             // kernel fills in. WNOWAIT leaves the child reapable for tokio's in-drop reap.
             let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
             if rc == 0 {
-                break;
+                break true;
             }
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             log::warn!("wait_and_reap: waitid on pid {pid} failed: {err}");
-            break;
-        }
+            break false;
+        };
         #[cfg(test)]
-        crate::child::spawn::fault::record_teardown_reap(pid, exit_status_of(&info));
+        if _waited {
+            crate::child::spawn::fault::record_teardown_reap(pid, exit_status_of(&info));
+        }
     }
     #[cfg(windows)]
     {
@@ -941,19 +942,21 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
     }
 }
 
-/// The `ExitStatus` a `waitid(WEXITED | WNOWAIT)` reported, in the raw `wait` encoding.
+/// Re-encodes a `waitid` result as a raw `wait` status.
 #[cfg(all(test, unix))]
 fn exit_status_of(info: &libc::siginfo_t) -> std::process::ExitStatus {
-    use std::os::unix::process::ExitStatusExt as _;
     // SAFETY: `info` was filled in by a successful `waitid`, which sets `si_status`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let status = unsafe { info.si_status() };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let status = info.si_status;
-    let raw = match info.si_code {
-        libc::CLD_EXITED => status << 8,
-        libc::CLD_DUMPED => status | 0x80,
-        _ => status, // CLD_KILLED: the signal number
+    exit_status_from_parts(info.si_code, unsafe { info.si_status() })
+}
+
+/// [`exit_status_of`] on the `si_code` and `si_status` of a `SIGCHLD` `siginfo_t`.
+#[cfg(all(test, unix))]
+fn exit_status_from_parts(si_code: libc::c_int, si_status: libc::c_int) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    let raw = match si_code {
+        libc::CLD_EXITED => si_status << 8,
+        libc::CLD_DUMPED => si_status | 0x80,
+        _ => si_status, // CLD_KILLED: the signal number
     };
     std::process::ExitStatus::from_raw(raw)
 }

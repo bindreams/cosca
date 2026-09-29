@@ -6,24 +6,24 @@ use crate::child::spawn::fault;
 use crate::error::Error;
 use crate::tokio::Command;
 
-/// [`blocker`] for a test that drives a kill-then-blocking-reap: the stdin writer is released
-/// between the two, so a kill that did nothing fails `assert_killed` instead of hanging the reap.
-/// See `child::spawn_tests::teardown_blocker`.
+/// [`blocker`] for a kill-then-blocking-reap test; see [`fault::teardown_blocker_stdin`].
 fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
+    let fault::TeardownBlockerParts {
+        argv,
+        stdin,
+        stdout,
+        guard,
+    } = fault::teardown_blocker_parts();
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    #[cfg(windows)]
-    {
-        cmd.args([crate::test_child::windows_more()]);
-        cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout null");
-    }
-    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
-    (cmd, teardown)
+    if let Some(stdout) = stdout {
+        cmd.stdout(stdout).expect("set stdout");
+    }
+    (cmd, guard)
 }
 
-// A child only a real kill ends — see `child::spawn_tests::blocker`.
+// A child only a real kill ends, its stdin writer leaked — see `child::spawn_tests::blocker`.
 #[cfg(target_os = "linux")]
 fn blocker() -> Command {
     let mut cmd = Command::new();
@@ -352,7 +352,7 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
     );
     let _ = crate::containment::cgroup::fault::take_reaped_orphans();
     fault::set_force_identity_vanished(true);
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.contain();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
@@ -364,6 +364,7 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
         "the leaf must not reap a child tokio owns"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
 }
 
 /// On the identity-failure path, a child tokio could not kill (`EPERM`) goes to tokio's orphan
@@ -524,26 +525,30 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
 // kill_on_drop(false) commits only with the spawn -----
 // Async twins of the sync `spawn_tests` of the same name.
 
-/// The sync command `spawn_uncommitted` takes: a [`blocker`] with `kill_on_drop(false)`.
+/// The sync command `spawn_uncommitted` takes: a [`blocker`] on `stdin` with `kill_on_drop(false)`.
 #[cfg(target_os = "linux")]
-fn opted_out_blocker() -> crate::command::Command {
+fn opted_out_blocker(stdin: crate::stdio::Stdio) -> crate::command::Command {
     let mut cmd = crate::command::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::test_child::leaked_writer_stdin())
-        .expect("set stdin pipe");
+    cmd.stdin(stdin).expect("set stdin pipe");
     cmd.kill_on_drop(false);
     cmd
 }
 
-/// [`opted_out_blocker`] for a test that drives a kill-then-blocking-reap: see [`teardown_blocker`].
+/// [`teardown_blocker`] with `kill_on_drop(false)`, as a sync command for `spawn_uncommitted`.
 #[cfg(target_os = "linux")]
 fn opted_out_teardown_blocker() -> (crate::command::Command, fault::TeardownBlocker) {
+    let fault::TeardownBlockerParts {
+        argv,
+        stdin,
+        stdout: _,
+        guard,
+    } = fault::teardown_blocker_parts();
     let mut cmd = crate::command::Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    cmd.args(argv);
     cmd.stdin(stdin).expect("set stdin pipe");
     cmd.kill_on_drop(false);
-    (cmd, teardown)
+    (cmd, guard)
 }
 
 /// An occupied temp leaf whose child entered it, attached to the next spawn on this thread.
@@ -568,12 +573,21 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-async-commit-leaf");
         attach_entered_leaf(&leaf_path);
-        let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = opted_out_blocker(stdin);
+        let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
         if commit {
             child.commit_kill_on_drop();
         }
         child.kill().expect("end the stand-in root");
-        _ = child.wait().await;
+        // Released only after the kill, so a child that exits 0 was not killed.
+        drop(writer);
+        let status = child.wait().await.expect("reap the stand-in root");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL),
+            "the stand-in root must die of the kill, got {status:?}"
+        );
         drop(child);
 
         let expected: &[u8] = if commit { b"" } else { b"1" };
@@ -709,7 +723,8 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-password-kill-fail-leaf");
     attach_entered_leaf(&leaf_path);
-    let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.detach();
 
@@ -720,6 +735,7 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     let _fence = ReaperFence::arm();
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
     assert!(
         crate::tokio::child::reaper::test_probe::take().is_some(),
         "a leaf whose kill was refused is not handed to the reaper, so there is nothing to fence"
