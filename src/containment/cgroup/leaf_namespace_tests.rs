@@ -8,9 +8,6 @@ use crate::containment::TreeDrain;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
-const OVERMOUNT_MARKER: &str = "COSCA_FIXTURE_LEAF_OVERMOUNT";
-const FORCED_SAME_MARKER: &str = "COSCA_FIXTURE_LEAF_FORCED_SAME";
-
 fn require_cgroup() {
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
@@ -50,12 +47,12 @@ fn namespaces_cgroup_membership_is_read_through_the_checked_proc_dirfd() {
         return;
     }
     require_cgroup();
-    ns::run(fixture_path!(fixture_leaf_overmount), OVERMOUNT_MARKER);
+    ns::run(fixture_path!(fixture_leaf_overmount));
 }
 
 #[test]
 fn fixture_leaf_overmount() {
-    if !ns::is_child(OVERMOUNT_MARKER) {
+    if !ns::is_child() {
         return;
     }
     ns::enter_private_mount_ns();
@@ -87,12 +84,12 @@ fn namespaces_cgroup_a_forced_same_view_reads_the_real_proc() {
         return;
     }
     require_cgroup();
-    ns::run(fixture_path!(fixture_leaf_forced_same), FORCED_SAME_MARKER);
+    ns::run(fixture_path!(fixture_leaf_forced_same));
 }
 
 #[test]
 fn fixture_leaf_forced_same() {
-    if !ns::is_child(FORCED_SAME_MARKER) {
+    if !ns::is_child() {
         return;
     }
     let (mut leaf, mut member, _own) = occupied_leaf();
