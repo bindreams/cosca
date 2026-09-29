@@ -758,6 +758,10 @@ fn signal_on_drop(pid: u32, os: &mut OsResources) {
         // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
         log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
     }
+    // MUTANT (tmp/ur343-drain): wait for the tree's drain after a successful tree kill.
+    else if os.attached.can_observe_drain() {
+        let _ = os.attached.wait_drained(None);
+    }
     // Already reaped: no signal to issue.
     let Some(proc) = os.proc.as_mut().filter(|proc| !proc.is_reaped()) else {
         return;
