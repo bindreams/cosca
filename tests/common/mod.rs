@@ -17,6 +17,43 @@ pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
+/// A program that blocks reading its stdin and ends only by a real kill or the caller closing
+/// that pipe: `cat` on Unix; on Windows `more.com` by its `System32` path, so no `PATH` entry can
+/// stand in for it. Unlike `findstr x`, `more` exits 0 on EOF, so [`assert_killed`] can tell a
+/// kill from a natural end. Mirrors the library's `test_child::windows_more`, which this separate
+/// compilation unit cannot name. Spawn it with a piped stdin and a null stdout (`more` echoes).
+pub fn stdin_blocker_program() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        "cat".into()
+    }
+    #[cfg(windows)]
+    {
+        std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
+            .join("System32")
+            .join("more.com")
+    }
+}
+
+/// The child of [`stdin_blocker_program`] died to a kill, not by exiting on its own once its
+/// stdin closed: `SIGKILL` on Unix, a non-zero exit on Windows.
+pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "{who} must be SIGKILLed, not exit on its own: {status:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "{who} must be killed, not exit on its own: {status:?}"
+    );
+}
+
 /// Run `cmd` under `cosca::test_spawn_lock()` and return its captured output — the ONLY way
 /// this test surface should fork a RAW `std::process::Command` (one not going through
 /// `cosca::Command`, which already takes this same lock internally). Cargo runs `#[test]` fns

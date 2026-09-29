@@ -273,6 +273,8 @@ impl Child {
             }
             Err(e) => return Err(e), // unchanged pre-existing behavior: no signal sent, no grace, no sweep
         };
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
 
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         //
@@ -352,6 +354,8 @@ impl Child {
                 return Err(sweep);
             }
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait().await?;
         if let Some(e) = watch_err {
             return Err(e);
@@ -427,6 +431,48 @@ pub(crate) mod fault {
     }
     pub(crate) fn forced_kill_tree_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
+    }
+
+    /// Where in `graceful_shutdown_tree` a test hook runs.
+    #[derive(Clone, Copy)]
+    pub(crate) enum HookPoint {
+        /// After `terminate_tree` returned `Ok` (or was held), before any drain or exit watch.
+        AfterTerminate,
+        /// After the sweep returned `Ok` (or was skipped), before the root is reaped.
+        BeforeReap,
+    }
+    type Hook = Option<Box<dyn FnOnce()>>;
+    thread_local! {
+        static HOOKS: std::cell::RefCell<[Hook; 2]> = const { std::cell::RefCell::new([None, None]) };
+    }
+    /// Drop `held` (a stdin a fixture blocks on) when `graceful_shutdown_tree` reaches `point`.
+    ///
+    /// A fixture whose only end is a real signal would otherwise hang the call's own blocking
+    /// wait if the signal under test never came. Released here instead, it ends by itself with
+    /// status 0, so the test's assertion on HOW it died fails at once. A real signal delivered
+    /// before `point` is already pending, so it always beats the release.
+    ///
+    /// The returned guard clears the slot on drop, so a release whose point was never reached
+    /// cannot fire in a later test on this thread. Arming over a live hook is a test bug.
+    pub(crate) fn release_at(point: HookPoint, held: impl Sized + 'static) -> ArmedHook {
+        let previous = HOOKS.with(|h| h.borrow_mut()[point as usize].replace(Box::new(move || drop(held))));
+        debug_assert!(previous.is_none(), "a hook is already armed at this point");
+        ArmedHook(point)
+    }
+    pub(crate) fn run_hook(point: HookPoint) {
+        let hook = HOOKS.with(|h| h.borrow_mut()[point as usize].take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    /// Clears the [`release_at`] slot on drop.
+    #[must_use]
+    pub(crate) struct ArmedHook(HookPoint);
+    impl Drop for ArmedHook {
+        fn drop(&mut self) {
+            let hook = HOOKS.with(|h| h.borrow_mut()[self.0 as usize].take());
+            drop(hook);
+        }
     }
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
