@@ -33,7 +33,7 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
 /// first read: `cgroup.events` changing, and the leaf's removal (`IN_DELETE` on its parent). The
 /// second matters because removing a cgroup can cancel the `populated` notification the kernel
 /// postponed (see cosca's `DrainWatch`), and the handle's own `Drop` may remove the leaf
-/// concurrently: the async handle drops it on a reaper thread. `ENOENT` or `ENODEV` from any step
+/// concurrently: an async drop removes a drained leaf on its own thread. `ENOENT` or `ENODEV` from any step
 /// means it is gone, which is the goal.
 pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
     wait_drained(leaf);

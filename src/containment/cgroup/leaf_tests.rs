@@ -237,8 +237,18 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 // CgroupLeaf::wait_drained real-mechanism test -----
 // Linux + cgroup-v2 only, and only when CI provisions a delegated leaf (COSCA_TEST_CGROUP=1) —
 // the same gating convention `tests/spawn_io.rs`'s `linux_cgroup_v2_*` tests already use: a true
-// no-op without the marker, but a loud panic (never a silent pass) if the marker is set and no
-// usable delegated cgroup v2 leaf actually exists.
+// no-op without the marker (or with `COSCA_TEST_CGROUP=0`, which CI's ordinary jobs set), but a
+// loud panic (never a silent pass) if the marker is set and no usable delegated cgroup v2 leaf
+// actually exists.
+
+/// Whether the caller provisioned a delegated cgroup for the two unignored real-cgroup tests
+/// below: `COSCA_TEST_CGROUP` set to anything but `0`. Until these tests migrate to the
+/// default-on group shape (#234), an explicit `0` is how CI's ordinary jobs switch the group off
+/// for every test that reads it.
+#[cfg(target_os = "linux")]
+fn cgroup_lane_provisioned() -> bool {
+    std::env::var_os("COSCA_TEST_CGROUP").is_some_and(|v| v != "0")
+}
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
@@ -259,7 +269,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+    if !cgroup_lane_provisioned() {
         // Unprovisioned: not a CI-cgroup environment — true no-op, never a false "ok".
         return;
     }
@@ -445,7 +455,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
+    if !cgroup_lane_provisioned() {
         return; // unprovisioned: not a CI-cgroup environment.
     }
     let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
@@ -1142,40 +1152,6 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     assert!(
         after_kill.iter().all(|s| s.starts_with("rmdir populated 0")),
         "every rmdir after the re-fired kill must wait for the drain, got {steps:?}"
-    );
-}
-
-/// The predicate `Child::drop` (async) uses to route a disarmed leaf's drain wait off the
-/// dropping thread and onto the reaper pool: true only once the child entered, `Drop` is
-/// disarmed, and a kill this handle already fired means `Drop` still waits for that kill's drain
-/// (see `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` above) —
-/// false for an armed leaf (its own `Drop` kills and waits synchronously by design) and false for
-/// a disarmed leaf nothing has killed yet (nothing to wait for).
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
-fn disarmed_kill_may_block_drop_is_true_only_once_entered_disarmed_and_killed() {
-    use crate::containment::cgroup::test_support::FakeLeaf;
-
-    // Not populated: if `Drop` runs at the end of this test, its drain wait (armed or disarmed)
-    // reads already-drained and returns at once, so no hook is needed to avoid a hang.
-    let fake = FakeLeaf::new("cosca-disarmed-predicate-leaf", false);
-    let leaf = entered_leaf_at(fake.leaf.clone());
-    assert!(
-        !leaf.disarmed_kill_may_block_drop(),
-        "an armed leaf's own Drop kills and waits itself; it never needs routing"
-    );
-
-    leaf.disarm();
-    assert!(
-        !leaf.disarmed_kill_may_block_drop(),
-        "a disarmed leaf nothing has killed yet has no drain to wait for"
-    );
-
-    leaf.hard_kill().expect("kill the tree");
-    assert!(
-        leaf.disarmed_kill_may_block_drop(),
-        "a disarmed leaf this handle already killed still waits for the drain in Drop, and that \
-         wait must be routed off the caller's thread"
     );
 }
 

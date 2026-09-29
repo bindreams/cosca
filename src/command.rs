@@ -519,32 +519,41 @@ impl Command {
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) before dropping if the
     /// child needs one.
     ///
-    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the drop waits for the tree to be gone**
-    /// before it removes the tree's leaf: it waits while any process remains in the leaf. That is
-    /// almost always instant, since every member was just sent `SIGKILL`. It lasts as long as a
-    /// member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2) the sync drop waits for the tree to be
+    /// gone** before it removes the tree's leaf: it waits while any process remains in the leaf.
+    /// That is almost always instant, since every member was just sent `SIGKILL`. It lasts as long
+    /// as a member stuck in uninterruptible I/O (D state) stays stuck, and as long as any process
     /// another party (the same uid, or root) moves into the leaf after the kill keeps running:
-    /// the kill reaches only the processes in the leaf when it is written. On kernels before
-    /// 6.14 (without commit b69bb476dee9, "cgroup: fix race between fork and cgroup.kill"), a
-    /// child a member forks at the moment of the kill can escape it too, and the drop waits for
-    /// that child's whole life. Neither case raises an event cosca could re-kill on: `populated`
-    /// does not change, and a fork writes no file. Under every other
+    /// the kill reaches only the processes in the leaf when it is written. Under every other
     /// mechanism descendants are killed, not waited for. To wait explicitly, call
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
+    /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
+    /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable
+    /// kernel that carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged
+    /// `Cc: stable # v5.14+`). On a kernel without it, a child forked while `cgroup.kill` runs can
+    /// escape the kill and keep running. [`wait_tree`](crate::Child::wait_tree) then waits for it,
+    /// and so does the sync drop, which waits for that child's whole life. A bare async drop leaves
+    /// the leaf behind with its warning. Neither case raises an event cosca could re-kill on:
+    /// `populated` does not change, and a fork writes no file. cosca does not probe for the fix.
+    ///
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
     /// until the root has exited, so after `drop` returns the child is gone. The async
-    /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
-    /// destructor is not something the caller can await or cancel — and hands the wait to reaper
-    /// threads of its own, so the reap happens later and off this thread. Its cgroup leaf's wait
-    /// happens there too, unless the drop releases the handle on the dropping thread: for a root
-    /// already reaped, one it could not signal, or when no reaper thread could be started.
+    /// [`Child`](crate::tokio::Child) does bounded work only, because a destructor cannot be
+    /// awaited or cancelled and parking a runtime worker in one stops every task on it: it sends
+    /// the signals, writes `cgroup.kill`, makes one `rmdir`, and returns. It never waits for the
+    /// root or for a drain.
     ///
-    /// The async reap is **not** unconditional: a host too thread-starved to start the pool falls
-    /// back to the runtime's orphan handling, and a process that forks without `exec` loses it
-    /// entirely in the forked child. Code that must know the child is gone should `kill` and
-    /// `await` [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
-    /// rustdoc for both paths.
+    /// - A root still running when the async handle drops is left to tokio's own drop of its
+    ///   `Child`, which reaps it best-effort: an in-drop `try_wait`, then tokio's orphan queue,
+    ///   which drains only while some tokio runtime runs. cosca keeps no reaper of its own.
+    /// - A cgroup leaf that has not drained is **left behind**, and a warning names it, if the
+    ///   drop killed it or was armed to. [`wait_tree`](crate::tokio::Child::wait_tree) awaited
+    ///   before the drop is how to have the leaf removed.
+    ///
+    /// Code that must know the child is gone should `kill` and `await`
+    /// [`wait`](crate::tokio::Child::wait) rather than rely on the drop. See that `Drop`'s
+    /// rustdoc, which also covers a process that forks without `exec`.
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
@@ -556,10 +565,11 @@ impl Command {
     /// a `SIGTERM` is catchable, so the tree may outlive it — which
     /// [`wait_tree`](crate::Child::wait_tree) before the drop is what proves either case is done.
     /// [`kill_tree`](crate::Child::kill_tree) is different: that kill is atomic, so once it has
-    /// returned `Ok`, a drop after it waits for that kill's drain before giving up the leaf, the
-    /// same as it would with `kill_on_drop` left on (for the async handle, that wait happens off
-    /// the dropping thread — see that `Drop`'s rustdoc). A `kill_tree()` that returned `Err`
-    /// leaves nothing for the drop to wait for. cosca does not come back
+    /// returned `Ok`, a sync drop after it waits for that kill's drain before giving up the leaf,
+    /// the same as it would with `kill_on_drop` left on. The async drop does not wait: it leaves
+    /// the leaf behind with a warning unless [`wait_tree`](crate::tokio::Child::wait_tree)
+    /// drained it first. A `kill_tree()` that returned `Err` leaves nothing for the drop to wait
+    /// for. cosca does not come back
     /// for a leaf it left: the empty `cosca-*` directory stays until something else removes it,
     /// such as systemd removing a stopped unit's cgroup subtree.
     pub fn kill_on_drop(&mut self, yes: bool) -> &mut Command {

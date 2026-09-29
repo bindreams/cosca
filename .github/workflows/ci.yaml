@@ -23,6 +23,8 @@ env:
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
+  # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
+  COSCA_TEST_CGROUP: "0"
 
 jobs:
   lint:
@@ -282,7 +284,8 @@ jobs:
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            export COSCA_TEST_CGROUP=1
+            # The cgroup tests: a delegated cgroup on a throwaway runner, so consent is given.
+            export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))"

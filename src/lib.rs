@@ -58,6 +58,9 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(feature = "tokio")]
+mod bounded;
+
 #[cfg(test)]
 mod log_capture;
 
