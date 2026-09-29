@@ -10,6 +10,13 @@ nextest-version = { required = "0.9.137" }
 filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# The pidfd handshake's deadlock tests: a helper thread that never sees EOF hangs the spawn
+# forever, so a regression must end as a timeout, not a stuck job. With correct code they finish in
+# milliseconds; this bound is pure headroom for a loaded runner.
+[[profile.default.overrides]]
+filter = 'test(/pidfd_handshake_tests::(a_spawn_that_fails_before_the_fork_ends_the_helper|a_child_that_fails_before_reporting_its_pid_ends_the_spawn|a_child_killed_before_reporting_its_pid)/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [profile.ci]
 fail-fast = false
 
