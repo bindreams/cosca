@@ -44,3 +44,39 @@ fn a_pid_zero_identity_never_reaches_kill() {
         "the caller must have survived - nothing may signal process group 0"
     );
 }
+
+/// `block_on_kqueue` with its frozen-clock advance dropped fails at the second round instead of
+/// re-arming forever.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `block_on_kqueue` -> same panic,
+/// without the seam.
+#[test]
+#[should_panic(expected = "no progress")]
+fn block_on_kqueue_panics_when_its_advance_is_dropped() {
+    use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
+    use nix::sys::event::Kqueue;
+    use std::time::Duration;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let (_clock, at) = FrozenClockGuard::install();
+    let _skip = SkipAdvanceGuard::install();
+    let deadline = Some(Some(at + Duration::from_millis(5)));
+    super::block_on_kqueue(&kq, deadline, false, |_, _| Ok(None)).ok();
+}
+
+/// Under a frozen clock a bounded `block_on_kqueue` ends: each real `kevent` advances the clock.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `block_on_kqueue` -> the second round
+/// panics with "no progress" instead of re-arming forever.
+#[test]
+fn block_on_kqueue_terminates_under_a_frozen_clock() {
+    use crate::wait::test_clock::FrozenClockGuard;
+    use nix::sys::event::Kqueue;
+    use std::time::Duration;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let (_clock, at) = FrozenClockGuard::install();
+    let deadline = Some(Some(at + Duration::from_millis(5)));
+    let verdict = super::block_on_kqueue(&kq, deadline, true, |_, _| Ok(None)).expect("bounded wait");
+    assert!(verdict, "an event-less wait ends by its deadline");
+}

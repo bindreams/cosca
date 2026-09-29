@@ -160,6 +160,52 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
     );
 }
 
+/// `wait_drained`'s bounded arm with its frozen-clock advance dropped fails at the second round
+/// instead of re-arming forever.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait_drained` -> same panic, without
+/// the seam.
+#[cfg(target_os = "linux")]
+#[test]
+#[should_panic(expected = "no progress")]
+fn wait_drained_panics_when_its_advance_is_dropped() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
+    use std::time::Duration;
+
+    let fake = FakeLeaf::new("cosca-wait-drained-advance-dropped", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    let (_clock, at) = FrozenClockGuard::install();
+    let _skip = SkipAdvanceGuard::install();
+    leaf.wait_drained(Some(Some(at + Duration::from_millis(5)))).ok();
+}
+
+/// Under a frozen clock a bounded `wait_drained` on a leaf that never drains ends: each real
+/// park advances the clock.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait_drained` -> the second round
+/// panics with "no progress" instead of re-arming forever.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_drained_terminates_under_a_frozen_clock() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::TreeDrain;
+    use crate::wait::test_clock::FrozenClockGuard;
+    use std::time::Duration;
+
+    let fake = FakeLeaf::new("cosca-wait-drained-frozen-clock", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    let (_clock, at) = FrozenClockGuard::install();
+    let verdict = leaf
+        .wait_drained(Some(Some(at + Duration::from_millis(5))))
+        .expect("wait_drained");
+    assert_eq!(verdict, TreeDrain::MembersRemain);
+}
+
 // CgroupLeaf::wait_drained real-mechanism test -----
 // Linux + cgroup-v2 only, and only when CI provisions a delegated leaf (COSCA_TEST_CGROUP=1) —
 // the same gating convention `tests/spawn_io.rs`'s `linux_cgroup_v2_*` tests already use: a true

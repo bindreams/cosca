@@ -548,6 +548,9 @@ impl CgroupLeaf {
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use event_listener::Listener as _;
 
+        // Only the bounded arm advances the frozen clock, so only it is checked.
+        #[cfg(test)]
+        let mut check = crate::wait::test_clock::RoundCheck::new("wait_drained");
         loop {
             match self.drain_step(deadline)? {
                 DrainStep::Done(drain) => return Ok(drain),
@@ -567,6 +570,8 @@ impl CgroupLeaf {
                     listener,
                     deadline: Some(at),
                 } => {
+                    #[cfg(test)]
+                    check.round();
                     #[cfg(test)]
                     let call_start = std::time::Instant::now();
                     #[cfg_attr(not(test), allow(unused_variables))]
