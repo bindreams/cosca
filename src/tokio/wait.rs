@@ -163,7 +163,7 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
         return Err(crate::wait::fault::forced_watch_error());
     }
     // Fixed before `spawn_blocking`; the blocking thread only recomputes against it.
-    let deadline = to_real_clock(deadline_from(grace)).flatten();
+    let deadline = deadline_from(grace).flatten();
     blocking_watch(id, deadline).await
 }
 
