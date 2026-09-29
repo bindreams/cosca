@@ -327,11 +327,13 @@ pub(crate) mod treewalk;
 
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
+#[cfg(unix)]
+pub(crate) use dispatch::DropView;
 #[allow(
     unused_imports,
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
-pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared};
+pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared, TreeKilled};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]

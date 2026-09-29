@@ -312,6 +312,8 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// genuine descendants, kill the root FIRST then each descendant. SIGKILL on
 /// Unix; `TerminateProcess` on Windows. Best-effort; already-gone is success.
 pub(crate) fn hard_kill(root: ProcessId) {
+    #[cfg(test)]
+    fault::note_walk(root.pid());
     let parents = crate::containment::enumerate::process_parents();
     let descendants = descendants(root, &parents);
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
@@ -346,9 +348,46 @@ pub(crate) fn hard_kill(root: ProcessId) {
 /// flag — arm and call on one thread; assert consumption via [`armed`].
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     thread_local! {
         static FORCE_ROOT_KILL_NOOP: Cell<bool> = const { Cell::new(false) };
+        static WALKS: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+    }
+
+    /// From now on every ppid walk from a root's pid on THIS thread (`treewalk::hard_kill`, a
+    /// macOS fd marker's channel 1+2) records that pid, so a test can tell a walk ran without a
+    /// process having to die. The walk itself still runs.
+    #[cfg(unix)]
+    pub(crate) fn record_walks() -> WalkRecorder {
+        WALKS.with(|w| *w.borrow_mut() = Some(Vec::new()));
+        WalkRecorder(())
+    }
+
+    #[cfg(unix)]
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct WalkRecorder(());
+
+    #[cfg(unix)]
+    impl WalkRecorder {
+        /// The root pids walked since the recorder was made.
+        pub(crate) fn walked(&self) -> Vec<u32> {
+            WALKS.with(|w| w.borrow().clone().expect("the recorder is live"))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WalkRecorder {
+        fn drop(&mut self) {
+            WALKS.with(|w| *w.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn note_walk(root_pid: u32) {
+        WALKS.with(|w| {
+            if let Some(walked) = w.borrow_mut().as_mut() {
+                walked.push(root_pid);
+            }
+        });
     }
     // On macOS, `Attached::TreeWalk` (and so `hard_kill`) is only reached when the fd marker
     // failed to install or is suppressed (decision 2: the marker otherwise takes priority) —

@@ -272,6 +272,10 @@ async fn async_drop_tears_down_a_contained_tree() {
     remove_leftover_leaf(leaf);
 }
 
+// Only for the mechanisms that still kill after the root is reaped: a macOS fd marker's holder
+// sweep, a Windows Job Object. (A cgroup does too, but this test is not in the cgroup lane.) A
+// process group does not, being named by the root's number: see the Unix test below (#382).
+#[cfg(any(windows, target_os = "macos"))]
 #[tokio::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
@@ -298,6 +302,30 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
             leaf.display()
         );
     }
+}
+
+/// The contract for a bare process group (#382): once the root is reaped its number may name an
+/// unrelated group, so the drop does not `killpg` it and the grandchild keeps running. The
+/// grandchild echoes a byte if it is alive and gives EOF if it was killed, so the round trip
+/// proves it, with no wait on a signal's delivery. It exits when its control socket closes.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test]
+async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
+    let common::AsyncEchoTree {
+        mut child,
+        root,
+        mut grand,
+        ..
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain_with(cosca::ContainMode::Session);
+    })
+    .await;
+    assert_eq!(child.containment(), cosca::Containment::Session);
+    drop(root); // the root exits when its control socket closes
+    child.wait().await.expect("wait reaps the root");
+    drop(child);
+
+    common::assert_echoes(&mut grand, "the grandchild of a reaped process-group root");
 }
 
 #[tokio::test]

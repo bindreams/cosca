@@ -29,6 +29,10 @@ mod graceful;
 #[path = "child_tests.rs"]
 mod child_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/drop_reaped_tests.rs"]
+mod drop_reaped_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -81,6 +85,8 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
+    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,
 }
@@ -100,6 +106,7 @@ impl Child {
             kill_on_drop,
             containment: attachment.containment,
             attached: attachment.attached,
+            tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
         }
@@ -171,6 +178,10 @@ impl Child {
     }
 
     /// Block until the child exits, returning its status.
+    ///
+    /// Reaps the root. Under a process-group, tree-walk or fd-marker containment, a later drop then
+    /// no longer kills by the root's number: call [`kill_tree`](Child::kill_tree) first to end
+    /// descendants (see this type's `Drop`).
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
         self.proc.wait().map_err(Error::Io)
     }
@@ -279,6 +290,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
+        self.tree_killed.mark();
         let group_result = self.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
@@ -502,6 +514,84 @@ impl Child {
     }
 }
 
+impl Child {
+    /// Whether the root has been reaped, read without reaping it. This handle's own reap is exact
+    /// (`ProcHandle::has_reaped`); a reap by someone else shows as the number reading `Gone` or as
+    /// a different process (a zombie still resolves to `self.id`). An OS refusal to answer reads
+    /// as not reaped, the state a handle nobody has waited on is in.
+    #[cfg(unix)]
+    fn root_is_reaped(&self) -> bool {
+        root_reaped(self.proc.has_reaped(), self.id, root_identity_now(self.id.pid()))
+    }
+}
+
+/// [`Child::root_is_reaped`] from its inputs: this handle's own reap, or the root's number
+/// reading `Gone` or as another process.
+#[cfg(unix)]
+pub(crate) fn root_reaped(own_reap: bool, id: ProcessId, now: crate::identity::Resolved<ProcessId>) -> bool {
+    own_reap
+        || match now {
+            crate::identity::Resolved::Found(now) => now != id,
+            crate::identity::Resolved::Gone => true,
+            crate::identity::Resolved::Unknown => false,
+        }
+}
+
+#[cfg(unix)]
+pub(crate) fn root_identity_now(pid: crate::identity::RawPid) -> crate::identity::Resolved<ProcessId> {
+    #[cfg(test)]
+    if let Some(forced) = fault::take_forced_root_read() {
+        return forced;
+    }
+    ProcessId::of(pid)
+}
+
+/// Test seam for [`root_identity_now`]. Thread-local, with an RAII reset.
+#[cfg(all(test, unix))]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    use crate::identity::{ProcessId, Resolved};
+
+    thread_local! {
+        static FORCED: Cell<Option<Resolved<ProcessId>>> = const { Cell::new(None) };
+    }
+
+    /// The next drop-time read of a root's number on THIS thread answers `read`. Standing in for
+    /// an OS refusal (`Unknown`), which cannot be provoked without a live process on the number.
+    pub(crate) fn force_next_root_read(read: Resolved<ProcessId>) -> ForcedRootRead {
+        FORCED.with(|f| f.set(Some(read)));
+        ForcedRootRead(())
+    }
+
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct ForcedRootRead(());
+
+    impl Drop for ForcedRootRead {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.set(None));
+        }
+    }
+
+    pub(super) fn take_forced_root_read() -> Option<Resolved<ProcessId>> {
+        FORCED.with(|f| f.take())
+    }
+}
+
+/// With `kill_on_drop` set (the default), hard-kills the contained tree, then kills and reaps the
+/// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
+///
+/// **Once the root has been reaped, the drop does not kill by the root's number, and logs a `warn`
+/// naming what it skipped.** The root is reaped by [`wait`](Child::wait) or
+/// [`try_wait`](Child::try_wait), by a reaper outside this handle, or by the spawn itself, which
+/// reaps a root that has already exited (`sh -c 'daemon & exit'`, say). Nothing pins the number
+/// after the reap, so a `killpg` to it, or a walk of the process table from it, could hit an
+/// unrelated process that reused it. That covers a process group, a Unix tree walk, and a macOS fd
+/// marker's group and walk; the fd marker still sweeps the descendants that hold the marker, which
+/// it names by identity. A cgroup and a Job Object name their tree without the number, and still
+/// kill. Descendants that outlived the reaped root are otherwise left running: call
+/// [`kill_tree`](Child::kill_tree) **before** `wait()` to end them, and the skip is then logged at
+/// `debug`. See [#382](https://github.com/bindreams/cosca/issues/382).
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -510,6 +600,19 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
+        //
+        // On Unix, nothing that names the tree by the root's number runs once the root is reaped
+        // (#382). Reaped is this handle's own reap, or the number no longer reading as this root:
+        // the foreign reap of principle 5. What remains open is that principle's window: a foreign
+        // reap landing after this read. An unreaped root stays a zombie, pinning its number, until
+        // `teardown_on_drop` below.
+        #[cfg(unix)]
+        let tree = self.attached.hard_kill_for_drop(crate::containment::DropView {
+            root_pid: self.id.pid(),
+            root_reaped: self.root_is_reaped(),
+            tree_killed: self.tree_killed.is_set(),
+        });
+        #[cfg(not(unix))]
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             // A live member refused, or couldn't be confirmed — visible, not silently

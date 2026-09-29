@@ -72,6 +72,8 @@ pub struct Child {
     id: ProcessId,
     kill_on_drop: bool,
     containment: Containment,
+    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// `Child`). Drives the universal-teardown kill mapping.
@@ -98,6 +100,7 @@ impl Child {
             id,
             kill_on_drop,
             containment: attachment.containment,
+            tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
         }
@@ -125,6 +128,7 @@ impl Child {
     /// separately.
     #[cfg(unix)]
     pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
+        self.tree_killed.mark();
         self.os.attached.hard_kill()
     }
 
@@ -488,6 +492,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
+        self.tree_killed.mark();
         let group_result = self.os.attached.hard_kill();
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
@@ -666,6 +671,10 @@ impl Child {
 mod child_drop_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child_drop_reaped_tests.rs"]
+mod child_drop_reaped_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
 
@@ -716,6 +725,13 @@ impl Child {
 ///
 /// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
 /// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
+///
+/// **Once the root has been reaped, the drop does not kill by the root's number, and logs a `warn`
+/// naming what it skipped**, exactly as the sync [`Child`](crate::Child)'s drop does (see there for
+/// which mechanisms this covers): nothing pins the number after the reap, so the kill could hit an
+/// unrelated process that reused it. Call [`kill_tree`](Child::kill_tree) **before** `wait()` to
+/// end descendants, and the skip is then logged at `debug`.
+/// See [#382](https://github.com/bindreams/cosca/issues/382).
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -790,6 +806,28 @@ impl Drop for Child {
         // group (console control events stop at that boundary). On Unix this and `terminate_tree`
         // have the same radius. The contract either way: the tree is signalled before `drop`
         // returns.
+        //
+        // On Unix, nothing that names the tree by the root's number runs once the root is reaped
+        // (#382). Reaped is this handle's own state, or the number no longer reading as this root:
+        // the foreign reap of principle 5, which tokio's state cannot see until it is polled. What
+        // remains open is principle 5's window: a foreign reap landing after this read, or
+        // tokio's orphan queue reaping by number after one (principle 3). Read before the handle
+        // is dismembered below.
+        #[cfg(unix)]
+        let tree = {
+            let root_pid = self.id.pid();
+            let root_reaped = crate::child::root_reaped(
+                self.os.proc_mut().is_reaped(),
+                self.id,
+                crate::child::root_identity_now(root_pid),
+            );
+            self.os.attached.hard_kill_for_drop(crate::containment::DropView {
+                root_pid,
+                root_reaped,
+                tree_killed: self.tree_killed.is_set(),
+            })
+        };
+        #[cfg(not(unix))]
         let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
