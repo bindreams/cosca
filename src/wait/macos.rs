@@ -9,6 +9,25 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use crate::error::Error;
 use crate::identity::ProcessId;
 
+/// The longest timeout ONE `kevent` call is armed with: `i32::MAX` seconds (~68 years). XNU's
+/// `kevent` rejects a `tv_sec` above `INT32_MAX` with `EINVAL` even when an event is pending.
+/// A longer remaining time is not a shorter deadline: the wait loop recomputes it from the real
+/// deadline and re-arms (principle 13).
+const KEVENT_MAX_SECS: u64 = i32::MAX as u64;
+
+/// The `kevent` timeout for a remaining time: `d` capped at [`KEVENT_MAX_SECS`].
+fn kevent_timeout(d: Duration) -> libc::timespec {
+    #[cfg(test)]
+    let cap = test_hooks::clamp_override().unwrap_or(Duration::from_secs(KEVENT_MAX_SECS));
+    #[cfg(not(test))]
+    let cap = Duration::from_secs(KEVENT_MAX_SECS);
+    let d = d.min(cap);
+    libc::timespec {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_nsec: d.subsec_nanos() as libc::c_long,
+    }
+}
+
 fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
@@ -154,10 +173,7 @@ pub(crate) fn block_on_kqueue<T: Copy>(
             let already_elapsed = remaining == Some(Duration::ZERO);
             // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
             #[allow(unused_mut)] // mutated only under #[cfg(test)] below
-            let mut timeout = remaining.map(|d| libc::timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-                tv_nsec: d.subsec_nanos() as libc::c_long,
-            });
+            let mut timeout = remaining.map(kevent_timeout);
             #[cfg(test)]
             if let Some(forced) = test_hooks::take_timeout_override() {
                 timeout = Some(libc::timespec {
