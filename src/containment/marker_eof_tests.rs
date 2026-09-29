@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use super::{arm, block_until_drained, drain_kqueue, probe, DrainOutcome};
 use crate::containment::TreeDrain;
 
-fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
     crate::child::spawn::spawn_lock()
 }
 

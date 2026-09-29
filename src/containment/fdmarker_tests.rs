@@ -49,7 +49,7 @@ fn all_pids() -> Vec<crate::identity::RawPid> {
 /// test in this crate in one shared process). Delegates to the SAME lock production code
 /// uses, not a private one, so it also excludes every other cosca-originated spawn elsewhere
 /// in this test binary.
-fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
     crate::child::spawn::spawn_lock()
 }
 

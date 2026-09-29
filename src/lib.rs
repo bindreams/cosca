@@ -30,7 +30,7 @@ pub use child::Child;
 /// describe, for a raw spawn that bypasses `cosca::Command` entirely. `#[doc(hidden)]`: not
 /// public API, present only for this crate's own `tests/` binaries to link against.
 #[doc(hidden)]
-pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn test_spawn_lock() -> impl Sized {
     child::spawn::spawn_lock()
 }
 

@@ -525,3 +525,25 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
         "spawn_lock must be released before the failure path's kill and reap"
     );
 }
+
+/// `fork_running` takes `spawn_lock` itself, and the mutex is not reentrant: a caller that already
+/// holds it must get a named panic, not a hang (which nextest would only bound minutes later).
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_running_under_an_outer_spawn_lock_panics_naming_the_reentry() {
+    let outer = crate::child::spawn::spawn_lock();
+    let unwound = std::panic::catch_unwind(|| {
+        let _ = fork_running(|| {});
+    });
+    drop(outer);
+    let payload = unwound.expect_err("fork_running must refuse to run under an outer spawn_lock");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        message.contains("spawn_lock re-entered"),
+        "the panic must name the re-entry, got: {message}"
+    );
+}
