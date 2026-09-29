@@ -1,10 +1,11 @@
 //! cosca's own shared child handle: concurrent `wait`, `try_wait`, `wait_deadline` and `kill` on
 //! one spawned child, from any number of threads.
 //!
-//! **The handle never reaps at adoption, and never blocks in a reap.** Every reap is a
-//! non-blocking `waitid` taken under the handle's lock, on the pidfd (Linux), the process handle
-//! (Windows) or the pid (macOS), and only of an exit record (see [`crate::wait::exit_only`]).
-//! A child that this process traces is therefore never taken for exited when it merely stops.
+//! **The handle never reaps at adoption, and never blocks in a reap.** Every reap is taken under
+//! the handle's lock and never blocks: a non-blocking `waitid`, only of an exit record, on the
+//! pidfd (Linux) or the pid (macOS); on Windows there is nothing to consume, and the reap reads
+//! the signalled process handle's exit code (see [`crate::wait::exit_only`]). A child that this
+//! process traces is therefore never taken for exited when it merely stops.
 //!
 //! # States
 //!
@@ -21,8 +22,9 @@
 //!   waiters, and a normal return can never restore `N` under a new holder, because
 //!   [`HolderGuard::finish`] consumes the guard.
 //! - A holder re-reads the state after it re-locks, before it acts on the wait's result.
-//! - Every timed block is clamped ([`crate::wait::clamp_block`]) and looped, and after every wake
-//!   `crate::wait::now() >= deadline` decides expiry, never the primitive's own "timed out".
+//! - Every timed block is clamped and looped ([`crate::wait::clamp_block`]; on macOS the
+//!   `kevent` timeout's own cap), and after every wake `crate::wait::now() >= deadline` decides
+//!   expiry, never the primitive's own "timed out".
 //!
 //! `pidfd: None` (Linux) means the child was already reaped elsewhere when it was adopted: every
 //! method answers `ECHILD`.
