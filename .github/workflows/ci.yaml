@@ -178,8 +178,20 @@ jobs:
       - name: Run tests (serde feature)
         run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
 
-      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16); this is
-      # the only step in this job that still uses plain `cargo test`. cosca has no doctests today.
+      # nextest gives every test a process of its own, which hides any test that changes
+      # process-global state (fd 0/1/2, RLIMIT_NOFILE) under `cargo test`'s threads-in-one-process
+      # model. These tests re-execute themselves via `test_own_process` to stay correct in both, so
+      # this step keeps that property from regressing. Same env as the steps above.
+      - name: Run plain cargo test (Unix)
+        if: matrix.os == 'linux' || matrix.os == 'darwin'
+        run: |
+          set -euxo pipefail
+          cargo test --locked --lib --target ${{ matrix.target }}
+          cargo test --locked --all-features --test spawn_io --test tokio_io --target ${{ matrix.target }}
+
+      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16); this and
+      # the step above are the only ones in this job that use plain `cargo test`. cosca has no
+      # doctests today.
       - name: Run doctests
         run: cargo test --locked --doc --all-features --target ${{ matrix.target }}
 
