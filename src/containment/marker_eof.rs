@@ -290,11 +290,11 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
     )];
     loop {
         match kq.kevent(&[], &mut events, Some(zero)) {
-            Ok(0) => return Ok(DrainOutcome::Spurious), // nothing pending
+            Ok(0) => return Ok(DrainOutcome::Declined), // nothing pending
             Ok(_) => {
                 return Ok(match interpret_read_event(&events[0], read_end, suppress_drain)? {
                     Some(verdict) => DrainOutcome::Drained(verdict),
-                    None => DrainOutcome::Declined,
+                    None => DrainOutcome::Spurious,
                 });
             }
             Err(nix::errno::Errno::EINTR) => continue,
