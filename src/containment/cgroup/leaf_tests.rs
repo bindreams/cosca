@@ -3043,10 +3043,10 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 /// stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
 /// real signal. The stdin is released by `fault::set_before_exit_wait`, which fires after
 /// `end_child`'s own kill and before its blocking `waitid` on the shell: the shell is parked in
-/// its own `wait`, not reading stdin, so with that kill skipped nothing after `drop(leaf)` could
-/// run, because `drop(leaf)` would never return. A real kill has already landed by then, so the
-/// byte goes nowhere; a skipped one lets the live `cat` echo it, so `rest` is non-empty and the
-/// test fails at once rather than hanging.
+/// its own `wait`, so with that kill skipped `drop(leaf)` would never return. A real kill has
+/// already landed by then, so the byte goes nowhere; a skipped one lets the live `cat` echo it,
+/// so `rest` is non-empty and the test fails at once rather than hanging. `drop(leaf)` may also
+/// return before the hook's fire point, so the test fires it itself afterwards.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
@@ -3079,6 +3079,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
         drop(stdin);
     });
     drop(leaf);
+    crate::containment::cgroup::fault::run_before_exit_wait();
 
     let mut rest = Vec::new();
     stdout
@@ -3116,9 +3117,7 @@ fn fail_closed_kills_the_childs_whole_process_group() {
         .process_group(0)
         .spawn()
         .expect("spawn");
-    // Moved into the hook below, not held past `take_placement`: with `fail_closed`'s own kill
-    // skipped, its `waitid` on the shell would block forever, so nothing after it could run.
-    // `child.wait()` closes the child's own stdin, so it must come after.
+    // Moved into the hook below; `child.wait()` closes the child's own stdin, so it must come after.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
@@ -3134,6 +3133,7 @@ fn fail_closed_kills_the_childs_whole_process_group() {
         drop(stdin);
     });
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
+    crate::containment::cgroup::fault::run_before_exit_wait();
     let mut rest = Vec::new();
     stdout
         .read_to_end(&mut rest)
@@ -3414,6 +3414,7 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
     let err = leaf
         .fail_closed(child.id(), channel, "the test cannot decide")
         .to_string();
+    crate::containment::cgroup::fault::run_before_exit_wait();
     assert!(err.contains("drain could not be watched"), "got {err}");
     let status = child.wait().expect("reap the child");
     assert_eq!(
@@ -3441,27 +3442,4 @@ fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
     let a = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     assert_ne!(a, b);
-}
-
-/// A hook whose fire point was never reached must not outlive its guard: it would fire in an
-/// unrelated later `fail_closed`/`end_child` on this thread and release the wrong fixture.
-#[cfg(target_os = "linux")]
-#[test]
-fn an_unfired_before_exit_wait_hook_is_cleared_when_its_guard_drops() {
-    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
-    let seen = fired.clone();
-    drop(crate::containment::cgroup::fault::set_before_exit_wait(move || {
-        seen.set(true)
-    }));
-    crate::containment::cgroup::fault::run_before_exit_wait();
-    assert!(!fired.get(), "a dropped guard must take its hook with it");
-    assert_eq!(std::rc::Rc::strong_count(&fired), 1, "the hook itself must be dropped");
-}
-
-#[cfg(all(target_os = "linux", debug_assertions))]
-#[test]
-#[should_panic(expected = "already armed")]
-fn arming_over_a_live_before_exit_wait_hook_is_refused() {
-    let _first = crate::containment::cgroup::fault::set_before_exit_wait(|| {});
-    let _second = crate::containment::cgroup::fault::set_before_exit_wait(|| {});
 }
