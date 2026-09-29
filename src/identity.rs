@@ -174,7 +174,7 @@ impl ProcessId {
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView};
+pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]

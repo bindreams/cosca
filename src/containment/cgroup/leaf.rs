@@ -73,12 +73,63 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
-/// The kernel's current state letter for `pid`, or `None` when `/proc/<pid>/stat` cannot be
-/// read or parsed. A not-yet-reaped child reads as `Z`, which is what separates "the
-/// placement write failed" from "the child exited before membership was checked".
+/// The kernel's current state letter for `pid`, or `None` when it is unknown; the cause is
+/// logged at debug (see [`StateUnknown`]). A not-yet-reaped child reads as `Z`, which is what
+/// separates "the placement write failed" from "the child exited before membership was checked".
 #[cfg(target_os = "linux")]
 fn proc_state(pid: u32) -> Option<char> {
-    parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    match read_proc_state(pid) {
+        Ok(state) => Some(state),
+        Err(why) => {
+            log::debug!("cgroup leaf: pid {pid}'s state is unknown: {why}");
+            None
+        }
+    }
+}
+
+/// Why [`read_proc_state`] has no state letter.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum StateUnknown {
+    /// `/proc` belongs to an outer pid namespace, so its `<pid>` could name another process.
+    OuterProcfs,
+    /// `/proc` could not be verified to be this process's own pid namespace's.
+    ViewUnassessable(crate::identity::ViewUnreadable),
+    /// `<pid>/stat` could not be read.
+    Unreadable(std::io::Error),
+    /// `<pid>/stat` has no state field.
+    Unparsable(String),
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for StateUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OuterProcfs => f.write_str("/proc is an outer pid namespace's"),
+            Self::ViewUnassessable(why) => write!(f, "the /proc view could not be established: {why}"),
+            Self::Unreadable(e) => write!(f, "its stat could not be read: {e}"),
+            Self::Unparsable(stat) => write!(f, "its stat has no state field: {stat:?}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_state(pid: u32) -> Result<char, StateUnknown> {
+    use crate::identity::ProcView;
+    let proc_dir = match crate::identity::proc_view() {
+        ProcView::Same(proc_dir) => proc_dir,
+        ProcView::Diverged => return Err(StateUnknown::OuterProcfs),
+        ProcView::Unassessable(why) => return Err(StateUnknown::ViewUnassessable(why)),
+    };
+    let stat = proc_dir
+        .read_to_string(&format!("{pid}/stat"))
+        .map_err(StateUnknown::Unreadable)?;
+    state_from_stat(stat)
+}
+
+#[cfg(target_os = "linux")]
+fn state_from_stat(stat: String) -> Result<char, StateUnknown> {
+    parse_proc_stat_state(&stat).ok_or(StateUnknown::Unparsable(stat))
 }
 
 /// What [`CgroupLeaf::drain_step`] found.
@@ -1519,3 +1570,7 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(test)]
 #[path = "leaf_tests.rs"]
 mod leaf_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_state_tests.rs"]
+mod leaf_state_tests;
