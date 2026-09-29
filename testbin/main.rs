@@ -843,12 +843,11 @@ fn main() {
             let mut cmd = cosca::Command::new();
             cmd.executable(&exe)
                 .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "G"])
-                .env(ack::ACK_ENV, "1")
                 .contain();
             let mut child = cmd.spawn().expect("spawn nested delegated child");
             // The tag proves the child is alive AND has completed console registration — it is
             // written after its ctrl handler is installed — before anything is signalled.
-            let mut ack = accept::accept_or_die(&listener, &mut child);
+            let mut ack = { let _ = &mut child; listener.accept().unwrap().0 };
             let mut t = [0u8; 1];
             ack.read_exact(&mut t).expect("read ack tag");
             assert_eq!(&t, b"G", "wrong ack tag");
@@ -1067,10 +1066,9 @@ fn main() {
             let mut cmd = cosca::Command::new();
             cmd.executable(&exe)
                 .args(["cosca_testbin", "control-block-ack-break", &ack_addr, "R"])
-                .env(ack::ACK_ENV, "1")
                 .contain();
             let mut child = cmd.spawn().expect("spawn contained root");
-            let mut ack = accept::accept_or_die(&listener, &mut child);
+            let mut ack = { let _ = &mut child; listener.accept().unwrap().0 };
             let mut t = [0u8; 1];
             ack.read_exact(&mut t).expect("read ack tag");
             assert_eq!(&t, b"R", "wrong ack tag");
@@ -1230,10 +1228,9 @@ fn main() {
                 let mut cmd = cosca::Command::new();
                 cmd.executable(&exe)
                     .args(["cosca_testbin", "control-block-ack-break", &ack_addr, tag])
-                    .env(ack::ACK_ENV, "1")
                     .contain();
                 let mut child = cmd.spawn().expect("spawn contained root");
-                let mut sock = accept::accept_or_die(&listener, &mut child);
+                let mut sock = { let _ = &mut child; listener.accept().unwrap().0 };
                 let mut t = [0u8; 1];
                 sock.read_exact(&mut t).expect("read ack tag");
                 assert_eq!(&t, tag.as_bytes(), "wrong ack tag");

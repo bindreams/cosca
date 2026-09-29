@@ -166,7 +166,6 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
             use std::os::windows::process::CommandExt;
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["control-block", addr, "C"])
-                .env(crate::ack::ACK_ENV, "1")
                 .creation_flags(if request { CREATE_BREAKAWAY_FROM_JOB.0 } else { 0 });
             match cmd.spawn() {
                 Ok(c) => {
@@ -178,7 +177,6 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
         }
         "argv" | "exec" => {
             let mut cmd = cosca::Command::new();
-            cmd.env(crate::ack::ACK_ENV, "1");
             if vehicle == "exec" {
                 cmd.executable(&exe).args(["cosca_testbin", "control-block", addr, "C"]);
             } else {
@@ -200,7 +198,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
     // The real edge: the child connected and tagged, so it is running and its job membership is
     // settled. No timer anywhere.
     let ctrl = child.as_mut().map(|child| {
-        let mut sock = crate::accept::accept_or_die(listener, child);
+        let mut sock = { let _ = &mut *child; listener.accept().unwrap().0 };
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("read the child's tag");
         assert_eq!(&tag, b"C", "wrong child tag");
