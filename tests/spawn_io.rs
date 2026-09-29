@@ -1622,9 +1622,9 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 ///
 /// A `Stdio::from_file` end is a dup numbered 3 or above, so it does not fill a gap first.
 ///
-/// Every case also runs with `pidfd_open` denied by a seccomp filter, where cosca cannot wait
-/// for the report: the child may then land on either side of its leaf, but cosca must report the
-/// side it is on.
+/// Every case also runs with `pidfd_open` denied by a seccomp filter. Linux needs a pidfd for
+/// every child, so the spawn must fail with `Unsupported`, naming the adoption, and leave no leaf
+/// behind.
 ///
 /// Each case runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
 /// is process-wide, so in a binary with other tests running it would hand their next `open` the
@@ -1857,6 +1857,24 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
             .join()
             .expect("the spawning thread")
     });
+    if deny_pidfd {
+        match spawned.err().expect("a spawn without a pidfd must fail") {
+            cosca::error::Error::Unsupported { op, .. } => assert_eq!(op, "spawn adoption"),
+            other => panic!("slots {slots:?}: expected Unsupported, got {other:?}"),
+        }
+        let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+        let prefix = format!("cosca-{}-", std::process::id());
+        let left: Vec<String> = std::fs::read_dir(&own_dir)
+            .expect("list this process's cgroup")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "slots {slots:?}: {left:?} left behind by the failed spawn"
+        );
+        return;
+    }
     let child = spawned.expect("spawn");
     let containment = child.containment();
     // Printed once 0, 1 and 2 are back, for a caller counting outcomes across runs.
@@ -1887,20 +1905,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
                 && random.len() == 16
                 && random.bytes().all(|b| b.is_ascii_hexdigit())
         });
-    let expected = if deny_pidfd && slots.len() >= 2 {
-        // `spawn` can return before the report, which cannot be waited for: either side of the
-        // leaf is right, as long as it is reported.
-        (
-            if in_leaf {
-                cosca::Containment::CgroupV2
-            } else {
-                cosca::Containment::ProcessGroup
-            },
-            in_leaf,
-        )
-    } else {
-        (cosca::Containment::CgroupV2, true)
-    };
+    let expected = (cosca::Containment::CgroupV2, true);
     assert_eq!(
         (containment, in_leaf),
         expected,
