@@ -850,16 +850,28 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     }
 }
 
+/// The mechanism `spawn_contained_tree` gets depends on the host (`CgroupV2` if the caller may
+/// create a cgroup, else `ProcessGroup`); the tree-kill tests hold under either, so accept any
+/// mechanism that tears down a tree.
+#[cfg(any(unix, windows))]
+fn assert_host_tree_containment(child: &cosca::Child) {
+    use cosca::Containment as C;
+    let got = child.containment();
+    let ok = if cfg!(windows) {
+        got == C::JobObject
+    } else if cfg!(target_os = "linux") {
+        matches!(got, C::CgroupV2 | C::ProcessGroup)
+    } else {
+        matches!(got, C::ProcessGroup | C::Session | C::FdMarker)
+    };
+    assert!(ok, "unexpected containment for a contained tree on this host: {got:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::ProcessGroup
-    };
-    assert_eq!(child.containment(), expected);
+    assert_host_tree_containment(&child);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -876,18 +888,13 @@ fn unix_kill_tree_reaps_the_grandchild() {
 #[test]
 fn unix_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::ProcessGroup
-    };
-    assert_eq!(child.containment(), expected);
+    assert_host_tree_containment(&child);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
 
-    // Same EOF-based proof: SIGTERM should have killed both the root and the
-    // grandchild (they share a process group).
+    // Same EOF-based proof: SIGTERM should have reached both the root and the
+    // grandchild (both are members of the contained tree).
     let mut buf = [0u8; 1];
     let n = gc_stream
         .read(&mut buf)
@@ -1268,26 +1275,7 @@ fn drop_kills_contained_tree() {
         cosca::Containment::None,
         "drop test requires real containment; got None"
     );
-    #[cfg(windows)]
-    assert_eq!(child.containment(), cosca::Containment::JobObject);
-    #[cfg(target_os = "linux")]
-    assert!(
-        matches!(
-            child.containment(),
-            cosca::Containment::CgroupV2 | cosca::Containment::ProcessGroup
-        ),
-        "Linux must use CgroupV2 or ProcessGroup, got {:?}",
-        child.containment()
-    );
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    assert!(
-        matches!(
-            child.containment(),
-            cosca::Containment::ProcessGroup | cosca::Containment::Session | cosca::Containment::FdMarker
-        ),
-        "macOS/BSD must use ProcessGroup, Session or FdMarker, got {:?}",
-        child.containment()
-    );
+    assert_host_tree_containment(&child);
 
     // Drop triggers: attached.hard_kill() → shared.kill() → shared.wait()
     drop(child);
