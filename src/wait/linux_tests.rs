@@ -110,7 +110,6 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval()
 fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 
-    let _guard = crate::child::spawn::spawn_lock();
     let (l_id, fixture) = build_reaped_pgid_leader();
     for view in [ForcedView::Diverged, ForcedView::Unassessable] {
         let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
