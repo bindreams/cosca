@@ -28,7 +28,7 @@ use crate::error::Error;
     not(unix),
     allow(
         dead_code,
-        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend; see comment above"
+        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend"
     )
 )]
 pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<Anchored, Error> {
@@ -59,7 +59,7 @@ pub(crate) fn anchor_posix(program: &OsStr, child_cwd: Option<&Path>) -> Result<
     not(unix),
     allow(
         dead_code,
-        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend; see comment above"
+        reason = "off-unix the std spawn never has an Exact program - it routes to the raw backend"
     )
 )]
 pub(crate) struct Anchored {

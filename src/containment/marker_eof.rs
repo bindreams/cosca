@@ -322,10 +322,7 @@ pub(crate) fn drain_kqueue(kq: &Kqueue, read_end: BorrowedFd<'_>, suppress_drain
 /// there.
 #[cfg_attr(
     not(feature = "tokio"),
-    allow(
-        dead_code,
-        reason = "only caller is wait_tree_deadline behind the tokio feature; see doc above"
-    )
+    allow(dead_code, reason = "only caller is wait_tree_deadline behind the tokio feature")
 )]
 pub(crate) fn probe(read_end: BorrowedFd<'_>) -> Result<TreeDrain, Error> {
     let kq = arm(read_end, false)?;

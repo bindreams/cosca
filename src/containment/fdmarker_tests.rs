@@ -887,9 +887,8 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 
     let mut p_cmd = member_command(0); // pgid == P's own pid.
     let scratch = super::install(&mut p_cmd, &[]).expect("install scratch marker on P");
-    // P is deliberately left unreaped for the rest of the test — see the doc above ("P is left
-    // an unreaped zombie throughout"). That's what keeps `pgid` allocated across the gap, so
-    // clippy's zombie-processes lint is a false positive here, not a real leak.
+    // P is deliberately left unreaped for the rest of the test (see the doc above): that keeps
+    // `pgid` allocated across the gap.
     #[allow(
         clippy::disallowed_methods,
         reason = "the test holds spawn_lock for its whole body via `_serialize`"

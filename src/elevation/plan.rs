@@ -13,13 +13,13 @@ use crate::error::{ElevationErrorKind, Error};
 // build the other platform's variant is never constructed. That is by design, not dead logic.
 #[allow(
     dead_code,
-    reason = "the other platform's Os variant is never constructed in a single-platform non-test build; see comment above"
+    reason = "the other platform's Os variant is never constructed in a single-platform non-test build"
 )]
 // The enum is named `Os` and `MacOs` names an OS, so the variant unavoidably ends
 // with the enum's name. Renaming either to satisfy the lint would make both worse.
 #[allow(
     clippy::enum_variant_names,
-    reason = "MacOs necessarily ends with the enum's own name Os; renaming either would make both worse, see comment above"
+    reason = "MacOs necessarily ends with the enum's own name Os; renaming either would make both worse"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -102,7 +102,7 @@ pub struct Host {
 // constructed in a single-platform non-test build, but is exercised by the cross-OS planner tests.
 #[allow(
     dead_code,
-    reason = "the other platform's effect arm is never constructed in a single-platform non-test build; see comment above"
+    reason = "the other platform's effect arm is never constructed in a single-platform non-test build"
 )]
 #[derive(Debug)]
 pub enum Transition {

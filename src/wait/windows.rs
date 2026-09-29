@@ -134,7 +134,7 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
         dead_code,
         reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
     )
-)] // only consumer is tokio::wait::grace_wait
+)]
 pub(crate) fn block_until_exit_or_cancel(
     id: ProcessId,
     deadline: Option<Instant>,

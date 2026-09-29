@@ -7,7 +7,7 @@
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
     )
 )]
 pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
@@ -22,7 +22,7 @@ pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
     )
 )]
 pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
@@ -62,7 +62,7 @@ pub(crate) fn parse_v2_relative_path(proc_self_cgroup: &str) -> Option<&str> {
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
     )
 )]
 pub(crate) fn summarize_cgroup_controllers(proc_self_cgroup: &str) -> (usize, String) {
@@ -89,7 +89,7 @@ pub(crate) fn summarize_cgroup_controllers(proc_self_cgroup: &str) -> (usize, St
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
     )
 )]
 pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
@@ -117,7 +117,7 @@ pub(crate) fn parse_populated(contents: &str) -> Option<bool> {
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic per the module doc above"
+        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
     )
 )]
 pub(crate) fn parse_proc_stat_state(stat: &str) -> Option<char> {

@@ -209,10 +209,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // configured n>=3. The n>=3 collection is Unix-only: on Windows the routing
         // above (any fd>=3 goes to the raw backend) guarantees `fds` holds no fd>=3,
         // so the push is dead code there — cfg-gate it to make that explicit.
-        #[cfg_attr(
-            not(unix),
-            allow(unused_mut, reason = "the n>=3 push below is unix-only; see comment above")
-        )]
+        #[cfg_attr(not(unix), allow(unused_mut, reason = "the n>=3 push below is unix-only"))]
         let mut v: Vec<Fd> = std_slots.to_vec();
         #[cfg(unix)]
         for &fd in fds.keys() {
@@ -709,7 +706,7 @@ pub(crate) enum PipeOwnership {
     /// on every path: they resolve like `Owned` and produce parent ends.
     #[cfg_attr(
         not(feature = "tokio"),
-        allow(dead_code, reason = "only the async spawn path constructs Deferred; see doc above")
+        allow(dead_code, reason = "only the async spawn path constructs Deferred")
     )]
     Deferred,
 }

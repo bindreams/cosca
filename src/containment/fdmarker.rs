@@ -282,7 +282,7 @@ pub(crate) fn holders(handle: u64, pids: &[RawPid]) -> Vec<Holder> {
     not(test),
     allow(
         dead_code,
-        reason = "only tests call it; production uses holds_marker_query directly (see doc above)"
+        reason = "only tests call it; production uses holds_marker_query directly"
     )
 )]
 pub(crate) fn holds_marker(pid: RawPid, handle: u64) -> bool {
@@ -903,7 +903,7 @@ impl Marker {
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "consumed by Child::test_marker_handle (test-only)")
-    )] // consumed by Child::test_marker_handle (test-only)
+    )]
     pub(crate) fn handle(&self) -> u64 {
         self.handle
     }

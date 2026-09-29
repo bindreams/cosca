@@ -14,7 +14,7 @@ use crate::error::Error;
 // async spawn, so the size difference is accepted deliberately.
 #[allow(
     clippy::large_enum_variant,
-    reason = "boxing Raw to shrink it would add an allocation to every async spawn on the common Tokio path; see comment above"
+    reason = "boxing Raw to shrink it would add an allocation to every async spawn on the common Tokio path"
 )]
 #[derive(Debug)]
 pub(crate) enum ProcSource {

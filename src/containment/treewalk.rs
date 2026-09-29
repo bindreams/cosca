@@ -358,7 +358,7 @@ pub(crate) mod fault {
         target_os = "macos",
         allow(
             dead_code,
-            reason = "dispatch_tests.rs uses the fdmarker::fault seam on macOS instead; see comment above"
+            reason = "dispatch_tests.rs uses the fdmarker::fault seam on macOS instead"
         )
     )]
     pub(crate) fn set_force_root_kill_noop(on: bool) {
@@ -371,7 +371,7 @@ pub(crate) mod fault {
         target_os = "macos",
         allow(
             dead_code,
-            reason = "dispatch_tests.rs uses the fdmarker::fault seam on macOS instead; see comment above"
+            reason = "dispatch_tests.rs uses the fdmarker::fault seam on macOS instead"
         )
     )]
     pub(crate) fn armed() -> bool {

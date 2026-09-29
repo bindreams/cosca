@@ -7,8 +7,8 @@
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
-// result on purpose with `_ = expr;`. Crate-level here, not in `[lints]`: it is a library policy, and
-// `[lints]` would extend it to the tests and test binaries, which discard results freely.
+// result on purpose with `_ = expr;`. Crate-level, not in `[lints]`, which would extend it to the
+// tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
 pub mod containment;

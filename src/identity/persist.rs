@@ -179,7 +179,7 @@ impl Scope {
         target_os = "linux",
         allow(
             dead_code,
-            reason = "only the Windows/macOS backends call this; the Linux backend builds a populated Scope directly, see doc above"
+            reason = "only the Windows/macOS backends call this; the Linux backend builds a populated Scope directly"
         )
     )]
     pub(crate) fn none() -> Scope {

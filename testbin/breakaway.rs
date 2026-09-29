@@ -117,7 +117,7 @@ enum ChildHandle {
     Cosca(
         #[allow(
             dead_code,
-            reason = "held only for its Drop side effect and to pin the pid; never read, see comment above"
+            reason = "held only for its Drop side effect and to pin the pid; never read"
         )]
         cosca::Child,
     ),

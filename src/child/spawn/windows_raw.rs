@@ -286,7 +286,7 @@ pub(crate) fn child_ops(ops: &[EnvOp], marker_env: bool) -> Cow<'_, [EnvOp]> {
 // Bundling them would only rename the same values one call site deep.
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors CreateProcessW's own parameter list plus the request its failure is classified against; see comment above"
+    reason = "mirrors CreateProcessW's own parameter list plus the request its failure is classified against"
 )]
 pub(crate) fn spawn_step(
     handles: &[HANDLE],

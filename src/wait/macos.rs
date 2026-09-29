@@ -154,13 +154,12 @@ pub(crate) fn block_on_kqueue<T: Copy>(
         #[cfg_attr(
             not(test),
             allow(unused_variables, reason = "`timeout` is read only for test recording")
-        )] // `timeout` is read only for test recording
+        )]
         let (already_elapsed, timeout, outcome) = loop {
             let remaining = crate::wait::remaining(deadline);
             let already_elapsed = remaining == Some(Duration::ZERO);
             // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
             #[allow(unused_mut, reason = "mutated only under #[cfg(test)] below")]
-            // mutated only under #[cfg(test)] below
             let mut timeout = remaining.map(|d| libc::timespec {
                 tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
                 tv_nsec: d.subsec_nanos() as libc::c_long,

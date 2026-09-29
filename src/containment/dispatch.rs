@@ -86,7 +86,7 @@ impl Prepared {
     not(all(target_os = "linux", feature = "tokio")),
     allow(
         dead_code,
-        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable; see comment above"
+        reason = "only a Linux leaf under tokio produces more than MaybeUnreachable"
     )
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,26 +467,23 @@ pub(crate) fn prepare(
         not(windows),
         allow(
             unused_variables,
-            reason = "only Windows can honour the caller's creation-flag request; see doc above"
+            reason = "only Windows can honour the caller's creation-flag request"
         )
     )]
     flags: &crate::command::flags::FlagsRequest,
     #[cfg_attr(
         not(target_os = "macos"),
-        allow(unused_variables, reason = "drives the macOS fd-marker install only; see doc above")
+        allow(unused_variables, reason = "drives the macOS fd-marker install only")
     )]
     reserved_fds: &[i32],
     #[cfg_attr(
         not(target_os = "macos"),
-        allow(unused_variables, reason = "drives the macOS fd-marker install only; see doc above")
+        allow(unused_variables, reason = "drives the macOS fd-marker install only")
     )]
     marker_suppressed: bool,
     #[cfg_attr(
         not(windows),
-        allow(
-            unused_variables,
-            reason = "only the Windows path composes env ops into the request; see doc above"
-        )
+        allow(unused_variables, reason = "only the Windows path composes env ops into the request")
     )]
     env_ops: &[crate::command::EnvOp],
 ) -> Result<Prepared, Error> {
@@ -657,10 +654,7 @@ pub(crate) fn prepare(
     // on every other target.
     #[cfg_attr(
         target_os = "linux",
-        expect(
-            unreachable_code,
-            reason = "the linux block above returns on every path; see this expression's comment"
-        )
+        expect(unreachable_code, reason = "the linux block above returns on every path")
     )]
     Ok(Prepared {
         mode,

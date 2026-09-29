@@ -8,7 +8,7 @@
 #![allow(
     dead_code,
     unused_imports,
-    reason = "each integration test crate compiles this whole shared module but uses only its own subset; see comment above"
+    reason = "each integration test crate compiles this whole shared module but uses only its own subset"
 )]
 
 use std::io::{Read, Write};

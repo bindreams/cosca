@@ -626,10 +626,7 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     // same path independently, so a non-unix build never uses this binding at all.
     #[cfg_attr(
         not(unix),
-        allow(
-            unused_variables,
-            reason = "only cfg(unix) reads `want` (to set the execute bit); see comment above"
-        )
+        allow(unused_variables, reason = "only cfg(unix) reads `want` (to set the execute bit)")
     )]
     let want = touch(&sub, &exe_name("tool"));
     #[cfg(unix)]

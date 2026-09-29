@@ -120,10 +120,7 @@ impl EnvSanitizer {
     // path sanitizes nothing here, so it is dead on non-unix.
     #[cfg_attr(
         not(unix),
-        allow(
-            dead_code,
-            reason = "consumed by the POSIX spawn arms via posix::rewrite; see comment above"
-        )
+        allow(dead_code, reason = "consumed by the POSIX spawn arms via posix::rewrite")
     )]
     pub(crate) fn apply(&self, env: Vec<(OsString, OsString)>) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
         let mut kept: Vec<(OsString, OsString)> = Vec::new();
