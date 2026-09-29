@@ -261,7 +261,8 @@ pub(crate) mod fault_observer {
 async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
-    let Some(pidfd) = crate::wait::backend::open_verified(id, "foreign process wait", "its exit cannot be observed")?
+    let Some(pidfd) =
+        crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::Wait, "its exit cannot be observed")?
     else {
         return Ok(());
     };

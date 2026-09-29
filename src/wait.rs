@@ -128,7 +128,9 @@ pub(crate) mod std_wait_seam {
 
 /// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
 /// = the timeout elapsed while it was still alive; `Err` = a wait failure (incl.
-/// `Unsupported` on Linux kernels < 5.3). `None` = block until exit; `Some(ZERO)` =
+/// `Unsupported` on Linux when `pidfd_open` is refused: a kernel < 5.3, or a filter answering
+/// `ENOSYS`, `EPERM`, `EACCES` or `ENODEV`; `Io` for a transient one, such as `EMFILE`).
+/// `None` = block until exit; `Some(ZERO)` =
 /// poll once; an overflowing `Duration` saturates to unbounded. Non-reaping.
 ///
 /// Cross-privilege divergence: when the caller lacks rights to wait on a *live* foreign

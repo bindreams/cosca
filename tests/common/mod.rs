@@ -13,6 +13,9 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 
+#[cfg(target_os = "linux")]
+pub mod seccomp;
+
 mod accept;
 pub use accept::*;
 

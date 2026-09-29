@@ -1,7 +1,11 @@
 //! Linux death-watch + kill via pidfd (kernel >= 5.3). `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS`, `EPERM` or `ENODEV` from
-//! `pidfd_open` (an old kernel, or a sandbox filter) => Unsupported, naming the errno.
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `pidfd_open` failures split two ways:
+//! a REFUSAL is [`Error::Unsupported`], naming the operation and the errno: `ENOSYS` (a kernel
+//! older than 5.3, or a filter) and every errno the kernel's own `pidfd_open` cannot produce, so
+//! only a seccomp filter or LSM can: `EPERM`, `EACCES` and `ENODEV`. A transient or state errno
+//! stays [`Error::Io`], prefixed `pidfd_open:` (`EMFILE`, `ENFILE`, `ENOMEM`); `ESRCH`, `EINVAL`
+//! and `ENOENT` mean gone, and are re-verified.
 //! The `/proc` checks behind `open_verified` use `openat2` (kernel >= 5.6); on 5.3 to 5.5 a live
 //! target is `Unassessable`.
 
@@ -20,7 +24,7 @@ use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, Proce
 /// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
 pub(crate) fn open_verified(
     id: ProcessId,
-    op: &'static str,
+    op: PidfdOp,
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
@@ -37,27 +41,63 @@ pub(crate) fn open_verified(
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, what, e),
-        Err(e @ (rustix::io::Errno::NOSYS | rustix::io::Errno::PERM | rustix::io::Errno::NODEV)) => {
-            Err(pidfd_open_unsupported(op, e))
-        }
-        Err(e) => Err(Error::Io(std::io::Error::from(e))),
+        Err(e) => match refusal_name(e) {
+            Some(name) => Err(pidfd_open_unsupported(op, name)),
+            None => Err(Error::Io(crate::error::io_context(
+                "pidfd_open",
+                std::io::Error::from(e),
+            ))),
+        },
     }
 }
 
-/// The [`Error::Unsupported`] for a `pidfd_open` that answered `errno` (`ENOSYS`, `EPERM` or
-/// `ENODEV`): the environment cannot provide a pidfd at all, so there is no fallback. `op` names
-/// the caller. `pidfd_open(2)` documents no `EPERM`, so an `EPERM` is a sandbox filter's.
-pub(crate) fn pidfd_open_unsupported(op: &'static str, errno: rustix::io::Errno) -> Error {
-    let (name, cause) = match errno {
-        rustix::io::Errno::NOSYS => ("ENOSYS", "the kernel predates Linux 5.3, or a sandbox filter denies it"),
-        rustix::io::Errno::PERM => ("EPERM", "a sandbox filter denies it"),
-        rustix::io::Errno::NODEV => ("ENODEV", "the kernel has no anonymous inode filesystem"),
-        other => unreachable!("pidfd_open_unsupported is only for ENOSYS, EPERM and ENODEV, got {other}"),
-    };
+/// The operation that needed a pidfd, named in [`Error::Unsupported`]. It names what the caller
+/// asked for, whoever owns the target: [`Process`](crate::Process) and
+/// [`Child`](crate::Child) reach the same three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidfdOp {
+    /// Waiting for exit: `wait`, `wait_timeout`, and the grace wait of `graceful_shutdown*`.
+    Wait,
+    /// `kill`, and the escalation of `graceful_shutdown*`.
+    Kill,
+    /// `terminate`, and the first step of `graceful_shutdown*`.
+    Terminate,
+    /// Signalling a process-group member during teardown.
+    GroupTeardown,
+}
+
+impl PidfdOp {
+    fn name(self) -> &'static str {
+        match self {
+            PidfdOp::Wait => "process wait",
+            PidfdOp::Kill => "process kill",
+            PidfdOp::Terminate => "process terminate",
+            PidfdOp::GroupTeardown => "process-group teardown",
+        }
+    }
+}
+
+/// The name of `errno` if `pidfd_open` answering it is a refusal: the environment does not let
+/// this process open a pidfd at all. `ENOSYS` is a kernel without the syscall or a filter;
+/// `EPERM`, `EACCES` and `ENODEV` are errnos the kernel's own `pidfd_open` never returns, so
+/// only a seccomp filter or an LSM can be answering. `pidfd_open(2)` documents none of them.
+fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
+    match errno {
+        rustix::io::Errno::NOSYS => Some("ENOSYS"),
+        rustix::io::Errno::PERM => Some("EPERM"),
+        rustix::io::Errno::ACCESS => Some("EACCES"),
+        rustix::io::Errno::NODEV => Some("ENODEV"),
+        _ => None,
+    }
+}
+
+fn pidfd_open_unsupported(op: PidfdOp, errno_name: &str) -> Error {
     Error::Unsupported {
-        op: op.into(),
+        op: op.name().into(),
         platform: "linux",
-        detail: format!("pidfd_open answered {name}: {cause}"),
+        detail: format!(
+            "cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: pidfd_open answered {errno_name}"
+        ),
     }
 }
 
@@ -329,7 +369,7 @@ pub(crate) mod fault {
 }
 
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
-    let Some(pidfd) = open_verified(id, "foreign process wait", "its exit cannot be observed")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Wait, "its exit cannot be observed")? else {
         return Ok(true);
     };
     loop {
@@ -361,7 +401,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, "foreign process kill", "no signal was sent")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Kill, "no signal was sent")? else {
         return Ok(());
     };
     match pidfd_send_signal(&pidfd, Signal::KILL) {
@@ -372,7 +412,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 }
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, "foreign process terminate", "no signal was sent")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Terminate, "no signal was sent")? else {
         return Ok(());
     };
     match pidfd_send_signal(&pidfd, Signal::TERM) {
