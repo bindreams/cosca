@@ -68,6 +68,9 @@ mod graceful_hooks;
 mod oneshot_hook;
 
 #[cfg(test)]
+mod relayed_probe;
+
+#[cfg(test)]
 mod test_child;
 
 #[cfg(all(test, unix))]
