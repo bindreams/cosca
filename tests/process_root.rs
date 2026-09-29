@@ -55,41 +55,42 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
     let target_bin = common::world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
 
     // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
-    // such concept), so this one spawn uses `std::process::Command` directly. `control-echo-pid`,
+    // such concept), so this one spawn uses `std::process::Command` directly, under the spawn
+    // lock like every raw fork in this suite (see `common::output_locked`). `control-echo-pid`,
     // not `control-block`: the survival check below needs a target that stays responsive, not
-    // merely present, to prove the denied kill didn't land. It gets a piped stdout it never
-    // writes to, purely as a death-watch: see `common::accept_or_die`.
-    let target = std::process::Command::new(&target_bin)
-        .args(["control-echo-pid", &addr, "R"])
-        .uid(common::TARGET_UID)
-        .gid(common::TARGET_UID)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the target under an unprivileged uid");
-    let mut target = KillOnDrop::new(target);
+    // merely present, to prove the denied kill didn't land.
+    let target = {
+        let _guard = cosca::test_spawn_lock();
+        std::process::Command::new(&target_bin)
+            .args(["control-echo-pid", &addr, "R"])
+            .uid(common::TARGET_UID)
+            .gid(common::TARGET_UID)
+            .spawn()
+            .expect("spawn the target under an unprivileged uid")
+    };
+    let target = KillOnDrop::new(target);
     let target_pid = target.id();
-    let mut dead_watch = target.take_stdout().expect("target was spawned with a piped stdout");
 
-    let mut sock = common::accept_or_die(&listener, &mut dead_watch);
+    let mut sock = common::accept_or_die(&listener, target_pid);
     let (tag, reported_pid) = common::read_tag_and_pid(&mut sock);
     assert_eq!(tag, b'R', "unexpected control tag from the target");
     assert_eq!(
         reported_pid, target_pid,
         "the target's self-reported pid must match what we spawned"
     );
-    drop(dead_watch); // no longer needed
 
     // The actual caller under test: re-exec THIS SAME test binary (another world-executable
     // copy — see above) as READER_UID. Its result crosses back as an exit code ONLY (never
     // parsed text) — see `foreign_kill_helper_main`'s doc for the exact mapping.
     let exe = std::env::current_exe().expect("this test binary's own path");
     let reader_bin = common::world_executable_copy(&exe, scratch.path());
-    let status = std::process::Command::new(&reader_bin)
-        .uid(common::READER_UID)
-        .gid(common::READER_UID)
-        .env(ENV_TARGET_PID, target_pid.to_string())
-        .status()
-        .expect("re-exec this binary as the unprivileged reader");
+    let status = common::status_locked(
+        std::process::Command::new(&reader_bin)
+            .uid(common::READER_UID)
+            .gid(common::READER_UID)
+            .env(ENV_TARGET_PID, target_pid.to_string()),
+    )
+    .expect("re-exec this binary as the unprivileged reader");
 
     assert_eq!(
         status.code(),
