@@ -1065,3 +1065,60 @@ async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
         "expected a \"before it connected\" panic, got: {message:?}"
     );
 }
+
+/// A target that connected and then exited must NOT be reported as having exited before it
+/// connected. A freshly registered tokio listener is not ready on its first poll, while
+/// `Child::wait()` on an already-exited child completes at once, so without the final
+/// non-blocking accept the exit arm wins with the connection still in the backlog.
+///
+/// Deterministic: the child is awaited to completion BEFORE the tokio listener even exists, so
+/// the connection is already queued in the std listener's backlog, the exit is already known, and
+/// the tokio wrapper's first poll has never seen a reactor event. Named mutant: the final accept
+/// removed (the exit arm panics directly).
+#[tokio::test]
+async fn accept_or_die_async_returns_the_connection_when_the_target_already_exited() {
+    use std::io::Read as _;
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = std_listener.local_addr().unwrap().to_string();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "control-once", addr.as_str(), "R"]);
+    let mut child = cmd.spawn().expect("spawn a target that connects and exits immediately");
+    let status = child.wait().await.expect("wait for the target to exit");
+    assert!(status.success(), "control-once should exit 0, got {status}");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set the listener nonblocking for tokio");
+    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
+
+    let mut sock = common::accept_or_die_async(&listener, &mut child).await;
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag)
+        .expect("read the tag sent before the target exited");
+    assert_eq!(tag, *b"R");
+}
+
+/// Only the GRANDCHILD dies (root alive, connected): the helper must fail, not wait forever for
+/// a "G". Named mutant: the helper watching only the root.
+#[tokio::test]
+async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+    let result = ::tokio::spawn(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
+    let Err(join_err) = result else {
+        panic!("spawn_tree_async must panic, not hang or succeed");
+    };
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    let message = common::panic_message(join_err.into_panic());
+    assert!(message.contains("before it connected"), "got: {message:?}");
+}
+
+/// [`spawn_echo_tree_async`]'s twin of the test above.
+#[tokio::test]
+async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+    let result = ::tokio::spawn(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
+    let join_err = result
+        .err()
+        .expect("spawn_echo_tree_async must panic, not hang or succeed");
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    let message = common::panic_message(join_err.into_panic());
+    assert!(message.contains("before it connected"), "got: {message:?}");
+}

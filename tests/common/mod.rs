@@ -7,11 +7,14 @@
 // log-capture re-exports, which only `macos_fdmarker.rs` uses) are expected here.
 #![allow(dead_code, unused_imports)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 #[cfg(target_os = "linux")]
 pub mod cgroup;
+
+mod accept;
+pub use accept::*;
 
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
@@ -196,300 +199,6 @@ pub fn read_report_line(sock: &TcpStream) -> String {
     line
 }
 
-/// Blocks until either `listener` gets an incoming connection, or the target process
-/// (`target_pid`) exits first — via the OS's own process-exit notification (a `pidfd` on Linux, a
-/// `kqueue`'s `EVFILT_PROC`/`NOTE_EXIT` on macOS, a process HANDLE via `WaitForMultipleObjects` on
-/// Windows — see each platform's own `accept_or_die` below), never a pipe. A pipe's EOF is hidden
-/// by any descendant still holding its write end open: measured, `sh -c 'sleep 8 & exit 3'`
-/// reports its OWN exit only 8s later through a pipe-EOF proxy, and `spawn_tree`'s grandchildren
-/// inherit the root's stdout the same way; on macOS the write end can also leak into a concurrent,
-/// unrelated fork. A plain blocking `accept()` would hang forever if the target dies first, for
-/// the same reason; this doesn't.
-///
-/// No thread, no reconnect: an earlier revision used a background thread that death-watched the
-/// target and, on death, RECONNECTED to `listener`'s own address to signal it — measured to be
-/// unsound: after the real target's own process (and this function) have moved on, nothing keeps
-/// that port reserved, and the OS can and does reissue it (observed on macOS) to a completely
-/// unrelated later listener, which then sees a spurious, wrongly-attributed connection.
-///
-/// The exit notification is a PROMPT to check again, not proof by itself: a target that connects
-/// and then exits immediately (an ordinary success for most callers) races its own exit signal
-/// against the connection already sitting in the listener's backlog. Every platform's
-/// implementation below resolves that race the same way, in [`final_peek_or_die`]: once the exit
-/// notification fires, a final NON-BLOCKING `accept()` is the actual authority, and wins if a
-/// connection is there — only an empty backlog at that instant is treated as "died before
-/// connecting".
-#[cfg(target_os = "linux")]
-pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    use std::os::fd::AsRawFd;
-
-    let raw = rustix::process::Pid::from_raw(target_pid as i32).expect("a spawned child's pid is never 0");
-    let pidfd = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
-        Ok(fd) => fd,
-        // The target was already gone by the time we tried to open it — not a setup failure,
-        // just the exit-first race arriving before this function could even arm its watch.
-        Err(rustix::io::Errno::SRCH) => return final_peek_or_die(listener, target_pid),
-        Err(e) => panic!(
-            "pidfd_open({target_pid}) for the death-watch: {}",
-            std::io::Error::from(e)
-        ),
-    };
-
-    let mut fds = [
-        libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("poll while waiting for a control connection: {e}");
-        }
-        // POLLNVAL on either fd would mean this function handed poll() a bad fd — a contract
-        // this function itself owns end to end, so a violation is a bug here, not a runtime
-        // condition to recover from.
-        debug_assert_eq!(
-            fds[0].revents & libc::POLLNVAL,
-            0,
-            "the control listener's fd went invalid mid-wait"
-        );
-        debug_assert_eq!(fds[1].revents & libc::POLLNVAL, 0, "the pidfd went invalid mid-wait");
-        // Unlike POLLNVAL, an error on the LISTENER is a real, externally-caused condition (the
-        // socket itself failing) — surfaced in every build, not compiled out with debug_assert.
-        if fds[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-            panic!(
-                "the control listener reported an error while waiting for a connection (revents={:#x})",
-                fds[0].revents
-            );
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            return listener.accept().expect("accept a control connection").0;
-        }
-        if fds[1].revents & libc::POLLIN != 0 {
-            return final_peek_or_die(listener, target_pid);
-        }
-    }
-}
-
-/// macOS sibling of the Linux `accept_or_die` above — same contract, via one `kqueue` carrying
-/// both an `EVFILT_PROC`/`NOTE_EXIT` watch on the target and an `EVFILT_READ` watch on the
-/// listener, instead of `poll()` over two fds: a `kqueue` fd is itself only readable, not
-/// filter-specific, so this is what actually distinguishes "the target exited" from "the listener
-/// is ready" on this platform.
-#[cfg(target_os = "macos")]
-pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    use std::os::fd::AsRawFd;
-
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
-    let kq = Kqueue::new().expect("kqueue() for the death-watch");
-    let changes = [
-        KEvent::new(
-            target_pid as usize,
-            EventFilter::EVFILT_PROC,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::NOTE_EXIT,
-            0,
-            0,
-        ),
-        KEvent::new(
-            listener.as_raw_fd() as usize,
-            EventFilter::EVFILT_READ,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::empty(),
-            0,
-            0,
-        ),
-    ];
-    let mut receipts = [changes[0]; 2];
-    kq.kevent(&changes, &mut receipts, None)
-        .expect("kevent(EV_ADD) to arm the death-watch and the listener watch");
-    for r in &receipts {
-        // EV_RECEIPT makes EV_ADD synchronous and always reports EV_ERROR, with the outcome (0 =
-        // armed OK) in `data` — this is the ONLY way to observe an EV_ADD failure at all; without
-        // it, a bad filter fails silently and this function would then wait forever.
-        assert!(
-            r.flags().contains(EvFlags::EV_ERROR),
-            "EV_RECEIPT should always report EV_ERROR: {r:?}"
-        );
-        let errno = r.data() as i32;
-        if r.filter() == Ok(EventFilter::EVFILT_PROC) && errno == libc::ESRCH {
-            // Already gone by the time we tried to arm the watch — the exit-first race arriving
-            // before this function could even arm it, same as the Linux SRCH case above.
-            return final_peek_or_die(listener, target_pid);
-        }
-        assert_eq!(
-            errno,
-            0,
-            "kevent(EV_ADD) receipt for {:?} reported errno {errno}",
-            r.filter()
-        );
-    }
-
-    let mut events = [changes[0]; 2];
-    loop {
-        let n = kq
-            .kevent(&[], &mut events, None)
-            .expect("kevent while waiting for a control connection");
-        for ev in &events[..n] {
-            // An armed kevent (not an EV_ADD receipt) reporting EV_ERROR would mean the kernel
-            // itself hit a problem delivering a notification this function already successfully
-            // armed — not a condition either filter's own documentation describes as possible.
-            debug_assert!(
-                !ev.flags().contains(EvFlags::EV_ERROR),
-                "an armed kevent reported EV_ERROR: {ev:?}"
-            );
-            match ev.filter() {
-                Ok(EventFilter::EVFILT_READ) => return listener.accept().expect("accept a control connection").0,
-                Ok(EventFilter::EVFILT_PROC) => return final_peek_or_die(listener, target_pid),
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Shared by every platform's `accept_or_die`: once the exit notification fires, a non-blocking
-/// `accept()` is the actual authority — see `accept_or_die`'s own doc for why the notification
-/// alone is only a prompt to check again, never proof.
-fn final_peek_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    listener
-        .set_nonblocking(true)
-        .expect("set the listener nonblocking for the final accept peek");
-    let peek = listener.accept();
-    listener
-        .set_nonblocking(false)
-        .expect("restore the listener to blocking mode after the peek");
-    match peek {
-        Ok((stream, _)) => stream,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            panic!("the control target (pid {target_pid}) died before it connected")
-        }
-        Err(e) => panic!("accept during the final peek before declaring pid {target_pid} died: {e}"),
-    }
-}
-
-/// Windows sibling of the Linux/macOS `accept_or_die` above — same contract, via
-/// `WaitForMultipleObjects` over a process HANDLE (opened fresh by pid, needing no raw-handle
-/// accessor from `cosca::Child`/`cosca::tokio::Child` — any caller that knows the target's pid can
-/// use this) and a `WSAEVENT` armed for `FD_ACCEPT` on the listener.
-#[cfg(windows)]
-pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    use std::os::windows::io::AsRawSocket;
-
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
-    use windows::Win32::Networking::WinSock::{WSACloseEvent, WSACreateEvent, WSAEventSelect, FD_ACCEPT, SOCKET};
-    use windows::Win32::System::Threading::{OpenProcess, WaitForMultipleObjects, INFINITE, PROCESS_SYNCHRONIZE};
-
-    // SAFETY: opens the target by pid with only SYNCHRONIZE — enough to wait for its exit.
-    // Unlike `src/wait/windows.rs`'s own by-pid wait, this does not re-verify the pid was not
-    // recycled between spawn and here: that production path guards a long-lived wait against an
-    // attacker-controlled window; this one's spawn-to-here window is microseconds of a test's
-    // own setup, so the same rigor buys nothing here.
-    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, target_pid) }
-        .unwrap_or_else(|e| panic!("OpenProcess({target_pid}, SYNCHRONIZE) for the death-watch: {e}"));
-
-    // SAFETY: creates an unnamed, unowned manual-reset event; closed explicitly below on every
-    // path out of this function.
-    let accept_event = unsafe { WSACreateEvent() }.expect("WSACreateEvent for the listener's accept-readiness watch");
-    let sock = SOCKET(listener.as_raw_socket() as usize);
-    // SAFETY: `sock` is the listener's own live socket; `accept_event` was just created above.
-    let rc = unsafe { WSAEventSelect(sock, Some(accept_event), FD_ACCEPT as i32) };
-    assert_eq!(
-        rc,
-        0,
-        "WSAEventSelect(FD_ACCEPT) on the control listener: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let handles = [HANDLE(accept_event.0 as *mut _), process];
-    // SAFETY: both handles are live and owned by this function for the call's duration.
-    let woken = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-
-    // WSAEventSelect(s, None, 0) cancels the association, documented as also returning the
-    // socket to blocking mode — measured in CI to NOT actually be reliable: a real run hit
-    // WSAEWOULDBLOCK on the very next `accept()` below without the explicit `set_nonblocking`
-    // that follows it. Both calls stay: the first cancels the FD_ACCEPT association (skipping it
-    // and going straight to `set_nonblocking` left the association armed, which — same CI
-    // evidence — is its own source of spurious wakeups), the second is what the socket's
-    // blocking mode has actually been observed to need.
-    // SAFETY: `sock` is still the listener's own live socket.
-    let rc = unsafe { WSAEventSelect(sock, None, 0) };
-    assert_eq!(
-        rc,
-        0,
-        "WSAEventSelect(0) to cancel the accept-readiness association: {}",
-        std::io::Error::last_os_error()
-    );
-    listener
-        .set_nonblocking(false)
-        .expect("restore the control listener to blocking mode");
-    // SAFETY: closes only the two handles this function opened above.
-    unsafe {
-        let _ = WSACloseEvent(accept_event);
-        let _ = CloseHandle(process);
-    }
-
-    if woken == WAIT_FAILED {
-        panic!(
-            "WaitForMultipleObjects while waiting for a control connection failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    match woken.0.wrapping_sub(WAIT_OBJECT_0.0) {
-        0 => listener.accept().expect("accept a control connection").0,
-        1 => final_peek_or_die(listener, target_pid),
-        _ => panic!("WaitForMultipleObjects while waiting for a control connection returned {woken:?}"),
-    }
-}
-
-/// Async sibling of [`accept_or_die`], for the `tokio`-feature helpers below: same contract, via
-/// a biased `tokio::select!` between accepting and the SAME exit watch cosca's own async `Child`
-/// already implements (`cosca::tokio::Child::wait`) — not a pipe, and no platform-specific fd/
-/// HANDLE plumbing needed here either, since `wait` already IS that on every platform.
-///
-/// `biased;` with the accept arm first gives the "listener wins" contract: `TcpListener::accept()`
-/// is cancel-safe (a dropped, not-yet-ready future consumes nothing), so a connection already
-/// queued when this function is polled is taken on the very first poll, before `wait()` is polled
-/// at all — the same "exit is a prompt, not proof" question the sync implementations resolve with
-/// `final_peek_or_die` does not even arise here, because polling itself is already atomic per
-/// call: there is no window where both arms are "ready" and one must be chosen over the other.
-#[cfg(feature = "tokio")]
-pub async fn accept_or_die_async(listener: &::tokio::net::TcpListener, child: &mut cosca::tokio::Child) -> TcpStream {
-    ::tokio::select! {
-        biased;
-        accepted = listener.accept() => {
-            let (stream, _) = accepted.expect("accept a control connection");
-            let stream = stream.into_std().expect("convert the accepted tokio stream to std");
-            // `into_std` does NOT reset blocking mode (verified: it just rewraps the same raw
-            // fd/socket, which tokio itself always keeps non-blocking) — every caller of this
-            // function does ordinary BLOCKING std reads/writes on the result, so this must
-            // explicitly restore blocking mode, not merely convert the type.
-            stream.set_nonblocking(false).expect("restore the accepted stream to blocking mode");
-            stream
-        }
-        status = child.wait() => {
-            match status {
-                Ok(status) => panic!("the control target exited ({status}) before it connected"),
-                // An error watching the exit is reported as exactly that error — never folded
-                // into "died", which would misattribute a wait-mechanism failure to the target.
-                Err(e) => panic!("watching the control target's exit while waiting for a connection: {e}"),
-            }
-        }
-    }
-}
-
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
@@ -564,6 +273,33 @@ pub fn spawn_blocker() -> (cosca::Child, TcpStream) {
     spawn_control("control-block", &["R"], false)
 }
 
+/// The text of a caught panic payload; fails loudly when the payload is not a string.
+pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"))
+}
+
+/// Env var telling a `spawn-grandchild*` testbin root where to report its grandchild's pid.
+/// Unset, the root reports nothing, so other consumers of these modes see no extra connection.
+const GC_PID_ADDR_ENV: &str = "COSCA_TEST_GC_PID_ADDR";
+
+/// Reads the `<pid>\n` line a `spawn-grandchild*` root sends over `report` right after spawning
+/// its grandchild, watching the root while it waits. Knowing the grandchild's pid BEFORE it
+/// connects is what lets the tree helpers watch it too: a root that lives while its grandchild
+/// died before connecting would otherwise leave them waiting forever.
+fn read_grandchild_pid(mut report: TcpStream) -> u32 {
+    let mut line = String::new();
+    std::io::BufReader::new(&mut report)
+        .read_line(&mut line)
+        .expect("read the grandchild pid report");
+    line.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("grandchild pid report {line:?}: {e}"))
+}
+
 /// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
 /// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
 /// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
@@ -577,16 +313,18 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     if contain {
         cmd.contain();
     }
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
+    cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
     let child = cmd.spawn().expect("spawn tree");
-    let target_pid = child.id().pid();
+    let root_pid = child.id().pid();
+    let grand_pid = read_grandchild_pid(accept_or_die(&report, root_pid));
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
-    // duplicate or foreign tag is a harness bug worth failing loudly on). Only the ROOT's own
-    // death is watched (both accepts share the same target_pid) — if the root dies the whole
-    // tree typically dies with it; the grandchild dying independently is not this helper's
-    // contract to catch.
+    // duplicate or foreign tag is a harness bug worth failing loudly on). The root is watched
+    // throughout, the grandchild until it has connected: either dying first fails the helper.
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
-        let mut s = accept_or_die(&listener, target_pid);
+        let watch_grand = grand.is_none().then_some(grand_pid);
+        let mut s = accept_or_die_also(&listener, root_pid, watch_grand);
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         match &tag {
@@ -610,7 +348,7 @@ pub fn spawn_grandchild(contain: bool) -> (cosca::Child, Vec<TcpStream>) {
 /// one definition so every caller sets non-blocking mode (required for `TcpListener::from_std`)
 /// the same way.
 #[cfg(feature = "tokio")]
-fn bind_async_listener() -> (::tokio::net::TcpListener, String) {
+pub fn bind_async_listener() -> (::tokio::net::TcpListener, String) {
     let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = std_listener.local_addr().unwrap().to_string();
     std_listener
@@ -651,9 +389,8 @@ pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (
 /// Returns the root and grandchild control sockets identified by tag (accept order is not
 /// guaranteed).
 ///
-/// Only the ROOT's own death is watched (both accepts race the same `child.wait()`), exactly
-/// like the sync `spawn_tree` — see its doc for why that is the established contract this
-/// mirrors, not a gap introduced here.
+/// The root is watched throughout and the grandchild until it has connected, as in the sync
+/// `spawn_tree`: either dying first fails the helper instead of hanging it.
 #[cfg(feature = "tokio")]
 pub async fn spawn_tree_async(
     mode: &str,
@@ -667,10 +404,14 @@ pub async fn spawn_tree_async(
     // applies the containment/nesting/kill_on_drop.
     cmd.args([testbin(), mode, addr.as_str()]);
     configure(&mut cmd);
+    let (report, report_addr) = bind_async_listener();
+    cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async tree");
+    let grand_pid = read_grandchild_pid(accept_or_die_async(&report, &mut child).await);
     let (mut root, mut grandchild) = (None, None);
     for _ in 0..2 {
-        let mut s = accept_or_die_async(&listener, &mut child).await;
+        let watch_grand = grandchild.is_none().then_some(grand_pid);
+        let mut s = accept_or_die_async_also(&listener, &mut child, watch_grand).await;
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         match &tag {
@@ -697,19 +438,29 @@ pub struct AsyncEchoTree {
     pub grand_pid: u32,
 }
 
-/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`. Only the root's death is
-/// watched, as in `spawn_tree_async` above.
+/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`. Root and grandchild are
+/// watched as in `spawn_tree_async` above.
 #[cfg(feature = "tokio")]
 pub async fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
+    spawn_echo_tree_async_mode("spawn-grandchild-echo", kill_on_drop).await
+}
+
+/// [`spawn_echo_tree_async`] over any echo-tree testbin `mode`.
+#[cfg(feature = "tokio")]
+pub async fn spawn_echo_tree_async_mode(mode: &str, kill_on_drop: bool) -> AsyncEchoTree {
     let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
-    cmd.args([testbin(), "spawn-grandchild-echo", addr.as_str()]);
+    cmd.args([testbin(), mode, addr.as_str()]);
     cmd.contain();
     cmd.kill_on_drop(kill_on_drop);
+    let (report, report_addr) = bind_async_listener();
+    cmd.env(GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn async echo tree");
+    let watched_grand_pid = read_grandchild_pid(accept_or_die_async(&report, &mut child).await);
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
-        let mut s = accept_or_die_async(&listener, &mut child).await;
+        let watch_grand = grand.is_none().then_some(watched_grand_pid);
+        let mut s = accept_or_die_async_also(&listener, &mut child, watch_grand).await;
         match read_tag_and_pid(&mut s) {
             (b'R', _) => root = Some(s),
             (b'G', pid) => grand = Some((s, pid)),
