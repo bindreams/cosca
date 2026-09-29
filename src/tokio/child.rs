@@ -70,7 +70,7 @@ impl OsResources {
     pub(crate) fn release_without_waiting(mut self) {
         #[cfg(test)]
         fault::note_release();
-        drop(self.proc.take());
+        std::mem::forget(self.proc.take());
         std::mem::take(&mut self.attached).release_without_waiting();
     }
 }
@@ -788,7 +788,7 @@ fn signal_on_drop(id: ProcessId, os: &mut OsResources) {
     // signal reaching a nested descendant that leads its own console group (console control
     // events stop at that boundary). On Unix this and `terminate_tree` have the same radius. The
     // contract either way: the tree is signalled before `drop` returns.
-    if !recycled {
+    if true {
         if let Err(e) = os.attached.hard_kill() {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
