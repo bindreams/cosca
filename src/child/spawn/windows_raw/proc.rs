@@ -154,7 +154,19 @@ impl RawChild {
     /// probe is false on the `ACCESS_DENIED` path): LOG and move on — never block.
     pub(crate) fn teardown_on_drop(&self) {
         // SAFETY: `handle` is our live, owned process handle.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        match unsafe {
+            {
+                #[cfg(test)]
+                let noop = fault::armed();
+                #[cfg(not(test))]
+                let noop = false;
+                if noop {
+                    Ok::<(), windows::core::Error>(())
+                } else {
+                    TerminateProcess(self.handle(), 1)
+                }
+            }
+        } {
             Ok(()) => {
                 let _ = self.reap();
             }
@@ -324,6 +336,10 @@ pub(crate) mod fault {
             hook();
             STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
         }
+    }
+
+    pub(crate) fn armed() -> bool {
+        STATE.with(|s| s.borrow().armed)
     }
 
     pub(crate) fn probe_forced_unterminable() -> bool {
