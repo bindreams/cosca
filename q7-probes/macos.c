@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/proc.h>
 #include <sys/proc_info.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,7 +16,7 @@ static void q(pid_t p, const char *label) {
 	       sizeof bi, e, strerror(e), bi.pbi_status, (unsigned long long)bi.pbi_start_tvsec, (unsigned long long)bi.pbi_start_tvusec, bi.pbi_comm);
 	struct proc_bsdshortinfo si; memset(&si, 0, sizeof si); errno = 0;
 	r = proc_pidinfo(p, PROC_PIDT_SHORTBSDINFO, 0, &si, sizeof si); e = errno;
-	printf("%-28s PROC_PIDT_SHORTBSDINFO ret=%d errno=%d(%s) status=%u\n", label, r, e, strerror(e), si.pbi_status);
+	printf("%-28s PROC_PIDT_SHORTBSDINFO ret=%d errno=%d(%s) status=%u\n", label, r, e, strerror(e), si.pbsi_status);
 	errno = 0; r = kill(p, 0); e = errno;
 	printf("%-28s kill(pid,0)=%d errno=%d(%s)\n", label, r, e, strerror(e));
 	fflush(stdout);
