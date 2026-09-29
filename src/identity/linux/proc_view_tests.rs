@@ -5,10 +5,10 @@ use std::os::fd::AsFd;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
-use super::fault::{force_proc_view_once, force_status_once, force_thread_stat_once, ForcedView};
+use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
-    classify_status, classify_thread_stat, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir,
-    ProcView, Verdict,
+    classify_ns_links, classify_status, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView,
+    Verdict,
 };
 
 fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
@@ -19,21 +19,24 @@ fn unreachable_ns_pid() -> io::Result<bool> {
     panic!("self/ns/pid must be consulted only when NSpid is absent")
 }
 
-/// The ordinary view of this test binary, derived from `thread-self/stat`'s pid against
-/// `gettid()`: the two agree exactly when `/proc` numbers this thread as the thread itself does,
-/// so the view is `Same`, and `Diverged` otherwise (a container without its own `/proc`).
+/// The ordinary view of this test binary, derived independently of `NSpid`: `/proc` is this
+/// namespace's exactly when it numbers this namespace's pid 1 as `1`. An outer procfs numbers
+/// that init otherwise (its own `1` is its own init, in another namespace), and one that cannot
+/// see it prints `0`. Comparing this thread's own ids instead can coincide.
 #[test]
-fn proc_view_matches_what_thread_self_stat_says_about_this_thread() {
-    let stat = ProcDir::open()
-        .expect("/proc opens")
-        .read_to_string("thread-self/stat")
-        .expect("thread-self/stat reads");
-    let same = stat.split(' ').next() == Some(&rustix::thread::gettid().as_raw_nonzero().to_string());
+fn proc_view_matches_how_proc_numbers_our_own_init() {
+    let dir = ProcDir::open().expect("/proc opens");
+    let init = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(1).expect("1 is nonzero"),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("pidfd_open(1)");
+    let numbered = pidfd_pid_in_view(&dir, init.as_fd()).expect("read pid 1's pidfd fdinfo");
     let view = proc_view();
     assert_eq!(
         matches!(view, ProcView::Same(_)),
-        same,
-        "got {view:?} for stat {stat:?}"
+        numbered == PidfdTarget::Pid(1),
+        "got {view:?}, while /proc numbers this namespace's init {numbered:?}"
     );
 }
 
@@ -205,48 +208,68 @@ fn the_proc_dir_refuses_a_magic_link() {
     assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
 }
 
-// thread-self cross-check (no NSpid) =====
+// Namespace-link cross-check (no NSpid) =====
 
 const NO_NSPID: &str = "Name:\tcosca\nState:\tR (running)\n";
 
-/// `thread-self/stat` numbers this thread as `gettid()` does: same namespace.
+fn link(target: &str) -> io::Result<Vec<u8>> {
+    Ok(target.as_bytes().to_vec())
+}
+
 #[test]
-fn a_thread_stat_naming_this_tid_is_same() {
-    let verdict = classify_thread_stat("4242 (cosca) R 1 4242", 4242);
+fn a_procfs_whose_pid_1_shares_this_threads_namespace_is_same() {
+    let verdict = classify_ns_links(link("pid:[4026531836]"), || link("pid:[4026531836]"));
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
 }
 
-/// Mutant: "compare the tgid, not the tid" and "any parseable stat is Same".
+/// Mutant: "any two readable links are Same".
 #[test]
-fn a_thread_stat_naming_another_tid_is_diverged() {
-    let verdict = classify_thread_stat("7 (cosca) R 1 7", 4242);
+fn a_procfs_whose_pid_1_is_in_another_namespace_is_diverged() {
+    let verdict = classify_ns_links(link("pid:[4026532831]"), || link("pid:[4026532830]"));
     assert!(matches!(verdict, Verdict::Diverged), "got {verdict:?}");
 }
 
 #[test]
-fn an_unparseable_thread_stat_is_unassessable() {
-    for stat in ["", "x (cosca) R", "(cosca) R"] {
-        let verdict = classify_thread_stat(stat, 4242);
-        assert!(matches!(verdict, Verdict::Unassessable(_)), "{stat:?}: got {verdict:?}");
+fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
+    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || {
+        Err(io::Error::from_raw_os_error(libc::EACCES))
+    }) else {
+        panic!("expected Unassessable");
+    };
+    assert!(why.reason.contains("1/ns/pid"), "{why}");
+    assert_eq!(why.source.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
+}
+
+/// An unreadable own link is reported as such, and the pid 1 link is then not read.
+#[test]
+fn an_unreadable_own_link_is_unassessable_without_reading_pid_1() {
+    let Verdict::Unassessable(why) = classify_ns_links(Err(io::Error::from_raw_os_error(libc::ENOENT)), || {
+        panic!("pid 1's link must not be read once the own link failed")
+    }) else {
+        panic!("expected Unassessable");
+    };
+    assert!(why.reason.contains("thread-self/ns/pid"), "{why}");
+}
+
+/// Two equal non-namespace targets (say, both empty) prove nothing. Mutant: "compare the raw
+/// targets".
+#[test]
+fn a_link_that_names_no_pid_namespace_is_unassessable() {
+    for (own, init) in [("", ""), ("net:[1]", "net:[1]"), ("pid:[1]", "pid:[1")] {
+        let verdict = classify_ns_links(link(own), || link(init));
+        assert!(
+            matches!(verdict, Verdict::Unassessable(_)),
+            "{own:?} {init:?}: got {verdict:?}"
+        );
     }
 }
 
-/// No `NSpid` although pid namespaces exist (gVisor): the real `thread-self/stat` decides, so an
-/// ordinary process is `Same`. Mutant: "an absent NSpid with namespaces present is Unassessable".
+/// The real links through the real `/proc` read as pid namespace links.
 #[test]
-fn a_status_without_nspid_is_decided_by_the_real_thread_stat() {
-    let _forced = force_status_once(NO_NSPID);
-    let view = proc_view();
-    assert!(matches!(view, ProcView::Same(_)), "got {view:?}");
-}
-
-/// The same arm against a thread stat that names another tid: an outer namespace's `/proc`.
-#[test]
-fn a_status_without_nspid_and_a_foreign_thread_stat_is_diverged() {
-    let _status = force_status_once(NO_NSPID);
-    let _stat = force_thread_stat_once("1 (init) S 0 1");
-    let view = proc_view();
-    assert!(matches!(view, ProcView::Diverged), "got {view:?}");
+fn this_threads_own_namespace_link_reads_through_the_proc_dir() {
+    let dir = ProcDir::open().expect("/proc opens");
+    let own = dir.read_link("thread-self/ns/pid").expect("read own link");
+    assert!(own.starts_with(b"pid:["), "{:?}", String::from_utf8_lossy(&own));
 }
 
 // pidfd fdinfo =====
@@ -320,4 +343,125 @@ fn fixture_fdinfo_after_unshare_files() {
         matches!(got, Ok(PidfdTarget::Pid(p)) if p == std::process::id()),
         "got {got:?}"
     );
+}
+
+// No-NSpid cross-check against real pid namespaces =====
+
+/// No `NSpid`, and `/proc` is an outer pid namespace's procfs that numbers the calling thread
+/// exactly as `gettid()` does: the numbers agree, the namespaces do not. `Diverged`.
+///
+/// Mutant: "compare `thread-self/stat`'s id with `gettid()`" — the coincidence reads as `Same`.
+#[test]
+fn namespaces_no_nspid_under_an_outer_procfs_numbering_this_thread_alike_is_diverged() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_coinciding_tid_driver));
+}
+
+#[test]
+fn fixture_coinciding_tid_driver() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_new_pid_ns_for_children();
+    ns::run(fixture_path!(fixture_coinciding_tid_outer_init));
+}
+
+/// Pid 1 of a fresh namespace P with P's own procfs on `/proc`; its next child is pid 1 of a
+/// namespace C below P and keeps P's procfs. P holds only this fixture chain, so nothing else
+/// allocates pids in it.
+#[test]
+fn fixture_coinciding_tid_outer_init() {
+    if !ns::is_child_in_new_pid_ns() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    ns::mount_proc(std::path::Path::new("/proc"));
+    ns::enter_new_pid_ns_for_children();
+    ns::run(fixture_path!(fixture_coinciding_tid_inner));
+}
+
+#[test]
+fn fixture_coinciding_tid_inner() {
+    if !ns::is_child_in_new_pid_ns() {
+        return;
+    }
+    // P's last allocation is this process's latest thread; point C's cursor at the same number so
+    // the next thread gets one number in both namespaces.
+    let last_in_proc = std::thread::spawn(ns::tid_in_proc).join().expect("probe thread");
+    ns::set_last_pid(last_in_proc);
+    let view = std::thread::spawn(|| {
+        let tid = rustix::thread::gettid().as_raw_nonzero().get() as u32;
+        assert_eq!(
+            ns::tid_in_proc(),
+            tid,
+            "precondition: /proc must number this thread as gettid() does"
+        );
+        let _status = force_status_once(NO_NSPID);
+        proc_view()
+    })
+    .join()
+    .expect("verdict thread");
+    assert!(matches!(view, ProcView::Diverged), "got {view:?}");
+}
+
+/// No `NSpid`, and `/proc` is this namespace's own procfs: `Same`. A process that cannot read the
+/// procfs's pid 1 namespace link (here a non-dumpable `nobody`, against a root pid 1) is
+/// `Unassessable`, naming that link: its own link it still reads.
+///
+/// Mutants: "an absent NSpid with namespaces present is Unassessable" (the first half);
+/// "compare `thread-self/stat`'s id with `gettid()`" (the second: it needs no permission, so it
+/// answers `Same`).
+#[test]
+fn namespaces_no_nspid_under_this_namespaces_own_procfs_is_same() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_own_procfs_driver));
+}
+
+#[test]
+fn fixture_own_procfs_driver() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_new_pid_ns_for_children();
+    ns::run(fixture_path!(fixture_own_procfs_init));
+}
+
+#[test]
+fn fixture_own_procfs_init() {
+    if !ns::is_child_in_new_pid_ns() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    ns::mount_proc(std::path::Path::new("/proc"));
+    let view = {
+        let _status = force_status_once(NO_NSPID);
+        proc_view()
+    };
+    assert!(matches!(view, ProcView::Same(_)), "got {view:?}");
+    ns::run(fixture_path!(fixture_own_procfs_unprivileged));
+}
+
+#[test]
+fn fixture_own_procfs_unprivileged() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::drop_to_nobody();
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).expect("PR_SET_DUMPABLE 0");
+    let _status = force_status_once(NO_NSPID);
+    match proc_view() {
+        ProcView::Unassessable(why) => {
+            assert!(why.reason.contains("1/ns/pid"), "{why}");
+            assert_eq!(
+                why.source.as_ref().and_then(io::Error::raw_os_error),
+                Some(libc::EACCES),
+                "{why}"
+            );
+        }
+        other => panic!("an unreadable pid 1 namespace link must be Unassessable, got {other:?}"),
+    }
 }

@@ -53,7 +53,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
 ///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
 ///   `kill(2)`.
 ///
-/// No pidfd to cross-check against, so the view comes from `NSpid` (`proc_view`).
+/// No pidfd to cross-check against, so the view comes from [`proc_view`](crate::identity::proc_view).
 fn verify_without_pidfd(
     id: ProcessId,
     what: &'static str,
@@ -91,7 +91,7 @@ fn verify_without_pidfd(
         ProcView::Diverged => Err(unassessable(
             id,
             what,
-            "this process's /proc is an outer pid namespace's (NSpid has several entries)",
+            "this process's /proc is an outer pid namespace's",
             None,
             Some(errno),
         )),

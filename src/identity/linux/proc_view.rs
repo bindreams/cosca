@@ -17,8 +17,8 @@
 //!   means this procfs names the target under that number.
 //! - **Without one** ([`proc_view`]): the `NSpid` line of `self/status`, which has one entry per
 //!   pid namespace from the procfs's down to the reader's. One entry means the same namespace.
-//!   Where `NSpid` is absent but pid namespaces exist (gVisor), `thread-self/stat`'s id must
-//!   equal `gettid()`.
+//!   Where `NSpid` is absent but pid namespaces exist (gVisor), the procfs's pid 1 namespace
+//!   link must name this thread's own pid namespace ([`cross_check_with_init_ns`]).
 //!
 //! [`ProcDir`] is proven procfs's root and reads only with `openat2` (Linux 5.6), so a mount
 //! placed over `/proc`, or over a file below it, after the check is refused, not read.
@@ -129,6 +129,12 @@ impl ProcDir {
         String::from_utf8(self.read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// The target of the symlink at `path` under this `/proc`, without following it.
+    fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
+        let link = self.open_beneath(path, OFlags::PATH | OFlags::NOFOLLOW)?;
+        Ok(rustix::fs::readlinkat(&link, "", Vec::new())?.into_bytes())
+    }
+
     /// Whether the symlink at `path` under this `/proc` exists, without following it.
     fn link_exists(&self, path: &str) -> io::Result<bool> {
         match self.open_beneath(path, OFlags::PATH | OFlags::NOFOLLOW) {
@@ -184,7 +190,7 @@ pub(crate) fn proc_view() -> ProcView {
         }
     };
     let verdict = match classify_status(&status, || ns_pid_exists(&dir)) {
-        Verdict::NoNspid => cross_check_with_thread_stat(&dir),
+        Verdict::NoNspid => cross_check_with_init_ns(&dir),
         decided => decided,
     };
     match verdict {
@@ -199,8 +205,8 @@ pub(crate) fn proc_view() -> ProcView {
 #[derive(Debug)]
 enum Verdict {
     Same,
-    /// `NSpid` is absent although pid namespaces exist; only [`cross_check_with_thread_stat`]
-    /// can decide. Never leaves [`proc_view`].
+    /// `NSpid` is absent although pid namespaces exist; only [`cross_check_with_init_ns`] can
+    /// decide. Never leaves [`proc_view`].
     NoNspid,
     Diverged,
     Unassessable(ViewUnreadable),
@@ -230,31 +236,51 @@ fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> io::Result<bool
     }
 }
 
-/// Decide [`Verdict::NoNspid`] from `thread-self/stat`: its first field is this thread's id as
-/// the mounted procfs numbers it, which equals `gettid()` only when that procfs is this
-/// thread's own pid namespace's.
-fn cross_check_with_thread_stat(dir: &ProcDir) -> Verdict {
-    #[cfg(test)]
-    let forced = fault::take_forced_thread_stat();
-    #[cfg(not(test))]
-    let forced: Option<String> = None;
-    match forced.map_or_else(|| dir.read_to_string("thread-self/stat"), Ok) {
-        Ok(stat) => classify_thread_stat(&stat, rustix::thread::gettid().as_raw_nonzero().get() as u32),
-        Err(e) => Verdict::Unassessable(ViewUnreadable::new(
-            "self/status has no NSpid line and thread-self/stat could not be read",
-            Some(e),
-        )),
+/// Decide [`Verdict::NoNspid`] by pid namespace identity. `thread-self/ns/pid` names this
+/// thread's pid namespace (a namespace link names its task's namespace, whichever procfs shows
+/// it), and `1/ns/pid` names the procfs's own, since its pid 1 is that namespace's init. Equal
+/// links: `Same`.
+///
+/// Numbers cannot decide it: an outer procfs can number this thread exactly as `gettid()` does.
+/// Nor can our own pidfd's fdinfo `Pid:`: Linux prints it in the procfs's namespace, where it
+/// coincides with `getpid()` just as the thread id does, and gVisor prints it in the fd owner's.
+///
+/// No Linux kernel reaches this arm (it prints `NSpid` whenever it has pid namespaces). "pid 1 is
+/// the init" holds on gVisor, whose allocator wraps to 2 and refuses a namespace whose init has
+/// exited. Reading this thread's own link needs no ptrace right, even non-dumpable. Linux lets
+/// only a reader with ptrace-read access to that pid 1 read its link (else `EACCES`:
+/// `Unassessable`); gVisor does not check. gVisor printed a fake, per-link `pid:[…]` until
+/// 2023-06 (commit 94bf4b6), but the arm needs `openat2` ([`ProcDir`]), which it gained in 2026-08.
+fn cross_check_with_init_ns(dir: &ProcDir) -> Verdict {
+    classify_ns_links(dir.read_link("thread-self/ns/pid"), || dir.read_link("1/ns/pid"))
+}
+
+/// Classify this thread's pid namespace link `own` against the procfs's pid 1's, which `init`
+/// reads only once `own` has been read.
+fn classify_ns_links(own: io::Result<Vec<u8>>, init: impl FnOnce() -> io::Result<Vec<u8>>) -> Verdict {
+    let links = pid_ns_link(own, "thread-self/ns/pid")
+        .and_then(|own| Ok((own, pid_ns_link(init(), "1/ns/pid (this /proc's pid 1)")?)));
+    match links {
+        Ok((own, init)) if own == init => Verdict::Same,
+        Ok(_) => Verdict::Diverged,
+        Err(why) => Verdict::Unassessable(why),
     }
 }
 
-/// Classify a `thread-self/stat` against `tid`, the caller's own `gettid()`.
-fn classify_thread_stat(stat: &str, tid: u32) -> Verdict {
-    match stat.split_once(' ').and_then(|(id, _)| id.parse::<u32>().ok()) {
-        Some(id) if id == tid => Verdict::Same,
-        Some(_) => Verdict::Diverged,
-        None => Verdict::Unassessable(ViewUnreadable::new(
-            "self/status has no NSpid line and thread-self/stat has no parseable id",
+/// `link`, the target read from `path`, if it names a pid namespace (`pid:[<inode>]`).
+fn pid_ns_link(link: io::Result<Vec<u8>>, path: &str) -> Result<Vec<u8>, ViewUnreadable> {
+    match link {
+        Ok(target) if target.starts_with(b"pid:[") && target.ends_with(b"]") => Ok(target),
+        Ok(target) => Err(ViewUnreadable::new(
+            format!(
+                "self/status has no NSpid line and {path} is not a pid namespace link ({:?})",
+                String::from_utf8_lossy(&target)
+            ),
             None,
+        )),
+        Err(e) => Err(ViewUnreadable::new(
+            format!("self/status has no NSpid line and {path} could not be read"),
+            Some(e),
         )),
     }
 }
@@ -320,7 +346,6 @@ pub(crate) mod fault {
     thread_local! {
         static FORCE_PROC_VIEW: Cell<Option<ForcedView>> = const { Cell::new(None) };
         static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
-        static FORCE_THREAD_STAT: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
     }
 
@@ -334,7 +359,6 @@ pub(crate) mod fault {
             FORCE_PROC_VIEW.with(|f| f.set(None));
             FORCE_FDINFO.with(|f| f.set(None));
             FORCE_STATUS.with(|f| f.take());
-            FORCE_THREAD_STAT.with(|f| f.take());
         }
     }
 
@@ -345,19 +369,8 @@ pub(crate) mod fault {
         Forced(())
     }
 
-    /// Make the NEXT [`proc_view`](super::proc_view) on THIS thread read `text` as its
-    /// `thread-self/stat` file.
-    pub(crate) fn force_thread_stat_once(text: &str) -> Forced {
-        FORCE_THREAD_STAT.with(|f| *f.borrow_mut() = Some(text.to_owned()));
-        Forced(())
-    }
-
     pub(crate) fn take_forced_status() -> Option<String> {
         FORCE_STATUS.with(|f| f.take())
-    }
-
-    pub(crate) fn take_forced_thread_stat() -> Option<String> {
-        FORCE_THREAD_STAT.with(|f| f.take())
     }
 
     /// Force the NEXT [`proc_view`](super::proc_view) on THIS thread.

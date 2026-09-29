@@ -71,6 +71,62 @@ pub(crate) fn bind_over(source: &Path, target: &Path) {
     mount_bind(source, target).unwrap_or_else(|e| panic!("bind {} over {}: {e}", source.display(), target.display()));
 }
 
+/// Mount a procfs of this process's own pid namespace on `target`.
+pub(crate) fn mount_proc(target: &Path) {
+    use rustix::mount::MountFlags;
+    mount(
+        "proc",
+        target,
+        "proc",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None::<&std::ffi::CStr>,
+    )
+    .unwrap_or_else(|e| panic!("mount proc on {}: {e}", target.display()));
+}
+
+/// Make `last` the last pid allocated in this process's pid namespace, so the next task created
+/// in it gets `last + 1` if that is free. The sysctl acts on the writer's pid namespace whichever
+/// procfs it is reached through.
+pub(crate) fn set_last_pid(last: u32) {
+    std::fs::write("/proc/sys/kernel/ns_last_pid", last.to_string()).expect("write ns_last_pid");
+}
+
+/// The calling thread's id as the procfs at `/proc` numbers it, from `thread-self`'s target
+/// (`<tgid>/task/<tid>`).
+pub(crate) fn tid_in_proc() -> u32 {
+    let target = std::fs::read_link("/proc/thread-self").expect("readlink /proc/thread-self");
+    let target = target.to_str().expect("thread-self's target is UTF-8");
+    target
+        .rsplit_once('/')
+        .and_then(|(_, tid)| tid.parse().ok())
+        .unwrap_or_else(|| panic!("thread-self's target {target:?} has no tid"))
+}
+
+/// Drop this whole process to `nobody` (65534) with no supplementary groups.
+pub(crate) fn drop_to_nobody() {
+    // SAFETY: plain credential syscalls; glibc and musl apply `setres[ug]id` to every thread.
+    unsafe {
+        assert_eq!(
+            libc::setgroups(0, std::ptr::null()),
+            0,
+            "setgroups: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::setresgid(65534, 65534, 65534),
+            0,
+            "setresgid: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::setresuid(65534, 65534, 65534),
+            0,
+            "setresuid: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Mount a fresh tmpfs on `target`.
 pub(crate) fn mount_tmpfs(target: &Path) {
     mount(
