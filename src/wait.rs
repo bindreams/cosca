@@ -481,7 +481,7 @@ pub(crate) fn rearm_until<T, E>(
         let round_start = Instant::now();
         let out = round(remaining_now)?;
         #[cfg(test)]
-        test_clock::advance_by_elapsed_if_frozen(round_start.elapsed());
+        let _ = round_start;
         if out.is_some() || remaining(deadline) == Some(Duration::ZERO) {
             return Ok(out);
         }
