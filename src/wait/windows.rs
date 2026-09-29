@@ -140,6 +140,7 @@ pub(crate) fn block_until_exit_or_cancel(
     deadline: Option<Option<Instant>>,
     cancel: &OwnedHandle,
 ) -> Result<bool, Error> {
+    let hoisted_reading = read_remaining(deadline);
     let handle = match crate::identity::windows_open_classified(
         id.pid(),
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -233,7 +234,7 @@ pub(crate) fn block_until_exit_or_cancel(
     // instead of being silently capped. `remaining` is recomputed FRESH every iteration (never
     // hoisted above the loop) — see docs/principles.md #13.
     let waited = loop {
-        let reading = read_remaining(deadline);
+        let reading = Reading { remaining: crate::wait::remaining(deadline), #[cfg(test)] now: hoisted_reading.now, #[cfg(test)] seq: hoisted_reading.seq };
         // Test-only: report what this call actually used. `reading` ties the remaining time to
         // the very `now` and sequence number taken with it, so a mutant that hoists the read
         // above `OpenProcess` carries all three with it.
