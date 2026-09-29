@@ -810,10 +810,6 @@ impl Command {
     // Consumed by the elevation paths: `elevation_request`/`fds` read the request;
     // `set_input_argv`/`set_env_ops`/`set_contain` build the POSIX DERIVED command
     // (hence the non-unix dead_code allows on the setters).
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "read by the POSIX derived-command build, dead off unix")
-    )]
     pub(crate) fn elevation_request(&self) -> &crate::elevation::ElevationRequest {
         &self.elevation
     }
@@ -873,10 +869,6 @@ impl Command {
     }
 
     // ---- crate-internal accessors for the spawn engine -------------
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "accessor for the spawn engine's POSIX path; dead off unix")
-    )]
     pub(crate) fn fds(&self) -> &BTreeMap<Fd, ResolvedStdio> {
         &self.fds
     }

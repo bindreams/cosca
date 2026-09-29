@@ -3,10 +3,6 @@
 //! the real nested-member `kill_tree` path, and `spawn-dump-env-block`, to spawn through each
 //! Windows backend. Behavior is selected by argv[1].
 
-// See `src/lib.rs`'s header for why: this bin is its own clippy-linted crate root, so it
-// needs its own copy of the deny.
-#![deny(clippy::allow_attributes_without_reason)]
-
 #[cfg(target_os = "macos")]
 use std::io::BufRead;
 use std::io::{Read, Write};
@@ -28,7 +24,11 @@ mod console_identity;
 /// The death-watched accept shared with `tests/`: a plain `accept()` on a child's ack socket would
 /// hang forever if that child died before connecting.
 #[cfg(windows)]
-#[allow(dead_code, unused_imports)] // shared with tests/, which uses the parts this binary does not
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared with tests/, which uses the parts this binary does not"
+)]
 #[path = "../tests/common/accept.rs"]
 mod accept;
 
@@ -210,10 +210,6 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
-#[allow(
-    clippy::zombie_processes,
-    reason = "the grandchild must outlive us; containment (or not) decides its fate"
-)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     #[allow(
         clippy::disallowed_methods,
@@ -232,7 +228,10 @@ fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandc
 
 /// Holds a grandchild's `Child` for the rest of the arm (see [`spawn_reported_grandchild`]); never
 /// waited on, on purpose.
-#[allow(dead_code, reason = "held only so its Drop never runs; the field is never read")]
+#[allow(
+    dead_code,
+    reason = "the field is only held, never read: keeping the `Child` alive keeps its pid from being reissued"
+)]
 struct KeptGrandchild(std::process::Child);
 
 fn main() {
@@ -701,7 +700,6 @@ fn main() {
         "orphan-relay" => {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes, reason = "the grandchild must outlive us")]
             #[allow(
                 clippy::disallowed_methods,
                 reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"

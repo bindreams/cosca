@@ -158,4 +158,10 @@ doc = false
 unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]
-all = "warn"
+# `all` is a group; priority -1 lets the individual entries below override it.
+all = { level = "warn", priority = -1 }
+# A silenced lint must say why: an unreasoned `#[allow(...)]` anywhere (including `#[cfg(test)]`
+# modules) is a build failure. `[lints]` reaches every target — lib, bins, tests and `build.rs` —
+# so no crate root needs its own copy. `disallowed-methods`'s exemptions are `#[expect]`, so a
+# stale one also fails; this deny keeps every OTHER lint's `#[allow]` equally accountable.
+allow_attributes_without_reason = "deny"

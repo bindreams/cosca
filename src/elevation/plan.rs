@@ -87,8 +87,6 @@ pub struct Host {
     /// What [`BackendSet::pkexec`]'s `--version` said, or why a pkexec on `PATH` was not stored
     /// ([`super::pkexec::PkexecVersion::Unresolved`]); asked only for a request that launches pkexec
     /// — `Backend::Pkexec` with `Auth::Gui`, from a non-root caller, on Linux.
-    // Read only by the POSIX rewrite.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the POSIX rewrite"))]
     pub pkexec_version: super::pkexec::PkexecVersion,
     /// [`BackendSet::pkexec`], opened by detection: the version probe and the launch both exec this
     /// descriptor's file (`/proc/self/fd/N`), so a file renamed over the path between them is

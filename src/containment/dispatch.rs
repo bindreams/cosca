@@ -6,9 +6,7 @@ use crate::error::Error;
 /// The pre-spawn containment decision produced by `prepare` (env-marker root
 /// detection plus per-OS pre-spawn setup).
 pub(crate) struct Prepared {
-    #[allow(dead_code, reason = "read in the #[cfg(unix)] branch of attach()")]
     pub mode: Option<ContainMode>,
-    #[allow(dead_code, reason = "read in the #[cfg(unix)] branch of attach()")]
     pub is_root: bool,
     /// Pre-created cgroup leaf (Linux only). `Some` means the child must be
     /// placed in the cgroup via the `pre_exec` closure; `None` means fall back

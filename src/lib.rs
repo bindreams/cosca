@@ -7,15 +7,9 @@
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
-// result on purpose with `_ = expr;`.
+// result on purpose with `_ = expr;`. Crate-level here, not in `[lints]`: it is a library policy, and
+// `[lints]` would extend it to the tests and test binaries, which discard results freely.
 #![warn(clippy::let_underscore_must_use)]
-// A silenced lint must say why: an unreasoned `#[allow(...)]` anywhere in this crate (including
-// its `#[cfg(test)]`-only modules, which are still part of this same crate) is itself a build
-// failure. See `clippy.toml`'s header for the sibling policy this backs: `disallowed-methods`'s
-// own exemptions are `#[expect]`, not `#[allow]`, precisely so a stale one also fails loudly; this
-// deny is what keeps every OTHER lint's `#[allow]` equally accountable, without requiring the
-// stronger (and here, per-target-fragile) `#[expect]` for all of them.
-#![deny(clippy::allow_attributes_without_reason)]
 
 pub mod containment;
 pub mod elevation;

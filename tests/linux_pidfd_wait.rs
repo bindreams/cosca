@@ -3,9 +3,6 @@
 //! one is `NotThreadGroupLeader`; an exited-but-unreaped (ptraced) one is exited. The
 //! reaped-leader sibling is in `src/wait/linux_tests.rs`.
 #![cfg(target_os = "linux")]
-// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted crate root, so it
-// needs its own copy of the deny.
-#![deny(clippy::allow_attributes_without_reason)]
 
 use std::io::{BufRead, Write};
 

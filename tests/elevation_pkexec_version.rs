@@ -8,9 +8,6 @@
 //! Linux only: cosca launches pkexec on Linux alone, and that pkexec is never run elsewhere is
 //! pinned by `detect_opens_and_probes_only_for_a_request_that_launches_pkexec` and the planner.
 #![cfg(target_os = "linux")]
-// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted crate root, so it
-// needs its own copy of the deny.
-#![deny(clippy::allow_attributes_without_reason)]
 
 #[path = "common/mod.rs"]
 mod common;

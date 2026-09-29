@@ -1,7 +1,3 @@
-// See `src/lib.rs`'s header for why: this integration test crate is its own clippy-linted
-// crate root, so it needs its own copy of the deny.
-#![deny(clippy::allow_attributes_without_reason)]
-
 use std::io::{Read, Write};
 
 use cosca::{Command, Fd, Stdio};
@@ -775,7 +771,7 @@ fn uncontained_child_reports_containment_none() {
     not(any(unix, windows)),
     allow(
         dead_code,
-        reason = "every caller below is unconditional; only a hypothetical non-unix, non-windows target would leave this unused"
+        reason = "every caller is `#[cfg(unix)]` or `#[cfg(windows)]`, so a target that is neither leaves this unused"
     )
 )]
 fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {

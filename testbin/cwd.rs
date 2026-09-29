@@ -19,10 +19,6 @@
 //!
 //! A `[[bin]]` cannot be `cfg`-ed out, so off Windows it exits 1.
 
-// See `src/lib.rs`'s header for why: this bin is its own clippy-linted crate root, so it
-// needs its own copy of the deny.
-#![deny(clippy::allow_attributes_without_reason)]
-
 #[cfg(windows)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
