@@ -200,7 +200,6 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::os::unix::fs::PermissionsExt;
     // `tempdir` creates 0o700, so the chmod is what makes `root` traversable to a dropped uid.
     let root = tempfile::tempdir().expect("tempdir");
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
     std::fs::create_dir(&p).expect("mkdir p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
