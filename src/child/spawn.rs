@@ -203,6 +203,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     if to_raw_backend {
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
+    #[cfg(target_os = "linux")]
+    let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register)?;
+    #[cfg(not(target_os = "linux"))]
     let mut std_cmd = build_std_command(cmd)?;
 
     // Resolve every configured slot to a child end via the shared core. Slots: 0/1/2
@@ -321,9 +324,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         )?;
 
         let _guard = spawn_lock();
-        // Registered before `fd_map`'s hook (see the macOS branch for why that one is last among
-        // the others): `fd_map` may `dup2` a mapping onto any number, including the channel's.
-        let handshake = pidfd_handshake::install(&mut std_cmd, &_guard)?;
+        // The hook was registered first of all (see `build_std_command_with`), so `fd_map`'s, which
+        // may `dup2` a mapping onto any number, including the channel's, runs after it is done.
+        let handshake = handshake.open(&_guard)?;
         let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()
             .map(|(fd, owned)| fd_map::FdMapping {
@@ -508,7 +511,17 @@ pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
+    build_std_command_with(cmd, |_| ()).map(|(std_cmd, ())| std_cmd)
+}
+
+/// [`build_std_command`], running `first` on the command before any hook of its own is
+/// registered, so a hook `first` registers runs first in the child. Returns what `first` returned.
+pub(crate) fn build_std_command_with<R>(
+    cmd: &Command,
+    first: impl FnOnce(&mut std::process::Command) -> R,
+) -> Result<(std::process::Command, R), Error> {
     // Program + args via the `quote` model.
     let StdLaunch {
         program,
@@ -546,6 +559,7 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
     // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
     reject_batch_path(std::path::Path::new(&program))?;
     apply_env(&mut std_cmd, cmd.env_ops());
+    let first = first(&mut std_cmd);
     match cwd {
         Some(dir) if enter => enter_in_child(&mut std_cmd, &dir)?,
         Some(dir) => {
@@ -553,7 +567,7 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
         }
         None => {}
     }
-    Ok(std_cmd)
+    Ok((std_cmd, first))
 }
 
 /// `chdir` to `dir` in the child, after std's own setup and just before its `execvp`, so a

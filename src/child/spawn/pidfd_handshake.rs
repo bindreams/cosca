@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The channel is one `AF_UNIX` stream socketpair, `SOCK_CLOEXEC`, made under `spawn_lock` (the
-//! witness parameter of [`install`]). A socket rather than two pipes so the child can `send` with
+//! witness parameter of [`Pending::open`]). A socket rather than two pipes so the child can `send` with
 //! `MSG_NOSIGNAL`: a hook that wrote to a dead parent would otherwise die of `SIGPIPE`, which std
 //! resets to the default in the child, and std reads a child that died before `exec` as a success.
 //!
@@ -41,7 +41,7 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
@@ -53,13 +53,27 @@ use crate::error::Error;
 const GO: u8 = 1;
 const ABORT: u8 = 0;
 
-/// The channel to one child, registered as a `pre_exec` hook. Consumed by [`run`](Self::run).
+/// What the hook reads in the child: fd numbers only, published by [`Pending::open`] before the
+/// fork, and withdrawn by [`Handshake::run`] after it.
+struct Shared {
+    child_end: AtomicI32,
+    parent_end: AtomicI32,
+    /// Whether the fd numbers name this spawn's channel. Cleared when the spawn is over: a command
+    /// spawned again after that would otherwise read whatever now owns the numbers; the hook
+    /// fails it instead.
+    live: AtomicBool,
+}
+
+/// The hook is registered; the channel is not yet made. See [`register`].
+pub(crate) struct Pending {
+    shared: Arc<Shared>,
+}
+
+/// The channel to one child. Consumed by [`run`](Self::run).
 pub(crate) struct Handshake {
     parent_end: OwnedFd,
     child_end: OwnedFd,
-    /// Cleared when the spawn is over. The hook holds only raw fd numbers, so a command spawned
-    /// again after that would read whatever now owns them; a cleared flag makes it fail instead.
-    live: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 }
 
 /// A spawned child, and the pidfd the parent opened while it was held before `exec`.
@@ -81,41 +95,55 @@ enum Outcome {
     NoPid,
 }
 
-/// Registers the hook on `cmd` and makes its channel. It runs BEFORE `fd_map`'s hook, so that
-/// hook cannot `dup2` a mapping over the channel's descriptor number in the child.
+/// Registers the hook on `cmd`, as its FIRST `pre_exec` hook where the caller can arrange it: the
+/// child then reports itself before anything else in it can fail, so a child that dies later has
+/// a pidfd held on it and is collected through that.
 ///
-/// The child's end sits at fd 3 or above: std's stdio setup `dup2`s onto 0, 1 and 2 before any
-/// hook runs.
-pub(crate) fn install(cmd: &mut std::process::Command, _lock: &SpawnLockGuard) -> Result<Handshake, Error> {
-    let (parent_end, child_end) =
-        rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)
-            .map_err(|e| Error::Io(crate::error::io_context("socketpair", e.into())))?;
-    let parent_end = above_stdio(parent_end)?;
-    let child_end = above_stdio(child_end)?;
-    let live = Arc::new(AtomicBool::new(true));
-    let (child_raw, parent_raw) = (child_end.as_raw_fd(), parent_end.as_raw_fd());
+/// The channel is made later, under `spawn_lock`, by [`Pending::open`]; a hook whose channel was
+/// never opened fails the spawn it belongs to rather than read fd numbers that mean nothing.
+pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
+    let shared = Arc::new(Shared {
+        child_end: AtomicI32::new(-1),
+        parent_end: AtomicI32::new(-1),
+        live: AtomicBool::new(false),
+    });
     #[cfg(test)]
     let fault = fault::child_fault();
-    let hook_live = Arc::clone(&live);
-    // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads an atomic,
-    // and makes raw `close`, `syscall`, `send` and `recv` calls on fd numbers. It allocates
-    // nothing and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
+    let hook = Arc::clone(&shared);
+    // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads atomics, and
+    // makes raw `close`, `syscall`, `send` and `recv` calls on fd numbers. It allocates nothing
+    // and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
     unsafe {
         cmd.pre_exec(move || {
             hold_child(
-                &hook_live,
-                child_raw,
-                parent_raw,
+                &hook,
                 #[cfg(test)]
                 fault,
             )
         });
     }
-    Ok(Handshake {
-        parent_end,
-        child_end,
-        live,
-    })
+    Pending { shared }
+}
+
+impl Pending {
+    /// Makes the channel and publishes its fd numbers to the hook. The child's end sits at fd 3 or
+    /// above: std's stdio setup `dup2`s onto 0, 1 and 2 before any hook runs. Both ends are
+    /// `SOCK_CLOEXEC`, and `_lock` is the witness that no other cosca fork can inherit them.
+    pub(crate) fn open(self, _lock: &SpawnLockGuard) -> Result<Handshake, Error> {
+        let (parent_end, child_end) =
+            rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)
+                .map_err(|e| Error::Io(crate::error::io_context("socketpair", e.into())))?;
+        let parent_end = above_stdio(parent_end)?;
+        let child_end = above_stdio(child_end)?;
+        self.shared.child_end.store(child_end.as_raw_fd(), Ordering::Relaxed);
+        self.shared.parent_end.store(parent_end.as_raw_fd(), Ordering::Relaxed);
+        self.shared.live.store(true, Ordering::Release);
+        Ok(Handshake {
+            parent_end,
+            child_end,
+            shared: self.shared,
+        })
+    }
 }
 
 fn above_stdio(fd: OwnedFd) -> Result<OwnedFd, Error> {
@@ -144,7 +172,7 @@ impl Handshake {
         let Handshake {
             parent_end,
             child_end,
-            live,
+            shared,
         } = self;
         // The seam is thread-local, and the helper is another thread: take the outcome here.
         #[cfg(test)]
@@ -172,7 +200,7 @@ impl Handshake {
             let helper = match helper {
                 Ok(helper) => helper,
                 Err(e) => {
-                    live.store(false, Ordering::Release);
+                    shared.live.store(false, Ordering::Release);
                     return Err(Error::Io(crate::error::io_context(
                         "starting the pidfd handshake thread",
                         e,
@@ -183,7 +211,7 @@ impl Handshake {
             #[cfg(test)]
             fault::count_spawn();
             let spawned = spawn();
-            live.store(false, Ordering::Release);
+            shared.live.store(false, Ordering::Release);
             // The last copy of the child's end that can keep the helper waiting.
             drop(child_end);
             let outcome = join_helper(
@@ -295,15 +323,12 @@ fn leave_unreaped(pid: Option<u32>) {
 }
 
 /// The child's side. Async-signal-safe: raw calls only, no allocation, no lock.
-fn hold_child(
-    live: &AtomicBool,
-    child_end: RawFd,
-    parent_end: RawFd,
-    #[cfg(test)] fault: fault::ChildFault,
-) -> io::Result<()> {
-    if !live.load(Ordering::Acquire) {
+fn hold_child(shared: &Shared, #[cfg(test)] fault: fault::ChildFault) -> io::Result<()> {
+    if !shared.live.load(Ordering::Acquire) {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
+    let child_end: RawFd = shared.child_end.load(Ordering::Relaxed);
+    let parent_end: RawFd = shared.parent_end.load(Ordering::Relaxed);
     // The parent's end, inherited: closed so the parent's drop of it is the child's EOF.
     // SAFETY: a plain `close` of a number this hook was given.
     unsafe { libc::close(parent_end) };
