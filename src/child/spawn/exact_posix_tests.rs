@@ -80,8 +80,10 @@ fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
 
 /// A `tool` in `dir` that exits with `code` if run in `dir` (it finds `./<marker>`), else with 3.
 fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(dir).expect("mkdir");
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    // Created 0o700 so the chmod is what makes `dir` traversable to a dropped uid, whatever the
+    // ambient umask; the umask is process-global, so a test must not change it.
+    std::fs::DirBuilder::new().mode(0o700).create(dir).expect("mkdir");
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
     std::fs::write(dir.join(marker), "").expect("write marker");
     let tool = dir.join("tool");
@@ -186,8 +188,8 @@ fn report(line: &str) {
 /// directory. The fixture starts without DAC bypass, so `p` binds a root driver too. Returns the
 /// fixture's exit code, and its stderr prefixed with the gate write's result.
 ///
-/// Root, `p`, `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the
-/// fixture is not their owner, and `tempdir` and `create_dir` leave modes to the umask.
+/// Root, `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the fixture
+/// is not their owner. `p` needs no mode: it is `0o000` before the dropped uid looks at it.
 ///
 /// The write can fail: a fixture that refused a precondition has exited before reading it. Its exit
 /// code and stderr then say why, so the write result is reported rather than panicked on.
@@ -196,15 +198,11 @@ fn report(line: &str) {
 fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_elevated: bool) -> (Option<i32>, String) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    // `tempdir` creates 0o700, so the chmod is what makes `root` traversable to a dropped uid.
     let root = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
-    // Created 0o700 so the chmod below is what makes `p` traversable, whatever the ambient umask.
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&p).expect("mkdir p");
-    }
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod p");
+    std::fs::create_dir(&p).expect("mkdir p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
     let (mut fixture, _exe_copy) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
