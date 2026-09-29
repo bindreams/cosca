@@ -47,16 +47,14 @@ pub(crate) fn run_fixture(fixture: &str) {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt as _;
-        // One lock over open-to-spawn. The fd is `O_CLOEXEC`, so an ordinary fork+exec never
-        // leaks it, but a bare `fork` copies the whole fd table. That lock covers every fork that
-        // takes it; `fork_running`'s bare fork does not yet (#250), and a copy it inherits is a
-        // harmless read-only directory fd that dies with that child.
+        // `spawn_lock` spans open-to-spawn: `O_CLOEXEC` only acts at `exec`, and a bare `fork`
+        // copies the whole fd table, so no other fork that takes the lock may land in between.
         let guard = crate::child::spawn::spawn_lock();
         let fd = scratch::open_scratch_fd(scratch.path());
         let raw = fd.0;
         cmd.env(scratch::FIXTURE_SCRATCH_FD_ENV, raw.to_string());
-        // SAFETY: `fcntl` is async-signal-safe. Clearing close-on-exec on the child's copy leaves
-        // the parent's, closed below, untouched.
+        // SAFETY: async-signal-safe `fcntl` in the forked child, clearing close-on-exec on the
+        // child's own copy only.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::fcntl(raw, libc::F_SETFD, 0) != 0 {
@@ -160,19 +158,16 @@ impl Drop for RestoreMode {
 /// one test, single-threaded, stdio captured, [`FIXTURE_PARENT_PID_ENV`] set (see
 /// [`is_fixture_reexec`]).
 ///
-/// No `TMPDIR` override: a `--read-only` rootfs whose only writable mount is a `TMPDIR`-pointed
-/// `tmpfs` elsewhere would break under a forced `/tmp`. A fixture that needs writable scratch after
-/// dropping privilege gets it from [`run_fixture`].
+/// The ambient `TMPDIR` is inherited untouched; see [`run_fixture`] for writable scratch after a
+/// drop.
 ///
 /// No argv-slot-0 placeholder, unlike [`fixture_argv`]: `std::process::Command` supplies argv[0].
 ///
 /// `pub(crate)` so a launcher with its own stdio needs (`exact_posix_tests.rs` pipes stdin) can
 /// start here and override only that.
 pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
-    // On Linux, `/proc/self/exe` rather than `current_exe()`'s path: the binary may sit where a
-    // post-drop caller cannot search (nextest extracts archives under `$TMPDIR`), and the kernel
-    // grants a process access to its own image regardless. Inside a freshly forked child it still
-    // names the parent's image, which is the binary being re-exec'd.
+    // `/proc/self/exe`: the binary's own directory (e.g. nextest's extraction dir under a `0700`
+    // TMPDIR) may be unreachable post-drop; the kernel grants a process its own image regardless.
     #[cfg(target_os = "linux")]
     let program = std::path::PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
@@ -194,14 +189,10 @@ fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
 /// Set by every fixture re-exec to its parent's pid; see [`is_fixture_reexec`].
 const FIXTURE_PARENT_PID_ENV: &str = "COSCA_FIXTURE_PARENT_PID";
 
-/// Whether this process's real parent deliberately re-exec'd it via a fixture launcher. The env
-/// var alone proves nothing: a stray `export` or CI `env:` block can hand it to the shared suite
-/// process, where a fixture body would run against every concurrent test. A real parent-pid match
-/// cannot be inherited by accident.
-///
-/// On `true`, writes [`FIXTURE_GATE_PASSED_LINE`] to the real stderr. A caller with more to check
-/// before it may claim the gate (as [`expected_cwd`] has a `marker_env`) uses
-/// [`parent_pid_matches`] and writes the line itself last.
+/// Whether this process's real parent is the one that re-exec'd it via `run_fixture*`; an
+/// inherited marker env var alone does not prove that. On `true`, writes
+/// [`FIXTURE_GATE_PASSED_LINE`]; a caller with further checks before its gate is really passed
+/// uses [`parent_pid_matches`] and writes the line itself.
 #[cfg(unix)]
 pub(crate) fn is_fixture_reexec() -> bool {
     let reexec = parent_pid_matches();

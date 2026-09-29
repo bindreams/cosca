@@ -118,8 +118,8 @@ const CHILD_DROP_FAILED: i32 = 126;
 /// `X_OK`, not a read check: every caller needs to enter a directory or run a binary. A directory
 /// that is search-only for others is reachable, and a readable file with no `x` bit is not.
 ///
-/// `spawn_lock()` is held across the `fork` like every other fork in this binary, so the child
-/// cannot inherit another test's transient fd marker.
+/// Holds `spawn_lock()` across the `fork` like every other fork in this binary (see
+/// `spawn_a_process_that_exits`).
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn check_path_traversable_by(path: &std::path::Path) -> Result<(), TraversalError> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -132,9 +132,8 @@ pub(super) fn check_path_traversable_by(path: &std::path::Path) -> Result<(), Tr
     // The guard stays in the parent: the child only makes raw syscalls and `_exit`s, so it never
     // runs the guard's `Drop`.
     let guard = crate::child::spawn::spawn_lock();
-    // SAFETY: a plain `fork` from a multithreaded process. The child allocates nothing, takes no
-    // lock and touches only `c_path`, which is already built; it leaves by `_exit`, so the
-    // parent's destructors never run twice.
+    // SAFETY: fork under `spawn_lock`; the child makes only async-signal-safe calls and always
+    // `_exit`s.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         // SAFETY: async-signal-safe syscalls only, then `_exit`.
@@ -185,12 +184,9 @@ pub(super) fn check_path_traversable_by(path: &std::path::Path) -> Result<(), Tr
     }
 }
 
-/// A copy of this test binary in a directory `chmod 0755` directly under `/tmp`, the one place
-/// every target guarantees world-searchable, for a root driver to re-exec the fixture from. The
-/// original path may sit somewhere the dropped identity cannot enter, such as a `cargo-nextest`
-/// archive-extraction directory.
-///
-/// Returns the directory alongside the copy's path; keep it alive as long as the fixture runs.
+/// A `0755` dir directly under `/tmp` holding a world-executable COPY of this test binary, for a
+/// root driver to re-exec instead of `current_exe()`. The caller keeps the returned `TempDir`
+/// alive until the fixture exits.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn copy_exe_to_traversable_scratch() -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
