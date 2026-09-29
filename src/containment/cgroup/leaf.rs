@@ -165,6 +165,10 @@ fn wait_deadline_seamed(listener: event_listener::EventListener, at: std::time::
     listener.wait_deadline(at).is_some()
 }
 
+/// What `hard_kill` writes to `cgroup.kill`.
+#[cfg(target_os = "linux")]
+pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
+
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
@@ -212,9 +216,9 @@ impl CgroupLeaf {
         self.child_entered() && !self.armed.load(Ordering::Relaxed) && self.killed.load(Ordering::Relaxed)
     }
 
-    /// The leaf's directory, for a test that must find this leaf and no other. Its one user is the
-    /// tokio spawn's post-fork failure seam.
-    #[cfg(all(test, feature = "tokio"))]
+    /// The leaf's directory: names the leaf in a caller's own message, since `hard_kill` returns
+    /// the kernel's error unwrapped (a message wrapper would erase `raw_os_error()`), and finds
+    /// this leaf and no other in tests.
     pub(crate) fn path(&self) -> &Path {
         &self.leaf_path
     }
@@ -510,7 +514,7 @@ impl CgroupLeaf {
     /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        match self.dir.write("cgroup.kill", b"1") {
+        match self.dir.write("cgroup.kill", KILL_PAYLOAD) {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());

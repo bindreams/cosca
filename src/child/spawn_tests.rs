@@ -600,6 +600,7 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_password_write_kills_the_contained_tree() {
+    crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-password-leaf");
     attach_entered_leaf(&leaf_path);
@@ -613,6 +614,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: "forced password-write failure".into(),
     });
+    let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
 
     assert!(
@@ -627,9 +629,92 @@ fn a_failed_password_write_kills_the_contained_tree() {
     );
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
-        b"1",
+        crate::containment::cgroup::KILL_PAYLOAD,
         "the failed spawn must kill its tree through the leaf"
     );
+    // A teardown that worked is not warned about.
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &super::teardown_warn_marker(&leaf_path)),
+        Vec::<log::Level>::new(),
+        "a successful tree kill must not warn"
+    );
+}
+
+/// A tree-teardown failure during a failed password write is logged at `warn`, naming the leaf
+/// and the OS reason, like other teardown-mechanism failures (e.g. `warn_leaf_left_behind`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_warns_when_the_tree_kill_fails() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-password-kill-fail-leaf");
+    attach_entered_leaf(&leaf_path);
+    let mut cmd = blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    child.attached.disarm();
+
+    // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
+    // directory fails EISDIR.
+    std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    assert!(
+        matches!(
+            err,
+            Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    let marker = super::teardown_warn_marker(&leaf_path);
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &marker),
+        [log::Level::Warn],
+        "a forced tree-kill failure must be logged at warn"
+    );
+    let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    let records = crate::log_capture::records_since(mark, &marker);
+    assert!(
+        records[0].contains(&errno_text),
+        "the warning must name the OS reason the write failed, got {records:?}"
+    );
+}
+
+/// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown
+/// at `warn` and in the returned note, and nothing when the teardown worked or was not tried.
+#[cfg(unix)]
+#[test]
+fn report_tree_teardown_reports_only_a_failed_teardown() {
+    crate::log_capture::install();
+    let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
+    for (name, tree, reported) in [
+        ("cosca-report-failed", failed(), true),
+        ("cosca-report-worked", Some(Ok(())), false),
+        ("cosca-report-not-tried", None, false),
+    ] {
+        let mark = crate::log_capture::mark();
+        let note = super::report_tree_teardown(tree, &name);
+        assert_eq!(
+            note.contains("its contained tree could not be killed"),
+            reported,
+            "{name}: {note:?}"
+        );
+        assert_eq!(
+            note.contains(name),
+            reported,
+            "{name}: the note names the subject, got {note:?}"
+        );
+        assert_eq!(
+            crate::log_capture::levels_since(mark, name),
+            if reported { vec![log::Level::Warn] } else { vec![] },
+            "{name}"
+        );
+    }
 }
 
 /// Whether `pid`, a child of this process, has been reaped: `waitpid` no longer knows it.

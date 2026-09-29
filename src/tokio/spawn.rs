@@ -437,6 +437,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         return Ok(child);
     };
     let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
+    let tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
     let root_note = match child.kill() {
         Ok(()) => {
             child.wait_and_reap_blocking();
@@ -449,7 +450,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {root_note}{}", crate::child::spawn::tree_note(tree)),
+        detail: format!("{write_err}; {root_note}{tree_note}"),
     })
 }
 

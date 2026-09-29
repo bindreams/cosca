@@ -150,6 +150,18 @@ impl std::fmt::Debug for crate::containment::cgroup::CgroupLeaf {
 }
 
 impl Attached {
+    /// What names this mechanism's tree in a message about its teardown: the cgroup leaf's path
+    /// (`hard_kill` returns the kernel's error unwrapped, so the error does not name it), else
+    /// the mechanism itself.
+    #[cfg(unix)]
+    pub(crate) fn teardown_subject(&self) -> String {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return format!("cgroup leaf {}", leaf.path().display());
+        }
+        format!("{self:?}")
+    }
+
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         match self {

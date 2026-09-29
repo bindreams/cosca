@@ -541,10 +541,15 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
     let err = leaf
         .hard_kill()
         .expect_err("a refused cgroup.kill write must not read as success");
-    let reason = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
-    assert!(
-        err.to_string().contains(&reason),
-        "the kernel's own reason must reach the caller, got {err}"
+    // Unwrapped: a message wrapper would erase `raw_os_error()` from the public `kill_tree()`
+    // error, and several errnos share one `ErrorKind`.
+    let crate::error::Error::Io(io) = &err else {
+        panic!("a refused cgroup.kill write must surface as Error::Io, got {err:?}");
+    };
+    assert_eq!(
+        io.raw_os_error(),
+        Some(libc::EISDIR),
+        "the kernel's errno must reach the caller, got {err}"
     );
 
     let attached = crate::containment::Attached::Cgroup(leaf);

@@ -96,6 +96,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         return Ok(child);
     };
     let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
+    let tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     let root_note = match child.kill() {
         Ok(()) => {
             let _ = child.wait();
@@ -108,17 +109,34 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     };
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {root_note}{}", tree_note(tree)),
+        detail: format!("{write_err}; {root_note}{tree_note}"),
     })
 }
 
-/// `None`: no tree kill was tried, as the containment cannot tear one down.
+/// The head of the `warn` line [`report_tree_teardown`] logs.
 #[cfg(unix)]
-pub(crate) fn tree_note(tree: Option<Result<(), Error>>) -> String {
-    match tree {
-        Some(Err(e)) => format!("; its contained tree could not be killed ({e})"),
-        _ => String::new(),
-    }
+pub(crate) const TREE_TEARDOWN_WARN: &str = "tree teardown after a failed password write failed";
+
+/// The marker of the warning about `leaf_path`'s tree teardown: unique to that leaf, so a twin
+/// test running in parallel (same message text) is never miscounted.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
+    format!("{TREE_TEARDOWN_WARN} (cgroup leaf {})", leaf_path.display())
+}
+
+/// Report a failed password write's tree teardown, for both `finish_elevated` variants: log it at
+/// `warn` and return the note for the error's `detail`. `subject` names the tree, because the
+/// teardown error itself may not (see `Attached::teardown_subject`).
+///
+/// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok)`: it worked.
+/// Neither is reported.
+#[cfg(unix)]
+pub(crate) fn report_tree_teardown(tree: Option<Result<(), Error>>, subject: &dyn std::fmt::Display) -> String {
+    let Some(Err(e)) = tree else {
+        return String::new();
+    };
+    log::warn!("{TREE_TEARDOWN_WARN} ({subject}): {e}");
+    format!("; its contained tree could not be killed ({subject}: {e})")
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`

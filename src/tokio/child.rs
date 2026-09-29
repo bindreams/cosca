@@ -9,7 +9,7 @@ mod proc_source;
 pub(crate) use proc_source::ProcSource;
 
 #[path = "child/reaper.rs"]
-mod reaper;
+pub(super) mod reaper;
 
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
@@ -126,6 +126,12 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
         self.os.attached.hard_kill()
+    }
+
+    /// What names this child's tree in a message about a failed teardown of it.
+    #[cfg(unix)]
+    pub(super) fn teardown_subject(&self) -> String {
+        self.os.attached.teardown_subject()
     }
 
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
