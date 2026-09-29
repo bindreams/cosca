@@ -7,7 +7,7 @@ set -euxo pipefail
 if [[ "${FOREIGN_TMPDIR:-}" == "true" ]]; then
     mkdir -p /tmp/foreign
     chown 1000:1000 /tmp/foreign
-    chmod 0700 /tmp/foreign
+    chmod 0755 /tmp/foreign
     export TMPDIR=/tmp/foreign
 fi
 

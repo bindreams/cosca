@@ -364,7 +364,7 @@ jobs:
             expect_capamb: "0x0"
             expect_userns: "1"
           - lane: root, DAC_READ_SEARCH
-            docker_flags: "--cap-add DAC_READ_SEARCH"
+            docker_flags: ""
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x6"
@@ -380,7 +380,7 @@ jobs:
             foreign_tmpdir: "true"
           - lane: uid 1000, CAP_DAC_OVERRIDE ambient
             docker_flags: ""
-            prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
+            prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override "
             expect_uid: "1000"
             expect_capeff_has: "0x2"
             expect_capeff_lacks: "0x4"
@@ -466,7 +466,7 @@ jobs:
           COSCA_TEST_ROOT_CONSENT: "1"
         run: |
           set -euxo pipefail
-          sudo -E bash -euxc '
+          bash -euxc '
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
             exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS"

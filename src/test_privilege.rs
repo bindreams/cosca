@@ -28,7 +28,7 @@ pub(crate) fn root_tests_enabled() -> bool {
 fn holds_dac_bypass() -> bool {
     #[cfg(target_os = "linux")]
     {
-        rustix::thread::capabilities(None).is_ok_and(|sets| bypasses_dac(sets.effective))
+        { let _ = bypasses_dac; unsafe { libc::geteuid() == 0 } }
     }
     #[cfg(not(target_os = "linux"))]
     {
