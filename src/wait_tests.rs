@@ -242,18 +242,20 @@ fn rearm_until_polls_once_for_a_past_deadline() {
     assert_eq!(rounds, [Some(Duration::ZERO)]);
 }
 
-/// A round's error ends the loop at once.
+/// A round's error ends the loop at once, wherever in the loop it arrives.
 ///
-/// Mutant: treat `Err` as `None`.
+/// Mutant: treat `Err` as `None` -> the third round runs and reports `Some`.
 #[test]
 fn rearm_until_stops_at_a_round_error() {
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    let deadline = Some(Some(at + Duration::from_secs(3600)));
     let mut rounds = 0;
-    let out = rearm_until(Some(None), |_| -> Result<Option<()>, &str> {
+    let out = rearm_until(deadline, |_| {
         rounds += 1;
-        if rounds == 2 {
-            Err("boom")
-        } else {
-            Ok(None)
+        match rounds {
+            1 => Ok(None),
+            2 => Err("boom"),
+            _ => Ok(Some(())),
         }
     });
     assert_eq!(out, Err("boom"));
