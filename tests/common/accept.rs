@@ -10,7 +10,7 @@
 //!   reaped, its status cached for the caller's own later `wait`), so the pid is never opened;
 //!   `false` means it is unreaped now and stays so, because nothing but the caller's own `wait`
 //!   or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps only
-//!   inside `SharedChild::new`, `wait` and `try_wait`). The pid is then a stable name for
+//!   inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
 //!   `pidfd_open`, `kqueue` or `OpenProcess`. The caller must not `wait` on the target
 //!   concurrently.
 //! - The target performs the accept handshake ([`ack`]): after `connect()` it blocks until
