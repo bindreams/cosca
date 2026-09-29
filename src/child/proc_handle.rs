@@ -44,7 +44,13 @@ impl ProcHandle {
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         match self {
-            ProcHandle::Std(s) => s.wait_deadline(deadline),
+            // The Raw arm rechecks inside `wait_until`, which advances the frozen clock itself.
+            ProcHandle::Std(s) => crate::wait::rearm_until(Some(Some(deadline)), |remaining| {
+                let armed = remaining
+                    .and_then(|r| Instant::now().checked_add(r))
+                    .unwrap_or(deadline);
+                std_wait_deadline(s, armed)
+            }),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait_deadline(deadline),
         }
@@ -123,6 +129,21 @@ fn std_teardown_action(kill_result: &io::Result<()>) -> StdTeardown {
         Ok(()) => StdTeardown::ReapBlocking,
         Err(_) => StdTeardown::ReapNonBlocking,
     }
+}
+
+/// One `shared_child` `wait_deadline` call, which can report `None` before `armed` on Windows
+/// (see `crate::wait::win32_timeout_ms`); the test seam scripts that.
+fn std_wait_deadline(s: &SharedChild, armed: Instant) -> io::Result<Option<ExitStatus>> {
+    #[cfg(test)]
+    match crate::wait::std_wait_seam::next(armed) {
+        Some(crate::wait::std_wait_seam::Step::EarlyNone) => return Ok(None),
+        Some(crate::wait::std_wait_seam::Step::Fail) => return Err(io::Error::other("scripted backend failure")),
+        Some(crate::wait::std_wait_seam::Step::Bounded(d)) => {
+            return s.wait_deadline(armed.min(Instant::now() + d));
+        }
+        None => {}
+    }
+    s.wait_deadline(armed)
 }
 
 #[cfg(test)]

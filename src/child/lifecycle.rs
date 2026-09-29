@@ -25,7 +25,7 @@ impl Child {
         // shared_child's wait_timeout computes `Instant::now() + timeout` internally, which
         // panics on overflow (e.g. Duration::MAX). Convert to a deadline with a saturating
         // checked_add: on overflow the timeout is effectively infinite, so block until exit.
-        match Instant::now().checked_add(timeout) {
+        match crate::wait::now().checked_add(timeout) {
             Some(deadline) => self.wait_deadline(deadline),
             None => self.wait().map(Some),
         }
@@ -33,6 +33,9 @@ impl Child {
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
+    ///
+    /// Never returns `None` before the real clock reaches `deadline`: the backend's `None` is
+    /// rechecked, since `shared_child`'s Windows `wait_deadline` can report it early.
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.proc.wait_deadline(deadline).map_err(Error::Io)
     }
