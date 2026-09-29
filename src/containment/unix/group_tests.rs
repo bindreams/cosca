@@ -431,3 +431,26 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     worker.join().unwrap();
     drop(gate_w);
 }
+
+// Checked /proc view (Linux) =====
+
+/// An outer namespace's `/proc` lists another namespace's processes: their pgids mean nothing
+/// here, so the listing is an error naming the view, never an answer about `pgid`. Mutant:
+/// "scan `/proc` by path whatever the view".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_when_the_proc_view_is_diverged() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+    let _forced = force_proc_view_once(ForcedView::Diverged);
+    let err = members(i32::MAX).expect_err("a diverged view lists nothing");
+    assert!(err.to_string().contains("outer pid namespace"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+    let _forced = force_proc_view_once(ForcedView::Unassessable);
+    let err = members(i32::MAX).expect_err("an unassessable view lists nothing");
+    assert!(err.to_string().contains("forced by a test"), "{err}");
+}

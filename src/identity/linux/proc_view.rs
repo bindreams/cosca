@@ -43,6 +43,20 @@ pub(crate) enum ProcView {
     Unassessable(ViewUnreadable),
 }
 
+/// Why a [`ProcView::Diverged`] `/proc` cannot answer questions about the caller's pids.
+pub(crate) const DIVERGED_REASON: &str = "this process's /proc is an outer pid namespace's";
+
+impl ProcView {
+    /// The `/proc` directory of a [`Same`](Self::Same) view; any other view is why not.
+    pub(crate) fn into_dir(self) -> Result<ProcDir, ViewUnreadable> {
+        match self {
+            ProcView::Same(dir) => Ok(dir),
+            ProcView::Diverged => Err(ViewUnreadable::new(DIVERGED_REASON, None)),
+            ProcView::Unassessable(why) => Err(why),
+        }
+    }
+}
+
 /// Why a `/proc` view or pidfd cross-check could not be established.
 #[derive(Debug)]
 pub(crate) struct ViewUnreadable {
@@ -149,6 +163,23 @@ impl ProcDir {
     fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
         let link = self.open_beneath(path, OFlags::PATH | OFlags::NOFOLLOW)?;
         Ok(rustix::fs::readlinkat(&link, "", Vec::new())?.into_bytes())
+    }
+
+    /// The pids listed under this `/proc`: its decimal-named entries.
+    pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
+        let mut pids = Vec::new();
+        for entry in rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)? {
+            let entry = entry?;
+            // Decimal names only: `self`, `thread-self`, `net`, ... are not pids.
+            if let Some(pid) = std::str::from_utf8(entry.file_name().to_bytes())
+                .ok()
+                .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|name| name.parse::<u32>().ok())
+            {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
     }
 
     /// Whether the symlink at `path` under this `/proc` exists, without following it.

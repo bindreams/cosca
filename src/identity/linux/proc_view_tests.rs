@@ -8,7 +8,7 @@ use crate::test_child::namespaces as ns;
 use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
     classify_ns_links, classify_status, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView,
-    Verdict,
+    Verdict, ViewUnreadable,
 };
 
 fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
@@ -461,4 +461,26 @@ fn fixture_own_procfs_unprivileged() {
         }
         other => panic!("an unreadable pid 1 namespace link must be Unassessable, got {other:?}"),
     }
+}
+
+// Listing =====
+
+/// Only decimal-named entries are pids. Mutant: "every entry is a pid" — `self` fails to parse
+/// and aborts, or `thread-self` is counted.
+#[test]
+fn pids_lists_the_numeric_entries_including_this_process() {
+    let pids = ProcDir::open().expect("/proc opens").pids().expect("list");
+    assert!(pids.contains(&std::process::id()), "{pids:?}");
+}
+
+/// `into_dir` yields the directory of a `Same` view and names the cause of any other.
+#[test]
+fn into_dir_names_why_a_view_is_not_usable() {
+    let same = ProcView::Same(ProcDir::open().expect("/proc opens"));
+    assert!(same.into_dir().is_ok());
+    let diverged = ProcView::Diverged.into_dir().expect_err("diverged");
+    assert!(diverged.reason.contains("outer pid namespace"), "{diverged}");
+    let why = ViewUnreadable::new("boom", None);
+    let unassessable = ProcView::Unassessable(why).into_dir().expect_err("unassessable");
+    assert_eq!(unassessable.reason, "boom");
 }

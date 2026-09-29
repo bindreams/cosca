@@ -140,24 +140,35 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     }
 }
 
-/// Linux: scan `/proc` and keep the entries whose `stat` field 5 is `pgid`, carrying field 22
-/// (`starttime`) as the token. There is no narrower kernel interface for process-group
-/// membership.
+/// Linux: scan the checked `/proc` (`identity::linux::proc_view`) and keep the entries whose
+/// `stat` field 5 is `pgid`, carrying field 22 (`starttime`) as the token. There is no narrower
+/// kernel interface for process-group membership.
+///
+/// A `/proc` that is not this process's own pid namespace's lists other processes' pgids, which
+/// mean nothing here: that is an error naming the view, not an empty group.
 #[cfg(target_os = "linux")]
 pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
+    let proc_dir = crate::identity::proc_view().into_dir().map_err(|why| {
+        std::io::Error::other(format!(
+            "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
+        ))
+    })?;
     let mut out = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        // A genuine read_dir iteration error means the listing itself is unreliable —
-        // propagate it rather than silently treating it as one absent entry among many.
-        let entry = entry?;
-        // /proc/<pid> directories are named by their decimal pid; skip the rest (self, net, ...).
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<RawPid>().ok()) else {
-            continue;
-        };
-        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+    // A genuine listing error means the listing itself is unreliable — propagate it rather than
+    // silently treating it as one absent entry among many.
+    for pid in proc_dir.pids()? {
+        let stat = match proc_dir.read(&format!("{pid}/stat")) {
             Ok(bytes) => bytes,
+            // A read the checked directory REFUSES (it would leave or cross a mount) is not a
+            // process that went away: the record is not the kernel's, so the listing is unreliable.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ELOOP)) => {
+                return Err(std::io::Error::other(format!(
+                    "containment::unix::group::members: {pid}/stat lies beyond a mount in /proc and was not \
+                     read: {e}"
+                )));
+            }
             // Deliberately NOT propagated as a listing failure, and deliberately NOT
             // disambiguated by probing with `kill(pid, 0)`: this loop scans ALL of `/proc`, not
             // just `pgid`'s members, and a `hidepid`-restricted `/proc` answers a foreign-uid
@@ -701,3 +712,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "group_tests.rs"]
 mod group_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "group_namespace_tests.rs"]
+mod group_namespace_tests;
