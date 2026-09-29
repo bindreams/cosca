@@ -80,8 +80,11 @@ fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
 
 /// A `tool` in `dir` that exits with `code` if run in `dir` (it finds `./<marker>`), else with 3.
 fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(dir).expect("mkdir");
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    // Created 0o700 so the chmod is what makes `dir` traversable to a dropped uid, whatever the
+    // ambient umask; the umask is process-global, so a test must not change it.
+    std::fs::DirBuilder::new().mode(0o700).create(dir).expect("mkdir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
     std::fs::write(dir.join(marker), "").expect("write marker");
     let tool = dir.join("tool");
     // Under the lock for the reason `cwd_and_path_tools` gives.
@@ -92,8 +95,8 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
 
 const FIXTURE_UNREACHABLE_CWD_TEST: &str =
     "child::spawn::exact_posix_tests::fixture_spawn_exact_tool_in_an_unreachable_cwd";
-/// The fixture's own directory as a path, which it must fail to reach. Its presence also marks a
-/// deliberate re-exec rather than an ordinary suite run.
+/// The fixture's own directory as a path, which it must fail to reach. A deliberate re-exec also
+/// needs [`crate::test_child::is_fixture_reexec`].
 const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
 /// The `current_dir()` the fixture sets, if any.
 const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
@@ -112,7 +115,9 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
         return;
     };
-    drop_root();
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -149,34 +154,6 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     std::process::exit(code);
 }
 
-/// Root reaches an unsearchable directory anyway (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`), so a
-/// root fixture becomes [`UNPRIVILEGED`] first: the test is then the same one it is for any other
-/// user, rather than one that cannot set up its own precondition.
-fn drop_root() {
-    // SAFETY: plain credential calls with valid arguments. libtest runs this on a thread of its
-    // own, not the main one, which is fine: glibc and musl broadcast a set*id to every thread
-    // (setxid), and Darwin's credentials are per-process, so the whole fixture process drops
-    // together — and the spawn that must run unprivileged happens on this same thread anyway.
-    unsafe {
-        if libc::geteuid() != 0 {
-            return;
-        }
-        if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setgid(UNPRIVILEGED) != 0
-            || libc::setuid(UNPRIVILEGED) != 0
-        {
-            report(&format!(
-                "precondition: dropping root: {}",
-                std::io::Error::last_os_error()
-            ));
-            std::process::exit(PRECONDITION_FAILED);
-        }
-    }
-}
-
-/// The uid and gid a root fixture drops to: `nobody` on Linux.
-const UNPRIVILEGED: libc::uid_t = 65534;
-
 /// The command `.elevate()` spawns from a process that is already root, on any host.
 fn already_elevated(c: &mut Command) -> Result<Command, Error> {
     use crate::elevation::plan::{BackendSet, Host, Os};
@@ -205,19 +182,15 @@ fn report(line: &str) {
     _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// Restores a directory's mode on drop, so the tempdir can be removed even after a panic.
-struct RestoreMode(std::path::PathBuf);
-impl Drop for RestoreMode {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
 /// Runs the fixture in `<root>/p/d` with `p` unsearchable, so its cwd has no path it can use —
 /// `getcwd` fails on macOS, and a `chdir` to the path fails everywhere. `d/tool` exits with
 /// [`CWD_TOOL_EXIT`] and `d/sub/tool` with [`PATH_TOOL_EXIT`], each only when run in its own
-/// directory. Returns the fixture's exit code, and its stderr prefixed with the gate write's result.
+/// directory. The fixture starts without DAC bypass, so `p` binds a root driver too. Returns the
+/// fixture's exit code, and its stderr prefixed with the gate write's result.
+///
+/// `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the fixture is not
+/// their owner. `root` and `p` need no mode: the fixture's cwd is entered before it drops uid, and
+/// `p` is `0o000` before it looks at anything.
 ///
 /// The write can fail: a fixture that refused a precondition has exited before reading it. Its exit
 /// code and stderr then say why, so the write result is reported rather than panicked on.
@@ -227,19 +200,16 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
-    // Reachable by the unprivileged user a root fixture drops to; `tempdir` makes it 0700.
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
+    std::fs::create_dir(&p).expect("mkdir p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
-    let mut fixture = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    let (mut fixture, _exe_copy) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
     fixture
-        .args(["--test-threads=1", "--exact", FIXTURE_UNREACHABLE_CWD_TEST])
         .env(FIXTURE_UNREACHABLE_CWD_ENV, &d)
         .current_dir(&d)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::null());
     if let Some(dir) = current_dir {
         fixture.env(FIXTURE_CURRENT_DIR_ENV, dir);
     }
@@ -251,7 +221,7 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
         let _guard = crate::child::spawn::spawn_lock();
         fixture.spawn().expect("spawn the fixture")
     };
-    let _restore = RestoreMode(p.clone());
+    let _restore = crate::test_child::RestoreMode::new(&p, 0o755);
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let gate = child.stdin.take().expect("stdin").write_all(b"x");
     let out = child.wait_with_output().expect("wait");

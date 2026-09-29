@@ -278,43 +278,129 @@ fn a_candidate_is_accepted_when_fully_qualified() {
     }
 }
 
-/// Restores a directory's permissions on drop, so the tempdir can be removed whatever the test's
-/// outcome.
+/// The raw OS error [`crate::error::io_context`] wrapped: it keeps the original error as `source()`
+/// so the code survives, and several codes share one [`std::io::ErrorKind`].
 #[cfg(unix)]
-struct Locked(PathBuf);
+fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
+    std::error::Error::source(e)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
+/// Joins two directories into the `PATH` value [`search_tool`]'s `windows: true` parses. Not
+/// `std::env::join_paths`, which uses the host's `:`. Each entry is quoted, which
+/// [`split_path_var_windows`] copies through literally, so a `;` in an ambient `TMPDIR` cannot split
+/// an entry.
+///
+/// Panics on a `"` in either path: the grammar has no escape for one, and NTFS forbids it in a name.
+#[cfg(unix)]
+fn windows_path_var(first: &Path, second: &Path) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    for dir in [first, second] {
+        assert!(
+            !dir.as_os_str().as_bytes().contains(&b'"'),
+            "precondition: {dir:?} must not contain a `\"` — NTFS forbids it, and the Windows \
+             PATH grammar cannot express one"
+        );
+    }
+    let mut path = std::ffi::OsString::from("\"");
+    path.push(first);
+    path.push("\";\"");
+    path.push(second);
+    path.push("\"");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_path_var_resolves_two_ordinary_directories() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(second.path().join("tool.exe"), b"x").unwrap();
+    let path = windows_path_var(first.path(), second.path());
+    assert_eq!(search_tool(&path, false).unwrap(), second.path().join("tool.exe"));
+}
+
+/// An ambient `TMPDIR` containing the `PATH` separator must not merge two entries into one.
+#[cfg(unix)]
+#[test]
+fn windows_path_var_resolves_a_directory_whose_name_contains_the_separator() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::Builder::new().prefix("has;semicolon").tempdir().unwrap();
+    std::fs::write(second.path().join("tool.exe"), b"x").unwrap();
+    let path = windows_path_var(first.path(), second.path());
+    assert_eq!(search_tool(&path, false).unwrap(), second.path().join("tool.exe"));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "must not contain a `\"`")]
+fn windows_path_var_refuses_a_component_holding_a_quote() {
+    windows_path_var(Path::new("/tmp/has\"quote"), Path::new("/tmp/b"));
+}
+
+/// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
+///
+/// The first entry is a symlink to itself, so `<loop>/tool.exe` is `ELOOP` for every uid: the
+/// kernel's loop limit is not a DAC (discretionary access control) decision, which no capability
+/// overrides. The precondition, a candidate `is_absence` cannot call absent, is asserted.
+#[cfg(unix)]
+fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
+    let root = tempfile::tempdir().unwrap();
+    let looping = root.path().join("loop");
+    std::os::unix::fs::symlink("loop", &looping).unwrap();
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::write(open.join("tool.exe"), b"x").unwrap();
+    let candidate = looping.join("tool.exe");
+    let e = std::fs::metadata(&candidate).unwrap_err();
+    assert!(
+        !is_absence(&e),
+        "precondition: {candidate:?} must be undeterminable, not a definite absence: {e}"
+    );
+    let path = windows_path_var(&looping, &open);
+    (root, open, path)
+}
+
+/// A `chmod 0o000` directory, and the guard that unlocks it on drop.
+#[cfg(unix)]
+struct Locked(PathBuf, crate::test_child::RestoreMode);
 
 #[cfg(unix)]
 impl Locked {
     fn new(dir: PathBuf) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        let restore = crate::test_child::RestoreMode::new(&dir, 0o755);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        Locked(dir)
+        Locked(dir, restore)
     }
 }
 
-#[cfg(unix)]
-impl Drop for Locked {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)) {
-            log::warn!("could not unlock {:?}: {e}", self.0);
-        }
-    }
-}
-
-/// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
+/// A `PATH` entry whose candidate is refused with `EACCES`, followed by one that holds the name:
+/// the one failure whose kind is `PermissionDenied`.
+///
+/// Only a caller without DAC bypass gets `EACCES`: root's, or either DAC capability, would see an
+/// empty directory. Callers therefore run in a fixture [`crate::test_child::run_fixture`] started
+/// without it, and the precondition is asserted.
 #[cfg(unix)]
 fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_child::fixture_scratch_tempdir();
     let locked = root.path().join("locked");
     let open = root.path().join("open");
     std::fs::create_dir(&locked).unwrap();
     std::fs::create_dir(&open).unwrap();
     std::fs::write(open.join("tool.exe"), b"x").unwrap();
-    let mut path = locked.clone().into_os_string();
-    path.push(";");
-    path.push(&open);
-    (root, Locked::new(locked), open, path)
+    let locked = Locked::new(locked);
+    let candidate = locked.0.join("tool.exe");
+    let e = std::fs::metadata(&candidate).unwrap_err();
+    assert_eq!(
+        e.raw_os_error(),
+        Some(libc::EACCES),
+        "precondition: {candidate:?} must be denied to this caller, not {e} — did the caller \
+         forget run_fixture?"
+    );
+    let path = windows_path_var(&locked.0, &open);
+    (root, locked, open, path)
 }
 
 #[cfg(unix)]
@@ -330,26 +416,164 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
     })
 }
 
+/// The env var [`stat_errno_via_grandchild`] sets `fixture_stat_errno_probe`'s target to.
+#[cfg(unix)]
+const FIXTURE_STAT_TARGET_ENV: &str = "COSCA_FIXTURE_STAT_TARGET";
+
+/// Prefix of the line the probe writes to its real stderr: `stat`'s raw errno, `0` on success.
+#[cfg(unix)]
+const STAT_ERRNO_PREFIX: &str = "COSCA_FIXTURE_STAT_ERRNO=";
+
+/// Inert in an ordinary suite run. `stat`s [`FIXTURE_STAT_TARGET_ENV`] and reports the raw errno on
+/// its real stderr as `STAT_ERRNO_PREFIX<n>`. A number carries no locale, unlike `strerror()` text,
+/// and unlike the exit status it cannot be confused with libtest's own codes.
+#[cfg(unix)]
+#[test]
+fn fixture_stat_errno_probe() {
+    use std::io::Write as _;
+    let Some(target) = std::env::var_os(FIXTURE_STAT_TARGET_ENV) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    let errno = std::fs::metadata(&target)
+        .err()
+        .map_or(0, |e| e.raw_os_error().unwrap_or(-1));
+    writeln!(std::io::stderr(), "{STAT_ERRNO_PREFIX}{errno}").expect("report the errno");
+}
+
+/// Re-execs [`fixture_stat_errno_probe`] against `target` in a fresh child, a real `execve` rather
+/// than this thread's own `stat`, and returns the errno it saw (`None` on success). Panics unless
+/// the probe passed its gate and reported.
+#[cfg(unix)]
+fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        crate::test_child::fixture_command(crate::test_child::fixture_path!(fixture_stat_errno_probe))
+            .env(FIXTURE_STAT_TARGET_ENV, target)
+            .spawn()
+            .expect("spawn the stat probe")
+    };
+    let output = child.wait_with_output().expect("wait for the stat probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stderr.contains(crate::test_child::FIXTURE_GATE_PASSED_LINE),
+        "the stat probe did not run: {output:?}"
+    );
+    let errno: i32 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix(STAT_ERRNO_PREFIX))
+        .unwrap_or_else(|| panic!("the stat probe reported no errno: {stderr}"))
+        .parse()
+        .expect("the reported errno is a number");
+    (errno != 0).then_some(errno)
+}
+
 /// Under `loadable_only`, a candidate whose existence cannot be determined fails the search closed:
-/// the entry after it must not win because a check errored. Fails loudly under root, which can
-/// search the locked directory.
+/// the entry after it must not win because a check errored. Uid-independent: passes as root and as
+/// any other caller alike.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
-    let (_root, _locked, _open, path) = locked_then_open();
+    let (_root, _open, path) = loop_then_open();
     match search_tool(&path, true) {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::ELOOP), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
 }
 
-/// An ordinary spawn skips it and goes on, as before, so one unreadable `PATH` directory does not
-/// break every unelevated spawn.
+/// The `EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]: the
+/// production case (`resolve.rs`'s `Err(e) if input.loadable_only` arm). Runs in a re-exec.
+#[cfg(unix)]
+#[test]
+fn a_denied_candidate_fails_a_loadable_only_search_closed() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_fails_a_loadable_only_search_closed
+    ));
+}
+
+/// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]; inert unless
+/// [`crate::test_child::run_fixture`] started it.
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    let (_root, _locked, _open, path) = locked_then_open();
+    match search_tool(&path, true) {
+        Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
+        other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
+    }
+}
+
+/// An ordinary spawn skips it and goes on, as before, so one `PATH` entry whose candidate cannot be
+/// checked does not break every unelevated spawn.
 #[cfg(unix)]
 #[test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
+    let (_root, open, path) = loop_then_open();
+    assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
+}
+
+/// The `EACCES` twin of [`an_undeterminable_candidate_is_skipped_by_an_ordinary_search`]: the
+/// production case (`resolve.rs`'s `Err(e) => log::warn!(...)` skip arm). Runs in a re-exec.
+#[cfg(unix)]
+#[test]
+fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_is_skipped_by_an_ordinary_search
+    ));
+}
+
+/// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`].
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
     let (_root, _locked, open, path) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
+}
+
+/// An `execve` from the fixture must not give DAC bypass back. `test_privilege` sets
+/// `no_new_privs` for exactly that: without it, a uid-0 `execve` regains the capabilities from the
+/// bounding set (`capabilities(7)`, set-user-ID-root compatibility). A non-root driver has nothing
+/// to regain, so this needs root; see [`crate::test_privilege::root_tests_enabled`].
+#[cfg(unix)]
+#[test]
+fn a_denied_candidate_is_denied_by_an_exec_child() {
+    if !crate::test_privilege::root_tests_enabled() {
+        return;
+    }
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_candidate_is_denied_by_an_exec_child
+    ));
+}
+
+/// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`]: an exec'd probe must be
+/// denied too.
+#[cfg(unix)]
+#[test]
+fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    let (_root, locked, open, _path) = locked_then_open();
+    assert_eq!(
+        stat_errno_via_grandchild(&open.join("tool.exe")),
+        None,
+        "positive control: an exec'd child must reach the unlocked directory, or a denial below \
+         proves nothing"
+    );
+    let errno = stat_errno_via_grandchild(&locked.0.join("tool.exe"));
+    assert_eq!(
+        errno,
+        Some(libc::EACCES),
+        "an exec'd child must not regain access this process was denied"
+    );
 }
 
 /// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no

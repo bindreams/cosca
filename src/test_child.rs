@@ -169,51 +169,240 @@ mod write_to_possibly_dead_stdin_tests {
 
 // Re-exec fixtures =====
 
+#[cfg(unix)]
+mod scratch;
+#[cfg(unix)]
+pub(crate) use scratch::fixture_scratch_tempdir;
+
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
 /// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
-/// cwd is `cwd` — proving whatever the fixture's body proves about a process's REAL cwd without
-/// ever mutating THIS (shared, multithreaded) test binary's own cwd, which every other
-/// concurrently running test in this binary would otherwise race. `Command::current_dir` sets the
-/// CHILD's cwd before its own `exec`/`CreateProcessW`, so no window exists where this process's
-/// cwd is anything other than what it always was.
+/// cwd is `cwd`. This proves what the fixture's body proves about a process's real cwd without
+/// mutating this shared, multithreaded binary's own cwd. `Command::current_dir` sets the child's
+/// cwd before its `exec`/`CreateProcessW`.
 ///
-/// `marker_env` is set to `cwd` itself in the child only, so the fixture can both (a) tell this
-/// deliberate re-exec apart from being picked up by an ordinary, unfiltered suite run — where it
-/// must no-op rather than assert against whatever the suite's own ambient cwd happens to be — and
-/// (b) assert its OWN `std::env::current_dir()` against that same value, rather than trusting
-/// that this function's `.current_dir(cwd)` call below actually took effect. Carrying the
-/// directory in the marker, rather than a bare `"1"`, is what lets a fixture catch this helper's
-/// OWN cwd-setting being silently dropped — a mutation that a caller checking only the fixture's
-/// pass/fail outcome cannot otherwise see, since the fixture would still be asserting something
-/// true about *some* directory, just not necessarily the one the parent prepared.
+/// `marker_env` is set to `cwd` in the child only. The fixture uses it to tell a deliberate
+/// re-exec from an ordinary suite run, where it must no-op, and to assert its own
+/// `current_dir()` against the value, so a dropped `.current_dir(cwd)` is caught (see
+/// [`expected_cwd`]).
 ///
-/// Spawns under `spawn_lock()`, matching every other raw `std::process::Command` re-exec of this
-/// test binary (see [`spawn_a_process_that_exits`]'s doc for the macOS fd-marker hazard that
-/// convention guards against).
+/// Spawns under `spawn_lock()`, like every raw `std::process::Command` re-exec of this binary (see
+/// [`spawn_a_process_that_exits`]).
 ///
-/// Panics with the child's captured stdout/stderr on a non-zero exit, i.e. whenever the fixture's
-/// own assertions failed — OR when the child's own libtest banner does not show that exactly the
-/// one intended fixture ran. `--exact <fixture>` naming a test that does not exist (a typo, or a
-/// rename on one side of the caller/fixture pair) makes libtest match ZERO tests and still exit
-/// 0, which a bare `status.success()` check cannot tell apart from "the fixture ran and passed" —
-/// build `fixture` with [`fixture_path!`] rather than a hand-typed string literal, so a mismatch
-/// between a call site and its `#[test] fn` is a compile error instead of a silently-empty
-/// filter; this stdout check is the remaining backstop for whatever that still lets through.
+/// Panics with the child's captured output on a non-zero exit, or when its libtest banner does not
+/// show exactly one test ran and passed: `--exact <fixture>` naming no test matches ZERO tests and
+/// still exits 0. Build `fixture` with [`fixture_path!`] so a stale name is a compile error; the
+/// banner check backstops the rest.
 pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_env: &str) {
-    // No `"cosca_unit_tests"` placeholder in slot 0 (that's [`fixture_argv`]'s convention for
-    // `cosca::Command`, see its doc): `std::process::Command` below already supplies its own
-    // argv[0] from `Command::new`'s program path.
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, cwd).current_dir(cwd);
+    run_fixture_command(fixture, cmd);
+}
+
+/// Runs the libtest fixture at `fixture` in a FRESH re-exec of this binary that starts without
+/// DAC bypass (see [`fixture_command_without_dac_bypass`]), for a fixture whose `EACCES`
+/// precondition must hold for a root driver too. Credentials are per-process state, so the drop
+/// cannot happen in this shared suite process.
+///
+/// The fixture gets a scratch directory built here, under this driver's ambient `TMPDIR`, that
+/// its post-drop identity can use; it reaches it with [`fixture_scratch_tempdir`]. Loosening the
+/// ambient `TMPDIR` instead would widen a directory this crate does not own.
+///
+/// See [`run_fixture_with_cwd`] for the re-exec, the panic conditions and [`fixture_path!`].
+#[cfg(unix)]
+pub(crate) fn run_fixture(fixture: &str) {
+    let scratch = tempfile::tempdir().expect("tempdir for fixture scratch root");
+    let (mut cmd, _exe_copy) = fixture_command_without_dac_bypass(fixture);
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // `spawn_lock` spans open-to-spawn: `O_CLOEXEC` only acts at `exec`, and a bare `fork`
+        // copies the whole fd table, so no other fork that takes the lock may land in between.
+        let guard = crate::child::spawn::spawn_lock();
+        let fd = scratch::open_scratch_fd(scratch.path());
+        let raw = fd.0;
+        cmd.env(scratch::FIXTURE_SCRATCH_FD_ENV, raw.to_string());
+        // SAFETY: async-signal-safe `fcntl` in the forked child, clearing close-on-exec on the
+        // child's own copy only.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(raw, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn fixture child");
+        drop(fd);
+        drop(guard);
+        finish_fixture_command(fixture, child);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The fixture runs as a different uid when this driver is root: hand it the scratch root.
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::ffi::CString::new(scratch.path().as_os_str().as_bytes())
+                .expect("scratch root path has no interior NUL");
+            // SAFETY: `path` is a valid C string naming a directory this function just created.
+            let rc = unsafe {
+                libc::chown(
+                    path.as_ptr(),
+                    crate::test_privilege::UNPRIVILEGED,
+                    crate::test_privilege::UNPRIVILEGED,
+                )
+            };
+            assert!(
+                rc == 0,
+                "chown scratch root to the fixture's post-drop identity: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        cmd.env(scratch::FIXTURE_SCRATCH_ROOT_ENV, scratch.path());
+        let child = {
+            let _guard = crate::child::spawn::spawn_lock();
+            cmd.spawn().expect("spawn fixture child")
+        };
+        finish_fixture_command(fixture, child);
+    }
+}
+
+/// [`fixture_command`] whose child drops DAC bypass in `pre_exec` (see
+/// [`crate::test_privilege::drop_dac_bypass_before_exec`]), so the fixture is unprivileged from its
+/// first instruction and so is everything it spawns.
+///
+/// Where a root driver changes uid (non-Linux), the fixture re-execs a copy of this binary in a
+/// directory the new uid can enter, and the ambient `TMPDIR` must be one it can enter too. The
+/// returned directory holds that copy: keep it until the fixture has exited.
+#[cfg(unix)]
+pub(crate) fn fixture_command_without_dac_bypass(fixture: &str) -> (std::process::Command, Option<tempfile::TempDir>) {
+    #[cfg(target_os = "linux")]
+    let (mut cmd, exe_copy) = (fixture_command(fixture), None);
+    #[cfg(not(target_os = "linux"))]
+    let (mut cmd, exe_copy) = if unsafe { libc::geteuid() } == 0 {
+        scratch::assert_dropped_identity_can_traverse_tmpdir();
+        let (dir, exe) = scratch::copy_exe_to_traversable_scratch();
+        let mut cmd = std::process::Command::new(exe);
+        configure_fixture_command(&mut cmd, fixture);
+        (cmd, Some(dir))
+    } else {
+        (fixture_command(fixture), None)
+    };
+    crate::test_privilege::drop_dac_bypass_before_exec(&mut cmd);
+    (cmd, exe_copy)
+}
+
+/// Restores a directory's mode on drop, so a test that locked a tempdir down can still remove it,
+/// even after a panic. Declare it after the `TempDir` it guards: locals drop in reverse order, so
+/// the restore runs first. (`TempDir::drop` swallows its own removal error and would leak the
+/// directory.)
+#[cfg(unix)]
+pub(crate) struct RestoreMode {
+    path: std::path::PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestoreMode {
+    pub(crate) fn new(path: impl Into<std::path::PathBuf>, mode: u32) -> Self {
+        Self {
+            path: path.into(),
+            mode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode)) {
+            log::warn!("could not restore mode {:o} on {:?}: {e}", self.mode, self.path);
+        }
+    }
+}
+
+/// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
+/// one test, single-threaded, stdio captured, [`FIXTURE_PARENT_PID_ENV`] set (see
+/// [`is_fixture_reexec`]).
+///
+/// The ambient `TMPDIR` is inherited untouched; see [`run_fixture`] for writable scratch after a
+/// drop.
+///
+/// No argv-slot-0 placeholder, unlike [`fixture_argv`]: `std::process::Command` supplies argv[0].
+///
+/// `pub(crate)` so a launcher with its own stdio needs (`exact_posix_tests.rs` pipes stdin) can
+/// start here and override only that.
+pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
+    // `/proc/self/exe`: the binary's own directory (e.g. nextest's extraction dir under a `0700`
+    // TMPDIR) may be unreachable post-drop; the kernel grants a process its own image regardless.
+    #[cfg(target_os = "linux")]
+    let program = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let program = std::env::current_exe().expect("current_exe");
+    let mut cmd = std::process::Command::new(program);
+    configure_fixture_command(&mut cmd, fixture);
+    cmd
+}
+
+/// The argv, env and stdio common to every fixture re-exec, split out for a caller that supplies
+/// its own program path.
+fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
+    cmd.args(["--test-threads=1", "--exact", fixture])
+        .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+}
+
+/// Set by every fixture re-exec to its parent's pid; see [`is_fixture_reexec`].
+const FIXTURE_PARENT_PID_ENV: &str = "COSCA_FIXTURE_PARENT_PID";
+
+/// Whether this process's real parent is the one that re-exec'd it via `run_fixture*`; an
+/// inherited marker env var alone does not prove that. On `true`, writes
+/// [`FIXTURE_GATE_PASSED_LINE`]; a caller with further checks before its gate is really passed
+/// uses [`parent_pid_matches`] and writes the line itself.
+#[cfg(unix)]
+pub(crate) fn is_fixture_reexec() -> bool {
+    let reexec = parent_pid_matches();
+    if reexec {
+        write_gate_passed();
+    }
+    reexec
+}
+
+/// [`is_fixture_reexec`]'s check, without the write.
+#[cfg(unix)]
+fn parent_pid_matches() -> bool {
+    std::env::var(FIXTURE_PARENT_PID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|pid| pid == std::os::unix::process::parent_id())
+}
+
+/// Written to a fixture's real stderr, bypassing libtest's capture, once its gate passes. A gate
+/// that returns early exits 0 like a fixture that ran and passed, so [`finish_fixture_command`]
+/// requires the line to tell them apart.
+pub(crate) const FIXTURE_GATE_PASSED_LINE: &str = "COSCA_FIXTURE_GATE_PASSED";
+
+fn write_gate_passed() {
+    use std::io::Write;
+    // A failed write is a broken fixture, not a missing line for the driver to guess at.
+    writeln!(std::io::stderr(), "{FIXTURE_GATE_PASSED_LINE}").expect("write the gate line to stderr");
+}
+
+/// Spawns `cmd` (from [`fixture_command`]) under `spawn_lock()` and waits for it; panics as
+/// [`run_fixture_with_cwd`] documents.
+fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
     let child = {
         let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(["--test-threads=1", "--exact", fixture])
-            .env(marker_env, cwd)
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn fixture child")
+        cmd.spawn().expect("spawn fixture child")
     };
+    finish_fixture_command(fixture, child);
+}
+
+/// The post-spawn half of [`run_fixture_command`], for a launcher that spawned under its own lock.
+fn finish_fixture_command(fixture: &str, child: std::process::Child) {
     let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -224,26 +413,28 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
     );
     assert!(
         stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
-        "fixture {fixture} exited 0 but its libtest banner shows something other than exactly \
-         one test run and passed — most likely `--exact {fixture}` matched ZERO tests (a stale \
-         name on one side of a caller/fixture pair), which libtest also exits 0 for:\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        "fixture {fixture} exited 0 but did not run and pass exactly one test; `--exact {fixture}` \
+         probably matched none:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    );
+    assert!(
+        stderr.contains(FIXTURE_GATE_PASSED_LINE),
+        "fixture {fixture} passed but never wrote {FIXTURE_GATE_PASSED_LINE:?}: its re-exec gate \
+         returned early without running its body:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
     );
 }
 
-/// Reads `marker_env`'s value as the directory [`run_fixture_with_cwd`]'s caller prepared, and
-/// returns `None` when it is unset — a fixture is picked up by an ordinary, unfiltered suite run
-/// too, where it must no-op rather than assert against whatever the suite's own ambient cwd
-/// happens to be.
+/// The directory [`run_fixture_with_cwd`]'s caller prepared, read from `marker_env`; `None` when it
+/// is unset or (on unix) [`parent_pid_matches`] says this is not a deliberate re-exec. Either way
+/// the fixture is also picked up by ordinary suite runs, where it must no-op.
 ///
-/// When set, also asserts this fixture's OWN `std::env::current_dir()` actually IS that
-/// directory: `run_fixture_with_cwd`'s `.current_dir(cwd)` call is what is supposed to guarantee
-/// that, but a fixture that never checks it would keep passing even if that call were silently
-/// dropped — an assertion the fixture's OWN body happened to still satisfy in whatever the
-/// process's REAL ambient cwd was, for reasons that have nothing to do with the directory under
-/// test. Every fixture in this file that takes a `marker_env` argument calls this instead of
-/// reading `std::env::current_dir()` directly, so that check is never skippable by omission.
+/// Also asserts this process's own `current_dir()` IS that directory, so a fixture that reads its
+/// cwd through here cannot keep passing after `.current_dir(cwd)` is silently dropped. The gate
+/// line is written last, after both checks.
 pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    if !parent_pid_matches() {
+        return None;
+    }
     let expected = std::path::PathBuf::from(std::env::var_os(marker_env)?);
     let actual = std::env::current_dir().expect("current_dir");
     assert_eq!(
@@ -251,6 +442,7 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
         expected.canonicalize().expect("canonicalize expected cwd"),
         "this fixture's OS-level cwd must be the directory run_fixture_with_cwd's caller prepared",
     );
+    write_gate_passed();
     Some(expected)
 }
 
@@ -525,3 +717,7 @@ pub(crate) fn cwd_and_path_tools() -> (tempfile::TempDir, tempfile::TempDir) {
     }
     dirs
 }
+
+#[cfg(test)]
+#[path = "test_child_tests.rs"]
+mod test_child_tests;
