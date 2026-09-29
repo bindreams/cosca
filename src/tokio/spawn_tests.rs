@@ -24,6 +24,7 @@ fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 }
 
 // A child only a real kill ends — see `child::spawn_tests::blocker`.
+#[cfg(target_os = "linux")]
 fn blocker() -> Command {
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
