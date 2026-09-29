@@ -1,7 +1,9 @@
 use std::os::windows::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
-use windows::Win32::System::Threading::{CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
+use windows::Win32::System::Threading::{
+    TerminateProcess, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW,
+};
 
 use super::{create_process, win32_io_error, RawChild};
 
@@ -29,7 +31,18 @@ impl Drop for KillOnDrop {
 /// A `CREATE_SUSPENDED` process: its thread never runs, so it never exits on its own. Held in
 /// `KillOnDrop` so a panic mid-test still kills and reaps it.
 fn spawn_suspended() -> KillOnDrop {
-    let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect(); // never actually runs
+    spawn_suspended_as(RawChild::new)
+}
+
+/// [`spawn_suspended`] wrapped with the runas flag: a real, NON-elevated child that takes
+/// `RawChild`'s runas arms.
+fn spawn_suspended_runas() -> KillOnDrop {
+    spawn_suspended_as(RawChild::new_runas)
+}
+
+fn spawn_suspended_as(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> KillOnDrop {
+    // Never actually runs.
+    let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect();
     let mut si = STARTUPINFOEXW::default();
     let (proc, pid) = create_process(
         None,
@@ -40,42 +53,54 @@ fn spawn_suspended() -> KillOnDrop {
         EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
     )
     .expect("spawn suspended");
-    KillOnDrop(RawChild::new(proc, pid))
+    KillOnDrop(wrap(proc, pid))
 }
 
-fn spawn_long_lived_runas() -> RawChild {
-    // A real, NON-elevated child wrapped with the runas flag. `ping -n 5 127.0.0.1` runs
-    // ~4s — long-lived enough that kill/teardown must actually terminate it.
-    let mut cmdline: Vec<u16> = "ping -n 5 127.0.0.1\0".encode_utf16().collect();
-    // A zeroed STARTUPINFOEXW (null lpAttributeList is fine); `create_process` fills cb.
-    // `EXTENDED_STARTUPINFO_PRESENT` satisfies create_process's contract (it sizes the
-    // struct as extended, so CreateProcessW must be told to treat it as such).
-    let mut si = STARTUPINFOEXW::default();
-    let (proc, pid) =
-        create_process(None, &mut cmdline, &mut si, None, &None, EXTENDED_STARTUPINFO_PRESENT.0).expect("spawn");
-    RawChild::new_runas(proc, pid)
+/// End `handle` with exit code 0, which only a process no earlier `TerminateProcess` has claimed
+/// takes: once the first call has started the termination, a second is refused with
+/// `ERROR_ACCESS_DENIED` and the exit code stays the first's. A real kill exits 1; a kill that
+/// did nothing leaves the suspended child for this, and it exits 0.
+///
+/// `handle` must stay valid for the call: the child outlives every use here.
+fn end_with_code_zero(handle: windows::Win32::Foundation::HANDLE) {
+    // SAFETY: the caller's live process handle; a refused second terminate is expected.
+    let _ = unsafe { TerminateProcess(handle, 0) };
 }
 
 #[test]
 fn runas_kill_of_a_killable_child_returns_and_reaps() {
-    let child = spawn_long_lived_runas();
+    let child = spawn_suspended_runas();
     child
         .kill()
         .expect("kill of our own (non-elevated) runas-flagged child must succeed");
-    // kill() returned (no hang). `TerminateProcess` is asynchronous — it initiates termination
-    // and returns before the process object signals — so confirm the real exit via a blocking
-    // wait on that event (never a racing try_wait poll, never a timer).
+    // Were `kill` a no-op, the wait below would block on a child that never runs. End it with
+    // exit code 0 instead: the real kill already claimed the exit code, so only a no-op lets this
+    // one through (see `end_with_code_zero`).
+    end_with_code_zero(child.handle());
+    // `TerminateProcess` is asynchronous — it initiates termination and returns before the
+    // process object signals — so confirm the real exit via a blocking wait on that event
+    // (never a racing try_wait poll, never a timer).
     let status = child.wait().expect("wait after kill");
-    assert!(!status.success(), "a TerminateProcess(1) exit is non-zero: {status:?}");
+    assert_eq!(status.code(), Some(1), "a TerminateProcess(1) exit is 1: {status:?}");
 }
 
 #[test]
 fn runas_teardown_on_drop_returns_promptly() {
-    let child = spawn_long_lived_runas();
+    let child = spawn_suspended_runas();
+    // Copy; valid until `child` drops.
+    let handle = child.handle();
+    // Fired between `teardown_on_drop`'s terminate and its wait. Were the terminate a no-op, that
+    // wait would block on a child that never runs; this ends it with exit code 0 instead.
+    let _release = super::fault::set_between_kill_and_wait(move || end_with_code_zero(handle));
     child.teardown_on_drop(); // must not hang even though the runas arm is taken
-    assert!(
-        child.try_wait().expect("try_wait").is_some(),
-        "teardown must reap a killable runas child"
+    let status = child
+        .try_wait()
+        .expect("try_wait")
+        .expect("teardown must reap a killable runas child");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "teardown must end it with TerminateProcess(1): {status:?}"
     );
 }
 
