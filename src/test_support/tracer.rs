@@ -313,12 +313,9 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
         // Not inherited from the test's own environment into a client's helper.
         None => cmd.env_remove("COSCA_UH_TRACE").env_remove("COSCA_UH_FORCE"),
     };
-    // Under `spawn_lock()`: macOS pipes get `FD_CLOEXEC` after `pipe()`, so a concurrent fork
-    // could otherwise inherit this helper's pipe ends.
-    let mut helper = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn the tracer helper")
-    };
+    // Under `spawn_lock()` (via `test_spawn`): macOS pipes get `FD_CLOEXEC` after `pipe()`, so a
+    // concurrent fork could otherwise inherit this helper's pipe ends.
+    let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the tracer helper");
     let signal_tx = helper.stdin.take().expect("the helper's stdin is piped");
     let rx = std::io::BufReader::new(helper.stdout.take().expect("the helper's stdout is piped"));
     Pending {
@@ -348,15 +345,19 @@ fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
         let _guard = crate::child::spawn::spawn_lock();
         std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
         std::fs::write(&plist, ENTITLEMENTS).expect("write the entitlements plist");
-        std::process::Command::new("/usr/bin/codesign")
-            .args(["--sign", "-", "--force", "--entitlements"])
+        let mut cmd = std::process::Command::new("/usr/bin/codesign");
+        cmd.args(["--sign", "-", "--force", "--entitlements"])
             .arg(&plist)
             .arg(&exe)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn codesign")
+            .stderr(std::process::Stdio::piped());
+        // `test_spawn::spawn` would re-take the non-reentrant lock; `_guard` is spawn_lock.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "`_guard` is spawn_lock, held over the copy and the fork"
+        )]
+        cmd.spawn().expect("spawn codesign")
     };
     let out = codesign.wait_with_output().expect("wait for codesign");
     assert!(
