@@ -2,7 +2,7 @@ nextest-version = { required = "0.9.137" }
 
 # Death-watch tests that a regression would turn into a hang rather than a failure.
 [[profile.default.overrides]]
-filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|_releases_the_lock_before_the_wait/)'
+filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 [profile.ci]

@@ -354,10 +354,7 @@ pub(crate) fn occupied_leaf() -> (
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let member = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn the member")
-    };
+    let member = crate::test_spawn::spawn(&mut cmd).expect("spawn the member");
     (leaf, MemberGuard(member), own)
 }
 

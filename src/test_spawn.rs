@@ -12,6 +12,22 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
+thread_local! {
+    static BETWEEN_SPAWN_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+}
+
+/// Run `hook` once on this thread in the next sync or tokio `output_captured`/`status`, after the
+/// spawn returned and before the wait. A test asserts there that the lock is not held, so a helper
+/// that holds it across the wait fails an assertion instead of deadlocking.
+#[cfg_attr(not(unix), allow(dead_code, reason = "only the unix helper tests arm it"))]
+pub(crate) fn set_between_spawn_and_wait(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BETWEEN_SPAWN_AND_WAIT, hook)
+}
+
+fn run_between_spawn_and_wait() {
+    crate::oneshot_hook::fire(&BETWEEN_SPAWN_AND_WAIT);
+}
+
 struct Held {
     _guard: crate::child::spawn::SpawnLockGuard,
 }
@@ -46,7 +62,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Child> {
 )]
 pub(crate) fn output_captured(cmd: &mut Command) -> io::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    spawn(cmd)?.wait_with_output()
+    let child = spawn(cmd)?;
+    run_between_spawn_and_wait();
+    child.wait_with_output()
 }
 
 /// [`Command::status`] under `spawn_lock` for the spawn only; the wait runs unlocked.
@@ -55,7 +73,9 @@ pub(crate) fn output_captured(cmd: &mut Command) -> io::Result<Output> {
     allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
 )]
 pub(crate) fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
-    spawn(cmd)?.wait()
+    let mut child = spawn(cmd)?;
+    run_between_spawn_and_wait();
+    child.wait()
 }
 
 /// `tokio::process::Command::spawn` under `spawn_lock`.
@@ -74,7 +94,9 @@ pub(crate) fn spawn_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<::t
 )]
 pub(crate) async fn output_captured_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    spawn_tokio(cmd)?.wait_with_output().await
+    let child = spawn_tokio(cmd)?;
+    run_between_spawn_and_wait();
+    child.wait_with_output().await
 }
 
 /// The tokio twin of [`status`].
@@ -84,7 +106,9 @@ pub(crate) async fn output_captured_tokio(cmd: &mut ::tokio::process::Command) -
     allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
 )]
 pub(crate) async fn status_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<ExitStatus> {
-    spawn_tokio(cmd)?.wait().await
+    let mut child = spawn_tokio(cmd)?;
+    run_between_spawn_and_wait();
+    child.wait().await
 }
 
 #[cfg(test)]

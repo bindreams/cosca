@@ -185,14 +185,7 @@ fn waitid_status(pid: u32) -> std::process::ExitStatus {
 #[test]
 fn exit_status_of_matches_std_for_exited_and_killed_children() {
     for script in ["exit 3", "kill -KILL $$"] {
-        let child = {
-            let _guard = crate::child::spawn::spawn_lock();
-            std::process::Command::new("sh")
-                .args(["-c", script])
-                .spawn()
-                .expect("spawn")
-        };
-        let mut child = child;
+        let mut child = crate::test_spawn::spawn(std::process::Command::new("sh").args(["-c", script])).expect("spawn");
         let decoded = waitid_status(child.id());
         let real = child.wait().expect("wait");
         assert_eq!(decoded, real, "`sh -c '{script}'`");

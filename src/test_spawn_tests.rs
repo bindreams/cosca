@@ -9,8 +9,6 @@ mod window;
 #[path = "../tests/common/locked.rs"]
 mod locked;
 
-#[cfg(feature = "tokio")]
-use std::future::Future;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::process::Command;
@@ -261,77 +259,50 @@ async fn status_tokio_returns_the_exit_code() {
 
 // The lock is not held across the wait =====
 
-/// A `sh` that opens `go` for reading, so it blocks until the test opens it for writing. Once the
-/// child is running, its `spawn` is over or about to return; taking `spawn_lock` on the test thread
-/// therefore succeeds if and only if the helper released it before its wait.
-fn blocked_on_fifo() -> (tempfile::TempDir, std::path::PathBuf, [String; 2]) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let go = dir.path().join("go");
-    let go_c = std::ffi::CString::new(go.to_str().unwrap()).unwrap();
-    // SAFETY: `go_c` is a valid NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(go_c.as_ptr(), 0o600) }, 0, "mkfifo");
-    let args = ["-c".to_owned(), format!("read x < '{}'", go.display())];
-    (dir, go, args)
+/// Arms the seam to record whether this thread holds `spawn_lock` between the spawn and the wait.
+fn record_lock_held_at_wait() -> (std::rc::Rc<std::cell::Cell<Option<bool>>>, crate::oneshot_hook::Armed) {
+    let held = std::rc::Rc::new(std::cell::Cell::new(None));
+    let armed = super::set_between_spawn_and_wait({
+        let held = held.clone();
+        move || held.set(Some(super::held_by_this_thread()))
+    });
+    (held, armed)
 }
 
-/// Opens `go` for writing (returns once the child is blocked reading it), takes `spawn_lock`, and
-/// releases the child. A helper that holds `spawn_lock` through its wait never lets the lock be
-/// taken here, and this test blocks.
-fn take_the_lock_then_release(go: &std::path::Path) {
-    use std::io::Write;
-    let mut go_write = std::fs::OpenOptions::new().write(true).open(go).expect("open go");
-    drop(crate::child::spawn::spawn_lock());
-    go_write.write_all(b"x\n").expect("release the child");
+fn true_command() -> Command {
+    Command::new("/usr/bin/true")
 }
 
 #[test]
 fn output_captured_releases_the_lock_before_the_wait() {
-    let (_dir, go, args) = blocked_on_fifo();
-    let helper = std::thread::spawn(move || {
-        super::output_captured(Command::new("/bin/sh").args(args)).expect("output_captured")
-    });
-    take_the_lock_then_release(&go);
-    assert!(helper.join().expect("helper").status.success());
+    let (held, _armed) = record_lock_held_at_wait();
+    super::output_captured(&mut true_command()).expect("output_captured");
+    assert_eq!(held.get(), Some(false), "the lock must not be held across the wait");
 }
 
 #[test]
 fn status_releases_the_lock_before_the_wait() {
-    let (_dir, go, args) = blocked_on_fifo();
-    let helper = std::thread::spawn(move || super::status(Command::new("/bin/sh").args(args)).expect("status"));
-    take_the_lock_then_release(&go);
-    assert!(helper.join().expect("helper").success());
+    let (held, _armed) = record_lock_held_at_wait();
+    super::status(&mut true_command()).expect("status");
+    assert_eq!(held.get(), Some(false), "the lock must not be held across the wait");
 }
 
-/// The tokio helpers run on the polling thread, so the thread-local lock flag is observable while
-/// the future is parked in its wait.
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn output_captured_tokio_releases_the_lock_before_the_wait() {
-    let (_dir, go, args) = blocked_on_fifo();
-    let mut cmd = ::tokio::process::Command::new("/bin/sh");
-    cmd.args(args);
-    let mut fut = std::pin::pin!(super::output_captured_tokio(&mut cmd));
-    assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
-    assert!(
-        !super::held_by_this_thread(),
-        "the lock must not be held across the wait"
-    );
-    take_the_lock_then_release(&go);
-    assert!(fut.await.expect("output_captured_tokio").status.success());
+    let (held, _armed) = record_lock_held_at_wait();
+    super::output_captured_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
+        .await
+        .expect("output_captured_tokio");
+    assert_eq!(held.get(), Some(false), "the lock must not be held across the wait");
 }
 
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn status_tokio_releases_the_lock_before_the_wait() {
-    let (_dir, go, args) = blocked_on_fifo();
-    let mut cmd = ::tokio::process::Command::new("/bin/sh");
-    cmd.args(args);
-    let mut fut = std::pin::pin!(super::status_tokio(&mut cmd));
-    assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
-    assert!(
-        !super::held_by_this_thread(),
-        "the lock must not be held across the wait"
-    );
-    take_the_lock_then_release(&go);
-    assert!(fut.await.expect("status_tokio").success());
+    let (held, _armed) = record_lock_held_at_wait();
+    super::status_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
+        .await
+        .expect("status_tokio");
+    assert_eq!(held.get(), Some(false), "the lock must not be held across the wait");
 }
