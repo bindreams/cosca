@@ -50,10 +50,12 @@ impl SharedChild {
         #[cfg(test)]
         exit_only::seams::step(exit_only::seams::HolderStep::Poll);
         let seen = crate::wait::rearm_until(deadline.map(Some), |remaining| {
+            // Capped like every timed block; the round is re-armed against the real deadline.
+            let remaining = remaining.map(crate::wait::clamp_block);
             #[cfg(test)]
             crate::wait::block_probe::record(remaining);
             let ts = remaining.map(|d| Timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
+                tv_sec: d.as_secs() as i64,
                 tv_nsec: d.subsec_nanos() as _,
             });
             // A deadline wait never arms an unbounded poll.

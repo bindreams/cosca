@@ -56,3 +56,45 @@ mod unix {
         }
     }
 }
+
+mod step_hooks {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::wait::exit_only::seams::{self, HolderStep};
+
+    /// A dropped guard takes its unfired hook with it: the next `step` runs nothing.
+    ///
+    /// Mutant: the guard's `Drop` does nothing.
+    #[test]
+    fn a_dropped_step_hook_guard_removes_its_hook() {
+        let fired = Rc::new(Cell::new(false));
+        let guard = seams::on_holder_step(HolderStep::FinalPeek, {
+            let fired = Rc::clone(&fired);
+            move || fired.set(true)
+        });
+        drop(guard);
+        seams::step(HolderStep::FinalPeek);
+        assert!(!fired.get(), "the hook outlived its guard");
+        seams::holder_steps();
+    }
+
+    /// A guard removes only its own hook: dropping the guard of one that already fired leaves a
+    /// later hook for the same step armed.
+    ///
+    /// Mutant: the guard removes every hook of its step.
+    #[test]
+    fn a_step_hook_guard_removes_only_its_own_hook() {
+        let first = seams::on_holder_step(HolderStep::FinalPeek, || ());
+        seams::step(HolderStep::FinalPeek);
+        let fired = Rc::new(Cell::new(false));
+        let _second = seams::on_holder_step(HolderStep::FinalPeek, {
+            let fired = Rc::clone(&fired);
+            move || fired.set(true)
+        });
+        drop(first);
+        seams::step(HolderStep::FinalPeek);
+        assert!(fired.get(), "an earlier guard removed a later hook");
+        seams::holder_steps();
+    }
+}
