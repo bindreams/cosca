@@ -750,6 +750,7 @@ impl Drop for Child {
         let mut os = std::mem::take(&mut self.os);
         if self.kill_on_drop {
             signal_on_drop(self.id.pid(), &mut os);
+            _ = os.attached.wait_drained(None);
         }
         os.release_without_waiting();
     }
