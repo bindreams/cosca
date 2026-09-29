@@ -10,11 +10,10 @@
 /// inherits EVERY fd this process has open at the moment of the fork — not just ones a spawn
 /// deliberately marks inheritable — including an fd that exists only transiently, opened non-
 /// `CLOEXEC`, inside another `spawn_lock` holder's own critical section. Held across the `fork()`
-/// call itself; released once the parent's `pidfd_open` resolves either way. In the `Ok` arm that
-/// release is one beat later, after [`KillOnDrop`] is built — purely so that arm's own test hook
-/// has somewhere safe to run (the child already exists and is reapable by then, so a hook that
-/// panics still unwinds through a real guard); the lock itself has nothing to do with building
-/// `KillOnDrop`.
+/// call itself; released once the parent's `pidfd_open` resolves either way. In the `Ok` arm the
+/// release comes after [`KillOnDrop`] is built and the test hook has run: the hook runs while the
+/// lock is still held so a test can assert exactly that, and building the guard first means a hook
+/// that panics still unwinds through a guard that kills and reaps the child.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     let guard = crate::child::spawn::spawn_lock_tracked();

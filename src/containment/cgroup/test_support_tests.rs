@@ -298,16 +298,13 @@ fn defuse_disarms_the_guard() {
 ///   `spawn_lock_held_by_this_thread()` — it runs on the forking thread, so this reads the SAME
 ///   thread-local the fork used, not a copy. This is what actually catches a lock released right
 ///   after the fork, before `pidfd_open` and the hook: `kill(pid, 0)` (still checked below, as a
-///   sanity check that `fork()` really happened) does NOT catch that — sending signal 0 to
-///   whatever pid the hook is handed always succeeds once a real fork occurred, mutated or not,
-///   so a mutant that hardcodes a bogus pid there would defeat a "the hook cannot compile before
-///   the fork" argument; no such claim is made here.
+///   sanity check that `fork()` really happened) does NOT catch that: signal 0 to the pid the
+///   hook is handed succeeds whenever a real fork occurred, whether or not the lock is still held.
 ///
-/// **Never hangs**, even if the fix regresses so the child never reports: the child's
-/// [`KillOnDrop`] is killed and reaped BEFORE the read below, so its copy of the write end is
-/// always closed by the time this reads, and the read end is `O_NONBLOCK` — a broken `write` in
-/// the child (or, in the worst case, some unrelated fork still holding a copy of the write end)
-/// answers `WouldBlock`, read as "not reported" and failed loudly, never blocks forever. The pipe
+/// **Never hangs**, even if the fix regresses so the child never reports: the child exits by
+/// itself after reporting, and is reaped BEFORE the read below; the read end is `O_NONBLOCK`, so
+/// a missing byte (even with some unrelated fork still holding a copy of the write end) answers
+/// `WouldBlock`, read as "not reported" and failed loudly, never blocks forever. The pipe
 /// itself is opened while holding `spawn_lock` too, so an unrelated concurrent `fork_running`
 /// elsewhere in this binary — serialized on the very same lock — cannot fork and inherit its
 /// write end while this test is creating it.
@@ -357,10 +354,9 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
             // returned value or its own unwind.
             let _ = rx_release.recv();
         });
-        fork_running(|| {
-            // SAFETY: `pause` is async-signal-safe.
-            unsafe { libc::pause() };
-        })
+        // The child reports, runs this empty body, and `_exit`s on its own: the test then waits
+        // for that exit (an event) instead of killing it, which could land before the report.
+        fork_running(|| {})
     });
 
     // Blocks until fork_running's hook is running — not a fixed duration.
@@ -382,10 +378,10 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
 
     let guard = fork_thread.join().expect("fork_thread must not panic");
 
-    // Killed and reaped BEFORE the read: a child that never reports (a broken `write`, say) must
-    // not hang this test waiting for a byte that will never come. Once it is dead, its own copy
-    // of the write end is closed by the kernel no matter what it did.
-    drop(guard);
+    // Reaped BEFORE the read: the child exits by itself right after its report (or lack of one),
+    // so once it is reaped its byte is in the pipe or never will be. Killing it instead could
+    // land before it had run at all.
+    reap(guard.defuse());
     drop(report_write);
 
     let mut held = 0u8;
