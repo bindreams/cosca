@@ -104,19 +104,24 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
     }
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
-    // Test-only: `armed_probe` and `read_probe` are thread-local (see their docs for why), and
-    // this closure runs on a blocking-pool thread distinct from this one (the "arming" thread) —
-    // so read whatever THIS thread has installed now, while still on it (nothing before this
-    // point yields), and move the captured values into the closure to re-install on ITS thread.
+    // Test-only: `armed_probe`, `read_probe` and `fault_observer` are thread-local (see their
+    // docs for why), and this closure runs on a blocking-pool thread distinct from this one (the
+    // "arming" thread) — so read whatever THIS thread has installed now, while still on it
+    // (nothing before this point yields), and move the captured values into the closure to
+    // re-install on ITS thread.
     #[cfg(test)]
     let armed_tx = crate::wait::backend::armed_probe::current();
     #[cfg(test)]
     let read_tx = crate::wait::read_probe::current();
+    #[cfg(test)]
+    let released_tx = fault_observer::current();
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _armed_guard = armed_tx.map(crate::wait::backend::armed_probe::install);
         #[cfg(test)]
         let _read_guard = read_tx.map(crate::wait::read_probe::install);
+        #[cfg(test)]
+        let _released_guard = released_tx.map(fault_observer::install);
         let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
@@ -195,18 +200,59 @@ pub(crate) async fn wait_exit(id: ProcessId) -> Result<(), Error> {
 /// Deliberate test scaffolding (the `wait::fault` pattern): signals when the blocking
 /// watcher RETURNS, so a test can prove drop-release with a plain `recv()` — the
 /// no-time-sync alternative to observing teardown timing. Absent from non-test builds.
+///
+/// `thread_local!`, not a process-global slot, for the same reason `crate::wait::backend::
+/// armed_probe` is (see its own doc): `notify_released` runs inside `blocking_watch`'s
+/// `spawn_blocking` closure, the SAME function EVERY grace-wait/wait-exit call in the binary
+/// goes through, so a global slot would let an unrelated watch on another thread notify THIS
+/// thread's observer — `wait_exit_drop_releases_the_windows_watcher`'s `rx.recv()` returning on
+/// a stranger's release, not its own, would be a vacuous pass under plain `cargo test`'s
+/// shared-process, many-threads model. Relayed across the `spawn_blocking` boundary the
+/// identical way: `blocking_watch` reads [`current`] on the arming thread (cloned, before
+/// calling `spawn_blocking` — nothing before that call yields) and moves the captured value
+/// into the closure, re-installing it there via [`install`]'s `Guard`, scoped to that one
+/// blocking-pool call.
 #[cfg(all(test, windows))]
 pub(crate) mod fault_observer {
+    use std::cell::RefCell;
     use std::sync::mpsc::Sender;
-    use std::sync::Mutex;
-    static RELEASE_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
-    pub(crate) fn install_release_observer(tx: Sender<()>) {
-        *RELEASE_TX.lock().unwrap() = Some(tx);
+
+    thread_local! {
+        static RELEASE_TX: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
     }
-    pub(crate) fn notify_released() {
-        if let Some(tx) = RELEASE_TX.lock().unwrap().as_ref() {
-            _ = tx.send(());
+
+    /// `!Send` — see `crate::wait::backend::armed_probe::Guard`'s own doc for why: dropping it
+    /// on another thread would clear THAT thread's slot instead of the one it was installed on.
+    #[must_use = "dropping this immediately uninstalls the observer; bind it for its duration"]
+    pub(crate) struct Guard(std::marker::PhantomData<*const ()>);
+
+    pub(crate) fn install(tx: Sender<()>) -> Guard {
+        let prev = RELEASE_TX.with(|cell| cell.replace(Some(tx)));
+        debug_assert!(prev.is_none(), "fault_observer::install nested on the same thread");
+        Guard(std::marker::PhantomData)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RELEASE_TX.with(|cell| *cell.borrow_mut() = None);
         }
+    }
+
+    /// The CURRENT thread's installed observer, if any — read on the arming thread, before
+    /// `spawn_blocking`, so `blocking_watch` can `move` it into that closure. Cloned, not
+    /// taken: the arming thread's own installation must survive for its guard's whole
+    /// lifetime, which may span more than one `blocking_watch` call (e.g. `wait_exit`'s retry
+    /// loop).
+    pub(crate) fn current() -> Option<Sender<()>> {
+        RELEASE_TX.with(|cell| cell.borrow().clone())
+    }
+
+    pub(crate) fn notify_released() {
+        RELEASE_TX.with(|cell| {
+            if let Some(tx) = cell.borrow().as_ref() {
+                _ = tx.send(());
+            }
+        });
     }
 }
 
