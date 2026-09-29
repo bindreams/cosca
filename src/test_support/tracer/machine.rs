@@ -103,6 +103,10 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use super::sys::{self, Stop};
 use super::{Mode, Until};
 
+fn m(name: &str) -> bool {
+    std::env::var("COSCA_UH_MUTANT").as_deref() == Ok(name)
+}
+
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -171,7 +175,9 @@ fn read_pid_line() -> PidLine {
     let mut line = Vec::new();
     loop {
         match sys::read_byte(0) {
+            None if line.is_empty() && m("sm1_eof") => return PidLine::Pid(99_999_999),
             None if line.is_empty() => return PidLine::Eof,
+            None if m("sm1_partial_line") => break,
             None => return PidLine::Malformed(line),
             Some(b'\n') => break,
             Some(byte) => line.push(byte),
@@ -181,9 +187,10 @@ fn read_pid_line() -> PidLine {
         .ok()
         .and_then(|line| line.strip_prefix("pid "))
         .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-        .filter(|&pid| pid > 0);
+        .filter(|&pid| pid > 0 || (m("sm1_pid_zero") && pid == 0) || m("sm1_pid_negative"));
     match pid {
         Some(pid) => PidLine::Pid(pid as u32),
+        None if m("sm1_malformed_as_eof") => PidLine::Eof,
         None => PidLine::Malformed(line),
     }
 }
@@ -396,7 +403,11 @@ impl Machine<'_> {
     /// byte re-enters `done`, so a test can see the helper still holding.
     fn done(&mut self) {
         loop {
-            if self.block("done", Until::Eof).is_err() || sys::read_byte(0).is_none() || self.enter("done").is_err() {
+            if self.block("done", Until::Eof).is_err()
+                || sys::read_byte(0).is_none()
+                || m("done_exits_on_byte")
+                || self.enter("done").is_err()
+            {
                 return;
             }
         }
@@ -426,6 +437,7 @@ impl Machine<'_> {
         };
         match registered {
             Ok(()) => to(State::S1),
+            Err(_) if m("s0_ignore") => to(State::S1),
             Err(e) => self.fail(e, "S0"),
         }
     }
@@ -435,6 +447,7 @@ impl Machine<'_> {
         let hold = match self.forces.take("S1").as_deref() {
             None => false,
             Some("hold") => true,
+            Some(_) if m("s1_ignore") => return to(State::S2),
             Some(name) => return self.fail(errno_named(name), "S1"),
         };
         match sys::attach(self.pid) {
@@ -452,13 +465,13 @@ impl Machine<'_> {
         loop {
             let batch = self.wait(kq, "S1h", backoff)?;
             if batch.note_exit {
-                return to(State::S5);
+                return to(if m("s1h_note_to_s2") { State::S2 } else { State::S5 });
             }
             if batch.eof {
-                return EXIT;
+                return if m("s1h_eof_to_s2") { to(State::S2) } else { EXIT };
             }
             if batch.signal {
-                return to(State::S2);
+                return to(if m("s1h_sig_to_s3") { State::S3 } else { State::S2 });
             }
             let Some(current) = backoff else {
                 continue;
@@ -468,7 +481,16 @@ impl Machine<'_> {
                     self.enter("S1hs")?;
                     backoff = None;
                 }
+                Ok(Stop::Running) if m("s1h_none_holds") => {
+                    self.enter("S1hs")?;
+                    backoff = None;
+                }
+                Ok(Stop::Settling) if m("s1h_settling_holds") => {
+                    self.enter("S1hs")?;
+                    backoff = None;
+                }
                 Ok(Stop::Running | Stop::Settling) => backoff = Some(next_backoff(current)),
+                Err(_) if m("s1h_peek_retry_any") => backoff = Some(next_backoff(current)),
                 Err(e) => return self.fail(e, "S1h"),
             }
         }
@@ -487,10 +509,19 @@ impl Machine<'_> {
             };
             match result {
                 Ok(()) => return self.report_then("attached", to(State::S3)),
+                Err(libc::EBUSY) if m("s2_ebusy_fails") => return self.fail(libc::EBUSY, "S2"),
+                Err(libc::EINVAL) if m("s2_einval_as_ebusy") => {
+                    self.enter("S2b")?;
+                    let _ = self.wait(kq, "S2b", Some(backoff))?;
+                    backoff = next_backoff(backoff);
+                }
                 Err(libc::EBUSY) => {
                     self.enter("S2b")?;
                     let batch = self.wait(kq, "S2b", Some(backoff))?;
-                    if batch.any() {
+                    let retried = (batch.note_exit && m("s2b_note_retries"))
+                        || (batch.signal && m("s2b_sig_retries"))
+                        || (batch.eof && m("s2b_eof_retries"));
+                    if batch.any() && !retried {
                         return self.fail(batch.cause(), "S2b");
                     }
                     backoff = next_backoff(backoff);
@@ -511,22 +542,44 @@ impl Machine<'_> {
                 let previous = settling.take();
                 match stop {
                     Ok(Stop::Stopped(signal)) => match self.pass_on("S3", signal)? {
+                        Err(libc::ESRCH) if m("s3_cont_esrch_fails") => return self.fail(libc::ESRCH, "S3"),
                         // Exiting: its NOTE_EXIT follows.
                         Ok(()) | Err(libc::ESRCH) => {}
+                        Err(_) if m("s3_cont_err_ignored") => {}
                         Err(e) => return self.fail(e, "S3"),
                     },
+                    Ok(Stop::Settling) if m("s3_settling_as_running") => {}
                     Ok(Stop::Settling) => settling = Some(previous.map_or(FIRST_BACKOFF, next_backoff)),
+                    Ok(Stop::Running) if m("s3_sigchld_to_s4") => return to(State::S4),
                     Ok(Stop::Running) => {}
+                    Err(_) if m("s3_peek_err_ignored") => {}
                     Err(e) => return self.fail(e, "S3"),
                 }
             }
-            if batch.any() {
+            let hold_eof_waits =
+                m("s3_hold_eof_waits") && self.mode == Mode::Hold && batch.eof && !batch.note_exit && !batch.signal;
+            if batch.any() && !hold_eof_waits {
                 break batch;
             }
         };
-        let release = batch.signal || batch.eof;
+        let release =
+            (batch.signal || (batch.eof && !m("s3_hold_release_signal_only"))) && !m("s3_hold_drop_batch_sig");
+        if m("s3_auto_signal_first") && batch.signal {
+            return to(State::S4);
+        }
+        if self.mode == Mode::Auto && batch.signal && m("s3_auto_sig_to_s5") {
+            return to(State::S5);
+        }
+        if self.mode == Mode::Auto && batch.eof && m("s3_eof_as_note") {
+            return to(State::S5);
+        }
+        if self.mode == Mode::Hold && !batch.note_exit && batch.signal && m("s3_hold_sig_to_s3x") {
+            return self.report_then("exited", to(State::S3x { release: false }));
+        }
         match (self.mode, batch.note_exit) {
+            (Mode::Auto, true) if m("s3_auto_note_to_s4") => to(State::S4),
             (Mode::Auto, true) => to(State::S5),
+            (Mode::Hold, true) if m("s3_hold_reap_at_once") => to(State::S5),
             (Mode::Hold, true) => {
                 self.block("S3", Until::Exit)?;
                 match sys::await_zombie(self.pid) {
@@ -543,8 +596,11 @@ impl Machine<'_> {
         if release {
             return to(State::S5);
         }
-        let batch = self.wait(kq, "S3x", None)?;
-        if batch.note_exit {
+        let mut batch = self.wait(kq, "S3x", None)?;
+        while !batch.note_exit && ((batch.eof && m("s3x_ignore_eof")) || (batch.signal && m("s3x_ignore_signal"))) {
+            batch = self.wait(kq, "S3x", None)?;
+        }
+        if batch.note_exit && !m("s3x_note_releases") {
             return self.fail("NOTE_EXIT", "S3x");
         }
         to(State::S5)
@@ -560,6 +616,7 @@ impl Machine<'_> {
             Some(name) => Err(errno_named(name)),
         };
         match stopped {
+            _ if m("s4_ignore_stop_result") => {}
             Ok(()) => {}
             Err(libc::ESRCH) => return self.exiting(),
             Err(e) => return self.fail(e, "S4"),
@@ -575,11 +632,27 @@ impl Machine<'_> {
             };
             match result {
                 Ok(()) => return self.detached(),
+                Err(libc::ESRCH) if m("s4_esrch_fails") => return self.fail(libc::ESRCH, "S4"),
                 Err(libc::ESRCH) => return self.exiting(),
+                Err(libc::EPERM) if m("s4_eperm_esrch") => return self.exiting(),
+                Err(libc::EINVAL) if m("s4_einval_as_ebusy") => {
+                    self.enter("S4b")?;
+                    let _ = self.wait(kq, "S4b", Some(backoff))?;
+                    backoff = next_backoff(backoff);
+                    forced = self.forces.result("S4");
+                }
+                Err(libc::EBUSY) if m("s4_ebusy_fails") => return self.fail(libc::EBUSY, "S4"),
                 Err(libc::EBUSY) => {
                     self.enter("S4b")?;
-                    if self.wait(kq, "S4b", Some(backoff))?.note_exit {
+                    let batch = self.wait(kq, "S4b", Some(backoff))?;
+                    if batch.note_exit && !m("s4b_ignore_note") {
                         return to(State::S5);
+                    }
+                    if batch.signal && m("s4b_sig_fails") {
+                        return self.fail("SIGNAL", "S4b");
+                    }
+                    if batch.eof && m("s4b_eof_fails") {
+                        return self.fail("EOF", "S4b");
                     }
                     backoff = next_backoff(backoff);
                     forced = self.forces.result("S4");
@@ -591,10 +664,18 @@ impl Machine<'_> {
 
     /// After `PT_DETACH`: re-sends the kept stop signal, which XNU would have discarded.
     fn detached(&mut self) -> Step {
-        if let Some(signal) = self.kept.take() {
-            let sent = self.forces.result("S4r").unwrap_or_else(|| sys::kill(self.pid, signal));
+        if let Some(signal) = self.kept.take().filter(|_| !m("resend_none")) {
+            let sent = self.forces.result("S4r").unwrap_or_else(|| {
+                if m("resend_silent") {
+                    Ok(())
+                } else {
+                    sys::kill(self.pid, signal)
+                }
+            });
             if let Err(e) = sent {
-                return self.fail(e, "S4");
+                if !m("resend_err_ignored") {
+                    return self.fail(e, "S4");
+                }
             }
             self.enter("S4r")?;
         }
@@ -609,13 +690,33 @@ impl Machine<'_> {
             .forces
             .stop(&format!("{tag}stop"))
             .unwrap_or_else(|| sys::stop(self.pid));
+        let s4 = tag == "S4";
+        let s2 = tag == "S2";
+        let stop = match stop {
+            Err(_) if (s4 && m("s4_peek_err_as_running")) || (s2 && m("s2_peek_err_ignored")) => Ok(Stop::Running),
+            other => other,
+        };
         Ok(match stop {
             Err(e) => Check::PeekFailed(e),
+            Ok(Stop::Stopped(libc::SIGSTOP)) if s4 && m("detach_noop") => Check::Result(Ok(())),
             Ok(Stop::Stopped(libc::SIGSTOP)) => Check::Result(act(self.pid)),
+            Ok(Stop::Stopped(_)) if (s4 && m("s4_detach_any_stop")) || (s2 && m("s2_no_passthrough")) => {
+                Check::Result(act(self.pid))
+            }
             Ok(Stop::Stopped(signal)) => match self.pass_on(tag, signal)? {
                 Ok(()) => Check::Result(Err(libc::EBUSY)),
+                Err(libc::ESRCH) if s4 && m("s4_cont_esrch_fails") => Check::Result(Err(libc::EINVAL)),
+                Err(_) if (s4 && m("s4_cont_err_ignored")) || (s2 && m("s2_cont_err_ignored")) => {
+                    Check::Result(Err(libc::EBUSY))
+                }
                 Err(e) => Check::Result(Err(e)),
             },
+            Ok(Stop::Running) if (s2 && m("s2_none_acts")) || (s4 && m("s4_none_acts")) => Check::Result(act(self.pid)),
+            Ok(Stop::Settling) if (s2 && m("s2_settling_acts")) || (s4 && m("s4_settling_acts")) => {
+                Check::Result(act(self.pid))
+            }
+            Ok(Stop::Running) if s2 && m("s2_none_fails") => Check::PeekFailed(libc::EINVAL),
+            Ok(Stop::Running) if s4 && m("s4_none_fails") => Check::PeekFailed(libc::EINVAL),
             Ok(Stop::Running | Stop::Settling) => Check::Result(Err(libc::EBUSY)),
         })
     }
@@ -623,25 +724,35 @@ impl Machine<'_> {
     /// Releases the tracee from a stop by `signal`: keeps a stop signal and releases the tracee
     /// without it (`<tag>k`), or delivers any other signal (`<tag>s`).
     fn pass_on(&mut self, tag: &str, signal: i32) -> Result<Result<(), i32>, Gone> {
-        let keep = is_stop_signal(signal);
-        let delivered = if keep { 0 } else { signal };
+        let keep = is_stop_signal(signal) && !m("keep_passthru");
+        let zero = (tag == "S2" && m("s2_passthru_zero")) || (tag == "S3" && m("s3_passthru_zero"));
+        let delivered = if keep || zero { 0 } else { signal };
         let result = self
             .forces
             .result(&format!("{tag}cont"))
             .unwrap_or_else(|| sys::cont(self.pid, delivered));
         if result.is_ok() {
-            if keep {
+            if keep && m("keep_last") {
+                self.kept = Some(signal);
+            } else if keep {
                 self.kept.get_or_insert(signal);
-            } else if signal == libc::SIGCONT {
+            } else if signal == libc::SIGCONT && !m("sigcont_keeps") {
                 self.kept = None;
             }
-            self.enter(&format!("{tag}{}", if keep { "k" } else { "s" }))?;
+            let traced = self.enter(&format!("{tag}{}", if keep { "k" } else { "s" }));
+            if !m("pass_on_trace_ignores_gone") {
+                traced?;
+            }
         }
         Ok(result)
     }
 
     fn exiting(&self) -> Step {
-        to(if self.note_exit_seen { State::S5 } else { State::S6 })
+        to(if self.note_exit_seen && !m("s4_esrch_ignores_seen") {
+            State::S5
+        } else {
+            State::S6
+        })
     }
 
     fn s5(&mut self) -> Step {
@@ -657,7 +768,9 @@ impl Machine<'_> {
             };
             match reaped {
                 Ok(()) => return self.report_then("reaped", EXIT),
+                Err(libc::EINTR) if m("s5_eintr_fails") => return self.fail(libc::EINTR, "S5"),
                 Err(libc::EINTR) => {}
+                Err(_) if m("s5_retry_any") => {}
                 Err(e) => return self.fail(e, "S5"),
             }
         }
@@ -665,8 +778,11 @@ impl Machine<'_> {
 
     fn s6(&mut self, kq: &Kqueue) -> Step {
         self.enter("S6")?;
-        if self.wait(kq, "S6", None)?.note_exit {
+        let batch = self.wait(kq, "S6", None)?;
+        if batch.note_exit || (batch.signal && m("s6_sig_to_s5")) {
             to(State::S5)
+        } else if batch.eof && m("s6_eof_exits") {
+            EXIT
         } else {
             to(State::S6)
         }
@@ -699,6 +815,12 @@ impl Machine<'_> {
             };
             self.note_exit_seen |= batch.note_exit;
             self.eof_seen |= batch.eof;
+            if !sigchld && batch.sigchld && !batch.any() && m("lone_sigchld_as_signal") {
+                batch.signal = true;
+            }
+            if !sigchld && batch.sigchld && !batch.any() && m("lone_sigchld_as_note_exit") {
+                batch.note_exit = true;
+            }
             batch.sigchld &= sigchld;
             if batch.any() || batch.sigchld || timeout.is_some() {
                 return Ok(batch);
@@ -723,7 +845,10 @@ impl Machine<'_> {
             }
         );
         if self.blocked.as_deref() != Some(text.as_str()) {
-            self.report(&text)?;
+            let written = self.report(&text);
+            if !m("block_ignores_gone") {
+                written?;
+            }
             self.blocked = Some(text);
         }
         Ok(())
@@ -731,7 +856,7 @@ impl Machine<'_> {
 
     fn report(&mut self, text: &str) -> Result<(), Gone> {
         self.blocked = None;
-        if !self.forces.take_exact("gone", text) && write_report(&self.marker, text) {
+        if !self.forces.take_exact("gone", text) && (write_report(&self.marker, text) || m("ignore_epipe")) {
             Ok(())
         } else {
             Err(Gone)
@@ -739,7 +864,10 @@ impl Machine<'_> {
     }
 
     fn report_then(&mut self, text: &str, next: Step) -> Step {
-        self.report(text)?;
+        let written = self.report(text);
+        if !m("report_then_ignores_gone") {
+            written?;
+        }
         next
     }
 
