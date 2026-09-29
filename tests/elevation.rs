@@ -13,6 +13,9 @@
 
 use std::path::PathBuf;
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn gated() -> bool {
     std::env::var_os("COSCA_TEST_ELEVATION").is_some()
 }
@@ -141,213 +144,62 @@ fn controlling_terminal_probe_is_false_after_setsid() {
     );
 }
 
-// GATED: run0 client -> transient-unit kill propagation. The client is ALWAYS reaped by
-// wait(), so that proves nothing; instead the elevated PAYLOAD reports its own pid over a
-// loopback socket, and after killing the client we assert THAT (the transient-unit process) is
-// gone. run0 auths via polkit; --no-ask-password (Auth::NonInteractive) suppresses the prompt.
-// `run0` itself does exit (not hang) when auth fails without a polkit rule — but this test's OWN
-// `listener.accept()` used to hang forever in exactly that case, since nothing would ever
-// connect if the payload never started (measured with a fake failing run0: the earlier version
-// of this test needed an external 60s kill). Racing the accept against the client's own exit,
-// below, is what actually makes THIS TEST fail loud rather than hang — an unattended run still
-// needs a passwordless polkit rule for the run0 action to reach the propagation check at all.
-//
-// The payload's own lifetime is tied to THIS TEST PROCESS's socket, never to the client: the
-// client is what gets killed here, on purpose, to observe whether elevation's OWN kill
-// propagation reaches the payload — tying the payload's death to the client's own exit (a
-// stdin-EOF design, as the sibling Unkillable/drop test below uses) would make the payload die
-// from the client's own teardown instead, masking a genuinely broken propagation path. Nextest
-// gives this test its own process, so if propagation really is broken and the bounded wait
-// below fails the test, THIS process's own exit still closes the listener/socket, releasing the
-// payload — the same safety net `sleep-marker`'s own doc describes, not a substitute for the
-// propagation check itself (nothing here closes the socket before that check completes).
+// GATED: run0 client -> transient-unit kill propagation. The payload holds a socket to this
+// test, so its death is EOF on that socket. run0 authenticates via polkit;
+// `--no-ask-password` (Auth::NonInteractive) suppresses the prompt.
 #[cfg(target_os = "linux")]
 #[test]
 fn run0_client_kill_propagates_to_the_transient_unit() {
-    use std::io::BufRead as _;
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
 
     if !gated() || std::env::var_os("COSCA_TEST_ELEVATION_RUN0").is_none() {
         return; // requires run0 + a polkit-passwordless context that can spawn a transient unit.
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("local_addr").to_string();
+    let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::Command::new();
     c.executable(&exe)
         .args([
             exe.clone().into_os_string(),
-            "write-pid-then-block-on-socket".into(),
+            "block-on-socket".into(),
             addr.into(),
+            nonce.clone().into(),
         ])
         .elevation_backend(cosca::elevation::Backend::Run0)
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = std::sync::Arc::new(c.spawn().expect("run0 spawn"));
 
-    // Races the accept against the CLIENT's own exit — no timeout needed, since a run0 failure
-    // before the payload ever starts (a denied polkit prompt, a missing rule, run0 itself
-    // erroring out) is a real, already-existing event: the client process exiting. Without this,
-    // `listener.accept()` alone would hang forever on exactly that failure, since nothing would
-    // ever connect (measured: the reviewer confirmed this with a fake failing run0, killed only
-    // by an external 60s bound). Both arms start racing concurrently, on their own threads, before
-    // either result is awaited — `Child::wait()` takes `&self` (`SharedChild`-backed, safe to call
-    // from a second thread while this one later calls `kill()`/`wait()` on the same `Arc` clone),
-    // so the loser (usually the client-exit watch, since the client keeps running for the rest of
-    // this test) is simply abandoned rather than joined: its result is sent but never read, and it
-    // exits on its own once the client actually does.
-    enum Raced {
-        Connected(std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>),
-        ClientExited(Result<std::process::ExitStatus, cosca::error::Error>),
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Raced::Connected(listener.accept()));
-        }
-    });
-    std::thread::spawn({
-        let tx = tx.clone();
+    let mut payload = common::payload::accept_payload(listener, &nonce, {
         let child = std::sync::Arc::clone(&child);
-        move || {
-            let _ = tx.send(Raced::ClientExited(child.wait()));
-        }
+        move || format!("{:?}", child.wait())
     });
-    let sock = match rx.recv().expect("neither race arm hung up") {
-        Raced::Connected(r) => r.expect("accept payload connection").0,
-        Raced::ClientExited(status) => panic!(
-            "the run0 client exited ({status:?}) before its payload ever connected — \
-             run0 failed before the payload started"
-        ),
-    };
-    let mut reader = std::io::BufReader::new(sock);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read payload pid");
-    let mut fields = line.split_whitespace();
-    let payload_pid: u32 = fields
-        .next()
-        .expect("payload pid field")
-        .parse()
-        .expect("parse payload pid");
-    let payload_starttime: u64 = fields
-        .next()
-        .expect("payload starttime field")
-        .parse()
-        .expect("parse payload starttime");
 
-    // The run0 CLIENT can exit on its own (independent of the `child.kill()` below) between the
-    // payload connecting above and this `pidfd_open` — freeing `payload_pid` for reuse by an
-    // unrelated process in that window. A bare `pidfd_open(payload_pid)` could then silently name
-    // the wrong process. Guard against it two ways: (1) confirm the pidfd is NOT yet readable
-    // right after opening it — if the original payload had already exited and been reaped, a
-    // pidfd opened against its reused pid would still be for a live (different) process, so this
-    // alone doesn't fully prove correctness, which is why (2) matters — comparing the payload's
-    // self-reported `/proc/self/stat` starttime against a FRESH read of `/proc/<pid>/stat` for
-    // this exact pid confirms the pidfd names a process with the SAME start time, i.e. the same
-    // process, not a reuse.
-    let rpid = rustix::process::Pid::from_raw(payload_pid as i32).expect("payload pid is positive");
-    let pidfd =
-        rustix::process::pidfd_open(rpid, rustix::process::PidfdFlags::empty()).expect("pidfd_open the payload");
-
-    {
-        use std::os::fd::AsRawFd as _;
-        let mut pfd = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; a zero timeout makes this a
-        // non-blocking readiness check, not a wait.
-        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-        assert_eq!(
-            rc, 0,
-            "the pidfd is already readable right after pidfd_open — the payload exited before \
-             the client was even killed, so this pidfd may name a reused pid"
-        );
-    }
-    let observed_starttime = starttime_jiffies_of(payload_pid);
-    assert_eq!(
-        observed_starttime, payload_starttime,
-        "the pidfd's pid (pid {payload_pid}) has a different /proc start time than the payload \
-         reported — the pid was reused by another process before pidfd_open ran"
-    );
-
-    assert!(pid_is_alive(payload_pid), "payload should be running before the kill");
     child.kill().expect("kill run0 client");
-    child.wait().expect("wait run0 client");
-
-    // Block on the pidfd becoming readable (the payload exiting) — a real kernel event, not a
-    // busy-spin — bounded at 30s as the FAILURE surface: the bound is on run0's own kill
-    // propagation actually tearing down the transient unit, a genuinely external event this
-    // test does not control, not a substitute for one.
-    use std::os::fd::AsRawFd as _;
-    let mut pfd = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // An absolute deadline, not a duration re-armed at 30s on every retry: an EINTR (e.g. a
-    // signal this test process itself receives) must not extend the total bound past 30s.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let rc = loop {
-        // Round UP, not truncate: `as_millis()` floors any leftover sub-millisecond remainder,
-        // which would let `poll` return early on a deadline it hasn't actually reached yet.
-        let remaining_ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .try_into()
-            .unwrap_or(i32::MAX);
-        // SAFETY: `pfd` is a single, correctly-initialized `pollfd`; `poll` writes only within
-        // its bounds, and the `1` count matches the slice length passed.
-        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
-        if rc >= 0 {
-            break rc;
-        }
-        let err = std::io::Error::last_os_error();
-        assert_eq!(err.raw_os_error(), Some(libc::EINTR), "poll failed: {err}");
-    };
+    let status = child.wait().expect("wait run0 client");
     assert_eq!(
-        rc, 1,
-        "the transient unit's payload (pid {payload_pid}) is still alive 30s after the run0 \
-         client was killed — run0's kill propagation to the transient unit appears broken"
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the client was not killed by our SIGKILL (it had already exited): {status:?}"
     );
-    // No `!pid_is_alive(payload_pid)` check here: `POLLIN` on the pidfd fires at the payload's
-    // exit, before systemd reaps it, so `kill(pid, 0)` would still succeed against the zombie —
-    // and once it IS reaped, the pid can be reused, making a post-hoc `kill(pid, 0)` meaningless
-    // either way. Pidfd readiness is already the proof; a second, racy check on the bare pid adds
-    // nothing but a false-failure risk.
-}
 
-/// `starttime` (field 22 of `/proc/<pid>/stat`, raw jiffies since boot). `comm` (field 2) is
-/// parenthesized and may itself contain spaces or `)`, so split on the LAST `)` to skip it
-/// safely; the remaining fields are whitespace-separated, with field 3 (state) at index 0 —
-/// making field 22 (starttime) index 19.
-#[cfg(target_os = "linux")]
-fn starttime_jiffies_of(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/<pid>/stat");
-    let after_comm = stat.rsplit_once(')').expect("/proc/<pid>/stat has a comm field").1;
-    after_comm
-        .split_whitespace()
-        .nth(19)
-        .expect("/proc/<pid>/stat has a starttime field")
-        .parse()
-        .expect("starttime is a u64")
-}
-
-/// `kill(pid, 0)` performs only the existence/permission check, sending nothing. Success
-/// means the pid is live (or a zombie we could signal). EPERM ALSO means alive: an
-/// unprivileged parent probing a ROOT process gets EPERM from the permission check itself,
-/// not ESRCH — so treating EPERM as "dead" would misreport a live root payload. Only ESRCH
-/// (or any other errno) means the pid is actually gone.
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 performs only the existence/permission check, sends nothing.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    // The bound is on run0's own kill propagation, an external event; EOF is the payload dying.
+    payload
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .expect("set read timeout");
+    let mut sink = [0u8; 1];
+    match payload.sock.read(&mut sink) {
+        Ok(0) => {}
+        Ok(n) => panic!("the payload wrote {n} unexpected bytes"),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => panic!(
+            "the payload (pid {}) is still alive 30s after the run0 client was killed: kill propagation is broken",
+            payload.pid
+        ),
+        Err(e) => panic!("reading the payload socket failed: {e}"),
     }
-    let err = std::io::Error::last_os_error().raw_os_error();
-    err == Some(libc::EPERM) // ESRCH (or anything else) => not alive
 }
 
 // GATED: Auth::Stdin feeds the real password to `sudo -S`; the elevated child is root.
@@ -407,52 +259,33 @@ fn posix_askpass_auth_reaches_root() {
 // GATED (POSIX): dropping a non-contained elevated long-lived child must
 // RETURN (no hang), and kill() on it must return the typed Unkillable error.
 //
-// Synchronized on a REAL event, not a timer: `sudo` is setuid, and its REAL uid stays the
-// invoking user until it setresuid(2)s to root just before exec'ing the target. A kill()
-// delivered in that window targets a process still owned (in the permission-check sense) by
-// the invoking user, so it SUCCEEDS — racing sudo's internal privilege transition. Spawning
-// the `write-pid-then-block-on-stdin` payload and BLOCKING on its piped stdout (written only
-// once the payload is running, i.e. strictly after the exec into a root-owned image) closes
-// that window: the read is on a real pipe event, never a filesystem poll or a sleep.
-//
-// The payload's own lifetime is tied to THIS PROCESS, not a timer or a privileged kill: its
-// stdin is a pipe whose write end this test holds. `sudo`/`doas`'s `closefrom` drops fds > 2 in
-// the elevated child, so an extra marker fd would not survive it, but stdio does (see
-// `write-pid-then-block-on-stdin`'s own doc) — and because the write end lives HERE, the OS
-// closes it the moment this process exits for any reason (a clean return, a panic, or this
-// process itself being killed), delivering EOF to the payload with no privileged kill needed.
-// The un-killable case this test exists to prove (`kill()` returning `Unkillable`, decision A)
-// is exactly the case where cleanup CANNOT be a privileged signal from here — the payload's own
-// exit-on-EOF is the only cleanup this test can perform without privilege, matching that.
+// Waiting for the payload's readiness line closes the window in which `sudo` has not yet
+// setresuid(2)d to root and a kill() would still succeed. Dropping the socket at the end
+// releases the payload without needing a privileged kill.
 #[cfg(unix)]
 #[test]
 fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
-    use std::io::BufRead as _;
-
     if !gated() {
         return;
     }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::Command::new();
     c.executable(&exe)
-        .args([exe.clone().into_os_string(), "write-pid-then-block-on-stdin".into()])
+        .args([
+            exe.clone().into_os_string(),
+            "block-on-socket".into(),
+            addr.into(),
+            nonce.clone().into(),
+        ])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
-    c.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
-    c.stdout(cosca::Stdio::pipe()).expect("set stdout pipe");
-    let mut child = c.spawn().expect("elevated write-pid-then-block-on-stdin");
-    // Held until dropped explicitly below (not for the rest of this process's life): the
-    // payload can only exit via EOF on this pipe, which the OS delivers once this handle — or
-    // the whole process holding it — goes away.
-    let _stdin = child.stdin().expect("piped stdin");
-
-    // Block reading the payload's pid off its piped stdout — a real pipe event, strictly after
-    // sudo's setresuid+exec into the payload (it cannot write before then).
-    let mut line = String::new();
-    std::io::BufReader::new(child.stdout().expect("piped stdout"))
-        .read_line(&mut line)
-        .expect("read payload pid");
-    let payload_pid: u32 = line.trim().parse().expect("parse payload pid");
-    assert!(pid_is_alive(payload_pid), "payload should be running before the kill");
+    let child = std::sync::Arc::new(c.spawn().expect("elevated block-on-socket"));
+    let payload = common::payload::accept_payload(listener, &nonce, {
+        let child = std::sync::Arc::clone(&child);
+        move || format!("{:?}", child.wait())
+    });
 
     // kill() outcome depends on the backend's process topology:
     //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
@@ -473,13 +306,10 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
         }) => {}
         other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
     }
-    // Dropping it must return (kill_on_drop is best-effort, non-blocking) — the test itself
-    // completing is the assertion.
+    // The exit watcher holds the other handle, so `release` is where the last one drops: its
+    // join returning is the "drop does not hang" assertion.
     drop(child);
-    // Only now: releases the payload for real, without needing any privilege — see this
-    // function's own doc for why this is the cleanup this test uses instead of a privileged
-    // kill (which the Unkillable case this test proves cannot always be relied on).
-    drop(_stdin);
+    payload.release();
 }
 
 // GATED: the allowed (already-elevated) spawn path reports elevation() honestly.
@@ -541,51 +371,32 @@ async fn async_posix_elevated_child_runs_as_root() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
 }
 
-/// Accepts one connection on `listener`, bounded at 30s as a FAILURE surface: an elevated
-/// child that never connects (a crashed spawn, a dismissed UAC prompt, or the readiness tag
-/// never arriving) would otherwise hang `TcpListener::accept()` forever. Runs the accept on a
-/// background thread and races it against the bound via a channel — `accept()` itself has no
-/// portable way to cancel, so a genuine hang there leaks that one thread in an already-failing,
-/// soon-to-exit test process rather than hanging the whole CI job.
-#[cfg(windows)]
-fn accept_bounded(listener: std::net::TcpListener) -> std::net::TcpStream {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(listener.accept());
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(30))
-        .expect("accept() did not complete within its failure bound — the elevated child likely never connected")
-        .expect("accept readiness connection")
-        .0
-}
-
 // GATED (Windows): a non-contained runas child a medium parent cannot
 // PROCESS_TERMINATE returns the typed Unkillable, and Drop does not hang.
 #[cfg(windows)]
 #[test]
 fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
-    use std::io::Read;
-
     if !gated() {
         return;
     }
-    // A loopback TCP address, not a pipe or any other inherited handle: an elevated `runas`
-    // child gets its own console and inherits nothing from its caller (`spawn_elevated`'s
-    // `ElevatedStdio::OwnConsole`), but it CAN still dial back out over loopback. This gives a
-    // real readiness edge (the accepted connection + tag, proving the child is genuinely
-    // running before `kill()` is attempted — never a chosen sleep duration) and, at the end, a
-    // real way to end the child regardless of whether `kill()` itself succeeded.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("local_addr").to_string();
+    let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::Command::new();
     c.executable(&exe)
-        .args([exe.clone().into_os_string(), "sleep-marker".into(), addr.into()])
+        .args([
+            exe.clone().into_os_string(),
+            "block-on-socket".into(),
+            addr.into(),
+            nonce.clone().into(),
+        ])
         .elevate();
-    let child = c.spawn().expect("runas spawn");
-    let mut sock = accept_bounded(listener);
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("readiness tag");
+    let child = std::sync::Arc::new(c.spawn().expect("runas spawn"));
+    let payload = common::payload::accept_payload(listener, &nonce, {
+        let child = std::sync::Arc::clone(&child);
+        move || format!("{:?}", child.wait())
+    });
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -594,12 +405,11 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         Ok(()) => {}
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
-    drop(child); // must return promptly (non-blocking teardown)
-
-    // Only now: on the (typical) Unkillable path the child is still running (that IS the
-    // property under test), so ending it for real is this test's own responsibility, not
-    // `kill()`'s — dropping the socket delivers EOF, which the child exits on.
-    drop(sock);
+    // The exit watcher holds the other handle, so `release` is where the last one drops: its
+    // join returning is the "drop does not hang" assertion. Releasing also ends a child that
+    // `kill()` could not.
+    drop(child);
+    payload.release();
 }
 
 // MANUAL-TIER async Windows elevation (4c785f26): mirrors the sync marker test. Runs only
@@ -642,24 +452,43 @@ async fn async_windows_elevated_child_writes_admin_marker() {
 #[cfg(all(windows, feature = "tokio"))]
 #[tokio::test]
 async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
-    use std::io::Read;
-
     if !gated() {
         return;
     }
-    // See the sync twin's doc for why a loopback TCP address, not a pipe, is what crosses the
-    // elevation boundary here.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("local_addr").to_string();
+    let nonce = common::payload::fresh_nonce();
     let exe = testbin();
     let mut c = cosca::tokio::Command::new();
     c.executable(&exe)
-        .args([exe.clone().into_os_string(), "sleep-marker".into(), addr.into()])
+        .args([
+            exe.clone().into_os_string(),
+            "block-on-socket".into(),
+            addr.into(),
+            nonce.clone().into(),
+        ])
         .elevate();
     let mut child = c.spawn().expect("async runas spawn");
-    let mut sock = accept_bounded(listener);
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("readiness tag");
+
+    // `Child::wait` is async and `&mut`, so the race is `select!` here and the helper's exit
+    // arm just parks until this test stops watching.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn({
+        let nonce = nonce.clone();
+        move || {
+            let payload = common::payload::accept_payload(listener, &nonce, move || {
+                let _ = stop_rx.recv();
+                "the test stopped watching".into()
+            });
+            let _ = done_tx.send(payload);
+        }
+    });
+    let payload = tokio::select! {
+        payload = done_rx => payload.expect("accept thread ended without a payload"),
+        status = child.wait() => panic!("the client exited ({status:?}) before its payload reported ready"),
+    };
+    drop(stop_tx);
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -669,10 +498,7 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
     drop(child); // must return promptly (non-blocking async teardown)
-
-    // Only now: see the sync twin's doc for why ending the child is this test's own
-    // responsibility on the (typical) Unkillable path.
-    drop(sock);
+    payload.release();
 }
 
 // GATED behind COSCA_TEST_ELEVATION_GUI: a TRUE no-op without it, and loud when set.

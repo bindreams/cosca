@@ -76,24 +76,6 @@ fn fake_pkexec(args: &[String]) {
     writeln!(f, "{line}").expect("append to the log");
 }
 
-/// This process's own `starttime` (field 22 of `/proc/self/stat`, raw jiffies since boot): a
-/// caller that later re-derives the same field for a pid can use it to confirm a pidfd it holds
-/// still names this exact process, not a different one that has since reused the pid. `comm`
-/// (field 2) is parenthesized and may itself contain spaces or `)`, so split on the LAST `)` to
-/// skip it safely; the remaining fields are whitespace-separated, with field 3 (state) at index
-/// 0 — making field 22 (starttime) index 19.
-#[cfg(target_os = "linux")]
-fn self_starttime_jiffies() -> u64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
-    let after_comm = stat.rsplit_once(')').expect("/proc/self/stat has a comm field").1;
-    after_comm
-        .split_whitespace()
-        .nth(19)
-        .expect("/proc/self/stat has a starttime field")
-        .parse()
-        .expect("starttime is a u64")
-}
-
 /// If root, become the `uid:gid` the test names in `COSCA_TEST_DROP_TO`: one the test checked this
 /// user namespace maps. `setgroups` is skipped where the namespace denies it
 /// (`/proc/self/setgroups` reads `deny`), leaving the supplementary groups root had. Runs
@@ -1525,69 +1507,18 @@ fn main() {
             let path = &args[2];
             std::fs::write(path, b"1").expect("write marker");
         }
-        // Publish our own pid over a loopback socket, then block reading it — never a chosen
-        // sleep duration, and never an unbounded block only a privileged kill can end. Connects
-        // to the address in `args[2]` (the SAME shape as `sleep-marker` below, whose own doc has
-        // the full rationale for why a TCP connection, not a pipe, pidfile or in-process
-        // channel, crosses the elevation boundary AND gives the caller a real, event-driven way
-        // to end the payload regardless of whether the privileged kill this test exists to check
-        // actually propagates). A stdin-EOF-based lifetime (as `write-pid-then-block-on-stdin`
-        // below uses) is deliberately NOT used here: this payload's caller kills the CLIENT
-        // process, not the payload, specifically to observe whether elevated kill propagation
-        // reaches the payload on its own — tying the payload's death to the client's own exit
-        // (which closing its stdin would do) would make the payload die from the caller's own
-        // cleanup instead, masking exactly the propagation failure this test exists to catch.
-        "write-pid-then-block-on-socket" => {
-            let addr = &args[2];
-            let mut sock = std::net::TcpStream::connect(addr).expect("connect readiness socket");
-            // Both the pid AND this process's own `/proc/self/stat` starttime (field 22, raw
-            // jiffies since boot): the caller opens a pidfd for `pid` only after reading this
-            // line, and by then the run0 client may already have exited on its own, freeing
-            // `pid` for reuse before the caller's `pidfd_open` runs. The starttime is what lets
-            // the caller confirm its pidfd really names THIS process, not a different one that
-            // happened to reuse the same pid in that window.
-            #[cfg(target_os = "linux")]
-            let starttime = self_starttime_jiffies();
-            // This mode is only ever invoked by run0 (Linux-only) tests; kept compiling on
-            // every platform anyway since `main`'s mode dispatch is not itself split by target.
-            #[cfg(not(target_os = "linux"))]
-            let starttime: u64 = 0;
-            sock.write_all(format!("{} {}\n", std::process::id(), starttime).as_bytes())
-                .expect("write pid and starttime");
+        // A payload that lives until the caller lets go of its socket. Connects to `args[2]`,
+        // sends `<nonce> <pid>\n` (`args[3]` is the caller's per-run nonce; the pid is for
+        // messages only), then blocks reading; EOF or a write from the caller releases it.
+        // Loopback TCP is the channel because an elevated payload inherits nothing but stdio and
+        // can still dial out: pipes, pidfiles and extra fds do not cross sudo/doas/run0/`runas`.
+        // Its death is observable to the caller as EOF on its end of the socket.
+        "block-on-socket" => {
+            let mut sock = std::net::TcpStream::connect(&args[2]).expect("connect readiness socket");
+            sock.write_all(format!("{} {}\n", args[3], std::process::id()).as_bytes())
+                .expect("write readiness line");
             let mut sink = [0u8; 1];
-            let _ = sock.read(&mut sink); // blocks until the caller writes back or drops its end
-        }
-        // Publish our own pid on stdout, then block reading stdin until it closes — never via a
-        // chosen sleep duration or an unbounded block only a privileged kill can end. The caller
-        // pipes this process's stdin AND stdout: stdin's write end is held for exactly as long
-        // as the payload should stay alive, and stdout is read as a blocking, event-driven
-        // readiness signal instead of polling a pidfile on a timer. `sudo`/`doas`'s `closefrom`
-        // drops fds > 2 in the elevated child, but stdio (0-2) survives it (unlike an extra
-        // marker fd), so this crosses the elevation boundary cleanly. Because the stdin write
-        // end lives in the CALLER's own process, the OS closes it — delivering EOF here — the
-        // moment that process exits, for ANY reason (normal return, panic, or being killed
-        // itself), with no privileged kill required.
-        "write-pid-then-block-on-stdin" => {
-            println!("{}", std::process::id());
-            std::io::stdout().flush().expect("flush stdout");
-            let mut buf = [0u8; 1];
-            let _ = std::io::stdin().read(&mut buf);
-        }
-        // A long-lived elevated child for the Windows Unkillable/drop test. Connects to the
-        // loopback address in `args[2]`, sends a one-byte readiness tag, then blocks on a read
-        // of that same socket and exits on EOF. A TCP address — unlike a pipe or any other
-        // inherited handle — DOES cross the elevation boundary (an elevated `runas` child gets
-        // its own console and inherits no handles from its caller, but it can still dial back
-        // out over loopback), so this gives the caller BOTH a real readiness edge (proving the
-        // child is actually running before `kill()` is attempted) and a real way to end the
-        // child afterward regardless of whether `kill()` itself succeeded (the caller drops its
-        // end of the socket once done) — never a chosen sleep duration either way.
-        "sleep-marker" => {
-            let addr = &args[2];
-            let mut sock = std::net::TcpStream::connect(addr).expect("connect readiness socket");
-            sock.write_all(b"R").expect("write readiness tag");
-            let mut sink = [0u8; 1];
-            let _ = sock.read(&mut sink); // blocks until the caller writes back or drops its end
+            let _ = sock.read(&mut sink);
         }
         other => {
             eprintln!("cosca_testbin: unknown mode {other:?}");
