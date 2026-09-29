@@ -165,6 +165,31 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
     }
 }
 
+/// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TEST_GC_PID_ADDR`,
+/// report its pid there as one `<pid>\n` line on a throwaway connection. The harness watches that
+/// pid alongside this root's, so a grandchild that dies before it connects fails the harness
+/// instead of leaving it waiting on a live root forever. Unset, nothing is reported and other
+/// consumers of the `spawn-grandchild*` modes see no extra connection.
+///
+/// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
+/// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
+/// unreaped zombie (its pid stable) because nothing here ever waits on it.
+#[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
+fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
+    let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
+    if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
+        let mut sock = std::net::TcpStream::connect(addr.to_str().unwrap()).unwrap();
+        writeln!(sock, "{}", gc.id()).unwrap();
+        sock.flush().unwrap();
+    }
+    KeptGrandchild(gc)
+}
+
+/// Holds a grandchild's `Child` for the rest of the arm (see [`spawn_reported_grandchild`]); never
+/// waited on, on purpose.
+#[allow(dead_code)]
+struct KeptGrandchild(std::process::Child);
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "linux")]
@@ -381,17 +406,33 @@ fn main() {
             // then hold ours (tag "R"). Both die together iff containment works.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills it
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
             // Become a control-block ourselves (no test-owned stdin → no EOF confound).
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
+        }
+        "spawn-grandchild-dies" => {
+            // spawn-grandchild whose grandchild dies at once (an unknown mode exits immediately)
+            // while this root lives and connects: the harness must fail, not wait for a "G" that
+            // will never come.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["--not-a-real-mode"]);
+            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            sock.write_all(b"R").unwrap();
+            sock.flush().unwrap();
+            let mut buf = [0u8; 1];
+            let _ = sock.read(&mut buf);
+        }
+        "spawn-grandchild-echo-dies" => {
+            // spawn-grandchild-echo with a grandchild that dies at once, as in spawn-grandchild-dies.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["--not-a-real-mode"]);
+            run_control_echo_pid(&addr, "R");
         }
         "spawn-grandchild-echo" => {
             // Like spawn-grandchild, but both levels round-trip a byte (`control-echo-pid`)
@@ -402,12 +443,7 @@ fn main() {
             // needs the real round trip this mode gives both members.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)]
-            // intentional: grandchild must outlive us; containment (or not) decides its fate
-            let _gc = std::process::Command::new(exe)
-                .args(["control-echo-pid", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-echo-pid", &addr, "G"]);
             run_control_echo_pid(&addr, "R");
         }
         #[cfg(unix)]
@@ -511,11 +547,7 @@ fn main() {
                 let _ = libc::setsid();
             }
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; TreeWalk kills it
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
@@ -565,11 +597,7 @@ fn main() {
             }
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block-ignore-term", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
@@ -616,11 +644,7 @@ fn main() {
             // survivor only the post-grace hard sweep can reach.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block-ignore-term", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
@@ -646,11 +670,7 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block-ignore-break", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-break", &addr, "G"]);
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
@@ -715,11 +735,7 @@ fn main() {
             install_ignore_break();
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: see spawn-grandchild
-            let _gc = std::process::Command::new(exe)
-                .args(["control-block-ack-break", &addr, "G"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block-ack-break", &addr, "G"]);
             let mut sock = std::net::TcpStream::connect(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
