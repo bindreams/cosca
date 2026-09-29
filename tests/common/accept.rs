@@ -149,6 +149,24 @@ pub fn accept_or_die_also(listener: &TcpListener, target: &mut impl Target, also
     }
 }
 
+/// Blocks until `pid` exits, with the same contract on `pid` as [`accept_or_die_also`]'s target:
+/// an unreaped child the caller does not `wait` on concurrently.
+///
+/// The backends wait on a source and a pid, so the source here is one end of a loopback pair
+/// whose other end lives in this frame: nothing can ever make it readable, and unlike a
+/// listener no stranger can connect to it.
+pub(crate) fn wait_for_exit(pid: u32) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the exit watch's private pair");
+    let held = TcpStream::connect(listener.local_addr().expect("local_addr of the private pair"))
+        .expect("connect the exit watch's private pair");
+    let (silent, _) = listener.accept().expect("accept the exit watch's private pair");
+    match platform::wait(Source::Stream(&silent), pid, None) {
+        WatchEvent::Died(dead) => debug_assert_eq!(dead, pid, "the exit watch watches one pid"),
+        WatchEvent::Ready => unreachable!("nothing writes to or closes the exit watch's private pair"),
+    }
+    drop(held);
+}
+
 /// Waits until `stream` has bytes (or EOF) to read, or `target_pid` exits first.
 pub(crate) fn wait_readable(stream: &TcpStream, target_pid: u32) -> WatchEvent {
     platform::wait(Source::Stream(stream), target_pid, None)

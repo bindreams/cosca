@@ -172,10 +172,14 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = std::sync::Arc::new(c.spawn().expect("run0 spawn"));
 
-    let mut payload = common::payload::accept_payload(listener, &nonce, {
-        let child = std::sync::Arc::clone(&child);
-        move || format!("{:?}", child.wait())
-    });
+    let mut payload = common::payload::accept_payload(
+        listener,
+        &nonce,
+        common::payload::ExitWatch::custom({
+            let child = std::sync::Arc::clone(&child);
+            move || format!("{:?}", child.wait())
+        }),
+    );
 
     child.kill().expect("kill run0 client");
     let status = child.wait().expect("wait run0 client");
@@ -281,11 +285,11 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
             nonce.clone().into(),
         ])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
-    let child = std::sync::Arc::new(c.spawn().expect("elevated block-on-socket"));
-    let payload = common::payload::accept_payload(listener, &nonce, {
-        let child = std::sync::Arc::clone(&child);
-        move || format!("{:?}", child.wait())
-    });
+    let child = c.spawn().expect("elevated block-on-socket");
+    // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
+    // is the `Drop` under test and not a reference count going down.
+    let payload =
+        common::payload::accept_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
 
     // kill() outcome depends on the backend's process topology:
     //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
@@ -306,8 +310,8 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
         }) => {}
         other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
     }
-    // The exit watcher holds the other handle, so `release` is where the last one drops: its
-    // join returning is the "drop does not hang" assertion.
+    // The payload is alive and `kill()` could not reap it, so a `Drop` that waited for the child
+    // would block here until the test ended.
     drop(child);
     payload.release();
 }
@@ -392,11 +396,10 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
             nonce.clone().into(),
         ])
         .elevate();
-    let child = std::sync::Arc::new(c.spawn().expect("runas spawn"));
-    let payload = common::payload::accept_payload(listener, &nonce, {
-        let child = std::sync::Arc::clone(&child);
-        move || format!("{:?}", child.wait())
-    });
+    let child = c.spawn().expect("runas spawn");
+    // A medium-integrity parent cannot open the UAC-elevated child by pid, and `Child` exposes no
+    // handle to wait on, so its early exit cannot be watched; the `drop` below is the only owner.
+    let payload = common::payload::accept_payload(listener, &nonce, common::payload::ExitWatch::Unobservable);
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -405,9 +408,8 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
         Ok(()) => {}
         other => panic!("expected Unkillable or Ok, got {other:?}"),
     }
-    // The exit watcher holds the other handle, so `release` is where the last one drops: its
-    // join returning is the "drop does not hang" assertion. Releasing also ends a child that
-    // `kill()` could not.
+    // The payload is alive and `kill()` could not end it, so a `Drop` that waited for the child
+    // would block here. Releasing afterwards ends a child that `kill()` could not.
     drop(child);
     payload.release();
 }
@@ -477,10 +479,14 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     std::thread::spawn({
         let nonce = nonce.clone();
         move || {
-            let payload = common::payload::accept_payload(listener, &nonce, move || {
-                let _ = stop_rx.recv();
-                "the test stopped watching".into()
-            });
+            let payload = common::payload::accept_payload(
+                listener,
+                &nonce,
+                common::payload::ExitWatch::custom(move || {
+                    let _ = stop_rx.recv();
+                    "the test stopped watching".into()
+                }),
+            );
             let _ = done_tx.send(payload);
         }
     });
