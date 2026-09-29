@@ -100,11 +100,14 @@ pub(crate) fn capture() -> Relay {
 impl Relay {
     /// Install the captured probes on this thread until the guard drops.
     pub(crate) fn reinstall(self) -> RelayGuard {
-        let ids = self.0.iter().map(|(id, _)| *id).collect();
+        // Bound before the loop: a panicking `insert` unwinds through this guard, which then
+        // removes the entries already inserted.
+        let mut guard = RelayGuard(Vec::with_capacity(self.0.len()), PhantomData);
         for (id, entry) in self.0 {
             insert(id, entry);
+            guard.0.push(id);
         }
-        RelayGuard(ids, PhantomData)
+        guard
     }
 }
 

@@ -363,11 +363,9 @@ pub(crate) mod armed_probe {
 
     pub(crate) type Guard = relayed_probe::Guard<Armed>;
 
-    // Consumers are the tokio TreeWalk fast-path test
-    // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`) and
-    // `grace_wait_resolves_immediately_on_an_identity_mismatch`, both `tokio`-only, so this is
-    // dead code in a `--no-default-features` (no `tokio`) build — same shape as
-    // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
+    // Every consumer is a `tokio`-only test, so this is dead code in a `--no-default-features`
+    // (no `tokio`) build — same shape as `block_until_exit_or_cancel`'s own `allow(dead_code)`
+    // just above.
     #[cfg_attr(
         not(feature = "tokio"),
         allow(

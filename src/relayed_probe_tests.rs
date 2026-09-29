@@ -105,3 +105,29 @@ fn capturing_leaves_the_arming_threads_probe_installed() {
     notify::<A>(3);
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), [3]);
 }
+
+/// A reinstall that panics part-way must not strand the entries it already inserted.
+///
+/// Mutant: build the `RelayGuard` after the insert loop -> `A` stays installed after the panic.
+#[cfg(debug_assertions)]
+#[test]
+fn a_reinstall_that_panics_midway_uninstalls_what_it_inserted() {
+    let (a_tx, _a_rx) = channel::<u8>();
+    let (b_tx, _b_rx) = channel::<&'static str>();
+    let relay = Relay(vec![
+        (TypeId::of::<A>(), Box::new(a_tx) as Box<dyn Entry>),
+        (TypeId::of::<B>(), Box::new(b_tx.clone()) as Box<dyn Entry>),
+    ]);
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            // Occupy `B`'s slot, so the second insert trips the nesting assert.
+            std::mem::forget(install::<B>(b_tx));
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relay.reinstall()));
+            assert!(unwound.is_err(), "the nested install must panic");
+            assert!(
+                !is_installed::<A>(),
+                "the entry inserted before the panic must be uninstalled"
+            );
+        });
+    });
+}

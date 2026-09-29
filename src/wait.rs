@@ -449,10 +449,6 @@ pub(crate) mod read_probe {
     }
 
     /// This thread's installed log, cloned so the installation survives.
-    #[cfg_attr(
-        not(all(windows, feature = "tokio")),
-        allow(dead_code, reason = "Windows tokio tests are the only non-portable-test consumers")
-    )]
     pub(crate) fn current() -> Option<Sender<Event>> {
         relayed_probe::current::<Log>()
     }
