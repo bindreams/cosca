@@ -159,7 +159,7 @@ impl RawChild {
                 let _ = self.reap();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                if self.runas && !self.can_terminate() {
+                if self.runas {
                     log::warn!(
                         "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
                         self.pid
