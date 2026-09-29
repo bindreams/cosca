@@ -3,7 +3,8 @@
 
 use std::time::Duration;
 
-use super::fixtures::Blocker;
+use super::fixtures::{identity_of, spawn_std_blocker, Blocker};
+use crate::child::shared::SharedChild;
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap};
 
 /// S11m: a signalled handle always has an exit code to read, so a reap that finds nothing after
@@ -55,4 +56,27 @@ fn a_deadline_wait_for_single_object_arms_the_remaining_time() {
         );
     }
     assert!(crate::wait::now() >= at + limit);
+}
+
+/// A `WAIT_TIMEOUT` hours before the deadline is not trusted: the wait re-arms against the real
+/// deadline and reports the exit that comes later. The first arm is 1 ms (a forced sub-millisecond
+/// remainder) on a child held on its stdin, so it times out; the child is ended as the second arm
+/// is recorded, before its wait starts.
+///
+/// Mutant: the holder's wait trusts the first `WAIT_TIMEOUT` (one `WaitForSingleObject` in place
+/// of `wait_until`): `Ok(None)` after 1 ms.
+#[test]
+fn a_wait_timeout_before_the_deadline_is_not_trusted() {
+    let (child, stdin) = spawn_std_blocker();
+    let id = identity_of(&child);
+    let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+    let got = shared.wait_deadline(deadline);
+    let arms = crate::wait::wait_ms_probe::take();
+    let status = got.expect("a genuinely-exited child is not an error");
+    assert!(status.is_some(), "an early WAIT_TIMEOUT was trusted: {arms:?}");
+    assert!(arms.len() >= 2, "expected a re-arm, got {arms:?}");
 }
