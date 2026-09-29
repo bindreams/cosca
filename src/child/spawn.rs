@@ -955,6 +955,8 @@ fn teardown_unadopted(mut child: std::process::Child) {
         );
         return;
     }
+    #[cfg(all(test, unix))]
+    fault::run_between_kill_and_wait();
     if let Err(reap) = reap_unadopted(&mut child) {
         log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
         debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
@@ -1013,11 +1015,15 @@ fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
 /// test that asks for it leaks nothing.
 fn reap_unadopted(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(test)]
-    if let Some(marker) = fault::take_force_reap_failure() {
-        child.wait()?;
+    let forced = fault::take_force_reap_failure();
+    let status = child.wait()?;
+    #[cfg(all(test, unix))]
+    fault::record_teardown_reap(child.id(), std::os::unix::process::ExitStatusExt::signal(&status));
+    #[cfg(test)]
+    if let Some(marker) = forced {
         return Err(std::io::Error::other(marker));
     }
-    child.wait()
+    Ok(status)
 }
 
 /// Test-only fault injection + assertions for the spawn error-teardown paths, shared by both spawns.
@@ -1034,6 +1040,10 @@ pub(crate) mod fault {
         static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
         static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
+        #[cfg(unix)]
+        static BETWEEN_KILL_AND_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+        #[cfg(unix)]
+        static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
             const { std::cell::RefCell::new(None) };
@@ -1165,6 +1175,81 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_captured() -> Option<crate::identity::Resolved<ProcessId>> {
         CAPTURED.with(|c| c.take())
+    }
+
+    /// Run `hook` in the NEXT `teardown_unadopted` on this thread, once `kill_unadopted` has
+    /// already returned `Ok` and before `reap_unadopted`'s blocking `wait()`. A fixture that
+    /// would otherwise have nothing to end it if that kill were a no-op (the blocking wait would
+    /// then hang) is released here instead, so a no-kill mutant fails an assertion on how the
+    /// child died (see [`record_teardown_reaps`]) rather than hanging. Unix only: the assertion
+    /// reads `ExitStatusExt::signal`, which has no Windows analogue.
+    ///
+    /// The returned guard clears the slot on drop, so a hook whose fire point was never reached
+    /// cannot leak into a later test on this thread. Arming over a live hook is a test bug.
+    #[cfg(unix)]
+    pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
+        let previous = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().replace(Box::new(hook)));
+        debug_assert!(previous.is_none(), "a between-kill-and-wait hook is already armed");
+        ArmedBetweenKillAndWait
+    }
+    #[cfg(unix)]
+    pub(crate) fn run_between_kill_and_wait() {
+        let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    /// Clears the [`set_between_kill_and_wait`] slot on drop.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) struct ArmedBetweenKillAndWait;
+    #[cfg(unix)]
+    impl Drop for ArmedBetweenKillAndWait {
+        fn drop(&mut self) {
+            let hook = BETWEEN_KILL_AND_WAIT.with(|h| h.borrow_mut().take());
+            drop(hook);
+        }
+    }
+
+    /// A reaped teardown child's pid and terminating signal.
+    #[cfg(unix)]
+    type TeardownReap = (u32, Option<i32>);
+
+    /// Record the pid and signal of every child `reap_unadopted` waits on for real on this
+    /// thread until the returned guard drops, mirroring
+    /// `containment::cgroup::fault::record_reaped_orphan`'s pattern for the background-reap path.
+    /// Unix only, for the same reason as [`set_between_kill_and_wait`].
+    #[cfg(unix)]
+    pub(crate) fn record_teardown_reaps() -> TeardownReaps {
+        let previous = TEARDOWN_REAPS.with(|r| r.borrow_mut().replace(Vec::new()));
+        debug_assert!(previous.is_none(), "teardown reaps are already being recorded");
+        TeardownReaps
+    }
+    #[cfg(unix)]
+    pub(crate) fn record_teardown_reap(pid: u32, signal: Option<i32>) {
+        TEARDOWN_REAPS.with(|r| {
+            if let Some(reaps) = r.borrow_mut().as_mut() {
+                reaps.push((pid, signal));
+            }
+        });
+    }
+    /// Stops the [`record_teardown_reaps`] recording on drop.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) struct TeardownReaps;
+    #[cfg(unix)]
+    impl TeardownReaps {
+        /// The `(pid, signal)` of each reap recorded so far, oldest first.
+        pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
+            TEARDOWN_REAPS.with(|r| r.borrow().clone().unwrap_or_default())
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for TeardownReaps {
+        fn drop(&mut self) {
+            let reaps = TEARDOWN_REAPS.with(|r| r.borrow_mut().take());
+            drop(reaps);
+        }
     }
 
     /// Assert the spawned child was fully torn down — reuse-immune, via the child's stable identity
