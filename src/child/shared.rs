@@ -240,7 +240,13 @@ impl SharedChild {
 
     /// Hard-kill the child. Already-exited (or already reaped by us) is success.
     pub(crate) fn kill(&self) -> io::Result<()> {
-        #[cfg_attr(target_os = "linux", allow(unused_mut))]
+        #[cfg_attr(
+            target_os = "linux",
+            allow(
+                unused_mut,
+                reason = "only the non-Linux branch calls `lock.child.kill()`, which needs `&mut`"
+            )
+        )]
         let mut lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return Ok(());
