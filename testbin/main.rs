@@ -194,7 +194,19 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
-    let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
+    spawn_reported_grandchild_with(exe, args, |_| {})
+}
+
+#[allow(clippy::zombie_processes)]
+fn spawn_reported_grandchild_with(
+    exe: &std::path::Path,
+    args: &[&str],
+    configure: impl FnOnce(&mut std::process::Command),
+) -> KeptGrandchild {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    configure(&mut cmd);
+    let gc = cmd.spawn().unwrap();
     if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
         // `connect_control` waits for the first ack: the harness has accepted this connection.
         let mut sock = crate::ack::connect_control(addr.to_str().unwrap()).unwrap();
@@ -498,7 +510,11 @@ fn main() {
             // address: the report accept succeeds and the main accepts must fail on the root.
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
+            let _gc = spawn_reported_grandchild_with(&exe, &["control-block", &addr, "G"], |c| {
+                c.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            });
         }
         "spawn-grandchild-report-eof" => {
             // Connects to the pid report address, then exits without reporting anything.
