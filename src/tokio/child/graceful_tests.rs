@@ -279,6 +279,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
             ));
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
         crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+        cmd.env(crate::test_child::ack::ACK_ENV, "1");
     }
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
@@ -300,7 +301,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     #[cfg(windows)]
     let _sock = {
         use std::io::Read;
-        let (mut sock, _) = listener.accept().expect("accept rendezvous connection");
+        let mut sock = crate::test_child::accept_or_die(&listener, child.id());
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("registration tag");
         sock
@@ -449,10 +450,13 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
 #[tokio::test]
 async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     use std::io::Read;
-    use std::net::TcpListener;
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
-    let addr = listener.local_addr().expect("local_addr").to_string();
+    use tokio::io::AsyncWriteExt as _;
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = std_listener.local_addr().expect("local_addr").to_string();
+    std_listener.set_nonblocking(true).expect("nonblocking listener");
+    let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
 
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
@@ -461,9 +465,22 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
         ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(crate::test_child::ack::ACK_ENV, "1");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
-    let (mut sock, _) = listener.accept().expect("accept readiness connection");
+    // The fixture exits at once and its group-signal-immune descendant is the one that connects,
+    // so the fixture's own pid cannot be watched: the job draining is the death of every possible
+    // connector. The connector waits for the ack, so a drain with nothing accepted is a failure.
+    let mut sock = tokio::select! {
+        biased;
+        accepted = listener.accept() => accepted.expect("accept the readiness connection").0,
+        _ = child.wait_tree() => panic!("the tree drained before anything connected"),
+    };
+    sock.write_all(&[crate::test_child::ack::ACK_BYTE])
+        .await
+        .expect("ack the readiness connection");
+    let mut sock = sock.into_std().expect("into std");
+    sock.set_nonblocking(false).expect("blocking stream");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("readiness tag");
     term_fault::set_force_kill_tree_error(true);

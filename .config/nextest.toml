@@ -7,7 +7,7 @@ nextest-version = { required = "0.9.146" }
 # `*_unkillable_and_drop_does_not_hang` (a `Drop` that waited on a live child blocks) cover the
 # same shape of regression. The helper's own tests fail on a broken helper without waiting; this
 # bound only stops a regression they did not anticipate from stalling the job.
-filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
+filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|accept_tree_panics|accept_or_signalled_panics|unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [profile.ci]

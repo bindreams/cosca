@@ -15,10 +15,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::windows::io::{BorrowedHandle, RawHandle};
 
+#[path = "common/mod.rs"]
+mod common;
+
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateProcessW, ResumeThread, TerminateProcess, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// One tree member's control channel: its pid, the socket that proves it alive or dead, and
@@ -105,6 +109,16 @@ impl Suspended {
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
+        // Our environment plus the accept-handshake opt-in, as a UTF-16 block.
+        let mut env: Vec<u16> = Vec::new();
+        for (key, value) in std::env::vars_os().chain([(common::ACK_ENV.into(), "1".into())]) {
+            use std::os::windows::ffi::OsStrExt;
+            env.extend(key.encode_wide());
+            env.push(u16::from(b'='));
+            env.extend(value.encode_wide());
+            env.push(0);
+        }
+        env.push(0);
         // Serialized against the crate's own inheritable-handle window, exactly like
         // `tests/windows_console_identity.rs`'s `probe_raw` — a raw spawn that bypasses
         // `cosca::Command` entirely still needs to be ordered against it.
@@ -119,8 +133,8 @@ impl Suspended {
                     None,
                     None,
                     false,
-                    CREATE_SUSPENDED,
-                    None,
+                    CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                    Some(env.as_ptr().cast()),
                     None,
                     &si,
                     &mut pi,
@@ -156,6 +170,17 @@ impl Suspended {
     }
 }
 
+impl common::Target for Suspended {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn has_exited(&mut self) -> bool {
+        // SAFETY: `self.process` is a live handle owned by `self`, which keeps the pid stable.
+        unsafe { WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 }
+    }
+}
+
 impl Drop for Suspended {
     fn drop(&mut self) {
         // Best-effort cleanup: whether the tree is contained, disarmed, or already dead by the
@@ -187,7 +212,7 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     let mut root_member = None;
     let mut grand_member = None;
     for _ in 0..2 {
-        let (s, _) = listener.accept().expect("accept");
+        let s = common::accept_or_die(&listener, &mut root);
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
