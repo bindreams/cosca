@@ -73,12 +73,17 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
-/// The kernel's current state letter for `pid`, or `None` when `/proc/<pid>/stat` cannot be
-/// read or parsed. A not-yet-reaped child reads as `Z`, which is what separates "the
+/// The kernel's current state letter for `pid`, or `None` when `{pid}/stat` cannot be read or
+/// parsed, or when `/proc` is not shown to be this process's own pid namespace's (its `{pid}`
+/// may be another process). A not-yet-reaped child reads as `Z`, which is what separates "the
 /// placement write failed" from "the child exited before membership was checked".
 #[cfg(target_os = "linux")]
 fn proc_state(pid: u32) -> Option<char> {
-    parse_proc_stat_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    let crate::identity::ProcView::Same(proc_dir) = crate::identity::proc_view() else {
+        log::debug!("cgroup leaf: the /proc view is not this process's own, so pid {pid}'s state is unknown");
+        return None;
+    };
+    parse_proc_stat_state(&proc_dir.read_to_string(&format!("{pid}/stat")).ok()?)
 }
 
 /// What [`CgroupLeaf::drain_step`] found.
@@ -1519,3 +1524,7 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(test)]
 #[path = "leaf_tests.rs"]
 mod leaf_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_state_tests.rs"]
+mod leaf_state_tests;
