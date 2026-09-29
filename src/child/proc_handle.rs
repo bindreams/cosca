@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use shared_child::SharedChild;
+use super::shared::SharedChild;
 
 #[cfg(windows)]
 use super::spawn::windows_raw::RawChild;
@@ -16,7 +16,7 @@ use super::spawn::windows_raw::RawChild;
 /// The process backend behind an owned [`Child`](super::Child).
 #[derive(Debug)]
 pub(crate) enum ProcHandle {
-    /// std-spawned child, adopted into `shared_child` for concurrent wait/kill. The flag is
+    /// std-spawned child, adopted into a [`SharedChild`] for concurrent wait/kill. The flag is
     /// [`ProcHandle::has_reaped`]'s.
     Std(SharedChild, AtomicBool),
     /// Raw `CreateProcessW` child owning the process handle directly.
@@ -72,17 +72,8 @@ impl ProcHandle {
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         match self {
-            // The Raw arm rechecks inside `wait_until`, which advances the frozen clock itself.
-            ProcHandle::Std(s, reaped) => Self::note(
-                reaped,
-                crate::wait::rearm_until(Some(Some(deadline)), |remaining| {
-                    let armed = remaining
-                        .and_then(|r| Instant::now().checked_add(r))
-                        .unwrap_or(deadline);
-                    std_wait_deadline(s, armed)
-                }),
-                Option::is_some,
-            ),
+            // `SharedChild` decides expiry itself, from `crate::wait::now()`, never early.
+            ProcHandle::Std(s, reaped) => Self::note(reaped, s.wait_deadline(deadline), Option::is_some),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait_deadline(deadline),
         }
@@ -163,21 +154,6 @@ fn std_teardown_action(kill_result: &io::Result<()>) -> StdTeardown {
         Ok(()) => StdTeardown::ReapBlocking,
         Err(_) => StdTeardown::ReapNonBlocking,
     }
-}
-
-/// One `shared_child` `wait_deadline` call, which can report `None` before `armed` on Windows
-/// (see `crate::wait::win32_timeout_ms`); the test seam scripts that.
-fn std_wait_deadline(s: &SharedChild, armed: Instant) -> io::Result<Option<ExitStatus>> {
-    #[cfg(test)]
-    match crate::wait::std_wait_seam::next(armed) {
-        Some(crate::wait::std_wait_seam::Step::EarlyNone) => return Ok(None),
-        Some(crate::wait::std_wait_seam::Step::Fail) => return Err(io::Error::other("scripted backend failure")),
-        Some(crate::wait::std_wait_seam::Step::Bounded(d)) => {
-            return s.wait_deadline(armed.min(Instant::now() + d));
-        }
-        None => {}
-    }
-    s.wait_deadline(armed)
 }
 
 #[cfg(test)]
