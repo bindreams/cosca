@@ -9,7 +9,7 @@ thread_local! {
     static AFTER_FINAL_READ: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static BEFORE_EXIT_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
@@ -412,21 +412,13 @@ pub(crate) fn run_between_check_and_kill() {
 /// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
 /// at once instead of waiting out the child.
 pub(crate) fn set_before_exit_wait(hook: impl FnOnce() + 'static) -> BeforeExitWaitGuard {
-    BEFORE_EXIT_WAIT.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    BeforeExitWaitGuard
+    crate::oneshot_hook::arm(&BEFORE_EXIT_WAIT, hook)
 }
-/// Clears the [`set_before_exit_wait`] hook on drop, whether or not it ran.
-#[must_use]
-pub(crate) struct BeforeExitWaitGuard;
-impl Drop for BeforeExitWaitGuard {
-    fn drop(&mut self) {
-        BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take());
-    }
-}
+pub(crate) type BeforeExitWaitGuard = crate::oneshot_hook::Armed;
+/// Fire the [`set_before_exit_wait`] hook now, if it has not fired. A test calls this after the
+/// code under test returns, so a return before the fire point still releases its fixture.
 pub(crate) fn run_before_exit_wait() {
-    if let Some(hook) = BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
+    crate::oneshot_hook::fire(&BEFORE_EXIT_WAIT);
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if

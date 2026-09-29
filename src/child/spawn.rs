@@ -955,6 +955,8 @@ fn teardown_unadopted(mut child: std::process::Child) {
         );
         return;
     }
+    #[cfg(test)]
+    fault::run_between_kill_and_wait();
     if let Err(reap) = reap_unadopted(&mut child) {
         log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
         debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
@@ -992,6 +994,9 @@ fn reap_in_background(mut child: std::process::Child) {
 /// NOT waited on is left to `kill(2)`, whose answer for a zombie std does not promise — so an
 /// `Err` here is checked the same way Windows' is, and dropped if the child has exited.
 ///
+/// A test can also make `kill` fail for a child that has really exited (see
+/// `fault::set_force_kill_error_after_exit`).
+///
 /// The forced failure KILLS AND REAPS first, so the test that asks for it leaks nothing although
 /// the teardown then skips its own reap — unless it was set to leave the child alive.
 fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
@@ -1003,7 +1008,17 @@ fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
         }
         return Err(std::io::Error::new(kind, marker));
     }
-    match child.kill() {
+    #[cfg(test)]
+    let killed = match fault::take_force_kill_error_after_exit() {
+        Some((marker, kind)) => {
+            child.wait()?;
+            Err(std::io::Error::new(kind, marker))
+        }
+        None => child.kill(),
+    };
+    #[cfg(not(test))]
+    let killed = child.kill();
+    match killed {
         Err(_) if matches!(child.try_wait(), Ok(Some(_))) => Ok(()),
         other => other,
     }
@@ -1013,11 +1028,15 @@ fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
 /// test that asks for it leaks nothing.
 fn reap_unadopted(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(test)]
-    if let Some(marker) = fault::take_force_reap_failure() {
-        child.wait()?;
+    let forced = fault::take_force_reap_failure();
+    let status = child.wait()?;
+    #[cfg(test)]
+    fault::record_teardown_reap(child.id(), status);
+    #[cfg(test)]
+    if let Some(marker) = forced {
         return Err(std::io::Error::other(marker));
     }
-    child.wait()
+    Ok(status)
 }
 
 /// Test-only fault injection + assertions for the spawn error-teardown paths, shared by both spawns.
@@ -1032,8 +1051,11 @@ pub(crate) mod fault {
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
         static FORCE_REAP_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
+        static FORCE_KILL_ERROR_AFTER_EXIT: Cell<Option<(&'static str, std::io::ErrorKind)>> = const { Cell::new(None) };
         static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
+        static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
             const { std::cell::RefCell::new(None) };
@@ -1150,6 +1172,14 @@ pub(crate) mod fault {
     pub(crate) fn set_force_kill_failure_leaving_child_alive_as(marker: &'static str, kind: std::io::ErrorKind) {
         FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, true))));
     }
+    /// Make the next teardown kill on this thread wait for its child to exit on its own, then fail
+    /// with an error of `kind` carrying `marker`: an `Err` from `kill` for a child that is gone.
+    pub(crate) fn set_force_kill_error_after_exit(marker: &'static str, kind: std::io::ErrorKind) {
+        FORCE_KILL_ERROR_AFTER_EXIT.with(|f| f.set(Some((marker, kind))));
+    }
+    pub(crate) fn take_force_kill_error_after_exit() -> Option<(&'static str, std::io::ErrorKind)> {
+        FORCE_KILL_ERROR_AFTER_EXIT.with(|f| f.take())
+    }
     /// Have the next background reap started on this thread report its outcome on `notify`.
     pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<std::io::Result<()>>) {
         BACKGROUND_REAP_NOTIFY.with(|f| f.set(Some(notify)));
@@ -1165,6 +1195,52 @@ pub(crate) mod fault {
     }
     pub(crate) fn take_captured() -> Option<crate::identity::Resolved<ProcessId>> {
         CAPTURED.with(|c| c.take())
+    }
+
+    /// Run `hook` in the NEXT `teardown_unadopted` on this thread, once `kill_unadopted` has
+    /// already returned `Ok` and before `reap_unadopted`'s blocking `wait()`. A fixture that
+    /// would otherwise have nothing to end it if that kill were a no-op (the blocking wait would
+    /// then hang) is released here instead, so a no-kill mutant fails an assertion on how the
+    /// child died (see [`record_teardown_reaps`]) rather than hanging.
+    pub(crate) fn set_between_kill_and_wait(hook: impl FnOnce() + 'static) -> ArmedBetweenKillAndWait {
+        crate::oneshot_hook::arm(&BETWEEN_KILL_AND_WAIT, hook)
+    }
+    pub(crate) fn run_between_kill_and_wait() {
+        crate::oneshot_hook::fire(&BETWEEN_KILL_AND_WAIT);
+    }
+    pub(crate) type ArmedBetweenKillAndWait = crate::oneshot_hook::Armed;
+
+    /// A reaped teardown child's pid and exit status.
+    type TeardownReap = (u32, std::process::ExitStatus);
+
+    /// Record the pid and status of every child `reap_unadopted` waits on for real on this
+    /// thread until the returned guard drops.
+    pub(crate) fn record_teardown_reaps() -> TeardownReaps {
+        let previous = TEARDOWN_REAPS.with(|r| r.borrow_mut().replace(Vec::new()));
+        debug_assert!(previous.is_none(), "teardown reaps are already being recorded");
+        TeardownReaps
+    }
+    pub(crate) fn record_teardown_reap(pid: u32, status: std::process::ExitStatus) {
+        TEARDOWN_REAPS.with(|r| {
+            if let Some(reaps) = r.borrow_mut().as_mut() {
+                reaps.push((pid, status));
+            }
+        });
+    }
+    /// Stops the [`record_teardown_reaps`] recording on drop.
+    #[must_use]
+    pub(crate) struct TeardownReaps;
+    impl TeardownReaps {
+        /// The `(pid, status)` of each reap recorded so far, oldest first.
+        pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
+            TEARDOWN_REAPS.with(|r| r.borrow().clone().unwrap_or_default())
+        }
+    }
+    impl Drop for TeardownReaps {
+        fn drop(&mut self) {
+            let reaps = TEARDOWN_REAPS.with(|r| r.borrow_mut().take());
+            drop(reaps);
+        }
     }
 
     /// Assert the spawned child was fully torn down — reuse-immune, via the child's stable identity
