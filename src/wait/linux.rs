@@ -1,11 +1,11 @@
 //! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
 //! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` from `pidfd_open` =>
-//! Unsupported.
+//! `Unsupported`; any other `pidfd_open` failure, such as a seccomp `EPERM`, is `Io`.
 //!
 //! cosca requires Linux >= 5.6 (see the crate root's "Platform requirements"). The syscalls
 //! behind it: `pidfd_open` needs 5.3; `waitid(P_PIDFD)`, 5.4; the `/proc` checks behind
-//! `open_verified` use `openat2`, 5.6. On 5.3 to 5.5 a live target is `Unassessable`.
+//! `open_verified` use `openat2`, 5.6. Without `openat2` (5.3 to 5.5) a live target is `Unassessable`.
 
 use std::os::fd::AsFd;
 use std::time::Instant;

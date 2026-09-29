@@ -413,8 +413,8 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
 /// - `Error::Unsupported` (`pidfd_open` answered `ENOSYS`: a kernel before 5.3, or a seccomp
-///   policy blocking the syscall, both outside cosca's Linux requirements) and `Error::Io` (every other `pidfd_open` or `poll` failure, such as
-///   the `EPERM` a seccomp profile may return instead) fall back to `check_or_signal`'s plain
+///   policy blocking the syscall) and `Error::Io` (every other `pidfd_open` or `poll` failure,
+///   such as the `EPERM` a seccomp profile may return instead) fall back to `check_or_signal`'s plain
 ///   `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
 ///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:

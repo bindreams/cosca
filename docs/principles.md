@@ -48,10 +48,10 @@ behind and logs it as principle 7 says.
 
 A dropped, still-running async root is left to tokio's drop of its `Child`: an in-drop `try_wait`
 ([tokio reap.rs], [tokio pidfd_reaper.rs]), then tokio's orphan queue. Both are tokio's state, not
-cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's, outside cosca's control
-(principle 4), and [#174] keeps it documented until it is resolved. The alternatives are a reaper
-cosca would own (principle 1) or a wait in `Drop`. The orphan queue is
-best-effort: it drains only while some tokio runtime parks ([tokio runtime/process.rs]), and until
+cosca's, and both reap with `waitpid(pid)`. That by-number reap is tokio's (principle 4); cosca can only
+avoid it or forget tokio's `Child` (below), and [#174] keeps the gap documented until it is resolved.
+The alternatives are a reaper cosca would own (principle 1) or a wait in `Drop`. The orphan queue
+is best-effort: it drains only while some tokio runtime parks ([tokio runtime/process.rs]), and until
 then the root stays a zombie.
 
 On evidence of a foreign reap at drop time, cosca instead takes the child's stdio out, forgets
@@ -86,15 +86,16 @@ process:
 
 On Linux cosca requires a pidfd for every child it spawns. When `pidfd_open` is refused (a kernel
 before 5.3, or a seccomp profile that blocks it), spawn fails with `Error::Unsupported`, and cosca
-itself never reaps by pid on Linux. macOS has no pidfd, so it reaps by pid, only while the process is an unreaped
-child. A macOS `Drop` that cannot confirm its child is ours leaks the child with a `warn` naming
-the pid; it never reaps on a guess.
+itself never reaps by pid on Linux; `main` doesn't do this yet ([#341]). macOS has no pidfd, so it
+reaps by pid, only while the process is an unreaped child. A macOS `Drop` that cannot confirm its
+child is ours leaks the child with a `warn` naming the pid; it never reaps on a guess.
 
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 
 One by-number reap is outside this rule: tokio's own reap of a dropped async root. It is tokio's,
-not cosca's, and cosca does not control it (principle 3, [#174]).
+not cosca's. cosca can only avoid it, by not using tokio's spawn, or forget tokio's `Child` on
+evidence of a foreign reap (principle 3, [#174]).
 
 **Why:** once the process is reaped its number can belong to anyone, and a signal sent to it hits an
 unrelated process.
@@ -308,3 +309,4 @@ stacked fix PR that resolves it.
 [#234]: https://github.com/bindreams/cosca/issues/234
 [#240]: https://github.com/bindreams/cosca/pull/240
 [#242]: https://github.com/bindreams/cosca/issues/242
+[#341]: https://github.com/bindreams/cosca/issues/341

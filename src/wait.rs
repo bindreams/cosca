@@ -127,9 +127,8 @@ pub(crate) mod std_wait_seam {
 }
 
 /// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
-/// = the timeout elapsed while it was still alive; `Err` = a wait failure (incl.
-/// `Unsupported` where the Linux requirements are unmet: see the crate root's "Platform
-/// requirements"). `None` = block until exit; `Some(ZERO)` =
+/// = the timeout elapsed while it was still alive; `Err` = a wait failure (on Linux,
+/// see the crate root's "Platform requirements"). `None` = block until exit; `Some(ZERO)` =
 /// poll once; an overflowing `Duration` saturates to unbounded. Non-reaping.
 ///
 /// Cross-privilege divergence: when the caller lacks rights to wait on a *live* foreign

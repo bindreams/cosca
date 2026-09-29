@@ -77,8 +77,8 @@ impl Process {
     }
 
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). `Err` only on a wait failure (incl. `Unsupported` where the Linux
-    /// requirements are unmet: see the crate root's "Platform requirements").
+    /// parent gets one). `Err` only on a wait failure (on Linux, see the
+    /// crate root's "Platform requirements").
     /// Non-reaping.
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::wait::block_until_exit(self.id, None)?;
