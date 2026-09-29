@@ -73,6 +73,12 @@ pub(crate) fn bind_over(source: &Path, target: &Path) {
 
 /// Mount a fresh tmpfs on `target`.
 pub(crate) fn mount_tmpfs(target: &Path) {
-    mount("tmpfs", target, "tmpfs", rustix::mount::MountFlags::empty(), None::<&std::ffi::CStr>)
-        .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
+    mount(
+        "tmpfs",
+        target,
+        "tmpfs",
+        rustix::mount::MountFlags::empty(),
+        None::<&std::ffi::CStr>,
+    )
+    .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
 }

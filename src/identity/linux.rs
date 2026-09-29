@@ -7,8 +7,8 @@ pub(crate) mod proc_view;
 
 use std::time::{Duration, SystemTime};
 
-use super::probe::{classify_unreadable, SignalProbe};
 use self::proc_view::ProcDir;
+use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
 use super::{Liveness, RawPid, Resolved, StartToken};
 

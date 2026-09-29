@@ -1,6 +1,8 @@
 //! Linux death-watch + kill via pidfd (kernel >= 5.3). `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
 //! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` on < 5.3 => Unsupported.
+//! The `/proc` checks behind `open_verified` use `openat2` (kernel >= 5.6); on 5.3 to 5.5 a live
+//! target is `Unassessable`.
 
 use std::os::fd::AsFd;
 use std::time::Instant;
@@ -109,7 +111,8 @@ fn verify_pidfd_target(
     pidfd: rustix::fd::OwnedFd,
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    let proc_dir = crate::identity::ProcDir::open().map_err(|why| unassessable(id, what, &why.reason, why.source, None))?;
+    let proc_dir =
+        crate::identity::ProcDir::open().map_err(|why| unassessable(id, what, &why.reason, why.source, None))?;
     match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.

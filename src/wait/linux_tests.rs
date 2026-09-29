@@ -509,7 +509,9 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
     let mut child = child;
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
     let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
-    let id = ProcessId::of(child.id()).found().expect("the unreaped child has an identity");
+    let id = ProcessId::of(child.id())
+        .found()
+        .expect("the unreaped child has an identity");
     child.wait().expect("reap the child");
     let result = super::verify_pidfd_target(id, pidfd, "reaped-after-open probe");
     assert!(matches!(result, Ok(None)), "got {result:?}");

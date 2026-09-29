@@ -9,14 +9,19 @@
 //! caller's `<pid>`, `Gone` included.
 //!
 //! Two ways to establish that the mounted `/proc` describes a given target, each through ONE
-//! `/proc` dirfd so nothing re-resolves `/proc` by path between the check and the read:
+//! [`ProcDir`] so nothing re-resolves `/proc` by path between the check and the read:
 //!
 //! - **With a pidfd** ([`pidfd_pid_in_view`]): a pidfd's fdinfo `Pid:` line is printed
 //!   unconditionally, relative to the pid namespace of the procfs that printed it (`0` when the
-//!   target is not visible there). Equal to the pid the caller holds means this procfs names the
-//!   target under that number.
+//!   target is not visible there, `-1` when it was reaped). Equal to the pid the caller holds
+//!   means this procfs names the target under that number.
 //! - **Without one** ([`proc_view`]): the `NSpid` line of `self/status`, which has one entry per
 //!   pid namespace from the procfs's down to the reader's. One entry means the same namespace.
+//!   Where `NSpid` is absent but pid namespaces exist (gVisor), `thread-self/stat`'s id must
+//!   equal `gettid()`.
+//!
+//! [`ProcDir`] is proven procfs's root and reads only with `openat2` (Linux 5.6), so a mount
+//! placed over `/proc`, or over a file below it, after the check is refused, not read.
 
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
@@ -80,8 +85,8 @@ impl ProcDir {
             ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(|e| ViewUnreadable::new("/proc could not be opened", Some(openat2_error(e))))?;
-        let fs = rustix::fs::fstatfs(&fd)
-            .map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
+        let fs =
+            rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
         if fs.f_type != PROC_SUPER_MAGIC {
             return Err(ViewUnreadable::new(
                 format!("/proc is not procfs (filesystem type {:#x})", fs.f_type),

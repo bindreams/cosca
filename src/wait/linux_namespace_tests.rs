@@ -11,7 +11,6 @@ use crate::identity::{proc_view, ProcDir, ProcView, ProcessId};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
-
 /// A status file mounted over `/proc/<pid>/status` is a mount below the checked `/proc`, which no
 /// read crosses: the view is `Unassessable` naming the refused crossing. A live foreign kill does
 /// not depend on the view (the success path proves its target through the pidfd's fdinfo), so it
@@ -118,7 +117,6 @@ fn fixture_pid_ns_inner() {
         other => panic!("the success path under an outer procfs must be Unassessable, got {other:?}"),
     }
 }
-
 
 fn fake_stat(pid: u32) -> String {
     let zeros = ["0"; 18].join(" ");

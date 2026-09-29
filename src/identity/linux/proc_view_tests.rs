@@ -2,6 +2,9 @@ use std::io;
 
 use std::os::fd::AsFd;
 
+use crate::test_child::fixture_path;
+use crate::test_child::namespaces as ns;
+
 use super::fault::{force_proc_view_once, force_status_once, force_thread_stat_once, ForcedView};
 use super::{
     classify_status, classify_thread_stat, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir,
@@ -27,7 +30,11 @@ fn proc_view_matches_what_thread_self_stat_says_about_this_thread() {
         .expect("thread-self/stat reads");
     let same = stat.split(' ').next() == Some(&rustix::thread::gettid().as_raw_nonzero().to_string());
     let view = proc_view();
-    assert_eq!(matches!(view, ProcView::Same(_)), same, "got {view:?} for stat {stat:?}");
+    assert_eq!(
+        matches!(view, ProcView::Same(_)),
+        same,
+        "got {view:?} for stat {stat:?}"
+    );
 }
 
 #[test]
@@ -180,6 +187,15 @@ fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
     assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
 }
 
+/// An absolute path names another tree entirely. Mutant: "no `RESOLVE_BENEATH`" — the path
+/// resolves from the root, and `NO_XDEV` alone allows it (the root filesystem is one mount).
+#[test]
+fn the_proc_dir_refuses_an_absolute_path() {
+    let dir = ProcDir::open().expect("/proc opens");
+    let err = dir.read("/etc/passwd").expect_err("must not leave /proc");
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+}
+
 /// A magic link (`self/exe`, `self/fd/N`) jumps out of the tree, so it is refused. Mutant:
 /// "no `RESOLVE_NO_MAGICLINKS`".
 #[test]
@@ -253,7 +269,10 @@ fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
     let got = pidfd_pid_in_view(&dir, pidfd.as_fd());
     let pid = child.id();
     child.wait().expect("reap the child");
-    assert!(matches!(got, Ok(PidfdTarget::Pid(p)) if p == pid), "got {got:?}, pid {pid}");
+    assert!(
+        matches!(got, Ok(PidfdTarget::Pid(p)) if p == pid),
+        "got {got:?}, pid {pid}"
+    );
 }
 
 fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd) {
@@ -269,14 +288,27 @@ fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd)
 /// A thread that unshared its fd table has fds the leader's `self/fdinfo` does not know; the
 /// fdinfo must be read through `thread-self`. Mutant: "read `self/fdinfo`" — the leader's table
 /// has no such fd (or a different file at that number).
+///
+/// In the namespaces group: `unshare` is refused by default container seccomp profiles.
 #[test]
-fn the_fdinfo_is_read_through_the_calling_threads_fd_table() {
+fn namespaces_the_fdinfo_is_read_through_the_calling_threads_fd_table() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_fdinfo_after_unshare_files));
+}
+
+#[test]
+fn fixture_fdinfo_after_unshare_files() {
+    if !ns::is_child() {
+        return;
+    }
     let dir = ProcDir::open().expect("/proc opens");
     let own = rustix::process::Pid::from_raw(std::process::id() as i32).expect("own pid");
     let got = std::thread::scope(|s| {
         s.spawn(|| {
-            // SAFETY: this thread is fresh and its own copy of the table is the only one it uses;
-            // it opens the pidfd after the unshare and hands nothing to another thread.
+            // SAFETY: this thread is fresh; it opens the pidfd after the unshare and hands nothing
+            // to another thread.
             unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::FILES) }.expect("unshare(FILES)");
             let pidfd = rustix::process::pidfd_open(own, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
             pidfd_pid_in_view(&dir, pidfd.as_fd())
