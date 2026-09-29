@@ -174,7 +174,7 @@ pub(crate) fn block_on_kqueue<T: Copy>(
         // advance: see `test_clock::advance_by_elapsed_if_frozen`'s own doc. A no-op outside
         // tests and whenever the clock isn't frozen.
         #[cfg(test)]
-        crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+        let _ = call_start;
         #[cfg(test)]
         test_hooks::record_kevent_call(as_duration(timeout));
         // Captured before incrementing: this round's own index, not the next round's.
