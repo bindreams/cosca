@@ -1,50 +1,49 @@
-use super::check_group;
+use super::{check_group, require_group_in};
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
 }
 
-/// Mutant: the group variable is required to be set (would refuse an unset one).
+/// Mutant: the group variable is required to be set.
 #[test]
 fn an_unset_group_variable_with_consent_runs() {
     assert_eq!(
         check_group("TRACER", env(&[("COSCA_TEST_TRACER_CONSENT", "1")])),
-        Ok(())
+        Ok(true)
     );
 }
 
-/// Mutant: only `1` enables (would refuse `2`).
+/// Mutant: only `1` enables.
 #[test]
 fn any_group_value_but_0_runs() {
     let vars = [("COSCA_TEST_TRACER", "2"), ("COSCA_TEST_TRACER_CONSENT", "1")];
-    assert_eq!(check_group("TRACER", env(&vars)), Ok(()));
+    assert_eq!(check_group("TRACER", env(&vars)), Ok(true));
 }
 
-/// Mutant: `0` is honoured by returning early (would be `Ok`).
+/// Mutant: `0` is ignored.
 #[test]
-fn group_0_fails_and_names_the_filter() {
+fn group_0_turns_the_group_off() {
     let vars = [("COSCA_TEST_TRACER", "0"), ("COSCA_TEST_TRACER_CONSENT", "1")];
-    let why = check_group("TRACER", env(&vars)).unwrap_err();
-    assert!(
-        why.contains("COSCA_TEST_TRACER=0") && why.contains("not test(/tracer/)"),
-        "{why}"
-    );
+    assert_eq!(check_group("TRACER", env(&vars)), Ok(false));
 }
 
-/// Names the consent and the explicit opt-out. Mutant: consent defaults to given (would be
-/// `Ok`).
+/// Consent is asked only of an enabled group. Mutant: consent is checked before `=0`.
 #[test]
-fn unset_consent_fails_and_names_the_variable() {
+fn group_0_needs_no_consent() {
+    assert_eq!(check_group("TRACER", env(&[("COSCA_TEST_TRACER", "0")])), Ok(false));
+}
+
+/// Mutant: consent defaults to given.
+#[test]
+fn unset_consent_fails_and_names_the_variables() {
     let why = check_group("TRACER", env(&[])).unwrap_err();
     assert!(
-        why.contains("COSCA_TEST_TRACER_CONSENT=1")
-            && why.contains("COSCA_TEST_TRACER=0")
-            && why.contains("not test(/tracer/)"),
+        why.contains("COSCA_TEST_TRACER_CONSENT=1") && why.contains("COSCA_TEST_TRACER=0"),
         "{why}"
     );
 }
 
-/// Mutant: any non-empty consent counts (would be `Ok`).
+/// Mutant: any non-empty consent counts.
 #[test]
 fn consent_other_than_1_fails() {
     for value in ["0", "yes", "true", " 1", ""] {
@@ -54,4 +53,18 @@ fn consent_other_than_1_fails() {
             "consent {value:?} was accepted"
         );
     }
+}
+
+/// Mutant: `require_group` returns `false` instead of failing.
+#[test]
+#[should_panic(expected = "set COSCA_TEST_TRACER_CONSENT=1")]
+fn require_group_fails_without_consent() {
+    require_group_in("TRACER", env(&[]));
+}
+
+/// Mutant: `require_group` ignores the rule's answer.
+#[test]
+fn require_group_passes_the_answer_on() {
+    assert!(!require_group_in("TRACER", env(&[("COSCA_TEST_TRACER", "0")])));
+    assert!(require_group_in("TRACER", env(&[("COSCA_TEST_TRACER_CONSENT", "1")])));
 }

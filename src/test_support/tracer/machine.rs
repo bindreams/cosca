@@ -5,35 +5,49 @@
 //! signal pipe's EOF, and a backoff's timeout. A backoff is the kqueue's own timeout, 1 ms
 //! doubling to 50 ms, with no cap: it only paces the re-check of a real condition.
 //!
-//! The tracee's stops are passed through as a debugger does: a signal that stops the traced
-//! tracee is delivered to it with `PT_CONTINUE`, except a `SIGSTOP` in S2 or S4, which the
-//! attach and S4 send, and which `PT_CONTINUE` or `PT_DETACH` discards. A client's own `SIGSTOP`
-//! is indistinguishable from those. What XNU does with a stop signal passed through in S3 to a
-//! still-traced tracee is not measured.
+//! **Blocking reports.** Before every wait with no timeout the helper reports `blocking <state>
+//! eof` if the signal pipe's EOF ends that wait, or `blocking <state> exit` if only the tracee's
+//! exit does. It skips the report when it already made it and has reported nothing since, so a
+//! re-wait after an ignored event adds none. A test reads up to the wait it expects and acts
+//! there, so a wrong path fails an assertion instead of hanging.
+//!
+//! **Signals.** The tracee's stops are passed on as a debugger does. XNU discards a stop signal
+//! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`
+//! delivers to a still-traced tracee (xnu `kern_sig.c`, `issignal`). So the helper keeps the
+//! first stop signal that stops the tracee, releases the tracee without it (`S2k`, `S3k`,
+//! `S4k`), and re-sends it with `kill(2)` after `PT_DETACH` (`S4r`). A `SIGCONT` passed on later
+//! drops it, since it would have continued the stopped tracee. Every other signal is delivered at
+//! once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). A `SIGSTOP` in S2 or S4 is taken for the one
+//! the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a client's own `SIGSTOP`
+//! there is indistinguishable from it.
 //!
 //! | State | Event or result | Next | Report |
 //! |---|---|---|---|
-//! | S-1 Awaiting pid | a `pid <n>` line | S0 | |
-//! | S-1 | EOF, or any other line | exit | |
+//! | S-1 Awaiting pid | a `pid <n>` line, `n` > 0 | S0 | |
+//! | S-1 | EOF before any byte | exit | |
+//! | S-1 | any other line | exit with status 3 | stderr |
 //! | S0 Register | `NOTE_EXIT`, `SIGCHLD` and the signal pipe registered | S1 | |
 //! | S0 | a registration's receipt error | done | `error` |
 //! | S1 Attach | `PT_ATTACH` succeeds | S2 (S1h under `S1:hold`) | |
 //! | S1 | any error | done | `error` |
-//! | S1h Held (probe) | backoff timeout, not yet `SSTOP` | S1h, sampling `pbi_status` | probe lines |
-//! | S1h | backoff timeout, `SSTOP` sampled | S1hs: S1h with no more timeouts | probe lines |
+//! | S1h Held | backoff timeout, `pbi_status` not `SSTOP` or `ESRCH` (exiting) | S1h | |
+//! | S1h | backoff timeout, `SSTOP` sampled | S1hs: S1h with no more timeouts | |
+//! | S1h | `pbi_status` fails otherwise | done | `error` |
 //! | S1h | signal byte | S2 | |
 //! | S1h | EOF | exit; XNU kills the still-traced tracee | |
 //! | S1h | `NOTE_EXIT` | S5 | |
 //! | S2 Release | a `SIGSTOP` (the attach's) holds the tracee: `PT_CONTINUE` succeeds | S3 | `attached` |
-//! | S2 | the tracee stopped by another signal | pass it through; S2s, then S2b | |
+//! | S2 | the tracee stopped by another stop signal | keep it, release the tracee; S2k, then S2b | |
+//! | S2 | the tracee stopped by any other signal | pass it on; S2s, then S2b | |
 //! | S2 | the tracee not stopped yet, or `PT_CONTINUE` fails with `EBUSY` | S2b | |
-//! | S2b Backoff | timeout | retry S2's `PT_CONTINUE` | |
+//! | S2b Backoff | timeout | retry S2's stop check | |
 //! | S2b | `NOTE_EXIT`, signal byte or EOF | done: nothing may happen before `attached` | `error` |
-//! | S2 | the stop peek, the pass-through or `PT_CONTINUE` fails otherwise | done | `error` |
-//! | S3 Traced | `SIGCHLD`, the tracee stopped by a signal | pass it through; S3s, then S3 | |
+//! | S2 | the stop peek, the release or `PT_CONTINUE` fails otherwise | done | `error` |
+//! | S3 Traced | `SIGCHLD`, the tracee stopped by a stop signal | keep it, release the tracee; S3k, then S3 | |
+//! | S3 | `SIGCHLD`, the tracee stopped by any other signal | pass it on; S3s, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee not stopped | S3 | |
-//! | S3 | the pass-through's `PT_CONTINUE` fails with `ESRCH` (the tracee is exiting) | S3 | |
-//! | S3 | the stop peek or the pass-through fails otherwise | done | `error` |
+//! | S3 | the release fails with `ESRCH` (the tracee is exiting) | S3 | |
+//! | S3 | the stop peek or the release fails otherwise | done | `error` |
 //! | S3, `auto` | `NOTE_EXIT` (wins over a byte in the same batch) | S5 | |
 //! | S3, `auto` | signal byte or EOF | S4 | |
 //! | S3, `hold` | `NOTE_EXIT`, then the zombie is confirmed | S3x | `exited` |
@@ -42,12 +56,12 @@
 //! | S3, `hold` | `NOTE_EXIT` and a signal byte or EOF in one batch | S3x, then S5 | `exited` |
 //! | S3x Exited, held | signal byte or EOF | S5 | |
 //! | S3x | `NOTE_EXIT` (only by injection: it is one-shot) | done | `error` |
-//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` succeeds | done | `detached` |
-//! | S4 | the tracee stopped by another signal | pass it through; S4s, then S4b | |
+//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` succeeds, then a kept stop signal is re-sent (S4r) | done | `detached` |
+//! | S4 | re-sending the kept stop signal fails | done | `error` |
+//! | S4 | the tracee stopped by another stop signal | keep it, release the tracee; S4k, then S4b | |
+//! | S4 | the tracee stopped by any other signal | pass it on; S4s, then S4b | |
 //! | S4 | the tracee not stopped yet, or `PT_DETACH` fails with `EBUSY` | S4b | |
-//! | S4 | `SIGSTOP`, the pass-through or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
-//! | S4 | `PT_DETACH` or the pass-through fails with `EPERM` and `pbi_status` answers `ESRCH` | as `ESRCH` | |
-//! | S4 | `EPERM` with anything else from `pbi_status` | done | `error` |
+//! | S4 | `SIGSTOP`, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
 //! | S4 | the stop peek fails, or any other error | done | `error` |
 //! | S4b Backoff | `NOTE_EXIT` | S5 | |
 //! | S4b | timeout, signal byte (ignored) or EOF | back to S4's stop check | |
@@ -58,9 +72,14 @@
 //! | S6 Exiting | `NOTE_EXIT` | S5 | |
 //! | S6 | signal byte (ignored) or EOF | S6 again: `NOTE_EXIT` is certain, registered while the tracee lived | |
 //! | any but S3 | `SIGCHLD` alone | the same state; in a backoff it reads as the timeout | |
-//! | any | a report or `state` write fails (`EPIPE`: the test is gone) | done | |
+//! | any | a report write fails (`EPIPE`: the test is gone) | done, which exits at its own failed report | |
 //! | done | signal byte (ignored) | done again | |
 //! | done | EOF | exit | |
+//!
+//! `EPERM` from `PT_CONTINUE` or `PT_DETACH` means the tracee is not traced by this helper, a
+//! protocol error: XNU's `ptrace` looks the tracee up before it checks the tracing, and an
+//! exiting process leaves the lookup before its tracing is cleared, so an exiting tracee gets
+//! `ESRCH` (xnu `mach_process.c`, `kern_exit.c`).
 //!
 //! "Done" keeps the helper alive until the client closes the signal pipe, so the tracee's state
 //! after a terminal report holds until then: a reaped zombie is already the test's, and the
@@ -68,30 +87,22 @@
 //! still tracing leaves XNU to kill the tracee (measured), so a failed or abandoned helper never
 //! leaves it stopped.
 //!
-//! **Injections** (`COSCA_UH_FORCE`, a list of `<tag>:<directive>`, each entry used once, in
-//! order): a state tag with an errno name or number, or `ok`, replaces that state's syscall
-//! result; `S1:hold` enters S1h; `S1h`, `S2b`, `S3`, `S3x`, `S4b` and `S6` take events
-//! (`NOTE_EXIT`, `SIGCHLD`, `SIGNAL`, `EOF`, joined by `+` for one batch) in place of a
-//! `kevent`; `S2stop`, `S3stop` and `S4stop` replace the stop peek's answer (`SIGTERM`,
-//! `SIGSTOP`, `none`, or an errno); `S2cont`, `S3cont` and `S4cont` replace the pass-through's
-//! result;
-//! `S4pidinfo:ESRCH|ok` replaces the `pbi_status` answer; `S4sigstop:0|1|<errno>` skips S4's
-//! `SIGSTOP`, sends it, or replaces its result (by default it is sent only when `PT_DETACH` is
-//! not forced, because a real stop would leave a tracee the test needs to end by EOF stopped);
-//! `seed:NOTE_EXIT` marks `NOTE_EXIT` as seen from the start, for S4's "else S5" branch that no
-//! real run reaches. An entry the run never uses panics the helper, failing the test.
+//! **Injections** (`COSCA_UH_FORCE`): a list of `<tag>:<directive>`, each entry used once, in
+//! order. [`FORCE_TAGS`] lists the tags and their directives. An entry the run never uses
+//! panics the helper, failing the test.
 
 use std::time::Duration;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::{sys, Mode};
+use super::{sys, Mode, Until};
 
-const PROBE_MARKER: &str = "@@cosca-uh-probe@@";
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(50);
 
-/// The helper process's body.
+/// The helper's exit status after a malformed pid line.
+pub(super) const MALFORMED_PID_LINE: i32 = 3;
+
 pub(super) fn main() {
     let marker = std::env::var("COSCA_UH_MARKER").expect("COSCA_UH_MARKER is set by the client");
     let mode = match std::env::var("COSCA_UH_MODE").as_deref() {
@@ -106,16 +117,33 @@ pub(super) fn main() {
         Some("NOTE_EXIT") => true,
         Some(other) => panic!("seed takes only NOTE_EXIT, got {other:?}"),
     };
-    if let Some(pid) = read_pid_line() {
-        Machine {
+    match read_pid_line() {
+        PidLine::Pid(pid) => Machine {
             pid,
             mode,
             marker,
             trace,
             forces: &mut forces,
             note_exit_seen,
+            kept: None,
+            blocked: None,
+            eof_seen: false,
         }
-        .run();
+        .run(),
+        PidLine::Eof => {}
+        PidLine::Malformed(line) => {
+            use std::io::Write as _;
+            let message = format!(
+                "tracer helper: malformed pid line {:?}\n",
+                String::from_utf8_lossy(&line)
+            );
+            // The exit status carries the failure if this write does not.
+            std::io::stderr()
+                .lock()
+                .write_all(message.as_bytes())
+                .unwrap_or_default();
+            std::process::exit(MALFORMED_PID_LINE);
+        }
     }
     assert!(
         forces.0.is_empty(),
@@ -124,25 +152,56 @@ pub(super) fn main() {
     );
 }
 
-/// S-1: reads the `pid <n>` line a byte at a time, so no later signal byte is buffered away.
-fn read_pid_line() -> Option<u32> {
+enum PidLine {
+    Pid(u32),
+    Eof,
+    /// Anything but `pid <n>` with `n` a positive `pid_t`: a pid of 0 or below would make
+    /// `kill(2)` signal a process group.
+    Malformed(Vec<u8>),
+}
+
+/// Reads a byte at a time, so no later signal byte is buffered away.
+fn read_pid_line() -> PidLine {
     let mut line = Vec::new();
     loop {
-        match sys::read_byte(0)? {
-            b'\n' => break,
-            byte => line.push(byte),
+        match sys::read_byte(0) {
+            None if line.is_empty() => return PidLine::Eof,
+            None => return PidLine::Malformed(line),
+            Some(b'\n') => break,
+            Some(byte) => line.push(byte),
         }
     }
-    std::str::from_utf8(&line).ok()?.strip_prefix("pid ")?.parse().ok()
+    let pid = std::str::from_utf8(&line)
+        .ok()
+        .and_then(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid > 0);
+    match pid {
+        Some(pid) => PidLine::Pid(pid as u32),
+        None => PidLine::Malformed(line),
+    }
 }
 
 struct Forces(Vec<(String, String)>);
 
+/// The injection tags. A state tag (`S0`, `S1`, `S2`, `S4`, `S5`) takes `ok` or an errno name
+/// or number, which replaces that state's syscall result; `S1` also takes `hold`, which enters
+/// S1h. `S1h`, `S2b`, `S3`, `S3x`, `S4b` and `S6` take events (`NOTE_EXIT`, `SIGCHLD`,
+/// `SIGNAL`, `EOF`, joined by `+` for one batch) in place of a `kevent`. `S1hstatus` takes an
+/// errno for `pbi_status`. `S2stop`, `S3stop` and `S4stop` replace the stop peek's answer (a
+/// signal name, `none`, or an errno); `S2cont`, `S3cont` and `S4cont` replace the release's or
+/// pass-through's result, and `S4r` the re-send's. `S4sigstop` takes `0` to skip S4's `SIGSTOP`,
+/// `1` to send it, or an errno for its result; by default it is sent only when `S4`'s result is
+/// not forced, because a real stop would leave a tracee the test needs to end by EOF stopped.
+/// `seed:NOTE_EXIT` marks `NOTE_EXIT` as seen from the start, for S4's "else S5" branch that no
+/// real run reaches. `gone:<report>` fails the write of that report as `EPIPE` would.
 const FORCE_TAGS: &[&str] = &[
     "seed",
+    "gone",
     "S0",
     "S1",
     "S1h",
+    "S1hstatus",
     "S2",
     "S2b",
     "S2stop",
@@ -156,7 +215,7 @@ const FORCE_TAGS: &[&str] = &[
     "S4stop",
     "S4cont",
     "S4sigstop",
-    "S4pidinfo",
+    "S4r",
     "S5",
     "S6",
 ];
@@ -185,12 +244,21 @@ impl Forces {
         Some(self.0.remove(at).1)
     }
 
+    /// Takes the first `tag` entry whose directive is `directive`, if any.
+    fn take_exact(&mut self, tag: &str, directive: &str) -> bool {
+        let Some(at) = self.0.iter().position(|(t, d)| t == tag && d == directive) else {
+            return false;
+        };
+        self.0.remove(at);
+        true
+    }
+
     /// A forced stop-peek answer for `tag`, if any: a stopping signal, `none`, or an errno.
     fn stop(&mut self, tag: &str) -> Option<Result<Option<i32>, i32>> {
         self.take(tag).map(|directive| match directive.as_str() {
             "none" => Ok(None),
             "SIGTERM" => Ok(Some(libc::SIGTERM)),
-            "SIGSTOP" => Ok(Some(libc::SIGSTOP)),
+            "SIGTSTP" => Ok(Some(libc::SIGTSTP)),
             name => Err(errno_named(name)),
         })
     }
@@ -212,11 +280,15 @@ fn errno_named(name: &str) -> i32 {
         "ECHILD" => libc::ECHILD,
         "EBUSY" => libc::EBUSY,
         "EINVAL" => libc::EINVAL,
-        "ENOTSUP" => libc::ENOTSUP,
         number => number
             .parse()
             .unwrap_or_else(|_| panic!("COSCA_UH_FORCE: unknown errno {number:?}")),
     }
+}
+
+/// Whether `signal`'s default action stops the process.
+fn is_stop_signal(signal: i32) -> bool {
+    matches!(signal, libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU)
 }
 
 /// What one `kevent` round (or one injection) delivered. All false is a backoff's timeout.
@@ -236,12 +308,12 @@ impl Batch {
 
     /// The event an `error` report names, `NOTE_EXIT` first.
     fn cause(&self) -> &'static str {
-        if self.note_exit {
-            "NOTE_EXIT"
-        } else if self.signal {
-            "SIGNAL"
-        } else {
-            "EOF"
+        debug_assert!(self.any(), "cause() of a batch with no event");
+        match (self.note_exit, self.signal, self.eof) {
+            (true, _, _) => "NOTE_EXIT",
+            (false, true, _) => "SIGNAL",
+            (false, false, true) => "EOF",
+            (false, false, false) => unreachable!("cause() of a batch with no event"),
         }
     }
 }
@@ -268,17 +340,17 @@ enum Next {
     Exit,
 }
 
-/// A report write failed (`EPIPE`): the test is gone, and the run ends.
+/// A report write failed: the test is gone.
 struct Gone;
 
-/// Why S2's or S4's stop check ended its round early.
-enum Round {
+/// How one round of S2's or S4's stop check ended.
+enum Check {
+    /// `act`'s result, the release's or pass-through's error, or `EBUSY` while no `SIGSTOP`
+    /// holds the tracee.
+    Result(Result<(), i32>),
     /// The stop peek failed with this errno.
-    Failed(i32),
-    Reported(Gone),
+    PeekFailed(i32),
 }
-
-use Round::{Failed, Reported};
 
 type Step = Result<Next, Gone>;
 
@@ -295,6 +367,11 @@ struct Machine<'f> {
     trace: bool,
     forces: &'f mut Forces,
     note_exit_seen: bool,
+    /// The stop signal to re-send after `PT_DETACH`.
+    kept: Option<i32>,
+    /// The last `blocking` report, until any other report follows it.
+    blocked: Option<String>,
+    eof_seen: bool,
 }
 
 impl Machine<'_> {
@@ -309,9 +386,9 @@ impl Machine<'_> {
 
     /// Holds what the reports promised until the client closes the signal pipe. Each ignored
     /// byte re-enters `done`, so a test can see the helper still holding.
-    fn done(&self) {
-        while sys::read_byte(0).is_some() {
-            if self.enter("done").is_err() {
+    fn done(&mut self) {
+        loop {
+            if self.block("done", Until::Eof).is_err() || sys::read_byte(0).is_none() || self.enter("done").is_err() {
                 return;
             }
         }
@@ -341,7 +418,7 @@ impl Machine<'_> {
         };
         match registered {
             Ok(()) => to(State::S1),
-            Err(e) => self.fail(&e.to_string(), "S0"),
+            Err(e) => self.fail(e, "S0"),
         }
     }
 
@@ -350,30 +427,22 @@ impl Machine<'_> {
         let hold = match self.forces.take("S1").as_deref() {
             None => false,
             Some("hold") => true,
-            Some(name) => return self.fail(&errno_named(name).to_string(), "S1"),
+            Some(name) => return self.fail(errno_named(name), "S1"),
         };
-        let attached = sys::attach(self.pid);
-        if hold {
-            let field = attached.map_or_else(|e| format!("errno {e}"), |()| "ok".to_string());
-            probe(&format!("attach={field}"));
-        }
-        match attached {
+        match sys::attach(self.pid) {
             Ok(()) if hold => to(State::S1h),
             Ok(()) => to(State::S2),
-            Err(e) => self.fail(&e.to_string(), "S1"),
+            Err(e) => self.fail(e, "S1"),
         }
     }
 
-    /// The feasibility probe's hold: samples `pbi_status` under the backoff until `SSTOP`, then
-    /// waits for an event with no timeout.
+    /// Samples `pbi_status` under the backoff until `SSTOP`, then waits for an event with no
+    /// timeout.
     fn s1h(&mut self, kq: &Kqueue) -> Step {
         self.enter("S1h")?;
-        let first = sys::pbi_status(self.pid);
-        probe(&format!("pbi_status_first={}", fmt_status(first)));
         let mut backoff = Some(FIRST_BACKOFF);
-        let mut rounds = 0u32;
         loop {
-            let batch = self.wait(kq, "S1h", backoff);
+            let batch = self.wait(kq, "S1h", backoff)?;
             if batch.note_exit {
                 return to(State::S5);
             }
@@ -386,20 +455,18 @@ impl Machine<'_> {
             let Some(current) = backoff else {
                 continue;
             };
-            rounds += 1;
-            let status = sys::pbi_status(self.pid);
-            if status == Ok(libc::SSTOP) {
-                self.enter("S1hs")?;
-                probe(&format!("pbi_status_settled=4 after_rounds={rounds}"));
-                let peek = match sys::stop_signal(self.pid) {
-                    Ok(Some(signal)) => format!("stopped signal={signal}"),
-                    Ok(None) => "running".to_string(),
-                    Err(e) => format!("errno {e}"),
-                };
-                probe(&format!("helper_wstopped_peek={peek}"));
-                backoff = None;
-            } else {
-                backoff = Some(next_backoff(current));
+            let status = match self.forces.take("S1hstatus") {
+                Some(name) => Err(errno_named(&name)),
+                None => sys::pbi_status(self.pid),
+            };
+            match status {
+                Ok(libc::SSTOP) => {
+                    self.enter("S1hs")?;
+                    backoff = None;
+                }
+                // ESRCH: the tracee is exiting, and its NOTE_EXIT follows.
+                Ok(_) | Err(libc::ESRCH) => backoff = Some(next_backoff(current)),
+                Err(e) => return self.fail(e, "S1h"),
             }
         }
     }
@@ -410,23 +477,22 @@ impl Machine<'_> {
         loop {
             let result = match self.forces.result("S2") {
                 Some(forced) => forced,
-                None => match self.act_once_stopped(["S2stop", "S2cont", "S2s"], sys::cont) {
-                    Ok(result) => result,
-                    Err(Failed(e)) => return self.fail(&e.to_string(), "S2"),
-                    Err(Reported(gone)) => return Err(gone),
+                None => match self.act_once_stopped("S2", sys::resume)? {
+                    Check::Result(result) => result,
+                    Check::PeekFailed(e) => return self.fail(e, "S2"),
                 },
             };
             match result {
                 Ok(()) => return self.report_then("attached", to(State::S3)),
                 Err(libc::EBUSY) => {
                     self.enter("S2b")?;
-                    let batch = self.wait(kq, "S2b", Some(backoff));
+                    let batch = self.wait(kq, "S2b", Some(backoff))?;
                     if batch.any() {
                         return self.fail(batch.cause(), "S2b");
                     }
                     backoff = next_backoff(backoff);
                 }
-                Err(e) => return self.fail(&e.to_string(), "S2"),
+                Err(e) => return self.fail(e, "S2"),
             }
         }
     }
@@ -434,24 +500,17 @@ impl Machine<'_> {
     fn s3(&mut self, kq: &Kqueue) -> Step {
         self.enter("S3")?;
         let batch = loop {
-            let batch = self.wait_with(kq, "S3", None, true);
+            let batch = self.wait_with(kq, "S3", None, true)?;
             if batch.sigchld {
                 let stop = self.forces.stop("S3stop").unwrap_or_else(|| sys::stop_signal(self.pid));
                 match stop {
-                    Ok(Some(signal)) => {
-                        let passed = self
-                            .forces
-                            .result("S3cont")
-                            .unwrap_or_else(|| sys::cont_with(self.pid, signal));
-                        match passed {
-                            Ok(()) => self.enter("S3s")?,
-                            // Exiting: its NOTE_EXIT follows.
-                            Err(libc::ESRCH) => {}
-                            Err(e) => return self.fail(&e.to_string(), "S3"),
-                        }
-                    }
+                    Ok(Some(signal)) => match self.pass_on("S3", signal)? {
+                        // Exiting: its NOTE_EXIT follows.
+                        Ok(()) | Err(libc::ESRCH) => {}
+                        Err(e) => return self.fail(e, "S3"),
+                    },
                     Ok(None) => {}
-                    Err(e) => return self.fail(&e.to_string(), "S3"),
+                    Err(e) => return self.fail(e, "S3"),
                 }
             }
             if batch.any() {
@@ -461,10 +520,13 @@ impl Machine<'_> {
         let release = batch.signal || batch.eof;
         match (self.mode, batch.note_exit) {
             (Mode::Auto, true) => to(State::S5),
-            (Mode::Hold, true) => match sys::await_zombie(self.pid) {
-                Ok(()) => self.report_then("exited", to(State::S3x { release })),
-                Err(e) => self.fail(&e.to_string(), "S3"),
-            },
+            (Mode::Hold, true) => {
+                self.block("S3", Until::Exit)?;
+                match sys::await_zombie(self.pid) {
+                    Ok(()) => self.report_then("exited", to(State::S3x { release })),
+                    Err(e) => self.fail(e, "S3"),
+                }
+            }
             (_, false) => to(State::S4),
         }
     }
@@ -474,7 +536,7 @@ impl Machine<'_> {
         if release {
             return to(State::S5);
         }
-        let batch = self.wait(kq, "S3x", None);
+        let batch = self.wait(kq, "S3x", None)?;
         if batch.note_exit {
             return self.fail("NOTE_EXIT", "S3x");
         }
@@ -485,106 +547,118 @@ impl Machine<'_> {
         self.enter("S4")?;
         let mut forced = self.forces.result("S4");
         let stopped = match self.forces.take("S4sigstop").as_deref() {
-            None if forced.is_none() => sys::sigstop(self.pid),
+            None if forced.is_none() => sys::kill(self.pid, libc::SIGSTOP),
             None | Some("0") => Ok(()),
-            Some("1") => sys::sigstop(self.pid),
+            Some("1") => sys::kill(self.pid, libc::SIGSTOP),
             Some(name) => Err(errno_named(name)),
         };
         match stopped {
             Ok(()) => {}
             Err(libc::ESRCH) => return self.exiting(),
-            Err(e) => return self.fail(&e.to_string(), "S4"),
+            Err(e) => return self.fail(e, "S4"),
         }
         let mut backoff = FIRST_BACKOFF;
         loop {
             let result = match forced.take() {
                 Some(forced) => forced,
-                None => match self.act_once_stopped(["S4stop", "S4cont", "S4s"], sys::detach) {
-                    Ok(result) => result,
-                    Err(Failed(e)) => return self.fail(&e.to_string(), "S4"),
-                    Err(Reported(gone)) => return Err(gone),
+                None => match self.act_once_stopped("S4", sys::detach)? {
+                    Check::Result(result) => result,
+                    Check::PeekFailed(e) => return self.fail(e, "S4"),
                 },
             };
             match result {
-                Ok(()) => return self.report_then("detached", EXIT),
+                Ok(()) => return self.detached(),
                 Err(libc::ESRCH) => return self.exiting(),
-                Err(libc::EPERM) => {
-                    // PT_DETACH's and PT_CONTINUE's only EPERM is "not traced": the tracee is
-                    // past the point in exit where tracing is cleared, or this is a protocol error.
-                    let gone = match self.forces.take("S4pidinfo").as_deref() {
-                        Some("ESRCH") => true,
-                        Some("ok") => false,
-                        Some(other) => panic!("S4pidinfo takes ESRCH or ok, got {other:?}"),
-                        None => sys::pbi_status(self.pid) == Err(libc::ESRCH),
-                    };
-                    return if gone {
-                        self.exiting()
-                    } else {
-                        self.fail(&libc::EPERM.to_string(), "S4")
-                    };
-                }
                 Err(libc::EBUSY) => {
                     self.enter("S4b")?;
-                    if self.wait(kq, "S4b", Some(backoff)).note_exit {
+                    if self.wait(kq, "S4b", Some(backoff))?.note_exit {
                         return to(State::S5);
                     }
                     backoff = next_backoff(backoff);
                     forced = self.forces.result("S4");
                 }
-                Err(e) => return self.fail(&e.to_string(), "S4"),
+                Err(e) => return self.fail(e, "S4"),
             }
         }
     }
 
-    /// One round of S2's or S4's stop check, `tags` naming its injections and its pass-through
-    /// trace: `act` (`PT_CONTINUE` or `PT_DETACH`) once a `SIGSTOP` holds the tracee; the
-    /// pass-through, then `EBUSY`, for another signal's stop; `EBUSY` while it runs.
-    fn act_once_stopped(
-        &mut self,
-        [stop_tag, cont_tag, passed_trace]: [&str; 3],
-        act: fn(u32) -> Result<(), i32>,
-    ) -> Result<Result<(), i32>, Round> {
-        let stop = self.forces.stop(stop_tag).unwrap_or_else(|| sys::stop_signal(self.pid));
-        match stop.map_err(Failed)? {
-            Some(libc::SIGSTOP) => Ok(act(self.pid)),
-            Some(signal) => {
-                let passed = self
-                    .forces
-                    .result(cont_tag)
-                    .unwrap_or_else(|| sys::cont_with(self.pid, signal));
-                match passed {
-                    Ok(()) => {
-                        self.enter(passed_trace).map_err(Reported)?;
-                        Ok(Err(libc::EBUSY))
-                    }
-                    Err(e) => Ok(Err(e)),
-                }
+    /// After `PT_DETACH`: re-sends the kept stop signal, which XNU would have discarded.
+    fn detached(&mut self) -> Step {
+        if let Some(signal) = self.kept.take() {
+            let sent = self.forces.result("S4r").unwrap_or_else(|| sys::kill(self.pid, signal));
+            if let Err(e) = sent {
+                return self.fail(e, "S4");
             }
-            None => Ok(Err(libc::EBUSY)),
+            self.enter("S4r")?;
         }
+        self.report_then("detached", EXIT)
     }
 
-    /// S4's `ESRCH` row.
+    /// One round of S2's or S4's stop check, `tag` naming its injections and traces: `act`
+    /// (`PT_CONTINUE` or `PT_DETACH`) once a `SIGSTOP` holds the tracee, [`Self::pass_on`] for
+    /// another signal's stop.
+    fn act_once_stopped(&mut self, tag: &str, act: fn(u32) -> Result<(), i32>) -> Result<Check, Gone> {
+        let stop = self
+            .forces
+            .stop(&format!("{tag}stop"))
+            .unwrap_or_else(|| sys::stop_signal(self.pid));
+        Ok(match stop {
+            Err(e) => Check::PeekFailed(e),
+            Ok(Some(libc::SIGSTOP)) => Check::Result(act(self.pid)),
+            Ok(Some(signal)) => match self.pass_on(tag, signal)? {
+                Ok(()) => Check::Result(Err(libc::EBUSY)),
+                Err(e) => Check::Result(Err(e)),
+            },
+            Ok(None) => Check::Result(Err(libc::EBUSY)),
+        })
+    }
+
+    /// Releases the tracee from a stop by `signal`: keeps a stop signal and releases the tracee
+    /// without it (`<tag>k`), or delivers any other signal (`<tag>s`).
+    fn pass_on(&mut self, tag: &str, signal: i32) -> Result<Result<(), i32>, Gone> {
+        let keep = is_stop_signal(signal);
+        let delivered = if keep { 0 } else { signal };
+        let result = self
+            .forces
+            .result(&format!("{tag}cont"))
+            .unwrap_or_else(|| sys::cont(self.pid, delivered));
+        if result.is_ok() {
+            if keep {
+                self.kept.get_or_insert(signal);
+            } else if signal == libc::SIGCONT {
+                self.kept = None;
+            }
+            self.enter(&format!("{tag}{}", if keep { "k" } else { "s" }))?;
+        }
+        Ok(result)
+    }
+
     fn exiting(&self) -> Step {
         to(if self.note_exit_seen { State::S5 } else { State::S6 })
     }
 
     fn s5(&mut self) -> Step {
         self.enter("S5")?;
-        let mut result = self.forces.result("S5").unwrap_or_else(|| sys::reap(self.pid));
+        let mut result = self.forces.result("S5");
         loop {
-            match result {
+            let reaped = match result.take() {
+                Some(forced) => forced,
+                None => {
+                    self.block("S5", Until::Exit)?;
+                    sys::reap(self.pid)
+                }
+            };
+            match reaped {
                 Ok(()) => return self.report_then("reaped", EXIT),
-                Err(libc::EINTR) => result = sys::reap(self.pid),
-                Err(e) => return self.fail(&e.to_string(), "S5"),
+                Err(libc::EINTR) => {}
+                Err(e) => return self.fail(e, "S5"),
             }
         }
     }
 
-    /// An ignored event re-enters S6, so a test can see the self-transition.
     fn s6(&mut self, kq: &Kqueue) -> Step {
         self.enter("S6")?;
-        if self.wait(kq, "S6", None).note_exit {
+        if self.wait(kq, "S6", None)?.note_exit {
             to(State::S5)
         } else {
             to(State::S6)
@@ -592,52 +666,79 @@ impl Machine<'_> {
     }
 
     /// One `kevent` round, or the injection `tag` names. `timeout` `None` blocks.
-    fn wait(&mut self, kq: &Kqueue, tag: &str, timeout: Option<Duration>) -> Batch {
+    fn wait(&mut self, kq: &Kqueue, tag: &str, timeout: Option<Duration>) -> Result<Batch, Gone> {
         self.wait_with(kq, tag, timeout, false)
     }
 
     /// [`Self::wait`], reporting `SIGCHLD` only when `sigchld` (S3). Elsewhere a batch of
     /// `SIGCHLD` alone moves nothing: a timed wait returns it as its timeout, and an untimed one
     /// waits again.
-    fn wait_with(&mut self, kq: &Kqueue, tag: &str, timeout: Option<Duration>, sigchld: bool) -> Batch {
+    fn wait_with(&mut self, kq: &Kqueue, tag: &str, timeout: Option<Duration>, sigchld: bool) -> Result<Batch, Gone> {
         loop {
             let mut batch = match self.forces.take(tag) {
                 Some(directive) => injected(tag, &directive),
-                None => real_round(kq, timeout),
+                None => {
+                    if timeout.is_none() {
+                        // S6 ignores EOF; every other untimed wait ends on it.
+                        let until = if tag == "S6" { Until::Exit } else { Until::Eof };
+                        debug_assert!(
+                            until == Until::Exit || !self.eof_seen,
+                            "{tag} waits for an EOF that already came"
+                        );
+                        self.block(tag, until)?;
+                    }
+                    real_round(kq, timeout)
+                }
             };
             self.note_exit_seen |= batch.note_exit;
+            self.eof_seen |= batch.eof;
             batch.sigchld &= sigchld;
             if batch.any() || batch.sigchld || timeout.is_some() {
-                return batch;
+                return Ok(batch);
             }
         }
     }
 
-    fn enter(&self, state: &str) -> Result<(), Gone> {
+    fn enter(&mut self, state: &str) -> Result<(), Gone> {
         if self.trace {
             self.report(&format!("state {state}"))?;
         }
         Ok(())
     }
 
-    fn report(&self, text: &str) -> Result<(), Gone> {
-        if write_report(&self.marker, text) {
+    /// Reports the wait about to start at `state`, unless it is the last report.
+    fn block(&mut self, state: &str, until: Until) -> Result<(), Gone> {
+        let text = format!(
+            "blocking {state} {}",
+            match until {
+                Until::Eof => "eof",
+                Until::Exit => "exit",
+            }
+        );
+        if self.blocked.as_deref() != Some(text.as_str()) {
+            self.report(&text)?;
+            self.blocked = Some(text);
+        }
+        Ok(())
+    }
+
+    fn report(&mut self, text: &str) -> Result<(), Gone> {
+        self.blocked = None;
+        if !self.forces.take_exact("gone", text) && write_report(&self.marker, text) {
             Ok(())
         } else {
             Err(Gone)
         }
     }
 
-    fn report_then(&self, text: &str, next: Step) -> Step {
+    fn report_then(&mut self, text: &str, next: Step) -> Step {
         self.report(text)?;
         next
     }
 
-    /// Reports the failure and exits, whether or not the report could be written.
-    fn fail(&self, cause: &str, state: &str) -> Step {
-        match self.report(&format!("error {cause} {state}")) {
-            Ok(()) | Err(Gone) => EXIT,
-        }
+    /// Reports the failure and ends the run.
+    fn fail(&mut self, cause: impl std::fmt::Display, state: &str) -> Step {
+        self.report_then(&format!("error {cause} {state}"), EXIT)
     }
 }
 
@@ -700,23 +801,4 @@ fn write_report(marker: &str, text: &str) -> bool {
     let line = format!("\n{marker} {text}\n");
     let mut out = std::io::stdout().lock();
     out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_ok()
-}
-
-/// Writes a probe line to the inherited stderr through raw `io::stderr()`: libtest captures
-/// `eprintln!`, and discards it when the helper's own test passes.
-fn probe(text: &str) {
-    use std::io::Write as _;
-    // One `write` per line: the test process writes to the same stderr pipe.
-    let line = format!("{PROBE_MARKER} {text}\n");
-    std::io::stderr()
-        .lock()
-        .write_all(line.as_bytes())
-        .expect("write a probe line to stderr");
-}
-
-fn fmt_status(status: Result<u32, i32>) -> String {
-    match status {
-        Ok(status) => status.to_string(),
-        Err(e) => format!("errno {e}"),
-    }
 }
