@@ -1338,9 +1338,20 @@ fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
     );
 }
 
-/// A real leaf whose one member, a `cat`, entered it. For the lane tests.
+/// A real leaf whose one member, a `cat` blocked on a piped stdin, entered it. For the lane tests.
+///
+/// Returns the member's `ChildStdin` separately so a caller cannot forget it: the member's only
+/// job is to keep the leaf populated until a real kill through the leaf (under test in every
+/// caller) ends it, which needs the writer held for exactly that long. Dropping it, or
+/// `member.wait()` (which closes a piped stdin before waiting), is an EOF that ends the `cat`
+/// without any kill, so every caller either releases it from a seam that fires after the kill
+/// ([`drop_under_a_mount`]) or asserts the exit status carries `SIGKILL`.
 #[cfg(target_os = "linux")]
-fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process::Child) {
+fn entered_real_leaf() -> (
+    crate::containment::cgroup::CgroupLeaf,
+    std::process::Child,
+    std::process::ChildStdin,
+) {
     use std::os::unix::process::CommandExt;
 
     assert!(
@@ -1349,36 +1360,18 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     );
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
-    // `cat`, blocked reading a piped stdin, not `sleep 300`: this member's only job is to keep
-    // the leaf populated until a real kill (through the leaf, under test in every caller) ends
-    // it. A `sleep`-based member has its own 300s timer completely independent of that kill, so
-    // a caller whose assertion is merely "the leaf is gone" (not "gone because it was signalled")
-    // would still pass once that timer alone drains the leaf — the same vacuous-pass shape
-    // measured directly (300.01s) in this file's other group-kill tests. The real protection each
-    // caller below actually applies is one of: asserting the member's exit status carries
-    // `SIGKILL` (`cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf`,
-    // `cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf`),
-    // or reading whether the leaf directory was removed BEFORE ever calling the blocking
-    // `member.wait()` (`cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf`)
-    // — either one only holds if the kill, not the fixture's own end, is what happened.
-    let mut cmd = std::process::Command::new("cat");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null());
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
     unsafe {
         cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
     }
-    let member = cmd.spawn().expect("spawn a member");
-    // Deliberately NOT taken out of `member`: every caller either kills it for real before
-    // `wait()`-ing (which itself would also close this, but only after the real kill already
-    // ran) or checks something before ever touching `member` again, so leaving it inside is
-    // safe here — see `test_child::member_command`'s doc for the general
-    // hazard this would otherwise be.
+    let mut member = cmd.spawn().expect("spawn a member");
+    let stdin = member.stdin.take().expect("piped stdin");
     leaf.take_placement(member.id())
         .expect("decidable")
         .expect("the member entered the leaf");
-    (leaf, member)
+    (leaf, member, stdin)
 }
 
 /// Give the calling thread alone a mount namespace, private, so that every mount it makes stays in
@@ -1433,13 +1426,13 @@ fn drop_under_a_mount(
     leaf: crate::containment::cgroup::CgroupLeaf,
     over: std::path::PathBuf,
     marker: String,
-    member_stdin: Option<std::process::ChildStdin>,
+    member_stdin: std::process::ChildStdin,
 ) -> (Vec<log::Level>, Vec<String>) {
     crate::log_capture::install();
     std::thread::spawn(move || {
         enter_a_private_mount_namespace();
         mount_a_tmpfs_over(&over);
-        let mut stdin = member_stdin;
+        let mut stdin = Some(member_stdin);
         let _guard = on_each_drain_block(move |_| {
             if let Some(mut s) = stdin.take() {
                 crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
@@ -1465,10 +1458,9 @@ fn drop_under_a_mount(
 fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let (leaf, mut member) = entered_real_leaf();
+    let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
-    let stdin = member.stdin.take();
 
     let (levels, records) = drop_under_a_mount(leaf, leaf_path.clone(), name, stdin);
     let status = member.wait().expect("reap the member");
@@ -1496,7 +1488,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
     crate::log_capture::install();
     let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
         enter_a_private_mount_namespace();
-        let (leaf, mut member) = entered_real_leaf();
+        let (leaf, member, stdin) = entered_real_leaf();
         let leaf_path = leaf.leaf_path.clone();
         let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
         mount_a_tmpfs_over(&leaf_path);
@@ -1504,7 +1496,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
         // `hard_kill()`) — see `drop_under_a_mount`'s doc for why: a real kill makes this a no-op
         // past a dead pipe, while a `hard_kill()` mutated away lets the member exit on its own,
         // so `drop(leaf)` below is never a hang against nextest's slow-timeout bound.
-        let mut stdin = member.stdin.take();
+        let mut stdin = Some(stdin);
         let _guard = on_each_drain_block(move |_| {
             if let Some(mut s) = stdin.take() {
                 crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
@@ -1542,11 +1534,10 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let (leaf, mut member) = entered_real_leaf();
+    let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
     let parent = leaf_path.parent().expect("a parent").to_path_buf();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
-    let stdin = member.stdin.take();
 
     let (levels, _) = drop_under_a_mount(leaf, parent, name, stdin);
     let removed = !leaf_path.exists();
@@ -3105,7 +3096,7 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
-    use std::io::{BufRead, Read, Write as _};
+    use std::io::{BufRead, Read};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-group");
@@ -3162,7 +3153,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn fail_closed_kills_the_childs_whole_process_group() {
-    use std::io::{BufRead, Read, Write as _};
+    use std::io::{BufRead, Read};
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
     let dir = tempfile::tempdir().expect("tempdir");
