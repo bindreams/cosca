@@ -1000,7 +1000,7 @@ fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
             child.wait()?;
             Err(std::io::Error::new(kind, marker))
         }
-        None => child.kill(),
+        None => Ok(()),
     };
     #[cfg(not(test))]
     let killed = child.kill();
