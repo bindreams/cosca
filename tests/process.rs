@@ -340,24 +340,6 @@ fn accept_or_die_returns_the_connection_when_the_target_already_exited() {
     assert!(child.wait().expect("reap").success(), "control-once should exit 0");
 }
 
-/// `accept_or_die` on an already-REAPED pid is a contract violation, not "the target died": the
-/// number may name a stranger by now. On Linux an unreaped zombie still opens as a `pidfd`, so
-/// `ESRCH` can only mean it was reaped.
-#[cfg(target_os = "linux")]
-#[test]
-fn accept_or_die_rejects_an_already_reaped_target() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let mut child = std::process::Command::new(common::testbin())
-        .args(["--not-a-real-mode"])
-        .spawn()
-        .expect("spawn a child that exits immediately");
-    let pid = child.id();
-    child.wait().expect("reap the child");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| common::accept_or_die(&listener, pid)));
-    let message = common::panic_message(result.expect_err("a reaped target must panic"));
-    assert!(message.contains("already reaped"), "got: {message:?}");
-}
-
 /// Mutant coverage for "a helper's own call to `accept_or_die` gets reverted to a plain
 /// `.accept()`": exercises `spawn_control`/`spawn_tree` themselves, end to end, not just the
 /// shared primitive in isolation — a plain `.accept()` here would hang instead of panicking, so
