@@ -2,15 +2,22 @@
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
 //! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` on < 5.3 => Unsupported.
 
+use std::os::fd::{AsFd, BorrowedFd};
 use std::time::Instant;
 
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, ProcessId};
+use crate::identity::{Existence, Liveness, ProcView, ProcessId};
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
+///
+/// Every `/proc` read the verdict rests on goes through ONE `/proc` dirfd, and only after that
+/// `/proc` is shown to describe `id`'s pid namespace; otherwise the answer is
+/// [`Error::Unassessable`] naming why — never a `Gone` read off a `/proc` that may be
+/// describing an unrelated process. The one `Gone` that needs no `/proc` is `kill(pid, 0)`
+/// answering `ESRCH`, which resolves `pid` in this process's own namespace.
 pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
@@ -18,56 +25,145 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
         id.pid()
     );
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
-    let pidfd = match pidfd_open_checked(raw) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::SRCH) => return Ok(None),
+    match pidfd_open_checked(raw) {
+        Ok(pidfd) => verify_pidfd_target(id, pidfd, what),
+        Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
         // ENOENT (>= 6.16) means either a reaped process-group leader whose pid lives on as a PGID
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
-        // waits. Errno alone can't tell, so re-verify via exists() and is_alive(). Unknown is
-        // never treated as gone.
-        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => {
-            return match exists_checked(id) {
-                Existence::Gone => Ok(None),
-                Existence::Present => match alive_checked(id) {
-                    Liveness::Dead => Ok(None),
-                    Liveness::Alive => Err(Error::NotThreadGroupLeader {
-                        pid: id.pid(),
-                        detail: what.into(),
-                        source: std::io::Error::from(e),
-                    }),
-                    Liveness::Unknown => Err(identity_unassessable(id, what, Some(e))),
-                },
-                Existence::Unknown => Err(identity_unassessable(id, what, Some(e))),
-            };
-        }
-        Err(rustix::io::Errno::NOSYS) => {
-            return Err(Error::Unsupported {
-                op: "foreign process wait/kill".into(),
-                platform: "linux",
-                detail: "pidfd_open requires Linux kernel >= 5.3".into(),
-            });
-        }
-        Err(e) => return Err(Error::Io(std::io::Error::from(e))),
-    };
-    // Re-verify: a pid recycled before open means the original is already gone. An
-    // unassessable pid (hidepid, EPERM) is NOT gone and must not be treated as one.
-    match exists_checked(id) {
-        Existence::Present => Ok(Some(pidfd)),
-        Existence::Gone => Ok(None),
-        Existence::Unknown => Err(identity_unassessable(id, what, None)),
+        // waits. Errno alone can't tell, so re-verify.
+        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, what, e),
+        Err(rustix::io::Errno::NOSYS) => Err(Error::Unsupported {
+            op: "foreign process wait/kill".into(),
+            platform: "linux",
+            detail: "pidfd_open requires Linux kernel >= 5.3".into(),
+        }),
+        Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }
 }
 
-/// `id`'s existence or liveness could not be established: logs at `warn` and builds the
-/// `Unassessable` error. Never treated as gone. `errno` is the `pidfd_open` failure that made the
-/// query necessary, if any.
-fn identity_unassessable(id: ProcessId, what: &'static str, errno: Option<rustix::io::Errno>) -> Error {
-    let cause = errno.map_or(String::new(), |e| format!(" (pidfd_open: {e})"));
-    log::warn!("wait: pid {} identity could not be confirmed{cause}; {what}", id.pid());
+/// `pidfd_open` refused `id`'s pid with `errno`. `Ok(None)` when the process is provably gone;
+/// otherwise an error, since a live target cannot be waited on or signalled through a pidfd.
+///
+/// - `kill(pid, 0)` answering `ESRCH` is `Gone` whatever `/proc` shows.
+/// - Else the `/proc` view must be [`ProcView::Same`]: `Gone` means the process is gone.
+///   `Present` is a non-leader thread: `Dead` (a ptraced zombie) is exited, `Alive` is
+///   [`Error::NotThreadGroupLeader`]. `Unknown` from either query is `Unassessable`.
+/// - `Diverged`, or a view that could not be established, is `Unassessable` naming the view and
+///   the `pidfd_open` errno. A raw `Io` here would surface as a bare `NotFound` on 6.16+, which
+///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
+///   `kill(2)`.
+///
+/// Without a pidfd there is nothing to cross-check the view against, so this reads `NSpid`
+/// (`identity::linux::proc_view`). A kernel that omits `NSpid` while having pid namespaces
+/// (gVisor) is `Unassessable` here only.
+fn verify_without_pidfd(
+    id: ProcessId,
+    what: &'static str,
+    errno: rustix::io::Errno,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    if id.signal_says_no_such_process() {
+        return Ok(None);
+    }
+    match crate::identity::proc_view() {
+        ProcView::Same(proc_dir) => match exists_checked(id, proc_dir.as_fd()) {
+            Existence::Gone => Ok(None),
+            Existence::Present => match alive_checked(id, proc_dir.as_fd()) {
+                Liveness::Dead => Ok(None),
+                Liveness::Alive => Err(Error::NotThreadGroupLeader {
+                    pid: id.pid(),
+                    detail: what.into(),
+                    source: std::io::Error::from(errno),
+                }),
+                Liveness::Unknown => Err(unassessable(
+                    id,
+                    what,
+                    "the OS refused the liveness query",
+                    None,
+                    Some(errno),
+                )),
+            },
+            Existence::Unknown => Err(unassessable(
+                id,
+                what,
+                "the OS refused the existence query",
+                None,
+                Some(errno),
+            )),
+        },
+        ProcView::Diverged => Err(unassessable(
+            id,
+            what,
+            "this process's /proc is an outer pid namespace's (NSpid has several entries)",
+            None,
+            Some(errno),
+        )),
+        ProcView::Unassessable(why) => Err(unassessable(id, what, &why.reason, why.source, Some(errno))),
+    }
+}
+
+/// `pidfd_open` succeeded. Confirm that this process's `/proc` describes the target before
+/// comparing its start token, and read that token through the same `/proc` dirfd.
+///
+/// The pidfd's fdinfo `Pid:` is the target as the mounted procfs numbers it (`0` if invisible
+/// there). Equal to `id.pid()` means that procfs names the target under this number, so
+/// `{pid}/stat` describes it: the start token then tells a recycled pid from the original.
+/// Anything else is `Unassessable`. This does not read `NSpid`, which `CONFIG_PID_NS`-less
+/// kernels and gVisor omit.
+fn verify_pidfd_target(
+    id: ProcessId,
+    pidfd: rustix::fd::OwnedFd,
+    what: &'static str,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    let proc_dir = crate::identity::open_proc_dir()
+        .map_err(|e| unassessable(id, what, "/proc could not be opened", Some(e), None))?;
+    match crate::identity::pidfd_pid_in_view(proc_dir.as_fd(), pidfd.as_fd()) {
+        Ok(pid) if pid == id.pid() => {}
+        Ok(pid) => {
+            return Err(unassessable(
+                id,
+                what,
+                &format!(
+                    "the mounted /proc numbers the target {pid} (0 = invisible), so it is an outer pid namespace's"
+                ),
+                None,
+                None,
+            ));
+        }
+        Err(why) => return Err(unassessable(id, what, &why.reason, why.source, None)),
+    }
+    // A pid recycled before open means the original is already gone. An unassessable pid
+    // (hidepid, EPERM) is NOT gone and must not be treated as one.
+    match exists_checked(id, proc_dir.as_fd()) {
+        Existence::Present => Ok(Some(pidfd)),
+        Existence::Gone => Ok(None),
+        // The decision site `read_stat`-s debug-level probe relies on.
+        Existence::Unknown => Err(unassessable(id, what, "the OS refused the existence query", None, None)),
+    }
+}
+
+/// [`Error::Unassessable`] for `id`, logged at `warn`. `why` (with `source`'s text, if any) and
+/// the `pidfd_open` errno, if there was one, are in the message, so the cause survives a
+/// caller that only prints it; `source()` is the OS error behind `why`, else the errno.
+fn unassessable(
+    id: ProcessId,
+    what: &'static str,
+    why: &str,
+    source: Option<std::io::Error>,
+    pidfd_errno: Option<rustix::io::Errno>,
+) -> Error {
+    let mut detail = format!("pid {} identity could not be confirmed: {why}", id.pid());
+    if let Some(source) = &source {
+        detail.push_str(&format!(": {source}"));
+    }
+    if let Some(errno) = pidfd_errno {
+        detail.push_str(&format!(" (pidfd_open: {errno})"));
+    }
+    detail.push_str(&format!("; {what}"));
+    log::warn!("wait: {detail}");
     Error::Unassessable {
-        detail: format!("pid {} identity could not be confirmed{cause}; {what}", id.pid()),
-        source: errno.map(std::io::Error::from),
+        detail,
+        source: source.or_else(|| pidfd_errno.map(std::io::Error::from)),
     }
 }
 
@@ -85,32 +181,34 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
     pidfd_open(raw, PidfdFlags::empty())
 }
 
-/// `id.exists()`, with a test seam: a forced [`Existence`] (see [`fault::force_exists_once`])
-/// replaces the `/proc` read once, to drive the `Unknown` arms.
+/// `id.exists_in(proc_dir)`, with a test seam: a forced [`Existence`] (see
+/// [`fault::force_exists_once`]) replaces the `/proc` read once, to drive the `Unknown` arms; runs
+/// [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
-fn exists_checked(id: ProcessId) -> Existence {
+fn exists_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Existence {
+    fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
-        None => id.exists(),
+        None => id.exists_in(proc_dir),
     }
 }
 #[cfg(not(test))]
-fn exists_checked(id: ProcessId) -> Existence {
-    id.exists()
+fn exists_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Existence {
+    id.exists_in(proc_dir)
 }
 
-/// `id.is_alive()`, with a test seam: a forced [`Liveness`] (see [`fault::force_alive_once`])
-/// replaces the `/proc` read once.
+/// `id.is_alive_in(proc_dir)`, with a test seam: a forced [`Liveness`] (see
+/// [`fault::force_alive_once`]) replaces the `/proc` read once.
 #[cfg(test)]
-fn alive_checked(id: ProcessId) -> Liveness {
+fn alive_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Liveness {
     match fault::take_forced_alive() {
         Some(liveness) => liveness,
-        None => id.is_alive(),
+        None => id.is_alive_in(proc_dir),
     }
 }
 #[cfg(not(test))]
-fn alive_checked(id: ProcessId) -> Liveness {
-    id.is_alive()
+fn alive_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Liveness {
+    id.is_alive_in(proc_dir)
 }
 
 #[cfg(test)]
@@ -121,6 +219,31 @@ pub(crate) mod fault {
         static FORCE_PIDFD_OPEN_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
         static FORCE_ALIVE: Cell<Option<Liveness>> = const { Cell::new(None) };
+        static BETWEEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Clears the between-check-and-read hook on drop, consumed or not.
+    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
+    pub(crate) struct BetweenHook(());
+
+    /// Run `hook` once on THIS thread, after `open_verified` has checked that `/proc` describes
+    /// the target and before it reads `{pid}/stat`: the window in which a `/proc` looked up by
+    /// path could differ from the one that was checked.
+    pub(crate) fn between_check_and_read(hook: impl FnOnce() + 'static) -> BetweenHook {
+        BETWEEN_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        BetweenHook(())
+    }
+
+    impl Drop for BetweenHook {
+        fn drop(&mut self) {
+            BETWEEN_HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn run_between_hook() {
+        if let Some(hook) = BETWEEN_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     /// Disarms the forced errno on drop, so an unconsumed force can't leak into the next test on
@@ -170,8 +293,8 @@ pub(crate) mod fault {
     #[must_use = "dropping this immediately disarms the forced liveness; bind it for the probe's duration"]
     pub(crate) struct ForcedAlive(());
 
-    /// Force the NEXT `id.is_alive()` inside `open_verified` on THIS thread to answer `liveness`,
-    /// consumed the first time it's read.
+    /// Force the NEXT `id.is_alive_in(..)` inside `open_verified` on THIS thread to answer
+    /// `liveness`, consumed the first time it's read.
     pub(crate) fn force_alive_once(liveness: Liveness) -> ForcedAlive {
         FORCE_ALIVE.with(|f| f.set(Some(liveness)));
         ForcedAlive(())
@@ -245,3 +368,7 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 #[cfg(test)]
 #[path = "linux_tests.rs"]
 mod linux_tests;
+
+#[cfg(test)]
+#[path = "linux_namespace_tests.rs"]
+mod linux_namespace_tests;

@@ -2,7 +2,13 @@
 //! `/proc/<pid>/stat` as the start token; `is_running` via process state; `created_at` via
 //! `/proc/stat` `btime` and `_SC_CLK_TCK`.
 
+#[path = "linux/proc_view.rs"]
+pub(crate) mod proc_view;
+
+use std::os::fd::BorrowedFd;
 use std::time::{Duration, SystemTime};
+
+use rustix::fs::{Mode, OFlags};
 
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
@@ -28,7 +34,27 @@ fn signal_probe(pid: RawPid) -> SignalProbe {
 /// `hidepid` mount another user's `/proc/<pid>` is invisible, so a LIVE process yields
 /// `ENOENT`; and a task that exits mid-read yields `ESRCH`, which has no `ErrorKind`.
 fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
-    match std::fs::read(format!("/proc/{pid}/stat")) {
+    read_stat_with(pid, || std::fs::read(format!("/proc/{pid}/stat")))
+}
+
+/// [`read_stat`] through the `/proc` at `proc_dir` (`openat`), so a caller that verified that
+/// `/proc` reads exactly the mount it verified.
+fn read_stat_in(proc_dir: BorrowedFd<'_>, pid: RawPid) -> Resolved<Vec<u8>> {
+    read_stat_with(pid, || {
+        let fd = rustix::fs::openat(
+            proc_dir,
+            format!("{pid}/stat"),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn read_stat_with(pid: RawPid, read: impl FnOnce() -> std::io::Result<Vec<u8>>) -> Resolved<Vec<u8>> {
+    match read() {
         Ok(bytes) => Resolved::Found(bytes),
         Err(e) => match classify_unreadable(signal_probe(pid)) {
             Resolved::Gone => Resolved::Gone,
@@ -42,8 +68,24 @@ fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
     }
 }
 
+/// Whether `kill(pid, 0)` answers `ESRCH`. It resolves `pid` in THIS process's pid namespace,
+/// which is the one a caller's pid lives in, so unlike a `/proc` read this answer does not
+/// depend on which namespace `/proc` describes.
+pub(super) fn signal_says_no_such_process(pid: RawPid) -> bool {
+    signal_probe(pid) == SignalProbe::NoSuchProcess
+}
+
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
-    match read_stat(pid) {
+    start_token_from(pid, read_stat(pid))
+}
+
+/// [`start_token`], read through the `/proc` at `proc_dir`.
+pub(super) fn start_token_in(proc_dir: BorrowedFd<'_>, pid: RawPid) -> Resolved<StartToken> {
+    start_token_from(pid, read_stat_in(proc_dir, pid))
+}
+
+fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken> {
+    match stat {
         // RAW jiffies are the identity token — NOT converted to wall-clock.
         Resolved::Found(stat) => match parse_starttime_jiffies(&stat) {
             Some(j) => Resolved::Found(StartToken::from_raw(j)),
@@ -63,6 +105,15 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
     match read_stat(pid) {
         Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
         Resolved::Gone => Liveness::Dead, // gone (reaped) => not running
+        Resolved::Unknown => Liveness::Unknown,
+    }
+}
+
+/// [`is_running`], read through the `/proc` at `proc_dir`.
+pub(super) fn is_running_in(proc_dir: BorrowedFd<'_>, pid: RawPid, start: StartToken) -> Liveness {
+    match read_stat_in(proc_dir, pid) {
+        Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
+        Resolved::Gone => Liveness::Dead,
         Resolved::Unknown => Liveness::Unknown,
     }
 }

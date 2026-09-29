@@ -15,26 +15,47 @@ use fixture::{
     ChildStep,
 };
 
-/// Spawn a parked thread and return its tid, with a channel that releases it.
-fn spawn_parked_worker() -> (ProcessId, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let worker = std::thread::spawn(move || {
-        // SAFETY: SYS_gettid takes no arguments and always succeeds.
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
-        tid_tx.send(tid).expect("send tid to the test thread");
-        _ = stop_rx.recv();
-    });
-    let tid = tid_rx.recv().expect("recv tid from the worker thread");
-    let id = ProcessId::of(tid as u32)
-        .found()
-        .expect("the live worker thread's tid resolves to an identity");
-    assert_ne!(
-        id.pid(),
-        std::process::id(),
-        "the tid must not be this process's own thread-group leader pid"
-    );
-    (id, stop_tx, worker)
+/// A tid that is live but not a thread-group leader, for as long as this value lives.
+pub(super) struct LiveNonLeaderTid {
+    pub(super) id: ProcessId,
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LiveNonLeaderTid {
+    pub(super) fn spawn() -> Self {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // SAFETY: SYS_gettid takes no arguments and always succeeds.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            tid_tx.send(tid).expect("send tid to the test thread");
+            _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().expect("recv tid from the worker thread");
+        let id = ProcessId::of(tid as u32)
+            .found()
+            .expect("the live worker thread's tid resolves to an identity");
+        assert_ne!(
+            id.pid(),
+            std::process::id(),
+            "the tid must not be this process's own thread-group leader pid"
+        );
+        LiveNonLeaderTid {
+            id,
+            stop_tx: Some(stop_tx),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for LiveNonLeaderTid {
+    fn drop(&mut self) {
+        drop(self.stop_tx.take());
+        if let Some(worker) = self.worker.take() {
+            _ = worker.join();
+        }
+    }
 }
 
 /// A reaped process-group leader whose group lives on reports exited. Real syscall: `EINVAL` on
@@ -81,11 +102,37 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval()
     fixture.release_and_confirm_m_exited();
 }
 
+/// A reaped leader is exited whatever `/proc` view this process has: `kill(pid, 0)` answering
+/// `ESRCH` resolves the pid in this process's own namespace, needing no `/proc` at all. Without
+/// `/proc`, `exists()` already fell back to that probe before this stack, so a view that cannot
+/// be established must not turn an `ESRCH` into an error (pre-6.16 it used to be `Gone`).
+#[test]
+fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let (l_id, fixture) = build_reaped_pgid_leader();
+    for view in [ForcedView::Diverged, ForcedView::Unassessable] {
+        let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
+        let forced_view = force_proc_view_once(view);
+        let result = super::block_until_exit(l_id, None);
+        drop(forced_view);
+        drop(forced_errno);
+        assert!(
+            matches!(result, Ok(true)),
+            "a reaped leader is exited under a {view:?} view, got {result:?}"
+        );
+    }
+
+    fixture.release_and_confirm_m_exited();
+}
+
 /// A live non-leader tid with `pidfd_open` forced to `ENOENT` is `NotThreadGroupLeader` carrying
 /// the pid and the errno, not exited.
 #[test]
 fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
-    let (id, stop_tx, worker) = spawn_parked_worker();
+    let worker = LiveNonLeaderTid::spawn();
+    let id = worker.id;
 
     let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let result = super::block_until_exit(id, None);
@@ -97,9 +144,73 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
         }
         other => panic!("a forced ENOENT on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
     }
+}
 
-    _ = stop_tx.send(());
-    worker.join().expect("join the worker thread");
+/// `Unassessable` carrying `needles` in its message, with an OS error as `source()` iff
+/// `expect_source`, logged once at `warn` (`marker` finds the record).
+fn assert_unassessable_with_cause(
+    result: Result<bool, crate::error::Error>,
+    needles: &[&str],
+    expect_source: bool,
+    marker: &str,
+    mark: usize,
+) {
+    use std::error::Error as _;
+
+    let err = match result {
+        Err(e @ crate::error::Error::Unassessable { .. }) => e,
+        other => panic!("expected Unassessable, got {other:?}"),
+    };
+    let text = err.to_string();
+    for needle in needles {
+        assert!(text.contains(needle), "{needle:?} missing from the message: {text}");
+    }
+    assert_eq!(
+        err.source().is_some(),
+        expect_source,
+        "source() must be the OS error behind the cause, when there is one: {text}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, marker),
+        vec![log::Level::Warn],
+        "the verdict must be logged once, at warn: {text}"
+    );
+}
+
+/// A live non-leader tid under a DIVERGED view: `Unassessable` naming the view and the
+/// `pidfd_open` errno, never a raw errno (a bare `NotFound` from `ENOENT` on 6.16+ reads as "gone").
+
+#[test]
+fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+
+    crate::log_capture::install();
+    let worker = LiveNonLeaderTid::spawn();
+    let marker = format!("pid {} identity could not be confirmed", worker.id.pid());
+    let mark = crate::log_capture::mark();
+    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
+    let forced_view = force_proc_view_once(ForcedView::Diverged);
+    let result = super::block_until_exit(worker.id, None);
+    drop(forced_view);
+    drop(forced_errno);
+    assert_unassessable_with_cause(result, &["outer pid namespace", "pidfd_open: "], true, &marker, mark);
+}
+
+/// Twin for a view that could not be established: the reason is in the message.
+#[test]
+fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_unreadable() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+
+    crate::log_capture::install();
+    let worker = LiveNonLeaderTid::spawn();
+    let marker = format!("pid {} identity could not be confirmed", worker.id.pid());
+    let mark = crate::log_capture::mark();
+    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
+    let forced_view = force_proc_view_once(ForcedView::Unassessable);
+    let result = super::block_until_exit(worker.id, None);
+    drop(forced_view);
+    drop(forced_errno);
+    assert_unassessable_with_cause(result, &["forced by a test", "pidfd_open: "], true, &marker, mark);
 }
 
 /// A non-leader tid that has exited but is not yet reaped (a ptraced zombie thread) reads
@@ -107,7 +218,8 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
 /// fixture is in `tests/linux_pidfd_wait.rs`.
 #[test]
 fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
-    let (id, stop_tx, worker) = spawn_parked_worker();
+    let worker = LiveNonLeaderTid::spawn();
+    let id = worker.id;
 
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let forced_alive = super::fault::force_alive_once(Liveness::Dead);
@@ -118,9 +230,6 @@ fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
         matches!(result, Ok(true)),
         "a Present but Dead non-leader tid must report exited (Ok(true)), not {result:?}"
     );
-
-    _ = stop_tx.send(());
-    worker.join().expect("join the worker thread");
 }
 
 /// The `INVAL`/`NOENT` arm's liveness check refused: `Unassessable` carrying the errno and one
@@ -128,7 +237,8 @@ fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
 #[test]
 fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
     crate::log_capture::install();
-    let (id, stop_tx, worker) = spawn_parked_worker();
+    let worker = LiveNonLeaderTid::spawn();
+    let id = worker.id;
     let marker = format!("pid {} identity could not be confirmed", id.pid());
     let mark = crate::log_capture::mark();
 
@@ -150,38 +260,22 @@ fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
         vec![log::Level::Warn],
         "the Unassessable verdict must be logged once, at warn"
     );
-
-    _ = stop_tx.send(());
-    worker.join().expect("join the worker thread");
 }
 
 /// The `Unknown` branch of the `INVAL`/`NOENT` arm can't be produced for real, so both the errno
 /// and the exists() answer are forced. Unknown must be `Unassessable` carrying the errno + one
 /// warn, never exited.
 #[test]
-fn block_until_exit_is_unassessable_when_the_einval_arms_exists_is_unknown() {
+fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     crate::log_capture::install();
-    let id = ProcessId::current();
-    let marker = format!("pid {} identity could not be confirmed", id.pid());
+    let what = "einval-arm-exists-unknown probe";
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::block_until_exit(id, None);
+    let result = super::open_verified(ProcessId::current(), what);
     drop(forced_exists);
     drop(forced_errno);
-    match result {
-        Err(Error::Unassessable {
-            source: Some(source), ..
-        }) => {
-            assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
-        }
-        other => panic!("Existence::Unknown on the EINVAL/ENOENT arm must be Unassessable, got {other:?}"),
-    }
-    assert_eq!(
-        crate::log_capture::levels_since(mark, &marker),
-        vec![log::Level::Warn],
-        "the Unassessable verdict must be logged once, at warn"
-    );
+    assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], true, what, mark);
 }
 
 /// Twin for the post-open re-verify: a real pidfd on a live child, `exists()` forced `Unknown`.
@@ -333,4 +427,84 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
         .expect("the forking thread finishes once the lock is free");
     assert_eq!(rx.recv().expect("the forking thread reports its fork"), Event::Forked);
     reap(child);
+}
+
+/// The SUCCESS path with the pidfd's fdinfo `Pid:` forced: the target's pid as the mounted
+/// procfs numbers it. `ProcessId::current()` is a live target, so `pidfd_open` really succeeds.
+///
+/// `what` is unique per test: it is the marker a test finds its own log record by, since every
+/// test using `ProcessId::current()` shares one pid.
+fn open_verified_current_with_fdinfo(
+    answer: Result<u32, i32>,
+    what: &'static str,
+) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
+    let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
+    let result = super::open_verified(ProcessId::current(), what);
+    drop(forced);
+    result
+}
+
+/// A pidfd whose fdinfo `Pid:` is not `id.pid()` (another pid, or `0` = invisible) describes a
+/// `/proc` that is not the target's namespace: `Unassessable`, never a stat comparison.
+
+#[test]
+fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
+    crate::log_capture::install();
+    let own = std::process::id();
+    for (named, what) in [
+        (0, "fdinfo-names-pid-0 probe"),
+        (own + 1, "fdinfo-names-other-pid probe"),
+    ] {
+        let mark = crate::log_capture::mark();
+        let result = open_verified_current_with_fdinfo(Ok(named), what);
+        assert_unassessable_with_cause(
+            result.map(|fd| fd.is_some()),
+            &["outer pid namespace", &format!("numbers the target {named}")],
+            false,
+            what,
+            mark,
+        );
+    }
+}
+
+/// An fdinfo that cannot be read is `Unassessable` naming the OS error as its cause.
+#[test]
+fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
+    crate::log_capture::install();
+    let what = "fdinfo-unreadable probe";
+    let mark = crate::log_capture::mark();
+    let result = open_verified_current_with_fdinfo(Err(libc::EACCES), what);
+    assert_unassessable_with_cause(
+        result.map(|fd| fd.is_some()),
+        &["fdinfo could not be read"],
+        true,
+        what,
+        mark,
+    );
+}
+
+/// The match case: an fdinfo `Pid:` equal to `id.pid()` proceeds to the start-token comparison
+/// through the same `/proc` dirfd.
+#[test]
+fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
+    let forced = open_verified_current_with_fdinfo(Ok(std::process::id()), "fdinfo-matches probe");
+    assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
+    let unforced = super::open_verified(ProcessId::current(), "test probe");
+    assert!(
+        matches!(unforced, Ok(Some(_))),
+        "the real fdinfo must match too, got {unforced:?}"
+    );
+}
+
+/// The success path's own `Existence::Unknown` (the OS refused the stat read) is `Unassessable`,
+/// never `Gone`.
+#[test]
+fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
+    crate::log_capture::install();
+    let what = "success-path-exists-unknown probe";
+    let mark = crate::log_capture::mark();
+    let forced = super::fault::force_exists_once(Existence::Unknown);
+    let result = super::open_verified(ProcessId::current(), what);
+    drop(forced);
+    assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], false, what, mark);
 }
