@@ -5,7 +5,7 @@
 //!
 //! - The target is an unreaped child the caller owns: a [`Target`] (`cosca::Child`,
 //!   `std::process::Child`). A pid only names a process while it is an unreaped child (a zombie
-//!   at worst) or a handle to it is open (docs/principles.md, principle 4). Every entry point
+//!   at worst) or a handle to it is open. Every entry point
 //!   first calls [`Target::has_exited`], a `try_wait`: `true` means the target is dead (and now
 //!   reaped, its status cached for the caller's own later `wait`), so the pid is never opened;
 //!   `false` means it is unreaped now and stays so, because nothing but the caller's own `wait`
@@ -126,28 +126,17 @@ pub fn accept_or_die(listener: &TcpListener, target: &mut impl Target) -> TcpStr
     accept_or_die_also(listener, target, None)
 }
 
-/// Blocks until either `listener` gets an incoming connection, or `target` (or `also`) exits
-/// first, via the OS's own process-exit notification (a `pidfd` on Linux, a `kqueue`'s
-/// `EVFILT_PROC`/`NOTE_EXIT` on macOS, a process HANDLE via `WaitForMultipleObjects` on
-/// Windows), never a pipe. A pipe's EOF is hidden by any descendant still holding its write end
-/// open: measured, `sh -c 'sleep 8 & exit 3'` reports its OWN exit only 8s later through a
-/// pipe-EOF proxy. A plain blocking `accept()` would hang forever if the target dies first, for
-/// the same reason; this doesn't.
+/// Blocks until either `listener` gets a connection, or `target` (or `also`) exits first, via the
+/// OS's own exit notification (a `pidfd` on Linux, a `kqueue` `NOTE_EXIT` on macOS, a process
+/// HANDLE on Windows), never a pipe: a descendant holding the pipe's write end open hides the
+/// target's own exit from its EOF. A connection is accepted and acked (see the module doc).
 ///
-/// No thread, no reconnect: an earlier revision death-watched the target on a thread and, on
-/// death, RECONNECTED to `listener`'s own address to signal it, which is unsound: once the target
-/// and this function have moved on, nothing keeps that port reserved, and the OS can and does
-/// reissue it (observed on macOS) to an unrelated later listener.
+/// An exit is checked before the listener on Linux and Windows, and among simultaneously returned
+/// events on macOS. Both being ready means the target broke the ack handshake; either verdict then
+/// reports that misuse.
 ///
-/// On a connection it accepts and writes the ack byte (see the module doc). Exits are checked
-/// before the listener on Linux and Windows, and among events the kernel returns together on
-/// macOS. It does not
-/// matter which wins when both are ready: the target cannot legitimately have exited with its
-/// connection unacked, so a ready listener alongside an exit belongs to a target that broke the
-/// handshake, and either verdict then is the harness reporting that misuse.
-///
-/// `also` exists for a tree whose root is alive but whose grandchild died before connecting:
-/// watching the root alone would wait forever.
+/// `also` covers a tree whose root is alive but whose grandchild died before connecting: watching
+/// the root alone would wait forever.
 pub fn accept_or_die_also(listener: &TcpListener, target: &mut impl Target, also: Option<ProcessId>) -> TcpStream {
     let pid = target.pid();
     debug_assert_ne!(Some(pid), also.map(|id| id.pid()), "the two watched pids must differ");

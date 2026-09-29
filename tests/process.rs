@@ -299,13 +299,7 @@ impl common::Target for AlreadyDead {
     }
 }
 
-/// `accept_or_die`'s reason to exist: a dead-before-connecting target must panic, not hang the
-/// caller forever, and on the "died" message naming the target, not merely on ANY panic.
-///
-/// Named mutants: a plain blocking `accept()` (hangs; only nextest's bound in
-/// `.config/nextest.toml` can fail it) and, on Windows, swapped indices in the
-/// `WaitForMultipleObjects` handle array (the exit is then read as "a connection is ready" and the
-/// blocking accept hangs).
+/// A target that dies before connecting makes `accept_or_die` panic naming it, not hang.
 #[test]
 fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     use std::net::TcpListener;
@@ -320,15 +314,9 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     child.wait().expect("reap the already-exited child");
 }
 
-/// An exit AFTER the watch is armed: the target is alive when `accept_or_die` starts, and the
-/// armed hook (which runs once the watches are in place, just before the wait blocks) closes its
-/// stdin so it exits. This reaches the OS exit notification on every platform (pidfd, kqueue
-/// `NOTE_EXIT`, process handle), which the tests above mostly bypass by the target being dead
-/// before the call.
-///
-/// Named mutants: the target's exit watch dropped from the wait set on any platform (the wait
-/// then blocks forever; only nextest's bound fails it, since nothing else can observe a wait that
-/// never returns).
+/// An exit AFTER the watch is armed. The target is alive when `accept_or_die` starts; the armed
+/// hook, which runs once the watches are in place, closes its stdin so it exits. This reaches the
+/// OS exit notification itself (pidfd, kqueue `NOTE_EXIT`, process handle).
 #[test]
 fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     use std::net::TcpListener;
@@ -355,13 +343,8 @@ fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     child.wait().expect("reap");
 }
 
-/// The exit check comes before any pid is opened: a target that `has_exited` is dead, and its pid
-/// (here one that cannot exist) is never handed to `pidfd_open`/`kqueue`/`OpenProcess`, where a
-/// reaped pid could name a stranger.
-///
-/// Named mutant: skipping `has_exited` in `accept_or_die_also` (on Linux `pidfd_open` then fails
-/// with ESRCH and the panic is the contract violation, not "died"; on macOS and Windows the
-/// missing pid also reads as dead, so only the call count catches it there).
+/// A target that `has_exited` is dead, and its pid (here one that cannot exist) is never opened:
+/// a reaped pid could name a stranger.
 #[test]
 fn accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
     use std::net::TcpListener;
@@ -385,15 +368,8 @@ fn a_reaped_std_child_is_reported_exited() {
     assert!(child.has_exited());
 }
 
-/// A target that connects and exits without waiting for the accept ack (it is not opted in) is
-/// dead, whether or not its connection made it into the accept queue: the exit alone decides, so
-/// no race on the queue's state can flip the verdict. The target is waited to completion first,
-/// so `has_exited` is what reports it.
-///
-/// Named mutant: consulting the listener when the target has exited (a final non-blocking accept
-/// returning the queued connection). It returns the connection instead of panicking whenever the
-/// connection is already queued, which is the usual case; the outcome is decided by the queue,
-/// which is exactly the race this design removes.
+/// A target that connects and exits without waiting for the ack is dead whether or not its
+/// connection reached the accept queue: the exit alone decides.
 #[test]
 fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     use std::net::TcpListener;
@@ -410,11 +386,7 @@ fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_d
     assert_died_before_connecting(&message, pid);
 }
 
-/// The ack is what lets an opted-in target proceed: it is written on the accepted connection
-/// before `accept_or_die` returns. The target sends its tag only after the ack.
-///
-/// Named mutant: not writing the ack. The target then blocks forever and the tag read hangs; only
-/// nextest's bound can fail that.
+/// The ack is written on the accepted connection; the opted-in target sends its tag only after it.
 #[test]
 fn accept_or_die_acks_the_connection_it_accepts() {
     use std::net::TcpListener;
@@ -433,13 +405,9 @@ fn accept_or_die_acks_the_connection_it_accepts() {
     child.wait().expect("reap");
 }
 
-/// A descendant that is gone (here: reaped, so its identity no longer resolves) is reported dead
-/// rather than watched or panicked over, on every platform: Linux `pidfd_open` ESRCH or a stranger
-/// on the reissued pid, macOS `EV_ADD` ESRCH, Windows `OpenProcess` failing with
-/// `ERROR_INVALID_PARAMETER`. The target is alive throughout.
-///
-/// Named mutants: Windows mapping `ERROR_INVALID_PARAMETER` to a panic, and Linux mapping ESRCH to
-/// a panic (both fail this test fast).
+/// A descendant that is gone (reaped, so its identity no longer resolves) is reported dead, not
+/// panicked over: Linux `pidfd_open` ESRCH, macOS `EV_ADD` ESRCH, Windows `OpenProcess` failing
+/// with `ERROR_INVALID_PARAMETER`. The target is alive throughout.
 #[test]
 fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
     use std::net::TcpListener;
@@ -467,13 +435,9 @@ fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
     target.wait().expect("reap the target");
 }
 
-/// The identity is confirmed after the watch is opened: a pid that is now running a DIFFERENT
-/// process (here: a live process, with an identity forged to differ in its start token, which is
-/// what a reissued pid looks like) is reported as the descendant being gone, never watched. The
-/// stranger stays alive for the whole test, so an unconfirmed watch would block forever.
-///
-/// Named mutant: skipping the `exists()` confirmation (the stranger is watched; only nextest's
-/// bound fails it).
+/// A pid now running a DIFFERENT process (a live one, with the identity forged to differ in its
+/// start token, which is what a reissued pid looks like) is reported as the descendant being gone,
+/// never watched.
 #[test]
 fn accept_or_die_also_does_not_watch_a_reissued_pid() {
     use std::net::TcpListener;
@@ -504,11 +468,7 @@ fn accept_or_die_also_does_not_watch_a_reissued_pid() {
     }
 }
 
-/// `wait_handles` reports the OS error of a failed wait as itself, captured before anything can
-/// overwrite it.
-///
-/// Named mutant: any call between `WaitForMultipleObjects` and `last_os_error` that resets the
-/// thread's last error (it then reads 0).
+/// `wait_handles` reports the OS error of a failed wait, captured before anything can overwrite it.
 #[cfg(windows)]
 #[test]
 fn wait_handles_reports_the_os_error_of_a_failed_wait() {
@@ -519,11 +479,7 @@ fn wait_handles_reports_the_os_error_of_a_failed_wait() {
 
 // Tree helpers =====
 
-/// Mutant coverage for "a helper's own call to `accept_or_die` gets reverted to a plain
-/// `.accept()`": exercises `spawn_control`/`spawn_tree` themselves, end to end, not just the
-/// shared primitive in isolation. A plain `.accept()` would hang instead of panicking, so
-/// nextest's own bound (`.config/nextest.toml`) fails it; this test asserts on the FAST, correct
-/// outcome.
+/// The helpers themselves (`spawn_control`, `spawn_tree`), end to end, fail rather than hang.
 #[test]
 fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(|| common::spawn_control("--not-a-real-mode", &[], false));
@@ -542,12 +498,8 @@ fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     );
 }
 
-/// The root is alive and connects; only the GRANDCHILD dies before connecting. Watching the root
-/// alone would wait for the grandchild's "G" forever. The panic must name the GRANDCHILD (the pid
-/// the root reported), not the live root.
-///
-/// Named mutant: `spawn_tree` watching only the root (passing `None` as the extra identity):
-/// hangs, and nextest's bound fails it.
+/// Only the GRANDCHILD dies before connecting; the panic must name it (the pid the root
+/// reported), not the live root.
 #[test]
 fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-dies", false));
@@ -568,11 +520,8 @@ fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
     );
 }
 
-/// The root connects to the report address and exits without reporting: the failure names the
-/// real cause instead of a parse error on an empty line.
-///
-/// Named mutant: the EOF case handed to the parser (the old `grandchild pid report "": cannot
-/// parse integer from empty string` panic).
+/// The root connects to the report address and exits without reporting: the failure names that,
+/// not a parse error on an empty line.
 #[test]
 fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-eof", false));

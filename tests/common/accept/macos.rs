@@ -48,9 +48,8 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         );
         let errno = r.data() as i32;
         if r.filter() == Ok(EventFilter::EVFILT_PROC) && errno == libc::ESRCH {
-            // Gone by the time we tried to arm the watch. This is also what an exited but
-            // UNREAPED child looks like here (measured: EV_ADD on a zombie reports ESRCH), so it
-            // is the ordinary path for a target or descendant that exited before this call.
+            // Gone by the time the watch was armed; EV_ADD on an exited but unreaped child also
+            // reports ESRCH.
             return WatchEvent::Died(r.ident() as u32);
         }
         assert_eq!(
@@ -80,8 +79,6 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             .kevent(&[], &mut events, None)
             .expect("kevent while waiting for a control connection");
         for ev in &events[..n] {
-            // An armed kevent reporting EV_ERROR would mean the kernel hit a problem delivering a
-            // notification this function already armed: not a condition either filter describes.
             debug_assert!(
                 !ev.flags().contains(EvFlags::EV_ERROR),
                 "an armed kevent reported EV_ERROR: {ev:?}"
