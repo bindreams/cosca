@@ -21,6 +21,8 @@ env:
   NEXTEST_VERSION: "0.9.137"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`.
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
+  # System-affecting groups are off workflow-wide; the root lane opts back in.
+  COSCA_TEST_NAMESPACES: "0"
 
 jobs:
   lint:
