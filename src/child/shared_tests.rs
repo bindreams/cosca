@@ -14,6 +14,9 @@ mod linux;
 mod macos;
 #[path = "shared_tests/states.rs"]
 mod states;
+#[cfg(unix)]
+#[path = "shared_tests/tracer.rs"]
+mod tracer;
 #[cfg(windows)]
 #[path = "shared_tests/windows.rs"]
 mod windows;
