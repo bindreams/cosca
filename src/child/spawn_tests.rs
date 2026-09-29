@@ -928,3 +928,77 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         "the tree's failure is reported, got {detail}"
     );
 }
+
+// A failed adoption tears the child down like any other failed spawn step =====
+
+/// Linux: a filter that answers `errno` to `pidfd_open` makes the spawn fail with `Unsupported`,
+/// naming `spawn` and the errno, after the child is killed and reaped. There is no fallback.
+#[cfg(target_os = "linux")]
+fn assert_adopt_refused_with(errno: rustix::io::Errno, name: &str) {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(errno);
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    let err = err.expect("a refused pidfd_open must fail the spawn");
+    assert!(matches!(err, Error::Unsupported { platform: "linux", .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "spawn is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+             refused here: pidfd_open answered {name}"
+        )
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}
+
+/// Mutant: `EPERM` read as gone (the spawn succeeds with a handle that answers `ECHILD`).
+#[cfg(target_os = "linux")]
+#[test]
+fn adopt_on_eperm_is_unsupported_and_tears_the_child_down() {
+    assert_adopt_refused_with(rustix::io::Errno::PERM, "EPERM");
+}
+
+/// Mutant: `EACCES` falls through to `Io`.
+#[cfg(target_os = "linux")]
+#[test]
+fn adopt_on_eacces_is_unsupported_and_tears_the_child_down() {
+    assert_adopt_refused_with(rustix::io::Errno::ACCESS, "EACCES");
+}
+
+/// Linux: an `EMFILE` from `pidfd_open` fails the spawn with `Io`, and the child is torn down.
+///
+/// Mutant: a pidfd-less fallback (the spawn succeeds).
+#[cfg(target_os = "linux")]
+#[test]
+fn adopt_on_emfile_tears_the_child_down() {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    match err.expect("a failed pidfd_open must fail the spawn") {
+        Error::Io(e) => assert_eq!(e.to_string(), "pidfd_open: Too many open files (os error 24)"),
+        other => panic!("expected Io, got {other:?}"),
+    }
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}
+
+/// Windows: a failed `DuplicateHandle` fails the spawn, and the child is torn down.
+///
+/// Mutant: an `adopt` that `.expect()`s the duplication (the test panics instead of getting
+/// `Err((e, child))` and a torn-down child).
+#[cfg(windows)]
+#[test]
+fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = crate::child::shared::seams::force_duplicate_handle_error_once();
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}

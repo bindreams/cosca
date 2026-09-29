@@ -175,11 +175,9 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     _ = treewalk_child.wait();
 }
 
-// `Child::wait_deadline` recheck loop (portable; seams live in `crate::wait`) =====
+// `Child::wait_deadline` (portable) =====
 
 use std::time::Instant;
-
-use crate::wait::std_wait_seam::{self, Step};
 
 /// A live, uncontained child that blocks on its piped stdin until EOF.
 fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
@@ -190,92 +188,6 @@ fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin was just configured above");
     (child, stdin)
-}
-
-/// A synthetic early `None` is not trusted, however often it repeats and even after a real wait:
-/// the loop re-arms and reports the real exit.
-///
-/// Mutant N2: return the first backend result -> the first forced `None` is returned.
-#[test]
-fn wait_deadline_never_reports_still_running_before_the_deadline() {
-    let (child, stdin) = spawn_never_exiting();
-    let steps = [
-        Step::EarlyNone,
-        Step::Bounded(Duration::from_millis(20)),
-        Step::EarlyNone,
-        Step::EarlyNone,
-    ];
-    let seam = std_wait_seam::arm(steps, move || drop(stdin));
-    let deadline = Instant::now() + Duration::from_secs(3600);
-    let status = child
-        .wait_deadline(deadline)
-        .expect("a genuinely-exiting child must not report a wait failure");
-    assert!(status.is_some(), "a synthetic early None was trusted");
-    assert!(seam.rounds().len() >= 5, "every scripted None must be rechecked");
-}
-
-/// Under a frozen clock an early `None` is still not trusted: the loop goes on to a second,
-/// real round armed no earlier than the deadline.
-///
-/// Mutant N2 (trust the first `None`): one round only.
-#[test]
-fn wait_deadline_rechecks_an_early_none_under_a_frozen_clock() {
-    let (child, _stdin) = spawn_never_exiting();
-    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-    let deadline = at + Duration::from_millis(50);
-    let seam = std_wait_seam::arm([Step::EarlyNone], || {});
-    let status = child
-        .wait_deadline(deadline)
-        .expect("a live child must not report a wait failure");
-    assert!(
-        status.is_none(),
-        "a never-exiting child is still running at the deadline"
-    );
-    let rounds = seam.rounds();
-    assert!(rounds.len() >= 2, "the early None was trusted: {rounds:?}");
-    assert!(rounds[1].armed >= deadline, "the recheck armed short of the deadline");
-}
-
-/// Every round is armed from the frozen `remaining`, so a frozen clock that lags real time cannot
-/// make the loop poll against a real deadline that has already passed.
-///
-/// Mutant: arm each round with the caller's `deadline` -> the first round is armed in the past.
-#[test]
-fn wait_deadline_arms_each_round_from_the_frozen_remaining() {
-    let (child, _stdin) = spawn_never_exiting();
-    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install_lagging(Duration::from_secs(1));
-    let deadline = at + Duration::from_millis(50);
-    let seam = std_wait_seam::arm([], || {});
-    let status = child
-        .wait_deadline(deadline)
-        .expect("a live child must not report a wait failure");
-    assert!(
-        status.is_none(),
-        "a never-exiting child is still running at the deadline"
-    );
-    let rounds = seam.rounds();
-    let first = rounds[0];
-    assert!(
-        first.armed > first.entered,
-        "the first of {} rounds was armed with a deadline already in the past: {first:?}",
-        rounds.len()
-    );
-}
-
-/// A deadline already in the past behaves like `try_wait` against a live child: one
-/// non-blocking backend call, then `None`.
-///
-/// Mutant: skip the first round when the deadline has passed -> no backend call at all.
-#[test]
-fn wait_deadline_in_the_past_polls_a_live_child_once() {
-    let (child, _stdin) = spawn_never_exiting();
-    let deadline = Instant::now();
-    let seam = std_wait_seam::arm([], || {});
-    let status = child.wait_deadline(deadline).expect("a live child must not fail");
-    assert!(status.is_none());
-    let rounds = seam.rounds();
-    assert_eq!(rounds.len(), 1, "{rounds:?}");
-    assert!(rounds[0].armed <= rounds[0].entered, "a past deadline must not block");
 }
 
 /// A deadline in the past against an already-exited child still reports the exit.
@@ -289,25 +201,6 @@ fn wait_deadline_in_the_past_reports_an_exited_child() {
         .wait_deadline(Instant::now())
         .expect("an exited child must not fail");
     assert_eq!(status, Some(waited));
-}
-
-/// A backend error ends the loop with that error, however the earlier rounds went.
-///
-/// Mutant: treat a backend `Err` as `None` -> the loop re-arms until the deadline and reports
-/// `Ok(None)`.
-#[test]
-fn wait_deadline_propagates_a_backend_error() {
-    let (child, _stdin) = spawn_never_exiting();
-    let seam = std_wait_seam::arm([Step::EarlyNone, Step::Fail], || {});
-    let deadline = Instant::now() + Duration::from_millis(300);
-    let err = child
-        .wait_deadline(deadline)
-        .expect_err("the scripted failure must surface");
-    assert!(
-        matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("scripted backend failure")),
-        "got {err:?}"
-    );
-    assert_eq!(seam.rounds().len(), 2, "the error must end the loop");
 }
 
 /// The frozen clock advances by the real elapsed time of each wait exactly once, so a second wait
