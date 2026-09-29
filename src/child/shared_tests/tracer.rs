@@ -160,7 +160,14 @@ mod macos {
 
     fn continue_tracee(blocker: &Blocker) {
         // SAFETY: as above; `1` resumes from where the tracee stopped.
-        let r = unsafe { libc::ptrace(libc::PT_CONTINUE, blocker.shared.id() as libc::pid_t, 1 as *mut _, 0) };
+        let r = unsafe {
+            libc::ptrace(
+                libc::PT_CONTINUE,
+                blocker.shared.id() as libc::pid_t,
+                std::ptr::dangling_mut::<libc::c_char>(),
+                0,
+            )
+        };
         assert_eq!(r, 0, "PT_CONTINUE: {}", std::io::Error::last_os_error());
     }
 
