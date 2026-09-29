@@ -48,9 +48,9 @@ async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: F) -> Optio
     }
     #[cfg(test)]
     armed_deadline_seam::notify(armed_deadline_seam::Armed::At(at));
-    ::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), fut)
-        .await
-        .ok()
+    #[allow(clippy::disallowed_methods)] // arm_at is the one sanctioned caller of timeout_at.
+    let armed = ::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), fut);
+    armed.await.ok()
 }
 
 /// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified

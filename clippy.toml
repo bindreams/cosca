@@ -5,8 +5,14 @@
 # `allow-invalid = true`: rustix's `pipe` feature isn't enabled in this crate today, so on the one
 # target that links rustix (Linux) the path is unreachable — a missing-feature gap, not a typo. A
 # target that never links rustix at all (macOS, Windows) skips the path silently either way.
+# The raw tokio timers are banned for the deadline contract (principle 13). advance/pause, used by
+# paused-clock tests, are not.
 disallowed-methods = [
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },
     { path = "nix::unistd::pipe", reason = "nix::unistd::pipe wraps libc::pipe, so its fds lack close-on-exec the same way. Use nix::unistd::pipe2(OFlag::O_CLOEXEC) where available, or std::io::pipe()." },
     { path = "rustix::pipe::pipe", reason = "rustix::pipe::pipe is a pipe/pipe2 call with no flags, so its fds lack close-on-exec. Use rustix::pipe::pipe_with(PipeFlags::CLOEXEC) or std::io::pipe().", allow-invalid = true },
+    { path = "tokio::time::timeout", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::timeout(d, fut) re-derives the deadline from a duration, so it can arm late or on the wrong clock. Use arm_at(at, fut) with an instant from deadline_from." },
+    { path = "tokio::time::timeout_at", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::timeout_at bypasses arm_at's margin check and its armed-deadline seam, so a deadline can arm late or on the wrong clock. Use arm_at(at, fut), which is its one sanctioned caller." },
+    { path = "tokio::time::sleep", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::sleep(d) re-derives the deadline from a duration, so it can arm late or on the wrong clock. Arm the deadline with arm_at(at, fut); never synchronize by sleeping." },
+    { path = "tokio::time::sleep_until", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::sleep_until re-derives the deadline from a duration, so it can arm late or on the wrong clock. Arm the deadline with arm_at(at, fut); never synchronize by sleeping." },
 ]

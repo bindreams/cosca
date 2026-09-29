@@ -359,10 +359,7 @@ async fn watch_loop_survives_a_non_exit_drain_cycle() {
         }
         Ok(drained)
     });
-    ::tokio::time::timeout(Duration::from_secs(30), watch)
-        .await
-        .expect("the re-awaited loop must resolve on the target's exit")
-        .expect("watch");
+    watch.await.expect("watch");
     let mut target = target_cell
         .borrow_mut()
         .take()
@@ -746,6 +743,7 @@ async fn tokio_arms_the_extreme_instant_arm_at_accepts_without_panicking() {
 /// armed deadline. It must answer `Ok(false)` only once the clock has reached `t0 + grace`.
 #[cfg(unix)]
 #[::tokio::test(start_paused = true)]
+#[allow(clippy::disallowed_methods)] // sleep drives the paused virtual clock; it is not a wait on real time.
 async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -785,6 +783,7 @@ async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
 /// pending, and nothing was armed (no fallback deadline of any length).
 #[cfg(unix)]
 #[::tokio::test(start_paused = true)]
+#[allow(clippy::disallowed_methods)] // sleep drives the paused virtual clock; it is not a wait on real time.
 async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_year() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -904,6 +903,7 @@ async fn arm_at_debug_asserts_a_deadline_inside_the_timer_margin() {
 /// reports an unbounded park, and no timer of any length bounds it.
 #[cfg(all(unix, not(debug_assertions)))]
 #[::tokio::test(start_paused = true)]
+#[allow(clippy::disallowed_methods)] // sleep drives the paused virtual clock; it is not a wait on real time.
 async fn arm_at_waits_unbounded_for_a_deadline_inside_the_timer_margin_in_release() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
