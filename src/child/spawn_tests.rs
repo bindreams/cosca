@@ -8,43 +8,14 @@ use super::fault;
 use crate::command::Command;
 use crate::error::Error;
 
-// A long-lived child, so a teardown leak would show as an alive process at the assert rather than
-// self-exiting — on EVERY platform: `sleep 30`/`ping -n 30` is not enough even on Unix, whose
-// `fault::assert_child_reaped` identity-resolution check IS immune to a pid simply having exited
-// on its own (see that function's own doc), because several callers reach it only after a REAL
-// BLOCKING `wait()` deeper in the teardown path (`teardown_unadopted` -> `reap_unadopted`) — a
-// mutant that skips the actual kill (e.g. `kill_unadopted` returning `Ok(())` without killing, or
-// `finish_elevated` dropping its own `child.kill()`) still lets that blocking wait return
-// successfully once `sleep 30`'s own timer naturally ends it, so the reap "succeeds" and
-// `assert_child_reaped` finds a genuinely (if belatedly, and for the wrong reason) gone child —
-// measured passing after the fixture's own duration elapsed, proving nothing about whether a kill
-// ever happened. `cat`/`findstr x`, with no natural end at all, turns that same mutant into a
-// hang instead: correct, loud, and never a vacuous pass. Stdin is piped from a pipe this function
-// creates and LEAKS the write end of (never closed, by us or by anything `Command`/`Child`'s own
-// `Drop` does to ITS OWN, separate copy of the stdio handle): the resulting child can only die
-// from a real kill by the code under test.
+// A child only a real kill ends, so a teardown leak shows as an alive process at the assert
+// rather than a self-exit, and a mutant that skips the kill hangs instead of passing. See
+// `test_child::BLOCKER_ARGV` for why, and `leaked_writer_stdin` for the stdin.
 fn blocker() -> Command {
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    {
-        cmd.args(["cat"]);
-        let (reader, writer) = std::io::pipe().expect("pipe");
-        cmd.stdin(crate::stdio::Stdio::from_file(std::fs::File::from(
-            std::os::fd::OwnedFd::from(reader),
-        )))
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::test_child::leaked_writer_stdin())
         .expect("set stdin pipe");
-        std::mem::forget(writer); // never closed — see this function's own doc
-    }
-    #[cfg(windows)]
-    {
-        cmd.args(["findstr", "x"]);
-        let (reader, writer) = std::io::pipe().expect("pipe");
-        cmd.stdin(crate::stdio::Stdio::from_file(std::fs::File::from(
-            std::os::windows::io::OwnedHandle::from(reader),
-        )))
-        .expect("set stdin pipe");
-        std::mem::forget(writer); // never closed — see this function's own doc
-    }
     cmd
 }
 
@@ -153,10 +124,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args(["findstr", "x"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     fault::set_force_attach_failure(true);

@@ -29,24 +29,10 @@ fn quick_contained_child() -> crate::Child {
     cmd.spawn().expect("spawn")
 }
 
-/// A contained child that blocks reading from a piped stdin this function's caller holds open —
-/// never via a chosen sleep duration, for the deadline-not-met case. `cat`/`findstr x` unblock
-/// only on EOF (the pipe dropped) or a real kill, so the `MembersRemain` assertion below cannot
-/// spuriously fail just because a fixed-duration sleep happened to finish before the check ran.
-/// Returns the child AND its stdin writer: the caller MUST keep the writer alive for exactly as
-/// long as it needs the child to stay running.
+/// A contained [`crate::test_child::BLOCKER_ARGV`] child and its stdin writer, which the caller
+/// must keep for exactly as long as the child must stay running.
 fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args(["findstr", "x"]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
+    crate::test_child::held_contained_blocker(crate::Stdio::null())
 }
 
 /// Drained case: on a drain-observable mechanism, an unbounded `wait_tree()` against a tree

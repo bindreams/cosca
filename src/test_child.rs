@@ -1,5 +1,114 @@
 //! Test-only child processes shared across the crate's unit tests.
 
+// Blocker fixtures =====
+
+/// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
+/// `findstr x` on Windows. Every fixture that needs a child "still alive at some later check"
+/// uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the child on
+/// its own and let a mutant that skips the kill under test pass for the wrong reason. Stdin is
+/// what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
+///
+/// - [`leaked_writer_stdin`]: the write end is never closed, so only a kill by the code under
+///   test ends the child (teardown tests that own no handle on it).
+/// - [`held_std_blocker`], [`held_contained_blocker`] and [`held_contained_blocker_async`]: the
+///   caller holds the write end and must keep it for exactly as long as the child must stay
+///   alive. Dropping it (or `std::process::Child::wait()`, which closes the piped stdin before
+///   it waits) is a deliberate EOF release.
+///
+/// Neither `cat` nor `findstr` is proof of life by itself: `Existence::Present` is
+/// zombie-inclusive, and `SIGKILL`/`TerminateProcess` land asynchronously. A liveness claim needs
+/// an echo round trip through a piped stdout, or (Windows, where `findstr` does not echo) a
+/// clean exit after a closed stdin.
+pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } else { &["cat"] };
+
+/// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
+/// [`BLOCKER_ARGV`]).
+pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    #[cfg(unix)]
+    let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+    #[cfg(windows)]
+    let file = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+    std::mem::forget(writer);
+    crate::stdio::Stdio::from_file(file)
+}
+
+/// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
+/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
+pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
+    let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
+    cmd.args(&BLOCKER_ARGV[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(stdout);
+    cmd
+}
+
+/// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin.
+pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = crate::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(stdout).expect("set stdout");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
+/// Async twin of [`held_contained_blocker`].
+#[cfg(feature = "tokio")]
+pub(crate) fn held_contained_blocker_async(stdout: crate::Stdio) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(stdout).expect("set stdout");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
+/// A process-group member that announces its own pid on a piped stdout and then blocks on a
+/// piped stdin. `pgid` is the group to join (`0` mints a new one of the member's own). The
+/// caller must take [`await_member_ready`] before using the member's identity: `spawn()`
+/// returning establishes neither that the image is running nor that its `setpgid` is visible.
+///
+/// `std::process::Child::wait()` closes the piped stdin before it waits, so `wait()` itself ends
+/// the member by EOF on its `read` (non-zero exit, no signal). An assertion that a real signal
+/// was the cause must check the status's `.signal()` and deliver the signal BEFORE `wait()`.
+#[cfg(unix)]
+pub(crate) fn member_command(pgid: i32) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .process_group(pgid);
+    cmd
+}
+
+/// Blocks until an [`member_command`] child has announced itself, and checks that the
+/// announcement came from that child.
+#[cfg(unix)]
+pub(crate) fn await_member_ready(child: &mut std::process::Child) {
+    use std::io::BufRead;
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read the member's announcement");
+    let announced: crate::identity::RawPid = line.trim().parse().expect("the announcement carries a pid");
+    assert_eq!(
+        announced,
+        child.id(),
+        "the announcement must come from the member itself"
+    );
+    // Hand the pipe back rather than dropping it: the member outlives this call, and closing
+    // the read end under a live child would make any later write to it a `SIGPIPE`.
+    child.stdout = Some(out.into_inner());
+}
+
+// Re-exec fixtures =====
+
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
 /// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
 /// cwd is `cwd` — proving whatever the fixture's body proves about a process's REAL cwd without

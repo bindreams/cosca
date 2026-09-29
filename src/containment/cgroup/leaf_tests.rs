@@ -1373,7 +1373,7 @@ fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, std::process:
     // Deliberately NOT taken out of `member`: every caller either kills it for real before
     // `wait()`-ing (which itself would also close this, but only after the real kill already
     // ran) or checks something before ever touching `member` again, so leaving it inside is
-    // safe here — see `containment::unix::group_tests::leader_command`'s doc for the general
+    // safe here — see `test_child::member_command`'s doc for the general
     // hazard this would otherwise be.
     leaf.take_placement(member.id())
         .expect("decidable")
@@ -3182,7 +3182,7 @@ fn fail_closed_kills_the_childs_whole_process_group() {
         .expect("spawn");
     // Held until after `take_placement` returns, then written to and dropped (see this
     // function's own doc): `child`'s own `wait()` closes its piped stdin before it waits (see
-    // `containment::unix::group_tests::leader_command`'s doc for why that alone is enough to end
+    // `test_child::member_command`'s doc for why that alone is enough to end
     // a `cat` blocker with no real signal involved), so this must not be what ends the
     // descendant, and letting `wait()` run first would make the write's result meaningless.
     let mut stdin = child.stdin.take().expect("piped stdin");

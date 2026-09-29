@@ -6,33 +6,12 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
-/// A contained child that blocks reading from a piped stdin this function's caller holds open
-/// — never via a chosen sleep duration. `cat`/`findstr x` unblock only on EOF (the pipe
-/// dropped) or a real kill, so a test that needs the child provably still alive at some later
-/// check point cannot pass vacuously just because a sleep hadn't finished yet. `Existence::Present`
-/// is NOT that proof by itself — it is zombie-inclusive on every platform (see `identity.rs`'s
-/// own doc), so it reads the same whether the child is genuinely running or was already killed
-/// and is simply not yet reaped. Stdout is piped, not nulled, so a Unix caller can round-trip a
-/// byte through `cat` (write to stdin, read the echo back from stdout) as a liveness proof that
-/// only a genuinely running process can produce — the pattern `leaf_tests.rs`'s
-/// `cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it` already
-/// uses. `findstr x` does not echo, so a Windows caller instead reads `id.is_alive() ==
-/// Liveness::Alive`, which answers from the process's own exit bookkeeping rather than the
-/// zombie-inclusive resolvability `exists()` reports. Returns the child AND its stdin writer:
-/// the caller MUST keep the writer alive for exactly as long as it needs the child to stay
-/// running.
+/// A contained [`crate::test_child::BLOCKER_ARGV`] child with piped stdin and stdout, plus its
+/// stdin writer, which the caller must keep for exactly as long as the child must stay running.
+/// `Existence::Present` is not proof of life — it is zombie-inclusive on every platform — so a
+/// liveness claim goes through [`assert_still_running`].
 fn blocker() -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args(["findstr", "x"]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
+    crate::test_child::held_contained_blocker(crate::Stdio::pipe())
 }
 
 /// Proves a [`blocker`] is genuinely still running, not merely still resolvable — see

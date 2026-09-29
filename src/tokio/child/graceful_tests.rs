@@ -5,22 +5,9 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
-/// Async twin of `child::graceful_tests::blocker` — see there for the full rationale. A
-/// contained child that blocks reading from a piped stdin this function's caller holds open,
-/// never via a chosen sleep duration. Stdout is piped, not nulled, so a Unix caller can prove
-/// liveness with an echo round trip — see `assert_still_running` below.
+/// Async twin of `child::graceful_tests::blocker`.
 fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args(["findstr", "x"]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
+    crate::test_child::held_contained_blocker_async(crate::Stdio::pipe())
 }
 
 /// Async twin of `child::graceful_tests::assert_still_running` — see there for the full

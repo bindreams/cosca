@@ -32,56 +32,15 @@ fn await_zombie(pid: u32) {
     }
 }
 
-/// A process-group leader that announces its own pid on a piped stdout, then blocks on a piped
-/// stdin — never via a chosen sleep duration. `pgid` is the group to join (`0` mints a new one
-/// of the leader's own, matching this file's existing `process_group(0)` convention). The
-/// caller MUST call [`await_leader_ready`] before using the leader's identity.
-///
-/// **`std::process::Child::wait()` itself closes the piped stdin before it waits** — not just
-/// an explicit `.take()`/`drop()` by the caller (verified: a bare `child.wait()`, with nothing
-/// else touching stdin, ends this leader by EOF on its trailing `read`, exiting non-zero from
-/// `read`'s own EOF failure, no signal involved). So `wait()` is itself a way to end the leader,
-/// and any assertion taken after it that depends on a REAL signal having been the cause (not a
-/// bare `!status.success()`, which an EOF-driven `read` failure also satisfies) must check the
-/// status's `.signal()` specifically, and must call whatever is meant to deliver that signal
-/// BEFORE calling `wait()` — see `state_of_an_owned_group_is_cleared_and_the_signal_was_real`.
-fn leader_command(pgid: i32) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg("echo $$; read _ignored")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .process_group(pgid);
-    cmd
-}
-
-/// Block until a [`leader_command`] child has announced itself, and check that the announcement
-/// came from that child — the real happens-before edge `spawn()` returning alone does not
-/// establish (see `fdmarker_tests.rs::await_member_ready`'s identical rationale).
-fn await_leader_ready(child: &mut std::process::Child) {
-    use std::io::BufRead;
-    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-    let mut line = String::new();
-    out.read_line(&mut line).expect("read the leader's announcement");
-    let announced: u32 = line.trim().parse().expect("the announcement carries a pid");
-    assert_eq!(
-        announced,
-        child.id(),
-        "the announcement must come from the leader itself"
-    );
-    // Hand the pipe back rather than dropping it: the leader outlives this call, and closing
-    // the read end under a live child would make any later write to it a `SIGPIPE`.
-    child.stdout = Some(out.into_inner());
-}
+use crate::test_child::{await_member_ready, member_command};
 
 /// A group we lead lists the member we put in it, with a token that resolves to Alive.
 #[test]
 fn members_lists_a_live_owned_group() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = leader_command(0).spawn().expect("spawn leader");
-    await_leader_ready(&mut child);
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -150,8 +109,8 @@ fn members_of_an_absent_group_is_empty() {
 fn members_token_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = leader_command(0).spawn().expect("spawn leader");
-    await_leader_ready(&mut child);
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -175,8 +134,8 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
 
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = leader_command(0).spawn().expect("spawn leader");
-    await_leader_ready(&mut child);
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
         matches!(state(pgid, Signal::SIGKILL), GroupState::Cleared),
@@ -184,7 +143,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     );
     let status = child.wait().expect("wait after state()'s own SIGKILL");
     // NOT `!status.success()`: `std::process::Child::wait()` itself closes the piped stdin
-    // before it waits, so `leader_command`'s trailing `read _ignored` hits EOF and `sh` exits
+    // before it waits, so `member_command`'s trailing `read _ignored` hits EOF and `sh` exits
     // non-zero (`read`'s own EOF failure) EVEN IF `state()` never sent anything — a mutant that
     // returns `Cleared` without actually converging would still pass a bare `!success()` check.
     // Only a real delivered `SIGKILL` proves `state()` converged.

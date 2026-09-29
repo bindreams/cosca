@@ -19,17 +19,14 @@ use crate::identity::ProcessId;
 // ends a `cat`/`findstr` blocker via EOF). Every test below calls `wait()` only as its very last
 // step, after an explicit `kill()` has already ended the child for real — never while an
 // earlier assertion still needs it alive — so this is safe here, but is NOT a property of
-// holding the `Child` value itself; see `containment::unix::group_tests::leader_command`'s
+// holding the `Child` value itself; see `test_child::member_command`'s
 // identical note for a case where the ordering matters.
 fn std_blocker() -> std::process::Child {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut cmd = std::process::Command::new(if cfg!(windows) { "findstr" } else { "cat" });
-    #[cfg(windows)]
-    cmd.arg("x");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null());
-    cmd.spawn().expect("spawn std blocker")
+    crate::test_child::held_std_blocker(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn std blocker")
 }
 
 /// Local to `wait_exit_cancel_leaves_child_untouched` and (on Windows)
@@ -43,12 +40,9 @@ fn std_blocker() -> std::process::Child {
 /// `is_alive()` check).
 fn std_blocker_with_stdout() -> std::process::Child {
     let _guard = crate::child::spawn::spawn_lock();
-    let mut cmd = std::process::Command::new(if cfg!(windows) { "findstr" } else { "cat" });
-    #[cfg(windows)]
-    cmd.arg("x");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-    cmd.spawn().expect("spawn std blocker")
+    crate::test_child::held_std_blocker(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn std blocker")
 }
 
 /// Proves `child` (a [`std_blocker_with_stdout`]) is genuinely still alive — see that function's

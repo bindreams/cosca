@@ -33,6 +33,7 @@
 //! concurrently-running `hard_kill()`/`holders()` scan in THIS module could then find and
 //! SIGKILL that bystander.
 
+use crate::test_child::{await_member_ready, member_command};
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -661,7 +662,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     drop(cmd);
 
     // Taken out and held past the EOF read below: `child.wait()` (which closes its OWN piped
-    // stdin before it waits — see `containment::unix::group_tests::leader_command`'s doc) must
+    // stdin before it waits — see `test_child::member_command`'s doc) must
     // not be what ends the orphan; only `hard_kill()`'s own real signal may.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -812,21 +813,6 @@ fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() 
     );
 }
 
-/// A process-group member for the sweep tests: a `/bin/sh` that announces its own pid on a
-/// piped stdout and then blocks on a piped stdin. `pgid` is the group to join (`0` mints a new
-/// one of the member's own). The caller installs any marker on the returned command, spawns it,
-/// and must then take the readiness edge with [`await_member_ready`] before scanning for it.
-fn member_command(pgid: i32) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg("echo $$; read _ignored")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .process_group(pgid);
-    cmd
-}
-
 /// A shell for scripts that redirect or close `marker_fd`, which `safe_marker_fd`/`HIGH_FLOOR` in
 /// `fdmarker.rs` guarantee is always >= 64: the fd number sits BEFORE the operator, in the
 /// IO_NUMBER position, and a dash-family shell only recognizes a single-digit IO_NUMBER there —
@@ -834,30 +820,6 @@ fn member_command(pgid: i32) -> std::process::Command {
 /// "exec: 64: not found" rather than closing fd 64.
 fn high_fd_shell() -> std::process::Command {
     std::process::Command::new("/bin/bash")
-}
-
-/// Block until a [`member_command`] child has announced itself, and check that the announcement
-/// came from that child.
-///
-/// The edge a spawned member must be scanned behind. `spawn()` returning reports the fork and
-/// the exec hand-off; it does not establish that the member's image is running, that its
-/// descriptor table answers a `proc_pidfdinfo` query, or that its `setpgid` is visible to
-/// `getpgid` — the three states a holder scan and the group-signal gate assert against. A
-/// `/bin/sleep` member can announce none of that, so the only way to wait for it would be a
-/// clock.
-fn await_member_ready(child: &mut std::process::Child) {
-    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-    let mut line = String::new();
-    out.read_line(&mut line).expect("read the member's announcement");
-    let announced: crate::identity::RawPid = line.trim().parse().expect("the announcement carries a pid");
-    assert_eq!(
-        announced,
-        child.id(),
-        "the announcement must come from the member itself"
-    );
-    // Hand the pipe back rather than dropping it: the member outlives this call, and closing
-    // the read end under a live child would make any later write to it a `SIGPIPE`.
-    child.stdout = Some(out.into_inner());
 }
 
 /// Item 1's central regression test: `sweep_pass`'s group-signal gate must re-fire on a LATER
