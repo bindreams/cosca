@@ -1282,8 +1282,11 @@ fn s2_passes_a_caught_stop_signal_through() {
 }
 
 /// As [`s4_keeps_a_stop_signal_until_after_the_detach`], for a caught `SIGTSTP`: passed on at
-/// S4, so the helper re-sends nothing. Mutants: S4 keeps a caught stop signal; S4 keeps every
-/// stop signal.
+/// S4, so the helper re-sends nothing. The handler may run after the test's own `SIGSTOP` (it
+/// runs on whichever thread XNU handed the signal to, once that thread is in user mode), so the
+/// test lets the tracee exit, continuing it if it stopped, and reads the handler's line then.
+/// Mutants: S4 passes on signal 0 (no handler line); S4 keeps a caught stop signal; S4 keeps
+/// every stop signal.
 #[test]
 fn s4_passes_a_caught_stop_signal_through() {
     let Some((mut tracee, stdin, stdout)) = setup_tracee("SIGTSTP", "") else {
@@ -1296,19 +1299,12 @@ fn s4_passes_a_caught_stop_signal_through() {
     expect(&mut th, &["S4b*", "detached", DONE]);
     drop(th);
     drop(stdin);
-    // Nothing was kept: the tracee is stopped by S4's `SIGSTOP` at most (macOS 26), never by a
-    // re-sent `SIGTSTP`; on macOS 15 it runs on and exits at the closed stdin.
-    let info = await_change(pid);
-    if info.si_code == libc::CLD_STOPPED {
-        assert_eq!(
-            info.si_status,
-            libc::SIGSTOP,
-            "the detached tracee is stopped by a re-sent signal"
-        );
-        end_stopped(tracee);
-    } else {
-        assert_exited_cleanly(tracee);
+    // Nothing was kept, so no re-sent `SIGTSTP` is pending: the test's `SIGSTOP` may have
+    // stopped the tracee (macOS 26), which then has to run on to exit; on macOS 15 it runs on.
+    if await_change(pid).si_code == libc::CLD_STOPPED {
+        send(pid, libc::SIGCONT);
     }
+    assert_exited_cleanly(tracee);
     assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
 }
 

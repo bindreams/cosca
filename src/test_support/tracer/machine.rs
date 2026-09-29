@@ -21,11 +21,15 @@
 //! `S4k`), and re-sends it with `kill(2)` after `PT_DETACH` (`S4r`); XNU discards it only if
 //! the detach left the tracee stopped (measured on CI: sometimes on macOS 26). A `SIGCONT`
 //! passed on later drops it, since it would have continued the stopped tracee. Every other
-//! signal is delivered at once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`), including a stop signal
-//! the tracee catches, which runs its handler instead of stopping, and one it ignores (`SIG_IGN`),
-//! which `issignal` drops: neither is discarded, and re-sending an ignored one after the detach
-//! would be dropped too. The tracee's disposition is read from `kinfo_proc`'s `p_sigcatch` and
-//! `p_sigignore` ([`sys::disposition`]) while it is stopped, so it cannot change under the read. A `SIGSTOP` in S2 or S4
+//! signal is delivered at once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). That includes a stop
+//! signal the tracee catches, which runs its handler instead of stopping, and one it ignores
+//! (`SIG_IGN`), which `issignal` discards (`case SIG_IGN`) as it would without tracing: passing
+//! it on loses nothing, and re-sending it after the detach would be discarded too. The tracee's
+//! disposition is read from `kinfo_proc`'s `p_sigcatch` and `p_sigignore`
+//! ([`sys::disposition`]) while it is stopped. A thread in user mode cannot change it under the
+//! read (`task_suspend_internal` stops it); a thread blocked in the kernel inside `sigaction`
+//! (say on a page fault after `copyin`, before `setsigvec`) can, so the read is a best effort
+//! there (`kern_sig.c`, `sigaction`). A `SIGSTOP` in S2 or S4
 //! is taken for the one the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a
 //! client's own `SIGSTOP` there is indistinguishable from it.
 //!
@@ -55,7 +59,7 @@
 //! | S3 | `SIGCHLD`, the tracee stopped by any other signal, or a stop signal it catches or ignores | pass it on; S3s, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee not stopped | S3 | |
 //! | S3 | `SIGCHLD`, the stop settling | S3 with a backoff timeout that peeks again | |
-//! | S3 | the release fails with `ESRCH` (the tracee is exiting) | S3 | |
+//! | S3 | the disposition read or the release fails with `ESRCH` (the tracee is exiting) | S3 | |
 //! | S3 | the stop peek, the disposition read or the release fails otherwise | done | `error` |
 //! | S3, `auto` | `NOTE_EXIT` (wins over a byte in the same batch) | S5 | |
 //! | S3, `auto` | signal byte or EOF | S4 | |
@@ -70,7 +74,7 @@
 //! | S4 | the tracee stopped by another stop signal with the default action | keep it, release the tracee; S4k, then S4b | |
 //! | S4 | the tracee stopped by any other signal, or a stop signal it catches or ignores | pass it on; S4s, then S4b | |
 //! | S4 | the tracee not stopped yet or its stop settling, or `PT_DETACH` fails with `EBUSY` | S4b | |
-//! | S4 | `SIGSTOP`, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
+//! | S4 | `SIGSTOP`, the disposition read, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
 //! | S4 | the stop peek fails, or any other error | done | `error` |
 //! | S4b Backoff | `NOTE_EXIT` | S5 | |
 //! | S4b | timeout, signal byte (ignored) or EOF | back to S4's stop check | |
