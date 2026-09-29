@@ -27,7 +27,7 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     THREAD_SUSPEND_RESUME,
 };
 
@@ -918,10 +918,7 @@ pub(crate) fn wait_drained_raw(
         // opened above — the ZERO-probe semantics fall out of the real API rather than a
         // pre-emptive return, so this round's `handles` (real, live members) still get one
         // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
-        let ms: u32 = match remaining {
-            None => INFINITE,
-            Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
-        };
+        let ms: u32 = crate::wait::win32_timeout_ms(remaining);
 
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the
@@ -937,7 +934,22 @@ pub(crate) fn wait_drained_raw(
         }
 
         if waited == WAIT_TIMEOUT {
-            return Ok(TreeDrain::MembersRemain);
+            // UNCONDITIONALLY rechecked against the real deadline rather than ever trusted
+            // outright. Per Microsoft's Wait Functions and Time-out Intervals: "If the time-out
+            // interval is less than the resolution of the system clock, the wait may time out
+            // in less than the specified length of time" — even an un-clamped, correctly-ceiled
+            // `ms` can return early on real hardware, so this recheck does not fire only when
+            // this round's wait was capped short by `win32_timeout_ms`'s clamp (production:
+            // `INFINITE - 1`, ~49.7 days; test: `wait_clamp_seam`) — that clamp is a second,
+            // much larger-gap reason the same recheck is needed, not the only one. `remaining`
+            // above is recomputed FRESH every round (never hoisted out of the outer `loop`). If
+            // the real deadline has not actually elapsed, loop back — the outer loop
+            // re-enumerates and next round's `ms` computation re-arms with the (now shorter)
+            // remaining time. See docs/principles.md #13.
+            if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+                return Ok(TreeDrain::MembersRemain);
+            }
+            continue;
         }
         if let Some(e) = wait_failed {
             return Err(Error::Io(e));

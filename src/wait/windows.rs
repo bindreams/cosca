@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
@@ -68,12 +68,23 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             });
         }
     }
-    let ms: u32 = match crate::wait::remaining(deadline) {
-        None => INFINITE,
-        Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
+    // Armed in rounds: a `WAIT_TIMEOUT` is UNCONDITIONALLY rechecked against the real deadline
+    // and re-armed rather than ever trusted outright. Per Microsoft's Wait Functions and
+    // Time-out Intervals: "If the time-out interval is less than the resolution of the system
+    // clock, the wait may time out in less than the specified length of time" — even an
+    // un-clamped, correctly-ceiled `ms` can return early on real hardware, so the recheck below
+    // is not conditional on whether `win32_timeout_ms`'s clamp (production: `INFINITE - 1`,
+    // ~49.7 days; test: `wait_clamp_seam`) fired this round — that clamp is a second, much
+    // larger-gap reason the same recheck is needed, not the only one. `remaining` is recomputed
+    // FRESH every iteration (never hoisted above the loop) — see docs/principles.md #13.
+    let waited = loop {
+        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
+        // SAFETY: `handle` is a live process handle held for the wait's duration.
+        let w = unsafe { WaitForSingleObject(handle, ms) };
+        if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
+            break w;
+        }
     };
-    // SAFETY: `handle` is a live process handle held for the wait's duration.
-    let waited = unsafe { WaitForSingleObject(handle, ms) };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -170,19 +181,17 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    let ms = match grace {
-        None => INFINITE,
-        // Capped at INFINITE-1 (~49.7 days) — the cancel event releases large graces early;
-        // a debug_assert flags the rare clamp.
-        Some(d) => {
-            let clamped = d.as_millis().min((INFINITE - 1) as u128) as u32;
-            debug_assert!(
-                d.as_millis() <= (INFINITE - 1) as u128,
-                "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
-                d.as_secs()
-            );
-            clamped
-        }
+    // Established HERE, from the relative `grace` — after `OpenProcess` and the identity check
+    // above, NOT at this function's actual entry. Every re-arm below recomputes its remaining
+    // time against this SAME absolute instant (via `crate::wait::remaining`, the inverse of
+    // `deadline_from`), so a re-arm never resets the clock — but the instant itself is measured
+    // slightly later than the caller actually asked for `grace` to start, since the open+
+    // identity work above already spent part of it. That lateness is real but out of scope
+    // here — a separate, pre-existing bug this PR does not fix (the sibling "grace armed late"
+    // PR does). `None` = unbounded, matching `deadline_from`'s own convention.
+    let deadline: Option<Option<Instant>> = match grace {
+        None => None,
+        Some(g) => crate::wait::deadline_from(g),
     };
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
@@ -212,8 +221,25 @@ pub(crate) fn block_until_exit_or_cancel(
         }
     }
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
-    // SAFETY: both handles are live for the wait's duration.
-    let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    // Armed in rounds: a `WAIT_TIMEOUT` is UNCONDITIONALLY rechecked against the real deadline
+    // and re-armed rather than ever trusted outright. Per Microsoft's Wait Functions and
+    // Time-out Intervals: "If the time-out interval is less than the resolution of the system
+    // clock, the wait may time out in less than the specified length of time" — even an
+    // un-clamped, correctly-ceiled `ms` can return early on real hardware, so the recheck below
+    // is not conditional on whether `win32_timeout_ms`'s clamp (production: `INFINITE - 1`,
+    // ~49.7 days — the cancel event releases large graces early; test: `wait_clamp_seam`) fired
+    // this round — that clamp is a second, much larger-gap reason the same recheck is needed,
+    // not the only one; it is also why a grace longer than the clamp is still honored correctly
+    // instead of being silently capped. `remaining` is recomputed FRESH every iteration (never
+    // hoisted above the loop) — see docs/principles.md #13.
+    let waited = loop {
+        let ms = crate::wait::win32_timeout_ms(crate::wait::remaining(deadline));
+        // SAFETY: both handles are live for the wait's duration.
+        let w = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+        if w != WAIT_TIMEOUT || crate::wait::remaining(deadline) == Some(Duration::ZERO) {
+            break w;
+        }
+    };
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -415,3 +441,7 @@ pub(crate) mod armed_probe {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod windows_tests;
