@@ -3036,9 +3036,12 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 /// directory, not a cgroup), so only the group kill can end the descendant, which holds the
 /// child's stdout: reading it to EOF proves both dead. The descendant is a `cat` blocked on a
 /// stdin this test holds (see `test_child::BLOCKER_ARGV` for the idiom), so it dies only from a
-/// real signal. After `drop(leaf)` a byte is written and the stdin dropped: after a real kill that
-/// goes nowhere, while a skipped kill lets the live `cat` echo it, so `rest` is non-empty and the
-/// test fails at once rather than hanging on the read.
+/// real signal. The stdin is released by `fault::set_before_exit_wait`, which fires after
+/// `end_child`'s own kill and before its blocking `waitid` on the shell: the shell is parked in
+/// its own `wait`, not reading stdin, so with that kill skipped nothing after `drop(leaf)` could
+/// run, because `drop(leaf)` would never return. A real kill has already landed by then, so the
+/// byte goes nowhere; a skipped one lets the live `cat` echo it, so `rest` is non-empty and the
+/// test fails at once rather than hanging.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
@@ -3055,7 +3058,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
         std::process::Stdio::piped(),
         std::process::Stdio::piped(),
     );
-    // Written to and dropped after `drop(leaf)`; see this function's doc.
+    // Moved into the hook below; see this function's doc.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
@@ -3066,10 +3069,12 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     );
     drop(child);
 
+    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || {
+        crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
+        drop(stdin);
+    });
     drop(leaf);
 
-    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
-    drop(stdin);
     let mut rest = Vec::new();
     stdout
         .read_to_end(&mut rest)
@@ -3085,8 +3090,8 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 /// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
 /// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
 /// The descendant is a `cat` blocked on a held stdin; see
-/// `an_abandoned_child_is_killed_with_the_group_it_leads` for the post-kill write that makes a
-/// skipped group kill fail at once instead of hanging.
+/// `an_abandoned_child_is_killed_with_the_group_it_leads` for the `set_before_exit_wait` release
+/// that makes a skipped kill fail at once instead of hanging in `fail_closed`.
 #[cfg(target_os = "linux")]
 #[test]
 fn fail_closed_kills_the_childs_whole_process_group() {
@@ -3106,8 +3111,9 @@ fn fail_closed_kills_the_childs_whole_process_group() {
         .process_group(0)
         .spawn()
         .expect("spawn");
-    // Written to and dropped after `take_placement` returns, before `child.wait()` closes the
-    // child's own stdin.
+    // Moved into the hook below, not held past `take_placement`: with `fail_closed`'s own kill
+    // skipped, its `waitid` on the shell would block forever, so nothing after it could run.
+    // `child.wait()` closes the child's own stdin, so it must come after.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
@@ -3118,9 +3124,11 @@ fn fail_closed_kills_the_childs_whole_process_group() {
     );
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
+    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || {
+        crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
+        drop(stdin);
+    });
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
-    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
-    drop(stdin);
     let mut rest = Vec::new();
     stdout
         .read_to_end(&mut rest)
