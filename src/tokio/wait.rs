@@ -372,12 +372,32 @@ pub(crate) async fn cgroup_wait_tree_drained(
             DrainStep::Block {
                 listener,
                 deadline: None,
-            } => listener.await,
-            // A timeout is looked at by the next step, which reads the leaf once more.
+            } => {
+                #[cfg(test)]
+                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
+                    crate::containment::cgroup::fault::TokioWaitSitePark { deadline: None },
+                );
+                listener.await
+            }
+            // A timeout is looked at by the next step, which reads the leaf once more. The seam
+            // reports `sleep.deadline()`, read back from the `Sleep`, so it reflects what was
+            // actually armed.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),
-            } => drop(::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), listener).await),
+            } => {
+                let sleep = ::tokio::time::sleep_until(::tokio::time::Instant::from_std(at));
+                #[cfg(test)]
+                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
+                    crate::containment::cgroup::fault::TokioWaitSitePark {
+                        deadline: Some(sleep.deadline().into_std()),
+                    },
+                );
+                ::tokio::select! {
+                    _ = listener => {}
+                    _ = sleep => {}
+                }
+            }
         }
     }
 }

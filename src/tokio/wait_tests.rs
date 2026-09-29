@@ -328,9 +328,18 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
     let fake = FakeLeaf::new("cosca-async-removed-while-waited", true);
     let removed = fake.leaf.clone();
     let (blocking_tx, blocking_rx) = std::sync::mpsc::channel::<()>();
+    // Loops on `recv` rather than returning after the first, so its receiver stays alive for as
+    // long as the notifier is installed: `drain_step` can legally re-block (a spurious wake, or
+    // the removal notification racing a stale re-read) before this wait ever completes, and a
+    // send with no live receiver by then is a contract violation `notify_drain_blocking`
+    // debug-asserts against.
     let remover = std::thread::spawn(move || {
-        if blocking_rx.recv().is_ok() {
-            FakeLeaf::remove(&removed);
+        let mut removed_once = false;
+        while blocking_rx.recv().is_ok() {
+            if !removed_once {
+                FakeLeaf::remove(&removed);
+                removed_once = true;
+            }
         }
     });
     crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
@@ -344,7 +353,7 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 
 /// A deadline within tokio's own ~1ms round-up margin of `Instant`'s ceiling must not panic:
 /// `crate::wait::deadline_from` saturates it to unbounded before `drain_step` ever sees it, so
-/// this call takes the `listener.await` arm, never `timeout_at`.
+/// this call takes the `listener.await` arm, never the bounded one.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
 async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
@@ -376,7 +385,7 @@ async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
 /// caller's own deadline. No upper bound is asserted — only that it never answers early.
 #[cfg(target_os = "linux")]
 #[::tokio::test]
-async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
+async fn cgroup_wait_tree_drained_through_sleep_until_never_answers_early() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
     use std::time::{Duration, Instant};
@@ -399,5 +408,73 @@ async fn cgroup_wait_tree_drained_through_timeout_at_never_answers_early() {
     assert!(
         elapsed >= BOUND,
         "cgroup_wait_tree_drained returned after {elapsed:?}, before its own {BOUND:?} deadline"
+    );
+}
+
+/// The async wait site (`cgroup_wait_tree_drained`'s own `Block` arm) is armed with the caller's
+/// deadline instant exactly — structural, no timing.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_arms_the_wait_site_with_the_callers_deadline_instant() {
+    use crate::containment::cgroup::test_support::{FakeLeaf, TokioWaitSiteParkGuard};
+    use std::time::{Duration, Instant};
+
+    let fake = FakeLeaf::new("cosca-async-wait-site-deadline", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    let (_guard, park_rx) = TokioWaitSiteParkGuard::install();
+
+    // Far enough out that a populated fake leaf never takes the zero-remaining shortcut; how far
+    // is irrelevant, since the future below is polled only once.
+    let at = Instant::now() + Duration::from_secs(3600);
+    let fut = super::cgroup_wait_tree_drained(&leaf, Some(Some(at)));
+    ::tokio::pin!(fut);
+    // Poll once, `biased` so `&mut fut` is polled first: a mutant resolving on this poll panics
+    // instead of being masked by `ready(())`.
+    ::tokio::select! {
+        biased;
+        _ = &mut fut => panic!(
+            "the fake leaf never drains and the deadline is an hour out; a single poll must not \
+             resolve this"
+        ),
+        _ = std::future::ready(()) => {}
+    }
+
+    let park = park_rx
+        .try_recv()
+        .expect("the wait site must arm a park on its first poll");
+    assert_eq!(
+        park.deadline,
+        Some(at),
+        "the tokio wait site must arm its wait with the caller's own deadline instant exactly, \
+         got {park:?}"
+    );
+}
+
+/// The async wait site's unbounded arm fires the same seam, with no deadline armed.
+#[cfg(target_os = "linux")]
+#[::tokio::test]
+async fn cgroup_wait_tree_drained_arms_the_wait_site_unbounded_with_no_deadline() {
+    use crate::containment::cgroup::test_support::{FakeLeaf, TokioWaitSiteParkGuard};
+
+    let fake = FakeLeaf::new("cosca-async-wait-site-unbounded", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+
+    let (_guard, park_rx) = TokioWaitSiteParkGuard::install();
+
+    let fut = super::cgroup_wait_tree_drained(&leaf, None);
+    ::tokio::pin!(fut);
+    ::tokio::select! {
+        biased;
+        _ = &mut fut => panic!("the fake leaf never drains; a single poll must not resolve this"),
+        _ = std::future::ready(()) => {}
+    }
+
+    let park = park_rx
+        .try_recv()
+        .expect("the wait site must arm a park on its first poll");
+    assert_eq!(
+        park.deadline, None,
+        "the unbounded wait site must arm with no deadline, got {park:?}"
     );
 }

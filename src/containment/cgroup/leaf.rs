@@ -151,6 +151,20 @@ pub(crate) struct CgroupLeaf {
 #[cfg(target_os = "linux")]
 const RELEASED: &str = "the leaf's spawn-side resources are released once its placement verdict is taken";
 
+/// `listener.wait_deadline(at)` — the only call site for it, so the seam that records `at` (test
+/// builds only) can never drift from what's actually passed: both come from the same parameter,
+/// in the same function, with nothing between them to retarget one without the other. Closes
+/// `event_listener::Listener::wait_deadline`'s own gap — it consumes the listener and exposes no
+/// way to read back what it was armed with — from the caller's side instead.
+#[cfg(target_os = "linux")]
+fn wait_deadline_seamed(listener: event_listener::EventListener, at: std::time::Instant) -> bool {
+    use event_listener::Listener as _;
+
+    #[cfg(test)]
+    fault::notify_wait_deadline_arg(at);
+    listener.wait_deadline(at).is_some()
+}
+
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
@@ -534,22 +548,49 @@ impl CgroupLeaf {
                 DrainStep::Block {
                     listener,
                     deadline: None,
-                } => listener.wait(),
+                } => {
+                    listener.wait();
+                    #[cfg(test)]
+                    fault::notify_wait_site_park(fault::WaitSitePark {
+                        deadline: None,
+                        woken: true,
+                    });
+                }
                 // A timeout is looked at by the next step, which reads the leaf once more.
                 DrainStep::Block {
                     listener,
                     deadline: Some(at),
-                } => drop(listener.wait_deadline(at)),
+                } => {
+                    #[cfg(test)]
+                    let call_start = std::time::Instant::now();
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let woken = wait_deadline_seamed(listener, at);
+                    // Bounds what would otherwise be an unbounded spin under a mock clock a test
+                    // forgot to advance: `at` is a real `Instant`, so once real time passes it
+                    // this returns immediately every iteration, and only a frozen `remaining()`
+                    // that never catches up would keep re-arming the same, already-past
+                    // deadline forever. See `test_clock::advance_by_elapsed_if_frozen`'s own doc.
+                    // A no-op outside tests and whenever the clock isn't frozen.
+                    #[cfg(test)]
+                    crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+                    #[cfg(test)]
+                    fault::notify_wait_site_park(fault::WaitSitePark {
+                        deadline: Some(at),
+                        woken,
+                    });
+                }
             }
         }
     }
 
     /// One step of a wait on the leaf's drain, shared by the sync and async waits: read the leaf,
     /// and answer if it has drained or `deadline` has passed. Otherwise listen, starting the pump
-    /// (which can itself take real time — spawning its thread), and read it again: a change after
-    /// that read is always heard, so the caller may block on the returned listener until
+    /// (which can itself take real time — spawning its thread), and read it again: a change
+    /// after that read is always heard, so the caller may block on the returned listener until
     /// `deadline`, then take another step. Returns `deadline`'s own instant unchanged, in
-    /// `Block` — see its doc for why.
+    /// `Block` — see its doc for why. Reads the clock via [`crate::wait::remaining`], which
+    /// honours the test clock in test builds, so a test can pin the zero-remaining shortcut's
+    /// boundary exactly without a real one.
     pub(crate) fn drain_step(
         &self,
         deadline: Option<Option<std::time::Instant>>,
@@ -560,6 +601,8 @@ impl CgroupLeaf {
             return Ok(DrainStep::Done(drain));
         }
         if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+            #[cfg(test)]
+            fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));
         }
         let listener = self.watch.listen().map_err(crate::error::Error::Io)?;

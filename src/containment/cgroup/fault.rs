@@ -24,6 +24,9 @@ thread_local! {
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitSitePark>>> = const { std::cell::RefCell::new(None) };
+    static WAIT_DEADLINE_ARG: std::cell::RefCell<Option<std::sync::mpsc::Sender<std::time::Instant>>> = const { std::cell::RefCell::new(None) };
     static LEAF_STEPS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -96,7 +99,121 @@ pub(crate) fn take_drain_blocking_notifier() {
 pub(crate) fn notify_drain_blocking() {
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            let _ = notify.send(());
+            // The send must always run — `debug_assert!` does not evaluate its condition in a
+            // release build, so it cannot gate the call itself, only check its result. A send
+            // failure while a notifier is installed means its receiver was dropped early — a
+            // contract violation by the test that installed it, not something to swallow.
+            let sent = notify.send(());
+            debug_assert!(sent.is_ok(), "drain-blocking notifier's receiver was dropped");
+        }
+    });
+}
+
+/// Send on `notify` each time a leaf's drain step on this thread takes its zero-remaining
+/// shortcut — answers `MembersRemain` from a step that arms no listener. Kept until
+/// [`take_drain_zero_remaining_notifier`].
+pub(crate) fn set_drain_zero_remaining_notifier(notify: std::sync::mpsc::Sender<()>) {
+    DRAIN_ZERO_REMAINING.with(|d| *d.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_drain_zero_remaining_notifier() {
+    DRAIN_ZERO_REMAINING.with(|d| d.borrow_mut().take());
+}
+pub(crate) fn notify_drain_zero_remaining() {
+    DRAIN_ZERO_REMAINING.with(|d| {
+        if let Some(notify) = d.borrow().as_ref() {
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(());
+            debug_assert!(sent.is_ok(), "zero-remaining notifier's receiver was dropped");
+        }
+    });
+}
+
+/// What `wait_drained`'s own `Block` arm saw when its wait call returned — including a listener
+/// already notified at registration, before any real park. `deadline` is the caller's own
+/// requested instant for a bounded park, not necessarily the one actually armed (`wait_deadline`
+/// consumes the listener, with no way to read that back) — `None` for an unbounded park, whose
+/// `woken` is always `true`: it has no timeout to elapse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WaitSitePark {
+    pub(crate) deadline: Option<std::time::Instant>,
+    pub(crate) woken: bool,
+}
+
+/// Send on `notify` each time `wait_drained`'s own `Block` arm's wait call returns — proof the
+/// call was reached, not that a real park happened: it also fires for a listener already
+/// notified at registration, before `wait_deadline`/`wait` ever parks. Kept until
+/// [`take_wait_site_park_notifier`].
+pub(crate) fn set_wait_site_park_notifier(notify: std::sync::mpsc::Sender<WaitSitePark>) {
+    WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_wait_site_park_notifier() {
+    WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
+}
+pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
+    WAIT_SITE_PARK.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(park);
+            debug_assert!(sent.is_ok(), "wait-site-park notifier's receiver was dropped");
+        }
+    });
+}
+
+/// Send on `notify` the exact instant about to be passed to `listener.wait_deadline(at)`, from
+/// `CgroupLeaf::wait_deadline_seamed` — the ONLY place this seam fires, one line above the real
+/// call, from the same `at` binding the call itself receives. Closes the sync side's own gap
+/// (`wait_deadline` consumes the listener and exposes no way to read back what it actually
+/// armed): `wait_deadline_seamed` exists so there is exactly one call site for the real
+/// `wait_deadline`, with this notify built in, rather than two separately-maintained lines a
+/// mutant could edit one of without the other. Kept until [`take_wait_deadline_arg_notifier`].
+pub(crate) fn set_wait_deadline_arg_notifier(notify: std::sync::mpsc::Sender<std::time::Instant>) {
+    WAIT_DEADLINE_ARG.with(|p| *p.borrow_mut() = Some(notify));
+}
+pub(crate) fn take_wait_deadline_arg_notifier() {
+    WAIT_DEADLINE_ARG.with(|p| p.borrow_mut().take());
+}
+pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
+    WAIT_DEADLINE_ARG.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(at);
+            debug_assert!(sent.is_ok(), "wait-deadline-arg notifier's receiver was dropped");
+        }
+    });
+}
+
+/// The instant the tokio twin (`cgroup_wait_tree_drained`) armed a bounded park with (`None` if
+/// unbounded); the async counterpart of [`WaitSitePark`].
+#[cfg(feature = "tokio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokioWaitSitePark {
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "tokio")]
+thread_local! {
+    static TOKIO_WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<TokioWaitSitePark>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn set_tokio_wait_site_park_notifier(notify: std::sync::mpsc::Sender<TokioWaitSitePark>) {
+    TOKIO_WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
+}
+#[cfg(feature = "tokio")]
+pub(crate) fn take_tokio_wait_site_park_notifier() {
+    TOKIO_WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
+}
+#[cfg(feature = "tokio")]
+pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
+    TOKIO_WAIT_SITE_PARK.with(|p| {
+        if let Some(notify) = p.borrow().as_ref() {
+            // The send must always run — see `notify_drain_blocking`'s own comment on why the
+            // result, not the call, is what `debug_assert!` gates.
+            let sent = notify.send(park);
+            debug_assert!(sent.is_ok(), "tokio-wait-site-park notifier's receiver was dropped");
         }
     });
 }
