@@ -40,16 +40,10 @@ pub(crate) mod fault {
     }
 }
 
-/// Test-only seam for `Child::wait_deadline`'s (std-backend) recheck loop: forces its FIRST
-/// iteration to receive a synthetic "still running" (`None`) WITHOUT calling the real
-/// underlying `shared_child::SharedChild::wait_deadline` at all. There is no seam into that
-/// third-party dependency's own Windows implementation
-/// (`shared_child::sys::windows::wait_deadline_noreap`, tracked upstream separately in cosca
-/// #237) to force ITS early-`WAIT_TIMEOUT` bug deterministically, so this fakes the
-/// OBSERVABLE effect instead — a `None` before the real deadline — at the one seam this crate
-/// does own: its own wrapping loop. Fires an optional one-shot hook the instant the forced
-/// value is consumed, so a test can end the wait via a real event (e.g. closing a fixture's
-/// stdin) exactly when the loop's second, REAL iteration is about to run.
+/// Test-only seam for `Child::wait_deadline`'s recheck loop: forces the FIRST iteration to see a
+/// synthetic `None` without calling the backend, standing in for `shared_child`'s early
+/// `WAIT_TIMEOUT` (no seam into that dependency exists; tracked as cosca #237). A hook fires when
+/// the forced value is consumed, so a test can end the wait through a real event.
 #[cfg(test)]
 pub(crate) mod early_none_seam {
     use std::cell::{Cell, RefCell};
@@ -166,7 +160,7 @@ pub(crate) mod test_clock {
     /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
     /// unfrozen clock already tracks real time on its own). Called after every real, blocking
     /// wait keyed to a real `Instant` deadline — macOS's `block_on_kqueue` (`kevent`), the Linux
-    /// cgroup drain loop (`CgroupLeaf::wait_drained`), and Windows' `wait_until` — so a frozen
+    /// cgroup drain loop (`CgroupLeaf::wait_drained`), Windows' `wait_until`, and `Child::wait_deadline` — so a frozen
     /// clock never hides a genuinely elapsed wait from `remaining`, and a re-arm loop under it
     /// cannot spin forever.
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
