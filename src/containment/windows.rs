@@ -946,7 +946,7 @@ pub(crate) fn wait_drained_raw(
             // the real deadline has not actually elapsed, loop back — the outer loop
             // re-enumerates and next round's `ms` computation re-arms with the (now shorter)
             // remaining time. See docs/principles.md #13.
-            if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+            if true {
                 return Ok(TreeDrain::MembersRemain);
             }
             continue;
