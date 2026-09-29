@@ -2681,12 +2681,13 @@ fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
 
     // A pid that is not this process's child is never signalled. `cat` reads the shell's stdin
     // through fd 3: an asynchronous list's own stdin is /dev/null.
-    let mut shell = std::process::Command::new("/bin/sh")
-        .args(["-c", "exec 3<&0; cat <&3 & echo $!; wait"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the shell");
+    let mut shell = crate::test_spawn::spawn(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "exec 3<&0; cat <&3 & echo $!; wait"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn the shell");
     let mut stdout = std::io::BufReader::new(shell.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the grandchild's pid");

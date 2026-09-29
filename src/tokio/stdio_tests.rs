@@ -13,7 +13,7 @@ async fn overlapped_pipe_reads_a_real_childs_output() {
     // here — the client is already open).
     let mut server = super::connect_task(server).await.expect("join").expect("connect");
     let mut child = crate::test_spawn::spawn(
-        &mut std::process::Command::new("cmd")
+        std::process::Command::new("cmd")
             .args(["/C", "echo overlapped-e2e"])
             .stdout(std::process::Stdio::from(client)),
     )
@@ -35,7 +35,7 @@ async fn overlapped_in_pipe_feeds_a_real_childs_input() {
     let (server, client) = super::overlapped_in_pipe().expect("pipe pair");
     let mut server = super::connect_task(server).await.expect("join").expect("connect");
     let mut child = crate::test_spawn::spawn(
-        &mut std::process::Command::new("findstr")
+        std::process::Command::new("findstr")
             .arg("^")
             .stdin(std::process::Stdio::from(client))
             .stdout(std::process::Stdio::piped()),
