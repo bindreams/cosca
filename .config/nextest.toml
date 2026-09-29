@@ -9,7 +9,7 @@ nextest-version = { required = "0.9.137" }
 # `[profile.default.overrides]` alone is enough: nextest applies it to every profile, `ci`
 # included.
 [[profile.default.overrides]]
-filter = 'test(/panics_loudly_when_the_target_dies_first|panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept|panics_when_the_grandchild_dies_before_connecting_while_the_root_lives|rejects_an_already_reaped_target/)'
+filter = 'test(/panics_loudly_when_the_target_dies_first|panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept|panics_when_the_grandchild_dies_before_connecting_while_the_root_lives/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 [profile.ci]
