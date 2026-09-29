@@ -29,10 +29,37 @@ pub fn enabled() -> bool {
     std::env::var_os(ACK_ENV).is_some()
 }
 
+/// Test seam for `tests/windows_testbin_ack.rs`, read by [`connect_control`]. Unset outside those
+/// tests. It probes the opt-in that a testbin mode gives its own children (`.env(ACK_ENV, "1")`),
+/// which an inherited [`ACK_ENV`] would otherwise hide.
+///
+/// - [`SEAM_STRICT`]: a connect without [`ACK_ENV`] panics, and once connected the process drops
+///   [`ACK_ENV`] from its own environment, so only an explicit `.env` reaches its children.
+/// - [`SEAM_DIE`]: once connected the process sets [`SEAM_DIE_NOW`], under which a descendant's
+///   connect exits before connecting: a child that dies before the mode's accept.
+pub const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
+pub const SEAM_STRICT: &str = "strict";
+pub const SEAM_DIE: &str = "die";
+pub const SEAM_DIE_NOW: &str = "die-now";
+
 /// `TcpStream::connect`, then, when [`enabled`], block until the harness's [`ACK_BYTE`] arrives.
 pub fn connect_control(addr: impl ToSocketAddrs) -> std::io::Result<TcpStream> {
+    let seam = std::env::var(SEAM_ENV).ok();
+    match seam.as_deref() {
+        Some(SEAM_STRICT) => assert!(
+            enabled(),
+            "{ACK_ENV} is not set: whoever spawned this process forgot to opt it in to the accept handshake"
+        ),
+        Some(SEAM_DIE_NOW) => std::process::exit(3),
+        _ => {}
+    }
     let mut sock = TcpStream::connect(addr)?;
     wait_for_ack(&mut sock);
+    match seam.as_deref() {
+        Some(SEAM_STRICT) => std::env::remove_var(ACK_ENV),
+        Some(SEAM_DIE) => std::env::set_var(SEAM_ENV, SEAM_DIE_NOW),
+        _ => {}
+    }
     Ok(sock)
 }
 

@@ -27,12 +27,13 @@ fn breakaway_report(shape: &str, vehicle: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = std::process::Command::new(testbin());
-    cmd.args(["report-breakaway", addr.as_str(), shape, vehicle]);
+    cmd.args(["report-breakaway", addr.as_str(), shape, vehicle])
+        .env(common::ACK_ENV, "1");
     let mut helper = {
         let _guard = cosca::test_spawn_lock();
         cmd.spawn().expect("spawn breakaway helper")
     };
-    let (sock, _) = listener.accept().expect("accept report socket");
+    let sock = common::accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
     drop(sock);
     helper.wait().expect("reap breakaway helper");

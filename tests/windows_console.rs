@@ -124,12 +124,12 @@ fn run_probe(detached: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-terminate", &addr]);
+    cmd.args(["report-console-terminate", &addr]).env(common::ACK_ENV, "1");
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
     let mut helper = cmd.spawn().expect("spawn probe helper");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");
     let status = helper.wait().expect("reap probe helper");
@@ -233,12 +233,12 @@ fn run_lone_probe(detached: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cosca_testbin"));
-    cmd.args(["report-console-lone", &addr]);
+    cmd.args(["report-console-lone", &addr]).env(common::ACK_ENV, "1");
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
     let mut helper = cmd.spawn().expect("spawn lone probe helper");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");
     let status = helper.wait().expect("reap lone probe helper");
