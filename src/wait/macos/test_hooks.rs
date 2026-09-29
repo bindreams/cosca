@@ -185,6 +185,7 @@ impl Drop for HookGuard {
 
 type OnceHook = Box<dyn FnOnce()>;
 type RoundHookOnce = (u32, OnceHook);
+type EveryRoundHook = Box<dyn FnMut(u32)>;
 
 thread_local! {
     static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
@@ -193,6 +194,8 @@ thread_local! {
     static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
+    static ON_EVERY_KEVENT_ROUND: RefCell<Option<EveryRoundHook>> = const { RefCell::new(None) };
+    static FORCED_EINTR: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
 /// Record the timeout one `await_reapable` `kevent` call was armed with. Kept apart from
@@ -228,9 +231,11 @@ pub(crate) fn take_forced_esrch_registration() -> bool {
     FORCE_ESRCH_REGISTRATION.with(Cell::take)
 }
 
-/// Run `hook` on the waiting thread just before the wait's next re-peek.
-pub(crate) fn on_before_repeek(hook: impl FnOnce() + 'static) {
+/// Run `hook` on the waiting thread just before the wait's next re-peek. The guard drops an
+/// unfired hook.
+pub(crate) fn on_before_repeek(hook: impl FnOnce() + 'static) -> ForcedOnce {
     ON_BEFORE_REPEEK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForcedOnce(|| ON_BEFORE_REPEEK.with(|h| *h.borrow_mut() = None))
 }
 
 pub(crate) fn fire_before_repeek() {
@@ -240,9 +245,10 @@ pub(crate) fn fire_before_repeek() {
 }
 
 /// Run `hook` on the waiting thread just before the next re-peek that follows an `ESRCH`
-/// registration (the backoff's re-peeks).
-pub(crate) fn on_esrch_repeek(hook: impl FnOnce() + 'static) {
+/// registration (the backoff's re-peeks). The guard drops an unfired hook.
+pub(crate) fn on_esrch_repeek(hook: impl FnOnce() + 'static) -> ForcedOnce {
     ON_ESRCH_REPEEK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForcedOnce(|| ON_ESRCH_REPEEK.with(|h| *h.borrow_mut() = None))
 }
 
 pub(crate) fn fire_esrch_repeek() {
@@ -252,12 +258,42 @@ pub(crate) fn fire_esrch_repeek() {
 }
 
 /// Run `hook` on the waiting thread just before round `round`'s blocking `kevent` in the
-/// `await_reapable` loop.
-pub(crate) fn on_kevent_round(round: u32, hook: impl FnOnce() + 'static) {
+/// `await_reapable` loop. The guard drops an unfired hook.
+pub(crate) fn on_kevent_round(round: u32, hook: impl FnOnce() + 'static) -> ForcedOnce {
     ON_KEVENT_ROUND.with(|h| *h.borrow_mut() = Some((round, Box::new(hook))));
+    ForcedOnce(|| ON_KEVENT_ROUND.with(|h| *h.borrow_mut() = None))
+}
+
+/// Run `hook` with the round index on the waiting thread just before every blocking `kevent`
+/// round of the `await_reapable` loop. The guard drops it.
+pub(crate) fn on_every_kevent_round(hook: impl FnMut(u32) + 'static) -> ForcedOnce {
+    ON_EVERY_KEVENT_ROUND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForcedOnce(|| ON_EVERY_KEVENT_ROUND.with(|h| *h.borrow_mut() = None))
+}
+
+/// The next blocking `kevent` call on this thread (not a zero-timeout drain) fails with `EINTR`
+/// instead of running, after the frozen clock has advanced by `elapsed`: the time a real
+/// interrupted call would have spent.
+pub(crate) fn force_eintr_once(elapsed: Duration) -> ForcedOnce {
+    FORCED_EINTR.with(|f| f.set(Some(elapsed)));
+    ForcedOnce(|| FORCED_EINTR.with(|f| f.set(None)))
+}
+
+pub(crate) fn take_forced_eintr() -> Option<Duration> {
+    FORCED_EINTR.with(Cell::take)
 }
 
 pub(crate) fn fire_kevent_round(round: u32) {
+    // Out of its slot for the call, so the hook may itself install or drop hooks.
+    if let Some(mut every) = ON_EVERY_KEVENT_ROUND.with(|h| h.borrow_mut().take()) {
+        every(round);
+        ON_EVERY_KEVENT_ROUND.with(|h| {
+            let mut slot = h.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(every);
+            }
+        });
+    }
     let hook = ON_KEVENT_ROUND.with(|h| {
         let mut slot = h.borrow_mut();
         match slot.as_ref() {
