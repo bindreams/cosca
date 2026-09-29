@@ -1,18 +1,35 @@
-# The flag-less pipe constructors in this crate's dependency graph: pipe(2)/pipe2 wrappers that
-# take no flags argument, so their fds always lack close-on-exec. Narrower than every
-# close-on-exec gap by design — pipe2 called with empty flags, openpty/forkpty and dup are out of
-# scope here. `nix::unistd::pipe` calls `libc::pipe` internally. `rustix::pipe::pipe` is marked
-# `allow-invalid = true`: rustix's `pipe` feature isn't enabled in this crate today, so on the one
-# target that links rustix (Linux) the path is unreachable — a missing-feature gap, not a typo. A
-# target that never links rustix at all (macOS, Windows) skips the path silently either way.
-# The raw tokio timers are banned for the deadline contract (principle 13). advance/pause, used by
-# paused-clock tests, are not.
+# Flag-less pipe constructors -----
+#
+# The pipe(2)/pipe2 wrappers in this crate's dependency graph that take no flags argument, so their
+# fds always lack close-on-exec. Narrower than every close-on-exec gap by design — pipe2 called
+# with empty flags, openpty/forkpty and dup are out of scope here. `nix::unistd::pipe` calls
+# `libc::pipe` internally. `rustix::pipe::pipe` is marked `allow-invalid = true`: rustix's `pipe`
+# feature isn't enabled in this crate today, so on the one target that links rustix (Linux) the
+# path is unreachable — a missing-feature gap, not a typo. A target that never links rustix at all
+# (macOS, Windows) skips the path silently either way.
+#
+# Raw tokio timers -----
+#
+# Every public tokio timer constructor and re-arm, banned for the deadline contract (principle 13).
+# `tokio::time::advance`/`pause` (paused-clock tests) are deliberately not banned.
+#
+# Both bans are guarded by .github/scripts/check-disallowed-methods.sh: every path below needs a
+# call in .github/fixtures/disallowed-methods.
 disallowed-methods = [
+    # Flag-less pipe constructors
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },
     { path = "nix::unistd::pipe", reason = "nix::unistd::pipe wraps libc::pipe, so its fds lack close-on-exec the same way. Use nix::unistd::pipe2(OFlag::O_CLOEXEC) where available, or std::io::pipe()." },
     { path = "rustix::pipe::pipe", reason = "rustix::pipe::pipe is a pipe/pipe2 call with no flags, so its fds lack close-on-exec. Use rustix::pipe::pipe_with(PipeFlags::CLOEXEC) or std::io::pipe().", allow-invalid = true },
-    { path = "tokio::time::timeout", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::timeout(d, fut) re-derives the deadline from a duration, so it can arm late or on the wrong clock. Use arm_at(at, fut) with an instant from deadline_from." },
-    { path = "tokio::time::timeout_at", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::timeout_at bypasses arm_at's margin check and its armed-deadline seam, so a deadline can arm late or on the wrong clock. Use arm_at(at, fut), which is its one sanctioned caller." },
-    { path = "tokio::time::sleep", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::sleep(d) re-derives the deadline from a duration, so it can arm late or on the wrong clock. Arm the deadline with arm_at(at, fut); never synchronize by sleeping." },
-    { path = "tokio::time::sleep_until", reason = "Every async deadline is armed through crate::tokio::wait::arm_at (principle 13, the deadline contract, cosca #249): a raw tokio::time::sleep_until re-derives the deadline from a duration, so it can arm late or on the wrong clock. Arm the deadline with arm_at(at, fut); never synchronize by sleeping." },
+    # Raw tokio timers
+    { path = "tokio::time::timeout", reason = "Deadlines are armed via crate::tokio::wait::arm_at (principle 13): a duration-based timeout re-derives the deadline and can arm late or on the wrong clock. Use arm_at(at, fut) with an instant from deadline_from." },
+    { path = "tokio::time::timeout_at", reason = "tokio::time::timeout_at bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut), its one sanctioned caller (principle 13)." },
+    { path = "tokio::time::sleep", reason = "Deadlines are armed via crate::tokio::wait::arm_at (principle 13): a duration-based sleep re-derives the deadline and can arm late or on the wrong clock. Use arm_at(at, fut) with an instant from deadline_from; never synchronize by sleeping." },
+    { path = "tokio::time::sleep_until", reason = "tokio::time::sleep_until bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13); never synchronize by sleeping." },
+    { path = "tokio::time::interval", reason = "An Interval arms its timer from a duration, outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
+    { path = "tokio::time::interval_at", reason = "An Interval arms its timer outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
+    { path = "tokio::time::Sleep::reset", reason = "Re-arming a Sleep bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
+    { path = "tokio::time::Interval::reset", reason = "Re-arming an Interval derives the deadline from its period, outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
+    { path = "tokio::time::Interval::reset_immediately", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
+    { path = "tokio::time::Interval::reset_after", reason = "Re-arming an Interval derives the deadline from a duration, outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
+    { path = "tokio::time::Interval::reset_at", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
 ]

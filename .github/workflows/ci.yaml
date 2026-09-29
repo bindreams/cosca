@@ -52,16 +52,16 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-script-tests.sh
 
-      # Regression check for clippy.toml's disallowed-methods pipe ban (see that file): lints
-      # .github/fixtures/disallowed-pipes, a standalone crate that calls every banned path,
+      # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
+      # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
       # against the real clippy.toml, and asserts the diagnostic actually fires for each —
       # structured JSON, not scraped text. Catches a renamed disallowed-methods key, a typo'd
       # path, or a dependency upgrade that silently moves a function out from under the ban.
       # `!cancelled()`: same override-success() rationale as the step below.
-      - name: Check the disallowed-methods pipe ban still fires
+      - name: Check the disallowed-methods bans still fire
         if: ${{ !cancelled() }}
         shell: bash
-        run: bash .github/scripts/check-disallowed-pipes.sh
+        run: bash .github/scripts/check-disallowed-methods.sh
 
       # The prek `cargo-clippy` hook above calls .github/scripts/clippy.sh with
       # neither --target nor --feature-powerset (host, no features) — this crate
@@ -76,6 +76,14 @@ jobs:
       - name: Clippy (feature powerset)
         if: ${{ !cancelled() }}
         uses: ./.github/actions/clippy-powerset
+
+      # `cfg(not(debug_assertions))` code (release-only branches and their tests) is compiled by no
+      # debug build, so the step above never lints it, and neither do clippy.toml's bans. The
+      # powerset action installed cargo-hack.
+      - name: Clippy (feature powerset, release)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: .github/scripts/clippy.sh --feature-powerset --release
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})

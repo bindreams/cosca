@@ -4,11 +4,12 @@
 # CI's clippy-powerset composite action (extra `--target`/`--feature-powerset`
 # for cross-target, cross-feature coverage the host-only prek hook can't give).
 #
-# Usage: clippy.sh [--target TRIPLE] [--feature-powerset]
+# Usage: clippy.sh [--target TRIPLE] [--feature-powerset] [--release]
 set -euo pipefail
 
 target=""
 powerset=0
+release=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18,6 +19,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --feature-powerset)
             powerset=1
+            shift
+            ;;
+        --release)
+            release=1
             shift
             ;;
         *)
@@ -36,6 +41,11 @@ fi
 
 if [[ -n "$target" ]]; then
     cmd+=(--target "$target")
+fi
+
+# Code under `cfg(not(debug_assertions))` (and its clippy bans) is only compiled by a release build.
+if [[ "$release" -eq 1 ]]; then
+    cmd+=(--release)
 fi
 
 cmd+=(--all-targets)
