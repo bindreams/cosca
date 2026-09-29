@@ -104,6 +104,13 @@ filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
 slow-timeout = { period = "20s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# A hang backstop for the tracer tests, which block on the helper's reports. The tests assert
+# each report as it arrives, so a broken transition fails an assertion; this bound is the last
+# resort.
+filter = 'test(/^test_support::tracer::/)'
+slow-timeout = { period = "10s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
 # stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
 # detect that themselves; this bound only stops a hang from stalling the job. It covers the whole
