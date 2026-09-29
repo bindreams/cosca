@@ -1336,6 +1336,7 @@ pub(crate) mod fault {
     }
     impl TeardownBlocker {
         /// The `(pid, status)` of each reap the teardown recorded so far.
+        #[cfg(unix)]
         pub(crate) fn recorded(&self) -> Vec<TeardownReap> {
             self.reaps.recorded()
         }
