@@ -46,6 +46,8 @@ tempfile = "3"
 serde_json = "1"
 # Word-boundary matching for tests/no_chdir_guard.rs's chdir-call scanner.
 regex = "1"
+# `test-util`: `start_paused` virtual clock for the deadline tests. Dev-only.
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is
@@ -84,11 +86,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# `test-util`, for the deterministic clock-advance check in
-# `windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped` — see the test's
-# own doc for what it catches that `armed_probe` alone does not. Dev-only: kept out of the
-# published crate's dependency footprint, same reasoning as this block's other additions.
-tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 # Unpredictable merge-target pipe names (std parity: std randomizes its anon-pipe names).

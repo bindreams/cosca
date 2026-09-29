@@ -419,36 +419,6 @@ impl WaitObserver {
     }
 }
 
-/// Installs `set_tokio_wait_site_park_notifier` on construction, uninstalling it on drop —
-/// panic-safe, so a panic between install and take never leaves the seam installed for whatever
-/// runs on this thread next. Same pattern as `WaitObserverGuard`, for the one seam it doesn't
-/// cover.
-#[cfg(target_os = "linux")]
-#[cfg(feature = "tokio")]
-#[must_use]
-pub(crate) struct TokioWaitSiteParkGuard;
-
-#[cfg(target_os = "linux")]
-#[cfg(feature = "tokio")]
-impl TokioWaitSiteParkGuard {
-    pub(crate) fn install() -> (
-        Self,
-        std::sync::mpsc::Receiver<crate::containment::cgroup::fault::TokioWaitSitePark>,
-    ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        crate::containment::cgroup::fault::set_tokio_wait_site_park_notifier(tx);
-        (Self, rx)
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[cfg(feature = "tokio")]
-impl Drop for TokioWaitSiteParkGuard {
-    fn drop(&mut self) {
-        crate::containment::cgroup::fault::take_tokio_wait_site_park_notifier();
-    }
-}
-
 /// Installs `set_wait_deadline_arg_notifier` on construction, uninstalling it on drop —
 /// panic-safe, same pattern as `WaitObserverGuard`. Separate from `WaitObserver` itself: this
 /// seam is for the one property `WaitSitePark`'s own `deadline` field can't prove (that a

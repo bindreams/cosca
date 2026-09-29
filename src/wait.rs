@@ -166,12 +166,12 @@ pub(crate) mod test_clock {
 }
 
 #[cfg(not(test))]
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     Instant::now()
 }
 
 #[cfg(test)]
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     test_clock::now()
 }
 
@@ -181,26 +181,44 @@ fn now() -> Instant {
 ///
 /// Reads the clock via [`now`], which honours [`test_clock`] in test builds.
 pub(crate) fn remaining(deadline: Option<Option<Instant>>) -> Option<Duration> {
+    remaining_at(deadline, now())
+}
+
+/// [`remaining`] against an explicit `now`, for waits that run on another clock (tokio's).
+pub(crate) fn remaining_at(deadline: Option<Option<Instant>>, now: Instant) -> Option<Duration> {
     match deadline {
         None | Some(None) => None,
-        Some(Some(at)) => Some(at.saturating_duration_since(now())),
+        Some(Some(at)) => Some(at.saturating_duration_since(now)),
     }
 }
 
+/// How far short of `Instant`'s ceiling a deadline must stay for tokio to arm it. tokio's timer
+/// wheel rounds deadlines UP by up to `999_999` ns with an unchecked `Instant + Duration`, which
+/// panics past the ceiling. 1 ms sits above that so we need not track tokio's constant. An instant
+/// inside it is unbounded: see [`deadline_at`].
+pub(crate) const TOKIO_TIMER_ROUNDING_MARGIN: Duration = Duration::from_millis(1);
+
+/// Whether `at` leaves [`TOKIO_TIMER_ROUNDING_MARGIN`] before `Instant`'s ceiling, i.e. tokio can
+/// arm it without panicking.
+pub(crate) fn clears_tokio_timer_margin(at: Instant) -> bool {
+    at.checked_add(TOKIO_TIMER_ROUNDING_MARGIN).is_some()
+}
+
+/// The pure core of [`deadline_from`]: `now + duration`, or `None` (unbounded) when that
+/// overflows `Instant` or lands inside [`TOKIO_TIMER_ROUNDING_MARGIN`] of its ceiling. An
+/// overflowing wait is unbounded everywhere in this crate, never a fixed far-future deadline,
+/// which would answer EARLY.
+pub(crate) fn deadline_at(now: Instant, duration: Duration) -> Option<Instant> {
+    now.checked_add(duration).filter(|at| clears_tokio_timer_margin(*at))
+}
+
 /// Convert a relative `duration` into the crate's `deadline` convention
-/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, saturating
-/// to unbounded (`Some(None)`, read by `remaining` the same as outer `None`) on overflow rather
-/// than panicking. Also saturates when the result lands within a millisecond of `Instant`'s own
-/// ceiling: tokio's timer wheel rounds a deadline up by just under that much (unchecked) when
-/// arming `sleep_until`/`timeout_at`, so a `Block` carrying an instant this close to the ceiling
-/// would panic there instead of waiting. Shared by every `_timeout`/`grace`-style call that
-/// starts a fresh relative wait from "now".
+/// (`Option<Option<Instant>>`, the inverse of [`remaining`]): [`now`]`() + duration`, per
+/// [`deadline_at`]: saturating to unbounded (`Some(None)`, read by `remaining` the same as outer
+/// `None`) rather than panicking, including inside [`TOKIO_TIMER_ROUNDING_MARGIN`] of the ceiling.
+/// Shared by every `_timeout`/`grace`-style call that starts a fresh relative wait from "now".
 pub(crate) fn deadline_from(duration: Duration) -> Option<Option<Instant>> {
-    Some(
-        now()
-            .checked_add(duration)
-            .filter(|at| at.checked_add(Duration::from_millis(1)).is_some()),
-    )
+    Some(deadline_at(now(), duration))
 }
 
 /// The largest `Instant` reachable from `start`, found purely through `checked_add`'s own

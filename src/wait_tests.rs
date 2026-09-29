@@ -1,6 +1,6 @@
 use super::{
-    ceil_millis, deadline_from, instant_near_ceiling, remaining, remaining_override_seam, test_clock, wait_clamp_seam,
-    wait_ms_probe, win32_timeout_ms,
+    ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, remaining,
+    remaining_override_seam, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
 };
 use std::time::{Duration, Instant};
 
@@ -140,4 +140,50 @@ fn wait_ms_probe_records_the_requested_remaining_beside_the_armed_one() {
     assert_eq!(arms[0].ms, 3);
     assert_eq!(arms[0].remaining, Duration::from_millis(3));
     assert_eq!(arms[0].requested, Duration::from_millis(999));
+}
+
+/// `ceiling - MARGIN` clears (adding the margin lands ON
+/// the ceiling, representable); one nanosecond later does not.
+#[test]
+fn deadline_at_passes_through_up_to_the_margin_and_is_unbounded_past_it() {
+    let now = Instant::now();
+    let ceiling = instant_near_ceiling(now);
+    let span = ceiling.saturating_duration_since(now);
+
+    let edge = span - TOKIO_TIMER_ROUNDING_MARGIN;
+    assert_eq!(deadline_at(now, edge), Some(now + edge));
+    assert_eq!(deadline_at(now, edge + Duration::from_nanos(1)), None);
+    assert_eq!(deadline_at(now, span), None);
+    assert_eq!(
+        deadline_at(now, span + Duration::from_nanos(1)),
+        None,
+        "overflow itself"
+    );
+    assert_eq!(deadline_at(now, Duration::MAX), None);
+    assert_eq!(deadline_at(now, Duration::ZERO), Some(now));
+    assert_eq!(
+        deadline_at(now, Duration::from_secs(1)),
+        Some(now + Duration::from_secs(1))
+    );
+}
+
+#[test]
+fn clears_tokio_timer_margin_is_true_exactly_up_to_the_margin() {
+    let ceiling = instant_near_ceiling(Instant::now());
+    assert!(clears_tokio_timer_margin(ceiling - TOKIO_TIMER_ROUNDING_MARGIN));
+    assert!(!clears_tokio_timer_margin(
+        ceiling - TOKIO_TIMER_ROUNDING_MARGIN + Duration::from_nanos(1)
+    ));
+}
+
+/// `deadline_from` is `deadline_at` on the frozen clock, wrapped in `Some`.
+#[test]
+fn deadline_from_applies_deadline_at_on_the_test_clock() {
+    let (_guard, t0) = test_clock::FrozenClockGuard::install();
+    let span = instant_near_ceiling(t0).saturating_duration_since(t0);
+    let edge = span - TOKIO_TIMER_ROUNDING_MARGIN;
+
+    assert_eq!(deadline_from(edge), Some(Some(t0 + edge)));
+    assert_eq!(deadline_from(edge + Duration::from_nanos(1)), Some(None));
+    assert_eq!(deadline_from(Duration::MAX), Some(None));
 }

@@ -186,39 +186,6 @@ pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
     });
 }
 
-/// The instant the tokio twin (`cgroup_wait_tree_drained`) armed a bounded park with (`None` if
-/// unbounded); the async counterpart of [`WaitSitePark`].
-#[cfg(feature = "tokio")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TokioWaitSitePark {
-    pub(crate) deadline: Option<std::time::Instant>,
-}
-
-#[cfg(feature = "tokio")]
-thread_local! {
-    static TOKIO_WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<TokioWaitSitePark>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(feature = "tokio")]
-pub(crate) fn set_tokio_wait_site_park_notifier(notify: std::sync::mpsc::Sender<TokioWaitSitePark>) {
-    TOKIO_WAIT_SITE_PARK.with(|p| *p.borrow_mut() = Some(notify));
-}
-#[cfg(feature = "tokio")]
-pub(crate) fn take_tokio_wait_site_park_notifier() {
-    TOKIO_WAIT_SITE_PARK.with(|p| p.borrow_mut().take());
-}
-#[cfg(feature = "tokio")]
-pub(crate) fn notify_tokio_wait_site_park(park: TokioWaitSitePark) {
-    TOKIO_WAIT_SITE_PARK.with(|p| {
-        if let Some(notify) = p.borrow().as_ref() {
-            // The send must always run — see `notify_drain_blocking`'s own comment on why the
-            // result, not the call, is what `debug_assert!` gates.
-            let sent = notify.send(park);
-            debug_assert!(sent.is_ok(), "tokio-wait-site-park notifier's receiver was dropped");
-        }
-    });
-}
-
 /// Record, on this thread, each `cgroup.kill` write (`"kill"`) and each `rmdir` of a leaf, the
 /// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
 pub(crate) fn record_leaf_steps() {
