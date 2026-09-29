@@ -87,6 +87,43 @@ fn probe_kill0(pid: u32) -> Result<(), Option<i32>> {
     Err(std::io::Error::last_os_error().raw_os_error())
 }
 
+/// The uid this test re-executes itself as when started as root: `nobody`.
+const UNPRIVILEGED: u32 = 65534;
+
+/// Set in the re-executed child. The child then prints [`RERAN`] before its body, because libtest
+/// exits 0 when the filter matches no test.
+const RERUN_ENV: &str = "COSCA_TEST_SETUID_RERUN";
+const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
+
+/// Re-executes this test binary as [`UNPRIVILEGED`], running only this test, and requires it to
+/// pass. The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
+/// executable by anyone) and this binary must be reachable by that uid; if they are not, the
+/// child's failure says so.
+fn rerun_unprivileged() {
+    use std::os::unix::process::CommandExt as _;
+
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([
+            "--exact",
+            "kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RERUN_ENV, "1")
+        .uid(UNPRIVILEGED)
+        .gid(UNPRIVILEGED)
+        .output()
+        .expect("re-execute this test as an unprivileged user");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.lines().any(|line| line == RERAN),
+        "the unprivileged re-run did not pass ({}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// One accepted control connection, classified by its first line:
 /// - `"R"` — the ordinary group leader, ready and blocked.
 /// - `"P <pid>"` — the setuid-root helper, ready (fully real-uid-0) and blocked, reporting its
@@ -134,6 +171,24 @@ fn accept_one(listener: &TcpListener) -> Handshake {
             run --test group_teardown_setuid --run-ignored only` — see this file's module docs"]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let helper = gated();
+    // Root may signal anything, so the setuid helper would not be unsignalable and this scenario
+    // would not exist. Run it as the unprivileged caller it is about instead of failing.
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        // Without this a re-run that is still root would re-execute itself without end.
+        assert!(
+            std::env::var_os(RERUN_ENV).is_none(),
+            "the unprivileged re-run is still root: dropping to uid {UNPRIVILEGED} did not take effect"
+        );
+        return rerun_unprivileged();
+    }
+    if std::env::var_os(RERUN_ENV).is_some() {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        writeln!(out, "\n{RERAN}")
+            .and_then(|()| out.flush())
+            .expect("announce the re-run");
+    }
     assert!(
         std::path::Path::new(&helper).is_file(),
         "COSCA_TEST_SETUID_HELPER={helper:?} does not point at an existing file"

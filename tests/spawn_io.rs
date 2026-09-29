@@ -850,16 +850,26 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     }
 }
 
+/// `spawn_contained_tree` asks for the strongest mechanism, and which one that is depends on the
+/// host: a caller that may create a cgroup gets `CgroupV2` where an unprivileged one gets
+/// `ProcessGroup`. The tests below prove the tree dies under whichever the host grants, so this
+/// pins only the set of mechanisms that tear a tree down.
+#[cfg(unix)]
+fn assert_strongest_tree_containment(child: &cosca::Child) {
+    let got = child.containment();
+    let ok = if cfg!(target_os = "macos") {
+        got == cosca::Containment::FdMarker
+    } else {
+        matches!(got, cosca::Containment::CgroupV2 | cosca::Containment::ProcessGroup)
+    };
+    assert!(ok, "unexpected containment for a contained tree: {got:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::ProcessGroup
-    };
-    assert_eq!(child.containment(), expected);
+    assert_strongest_tree_containment(&child);
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait(); // reap the root
@@ -876,12 +886,7 @@ fn unix_kill_tree_reaps_the_grandchild() {
 #[test]
 fn unix_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
-    let expected = if cfg!(target_os = "macos") {
-        cosca::Containment::FdMarker
-    } else {
-        cosca::Containment::ProcessGroup
-    };
-    assert_eq!(child.containment(), expected);
+    assert_strongest_tree_containment(&child);
 
     child.terminate_tree().expect("terminate_tree");
     let _ = child.wait(); // reap the root
