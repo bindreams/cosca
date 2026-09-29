@@ -77,7 +77,9 @@ impl Process {
     }
 
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). `Err` only on a wait failure (incl. `Unsupported` on Linux < 5.3).
+    /// parent gets one). `Err` only on a wait failure. On Linux that is `Unsupported` when `pidfd_open` is refused (a
+    /// kernel < 5.3, or a seccomp or LSM filter answering `ENOSYS`, `EPERM`, `EACCES` or `ENODEV`),
+    /// or `Io` prefixed `pidfd_open:` for a transient failure such as `EMFILE`.
     /// Non-reaping.
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::wait::block_until_exit(self.id, None)?;

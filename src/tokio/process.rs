@@ -72,7 +72,9 @@ impl Process {
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
     /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (incl.
-    /// `Unsupported` on Linux < 5.3). Dropping the future cancels the watch on every
+    /// `Unsupported` on Linux when `pidfd_open` is refused: a kernel < 5.3, or a seccomp or LSM filter
+    /// answering `ENOSYS`, `EPERM`, `EACCES` or `ENODEV`; `Io` prefixed `pidfd_open:` for a
+    /// transient failure such as `EMFILE`). Dropping the future cancels the watch on every
     /// platform (the Windows watcher is released via its cancel event).
     ///
     /// # Runtime

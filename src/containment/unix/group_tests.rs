@@ -343,6 +343,41 @@ fn pid1_uid() -> u32 {
     0
 }
 
+/// A refused `pidfd_open` falls back to `kill(2)` for the member, and the debug line that
+/// records the fallback names the operation as `process-group teardown`.
+///
+/// Mutants: the op is another `PidfdOp`; the forced errno is not consumed (no fallback, so no
+/// line).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
+    use crate::containment::cgroup::test_support::{block_on, fork_running};
+
+    crate::log_capture::install();
+    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
+    let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
+    let child = fork_running(|| block_on(gate_r_fd));
+    let id = ProcessId::of(child.pid()).found().expect("the live child resolves");
+    let mark = crate::log_capture::mark();
+
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::PERM);
+    let reached = super::check_or_signal_linux_sigkill(child.pid(), id);
+    drop(forced);
+
+    assert!(matches!(reached, super::Reached::Yes), "got {reached:?}");
+    let lines = crate::log_capture::records_since_on_current_thread(mark, "pidfd unavailable");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, log::Level::Debug);
+    assert!(
+        lines[0].1.contains(
+            "process-group teardown is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+             refused here: pidfd_open answered EPERM"
+        ),
+        "{lines:?}"
+    );
+    drop(gate_w);
+}
+
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
 /// never sent to the `kill(2)` fallback (a `kill` on a tid signals its whole thread group). The
 /// `pid` argument is a disposable child, so a regression that fell back would land on it, never on
