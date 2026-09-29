@@ -1296,8 +1296,19 @@ fn s4_passes_a_caught_stop_signal_through() {
     expect(&mut th, &["S4b*", "detached", DONE]);
     drop(th);
     drop(stdin);
-    assert_job_stopped(pid, libc::SIGSTOP);
-    end_stopped(tracee);
+    // Nothing was kept: the tracee is stopped by S4's `SIGSTOP` at most (macOS 26), never by a
+    // re-sent `SIGTSTP`; on macOS 15 it runs on and exits at the closed stdin.
+    let info = await_change(pid);
+    if info.si_code == libc::CLD_STOPPED {
+        assert_eq!(
+            info.si_status,
+            libc::SIGSTOP,
+            "the detached tracee is stopped by a re-sent signal"
+        );
+        end_stopped(tracee);
+    } else {
+        assert_exited_cleanly(tracee);
+    }
     assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
 }
 
