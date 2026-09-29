@@ -204,7 +204,14 @@ impl SharedChild {
 
         let handle = HANDLE(self.handle.as_raw_handle());
         // SAFETY: `handle` is our owned process handle, alive for the whole call.
-        let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe { WaitForSingleObject(handle, ms) });
+        // MUTANT (review): trust the first WAIT_TIMEOUT, keeping rearm_until's clock advance.
+        let waited = crate::wait::rearm_until(deadline.map(Some), |remaining| {
+            Ok::<_, std::convert::Infallible>(Some(unsafe {
+                WaitForSingleObject(handle, crate::wait::win32_timeout_ms(remaining))
+            }))
+        })
+        .unwrap_or_else(|never| match never {})
+        .unwrap_or(WAIT_TIMEOUT);
         if waited == WAIT_OBJECT_0 {
             return Ok(Unlocked::ExitSeen);
         }
