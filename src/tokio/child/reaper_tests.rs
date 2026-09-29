@@ -149,6 +149,7 @@ async fn drop_signals_the_root_and_returns_before_the_reap() {
 
     // Guard: `Drop` reached the handoff at all. Without it an early return would leave every
     // assertion below observing nothing and passing vacuously.
+    super::test_probe::assert_consumed();
     let dropping = ends.entered.recv().expect("Drop must reach the handoff");
     assert_eq!(
         dropping,
@@ -205,6 +206,7 @@ async fn drop_reaps_on_a_worker_thread() {
     let id = child.id();
     drop(child);
 
+    super::test_probe::assert_consumed();
     let dropping = entered.recv().expect("Drop must reach the handoff");
     let outcome = outcome.recv().expect("the teardown must report an outcome");
     // Thread ids FIRST: an inlined teardown is the failure under test, and asserting the
@@ -452,6 +454,7 @@ async fn teardown_panic_is_caught_and_reported() {
     super::fault::set_force_teardown_panic(true);
     drop(child);
 
+    super::test_probe::assert_consumed();
     entered.recv().expect("Drop must reach the handoff");
     assert_eq!(
         outcome
@@ -499,6 +502,7 @@ async fn unkillable_root_is_not_submitted() {
     super::fault::set_force_kill_failure(true);
     drop(child);
 
+    super::test_probe::assert_consumed();
     entered.recv().expect("Drop must reach the handoff");
     // Race-free: the seam REPLACED the kill, so the child was never signalled.
     assert_eq!(

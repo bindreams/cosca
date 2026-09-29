@@ -104,6 +104,7 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
 
     drop(child);
 
+    super::reaper::test_probe::assert_consumed();
     let dropping = entered
         .recv()
         .expect("a disarmed, already-killed drop must reach the reaper handoff");

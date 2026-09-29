@@ -446,6 +446,14 @@ pub(crate) mod test_probe {
     pub(crate) fn take() -> Option<DropProbe> {
         PROBE.with(|p| p.borrow_mut().take())
     }
+
+    /// Call right after the drop under test, before any blocking `recv` on the probe's receivers.
+    /// A `Drop` that never took the probe leaves its senders alive in this thread's own TLS, so
+    /// such a `recv` would wait on this very thread forever. Taking them here drops them, so a
+    /// missed handoff fails at once instead.
+    pub(crate) fn assert_consumed() {
+        assert!(take().is_none(), "Child::drop must have taken the armed probe");
+    }
 }
 
 #[cfg(test)]

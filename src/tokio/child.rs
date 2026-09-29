@@ -128,6 +128,12 @@ impl Child {
         self.os.attached.hard_kill()
     }
 
+    /// What names this child's tree in a message about a failed teardown of it.
+    #[cfg(unix)]
+    pub(super) fn teardown_subject(&self) -> String {
+        self.os.attached.teardown_subject()
+    }
+
     /// Attach the elevation report — set by the spawn arms before the deferred password write, so
     /// a cleanup `kill` in the write-failure path already sees the elevated state.
     pub(crate) fn set_elevation(&mut self, report: Option<crate::elevation::ElevationReport>) {

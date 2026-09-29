@@ -557,38 +557,71 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     }
 }
 
-/// A failed password write kills the contained tree through the leaf — checked BOTH on the
-/// thread-local step log and by reading `cgroup.kill`'s raw bytes, the latter only after this
-/// test has waited for the reaper pool to fully finish with the leaf.
+/// A `DropProbe` armed for the next `Child::drop` on this thread, gate released at once: the test
+/// observes the reaper, it does not pause it (the process-global pool's gate-hold budget is spent
+/// elsewhere, see `reaper_tests`).
+#[cfg(target_os = "linux")]
+struct ReaperFence {
+    entered: std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    started: std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    outcome: std::sync::mpsc::Receiver<crate::tokio::child::reaper::test_probe::ReapOutcome>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReaperFence {
+    fn arm() -> Self {
+        use crate::tokio::child::reaper::test_probe::{arm, DropProbe};
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        arm(DropProbe {
+            entered: entered_tx,
+            started: started_tx,
+            gate: gate_rx,
+            outcome: outcome_tx,
+        });
+        drop(gate_tx);
+        Self {
+            entered,
+            started,
+            outcome,
+        }
+    }
+
+    /// Block until the reaper pool has fully finished with the dropped child's leaf, so nothing
+    /// of it (a re-fired `cgroup.kill` write, the `rmdir`) can race the caller's reads or the
+    /// removal of its tempdir. Returns `(dropping thread, executing thread)`; the teardown must
+    /// have run on a pool thread, not inline.
+    fn wait(self) -> (std::thread::ThreadId, std::thread::ThreadId) {
+        use crate::tokio::child::reaper::test_probe::{assert_consumed, ReapOutcome};
+        assert_consumed();
+        let dropping = self.entered.recv().expect("Drop must reach the reaper handoff");
+        let executing = self.started.recv().expect("a reaper worker must take the job");
+        let outcome = self
+            .outcome
+            .recv()
+            .expect("the reaper must report an outcome for this job");
+        assert!(matches!(outcome, ReapOutcome::Reaped(_)), "got {outcome:?}");
+        assert_ne!(
+            executing, dropping,
+            "the teardown must run on a reaper thread, not inline"
+        );
+        (dropping, executing)
+    }
+}
+
+/// A failed password write kills the contained tree through the leaf: checked on the step log and
+/// on `cgroup.kill`'s raw bytes.
 ///
-/// **Why the wait.** `child`'s own `Drop`, at the end of this call, hands its leaf to the async
-/// reaper pool's background thread — a SEPARATE thread from this test's own. If that thread's own
-/// teardown logic finds the leaf disarmed-but-killed (exactly this test's shape — `detach()`,
-/// then a kill through the leaf outside `Drop`'s own path), it deliberately re-fires `hard_kill`
-/// itself: a documented defense in `CgroupLeaf::drop`'s own truth table against a stale `killed`
-/// flag (an occupant that migrated in after the first kill, or — pre-Linux-6.14 — a fork racing
-/// the first `cgroup.kill`). That second write is real and correct, but if this thread reads the
-/// raw file WHILE it is still in flight, `LeafDir::write`'s truncate-before-write can be caught
-/// mid-way, reading `[]`. Measured live in CI at a low but real rate before this test used the
-/// probe below. A second race, past just this one file read: the SAME background write goes
-/// through the leaf's OWN held directory fd, so it can still be in flight when this test's
-/// `tempfile::tempdir()` drops and removes the directory out from under it — a real, separate
-/// leak (nothing here reads the file at that point, but the temp dir's own `remove_dir_all` and
-/// the reaper's write raced on disk). Both races share one fix: know for certain the reaper's own
-/// teardown of THIS leaf has finished before this function returns.
-///
-/// [`reaper::test_probe::DropProbe`] is that certainty: armed before `finish_elevated` (so
-/// `Child::drop`, inside it, attaches it to the `ReapJob` it submits), its `gate` sender is
-/// dropped immediately — this test observes the reaper's work, it does not pause it, so it must
-/// not spend the process-global pool's own tightly budgeted gate-hold (see `reaper_tests`'
-/// header) — and its `outcome` receiver is a blocking wait for the SAME background thread's own
-/// `drop(os)` (which is what re-fires `hard_kill` and removes the leaf) to fully complete. Only
-/// once that wait returns does this function read the file, or let its `tempdir` drop.
+/// `child`'s `Drop` hands the disarmed-but-killed leaf to the reaper pool, which re-fires
+/// `hard_kill` on its own thread. Reading `cgroup.kill` or dropping `dir` while that write is in
+/// flight races it (`O_TRUNC` can be read as `[]`; the write lands in a removed dir). So the test
+/// waits on a [`ReaperFence`] first.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
-    use crate::tokio::child::reaper::test_probe::{DropProbe, ReapOutcome};
-
+    crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-password-leaf");
     attach_entered_leaf(&leaf_path);
@@ -596,25 +629,10 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.detach();
 
-    let (entered_tx, _entered_rx) = std::sync::mpsc::channel();
-    let (started_tx, _started_rx) = std::sync::mpsc::channel();
-    let (gate_tx, gate_rx) = std::sync::mpsc::channel();
-    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
-    crate::tokio::child::reaper::test_probe::arm(DropProbe {
-        entered: entered_tx,
-        started: started_tx,
-        gate: gate_rx,
-        outcome: outcome_tx,
-    });
-    // Released immediately, not held: see this test's own doc above.
-    drop(gate_tx);
-
-    let written = Err(Error::Elevation {
-        kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: "forced password-write failure".into(),
-    });
+    let fence = ReaperFence::arm();
     crate::containment::cgroup::fault::record_leaf_steps();
-    let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
 
     assert!(
         matches!(
@@ -626,34 +644,34 @@ async fn a_failed_password_write_kills_the_contained_tree() {
         ),
         "got {err:?}"
     );
+    // The step log is this thread's: the pool thread's re-fired kill is not in it.
     assert_eq!(
         crate::containment::cgroup::fault::take_leaf_steps(),
         vec!["kill".to_string()],
         "the failed spawn must kill its tree through the leaf"
     );
 
-    // Blocks until the reaper pool's own background teardown of this exact leaf — including any
-    // re-fired `hard_kill` — has fully finished, so the raw-file read below (and this function's
-    // own `dir` drop, right after) cannot race it.
-    let outcome = outcome_rx
-        .recv()
-        .expect("the reaper pool must report an outcome for this job");
-    assert!(
-        matches!(outcome, ReapOutcome::Reaped(_)),
-        "the reaper pool must have reaped the root, got {outcome:?}"
-    );
+    // Wait for the reaper's teardown of this leaf before reading the file or dropping `dir`.
+    fence.wait();
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
-        b"1",
+        crate::containment::cgroup::KILL_PAYLOAD,
         "the failed spawn must kill its tree through the leaf"
+    );
+    // A teardown that worked is not warned about.
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &crate::child::spawn::teardown_warn_marker(&leaf_path)),
+        Vec::<log::Level>::new(),
+        "a successful tree kill must not warn"
     );
 }
 
-/// Async twin of the sync `a_failed_password_write_warns_when_the_tree_kill_fails` (see there): a
-/// tree-teardown failure during a failed password write must be logged at `warn`, not only
-/// embedded in the returned error's `detail`. Before this, a real (e.g. transient) failure here
-/// left no diagnosable trace — a real, independent gap, not what explained the CI flake fixed
-/// just above in `a_failed_password_write_kills_the_contained_tree`'s own doc.
+/// Async twin of the sync `a_failed_password_write_warns_when_the_tree_kill_fails`: the teardown
+/// failure is logged at `warn`, not only embedded in the error's `detail`.
+///
+/// No [`ReaperFence`]: a refused `cgroup.kill` never sets the leaf's `killed`, so `Child::drop`
+/// does not hand it to the reaper and the leaf drops inline. The test pins that: were the leaf
+/// handed off, it would need a fence.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
@@ -665,14 +683,17 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.detach();
 
-    // Not ENOENT/ENODEV, so `hard_kill` cannot read this as "already gone" — it must take the
-    // real teardown-mechanism-failure arm. No test-only seam needed: `open(O_WRONLY)` on a real
-    // directory always fails EISDIR, the same technique
-    // `hard_kill_propagates_a_kill_the_kernel_refused` (`leaf_tests.rs`) uses.
+    // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
+    // directory fails EISDIR.
     std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
+    let _fence = ReaperFence::arm();
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    assert!(
+        crate::tokio::child::reaper::test_probe::take().is_some(),
+        "a leaf whose kill was refused is not handed to the reaper, so there is nothing to fence"
+    );
     assert!(
         matches!(
             err,
@@ -683,19 +704,16 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
         ),
         "got {err:?}"
     );
-    // The leaf path, not the generic message text, is the marker: it is unique to this test's
-    // own `tempfile::tempdir()`, so a concurrently running sibling test (e.g. the sync twin,
-    // which logs the identical generic text) cannot be miscounted as this test's own record.
-    let marker = leaf_path.join("cgroup.kill").display().to_string();
-    let records = crate::log_capture::records_since(mark, &marker);
+    let marker = crate::child::spawn::teardown_warn_marker(&leaf_path);
     assert_eq!(
         crate::log_capture::levels_since(mark, &marker),
         [log::Level::Warn],
-        "a forced tree-kill failure must be logged at warn, naming what failed, got {records:?}"
+        "a forced tree-kill failure must be logged at warn"
     );
     let errno_text = std::io::Error::from_raw_os_error(libc::EISDIR).to_string();
+    let records = crate::log_capture::records_since(mark, &marker);
     assert!(
-        records.iter().any(|r| r.contains(&errno_text)),
+        records[0].contains(&errno_text),
         "the warning must name the OS reason the write failed, got {records:?}"
     );
 }
