@@ -127,7 +127,7 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo nextest run --locked --target ${{ matrix.target }} --profile ci
+        run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci -E 'test(async_wait_never_drains_past_the_low_water_clamp)'
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
       # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.

@@ -162,7 +162,7 @@ pub(crate) fn arm(read_end: BorrowedFd<'_>, unbounded_wait: bool) -> Result<Kque
     let change = KEvent::new(
         read_end.as_raw_fd() as usize,
         EventFilter::EVFILT_READ,
-        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT | EvFlags::EV_CLEAR | EvFlags::EV_DISABLE,
         FilterFlag::NOTE_LOWAT,
         LOW_WATER_MARK,
         0,
