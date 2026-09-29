@@ -2810,7 +2810,7 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
     // Released once the kill has landed, right before the exit wait: a real kill makes this a
     // no-op, a skipped one lets the child exit 0 on EOF and fails the `SIGKILL` check below.
     let stdin = child.stdin.take().expect("piped stdin");
-    crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
+    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
     let pid = child.id();
     let pidfd = pidfd_of(pid);
     drop(child);
@@ -3393,7 +3393,7 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
     // Released once the kill has landed, right before `fail_closed`'s exit wait: a real kill makes
     // this a no-op, a skipped one lets the child exit 0 on EOF and fails the `SIGKILL` check below.
     let stdin = child.stdin.take().expect("piped stdin");
-    crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
+    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
     let channel = leaf.report.take().expect("the channel");
     // SAFETY: `channel` is open.
     unsafe { channel.slot().report_placed_for_test() };

@@ -439,8 +439,17 @@ pub(crate) fn run_between_check_and_kill() {
 /// holds releases it here: a real kill has already landed, so the release changes nothing, while
 /// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
 /// at once instead of waiting out the child.
-pub(crate) fn set_before_exit_wait(hook: impl FnOnce() + 'static) {
+pub(crate) fn set_before_exit_wait(hook: impl FnOnce() + 'static) -> BeforeExitWaitGuard {
     BEFORE_EXIT_WAIT.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    BeforeExitWaitGuard
+}
+/// Clears the [`set_before_exit_wait`] hook on drop, whether or not it ran.
+#[must_use]
+pub(crate) struct BeforeExitWaitGuard;
+impl Drop for BeforeExitWaitGuard {
+    fn drop(&mut self) {
+        BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take());
+    }
 }
 pub(crate) fn run_before_exit_wait() {
     if let Some(hook) = BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take()) {
