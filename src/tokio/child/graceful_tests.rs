@@ -50,6 +50,21 @@ async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate:
     }
 }
 
+/// Sweeps the tree and reaps the child. Windows discards errors: `assert_still_running` already
+/// reaped the child there, so a second kill or wait has nothing to act on.
+async fn cleanup(child: &mut crate::tokio::Child) {
+    #[cfg(unix)]
+    {
+        child.kill_tree().expect("cleanup sweep");
+        child.wait().await.expect("reap");
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill_tree();
+        let _ = child.wait().await;
+    }
+}
+
 #[tokio::test]
 async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     let mut cmd = crate::tokio::Command::new();
@@ -244,9 +259,7 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     );
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
     assert_still_running(&mut child, stdin).await;
-    // Clean up: the child is still running by design (no sweep happened above).
-    let _ = child.kill_tree();
-    let _ = child.wait().await;
+    cleanup(&mut child).await;
 }
 
 // Async twin of `graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative` —
@@ -328,8 +341,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
         );
         drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-        let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
-        let _ = child.wait().await;
+        cleanup(&mut child).await; // the forced failure means the real sweep never ran
     }
 }
 
@@ -653,7 +665,5 @@ async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
     assert_still_running(&mut child, stdin).await;
-    // Clean up: the child is still running by design (no sweep happened above).
-    let _ = child.kill_tree();
-    let _ = child.wait().await;
+    cleanup(&mut child).await;
 }

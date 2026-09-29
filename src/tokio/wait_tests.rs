@@ -99,6 +99,21 @@ fn assert_child_still_alive(child: &mut std::process::Child) {
     }
 }
 
+/// Kills and reaps `child`. Windows discards errors: `assert_child_still_alive` already reaped it
+/// there, so a second kill or wait has nothing to act on.
+fn kill_and_reap(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 #[tokio::test]
 async fn grace_wait_true_for_exited_unreaped_child() {
     let mut child = std_blocker();
@@ -323,9 +338,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
       // `assert_child_still_alive`'s own doc. A killed child could otherwise still read `Alive`
       // here and this "a cancelled watch must not affect the child" claim would be unproven.
     assert_child_still_alive(&mut child);
-    // Best-effort: `assert_child_still_alive` already reaped the child on Windows.
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(&mut child);
 }
 
 // Proves release without a timeout: the watcher signals a channel when it returns; recv()
@@ -351,9 +364,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     // `assert_child_still_alive`'s own doc. "release must be signal-free" would otherwise be
     // unproven if a signal-sending mutant's kill just hadn't completed teardown yet.
     assert_child_still_alive(&mut child);
-    // Best-effort: `assert_child_still_alive` already reaped the child.
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_and_reap(&mut child);
 }
 
 // `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on
