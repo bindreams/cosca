@@ -106,8 +106,9 @@ impl Process {
             Existence::Gone => return None,
             Existence::Unknown => {
                 log::warn!(
-                    "Process::parent: pid {} is unassessable — returning None",
-                    self.id.pid()
+                    "Process::parent: pid {} is unassessable{} — returning None",
+                    self.id.pid(),
+                    unassessable_cause(self.id)
                 );
                 return None;
             }
@@ -164,8 +165,9 @@ impl Process {
             Existence::Gone => return Vec::new(),
             Existence::Unknown => {
                 log::warn!(
-                    "Process::children: pid {} is unassessable — returning none",
-                    self.id.pid()
+                    "Process::children: pid {} is unassessable{} — returning none",
+                    self.id.pid(),
+                    unassessable_cause(self.id)
                 );
                 return Vec::new();
             }
@@ -197,6 +199,13 @@ impl Process {
     pub fn kill(&self) -> Result<(), Error> {
         crate::wait::kill(self.id)
     }
+}
+
+/// ` (<why>)` when the `/proc` view is why `id` reads `Unknown` (Linux: `openat2` missing, a
+/// diverged or unreadable view), else empty: `hidepid` and a racing exit have no view to blame.
+fn unassessable_cause(id: ProcessId) -> String {
+    crate::identity::unknown_identity_error(&format!("pid {}", id.pid()))
+        .map_or_else(String::new, |e| format!(" ({e})"))
 }
 
 #[cfg(test)]

@@ -105,3 +105,66 @@ fn a_foreign_terminate_tree_errors_when_the_view_is_untrusted() {
         release(child);
     }
 }
+
+/// Without `openat2` every walk that enumerates errors `Unsupported` naming the requirement, and
+/// signals nothing. Mutants: "map the snapshot's error to `Unassessable`" in `hard_kill`, in
+/// `terminate`, or in the snapshot itself.
+#[test]
+fn every_walk_without_openat2_is_unsupported_naming_it() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    type Walk = fn(ProcessId) -> Result<(), Error>;
+    let walks: [(&str, Walk); 4] = [
+        ("hard_kill", |id| super::hard_kill(id)),
+        ("terminate", |id| super::terminate(id)),
+        ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
+        ("terminate_tree", |id| crate::Process::from_id(id).terminate_tree()),
+    ];
+    for (name, walk) in walks {
+        for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
+            let (mut child, id) = live_member();
+            let forced = force_openat2_errno(errno);
+            let result = walk(id);
+            drop(forced);
+            match result {
+                Err(Error::Unsupported { detail, .. }) => assert_eq!(
+                    detail,
+                    format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {code}"),
+                    "{name} {errno}"
+                ),
+                other => panic!("{name} {errno}: expected Unsupported, got {other:?}"),
+            }
+            assert!(
+                child.try_wait().expect("try_wait").is_none(),
+                "{name} {errno}: nothing may be signalled"
+            );
+            release(child);
+        }
+    }
+}
+
+/// `parent` and `children` have no error channel: their `warn` names the requirement, both where
+/// the anchor read is what fails (this pid's `exists()` answers `Unknown`) and where the table
+/// read does. Mutant: "drop the cause from the anchor's warning".
+#[test]
+fn parent_and_children_without_openat2_warn_naming_it() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    use crate::Recursive;
+    crate::log_capture::install();
+    let me = crate::Process::from_id(ProcessId::current());
+    for errno in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+        let mark = crate::log_capture::mark();
+        let forced = force_openat2_errno(errno);
+        assert!(me.parent().is_none());
+        assert!(me.children(Recursive::Yes).is_empty());
+        drop(forced);
+        for marker in ["Process::parent", "Process::children"] {
+            let records = crate::log_capture::records_since_on_current_thread(mark, marker);
+            assert!(
+                records
+                    .iter()
+                    .any(|(level, m)| *level == log::Level::Warn && m.contains("refused here: openat2 answered")),
+                "{marker} {errno}: {records:?}"
+            );
+        }
+    }
+}
