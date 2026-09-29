@@ -540,8 +540,8 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
 
 /// An `execve` from the fixture must not give DAC bypass back. `test_privilege` sets
 /// `no_new_privs` for exactly that: without it, a uid-0 `execve` regains the capabilities from the
-/// bounding set (`capabilities(7)`, set-user-ID-root compatibility). A non-root driver has nothing
-/// to regain, so this needs root; see [`crate::test_privilege::root_tests_enabled`].
+/// bounding set (`capabilities(7)`, set-user-ID-root compatibility). The driver needs a DAC bypass
+/// for there to be anything to drop, root or not; see [`crate::test_privilege::root_tests_enabled`].
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_is_denied_by_an_exec_child() {
