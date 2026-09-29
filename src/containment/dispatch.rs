@@ -321,7 +321,8 @@ impl Attached {
                  call kill_tree() before wait() to end them \
                  (https://github.com/bindreams/cosca/issues/382)"
             );
-            return m.hard_kill_without_group_signal();
+            let _ = m;
+            return Ok(());
         }
         log::warn!(
             "Child::drop: the root is already reaped, so this drop does not kill its process group \
