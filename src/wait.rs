@@ -308,7 +308,7 @@ pub(crate) fn wait_until(
         let call_start = Instant::now();
         let waited = wait(win32_timeout_ms(remaining(deadline)));
         #[cfg(test)]
-        test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+        let _ = call_start;
         if waited != WAIT_TIMEOUT || remaining(deadline) == Some(Duration::ZERO) {
             return waited;
         }
