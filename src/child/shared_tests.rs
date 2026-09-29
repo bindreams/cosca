@@ -17,6 +17,9 @@ mod states;
 #[cfg(target_os = "macos")]
 #[path = "shared_tests/traced.rs"]
 mod traced;
+#[cfg(unix)]
+#[path = "shared_tests/tracer.rs"]
+mod tracer;
 #[cfg(windows)]
 #[path = "shared_tests/windows.rs"]
 mod windows;
