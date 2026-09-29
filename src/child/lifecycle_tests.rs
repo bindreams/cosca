@@ -227,7 +227,10 @@ fn wait_deadline_rechecks_an_early_none_under_a_frozen_clock() {
     let status = child
         .wait_deadline(deadline)
         .expect("a live child must not report a wait failure");
-    assert!(status.is_none(), "a never-exiting child is still running at the deadline");
+    assert!(
+        status.is_none(),
+        "a never-exiting child is still running at the deadline"
+    );
     let rounds = seam.rounds();
     assert!(rounds.len() >= 2, "the early None was trusted: {rounds:?}");
     assert!(rounds[1].armed >= deadline, "the recheck armed short of the deadline");
@@ -246,7 +249,10 @@ fn wait_deadline_arms_each_round_from_the_frozen_remaining() {
     let status = child
         .wait_deadline(deadline)
         .expect("a live child must not report a wait failure");
-    assert!(status.is_none(), "a never-exiting child is still running at the deadline");
+    assert!(
+        status.is_none(),
+        "a never-exiting child is still running at the deadline"
+    );
     let rounds = seam.rounds();
     let first = rounds[0];
     assert!(
@@ -294,7 +300,9 @@ fn wait_deadline_propagates_a_backend_error() {
     let (child, _stdin) = spawn_never_exiting();
     let seam = std_wait_seam::arm([Step::EarlyNone, Step::Fail], || {});
     let deadline = Instant::now() + Duration::from_millis(300);
-    let err = child.wait_deadline(deadline).expect_err("the scripted failure must surface");
+    let err = child
+        .wait_deadline(deadline)
+        .expect_err("the scripted failure must surface");
     assert!(
         matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("scripted backend failure")),
         "got {err:?}"
