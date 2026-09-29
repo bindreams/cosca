@@ -421,6 +421,8 @@ impl CgroupLeaf {
             }
             match killed {
                 Ok(()) => {
+                    #[cfg(test)]
+                    fault::run_before_exit_wait();
                     // Its exit, not its reaping: the spawn's error path reaps it.
                     while let Err(nix::errno::Errno::EINTR) =
                         waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
@@ -1107,6 +1109,8 @@ fn end_child(received: &Received) -> ChildFate {
         reap_in_background(id_owned(received, pid));
         return ChildFate::Unkillable;
     }
+    #[cfg(test)]
+    fault::run_before_exit_wait();
     let status = loop {
         match waitid(id(), WaitIdOptions::EXITED) {
             Err(rustix::io::Errno::INTR) => continue,

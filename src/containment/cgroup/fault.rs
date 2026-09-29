@@ -8,6 +8,7 @@ thread_local! {
     static AFTER_FINAL_READ: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_EXIT_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_KILL_DENIED: Cell<bool> = const { Cell::new(false) };
@@ -429,6 +430,20 @@ pub(crate) fn set_between_check_and_kill(hook: impl FnOnce() + 'static) {
 }
 pub(crate) fn run_between_check_and_kill() {
     if let Some(hook) = BETWEEN_CHECK_AND_KILL.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Run `hook` in the NEXT abandonment or `fail_closed` on this thread, after the child has been
+/// signalled and right before the wait for its exit. A test whose child blocks on a stdin it
+/// holds releases it here: a real kill has already landed, so the release changes nothing, while
+/// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
+/// at once instead of waiting out the child.
+pub(crate) fn set_before_exit_wait(hook: impl FnOnce() + 'static) {
+    BEFORE_EXIT_WAIT.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn run_before_exit_wait() {
+    if let Some(hook) = BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take()) {
         hook();
     }
 }

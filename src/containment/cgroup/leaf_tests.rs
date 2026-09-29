@@ -2822,14 +2822,18 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     // Inherited by the child forked from this thread, which takes it.
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
-    let child = spawn_placing(
+    let mut child = spawn_placing(
         &leaf,
-        &["/bin/sleep", "300"],
+        crate::test_child::BLOCKER_ARGV,
         false,
-        std::process::Stdio::inherit(),
+        std::process::Stdio::piped(),
         std::process::Stdio::null(),
     );
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
+    // Released once the kill has landed, right before the exit wait: a real kill makes this a
+    // no-op, a skipped one lets the child exit 0 on EOF and fails the `SIGKILL` check below.
+    let stdin = child.stdin.take().expect("piped stdin");
+    crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
     let pid = child.id();
     let pidfd = pidfd_of(pid);
     drop(child);
@@ -3453,13 +3457,13 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     std::fs::create_dir(leaf_path.join("cgroup.events")).expect("make cgroup.events unreadable");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // `/bin/sleep 300`, not a held-stdin `cat`: the assertion below is on the exit SIGNAL, which
-    // only a real kill produces — a mutant that skips the kill would otherwise let this test
-    // pass once `sleep 300`'s own timer alone ends the child (measured: 300.015s).
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("300")
+    let mut child = crate::test_child::held_std_blocker(std::process::Stdio::null())
         .spawn()
         .expect("spawn");
+    // Released once the kill has landed, right before `fail_closed`'s exit wait: a real kill makes
+    // this a no-op, a skipped one lets the child exit 0 on EOF and fails the `SIGKILL` check below.
+    let stdin = child.stdin.take().expect("piped stdin");
+    crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
     let channel = leaf.report.take().expect("the channel");
     // SAFETY: `channel` is open.
     unsafe { channel.slot().report_placed_for_test() };
