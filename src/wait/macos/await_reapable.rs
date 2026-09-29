@@ -21,9 +21,10 @@
 //!   (`kern_exit.c:2577-2601`). The wait registers `EVFILT_PROC` itself, so a caller whose own
 //!   registration got `ESRCH` still has a `NOTE_EXIT` to wait for.
 //! - `deadline` is the caller's bound: never early, and never late by the wait's own choice.
-//!   Every blocking `kevent`, the backoff's included, is timed to the time remaining. When that
-//!   runs out, one final peek decides: a zombie found is `Reapable`, else `DeadlinePassed`.
-//!   `None` is unbounded.
+//!   Every blocking `kevent`, the backoff's included, is timed to the time remaining, recomputed
+//!   before each call (an `EINTR` retry too) and capped by `kevent_timeout`, so a far deadline is
+//!   re-armed, not an `EINVAL`. When the time runs out, one final peek decides: a
+//!   zombie found is `Reapable`, else `DeadlinePassed`. `None` is unbounded.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -117,7 +118,7 @@ fn settle(peeked: Peek) -> Option<Waited> {
 /// the buffer holds; `true` if any is `NOTE_REAP`.
 fn drain_for_reap(kq: &Kqueue, events: &mut [KEvent; BATCH]) -> io::Result<bool> {
     loop {
-        let n = kevent_round(kq, events, Some(Duration::ZERO))?;
+        let n = kevent_round(kq, events, Block::Poll)?;
         if scan(&events[..n]).0 {
             return Ok(true);
         }
@@ -141,29 +142,69 @@ fn scan(events: &[KEvent]) -> (bool, bool) {
     (reap, exit)
 }
 
-/// One `kevent` call with `timeout`, `EINTR` retried inside the same round.
-fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], timeout: Option<Duration>) -> io::Result<usize> {
-    #[cfg(test)]
-    let started = Instant::now();
-    let n = loop {
-        match kq.kevent(&[], events, timeout.map(timespec)) {
-            Ok(n) => break n,
+/// How long one `kevent` call may block.
+#[derive(Clone, Copy)]
+enum Block {
+    /// Not at all: read what is pending.
+    Poll,
+    /// Until `deadline`, or `interval` if that is sooner (`None`: the deadline alone; both
+    /// `None`: unbounded).
+    Until {
+        interval: Option<Duration>,
+        deadline: Option<Option<Instant>>,
+    },
+}
+
+impl Block {
+    /// The time this call may block, recomputed from the clock on every call. It is uncapped:
+    /// [`kevent_timeout`](super::kevent_timeout) caps what reaches the syscall, and a capped
+    /// call that times out is just another round against the real deadline.
+    fn timeout(self) -> Option<Duration> {
+        match self {
+            Block::Poll => Some(Duration::ZERO),
+            Block::Until { interval, deadline } => {
+                let armed = match (interval, crate::wait::remaining(deadline)) {
+                    (Some(interval), Some(left)) => Some(interval.min(left)),
+                    (Some(interval), None) => Some(interval),
+                    (None, left) => left,
+                };
+                // A deadline wait never arms an unbounded `kevent`.
+                debug_assert!(
+                    !matches!(deadline, Some(Some(_))) || armed.is_some(),
+                    "a deadline wait armed an unbounded kevent"
+                );
+                armed
+            }
+        }
+    }
+}
+
+/// One `kevent` call armed by `block`. After an `EINTR` the timeout is recomputed, not reused:
+/// the interrupted call spent time.
+fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::Result<usize> {
+    loop {
+        let timeout = block.timeout().map(super::kevent_timeout);
+        #[cfg(test)]
+        {
+            let armed = timeout.map(|t| Duration::new(t.tv_sec as u64, t.tv_nsec as u32));
+            super::test_hooks::record_await_kevent(armed);
+            if armed != Some(Duration::ZERO) {
+                if let Some(elapsed) = super::test_hooks::take_forced_eintr() {
+                    crate::wait::test_clock::advance_by_elapsed_if_frozen(elapsed);
+                    continue;
+                }
+            }
+        }
+        #[cfg(test)]
+        let started = Instant::now();
+        let result = kq.kevent(&[], events, timeout);
+        #[cfg(test)]
+        crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
+        match result {
+            Ok(n) => return Ok(n),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
         }
-    };
-    #[cfg(test)]
-    {
-        crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
-        super::test_hooks::record_await_kevent(timeout);
-    }
-    Ok(n)
-}
-
-fn timespec(d: Duration) -> libc::timespec {
-    libc::timespec {
-        tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-        tv_nsec: d.subsec_nanos() as libc::c_long,
     }
 }
 
@@ -209,17 +250,11 @@ pub(crate) fn await_reapable_on(kq: &Kqueue, pid: u32, deadline: Option<Instant>
         {
             round += 1;
         }
-        let timeout = match (backoff, crate::wait::remaining(deadline)) {
-            (true, Some(left)) => Some(interval.min(left)),
-            (true, None) => Some(interval),
-            (false, left) => left,
+        let block = Block::Until {
+            interval: backoff.then_some(interval),
+            deadline,
         };
-        // A deadline wait never arms an unbounded `kevent`.
-        debug_assert!(
-            deadline.is_none() || timeout.is_some(),
-            "a deadline wait armed an unbounded kevent"
-        );
-        let n = kevent_round(kq, &mut events, timeout)?;
+        let n = kevent_round(kq, &mut events, block)?;
         let (reaped, exited) = scan(&events[..n]);
         if reaped {
             return Ok(Waited::Gone);
