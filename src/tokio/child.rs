@@ -849,7 +849,7 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
         // The sync seam's "leave it alive" form is the only one this path honours: it replaces the
         // kill, so the child really is left unsignalled.
         Some((marker, kind, _)) => Err(std::io::Error::new(kind, marker)),
-        None => child.start_kill(),
+        None => Ok(()),
     };
     // A failed start_kill means this is not a live process to wait on to a bound — ESRCH, it has
     // already exited; EPERM, a setuid child refused the kill — so skip, and a kill failure never

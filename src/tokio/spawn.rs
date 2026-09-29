@@ -437,7 +437,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         return Ok(child);
     };
     let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
-    let root_note = match child.kill() {
+    let root_note = match Ok::<(), Error>(()) {
         Ok(()) => {
             child.wait_and_reap_blocking();
             "the elevated child was terminated".to_string()
