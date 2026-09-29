@@ -112,7 +112,7 @@ impl RawChild {
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        match if self.runas { Ok(()) } else { unsafe { TerminateProcess(self.handle(), 1) } } {
             Ok(()) => Ok(()),
             // TerminateProcess reports ERROR_ACCESS_DENIED in two distinct situations: (a) the
             // target is already exiting/exited (the OS teardown window signals the denial before
@@ -143,7 +143,7 @@ impl RawChild {
     /// probe is false on the `ACCESS_DENIED` path): LOG and move on — never block.
     pub(crate) fn teardown_on_drop(&self) {
         // SAFETY: `handle` is our live, owned process handle.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        match if self.runas { Ok(()) } else { unsafe { TerminateProcess(self.handle(), 1) } } {
             Ok(()) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
