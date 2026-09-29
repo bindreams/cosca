@@ -533,3 +533,54 @@ fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
         "got: {message:?}"
     );
 }
+
+// The testbin's ack seam (`testbin/ack.rs`) =====
+
+/// Spawns `control-block` with the seam set to `seam` and, when `opted_in`, the accept opt-in.
+fn seamed_control_block(seam: &str, opted_in: bool) -> (std::process::Child, std::net::TcpListener) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut cmd = std::process::Command::new(common::testbin());
+    cmd.args(["control-block", &addr, "T"]).env("COSCA_TEST_ACK_SEAM", seam);
+    if opted_in {
+        cmd.env(common::ACK_ENV, "1");
+    }
+    let child = {
+        let _guard = cosca::test_spawn_lock();
+        cmd.spawn().expect("spawn control-block")
+    };
+    (child, listener)
+}
+
+fn reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    child.wait().expect("reap");
+}
+
+/// `strict` turns a missing opt-in into a death before connecting, which is how the mode tests
+/// see that a mode forgot to opt its child in.
+#[test]
+fn accept_or_die_seam_strict_kills_a_target_that_was_not_opted_in() {
+    let (mut child, listener) = seamed_control_block("strict", false);
+    let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
+    assert_died_before_connecting(&message, child.id());
+}
+
+#[test]
+fn accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
+    let (mut child, listener) = seamed_control_block("strict", true);
+    let mut sock = common::accept_or_die(&listener, &mut child);
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read the tag");
+    assert_eq!(&tag, b"T");
+    drop(sock);
+    reap(child);
+}
+
+/// `die-now` is the state the `die` seam leaves a mode in for its children.
+#[test]
+fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
+    let (mut child, listener) = seamed_control_block("die-now", true);
+    let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
+    assert_died_before_connecting(&message, child.id());
+}
