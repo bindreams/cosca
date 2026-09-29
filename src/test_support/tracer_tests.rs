@@ -62,10 +62,44 @@ fn expect(th: &mut TracerHelper<'_>, pattern: &[&str]) {
     let mut seen = Vec::new();
     let mut at = 0;
     while at < pattern.len() {
-        let report = th
-            .session
-            .next_report()
-            .unwrap_or_else(|| panic!("the helper exited after {seen:?}; expected {pattern:?}"));
+        let helper = th.session.helper.id();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let dog_seen = format!("{seen:?} expecting {pattern:?}");
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                let out = std::process::Command::new("/bin/ps")
+                    .args(["-A", "-o", "pid,ppid,pgid,stat,wchan,flags,command"])
+                    .output()
+                    .expect("ps");
+                let text = String::from_utf8_lossy(&out.stdout);
+                let me = std::process::id();
+                let mut lines = vec![format!("@@HANG@@ test={me} helper={helper} after {dog_seen}")];
+                for line in text.lines() {
+                    let f: Vec<&str> = line.split_whitespace().collect();
+                    if f.len() > 2 && [me.to_string(), helper.to_string()].iter().any(|p| f[0] == p || f[1] == p) {
+                        lines.push(format!("@@HANG@@ {line}"));
+                    }
+                }
+                let pids: Vec<String> = text
+                    .lines()
+                    .filter_map(|line| {
+                        let f: Vec<&str> = line.split_whitespace().collect();
+                        (f.len() > 2 && f[1] == helper.to_string()).then(|| f[0].to_string())
+                    })
+                    .collect();
+                for pid in &pids {
+                    let threads = std::process::Command::new("/bin/ps").args(["-M", "-p", pid]).output().expect("ps -M");
+                    lines.push(format!("@@HANG@@ threads of {pid}:\n{}", String::from_utf8_lossy(&threads.stdout)));
+                    if let Ok(n) = pid.parse::<u32>() {
+                        lines.push(format!("@@HANG@@ pbi_status {pid} = {:?}, peek = {:?}", super::sys::pbi_status(n), "n/a"));
+                    }
+                }
+                eprintln!("{}", lines.join("\n"));
+            }
+        });
+        let report = th.session.next_report();
+        drop(tx);
+        let report = report.unwrap_or_else(|| panic!("the helper exited after {seen:?}; expected {pattern:?}"));
         let report = label(report);
         loop {
             match pattern[at].strip_suffix('*') {
