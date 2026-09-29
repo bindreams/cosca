@@ -45,17 +45,49 @@ pub struct Payload {
     pub sock: TcpStream,
     /// For messages only.
     pub pid: u32,
-    watcher: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<String>>,
 }
 
+/// How long a live payload may take to echo a handshake byte before the test calls it broken. A
+/// failure bound on a peer's response (an elevated payload is reached through sudo, doas, run0
+/// or `runas`); a working payload answers at once and success never waits on it.
+const ECHO_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Payload {
-    /// Releases the payload, then waits for the exit watch to return. A launcher that exits
-    /// only once the payload does is thereby known to have exited.
-    pub fn release(self) {
+    /// Releases the payload, then waits for the exit watch to return, and returns how it said the
+    /// launcher exited (`None` when the watch is [`ExitWatch::Unobservable`]). A launcher that
+    /// exits only once the payload does is thereby known to have exited.
+    pub fn release(self) -> Option<String> {
         drop(self.sock);
-        if let Some(watcher) = self.watcher {
-            watcher.join().expect("client-exit watcher panicked");
+        self.watcher
+            .map(|watcher| watcher.join().expect("client-exit watcher panicked"))
+    }
+
+    /// Proves the payload is alive and blocked reading, not just that it once connected: writes
+    /// a byte and requires the same byte back, twice. A payload that has exited answers with EOF
+    /// or a reset; one that answered once and then exited fails the second round.
+    pub fn assert_blocked(&mut self) {
+        use std::io::Write as _;
+        self.sock
+            .set_read_timeout(Some(ECHO_BOUND))
+            .expect("set the handshake read timeout");
+        for probe in [0x41u8, 0x42] {
+            let mut echo = [0u8; 1];
+            let outcome = self
+                .sock
+                .write_all(&[probe])
+                .and_then(|()| self.sock.read_exact(&mut echo));
+            if let Err(e) = outcome {
+                panic!(
+                    "the payload (pid {}) did not echo handshake byte {probe:#x} ({e}): it is not alive and blocked",
+                    self.pid
+                );
+            }
+            assert_eq!(echo[0], probe, "the payload (pid {}) echoed a different byte", self.pid);
         }
+        self.sock
+            .set_read_timeout(None)
+            .expect("clear the handshake read timeout");
     }
 }
 
@@ -116,7 +148,8 @@ pub fn decide(nonce: &str, events: impl IntoIterator<Item = Event>) -> Result<(T
 /// stalls only its own reader.
 pub struct Sources {
     rx: mpsc::Receiver<Event>,
-    watcher: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<String>>,
+    armed: bool,
     acceptor: JoinHandle<()>,
     stop: Arc<AtomicBool>,
     addr: SocketAddr,
@@ -127,12 +160,15 @@ impl Sources {
     pub fn start(listener: TcpListener, watch: ExitWatch) -> Sources {
         let addr = listener.local_addr().expect("local_addr of the readiness listener");
         let (tx, rx) = mpsc::channel();
+        let mut armed = false;
         let watcher = match watch {
             ExitWatch::Unobservable => None,
             ExitWatch::Custom(client_exit) => {
                 let tx = tx.clone();
                 Some(std::thread::spawn(move || {
-                    let _ = tx.send(Event::ClientExited(client_exit()));
+                    let how = client_exit();
+                    let _ = tx.send(Event::ClientExited(how.clone()));
+                    how
                 }))
             }
             ExitWatch::Process(pid) => {
@@ -145,10 +181,12 @@ impl Sources {
                         },
                         || super::accept::wait_for_exit(pid),
                     );
-                    let _ = tx.send(Event::ClientExited(format!("process {pid} exited")));
+                    let how = format!("process {pid} exited");
+                    let _ = tx.send(Event::ClientExited(how.clone()));
+                    how
                 });
                 // `Err` means the thread ended without arming: the pid was already gone.
-                let _ = armed_rx.recv();
+                armed = armed_rx.recv().is_ok();
                 Some(watcher)
             }
         };
@@ -174,10 +212,18 @@ impl Sources {
         Sources {
             rx,
             watcher,
+            armed,
             acceptor,
             stop,
             addr,
         }
+    }
+
+    /// Whether an [`ExitWatch::Process`] watch had armed its OS notification by the time
+    /// [`Sources::start`] returned. `false` for the other watches, and for a pid that was already
+    /// gone. This is the pid-reuse guard: once armed, reaping the process cannot retarget it.
+    pub fn armed(&self) -> bool {
+        self.armed
     }
 
     /// Ends the accepting thread: it is blocked in `accept`, and a connection to its own address
@@ -200,6 +246,14 @@ impl Sources {
         self.acceptor.join().expect("accepting thread panicked");
         self.rx.try_iter().collect()
     }
+}
+
+/// [`accept_payload`], then [`Payload::assert_blocked`]: for a real testbin `block-on-socket`
+/// payload, which echoes. Not for the scripted peers of the helper's own tests.
+pub fn accept_live_payload(listener: TcpListener, nonce: &str, watch: ExitWatch) -> Payload {
+    let mut payload = accept_payload(listener, nonce, watch);
+    payload.assert_blocked();
+    payload
 }
 
 /// Accepts connections until one sends `<nonce> <pid>\n`, rejecting the rest. Panics if the

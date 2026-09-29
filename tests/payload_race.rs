@@ -204,6 +204,23 @@ fn the_launcher_exiting_first_is_the_verdict() {
 }
 
 #[test]
+fn the_socket_decided_on_is_the_payloads_not_the_first_peers() {
+    let (_stray_peer, stray) = pair();
+    let (right_peer, right) = pair();
+    let events = [
+        Event::Line(stray, Ok("wrong 1".into())),
+        Event::Line(right, Ok("n0nce 21".into())),
+    ];
+    let (sock, pid) = decide("n0nce", events).expect("the second peer is the payload");
+    assert_eq!(pid, 21);
+    assert_eq!(
+        sock.peer_addr().expect("peer_addr"),
+        right_peer.local_addr().expect("local_addr"),
+        "decide returned a socket that is not the payload's"
+    );
+}
+
+#[test]
 fn a_failed_accept_is_the_verdict() {
     let events = [Event::AcceptFailed(std::io::Error::other("boom"))];
     let message = decide("n0nce", events).expect_err("no payload arrived");
@@ -249,6 +266,7 @@ fn a_process_watch_reports_the_process_exit_once_it_is_armed() {
         .expect("spawn a process that outlives the watch's arming");
     // `start` returns only once the watch is armed, so the exit below is one it must report.
     let sources = Sources::start(l, ExitWatch::Process(child.id()));
+    assert!(sources.armed(), "start returned before the process watch was armed");
     drop(child.stdin.take());
     let events = sources.settle();
     child.wait().expect("reap");
@@ -265,5 +283,6 @@ fn release_joins_the_exit_watch() {
     let _peer = say(&addr, "n0nce 5\n");
     let p = accept_payload(l, "n0nce", exit);
     tx.send(()).expect("wake the exit watch");
-    p.release();
+    // Only a join can hand back what the watch returned.
+    assert_eq!(p.release().as_deref(), Some("test client exit"));
 }

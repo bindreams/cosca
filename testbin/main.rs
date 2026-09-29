@@ -1509,7 +1509,7 @@ fn main() {
         }
         // A payload that lives until the caller lets go of its socket. Connects to `args[2]`,
         // sends `<nonce> <pid>\n` (`args[3]` is the caller's per-run nonce; the pid is for
-        // messages only), then blocks reading; EOF or a write from the caller releases it.
+        // messages only), then echoes each byte the caller sends until it hangs up (EOF).
         // Loopback TCP is the channel because an elevated payload inherits nothing but stdio and
         // can still dial out: pipes, pidfiles and extra fds do not cross sudo/doas/run0/`runas`.
         // Its death is observable to the caller as EOF on its end of the socket.
@@ -1517,8 +1517,15 @@ fn main() {
             let mut sock = std::net::TcpStream::connect(&args[2]).expect("connect readiness socket");
             sock.write_all(format!("{} {}\n", args[3], std::process::id()).as_bytes())
                 .expect("write readiness line");
-            let mut sink = [0u8; 1];
-            let _ = sock.read(&mut sink);
+            // Echo every byte back until the caller hangs up. The caller writes a byte and waits
+            // for the echo before it trusts this process to be alive and blocked: a payload that
+            // has already exited answers with EOF or a reset instead.
+            let mut byte = [0u8; 1];
+            while matches!(sock.read(&mut byte), Ok(1)) {
+                if sock.write_all(&byte).is_err() {
+                    break;
+                }
+            }
         }
         other => {
             eprintln!("cosca_testbin: unknown mode {other:?}");

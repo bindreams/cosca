@@ -1,16 +1,17 @@
 //! testbin's `block-on-socket` payload, unelevated and on every OS: the elevation tests rely on
 //! it and cannot run without privilege, so this is where its contract is checked always.
 //!
-//! The contract: connect to the address in `argv[2]`, write `<argv[3]> <own pid>\n`, then block
-//! until the peer sends anything or hangs up, and exit 0. Death by any other route is EOF (or a
-//! reset) on the peer's end.
+//! The contract: connect to the address in `argv[2]`, write `<argv[3]> <own pid>\n`, then echo
+//! each byte the peer sends until it hangs up, and exit 0. Death by any other route is EOF (or a
+//! reset) on the peer's end. The echo is how a test proves the payload is alive and blocked, not
+//! merely that it once connected.
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::payload::{accept_payload, fresh_nonce, ExitWatch};
+use common::payload::{accept_live_payload, fresh_nonce, ExitWatch};
 use shared_child::SharedChild;
-use std::io::{BufRead as _, Read as _};
+use std::io::Read as _;
 use std::net::{Shutdown, TcpListener};
 use std::process::Command;
 use std::time::Duration;
@@ -51,16 +52,13 @@ fn spawn_payload(addr: &str, nonce: &str) -> Spawned {
 }
 
 #[test]
-fn the_payload_writes_its_nonce_and_own_pid() {
+fn the_payload_reports_its_own_pid_under_the_nonce_and_stays_blocked() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
     let child = spawn_payload(&addr, &nonce);
-    let (sock, _) = l.accept().expect("accept the payload");
-    let mut line = String::new();
-    std::io::BufReader::new(&sock)
-        .read_line(&mut line)
-        .expect("read the payload's line");
-    assert_eq!(line, format!("{nonce} {}\n", child.id()));
+    // `accept_live_payload` checks the nonce, and that the payload echoes rather than having exited.
+    let payload = accept_live_payload(l, &nonce, ExitWatch::Process(child.id()));
+    assert_eq!(payload.pid, child.id());
 }
 
 #[test]
@@ -68,7 +66,7 @@ fn a_killed_payload_is_eof_on_its_socket() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
     let child = spawn_payload(&addr, &nonce);
-    let mut payload = accept_payload(l, &nonce, ExitWatch::Process(child.id()));
+    let mut payload = accept_live_payload(l, &nonce, ExitWatch::Process(child.id()));
     assert_eq!(payload.pid, child.id());
     child.kill().expect("kill the payload");
     child.wait().expect("reap");
@@ -87,7 +85,7 @@ fn the_payload_exits_when_its_peer_hangs_up() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
     let child = spawn_payload(&addr, &nonce);
-    let payload = accept_payload(l, &nonce, ExitWatch::Process(child.id()));
+    let payload = accept_live_payload(l, &nonce, ExitWatch::Process(child.id()));
     payload.sock.shutdown(Shutdown::Both).expect("hang up");
     match child.wait_timeout(EXIT_BOUND).expect("wait for the payload") {
         Some(status) => assert!(status.success(), "the payload exited abnormally: {status:?}"),

@@ -289,7 +289,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
     // is the `Drop` under test and not a reference count going down.
     let payload =
-        common::payload::accept_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
+        common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
 
     // kill() outcome depends on the backend's process topology:
     //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
@@ -399,7 +399,7 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     let child = c.spawn().expect("runas spawn");
     // A medium-integrity parent cannot open the UAC-elevated child by pid, and `Child` exposes no
     // handle to wait on, so its early exit cannot be watched; the `drop` below is the only owner.
-    let payload = common::payload::accept_payload(listener, &nonce, common::payload::ExitWatch::Unobservable);
+    let payload = common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Unobservable);
     match child.kill() {
         Err(cosca::error::Error::Elevation { kind, .. }) => {
             assert_eq!(kind, cosca::error::ElevationErrorKind::Unkillable);
@@ -479,7 +479,7 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     std::thread::spawn({
         let nonce = nonce.clone();
         move || {
-            let payload = common::payload::accept_payload(
+            let payload = common::payload::accept_live_payload(
                 listener,
                 &nonce,
                 common::payload::ExitWatch::custom(move || {
