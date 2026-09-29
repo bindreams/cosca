@@ -5,10 +5,11 @@ use super::process_parents;
 use crate::test_child::namespaces as ns;
 use crate::test_child::{await_member_ready, fixture_path, member_command};
 
-/// pid 1 of a new pid namespace whose `/proc` is still the outer one: the snapshot is empty,
-/// not the outer namespace's processes. Mutant: "scan `/proc` whatever the view".
+/// pid 1 of a new pid namespace whose `/proc` is still the outer one: the snapshot is
+/// `Unassessable`, neither the outer namespace's processes nor an empty list. Mutants: "scan
+/// `/proc` whatever the view"; "return an empty snapshot".
 #[test]
-fn namespaces_an_outer_procfs_yields_an_empty_snapshot() {
+fn namespaces_an_outer_procfs_is_unassessable() {
     if !ns::enabled() {
         return;
     }
@@ -29,7 +30,12 @@ fn fixture_enumerate_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
     }
-    assert!(process_parents().is_empty());
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains("outer pid namespace"), "{detail}")
+        }
+        other => panic!("an outer procfs must be Unassessable, got {other:?}"),
+    }
 }
 
 /// A file mounted over a process's `stat` is not read: the process is omitted, not listed with
@@ -57,7 +63,7 @@ fn fixture_enumerate_stat_overmount() {
     std::fs::write(&fake, format!("{pid} (fake) S 4242 999 {zeros} 1 0\n")).expect("write the fake stat");
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
 
-    let snapshot = process_parents();
+    let snapshot = process_parents().expect("the /proc view is this namespace's");
     assert!(
         !snapshot.iter().any(|&(p, _)| p == pid),
         "a stat behind a mount must be omitted, got {:?}",

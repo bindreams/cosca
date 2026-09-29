@@ -11,9 +11,10 @@
 //!   between the snapshot and the query, a sandbox denies the fallback's own sysctl (rare —
 //!   EPERM/EACCES there is a DESIGNED `Unknown`, not a second EPERM gap), or `e_ppid == 0`
 //!   mid fork() on both reads (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
-//! - A failed snapshot is reported as an EMPTY one, because `process_parents` has no error
-//!   channel. A tree walk over an empty snapshot finds no descendants, so the failure is
-//!   logged at `warn` naming that consequence.
+//! - A failed snapshot is `Error::Unassessable` from `process_parents`, never an empty list: a
+//!   tree walk over an empty snapshot finds no descendants. [`snapshot`] is the other consumer
+//!   (the fd-marker sweep) and reports the same failure as an empty pid list, which that sweep
+//!   already treats as a blind pass.
 //! - `proc_listallpids`' fill path caps its walk at `min(nprocs + 20, our buffer capacity)`,
 //!   using an UNLOCKED read of `nprocs` taken before the process list locks (confirmed
 //!   against XNU's `bsd/kern/proc_info.c`). Our buffer capacity is the sizing call's answer
@@ -28,6 +29,7 @@
 //!   unlocked-read-to-locked-walk window. Nothing in this module can close it without
 //!   changing the underlying syscall.
 
+use crate::error::Error;
 use crate::identity::{RawPid, Resolved};
 
 /// Extra pid slots asked for on top of the kernel's sizing answer, so the common case
@@ -261,40 +263,41 @@ fn fill_all() -> std::io::Result<Filled> {
     collect_pids(capacity_for(needed), fill_from_kernel, allocate_pids)
 }
 
-/// Every pid the kernel will list, given a way to perform the snapshot. Split from
-/// [`all_pids`] so the `Err` arm - never reachable from a live syscall in a test, same
-/// reasoning as `collect_pids`'s injected `fill` - is exercisable without a genuine
-/// kernel-level failure.
-fn all_pids_via(fill_all: impl FnOnce() -> std::io::Result<Filled>) -> Vec<libc::c_int> {
-    match fill_all() {
-        Ok(filled) => filled.pids,
-        Err(e) => {
-            log::warn!(
-                "enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table, \
-                 so a tree walk over it finds no descendants"
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Every pid the kernel will list. Empty on failure — see the module docs.
+/// Every pid the kernel will list, or why it would not.
 ///
 /// Test-only fault seam: [`force_blind_snapshot_for_next_call`] arms a thread-local that makes
-/// the NEXT call on the calling thread report empty without touching the real syscall, as if
+/// the NEXT call on the calling thread fail without touching the real syscall, as if
 /// `proc_listallpids` itself had failed. This exists so `Marker::sweep`'s `incomplete`/`Err`
 /// path can be exercised end-to-end through the real public `hard_kill()`/`terminate()` API
 /// with a genuinely blind pass, rather than a synthetic in-process mock of `sweep`'s internals.
-fn all_pids() -> Vec<libc::c_int> {
+fn try_all_pids() -> std::io::Result<Vec<libc::c_int>> {
     #[cfg(test)]
     if FORCE_BLIND.with(|c| c.take()) {
         log::warn!(
             "proc_listallpids sizing call returned 0 (test fault injected); every containment \
              teardown channel that reads the process table is blind this round"
         );
-        return Vec::new();
+        return Err(std::io::Error::other(
+            "proc_listallpids sizing call returned 0 (test fault injected)",
+        ));
     }
-    all_pids_via(fill_all)
+    fill_all().map(|filled| filled.pids)
+}
+
+/// A failure reported as an empty list (logged): [`snapshot`]'s contract.
+fn all_pids_or_empty(pids: std::io::Result<Vec<libc::c_int>>) -> Vec<libc::c_int> {
+    pids.unwrap_or_else(|e| {
+        log::warn!(
+            "enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table, \
+             so a tree walk over it finds no descendants"
+        );
+        Vec::new()
+    })
+}
+
+/// [`try_all_pids`] through [`all_pids_or_empty`].
+fn all_pids() -> Vec<libc::c_int> {
+    all_pids_or_empty(try_all_pids())
 }
 
 #[cfg(test)]
@@ -328,21 +331,20 @@ fn push_denied_sample(sample: &mut Vec<libc::c_int>, pid: libc::c_int) {
     }
 }
 
-fn join_edges(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>) {
-    // A plain `Vec::with_capacity`, not a fallible reservation. `process_parents()` has FOUR
-    // live callers, and this allocation is not the only abort on every path to it:
-    // `treewalk::hard_kill`/`terminate` already do an unconditional `to_vec` on this same
-    // data one frame up (`descendants_with`), so reserving fallibly HERE would only relocate
-    // that abort, not remove it. But `Process::parent` (a plain `.iter().find(..)`, no copy)
-    // and `Process::children(Recursive::No)` (`treewalk::children_of_with`, which iterates
-    // the slice without copying it) do NOT allocate upstream - on those two paths this
-    // `Vec::with_capacity` is the only unbounded allocation in the chain, and it DOES abort.
-    // Making it fallible everywhere is blocked on `process_parents` gaining an error channel
-    // (#76): with none today, a fallible reservation here would turn an allocation failure
-    // into a successfully EMPTY process tree - the exact silent-absence shape this module's
-    // fallback work exists to eliminate, traded for a still-real abort on two of four
-    // callers. `pids.len()` over-estimates, since some entries are filtered or fail the join.
-    let mut edges = Vec::with_capacity(pids.len());
+/// The edges, the denied-read count, and a sample of the denied pids.
+type Joined = (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>);
+
+/// An allocation failure is an `Err`, not an abort: [`process_parents`] reports it as
+/// `Unassessable` rather than as an empty process tree. `pids.len()` over-estimates the edge
+/// count, since some entries are filtered or fail the join.
+fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
+    let mut edges = Vec::new();
+    edges.try_reserve_exact(pids.len()).map_err(|e| {
+        std::io::Error::other(format!(
+            "an edge buffer for {} pids could not be allocated: {e}",
+            pids.len()
+        ))
+    })?;
     let mut denied = 0usize;
     let mut sample = Vec::new();
     for &pid in pids {
@@ -358,11 +360,43 @@ fn join_edges(pids: &[libc::c_int]) -> (Vec<(RawPid, RawPid)>, usize, Vec<libc::
             }
         }
     }
-    (edges, denied, sample)
+    Ok((edges, denied, sample))
 }
 
-pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
-    snapshot().1
+/// [`Error::Unassessable`] naming the `proc_listallpids` failure when no pid list can be taken.
+pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
+    let raw = try_all_pids().map_err(|e| {
+        let detail = format!("the process snapshot could not be taken: proc_listallpids failed ({e})");
+        log::warn!("enumerate::process_parents: {detail}");
+        Error::Unassessable {
+            detail,
+            source: Some(e),
+        }
+    })?;
+    let (edges, denied, sample) = join_edges(&raw).map_err(|e| {
+        let detail = format!("the process snapshot could not be taken: {e}");
+        log::warn!("enumerate::process_parents: {detail}");
+        Error::Unassessable {
+            detail,
+            source: Some(e),
+        }
+    })?;
+    log_denied(denied, raw.len(), &sample);
+    Ok(edges)
+}
+
+/// One line per snapshot, not one per denied pid.
+fn log_denied(denied: usize, total: usize, sample: &[libc::c_int]) {
+    if denied > 0 {
+        // A snapshot with many EPERM/ESRCH-adjacent denials (commonly a sandboxed sysctl refusal
+        // or a fork()-in-progress read - see `ppid_of`'s doc - though the exact per-pid cause is
+        // not recorded) must not flood the log; `Marker::sweep`'s own doc explains why this count
+        // is NOT escalated into `incomplete` there.
+        log::debug!(
+            "containment snapshot: {denied} of {total} pids denied a ppid read; their subtrees are \
+             invisible to the ppid-walk channel this round; sample: {sample:?}"
+        );
+    }
 }
 
 /// Every listable pid, the `(pid, ppid)` edges readable from those pids, and how many pids the
@@ -377,19 +411,16 @@ pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
 /// it as one.
 pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
     let raw = all_pids();
-    let (edges, denied, sample) = join_edges(&raw);
-    if denied > 0 {
-        // One line per call, not one per denied pid: a snapshot with many EPERM/ESRCH-adjacent
-        // denials (commonly a sandboxed sysctl refusal or a fork()-in-progress read - see
-        // `ppid_of`'s doc - though the exact per-pid cause is not recorded) must not flood the
-        // log; `Marker::sweep`'s own doc explains why this count is NOT escalated into
-        // `incomplete` there.
-        log::debug!(
-            "containment snapshot: {denied} of {} pids denied a ppid read; their subtrees are \
-             invisible to the ppid-walk channel this round; sample: {sample:?}",
-            raw.len()
-        );
-    }
+    let (edges, denied, sample) = match join_edges(&raw) {
+        Ok(joined) => joined,
+        Err(e) => {
+            // Blind, like a failed `proc_listallpids`: the fd-marker sweep reads an empty pid
+            // list as an incomplete pass.
+            log::warn!("enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table");
+            return (Vec::new(), Vec::new(), 0);
+        }
+    };
+    log_denied(denied, raw.len(), &sample);
     let pids = raw.into_iter().filter(|&p| p > 0).map(|p| p as RawPid).collect();
     (pids, edges, denied)
 }
