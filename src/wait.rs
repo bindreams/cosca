@@ -57,10 +57,20 @@ pub(crate) mod early_none_seam {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static ON_CONSUMED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
-    /// Arm the seam and register the hook to run when it is consumed.
-    pub(crate) fn arm(on_consumed: impl FnOnce() + 'static) {
+    /// Arm the seam and register the hook to run when it is consumed. The seam stays armed for
+    /// this thread until consumed or the returned guard drops (RAII, even mid-panic).
+    #[must_use]
+    pub(crate) fn arm(on_consumed: impl FnOnce() + 'static) -> Guard {
         ARMED.with(|a| a.set(true));
         ON_CONSUMED.with(|h| *h.borrow_mut() = Some(Box::new(on_consumed)));
+        Guard(())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|a| a.set(false));
+            ON_CONSUMED.with(|h| *h.borrow_mut() = None);
+        }
     }
     /// If armed, disarm, run the registered hook, and report `true` (the caller should treat
     /// this iteration as having received a synthetic `None`). Otherwise report `false` and do

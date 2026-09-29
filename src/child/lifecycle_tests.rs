@@ -181,7 +181,7 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
 }
 
 // `Child::wait_deadline`'s own recheck loop (site 5 of the "deadline-windows-never-early" bug
-// family; see docs/principles.md #13 — PR #233, not yet merged, and this function's own doc):
+// family; see docs/principles.md #13, and this function's own doc):
 // a `None` ("still running") from the underlying backend must never be trusted as proof the
 // real `deadline` passed. Portable — this loop is cosca's own code, not Windows-specific — even
 // though the bug it defends against (`shared_child`'s Windows `wait_deadline_noreap` only
@@ -211,17 +211,14 @@ fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
 /// The loop's SECOND (real) iteration must then correctly detect that genuine exit — the
 /// synthetic `None` must never be returned to the caller as "still running".
 ///
-/// Mutant: revert `Child::wait_deadline` to a single `self.proc.wait_deadline(deadline)` call
-/// with no loop at all (this function's pre-fix shape) -> fails deterministically: the
-/// (possibly-forced) `None` is returned immediately, hours before the real deadline, and the
-/// fixture — per the hook, which never even got a chance to matter on this path since the
-/// forced value IS what gets returned directly — would leak running (`kill()`/`wait()` below
-/// still clean it up regardless, since they run unconditionally, not conditioned on the
-/// assertion having passed).
+/// Mutant: keep the `early_none_seam::take()` consultation but drop the loop, i.e. return the
+/// first result (`let status = ...; return Ok(status)`) -> fails deterministically: the forced
+/// `None` is returned at once, hours before the real deadline. The fixture is a `Child`, whose
+/// `Drop` kills and reaps it, so a failed assertion leaks nothing.
 #[test]
 fn wait_deadline_never_reports_still_running_before_the_deadline() {
     let (child, stdin) = spawn_never_exiting();
-    crate::wait::early_none_seam::arm(move || drop(stdin)); // EOF -> the fixture exits for real
+    let _seam = crate::wait::early_none_seam::arm(move || drop(stdin)); // EOF -> exits for real
     let deadline = std::time::Instant::now() + Duration::from_secs(3600); // hours off
     let result = child.wait_deadline(deadline);
     let status = result.expect("a genuinely-exiting child must not report a wait failure");
@@ -230,6 +227,4 @@ fn wait_deadline_never_reports_still_running_before_the_deadline() {
         "must report exited once the child genuinely exits, not falsely conclude still-running \
          from an early, synthetic None"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
