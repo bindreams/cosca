@@ -106,16 +106,16 @@ fn calls_tokio_interval_reset_at(interval: &mut tokio::time::Interval) {
 
 // Process-cwd mutators =====
 //
-// The `windows` and `windows_sys` `SetCurrentDirectory*` bans cannot be exercised here: clippy
-// skips a path whose crate isn't linked for the host target, and this fixture builds on Linux. The
-// check script lists them as unverifiable here rather than dropping them.
+// The `windows` and `windows_sys` `SetCurrentDirectory*` bans and the CRT `libc::chdir` are only
+// reachable when the fixture is linted for a Windows target; the check script does that in a
+// second pass.
 
 #[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
 fn calls_std_set_current_dir() {
     let _ = std::env::set_current_dir("/");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
 fn calls_libc_chdir() {
     unsafe { libc::chdir(c"/".as_ptr()) };
@@ -155,4 +155,28 @@ fn calls_rustix_fchdir() {
 #[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
 fn calls_rustix_dir_chdir(dir: &rustix::fs::Dir) {
     let _ = dir.chdir();
+}
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_windows_set_current_directory_a() {
+    let _ = unsafe { windows::Win32::System::Environment::SetCurrentDirectoryA(windows::core::s!("C:\\")) };
+}
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_windows_set_current_directory_w() {
+    let _ = unsafe { windows::Win32::System::Environment::SetCurrentDirectoryW(windows::core::w!("C:\\")) };
+}
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_windows_sys_set_current_directory_a() {
+    unsafe { windows_sys::Win32::System::Environment::SetCurrentDirectoryA(c"C:\\".as_ptr().cast()) };
+}
+
+#[cfg(windows)]
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_windows_sys_set_current_directory_w() {
+    unsafe { windows_sys::Win32::System::Environment::SetCurrentDirectoryW([0u16].as_ptr()) };
 }

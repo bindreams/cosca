@@ -34,9 +34,12 @@ jobs:
 
       # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
       # find a toolchain.
+      # The Windows target is for check-disallowed-methods.sh's second pass, which lints the
+      # fixture for it (std only; no Windows SDK is needed to type-check).
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
 
       # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
       - name: Install cargo-nextest
@@ -57,6 +60,7 @@ jobs:
       # against the real clippy.toml, and asserts the diagnostic actually fires for each —
       # structured JSON, not scraped text. Catches a renamed disallowed-methods key, a typo'd
       # path, or a dependency upgrade that silently moves a function out from under the ban.
+      # Two passes: the host, and x86_64-pc-windows-msvc for the Windows-only paths.
       # `!cancelled()`: same override-success() rationale as the step below.
       - name: Check the disallowed-methods bans still fire
         if: ${{ !cancelled() }}
