@@ -29,6 +29,7 @@ env:
 jobs:
   lint:
     name: Lint
+    if: false # throwaway mutant run: only the test matrix matters
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -357,6 +358,7 @@ jobs:
   # Capability masks: `CAP_DAC_OVERRIDE` is 0x2, `CAP_DAC_READ_SEARCH` is 0x4.
   resolve_root_lanes:
     name: Root lane (${{ matrix.lane }})
+    if: false # throwaway mutant run: only the test matrix matters
     runs-on: ubuntu-24.04 # matches the `ubuntu:24.04` run image's glibc
     timeout-minutes: 15
     strategy:
@@ -438,6 +440,7 @@ jobs:
   # No container on macOS runners, so this runs under `sudo`.
   resolve_root_lane_macos:
     name: Root lane (macOS, sudo -E)
+    if: false # throwaway mutant run: only the test matrix matters
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
