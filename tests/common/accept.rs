@@ -326,7 +326,7 @@ pub fn accept_or_die_also(listener: &TcpListener, target_pid: u32, also: Option<
         );
     }
     match woken.0.wrapping_sub(WAIT_OBJECT_0.0) as usize {
-        i if i < pids.len() => final_peek_or_die(listener, pids[i]),
+        i if i < pids.len() => panic!("the control target (pid {}) died before it connected", pids[i]),
         i if i == pids.len() => listener.accept().expect("accept a control connection").0,
         _ => panic!("WaitForMultipleObjects while waiting for a control connection returned {woken:?}"),
     }
