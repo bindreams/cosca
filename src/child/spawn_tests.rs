@@ -417,7 +417,7 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
 /// The sync path's only abandonment of a live child: `std` fails a spawn only once it has reaped
 /// the child, and every later failure takes the verdict with the child in hand.
 ///
-/// Runs in a copy of this test binary: closing 1 and 2 is process-wide.
+/// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
@@ -426,30 +426,18 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use std::os::fd::AsRawFd;
 
     use crate::containment::cgroup::fault as cgroup_fault;
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_stdio::RestoreStdio;
 
-    const NAME: &str =
-        "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
-    const INNER: &str = "COSCA_TEST_FAILED_CLOSED_STDIO_INNER";
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    if std::env::var_os(INNER).is_none() {
-        let out = crate::test_spawn::output_captured(
-            std::process::Command::new(std::env::current_exe().expect("this test binary"))
-                .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-                .env(INNER, "1"),
-        )
-        .expect("run the case");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let Some(done) = own_process(test_path!(
+        cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio
+    )) else {
         return;
-    }
+    };
 
     let mut file = tempfile::tempfile().expect("tempfile");
     let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
@@ -485,27 +473,12 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
         };
         seen.set(Some(exited.exit_status()));
     });
-    // SAFETY: this process's own std slots, closed only across the spawn and restored from copies
-    // above 2 before anything else runs.
-    let saved: Vec<(i32, i32)> = [1, 2]
-        .into_iter()
-        .map(|slot| unsafe { (slot, libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3)) })
-        .collect();
-    for &(slot, _) in &saved {
-        // SAFETY: as above.
-        unsafe { libc::close(slot) };
-    }
+    let restore = RestoreStdio::close(&done, &[1, 2]);
     // Inherited by the child, which waits on it at its hook; this thread's copy is cleared.
     cgroup_fault::set_hook_gate(gate_read.as_raw_fd());
     let spawned = cmd.spawn();
     let _ = cgroup_fault::take_hook_gate();
-    for &(slot, saved) in &saved {
-        // SAFETY: as above.
-        unsafe {
-            libc::dup2(saved, slot);
-            libc::close(saved);
-        }
-    }
+    drop(restore);
     // Released whatever happened, before any assert: a child held forever holds this process's
     // stdout, and would hang the outer run.
     gate_write.write_all(b"x").expect("release the child");
