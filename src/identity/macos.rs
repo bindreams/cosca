@@ -69,6 +69,55 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
     StartToken::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
 }
 
+/// Which `exit_only` read a `pbi_start_quiet` call is, so a test can inject a result into one
+/// read without touching the others, and a `warn` can name the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadPurpose {
+    /// A start-checked peek's, just before its consume.
+    Peek,
+    /// The own-zombie start read before the first reap, for the second peek.
+    PreReap,
+    /// The second peek's.
+    SecondPeek,
+}
+
+/// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees
+/// zombies and never waits on `P_LINTRANSIT` (a `sysctl(KERN_PROC_PID)` read sleeps while the
+/// pid's `exec` is in transit, which a hung NFS or FUSE mount can stretch without bound). Every
+/// failure is a value, never [`contract_violation`]: `Gone` for `ESRCH`, `Unknown` for the rest,
+/// with a `warn` naming `purpose` for those.
+pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<StartToken> {
+    #[cfg(test)]
+    if let Some(forced) = quiet_fault::take(purpose) {
+        return forced;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer and size match.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n == size {
+        return Resolved::Found(token_of_bsd(&info));
+    }
+    if n <= 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            return Resolved::Gone;
+        }
+        log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read failed: {e}");
+        return Resolved::Unknown;
+    }
+    log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read wrote {n} bytes, expected {size}");
+    Resolved::Unknown
+}
+
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
     #[cfg(test)]
     if fault::is_unknown(pid) {
@@ -308,3 +357,44 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
+
+/// Forces one [`pbi_start_quiet`] purpose to a chosen result, below the syscall.
+#[cfg(test)]
+pub(crate) mod quiet_fault {
+    use std::cell::RefCell;
+
+    use super::{ReadPurpose, Resolved, StartToken};
+
+    thread_local! {
+        static FORCED: RefCell<Option<(ReadPurpose, Resolved<StartToken>)>> = const { RefCell::new(None) };
+    }
+
+    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
+    pub(crate) struct Forced(());
+
+    /// The next `pbi_start_quiet` for `purpose` on this thread answers `result`. Other purposes
+    /// are untouched.
+    pub(crate) fn force_quiet_read_error_once(purpose: ReadPurpose, result: Resolved<StartToken>) -> Forced {
+        FORCED.with(|f| *f.borrow_mut() = Some((purpose, result)));
+        Forced(())
+    }
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|f| *f.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn take(purpose: ReadPurpose) -> Option<Resolved<StartToken>> {
+        FORCED.with(|f| {
+            let mut slot = f.borrow_mut();
+            match *slot {
+                Some((p, r)) if p == purpose => {
+                    *slot = None;
+                    Some(r)
+                }
+                _ => None,
+            }
+        })
+    }
+}
