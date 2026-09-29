@@ -135,9 +135,17 @@ fn assert_terminated(tracee: crate::Child) {
 }
 
 /// After `detached`: the tracee may stay stopped (measured on CI on macOS 26), so it is ended
-/// with `SIGKILL` through its handle.
-fn end_detached(tracee: crate::Child) {
+/// with `SIGKILL` through its handle, before its stdin closes: a running one would otherwise
+/// exit on EOF first.
+fn end_detached(tracee: crate::Child, stdin: std::io::PipeWriter) {
     tracee.kill().expect("kill the detached tracee");
+    drop(stdin);
+    assert_sigkilled(tracee);
+}
+
+/// Ends a tracee this test saw job-stopped, which cannot exit on its own.
+fn end_stopped(tracee: crate::Child) {
+    tracee.kill().expect("kill the stopped tracee");
     assert_sigkilled(tracee);
 }
 
@@ -214,7 +222,7 @@ fn feasibility_facts() {
         (libc::CLD_STOPPED, libc::SIGSTOP),
         "the detached tracee after SIGSTOP"
     );
-    end_detached(tracee);
+    end_stopped(tracee);
 }
 
 // Client ======================================================================================
@@ -534,7 +542,7 @@ fn s2_keeps_a_stop_signal_until_after_the_detach() {
     drop(th);
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
-    end_detached(tracee);
+    end_stopped(tracee);
 }
 
 fn s2_fails(force: &str) {
@@ -653,8 +661,7 @@ fn s3_auto_a_signal_byte_goes_to_detach() {
     expect(&mut th, &DETACHED);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S3 treats EOF as `NOTE_EXIT`.
@@ -668,8 +675,7 @@ fn s3_auto_eof_goes_to_detach() {
     expect(&mut th, &DETACHED);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S5 fails on `EINTR`.
@@ -847,8 +853,7 @@ fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach() {
     expect(&mut th, &DETACHED);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S3 `hold` waits on after EOF.
@@ -862,8 +867,7 @@ fn s3_hold_eof_without_note_exit_goes_to_detach() {
     expect(&mut th, &DETACHED);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// The injected batch is taken on S3's entry; S3 then waits for the real zombie.
@@ -914,8 +918,7 @@ fn s4_ebusy_backs_off_then_retries() {
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutants: S4 detaches a tracee its peek finds not stopped; S4 fails on it.
@@ -938,8 +941,7 @@ fn s4_backs_off_before_the_detach(stop: &str) {
     let mut th = from_held(&mut tracee, &force);
     expect(&mut th, &["S2", "attached", "S3", "S4", "S4b", "detached", DONE]);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S4b ignores `NOTE_EXIT` (with no `SIGSTOP` sent, S4 finds the tracee running and
@@ -964,8 +966,7 @@ fn s4b_ignores(event: &str) {
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
     assert_is_our_child(pid);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S4b fails on a signal byte.
@@ -1169,7 +1170,7 @@ fn s3_keeps_a_stop_signal_until_after_the_detach() {
     drop(th);
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
-    end_detached(tracee);
+    end_stopped(tracee);
 }
 
 /// Mutant: a later stop signal replaces the kept one.
@@ -1188,7 +1189,7 @@ fn s3_keeps_only_the_first_stop_signal() {
     drop(th);
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
-    end_detached(tracee);
+    end_stopped(tracee);
 }
 
 /// Mutant: a `SIGCONT` passed on leaves the kept stop signal.
@@ -1212,7 +1213,7 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
         "the dropped SIGTSTP stopped the tracee"
     );
     if info.si_code == libc::CLD_STOPPED {
-        end_detached(tracee);
+        end_stopped(tracee);
     } else {
         assert_exited_cleanly(tracee);
     }
@@ -1232,7 +1233,7 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
     drop(th);
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
-    end_detached(tracee);
+    end_stopped(tracee);
 }
 
 /// Mutant: S4 ignores a failed re-send.
@@ -1247,8 +1248,7 @@ fn s4_a_failed_resend_fails() {
     th.signal();
     expect(&mut th, &["S4", "S4b*", &err(libc::EPERM, "S4"), DONE]);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// Mutant: S3 takes a `SIGCHLD` with no stop for a signal byte.
@@ -1439,8 +1439,7 @@ fn a_failed_detached_write_ends_the_run() {
     let mut th = at_s4(&mut tracee, "gone:detached");
     expect(&mut th, &["S4", "S4b*", DONE]);
     drop(th);
-    drop(stdin);
-    end_detached(tracee);
+    end_detached(tracee, stdin);
 }
 
 /// `fail` ends the run whether or not its report is written.
