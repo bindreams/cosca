@@ -110,7 +110,7 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
     let relay = crate::relayed_probe::capture();
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
-        let _relay = relay.reinstall();
+        let _relay = std::mem::ManuallyDrop::new(relay.reinstall());
         let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
