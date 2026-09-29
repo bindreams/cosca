@@ -739,14 +739,15 @@ impl Drop for Child {
         let _bounded = crate::bounded::Section::enter();
         let mut os = std::mem::take(&mut self.os);
         if self.kill_on_drop {
-            signal_on_drop(self.id.pid(), &mut os);
+            signal_on_drop(self.id, &mut os);
         }
         os.release_without_waiting();
     }
 }
 
 /// The signals of a kill-on-drop drop: the tree, then the root.
-fn signal_on_drop(pid: u32, os: &mut OsResources) {
+fn signal_on_drop(id: ProcessId, os: &mut OsResources) {
+    let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
     //
@@ -775,6 +776,10 @@ fn signal_on_drop(pid: u32, os: &mut OsResources) {
     };
     #[cfg(not(test))]
     let killed = proc.start_kill();
+    // MUTANT (tmp/ur343-block): wait for the root's exit after a successful kill.
+    if killed.is_ok() {
+        let _ = crate::wait::block_until_exit(id, None);
+    }
     if killed.is_err() && !matches!(proc.try_wait(), Ok(Some(_))) {
         log::warn!("async child {pid} could not be terminated on drop; leaving it running");
     }
