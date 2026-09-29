@@ -70,6 +70,9 @@ mod test_child;
 #[cfg(all(test, unix))]
 mod test_privilege;
 
+#[cfg(test)]
+mod test_support;
+
 pub mod process;
 pub use process::{Process, Recursive};
 
