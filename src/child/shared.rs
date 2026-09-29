@@ -35,6 +35,7 @@ use std::process::ExitStatus;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+#[cfg(any(not(target_os = "linux"), test))]
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::exit_only::{self, Peek, Reap, Reaped, Target};
@@ -95,6 +96,8 @@ impl SharedChild {
         clippy::result_large_err,
         reason = "the child is handed back untouched for the caller to tear down"
     )]
+    // Production Linux spawns hold the pidfd from the handshake: see `adopt_opened`.
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn adopt(
         child: std::process::Child,
         id: ProcessId,
@@ -123,6 +126,28 @@ impl SharedChild {
             }),
             condvar: Condvar::new(),
         })
+    }
+
+    /// [`adopt`](Self::adopt) for a Linux child whose pidfd the spawn handshake already opened,
+    /// while the child was held before `exec`. Infallible: nothing is left to open. `pidfd` is
+    /// `None` only when the child was already gone at the handshake.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn adopt_opened(
+        child: std::process::Child,
+        id: ProcessId,
+        pidfd: Option<std::os::fd::OwnedFd>,
+    ) -> SharedChild {
+        debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
+        SharedChild {
+            id,
+            pidfd,
+            inner: Mutex::new(Inner {
+                child,
+                state: State::N,
+                next_token: 0,
+            }),
+            condvar: Condvar::new(),
+        }
     }
 
     #[cfg(windows)]
