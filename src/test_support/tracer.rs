@@ -29,6 +29,10 @@ use std::io::Write as _;
 mod machine;
 mod sys;
 
+fn m(name: &str) -> bool {
+    std::env::var("COSCA_UH_MUTANT").as_deref() == Ok(name)
+}
+
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
 /// What the helper does once the traced tracee exits.
@@ -230,7 +234,7 @@ impl Session {
         debug_assert!(!self.finished, "the tracer helper is already torn down");
         self.finished = true;
         let panicking = std::thread::panicking();
-        let stuck = self.awaits_exit.take();
+        let stuck = self.awaits_exit.take().filter(|_| !m("drop_drains_stuck"));
         if panicking || stuck.is_some() {
             if let Err(e) = self.helper.kill() {
                 eprintln!("could not kill the tracer helper: {e}");
@@ -282,7 +286,7 @@ pub(crate) struct Pending {
 
 /// Launches a helper for client tests, without transition traces or injections.
 pub(crate) fn start(mode: Mode) -> Pending {
-    launch(mode, None)
+    launch(mode, m("start_traces").then_some(""))
 }
 
 /// Launches a helper with `COSCA_UH_TRACE=1` and the injections in `force`, for the transition
@@ -378,7 +382,7 @@ impl Pending {
     /// act on it.
     pub(crate) fn attach(mut self, tracee: &mut crate::Child) -> TracerHelper<'_> {
         let pid = tracee.id().pid();
-        if let Err(e) = sys::peek_child(pid) {
+        if let Err(e) = sys::peek_child(pid).or_else(|e| if m("attach_no_check") { Ok(()) } else { Err(e) }) {
             panic!(
                 "attach: the tracee {pid} is not this process's unreaped child (waitid: errno {e}), \
                  so its pid may name another process"
@@ -407,7 +411,7 @@ impl TracerHelper<'_> {
     pub(crate) fn recv(&mut self) -> Report {
         loop {
             match self.session.next_report() {
-                Some(Report::Blocking { .. }) => {}
+                Some(Report::Blocking { .. }) if !m("recv_keeps_blocking") => {}
                 Some(report) => return report,
                 None => panic!("the tracer helper exited before the report this test waits for"),
             }

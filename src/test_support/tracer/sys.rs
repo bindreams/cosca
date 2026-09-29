@@ -2,6 +2,10 @@
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+fn m(name: &str) -> bool {
+    std::env::var("COSCA_UH_MUTANT").as_deref() == Ok(name)
+}
+
 fn errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
@@ -64,12 +68,15 @@ pub(super) fn kill(pid: u32, signal: i32) -> Result<(), i32> {
 /// `wait4(pid)`, blocking. `Err(EINVAL)` if it returned a stop, which a tracer's `wait4` also
 /// reports, rather than reaping an exit.
 pub(super) fn reap(pid: u32) -> Result<(), i32> {
+    if m("reap_noop") {
+        return Ok(());
+    }
     let mut status = 0;
     // SAFETY: `status` is a valid out-pointer; rusage is not requested.
     let rc = unsafe { libc::wait4(pid as libc::pid_t, &mut status, 0, std::ptr::null_mut()) };
     if rc != pid as libc::pid_t {
         Err(errno())
-    } else if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+    } else if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) || m("reap_accepts_stop") {
         Ok(())
     } else {
         Err(libc::EINVAL)
@@ -82,7 +89,7 @@ pub(super) fn await_zombie(pid: u32) -> Result<(), i32> {
     let info = peek(pid, libc::WEXITED)?;
     // CLD_EXITED, CLD_KILLED, CLD_DUMPED (<sys/signal.h>). Measured on CI: a WEXITED-only waitid
     // by the tracer also returns a traced child's stop, so the code is checked.
-    if matches!(info.si_code, 1..=3) {
+    if matches!(info.si_code, 1..=3) || m("zombie_no_check") {
         Ok(())
     } else {
         Err(libc::EINVAL)
