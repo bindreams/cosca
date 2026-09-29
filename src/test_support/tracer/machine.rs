@@ -764,10 +764,7 @@ fn injected(tag: &str, directive: &str) -> Batch {
 }
 
 fn real_round(kq: &Kqueue, timeout: Option<Duration>) -> Batch {
-    let timeout = timeout.map(|d| libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos().into(),
-    });
+    let timeout = timeout.map(crate::wait::backend::kevent_timeout);
     let blank = || KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [blank(), blank(), blank()];
     let n = loop {
@@ -809,3 +806,7 @@ fn write_report(marker: &str, text: &str) -> bool {
     let mut out = std::io::stdout().lock();
     out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
+
+#[cfg(test)]
+#[path = "machine_tests.rs"]
+mod machine_tests;

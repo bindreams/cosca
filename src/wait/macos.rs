@@ -9,6 +9,58 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use crate::error::Error;
 use crate::identity::ProcessId;
 
+/// The longest timeout ONE `kevent` call is armed with: `i32::MAX` seconds (~68 years). XNU's
+/// `kevent` rejects a `tv_sec` above `INT32_MAX` with `EINVAL` even when an event is pending.
+/// The wait loop re-arms from the real deadline, so the cap never shortens the wait (principle 13).
+const KEVENT_MAX_SECS: u64 = i32::MAX as u64;
+
+/// The cap in force: [`KEVENT_MAX_SECS`], or a lower one a test installed.
+fn kevent_cap() -> Duration {
+    #[cfg(test)]
+    if let Some(lowered) = test_hooks::clamp_override() {
+        return lowered;
+    }
+    Duration::from_secs(KEVENT_MAX_SECS)
+}
+
+/// Contract of every timespec handed to `kevent`, computed or forced.
+fn assert_kevent_timespec(ts: &libc::timespec) {
+    debug_assert!(
+        ts.tv_sec >= 0 && ts.tv_sec as u64 <= KEVENT_MAX_SECS,
+        "kevent tv_sec {} exceeds XNU's INT32_MAX limit",
+        ts.tv_sec
+    );
+}
+
+/// The `kevent` timeout for a remaining time: `d` capped at [`kevent_cap`]. The single conversion
+/// for every blocking `kevent` in the crate, the test tracer's included.
+pub(crate) fn kevent_timeout(d: Duration) -> libc::timespec {
+    let d = d.min(kevent_cap());
+    let ts = libc::timespec {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_nsec: d.subsec_nanos() as libc::c_long,
+    };
+    assert_kevent_timespec(&ts);
+    ts
+}
+
+/// What a `kevent` that returned 0 while the deadline still has time left means.
+#[derive(Debug, PartialEq, Eq)]
+enum ZeroReturn {
+    /// The timeout was the full cap, so the deadline was further off: the intended re-arm.
+    Rearm,
+    /// A shorter (or no) timeout came back empty with time left: an early wake.
+    Anomaly,
+}
+
+fn classify_zero_return(armed: Option<Duration>) -> ZeroReturn {
+    if armed == Some(kevent_cap()) {
+        ZeroReturn::Rearm
+    } else {
+        ZeroReturn::Anomaly
+    }
+}
+
 fn placeholder() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
@@ -151,25 +203,20 @@ pub(crate) fn block_on_kqueue<T: Copy>(
 
         // `EINTR` retries here, inside the SAME round, without re-firing the hook or advancing
         // `round` — round and kevent_calls() must stay one notion.
-        #[cfg_attr(
-            not(test),
-            allow(unused_variables, reason = "`timeout` is read only for test recording")
-        )]
         let (already_elapsed, timeout, outcome) = loop {
             let remaining = crate::wait::remaining(deadline);
             let already_elapsed = remaining == Some(Duration::ZERO);
             // nix Kqueue::kevent takes Option<libc::timespec> (None = block forever).
             #[allow(unused_mut, reason = "mutated only under #[cfg(test)] below")]
-            let mut timeout = remaining.map(|d| libc::timespec {
-                tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-                tv_nsec: d.subsec_nanos() as libc::c_long,
-            });
+            let mut timeout = remaining.map(kevent_timeout);
             #[cfg(test)]
             if let Some(forced) = test_hooks::take_timeout_override() {
-                timeout = Some(libc::timespec {
+                let forced = libc::timespec {
                     tv_sec: forced.as_secs() as libc::time_t,
                     tv_nsec: forced.subsec_nanos() as libc::c_long,
-                });
+                };
+                assert_kevent_timespec(&forced);
+                timeout = Some(forced);
             }
             match kq.kevent(&[], &mut events, timeout) {
                 Err(nix::errno::Errno::EINTR) => continue,
@@ -196,7 +243,14 @@ pub(crate) fn block_on_kqueue<T: Copy>(
                 if crate::wait::remaining(deadline) == Some(Duration::ZERO) {
                     return Ok(on_timeout);
                 }
-                continue; // spurious — retry
+                match classify_zero_return(as_duration(timeout)) {
+                    ZeroReturn::Rearm => log::debug!("wait: kevent reached its timeout cap with time left; re-arming"),
+                    ZeroReturn::Anomaly => log::warn!(
+                        "wait: kevent returned 0 after a timeout below the cap ({:?}) with time left; re-arming",
+                        as_duration(timeout)
+                    ),
+                }
+                continue; // retry from the freshly recomputed remaining time
             }
             Ok(_) => {
                 #[cfg(test)]
@@ -220,8 +274,7 @@ pub(crate) fn block_on_kqueue<T: Copy>(
     }
 }
 
-/// The requested `kevent` timeout as a `Duration`, for test recording.
-#[cfg(test)]
+/// The requested `kevent` timeout as a `Duration`.
 fn as_duration(timeout: Option<libc::timespec>) -> Option<Duration> {
     timeout.map(|ts| {
         debug_assert!(
