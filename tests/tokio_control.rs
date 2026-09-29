@@ -584,10 +584,8 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
     // its whole life, so no released pin could be observed through it at all.
     //
-    // Each child blocks reading a piped stdin this test holds, never via a chosen duration
-    // (`sleep 30`/`ping -n 30`): only the `kill()` below ends it, and the stdin is released right
-    // after it, so a `kill()` that did nothing lets the child exit 0 and fails `assert_killed`
-    // instead of hanging the `wait()`.
+    // Each child blocks on a piped stdin this test holds and releases right after the `kill()`, so
+    // a `kill()` that did nothing lets it exit 0 and fails `assert_killed` instead of hanging `wait()`.
     let argv = [common::stdin_blocker_program()];
     let (mut async_reaped, async_stdin) = {
         let mut cmd = cosca::tokio::Command::new();

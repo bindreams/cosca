@@ -62,6 +62,9 @@ mod wait;
 mod log_capture;
 
 #[cfg(test)]
+mod graceful_hooks;
+
+#[cfg(test)]
 mod oneshot_hook;
 
 #[cfg(test)]
