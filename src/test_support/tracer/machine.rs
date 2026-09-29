@@ -648,8 +648,11 @@ impl Machine<'_> {
                 .disposition(&format!("{tag}disp"))
                 .unwrap_or_else(|| sys::disposition(self.pid, signal))
             {
-                Ok(Disposition::Default) => true,
-                Ok(Disposition::Caught | Disposition::Ignored) => false,
+                Ok(Disposition::Default) => !sys::m("always_pass"),
+                Ok(Disposition::Caught) => sys::m("caught_keeps") || sys::m("always_keep"),
+                Ok(Disposition::Ignored) => sys::m("ignored_keeps") || sys::m("always_keep"),
+                Err(_) if sys::m("disp_err_default") => true,
+                Err(libc::ESRCH) if sys::m("disp_esrch_fails") => return Ok(Err(libc::EINVAL)),
                 Err(e) => return Ok(Err(e)),
             }
         } else {

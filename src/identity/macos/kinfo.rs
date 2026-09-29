@@ -39,12 +39,23 @@ impl kinfo_proc {
     }
 }
 
+pub(crate) fn m(name: &str) -> bool {
+    std::env::var("COSCA_UH_MUTANT").as_deref() == Ok(name)
+}
+
 /// Read only by the test-only tracer helper (`test_support::tracer`).
 #[cfg(test)]
 impl extern_proc {
     /// The signals the process has set to `SIG_IGN` (`p_sigignore`), bit `signal - 1` each.
     pub(crate) fn sig_ignored(&self, signal: libc::c_int) -> bool {
-        Self::has(self.p_sigignore, signal)
+        Self::has(
+            if m("disp_ignored_from_catch") {
+                self.p_sigcatch
+            } else {
+                self.p_sigignore
+            },
+            signal,
+        )
     }
 
     /// The signals the process has a handler for (`p_sigcatch`), bit `signal - 1` each.
@@ -54,6 +65,9 @@ impl extern_proc {
 
     fn has(mask: u32, signal: libc::c_int) -> bool {
         debug_assert!((1..=32).contains(&signal), "signal {signal} is outside the 32-bit mask");
+        if m("disp_bit_off") {
+            return mask & (1 << signal) != 0;
+        }
         mask & (1 << (signal - 1)) != 0
     }
 }

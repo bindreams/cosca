@@ -2,6 +2,10 @@
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+pub(crate) fn m(name: &str) -> bool {
+    std::env::var("COSCA_UH_MUTANT").as_deref() == Ok(name)
+}
+
 fn errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
@@ -159,10 +163,22 @@ pub(super) enum Disposition {
 /// refused the query.
 pub(super) fn disposition(pid: u32, signal: i32) -> Result<Disposition, i32> {
     use crate::identity::{kinfo::kinfo, Resolved};
+    if m("disp_default") {
+        return Ok(Disposition::Default);
+    }
     match kinfo(pid as _) {
         Resolved::Found(info) => {
             let (ignored, caught) = (info.kp_proc.sig_ignored(signal), info.kp_proc.sig_caught(signal));
             debug_assert!(!(ignored && caught), "signal {signal} is both ignored and caught");
+            if m("disp_swap") {
+                return Ok(if caught {
+                    Disposition::Ignored
+                } else if ignored {
+                    Disposition::Caught
+                } else {
+                    Disposition::Default
+                });
+            }
             Ok(if caught {
                 Disposition::Caught
             } else if ignored {
