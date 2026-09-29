@@ -7,13 +7,20 @@
 //!
 //! Every scenario here has TWO tests: a real-syscall one (whatever the host kernel actually
 //! produces) and a forced-errno twin (`fault::force_pidfd_open_errno_once`) that drives
-//! `open_verified`'s `EINVAL`/`ENOENT` arm deterministically. Both matter: on a >= 6.16 CI
-//! kernel, `pidfd_open` answers `ESRCH` for a reaped leader — the pre-existing arm this PR
-//! never touches — so the real-syscall reaped-leader test passes without ever reaching the
-//! changed code (measured: GitHub's own `ubuntu-latest`/`ubuntu-24.04-arm` runners are on
-//! `6.17.0-1022-azure`). Only the forced-`EINVAL` twin actually exercises the new arm on such a
-//! kernel, and is what makes mutant A ("no exists() fallback") observably red in THIS
-//! container, independent of the host kernel.
+//! `open_verified`'s `EINVAL`/`ENOENT` arm deterministically. The two scenarios differ in
+//! whether the real-syscall test alone is enough, on a >= 6.16 kernel (measured: GitHub's own
+//! `ubuntu-latest`/`ubuntu-24.04-arm` runners are on `6.17.0-1022-azure`, as is this file's own
+//! usual test container):
+//! - REAPED LEADER: `pidfd_open` answers `ESRCH` — the pre-existing arm this PR never touches —
+//!   so the real-syscall test passes without ever reaching the new arm at all. Only the forced-
+//!   `EINVAL` twin exercises it here, and is what makes mutant A ("no exists() fallback")
+//!   observably red in this container, independent of the host kernel.
+//! - LIVE NON-LEADER TID (`tests/linux_pidfd_wait.rs`): `pidfd_open` answers `ENOENT` — which
+//!   IS this PR's new arm (the `Present` branch specifically). The real-syscall test there DOES
+//!   reach the changed code on every kernel this crate supports, and mutant A turns it red too
+//!   (see that file's own doc). Its forced-`ENOENT` twin here exists for a different reason:
+//!   determinism independent of which of `EINVAL`/`ENOENT` the host kernel happens to give for
+//!   this scenario, not to reach otherwise-unreachable code.
 //!
 //! The forked children below run ONLY async-signal-safe operations — raw `libc`
 //! read/write/fork/setpgid/close_range/_exit calls, no allocation, no panics — the same
@@ -251,9 +258,18 @@ fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
     // signal.
     let mut rendezvous = [-1 as RawFd; 2];
     // SAFETY: `rendezvous` is a valid, writable 2-element array; `AF_UNIX`/`SOCK_STREAM` need no
-    // further setup.
+    // further setup. `SOCK_CLOEXEC`: defense in depth — neither end is ever meant to survive an
+    // `exec` (this test's fork tree never execs either), so close-on-exec costs nothing and
+    // rules the possibility out.
     assert_eq!(
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, rendezvous.as_mut_ptr()) },
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                rendezvous.as_mut_ptr(),
+            )
+        },
         0,
         "socketpair: {}",
         std::io::Error::last_os_error()
@@ -327,19 +343,41 @@ fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
     raw_close(block_r);
     // SAFETY: each fd was just returned by this process's own successful `socketpair`/`pipe`
     // call above and has not been closed since.
-    let rendezvous_test = unsafe { OwnedFd::from_raw_fd(rendezvous_test) };
-    let block_w = unsafe { OwnedFd::from_raw_fd(block_w) };
-    let m_ready_r = unsafe { OwnedFd::from_raw_fd(m_ready_r) };
-    let mut reap_l = ReapL {
-        pid: l_pid,
-        armed: true,
+    //
+    // Built into the fixture struct HERE — before anything below that can panic (a handshake
+    // read/write, an assertion, a parse) — so any such panic unwinds through exactly ONE local
+    // (`fixture`), whose FIELD drop order (declaration order, see the struct's own doc) governs
+    // teardown. Earlier code built these as four separate LOCAL variables instead: Rust drops
+    // locals in REVERSE creation order on unwind, and `reap_l` was created last — so it dropped
+    // FIRST, running `ReapL`'s blocking `waitpid(L)` before any of the three `OwnedFd`s had
+    // closed. If a panic landed before `L` was released, `L` was still blocked reading
+    // `rendezvous` and could never see that release OR the EOF the fds' own drops would
+    // otherwise have given it: `waitpid` — and the whole test — hung until an external kill.
+    // Building the struct immediately makes the CORRECT order (fds close, unblocking L/M, THEN
+    // `reap_l` waits — bounded by that) the only order any panic from here on can ever produce.
+    let mut fixture = ReapedLeaderFixture {
+        rendezvous_test: unsafe { OwnedFd::from_raw_fd(rendezvous_test) },
+        block_w: unsafe { OwnedFd::from_raw_fd(block_w) },
+        m_ready_r: unsafe { OwnedFd::from_raw_fd(m_ready_r) },
+        reap_l: ReapL {
+            pid: l_pid,
+            armed: true,
+        },
+        m_pid: 0, // filled in once M reports it, below
     };
+
+    if take_force_panic_after_fixture() {
+        // Test seam only (see `set_force_panic_after_fixture`): L is still blocked on its end
+        // of `rendezvous` right here — the release write below hasn't happened yet — so this
+        // reproduces exactly the scenario the reordering above fixes.
+        panic!("forced panic mid-handshake (test seam) — L is still blocked on rendezvous");
+    }
 
     // Block until L reports its group is set up and it is now blocked awaiting release — only
     // then is reading L's identity race-free (L cannot have exited yet).
     let mut ready = 0u8;
     retry_eintr_one_byte(
-        || unsafe { libc::read(rendezvous_test.as_raw_fd(), (&raw mut ready).cast(), 1) },
+        || unsafe { libc::read(fixture.rendezvous_test.as_raw_fd(), (&raw mut ready).cast(), 1) },
         "read L's ready byte",
     );
 
@@ -350,7 +388,7 @@ fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
     // Release L: it forks M, then exits.
     let release_byte = b'R';
     retry_eintr_one_byte(
-        || unsafe { libc::write(rendezvous_test.as_raw_fd(), (&raw const release_byte).cast(), 1) },
+        || unsafe { libc::write(fixture.rendezvous_test.as_raw_fd(), (&raw const release_byte).cast(), 1) },
         "release L",
     );
 
@@ -369,7 +407,7 @@ fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         "L must have exited 0, got raw status {status:#x}"
     );
-    reap_l.defuse(); // already reaped above; the guard's own Drop becomes a no-op
+    fixture.reap_l.defuse(); // already reaped above; the guard's own Drop becomes a no-op
 
     // Block until M reports alive (and past closing its own copy of `block`'s write end) —
     // confirms the "leader reaped, member alive, same group" precondition is real before the
@@ -377,29 +415,35 @@ fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        // SAFETY: `m_ready_r` is open; `byte` is a valid 1-byte buffer.
-        let n = unsafe { libc::read(m_ready_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: `fixture.m_ready_r` is open; `byte` is a valid 1-byte buffer.
+        let n = unsafe { libc::read(fixture.m_ready_r.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
         assert_eq!(n, 1, "read M's ready line: {}", std::io::Error::last_os_error());
         if byte[0] == b'\n' {
             break;
         }
         line.push(byte[0]);
     }
-    let m_pid: libc::pid_t = std::str::from_utf8(&line)
+    fixture.m_pid = std::str::from_utf8(&line)
         .expect("M's pid is ASCII")
         .parse()
         .expect("M's pid is a plain decimal number");
 
-    (
-        l_id,
-        ReapedLeaderFixture {
-            rendezvous_test,
-            block_w,
-            m_ready_r,
-            reap_l,
-            m_pid,
-        },
-    )
+    (l_id, fixture)
+}
+
+thread_local! {
+    /// Test-only seam: forces the NEXT [`build_reaped_pgid_leader`] call on this thread to
+    /// panic right after its fixture is built (`L` still blocked on `rendezvous`, not yet
+    /// released) — reproducing the exact window the fixture-first-then-panic-safe ordering
+    /// above exists to survive, for
+    /// [`a_panic_mid_handshake_before_release_does_not_hang`] to drive deterministically.
+    static FORCE_PANIC_AFTER_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn set_force_panic_after_fixture(on: bool) {
+    FORCE_PANIC_AFTER_FIXTURE.with(|f| f.set(on));
+}
+fn take_force_panic_after_fixture() -> bool {
+    FORCE_PANIC_AFTER_FIXTURE.with(|f| f.replace(false))
 }
 
 /// Retry a blocking one-byte `read`/`write` across `EINTR` (no cap) in THIS, the test process —
@@ -529,6 +573,38 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
     worker.join().expect("join the worker thread");
 }
 
+/// The `INVAL`/`NOENT` arm's `Existence::Unknown` branch — the OS refused the existence query
+/// (a `hidepid` mount, a permission race) — has no real-syscall reproduction available (nothing
+/// in this container denies `/proc/<pid>/stat` to itself), so this drives it entirely via seams:
+/// force the pidfd errno AND the `exists()` re-verify's answer, independently. Uses this test
+/// process's own identity as the target — its liveness is irrelevant, since both facts that
+/// matter are forced.
+///
+/// Mutant: "Existence::Unknown => Ok(None)" (silently treating an unconfirmable identity as
+/// gone, the same early-verdict mistake `Existence::Gone`'s OWN handling is correct to make,
+/// but `Unknown` is not `Gone` — it is "the query itself failed", nothing learned either way).
+#[test]
+fn block_until_exit_is_unassessable_when_the_einval_arms_exists_is_unknown() {
+    crate::log_capture::install();
+    let id = crate::identity::ProcessId::current();
+    let marker = format!("pid {} identity could not be confirmed", id.pid());
+    let mark = crate::log_capture::mark();
+    let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
+    let forced_exists = super::fault::force_exists_once(Existence::Unknown);
+    let result = super::block_until_exit(id, None);
+    drop(forced_exists);
+    drop(forced_errno);
+    assert!(
+        matches!(result, Err(crate::error::Error::Unassessable { .. })),
+        "Existence::Unknown on the EINVAL/NOENT arm must be Unassessable, not {result:?}"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &marker),
+        vec![log::Level::Warn],
+        "the Unassessable verdict must be logged once, at warn"
+    );
+}
+
 /// Stress check for the fixture's own cleanup guards: a panic between building the fixture and
 /// releasing it must still tear down both `L` and `M` — no survivor. `catch_unwind`, not a
 /// subprocess: the fixture's `Drop` must run on THIS thread's unwind, the exact path a real
@@ -565,4 +641,39 @@ fn a_panic_before_release_still_tears_down_l_and_m() {
         fds[0].revents().contains(rustix::event::PollFlags::IN),
         "M must have exited (or been reaped) once the panicking fixture unwound and dropped"
     );
+}
+
+/// Regression test for the deadlock a real adversarial review reproduced under `unshare --pid
+/// --fork` (no `--mount-proc`): a panic INSIDE [`build_reaped_pgid_leader`] itself, before `L`
+/// is released, used to hang forever. That is a different window than
+/// [`a_panic_before_release_still_tears_down_l_and_m`] above, which panics only after
+/// `build_reaped_pgid_leader` has ALREADY returned a complete fixture (`L` already reaped by
+/// its own normal flow) — that one never touched the bug. This one panics VIA the
+/// `set_force_panic_after_fixture` seam, at the earliest point the fixture exists and `L` is
+/// still genuinely blocked on `rendezvous`, not yet released: exactly the reported scenario.
+///
+/// Before the fix (four separate locals, `reap_l` created last): Rust drops locals in REVERSE
+/// creation order on unwind, so `reap_l`'s blocking `waitpid(L)` ran FIRST, before the fds
+/// closed — `L`, still blocked reading `rendezvous`, could never see the release or an EOF, and
+/// `waitpid` hung forever (observed: a hang until an external `SIGKILL`).
+///
+/// After the fix: this test simply RETURNING (not hanging) is the proof — no in-test timeout is
+/// possible or needed for "did this hang", per this crate's own no-time-based-sync rule
+/// (`docs/principles.md` #8); a regression here would hang this test, caught (eventually) only
+/// by nextest's own suite-level bound, the same backstop
+/// [`a_panic_before_release_still_tears_down_l_and_m`] already relies on.
+#[test]
+fn a_panic_mid_handshake_before_release_does_not_hang() {
+    let _guard = crate::child::spawn::spawn_lock();
+    set_force_panic_after_fixture(true);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_reaped_pgid_leader));
+    assert!(unwound.is_err(), "the forced panic must actually unwind");
+    assert!(
+        !FORCE_PANIC_AFTER_FIXTURE.with(std::cell::Cell::get),
+        "the seam must be consumed by build_reaped_pgid_leader, not leak armed"
+    );
+    // Reaching here at all (this function returning) is the assertion: before the fix, the
+    // panicking fixture's own unwind-drop deadlocked in ReapL::drop's waitpid(L), because L —
+    // still blocked on `rendezvous` — never got a chance to see either the release write or the
+    // EOF that should have preceded that wait.
 }

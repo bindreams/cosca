@@ -45,7 +45,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
         // existence query) gets the same treatment as the post-open re-verify below — never
         // treated as "gone" either.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => {
-            return match id.exists() {
+            return match exists_checked(id) {
                 Existence::Gone => Ok(None),
                 Existence::Present => Err(live_non_leader_error(id, what, e)),
                 Existence::Unknown => {
@@ -68,7 +68,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
     };
     // Re-verify: a pid recycled before open means the original is already gone. An
     // unassessable pid (hidepid, EPERM) is NOT gone and must not be treated as one.
-    match id.exists() {
+    match exists_checked(id) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
         Existence::Unknown => {
@@ -116,11 +116,30 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
     pidfd_open(raw, PidfdFlags::empty())
 }
 
+/// `id.exists()`, seamed for tests: a forced [`Existence`] (armed via
+/// [`fault::force_exists_once`]) stands in for the real `/proc` read exactly once, so a test can
+/// drive either of `open_verified`'s `Existence::Unknown` arms deterministically — reproducing
+/// "the OS refused the query" (`hidepid`, a permission race) without needing a host that
+/// actually refuses it. Compiles to a direct call in a non-test build — no seam, no overhead.
+#[cfg(test)]
+fn exists_checked(id: ProcessId) -> Existence {
+    match fault::take_forced_exists() {
+        Some(existence) => existence,
+        None => id.exists(),
+    }
+}
+#[cfg(not(test))]
+fn exists_checked(id: ProcessId) -> Existence {
+    id.exists()
+}
+
 #[cfg(test)]
 pub(crate) mod fault {
+    use crate::identity::Existence;
     use std::cell::Cell;
     thread_local! {
         static FORCE_PIDFD_OPEN_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
+        static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
     }
 
     /// Disarms the forced errno on drop, even if it was never consumed — so a test that panics
@@ -144,6 +163,28 @@ pub(crate) mod fault {
 
     pub(crate) fn take_forced_pidfd_open_errno() -> Option<rustix::io::Errno> {
         FORCE_PIDFD_OPEN_ERRNO.with(|f| f.take())
+    }
+
+    /// Disarms the forced `Existence` on drop, even if it was never consumed — same reasoning
+    /// as [`ForcedPidfdOpenErrno`].
+    #[must_use = "dropping this immediately disarms the forced existence; bind it for the probe's duration"]
+    pub(crate) struct ForcedExists(());
+
+    /// Force the NEXT `id.exists()` re-verify inside `open_verified` on THIS thread to answer
+    /// `existence`, consumed the first time it's read.
+    pub(crate) fn force_exists_once(existence: Existence) -> ForcedExists {
+        FORCE_EXISTS.with(|f| f.set(Some(existence)));
+        ForcedExists(())
+    }
+
+    impl Drop for ForcedExists {
+        fn drop(&mut self) {
+            FORCE_EXISTS.with(|f| f.set(None));
+        }
+    }
+
+    pub(crate) fn take_forced_exists() -> Option<Existence> {
+        FORCE_EXISTS.with(|f| f.take())
     }
 }
 
