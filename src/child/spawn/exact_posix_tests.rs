@@ -199,7 +199,11 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     let root = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
-    std::fs::create_dir(&p).expect("mkdir p");
+    // Created 0o700 so the chmod below is what makes `p` traversable, whatever the ambient umask.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&p).expect("mkdir p");
+    }
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
