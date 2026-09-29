@@ -10,21 +10,24 @@
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
 //! Each requirement comes from a different syscall:
 //!
-//! - `pidfd_open` needs 5.3. cosca requires a pidfd for every child it spawns on Linux. A kernel,
-//!   seccomp profile or LSM that refuses the call (`ENOSYS`, `EPERM`, `EACCES`, `ENODEV`) is
-//!   unsupported; a transient failure such as `EMFILE` is an I/O error.
-//! - `waitid(P_PIDFD)` needs 5.4. It is how cosca reaps through a pidfd; waiting only polls the
-//!   pidfd.
+//! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
+//!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
+//!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not enforce this yet: it
+//!   returns `Io` for the errnos only a filter produces (`EPERM`, `EACCES`, `ENODEV`) and does not
+//!   require a pidfd at spawn ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
+//!   leaf reaps that way; an owned child's waits and reaps still go by pid
+//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's identity. A refusal
-//!   (`ENOSYS`, `EPERM`) is unsupported.
+//!   checked `/proc` view uses it to read a process's identity. A refusal is `Unsupported`; `main`
+//!   surfaces it as [`Error::Unassessable`](error::Error::Unassessable)
+//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
 //!
-//! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14; without it the
-//! mechanism is not used, see `KillUnsupported` in `containment::cgroup::degrade`) and assumes
-//! kernel commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14,
-//! or a stable kernel that carries it (for example 6.1.129, 6.12.16, 6.13.4). cosca does not probe
-//! for it. What its absence costs is described
-//! under [`Command::kill_on_drop`].
+//! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
+//! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
+//! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
+//! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
+//! described under [`Command::kill_on_drop`].
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a

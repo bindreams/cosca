@@ -1,14 +1,10 @@
 //! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). A refused `pidfd_open` is
-//! `Unsupported`: `ENOSYS` (no such syscall, or a filter), or an errno only a filter or LSM can
-//! produce (`EPERM`, `EACCES`, `ENODEV`). A transient failure (`EMFILE`, `ENFILE`, `ENOMEM`) is
-//! `Io` and names the syscall. Main still returns `Io` for the filter errnos, and an `Io` without
-//! the syscall's name ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race).
 //!
-//! cosca requires Linux >= 5.6 (see the crate root's "Platform requirements"). The syscalls
-//! behind it: `pidfd_open` needs 5.3; `waitid(P_PIDFD)`, 5.4; the `/proc` checks behind
-//! `open_verified` use `openat2`, 5.6. Without `openat2` (5.3 to 5.5) a live target is `Unassessable`.
+//! The kernel floor, the per-syscall versions, and how a refused syscall is classified
+//! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
+//! the checked `/proc` view cannot be built, and a live target is `Unassessable`.
 
 use std::os::fd::AsFd;
 use std::time::Instant;
