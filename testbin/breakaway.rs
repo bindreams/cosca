@@ -202,7 +202,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
 /// Connect to `report_addr` FIRST, so a panic below reaches the test as socket EOF rather than a
 /// hang, then report and block until the test closes the socket.
 pub fn run(report_addr: &str, shape: &str, vehicle: &str) {
-    let mut sock: TcpStream = std::net::TcpStream::connect(report_addr).expect("connect report socket");
+    let mut sock: TcpStream = crate::ack::connect_control(report_addr).expect("connect report socket");
 
     let request = !shape.ends_with("no-request");
     let (outer, inner) = match shape {

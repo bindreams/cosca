@@ -1,0 +1,119 @@
+//! The grandchild pid report of the `spawn-grandchild*` testbin roots.
+//!
+//! A root started with [`GC_PID_ADDR_ENV`] connects to that address after spawning its grandchild
+//! (waiting for the accept ack, like any control connection), writes the grandchild's pid as one
+//! `<pid>\n` line, and then BLOCKS until the harness writes a second ack byte. The harness
+//! captures the grandchild's [`ProcessId`] before writing that release. Until then the root is
+//! alive and still the grandchild's parent, holding it unreaped (Unix) or by handle (Windows), so
+//! the pid names the grandchild for certain and the identity taken here is the real one. The
+//! tree helpers then watch that identity, never the bare pid, alongside the root's.
+
+use std::cell::Cell;
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+
+use cosca::identity::{ProcessId, Resolved};
+
+use super::accept::{
+    accept_or_die, ack_now, died_before_connecting, died_before_reporting, wait_readable, Target, WatchEvent,
+};
+
+/// Env var telling a `spawn-grandchild*` testbin root where to report its grandchild's pid.
+/// Unset, the root reports nothing, so other consumers of these modes see no extra connection.
+pub const GC_PID_ADDR_ENV: &str = "COSCA_TEST_GC_PID_ADDR";
+
+thread_local! {
+    static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// The pid of the grandchild most recently reported to this thread, if any. Lets a test that
+/// expects a helper to panic assert which process the panic names.
+pub fn last_reported_grandchild() -> Option<u32> {
+    LAST_REPORTED.with(Cell::get)
+}
+
+fn record(pid: u32) {
+    LAST_REPORTED.with(|c| c.set(Some(pid)));
+}
+
+fn parse_pid(line: &str) -> u32 {
+    line.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("grandchild pid report {line:?}: {e}"))
+}
+
+/// The identity of a reported grandchild, taken while its parent (the root) is held.
+fn identify(pid: u32) -> ProcessId {
+    record(pid);
+    match ProcessId::of(pid) {
+        Resolved::Found(id) => id,
+        // Unreaped (Unix) or handle-held (Windows) under the live root, so it still resolves;
+        // gone means it was reaped, which only its death can explain.
+        Resolved::Gone => died_before_connecting(pid),
+        Resolved::Unknown => panic!("the OS refused to identify the reported grandchild pid {pid}"),
+    }
+}
+
+/// Accepts the root's report connection, reads its pid line watching the root, captures the
+/// grandchild's identity and releases the root. See the module doc.
+pub fn report_grandchild(report: &TcpListener, root: &mut impl Target) -> ProcessId {
+    let root_pid = root.pid();
+    let mut stream = accept_or_die(report, root);
+    let mut line = Vec::new();
+    let mut buf = [0u8; 64];
+    while !line.contains(&b'\n') {
+        // A root that dies here closes the socket too; watching the process is what does not
+        // depend on that (a descendant could hold the socket open).
+        match wait_readable(&stream, root_pid) {
+            WatchEvent::Ready => {}
+            WatchEvent::Died(pid) => died_before_reporting(pid, "the grandchild pid"),
+        }
+        let n = stream.read(&mut buf).expect("read the grandchild pid report");
+        if n == 0 {
+            died_before_reporting(root_pid, "the grandchild pid");
+        }
+        line.extend_from_slice(&buf[..n]);
+    }
+    let id = identify(parse_pid(std::str::from_utf8(&line).expect("the report is UTF-8")));
+    release(stream);
+    id
+}
+
+fn release(stream: TcpStream) {
+    // The stream is written once and dropped; the root's next step is its main connection.
+    drop(ack_now(stream));
+}
+
+/// Async sibling of [`report_grandchild`].
+#[cfg(feature = "tokio")]
+pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &mut cosca::tokio::Child) -> ProcessId {
+    use ::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let root_pid = root.id().pid();
+    let std_stream = super::accept::accept_or_die_async(report, root).await;
+    std_stream
+        .set_nonblocking(true)
+        .expect("set the report stream nonblocking");
+    let mut stream = ::tokio::net::TcpStream::from_std(std_stream).expect("wrap the report stream for tokio");
+    let mut line = String::new();
+    let n = {
+        let mut reader = BufReader::new(&mut stream);
+        ::tokio::select! {
+            biased;
+            n = reader.read_line(&mut line) => n.expect("read the grandchild pid report"),
+            status = root.wait() => match status {
+                Ok(_) => died_before_reporting(root_pid, "the grandchild pid"),
+                Err(e) => panic!("watching the root's exit while reading the grandchild pid report: {e}"),
+            },
+        }
+    };
+    if n == 0 {
+        died_before_reporting(root_pid, "the grandchild pid");
+    }
+    let id = identify(parse_pid(&line));
+    stream
+        .write_all(&[super::accept::ack::ACK_BYTE])
+        .await
+        .unwrap_or_else(|e| panic!("writing the release to the grandchild pid report failed: {e}"));
+    id
+}
