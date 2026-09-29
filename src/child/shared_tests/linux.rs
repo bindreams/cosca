@@ -167,7 +167,12 @@ fn a_deadline_condvar_wait_is_clamped_to_the_remaining_time() {
         }
     });
     blocked_rx.recv().expect("the waiter must block in round one");
-    b.shared.condvar.notify_all();
+    // Taking the lock succeeds only once the waiter is inside its `Condvar` wait, which releases
+    // it atomically; notifying under it cannot be lost.
+    {
+        let _lock = b.shared.lock();
+        b.shared.condvar.notify_all();
+    }
     again_rx
         .recv()
         .expect("the spurious wake must send the waiter round again");
