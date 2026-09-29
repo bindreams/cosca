@@ -567,6 +567,8 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// can safely work around on its own.
 pub(crate) fn converge(pgid: i32, signal: Signal) -> std::io::Result<GroupState> {
     let listed = members(pgid)?;
+    #[cfg(test)]
+    fault::run_after_listing();
     let mut refused = Vec::new();
     let mut unassessable = Vec::new();
     for m in &listed {
@@ -669,6 +671,47 @@ pub(crate) fn state(pgid: i32, signal: Signal) -> GroupState {
             detail: format!("process group {pgid} could not be listed after {signal}"),
             source: Some(e),
         },
+    }
+}
+
+/// Test-only seam inside [`converge`].
+#[cfg(test)]
+pub(crate) mod fault {
+    thread_local! {
+        static AFTER_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` in the NEXT `converge` on this thread, once `members(pgid)` has returned and
+    /// before any member is signalled or classified: the window in which a member the listing
+    /// saw can still fork a process the listing did not. Whether that fork can succeed is what
+    /// tells apart a group that a prior `killpg` has doomed from one that only `converge`'s
+    /// per-member resend will reach.
+    ///
+    /// The returned guard clears the slot on drop, so a hook whose fire point was never reached
+    /// cannot leak into a later test on this thread. Arming over a live hook is a test bug.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_after_listing(hook: impl FnOnce() + 'static) -> ArmedAfterListing {
+        let previous = AFTER_LISTING.with(|h| h.borrow_mut().replace(Box::new(hook)));
+        debug_assert!(previous.is_none(), "an after-listing hook is already armed");
+        ArmedAfterListing
+    }
+    pub(crate) fn run_after_listing() {
+        let hook = AFTER_LISTING.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    /// Clears the [`set_after_listing`] slot on drop.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) struct ArmedAfterListing;
+    #[cfg(target_os = "linux")]
+    impl Drop for ArmedAfterListing {
+        fn drop(&mut self) {
+            let hook = AFTER_LISTING.with(|h| h.borrow_mut().take());
+            drop(hook);
+        }
     }
 }
 

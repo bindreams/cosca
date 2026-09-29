@@ -94,6 +94,62 @@ fn kill_group_on_owned_group_succeeds() {
     );
 }
 
+/// `kill_group`'s `killpg` dooms the group BEFORE `converge` lists it: a member cannot fork once
+/// its `SIGKILL` is pending, so the process the listing never saw is never created. Without that
+/// first `killpg`, `converge`'s per-member resend is the only delivery, and a member that forks
+/// in the window between the listing and its own signal leaves a survivor no one signals.
+///
+/// The leader is a shell that forks a process, writing `spawned`, for each line it reads. The
+/// hook, fired in `converge` right after the listing, feeds it one line and reads one back from a
+/// stdout only the group holds. With the first `killpg` the shell is already dead, so the write
+/// finds no reader (`EPIPE`, ignored) and the read is EOF: empty. Without it the shell forks, and
+/// the read returns `spawned`. Every step waits on a pipe event; nothing is timed.
+///
+/// Linux only: its `fork` refuses once a fatal signal is pending (`copy_process` checks after
+/// taking `tasklist_lock`, which `killpg` holds while delivering), which is the guarantee this
+/// proves the `killpg` provides. No such guarantee is asserted for other Unixes.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_group_dooms_the_group_before_it_is_listed() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut child = {
+        // Held for the fork itself, see `kill_group_on_owned_group_succeeds`.
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("while read x; do (echo spawned; exec cat) & done")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the leader")
+    };
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let pgid = child.id() as i32;
+
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let record = seen.clone();
+    let _armed = super::group::fault::set_after_listing(move || {
+        let _ = stdin.write_all(b"x\n"); // EPIPE (a dead leader) is expected and ignored
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read to a line or EOF");
+        *record.borrow_mut() = Some(line);
+    });
+    kill_group(pgid).expect("kill_group on an owned group");
+
+    let status = child.wait().expect("reap the leader");
+    let line = seen.borrow_mut().take().expect("the hook ran in converge");
+    assert_eq!(
+        line, "",
+        "a member forked after the listing: the first killpg did not doom the group"
+    );
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+}
+
 /// `term_group` on a real owned, LIVE (non-zombie) group succeeds, and the leader really did
 /// exit because of the delivered `SIGTERM` — not merely because it stayed reachable.
 /// Previously undertested (review): the only prior `term_group` coverage besides the
