@@ -96,17 +96,14 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
     );
     notify_armed();
 
-    // Process handles come BEFORE the event: with bWaitAll false, when several handles are
-    // signalled the lowest index wins, so an exit beats a ready source, as on Linux.
+    // Process handles come BEFORE the event: the lowest signalled index wins, so an exit beats a
+    // ready source.
     let mut handles = processes.clone();
     handles.push(HANDLE(event.0 as *mut _));
     let woken = wait_handles(&handles);
 
-    // WSAEventSelect(s, None, 0) cancels the association and is documented to return the socket to
-    // blocking mode. Measured in CI to NOT be reliable: a real run hit WSAEWOULDBLOCK on the next
-    // `accept()` without the explicit `set_nonblocking(false)` after it. Both stay: the first
-    // cancels the association (leaving it armed was its own source of spurious wakeups), the
-    // second is what the socket's blocking mode has actually been observed to need.
+    // Cancel the association, then restore blocking mode explicitly: cancelling alone does not
+    // reliably leave the socket blocking.
     // SAFETY: `sock` is still the source's own live socket.
     let rc = unsafe { WSAEventSelect(sock, None, 0) };
     assert_eq!(

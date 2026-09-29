@@ -1034,9 +1034,7 @@ fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca
     (listener, cmd.spawn().expect("spawn"))
 }
 
-/// Regression test for `common::accept_or_die_async`'s reason to exist: a dead-before-connecting
-/// target must panic (not hang) the task awaiting it, on the message naming the target.
-/// Named mutant: a plain `listener.accept().await` (hangs; only nextest's bound fails it).
+/// A target that dies before connecting makes `accept_or_die_async` panic naming it, not hang.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
     let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
@@ -1045,13 +1043,8 @@ async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
     assert_died_before_connecting(&message, pid);
 }
 
-/// A target that connects and exits without waiting for the accept ack (not opted in) is dead
-/// whether or not its connection reached the accept queue: an exit arm firing is the verdict, and
-/// no accept attempt on the listener follows it. The child is awaited to completion BEFORE the
-/// tokio listener is polled, so the connection is queued and the exit known.
-///
-/// Named mutant: a final non-blocking accept after the exit arm (it returns the queued
-/// connection instead of panicking).
+/// A target that connects and exits without waiting for the ack is dead whether or not its
+/// connection reached the accept queue. The child is awaited to completion first.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
@@ -1062,8 +1055,7 @@ async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_
     assert_died_before_connecting(&message, pid);
 }
 
-/// The ack: an opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
-/// Named mutant: not writing the ack (the tag read hangs; only nextest's bound fails it).
+/// An opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_acks_the_connection_it_accepts() {
     use std::io::{Read as _, Write as _};
@@ -1076,7 +1068,7 @@ async fn accept_or_die_async_acks_the_connection_it_accepts() {
     child.wait().await.expect("reap");
 }
 
-/// A gone descendant is reported dead, like the sync twin `accept_or_die_also_reports_a_gone_descendant_as_dead`.
+/// Async twin of `accept_or_die_also_reports_a_gone_descendant_as_dead`.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
@@ -1098,9 +1090,8 @@ async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     assert_died_before_connecting(&message, gone_id.pid());
 }
 
-/// Only the GRANDCHILD dies (root alive, connected): the helper must fail, not wait forever for
-/// a "G", and the panic names the grandchild the root reported. Named mutant: the helper
-/// watching only the root.
+/// Only the GRANDCHILD dies (root alive, connected): the panic names the grandchild the root
+/// reported.
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
@@ -1116,7 +1107,8 @@ async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting
     assert_died_before_connecting(&message, grandchild);
 }
 
-/// The root reports a live grandchild, then exits without connecting: the main loop fails on the root.
+/// The root reports a live grandchild, then exits without connecting: the main loop fails on the
+/// root.
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |_| {})).await;

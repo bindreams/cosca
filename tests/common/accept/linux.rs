@@ -62,8 +62,6 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             }
             panic!("poll while waiting for a control connection: {e}");
         }
-        // POLLNVAL would mean this function handed poll() a bad fd, a contract it owns end to
-        // end, so a violation is a bug here, not a runtime condition.
         for f in &fds {
             debug_assert_eq!(f.revents & libc::POLLNVAL, 0, "a polled fd went invalid mid-wait");
         }
@@ -75,9 +73,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
                 fds[0].revents
             );
         }
-        // Exits are checked BEFORE the source on purpose: routing every exit through one verdict
-        // gives one path to reason about, and a ready source alongside an exit belongs to a
-        // target that broke the accept handshake (see the module doc of `accept`).
+        // Exits before the source: see `accept_or_die_also`.
         for (i, (pid, _)) in watched.iter().enumerate() {
             if fds[i + 1].revents & libc::POLLIN != 0 {
                 return WatchEvent::Died(*pid);
