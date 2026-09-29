@@ -1,5 +1,6 @@
 //! Test-only support shared across the crate's unit tests.
 
+// The debugger stand-in is `ptrace` on macOS; Linux uses only `require_group`.
 #[cfg(target_os = "macos")]
 pub(crate) mod tracer;
 
