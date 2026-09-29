@@ -91,12 +91,10 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 /// running in a leaked leaf.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     let mut cmd = blocker();
     cmd.contain();
     fault::set_force_post_fork_failure(true);
@@ -287,14 +285,11 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// kill and is outside its leaf is out of reach, and warned about; it is reaped once it exits.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
     use crate::containment::cgroup::fault as cgroup_fault;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     crate::log_capture::install();
     for (placed, refuses) in [(true, false), (false, false), (false, true)] {
         let mut cmd = blocker();
@@ -344,12 +339,10 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
 /// own reap for the same pid.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     let _ = crate::containment::cgroup::fault::take_reaped_orphans();
     fault::set_force_identity_vanished(true);
     let (mut cmd, teardown) = teardown_blocker();
@@ -377,12 +370,10 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
 /// would mean the retried `rmdir` itself still failed once the leaf drained.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     let _ = crate::containment::cgroup::fault::take_reaped_orphans();
     fault::set_force_identity_vanished(true);
     fault::set_force_kill_failure_leaving_child_alive_as(
@@ -420,17 +411,15 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
 /// Each case runs in a copy of this test binary: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
     use std::io::{Read, Seek, Write};
     use std::os::fd::{AsFd, AsRawFd};
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
 
     const NAME: &str = "tokio::spawn::spawn_tests::cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio";
     const INNER: &str = "COSCA_TEST_ABANDONED_STDIO_INNER";
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
     if std::env::var_os(INNER).is_none() {
         let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
             .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
@@ -599,67 +588,12 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     }
 }
 
-/// A `DropProbe` armed for the next `Child::drop` on this thread, gate released at once: the test
-/// observes the reaper, it does not pause it (the process-global pool's gate-hold budget is spent
-/// elsewhere, see `reaper_tests`).
-#[cfg(target_os = "linux")]
-struct ReaperFence {
-    entered: std::sync::mpsc::Receiver<std::thread::ThreadId>,
-    started: std::sync::mpsc::Receiver<std::thread::ThreadId>,
-    outcome: std::sync::mpsc::Receiver<crate::tokio::child::reaper::test_probe::ReapOutcome>,
-}
-
-#[cfg(target_os = "linux")]
-impl ReaperFence {
-    fn arm() -> Self {
-        use crate::tokio::child::reaper::test_probe::{arm, DropProbe};
-        let (entered_tx, entered) = std::sync::mpsc::channel();
-        let (started_tx, started) = std::sync::mpsc::channel();
-        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
-        let (outcome_tx, outcome) = std::sync::mpsc::channel();
-        arm(DropProbe {
-            entered: entered_tx,
-            started: started_tx,
-            gate: gate_rx,
-            outcome: outcome_tx,
-        });
-        drop(gate_tx);
-        Self {
-            entered,
-            started,
-            outcome,
-        }
-    }
-
-    /// Block until the reaper pool has fully finished with the dropped child's leaf, so nothing
-    /// of it (a re-fired `cgroup.kill` write, the `rmdir`) can race the caller's reads or the
-    /// removal of its tempdir. Returns `(dropping thread, executing thread)`; the teardown must
-    /// have run on a pool thread, not inline.
-    fn wait(self) -> (std::thread::ThreadId, std::thread::ThreadId) {
-        use crate::tokio::child::reaper::test_probe::{assert_consumed, ReapOutcome};
-        assert_consumed();
-        let dropping = self.entered.recv().expect("Drop must reach the reaper handoff");
-        let executing = self.started.recv().expect("a reaper worker must take the job");
-        let outcome = self
-            .outcome
-            .recv()
-            .expect("the reaper must report an outcome for this job");
-        assert!(matches!(outcome, ReapOutcome::Reaped(_)), "got {outcome:?}");
-        assert_ne!(
-            executing, dropping,
-            "the teardown must run on a reaper thread, not inline"
-        );
-        (dropping, executing)
-    }
-}
-
 /// A failed password write kills the contained tree through the leaf: checked on the step log and
 /// on `cgroup.kill`'s raw bytes.
 ///
-/// `child`'s `Drop` hands the disarmed-but-killed leaf to the reaper pool, which re-fires
-/// `hard_kill` on its own thread. Reading `cgroup.kill` or dropping `dir` while that write is in
-/// flight races it (`O_TRUNC` can be read as `[]`; the write lands in a removed dir). So the test
-/// waits on a [`ReaperFence`] first.
+/// The `detach` below disarms the leaf, but this handle has killed it, so `child`'s `Drop`
+/// releases it like an armed one and re-fires `hard_kill` on the dropping thread. That write has
+/// finished by the time `finish_elevated` returns.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
@@ -669,10 +603,9 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    // Disarm the leaf, so the failure path's own kill is the only armed one.
     child.detach();
 
-    let fence = ReaperFence::arm();
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
@@ -688,15 +621,14 @@ async fn a_failed_password_write_kills_the_contained_tree() {
         ),
         "got {err:?}"
     );
-    // The step log is this thread's: the pool thread's re-fired kill is not in it.
+    // The failure path's own kill comes first; the `Drop` that follows re-fires it after its
+    // `rmdir`.
+    let steps = crate::containment::cgroup::fault::take_leaf_steps();
     assert_eq!(
-        crate::containment::cgroup::fault::take_leaf_steps(),
-        vec!["kill".to_string()],
-        "the failed spawn must kill its tree through the leaf"
+        steps.first().map(String::as_str),
+        Some("kill"),
+        "the failed spawn must kill its tree through the leaf, got {steps:?}"
     );
-
-    // Wait for the reaper's teardown of this leaf before reading the file or dropping `dir`.
-    fence.wait();
     assert_eq!(
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
         crate::containment::cgroup::KILL_PAYLOAD,
@@ -710,12 +642,63 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// A failed password write leaves no leaf behind once the killed tree has drained: `finish_elevated`
+/// may block, so it waits for the drain before the handle drops, and the drop's first `rmdir`
+/// succeeds. The members of the fake leaf exit when the wait is about to block, not before.
+///
+/// Mutant: `finish_elevated` does not wait for the drain after `kill_tree_members`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+
+    crate::log_capture::install();
+    let name = "cosca-async-password-drains-leaf";
+    let fake = FakeLeaf::new(name, true);
+    let (path, events) = (fake.leaf.clone(), fake.events.clone());
+    leaf_fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&path, &events));
+    let (blocking, wait_reached) = std::sync::mpsc::channel();
+    leaf_fault::set_drain_blocking_notifier(blocking);
+    let members = fake.events.clone();
+    let exiting = std::thread::spawn(move || {
+        // A closed channel means the wait never blocked: nothing to release.
+        if wait_reached.recv().is_ok() {
+            FakeLeaf::set_populated(&members, false);
+        }
+    });
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(entered_leaf_at(fake.leaf.clone())),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
+    leaf_fault::take_drain_blocking_notifier();
+    exiting.join().expect("the exiting thread");
+    leaf_fault::take_rmdir_hook();
+
+    assert!(matches!(err, Error::Elevation { .. }), "got {err:?}");
+    assert!(
+        !fake.leaf.exists(),
+        "the drained leaf must be removed by the handle's drop"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, name),
+        Vec::<log::Level>::new(),
+        "a leaf that was removed must not be warned about"
+    );
+}
+
 /// Async twin of the sync `a_failed_password_write_warns_when_the_tree_kill_fails`: the teardown
 /// failure is logged at `warn`, not only embedded in the error's `detail`.
 ///
-/// No [`ReaperFence`]: a refused `cgroup.kill` never sets the leaf's `killed`, so `Child::drop`
-/// does not hand it to the reaper and the leaf drops inline. The test pins that: were the leaf
-/// handed off, it would need a fence.
+/// A refused `cgroup.kill` never sets the leaf's `killed`, so the disarmed `Child::drop` that
+/// follows kills nothing again.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
@@ -725,21 +708,16 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     attach_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = opted_out_teardown_blocker();
     let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
-    // Rule out the leaf's `Drop`: only the failure path itself may kill.
+    // Disarm the leaf, so the failure path's own kill is the only armed one.
     child.detach();
 
     // Not ENOENT/ENODEV, so `hard_kill` treats it as a real failure: `open(O_WRONLY)` on a
     // directory fails EISDIR.
     std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
-    let _fence = ReaperFence::arm();
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
     teardown.assert_killed();
-    assert!(
-        crate::tokio::child::reaper::test_probe::take().is_some(),
-        "a leaf whose kill was refused is not handed to the reaper, so there is nothing to fence"
-    );
     assert!(
         matches!(
             err,

@@ -58,6 +58,9 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(feature = "tokio")]
+mod bounded;
+
 #[cfg(test)]
 mod log_capture;
 
@@ -69,6 +72,9 @@ mod oneshot_hook;
 
 #[cfg(test)]
 mod test_child;
+
+#[cfg(test)]
+mod test_enablement;
 
 #[cfg(all(test, unix))]
 mod test_privilege;

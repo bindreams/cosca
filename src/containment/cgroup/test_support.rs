@@ -302,11 +302,20 @@ pub(crate) fn alone(name: &str) -> bool {
     if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
         return true;
     }
-    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-        .env(ALONE, name)
-        .output()
-        .expect("run the test alone");
+    // Forked under `spawn_lock`, like every other fork here: another test's fd, held transiently
+    // non-`CLOEXEC` inside its own `spawn_lock` section, must not leak into this copy.
+    let copy = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+            .env(ALONE, name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the test alone")
+    };
+    let out = copy.wait_with_output().expect("wait for the test run alone");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("1 passed"),

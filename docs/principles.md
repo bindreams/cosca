@@ -55,8 +55,9 @@ then the root stays a zombie.
 
 On evidence of a foreign reap at drop time, cosca instead takes the child's stdio out, forgets
 tokio's `Child`, and logs what the forget leaks as principle 7 says: on Linux the pidfd and its
-reactor registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
-[#174] and open with the owner.
+reactor registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. `main` does not detect a
+foreign reap at drop time yet: `Drop` always hands tokio's `Child` its own drop. [#174] tracks the
+gap.
 
 tokio discards a PID that is already reaped: the queue drops it on `ECHILD` ([tokio orphan.rs]).
 Neither step can detect a foreign reap followed by the number's reuse for another child of ours,

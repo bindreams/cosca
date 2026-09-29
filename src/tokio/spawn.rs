@@ -118,10 +118,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
     // tokio's own `kill_on_drop` is intentionally left at its `false` default: cosca's
-    // `Child::drop` is the SOLE owner of the kill, and the reaper's `run_teardown` of the
-    // wait-and-release that follows it. Forwarding the builder's `kill_on_drop` to `tcmd` would
-    // add a second, unsequenced kill inside that release region, where nothing orders it against
-    // the wait.
+    // `Child::drop` is the SOLE owner of the kill, and it releases tokio's `Child` right after.
+    // Forwarding the builder's `kill_on_drop` to `tcmd` would add a second, unsequenced kill
+    // inside that release, where nothing orders it against the tree kill.
 
     // Merge pre-pass: a piped STD slot targeted by a merge cannot stay tokio-owned (tokio's
     // internal pipe end is not ours to dup into the merging slots), so build OUR pipe for it
@@ -383,7 +382,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
             // abandoned spawn's, reaping a pid tokio's own reap is about to.
             prepared.settle_verdict(pid);
-            reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
+            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
@@ -403,7 +402,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
-            reap_now(&mut child, pid, false); // never awaited — an already-Done child is impossible
+            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
             return Err(e);
         }
     };
@@ -436,7 +435,16 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let tree = child.containment().can_teardown().then(|| child.kill_tree_members());
+    let tree = child.containment().can_teardown().then(|| {
+        child.kill_tree_members()?;
+        // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
+        // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
+        // naming a `wait_tree` the caller never gets.
+        child.block_until_members_drained().map_err(|e| Error::Containment {
+            detail: format!("the kill succeeded, but its drain could not be watched ({e})"),
+        })?;
+        Ok(())
+    });
     let tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
     let root_note = match child.kill() {
         Ok(()) => {

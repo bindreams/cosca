@@ -224,6 +224,10 @@ impl Child {
     /// classified, never signaled, and the group can report cleared regardless. No fix
     /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
     /// value is not trustworthy evidence either.
+    ///
+    /// **Kernel requirement.** Under [`CgroupV2`](crate::Containment::CgroupV2) the kill needs
+    /// the `cgroup.kill` fork-race fix: see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+    /// Without it, `wait_tree` also waits for a child that escaped the kill.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
@@ -503,11 +507,9 @@ impl Drop for Child {
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
-        // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals, handing
-        // the wait to its own reaper threads rather than parking a runtime worker, and it must
-        // not collect, since tokio owns that child and its own reaping. `src/tokio/` mirrors this
-        // surface by hand with nothing enforcing parity, so both differences are deliberate, not
-        // drift.
+        // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals and
+        // never waits, rather than parking a runtime worker, and it must not collect, since tokio
+        // owns that child and its own reaping.
         self.proc.teardown_on_drop();
     }
 }

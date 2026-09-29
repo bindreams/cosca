@@ -69,12 +69,10 @@ fn a_leaf_that_cannot_be_held_after_its_mkdir_is_removed() {
 /// Mounts are never crossed by the child sweep. A bind mount inside a leaf keeps whatever it
 /// shows: an unprivileged run cannot mount, so the lane runs this one.
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_the_child_sweep_never_crosses_a_mount() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     let victim = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(victim.path().join("keep/me")).expect("make the victim's empty dirs");
     let victim_path = victim.path().to_path_buf();

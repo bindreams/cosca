@@ -267,37 +267,62 @@ async fn async_drop_tears_down_a_contained_tree() {
             other => panic!("{who} not torn down on drop: {other:?}"),
         }
     }
-    // The reaper thread drops the leaf after the reap, possibly before the killed grandchild
-    // has left it.
+    // `Drop` releases the leaf right after the kill without waiting for the drain, so the killed
+    // members may not have left it yet.
     remove_leftover_leaf(leaf);
+}
+
+/// Either the leaf `Drop` was given is gone and no warning names it, or it is still there and a
+/// warning at `warn` does. `Drop` writes `cgroup.kill` and reads the drain once: whether the kernel
+/// has finished the kill by then is not this test's to decide, and `Drop` waits for neither.
+#[cfg(target_os = "linux")]
+fn assert_leaf_gone_or_warned_about(leaf: &std::path::Path, mark: usize) {
+    let levels = common::levels_since(mark, &leaf.display().to_string());
+    if leaf.exists() {
+        assert!(
+            levels.contains(&log::Level::Warn),
+            "a leaf left behind must be warned about, got {levels:?}: {}",
+            leaf.display()
+        );
+    } else {
+        assert!(
+            !levels.contains(&log::Level::Warn),
+            "a leaf that was removed must not be warned about, got {levels:?}: {}",
+            leaf.display()
+        );
+    }
 }
 
 #[tokio::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
-    // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
-    // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
+    // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
+    // the tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
+    // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
     use std::io::{Read as _, Write as _};
+    common::install_log_capture();
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    drop(child); // root already reaped → nothing submitted; attached.hard_kill must still kill the grandchild
+    let mark = common::log_mark();
+    drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
     let mut buf = [0u8; 1];
     match grand.read(&mut buf) {
         Ok(0) => {}
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
         other => panic!("grandchild not torn down by hard_kill after the root was waited: {other:?}"),
     }
-    // This `Drop` ran on this thread, and waits for the leaf to drain before removing it.
-    if let Some(leaf) = leaf {
-        assert!(
-            !leaf.exists(),
-            "Drop must remove the leaf once it drains: {}",
-            leaf.display()
-        );
+    // `Drop` releases the leaf without waiting for the drain: the leaf is removed if the kill had
+    // finished by then, and left with a warning if not.
+    #[cfg(target_os = "linux")]
+    if let Some(leaf) = &leaf {
+        assert_leaf_gone_or_warned_about(leaf, mark);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mark;
+    remove_leftover_leaf(leaf);
 }
 
 #[tokio::test]
@@ -387,9 +412,10 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
 /// leaf unless the detach disarmed it. Proven by a byte round trip through both members.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
-    common::cgroup::require_lane();
+    if !common::require_group("CGROUP") {
+        return;
+    }
     assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
 }
 
@@ -397,33 +423,26 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
 /// `Attached::honor_kill_on_drop`).
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
-    common::cgroup::require_lane();
+    if !common::require_group("CGROUP") {
+        return;
+    }
     assert_async_opted_out_tree_survives(false, drop).await;
 }
 
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
-/// in `spawn_io.rs`: `kill_on_drop(false)` hits `Child::drop`'s early return (see its doc), so
-/// tokio's own teardown never runs — but `os.attached` (the `CgroupLeaf`) still drops as an
-/// ordinary struct field the moment `Child::drop` returns, on this thread, and its own `Drop`
-/// must wait for an already-fired `kill_tree()`'s drain before its `rmdir`, exactly as the sync
-/// `Child` does.
+/// in `spawn_io.rs`, with the wait made explicit: the async `Drop` never waits for a drain, so an
+/// opted-out handle that killed its tree removes the leaf only if the caller awaited the drain
+/// first.
 ///
-/// No `wait_tree()` before the drop: that would force the drain itself and mask the race.
-///
-/// This is a real-kernel regression check, not the deterministic proof of the fix: the leaf being
-/// gone when `drop` returns is also what the pre-fix single, unwaited `rmdir` would produce if the
-/// drain happens to finish first — which `let _ = child.wait().await` reaping the root just above
-/// makes likely, since the kernel has to reap every member before that call returns. The unit test
-/// `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` (`leaf_tests.rs`)
-/// is what deterministically forces the race and proves `Drop` itself waits — no sleeps, no
-/// polling from the test.
+/// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
+/// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain() {
-    common::cgroup::require_lane();
+async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf() {
+    if !common::require_group("CGROUP") {
+        return;
+    }
     common::install_log_capture();
     let common::AsyncEchoTree {
         mut child,
@@ -436,20 +455,91 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_
 
     let mark = common::log_mark();
     child.kill_tree().expect("kill_tree");
-    let _ = child.wait().await; // reap the root
-    drop(child); // no wait_tree(): Drop alone must wait for the drain before its rmdir
+    child.wait().await.expect("reap the root");
+    child.wait_tree().await.expect("wait_tree");
+    drop(child);
 
     assert!(
         !leaf.exists(),
-        "an explicit kill_tree(), even through a handle that opted out of kill_on_drop, must \
-         wait for the leaf to drain before Drop's rmdir: {}",
+        "a drop after wait_tree must find the leaf drained and remove it: {}",
         leaf.display()
     );
-    assert!(
-        !common::contains_since(mark, &format!("{} was not removed", leaf.display())),
-        "Drop must not report this leaf left behind once it waited for the drain"
+    assert_eq!(
+        common::levels_since(mark, &leaf.display().to_string()),
+        Vec::<log::Level>::new(),
+        "a leaf that was removed must not be warned about"
     );
     drop((root, grand));
+}
+
+/// `kill_tree()` is not called: the drop alone is the killer. A member the test itself spawned and
+/// placed in the leaf dies of `SIGKILL`, which the test reads by reaping it (a grandchild of the
+/// root cannot be reaped here, because tokio owns the root's children's parent).
+///
+/// Whether the drain has finished by the drop's single read is a race this test does not depend
+/// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover() {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    if !common::require_group("CGROUP") {
+        return;
+    }
+    common::install_log_capture();
+    let common::AsyncEchoTree {
+        child,
+        mut root,
+        mut grand,
+        grand_pid,
+    } = common::spawn_echo_tree_async(true).await;
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let leaf = common::cgroup::cgroup_of(grand_pid);
+
+    // A member of the test's own, blocked on its stdin and placed in the leaf.
+    let mut member = {
+        let _spawn = cosca::test_spawn_lock();
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a member")
+    };
+    let member_stdin = member.stdin.take().expect("the member's piped stdin");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(leaf.join("cgroup.procs"))
+        .and_then(|mut procs| std::io::Write::write_all(&mut procs, member.id().to_string().as_bytes()))
+        .expect("place the member in the leaf");
+    assert_eq!(
+        common::cgroup::cgroup_of(member.id()),
+        leaf,
+        "the member must be in the tree's leaf"
+    );
+
+    let mark = common::log_mark();
+    drop(child);
+
+    // `cgroup.kill` signalled the member before its stdin closes, so it dies of SIGKILL rather
+    // than of the end of its input.
+    drop(member_stdin);
+    let status = member.wait().expect("reap the member");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the drop must kill the leaf's members"
+    );
+    for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {
+        let mut buf = [0u8; 1];
+        match s.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("{who} not torn down on drop: {other:?}"),
+        }
+    }
+    assert_leaf_gone_or_warned_about(&leaf, mark);
+    common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
 /// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
@@ -486,9 +576,9 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
-// `async_drop_leaves_no_zombie` moved to `drop_reaps_on_a_worker_thread` in
-// `src/tokio/child/reaper_tests.rs`: once `Drop` returns before the reap, only the
-// `#[cfg(test)]` probe offers an edge to sequence the no-zombie check after.
+// There is no zombie check for a dropped root: tokio's orphan queue reaps it, best-effort, once a
+// runtime next sees `SIGCHLD`, and cosca offers no edge to sequence one after
+// (`docs/principles.md`, principle 3).
 
 // Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 

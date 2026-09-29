@@ -93,6 +93,13 @@ filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
 slow-timeout = { period = "15s", terminate-after = 1 }
 
 [[profile.default.overrides]]
+# `a_dropped_root_left_to_tokio_is_reaped` yields until tokio reaps the root the drop killed. It
+# checks the hand-off first and fails at once if that is missing; this bound only turns a root
+# that is never reaped into a failure instead of a hang.
+filter = 'binary(cosca) & test(=tokio::child::child_drop_tests::a_dropped_root_left_to_tokio_is_reaped)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+[[profile.default.overrides]]
 # A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
 # that the armed kqueue is already readable (which catches an `EV_DISABLE` arm) and then awaits
 # its `declined_hook` in a `select!`. What nothing in-process catches is the kqueue being readable
@@ -102,6 +109,13 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # `default` so a local run is bounded the same way.
 filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# The two real-kernel async-drop tests wait on events outside the library: a member's death by
+# `cgroup.kill`, and the sockets' EOF. Each event is ordered before the wait by the test itself,
+# so this bound only stops a lost kill from stalling the cgroup lane.
+filter = 'binary(tokio_io) & test(/^linux_cgroup_v2_async_(kill_tree_then_wait_tree_then_drop_leaves_no_leaf|drop_alone_kills_the_members_and_logs_the_leftover)$/)'
+slow-timeout = { period = "30s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
