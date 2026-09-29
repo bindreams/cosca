@@ -135,6 +135,7 @@ impl RawChild {
                 if self.runas && !self.can_terminate() {
                     // (b) A genuinely higher-integrity runas child we cannot terminate. Do NOT
                     // block in wait(): surface the denial.
+                    self.reap()?;
                     Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32))
                 } else {
                     // (a) Our own CreateProcessW child, or a runas child we DO have terminate
