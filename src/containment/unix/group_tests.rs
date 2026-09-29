@@ -454,3 +454,40 @@ fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let err = members(i32::MAX).expect_err("an unassessable view lists nothing");
     assert!(err.to_string().contains("forced by a test"), "{err}");
 }
+
+/// Without `openat2` no `/proc` view can be established, and the listing says that is why:
+/// `Unsupported`, naming the requirement, as a spawn does. Mutant: "surface every unreadable view
+/// as `io::Error::other`" — the kind is `Other` and the text is only "/proc could not be opened".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_without_openat2_is_unsupported_naming_the_requirement() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
+        let forced = force_openat2_errno(errno);
+        let err = members(i32::MAX).expect_err("no openat2, no listing");
+        drop(forced);
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "containment::unix::group::members: cosca requires openat2 (Linux \u{2265} 5.6), refused here: \
+                 openat2 answered {name}, so pgid {} cannot be listed",
+                i32::MAX
+            ),
+            "{errno}"
+        );
+    }
+}
+
+/// Any other `openat2` failure is not the requirement: it keeps its kind and does not claim
+/// `openat2` is missing. Mutant: "flag every `/proc` open failure as missing `openat2`".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_with_another_openat2_failure_is_not_unsupported() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    let forced = force_openat2_errno(rustix::io::Errno::NOENT);
+    let err = members(i32::MAX).expect_err("an unopenable /proc lists nothing");
+    drop(forced);
+    assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert!(!err.to_string().contains("cosca requires openat2"), "{err}");
+}

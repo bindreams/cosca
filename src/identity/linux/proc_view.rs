@@ -80,11 +80,19 @@ impl ViewUnreadable {
     /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
     /// could not be established. `op` is what could not be done.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
-        self.openat2_refused.map(|errno| Error::Unsupported {
+        self.openat2_requirement().map(|detail| Error::Unsupported {
             op: op.into(),
             platform: "linux",
-            detail: format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}"),
+            detail,
         })
+    }
+
+    /// The requirement text ("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered
+    /// <ERRNO>"), when `openat2` being refused is why the view could not be established. For
+    /// callers whose error type is not [`Error`].
+    pub(crate) fn openat2_requirement(&self) -> Option<String> {
+        self.openat2_refused
+            .map(|errno| format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}"))
     }
 }
 

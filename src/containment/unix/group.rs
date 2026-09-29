@@ -146,15 +146,23 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
 ///
 /// A `/proc` that is not this process's own pid namespace's lists other processes' pgids, which
 /// mean nothing here: that is an error naming the view, not an empty group.
+/// Where `openat2` is unavailable (Linux < 5.6, or a seccomp filter) no view can be checked, and the
+/// error is `ErrorKind::Unsupported` naming that requirement.
 #[cfg(target_os = "linux")]
 pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     use crate::identity::stat_parse::{parse_pgrp, parse_starttime_jiffies};
 
-    let proc_dir = crate::identity::proc_view().into_dir().map_err(|why| {
-        std::io::Error::other(format!(
-            "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
-        ))
-    })?;
+    let proc_dir = crate::identity::proc_view()
+        .into_dir()
+        .map_err(|why| match why.openat2_requirement() {
+            Some(requirement) => std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("containment::unix::group::members: {requirement}, so pgid {pgid} cannot be listed"),
+            ),
+            None => std::io::Error::other(format!(
+                "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
+            )),
+        })?;
     let mut out = Vec::new();
     // A genuine listing error means the listing itself is unreliable — propagate it rather than
     // silently treating it as one absent entry among many.
