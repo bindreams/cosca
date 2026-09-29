@@ -304,8 +304,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
     } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
-      // A cancelled watch must not affect the child.
-    assert_child_still_alive(&mut child);
+    assert_child_still_alive(&mut child); // a cancelled watch must not affect the child
     kill_and_reap(&mut child);
 }
 
@@ -328,8 +327,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     } // <- drop signals the cancel event
     rx.recv()
         .expect("the blocking watcher must return after the drop released it");
-    // Release must be signal-free.
-    assert_child_still_alive(&mut child);
+    assert_child_still_alive(&mut child); // release must be signal-free
     kill_and_reap(&mut child);
 }
 
