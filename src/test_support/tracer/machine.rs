@@ -11,6 +11,9 @@
 //! re-wait after an ignored event adds none. A test reads up to the wait it expects and acts
 //! there, so a wrong path fails an assertion instead of hanging.
 //!
+//! **Settling.** The helper acts on a stop only once it has settled, every tracee thread out of
+//! the running state: see [`sys::stop`].
+//!
 //! **Signals.** The tracee's stops are passed on as a debugger does. XNU discards a stop signal
 //! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`
 //! delivers to a still-traced tracee (xnu `kern_sig.c`, `issignal`). So the helper keeps the
@@ -31,22 +34,23 @@
 //! | S0 | a registration's receipt error | done | `error` |
 //! | S1 Attach | `PT_ATTACH` succeeds | S2 (S1h under `S1:hold`) | |
 //! | S1 | any error | done | `error` |
-//! | S1h Held | backoff timeout, `pbi_status` not `SSTOP` or `ESRCH` (exiting) | S1h | |
-//! | S1h | backoff timeout, `SSTOP` sampled | S1hs: S1h with no more timeouts | |
-//! | S1h | `pbi_status` fails otherwise | done | `error` |
+//! | S1h Held | backoff timeout, the tracee not stopped or its stop settling | S1h | |
+//! | S1h | backoff timeout, the stop settled | S1hs: S1h with no more timeouts | |
+//! | S1h | the stop peek fails | done | `error` |
 //! | S1h | signal byte | S2 | |
 //! | S1h | EOF | done, which exits at once; XNU kills the still-traced tracee | |
 //! | S1h | `NOTE_EXIT` | S5 | |
 //! | S2 Release | a `SIGSTOP` (the attach's) holds the tracee: `PT_CONTINUE` succeeds | S3 | `attached` |
 //! | S2 | the tracee stopped by another stop signal | keep it, release the tracee; S2k, then S2b | |
 //! | S2 | the tracee stopped by any other signal | pass it on; S2s, then S2b | |
-//! | S2 | the tracee not stopped yet, or `PT_CONTINUE` fails with `EBUSY` | S2b | |
+//! | S2 | the tracee not stopped yet or its stop settling, or `PT_CONTINUE` fails with `EBUSY` | S2b | |
 //! | S2b Backoff | timeout | retry S2's stop check | |
 //! | S2b | `NOTE_EXIT`, signal byte or EOF | done: nothing may happen before `attached` | `error` |
 //! | S2 | the stop peek, the release or `PT_CONTINUE` fails otherwise | done | `error` |
 //! | S3 Traced | `SIGCHLD`, the tracee stopped by a stop signal | keep it, release the tracee; S3k, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee stopped by any other signal | pass it on; S3s, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee not stopped | S3 | |
+//! | S3 | `SIGCHLD`, the stop settling | S3 with a backoff timeout that peeks again | |
 //! | S3 | the release fails with `ESRCH` (the tracee is exiting) | S3 | |
 //! | S3 | the stop peek or the release fails otherwise | done | `error` |
 //! | S3, `auto` | `NOTE_EXIT` (wins over a byte in the same batch) | S5 | |
@@ -61,7 +65,7 @@
 //! | S4 | re-sending the kept stop signal fails | done | `error` |
 //! | S4 | the tracee stopped by another stop signal | keep it, release the tracee; S4k, then S4b | |
 //! | S4 | the tracee stopped by any other signal | pass it on; S4s, then S4b | |
-//! | S4 | the tracee not stopped yet, or `PT_DETACH` fails with `EBUSY` | S4b | |
+//! | S4 | the tracee not stopped yet or its stop settling, or `PT_DETACH` fails with `EBUSY` | S4b | |
 //! | S4 | `SIGSTOP`, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
 //! | S4 | the stop peek fails, or any other error | done | `error` |
 //! | S4b Backoff | `NOTE_EXIT` | S5 | |
@@ -96,7 +100,8 @@ use std::time::Duration;
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::{sys, Mode, Until};
+use super::sys::{self, Stop};
+use super::{Mode, Until};
 
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(50);
@@ -188,9 +193,9 @@ struct Forces(Vec<(String, String)>);
 /// The injection tags. A state tag (`S0`, `S1`, `S2`, `S4`, `S5`) takes `ok` or an errno name
 /// or number, which replaces that state's syscall result; `S1` also takes `hold`, which enters
 /// S1h. `S1h`, `S2b`, `S3`, `S3x`, `S4b` and `S6` take events (`NOTE_EXIT`, `SIGCHLD`,
-/// `SIGNAL`, `EOF`, joined by `+` for one batch) in place of a `kevent`. `S1hstatus` takes an
-/// errno for `pbi_status`. `S2stop`, `S3stop` and `S4stop` replace the stop peek's answer (a
-/// signal name, `none`, or an errno); `S2cont`, `S3cont` and `S4cont` replace the release's or
+/// `SIGNAL`, `EOF`, joined by `+` for one batch) in place of a `kevent`. `S1hstop`, `S2stop`,
+/// `S3stop` and `S4stop` replace the stop peek's answer (a signal name, `none`, `settling`, or an
+/// errno); `S2cont`, `S3cont` and `S4cont` replace the release's or
 /// pass-through's result, and `S4r` the re-send's. `S4sigstop` takes `0` to skip S4's `SIGSTOP`,
 /// `1` to send it, or an errno for its result; by default it is sent only when `S4`'s result is
 /// not forced, because a real stop would leave a tracee the test needs to end by EOF stopped.
@@ -202,7 +207,7 @@ const FORCE_TAGS: &[&str] = &[
     "S0",
     "S1",
     "S1h",
-    "S1hstatus",
+    "S1hstop",
     "S2",
     "S2b",
     "S2stop",
@@ -254,12 +259,14 @@ impl Forces {
         true
     }
 
-    /// A forced stop-peek answer for `tag`, if any: a stopping signal, `none`, or an errno.
-    fn stop(&mut self, tag: &str) -> Option<Result<Option<i32>, i32>> {
+    /// A forced stop-peek answer for `tag`, if any: a stopping signal, `none`, `settling`, or an
+    /// errno.
+    fn stop(&mut self, tag: &str) -> Option<Result<Stop, i32>> {
         self.take(tag).map(|directive| match directive.as_str() {
-            "none" => Ok(None),
-            "SIGTERM" => Ok(Some(libc::SIGTERM)),
-            "SIGTSTP" => Ok(Some(libc::SIGTSTP)),
+            "none" => Ok(Stop::Running),
+            "settling" => Ok(Stop::Settling),
+            "SIGTERM" => Ok(Stop::Stopped(libc::SIGTERM)),
+            "SIGTSTP" => Ok(Stop::Stopped(libc::SIGTSTP)),
             name => Err(errno_named(name)),
         })
     }
@@ -437,8 +444,8 @@ impl Machine<'_> {
         }
     }
 
-    /// Samples `pbi_status` under the backoff until `SSTOP`, then waits for an event with no
-    /// timeout.
+    /// Peeks under the backoff until the attach's stop has settled, then waits for an event with
+    /// no timeout.
     fn s1h(&mut self, kq: &Kqueue) -> Step {
         self.enter("S1h")?;
         let mut backoff = Some(FIRST_BACKOFF);
@@ -456,17 +463,12 @@ impl Machine<'_> {
             let Some(current) = backoff else {
                 continue;
             };
-            let status = match self.forces.take("S1hstatus") {
-                Some(name) => Err(errno_named(&name)),
-                None => sys::pbi_status(self.pid),
-            };
-            match status {
-                Ok(libc::SSTOP) => {
+            match self.forces.stop("S1hstop").unwrap_or_else(|| sys::stop(self.pid)) {
+                Ok(Stop::Stopped(_)) => {
                     self.enter("S1hs")?;
                     backoff = None;
                 }
-                // ESRCH: the tracee is exiting, and its NOTE_EXIT follows.
-                Ok(_) | Err(libc::ESRCH) => backoff = Some(next_backoff(current)),
+                Ok(Stop::Running | Stop::Settling) => backoff = Some(next_backoff(current)),
                 Err(e) => return self.fail(e, "S1h"),
             }
         }
@@ -500,17 +502,21 @@ impl Machine<'_> {
 
     fn s3(&mut self, kq: &Kqueue) -> Step {
         self.enter("S3")?;
+        // While a stop settles, the next wait is a backoff that re-peeks: no SIGCHLD follows.
+        let mut settling = None;
         let batch = loop {
-            let batch = self.wait_with(kq, "S3", None, true)?;
-            if batch.sigchld {
-                let stop = self.forces.stop("S3stop").unwrap_or_else(|| sys::stop_signal(self.pid));
+            let batch = self.wait_with(kq, "S3", settling, true)?;
+            if batch.sigchld || settling.is_some() {
+                let stop = self.forces.stop("S3stop").unwrap_or_else(|| sys::stop(self.pid));
+                let previous = settling.take();
                 match stop {
-                    Ok(Some(signal)) => match self.pass_on("S3", signal)? {
+                    Ok(Stop::Stopped(signal)) => match self.pass_on("S3", signal)? {
                         // Exiting: its NOTE_EXIT follows.
                         Ok(()) | Err(libc::ESRCH) => {}
                         Err(e) => return self.fail(e, "S3"),
                     },
-                    Ok(None) => {}
+                    Ok(Stop::Settling) => settling = Some(previous.map_or(FIRST_BACKOFF, next_backoff)),
+                    Ok(Stop::Running) => {}
                     Err(e) => return self.fail(e, "S3"),
                 }
             }
@@ -602,15 +608,15 @@ impl Machine<'_> {
         let stop = self
             .forces
             .stop(&format!("{tag}stop"))
-            .unwrap_or_else(|| sys::stop_signal(self.pid));
+            .unwrap_or_else(|| sys::stop(self.pid));
         Ok(match stop {
             Err(e) => Check::PeekFailed(e),
-            Ok(Some(libc::SIGSTOP)) => Check::Result(act(self.pid)),
-            Ok(Some(signal)) => match self.pass_on(tag, signal)? {
+            Ok(Stop::Stopped(libc::SIGSTOP)) => Check::Result(act(self.pid)),
+            Ok(Stop::Stopped(signal)) => match self.pass_on(tag, signal)? {
                 Ok(()) => Check::Result(Err(libc::EBUSY)),
                 Err(e) => Check::Result(Err(e)),
             },
-            Ok(None) => Check::Result(Err(libc::EBUSY)),
+            Ok(Stop::Running | Stop::Settling) => Check::Result(Err(libc::EBUSY)),
         })
     }
 

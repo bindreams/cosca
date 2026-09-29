@@ -401,31 +401,32 @@ fn s1h_note_exit_goes_to_reap() {
     assert_sigkilled(tracee);
 }
 
-/// Mutant: S1h retries any failed `pbi_status`.
-#[test]
-fn s1h_a_failed_status_sample_fails() {
+/// Runs S1h's peeks under `force`, the last of which fails the run.
+fn s1h_peeks_until_the_error(force: &str) {
     let Some((mut tracee, stdin)) = tracee() else { return };
-    let mut th = super::start_forced(Mode::Auto, "S1:hold,S1hstatus:EINVAL").attach(&mut tracee);
+    let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h", &err(libc::EINVAL, "S1h"), DONE]);
     drop(th);
     drop(stdin);
     assert_sigkilled(tracee);
 }
 
-/// Mutant: S1h fails on `ESRCH` (an exiting tracee, whose `NOTE_EXIT` follows).
+/// Mutant: S1h retries a failed peek.
 #[test]
-fn s1h_an_exiting_status_sample_backs_off() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
-    let pid = tracee.id().pid();
-    let mut th = super::start_forced(Mode::Auto, "S1:hold,S1hstatus:ESRCH").attach(&mut tracee);
-    expect(&mut th, &HELD);
-    th.signal();
-    expect(&mut th, &RELEASED);
-    drop(stdin);
-    expect(&mut th, &REAPED);
-    assert_handed_back(pid);
-    drop(th);
-    assert_exited_cleanly(tracee);
+fn s1h_a_failed_stop_peek_fails() {
+    s1h_peeks_until_the_error("S1:hold,S1hstop:EINVAL");
+}
+
+/// Mutant: S1h holds a tracee that is not stopped.
+#[test]
+fn s1h_a_tracee_not_stopped_yet_backs_off() {
+    s1h_peeks_until_the_error("S1:hold,S1hstop:none,S1hstop:EINVAL");
+}
+
+/// Mutant: S1h holds a stop that has not settled.
+#[test]
+fn s1h_a_settling_stop_backs_off() {
+    s1h_peeks_until_the_error("S1:hold,S1hstop:settling,S1hstop:EINVAL");
 }
 
 /// Mutant: a lone `SIGCHLD` counts as a signal byte in S1h.
@@ -469,9 +470,19 @@ fn s2_ebusy_backs_off_then_retries() {
 /// Mutants: S2 releases a tracee its peek finds not stopped; S2 fails on it.
 #[test]
 fn s2_a_tracee_not_stopped_yet_backs_off() {
+    s2_backs_off_before_the_release("S1:hold,S2stop:none");
+}
+
+/// Mutant: S2 releases a stop that has not settled.
+#[test]
+fn s2_a_settling_stop_backs_off() {
+    s2_backs_off_before_the_release("S1:hold,S2stop:settling");
+}
+
+fn s2_backs_off_before_the_release(force: &str) {
     let Some((mut tracee, stdin)) = tracee() else { return };
     let pid = tracee.id().pid();
-    let mut th = from_held(&mut tracee, "S1:hold,S2stop:none");
+    let mut th = from_held(&mut tracee, force);
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
     drop(stdin);
     expect(&mut th, &REAPED);
@@ -907,13 +918,24 @@ fn s4_ebusy_backs_off_then_retries() {
     end_detached(tracee);
 }
 
-/// The tracee stays in the attach's settled stop (`S2:ok` skips the release), so the only
-/// backoff is the injected answer's. Mutants: S4 detaches a tracee its peek finds not stopped;
-/// S4 fails on it.
+/// Mutants: S4 detaches a tracee its peek finds not stopped; S4 fails on it.
 #[test]
 fn s4_a_tracee_not_stopped_yet_backs_off() {
+    s4_backs_off_before_the_detach("none");
+}
+
+/// Mutant: S4 detaches a stop that has not settled.
+#[test]
+fn s4_a_settling_stop_backs_off() {
+    s4_backs_off_before_the_detach("settling");
+}
+
+/// The tracee stays in the attach's settled stop (`S2:ok` skips the release), so the only
+/// backoff is the injected answer's.
+fn s4_backs_off_before_the_detach(stop: &str) {
     let Some((mut tracee, stdin)) = tracee() else { return };
-    let mut th = from_held(&mut tracee, "S1:hold,S2:ok,S3:SIGNAL,S4sigstop:0,S4stop:none");
+    let force = format!("S1:hold,S2:ok,S3:SIGNAL,S4sigstop:0,S4stop:{stop}");
+    let mut th = from_held(&mut tracee, &force);
     expect(&mut th, &["S2", "attached", "S3", "S4", "S4b", "detached", DONE]);
     drop(th);
     drop(stdin);
@@ -1282,6 +1304,13 @@ fn s3_fails(force: &str) {
 #[test]
 fn s3_a_failed_stop_peek_fails() {
     s3_fails("S3:SIGCHLD,S3stop:EINVAL");
+}
+
+/// The re-peek after the backoff meets the injected error. Mutant: S3 waits for another
+/// `SIGCHLD` after a settling stop.
+#[test]
+fn s3_a_settling_stop_peeks_again() {
+    s3_fails("S3:SIGCHLD,S3stop:settling,S3stop:EINVAL");
 }
 
 /// Mutant: S3 ignores a failed pass-through.

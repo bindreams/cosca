@@ -111,10 +111,76 @@ pub(super) fn pbi_status(pid: u32) -> Result<u32, i32> {
     }
 }
 
-/// `waitid(P_PID, pid, WSTOPPED | WNOHANG | WNOWAIT)`: `Ok(Some(signal))` while the tracee is
-/// stopped by `signal`, `Ok(None)` while it runs or has exited. Does not consume the stop.
-pub(super) fn stop_signal(pid: u32) -> Result<Option<i32>, i32> {
-    peek(pid, libc::WSTOPPED | libc::WNOHANG).map(|info| (info.si_pid != 0).then_some(info.si_status))
+/// The stop peek's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stop {
+    /// Not stopped: running, or exiting.
+    Running,
+    /// Stopped by the signal, but a thread still runs: the stop has not settled.
+    Settling,
+    /// Stopped by the signal, every thread blocked.
+    Stopped(i32),
+}
+
+/// Whether the tracee is stopped, and by which signal, without consuming the stop.
+///
+/// A traced stop sets `SSTOP` and posts `SIGCHLD` to the tracer before its thread waits for the
+/// tracer's release, and a `PT_CONTINUE` or `PT_DETACH` in between wakes nothing: the tracee then
+/// never runs again (xnu `kern_sig.c`, `issignal`, `assert_wait` on `sigwait`; seen on CI as a
+/// tracee that neither exits nor stops again). So a stop counts only once no thread of the
+/// tracee is in the running state.
+pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
+    let info = peek(pid, libc::WSTOPPED | libc::WNOHANG)?;
+    if info.si_pid == 0 {
+        return Ok(Stop::Running);
+    }
+    match threads_blocked(pid) {
+        Ok(true) => Ok(Stop::Stopped(info.si_status)),
+        Ok(false) => Ok(Stop::Settling),
+        // Exiting, and so no longer stopped: its NOTE_EXIT follows.
+        Err(libc::ESRCH) => Ok(Stop::Running),
+        Err(e) => Err(e),
+    }
+}
+
+/// `<sys/proc_info.h>`: lists a process's thread handles. Not in `libc`.
+const PROC_PIDLISTTHREADS: libc::c_int = 6;
+
+/// `proc_pidinfo` into `buf`, `Ok` with the bytes written.
+fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<usize, i32> {
+    let size = std::mem::size_of_val(buf) as libc::c_int;
+    // SAFETY: `buf` is a valid, writable buffer of `size` bytes of plain data.
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, flavor, arg, buf.as_mut_ptr().cast(), size) };
+    if n > 0 {
+        Ok(n as usize)
+    } else {
+        Err(errno())
+    }
+}
+
+/// `Ok(true)` if no thread of `pid` is in the running state.
+fn threads_blocked(pid: u32) -> Result<bool, i32> {
+    // SAFETY: `proc_taskinfo` is plain data; all-zero is a valid value.
+    let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
+    pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task)?;
+    let mut handles = vec![0u64; task[0].pti_threadnum.max(1) as usize];
+    let listed = loop {
+        let n = pidinfo(pid, PROC_PIDLISTTHREADS, 0, &mut handles)? / std::mem::size_of::<u64>();
+        // A full buffer may have cut the list short.
+        if n < handles.len() {
+            break n;
+        }
+        handles.resize(handles.len() * 2, 0);
+    };
+    for &handle in &handles[..listed] {
+        // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
+        let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
+        pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
+        if thread[0].pth_run_state == libc::TH_STATE_RUNNING {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `Ok` while `pid` is this process's unreaped child: a `waitid` peek that neither blocks nor
