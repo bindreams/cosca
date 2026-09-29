@@ -1083,6 +1083,7 @@ async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
         .expect("the live descendant resolves");
     drop(gone.stdin.take());
     gone.wait().expect("reap the descendant: its identity is now Gone");
+    drop(gone); // Windows: closing the handle is what makes `OpenProcess` fail for the pid
 
     let message =
         panic_message_of(async move { common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await })

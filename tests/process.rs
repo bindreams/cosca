@@ -428,6 +428,9 @@ fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
         .expect("the live descendant resolves");
     drop(gone.stdin.take());
     gone.wait().expect("reap the descendant: its identity is now Gone");
+    // Windows keeps the process object alive while a handle to it is open; closing it is what
+    // makes `OpenProcess` fail for the pid.
+    drop(gone);
 
     let message = panic_message_of(|| common::accept_or_die_also(&listener, &mut target, Some(gone_id)));
     assert_died_before_connecting(&message, gone_id.pid());
