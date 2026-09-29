@@ -44,11 +44,12 @@ fn spawn_configured(mode: &str, configure: impl Fn(&mut cosca::Command)) -> (cos
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin())
-        .args(["cosca_testbin", mode, addr.as_str(), "R"]);
+        .args(["cosca_testbin", mode, addr.as_str(), "R"])
+        .env(common::ACK_ENV, "1");
     common::silence(&mut cmd);
     configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn control child");
+    let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     assert_eq!(&tag, b"R", "wrong control tag");
@@ -56,19 +57,19 @@ fn spawn_configured(mode: &str, configure: impl Fn(&mut cosca::Command)) -> (cos
 }
 
 #[cfg(feature = "tokio")]
-fn spawn_configured_async(
+async fn spawn_configured_async(
     mode: &str,
     configure: impl Fn(&mut cosca::tokio::Command),
 ) -> (cosca::tokio::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, addr) = common::bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(testbin())
-        .args(["cosca_testbin", mode, addr.as_str(), "R"]);
+        .args(["cosca_testbin", mode, addr.as_str(), "R"])
+        .env(common::ACK_ENV, "1");
     common::silence_async(&mut cmd);
     configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn async control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn async control child");
+    let mut sock = common::accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     assert_eq!(&tag, b"R", "wrong control tag");
@@ -189,7 +190,8 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
 async fn an_async_plain_contained_root_really_receives_the_break() {
     let (mut child, mut sock) = spawn_configured_async("control-block-ack-break", |c| {
         c.contain();
-    });
+    })
+    .await;
     assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
     child.terminate_tree().expect("terminate_tree on a contained root");
 
@@ -205,7 +207,7 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
 
 #[cfg(feature = "tokio")]
 async fn assert_false_success_async(expected_containment: Containment, configure: impl Fn(&mut cosca::tokio::Command)) {
-    let (mut child, mut sock) = spawn_configured_async("control-block", &configure);
+    let (mut child, mut sock) = spawn_configured_async("control-block", &configure).await;
     assert_eq!(child.containment(), expected_containment);
     assert_eq!(
         child.graceful_mechanism(),
@@ -223,7 +225,7 @@ async fn assert_false_success_async(expected_containment: Containment, configure
     );
     drop(sock);
 
-    let (mut child, sock) = spawn_configured_async("control-block", &configure);
+    let (mut child, sock) = spawn_configured_async("control-block", &configure).await;
     child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
