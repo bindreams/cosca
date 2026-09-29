@@ -212,8 +212,8 @@ impl Child {
     /// Take the stashed our-owned read end of an Out-direction merge target (plain
     /// `BTreeMap::remove` — TAKE semantics: the first call moves the end out, later calls
     /// return `None`, matching the tokio-owned branch's `Option::take`). Unix converts the
-    /// raw end to a reactor pipe here; on a conversion failure (a contract violation:
-    /// debug_assert + `log::warn!`) the end drops, so the child observes EPIPE on writes —
+    /// raw end to a reactor pipe here; on a conversion failure (a real OS outcome:
+    /// `log::warn!`) the end drops, so the child observes EPIPE on writes —
     /// visible, never a hang.
     #[cfg(unix)]
     fn take_owned_out(&mut self, fd: Fd) -> Option<super::stdio::OutInner> {
@@ -222,7 +222,6 @@ impl Child {
             ParentEnd::Reader(r) => match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
                 Ok(recv) => Some(super::stdio::OutInner::Owned(recv)),
                 Err(e) => {
-                    debug_assert!(false, "own pipe end failed tokio conversion: {e}");
                     log::warn!(
                         "{fd} merge-target read end dropped: tokio conversion failed ({e}); the child will see EPIPE on writes"
                     );
@@ -260,7 +259,6 @@ impl Child {
             ParentEnd::Writer(w) => match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
                 Ok(send) => Some(super::stdio::InInner::Owned(send)),
                 Err(e) => {
-                    debug_assert!(false, "own pipe end failed tokio conversion: {e}");
                     log::warn!(
                         "{fd} merge-target write end dropped: tokio conversion failed ({e}); the child will see EOF on reads"
                     );
@@ -298,8 +296,8 @@ impl Child {
     /// # Returns
     ///
     /// `Some(receiver)` on success. `None` if the fd was not configured as a piped read end,
-    /// if it was already taken, or if reactor registration failed (a contract violation:
-    /// debug_assert + `log::warn!`; the dropped end closes the fd, so the child observes
+    /// if it was already taken, or if reactor registration failed (a real OS outcome,
+    /// handled with `log::warn!`; the dropped end closes the fd, so the child observes
     /// EPIPE on its write end — a visible failure, never a hang).
     #[cfg(unix)]
     pub fn fd_read_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Receiver> {
@@ -309,10 +307,8 @@ impl Child {
             crate::child::ParentEnd::Reader(r) => {
                 match ::tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(r)) {
                     Ok(recv) => Some(recv),
-                    // Reactor registration failure — a contract violation for an
-                    // our-own-pipe end (see docstring).
+                    // Reactor registration failure — a real OS outcome (see docstring).
                     Err(e) => {
-                        debug_assert!(false, "own pipe end failed tokio conversion: {e}");
                         log::warn!("fd {fd} read end dropped: tokio conversion failed ({e}); the child will see EPIPE on writes");
                         None
                     }
@@ -336,8 +332,8 @@ impl Child {
     /// # Returns
     ///
     /// `Some(sender)` on success. `None` if the fd was not configured as a piped write end,
-    /// if it was already taken, or if reactor registration failed (a contract violation:
-    /// debug_assert + `log::warn!`; the dropped end closes the fd, so the child observes
+    /// if it was already taken, or if reactor registration failed (a real OS outcome,
+    /// handled with `log::warn!`; the dropped end closes the fd, so the child observes
     /// EOF on its read end — a visible failure, never a hang).
     #[cfg(unix)]
     pub fn fd_write_end(&mut self, fd: impl Into<crate::stdio::Fd>) -> Option<::tokio::net::unix::pipe::Sender> {
@@ -348,7 +344,6 @@ impl Child {
                 match ::tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(w)) {
                     Ok(send) => Some(send),
                     Err(e) => {
-                        debug_assert!(false, "own pipe end failed tokio conversion: {e}");
                         log::warn!(
                             "fd {fd} write end dropped: tokio conversion failed ({e}); the child will see EOF on reads"
                         );
@@ -659,6 +654,10 @@ impl Child {
 #[cfg(test)]
 #[path = "child_drop_tests.rs"]
 mod child_drop_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child_pipe_conversion_tests.rs"]
+mod child_pipe_conversion_tests;
 
 #[cfg(test)]
 #[path = "child_reap_tests.rs"]
