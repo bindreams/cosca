@@ -28,6 +28,8 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
 
+use crate::error::Error;
+
 /// What this process's `/proc` says about its own pid namespace.
 #[derive(Debug)]
 pub(crate) enum ProcView {
@@ -47,6 +49,9 @@ pub(crate) struct ViewUnreadable {
     pub(crate) reason: String,
     /// The OS error behind `reason`, when there was one.
     pub(crate) source: Option<io::Error>,
+    /// `openat2` itself is refused (kernel older than 5.6, or a seccomp filter that answers it
+    /// `ENOSYS`/`EPERM`), so no `/proc` view can ever be established here: the errno's name.
+    openat2_refused: Option<&'static str>,
 }
 
 impl ViewUnreadable {
@@ -54,7 +59,18 @@ impl ViewUnreadable {
         ViewUnreadable {
             reason: reason.into(),
             source,
+            openat2_refused: None,
         }
+    }
+
+    /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
+    /// could not be established. `op` is what could not be done.
+    pub(crate) fn unsupported(&self, op: impl Into<String>) -> Option<Error> {
+        self.openat2_refused.map(|errno| Error::Unsupported {
+            op: op.into(),
+            platform: "linux",
+            detail: format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}"),
+        })
     }
 }
 
@@ -69,22 +85,22 @@ impl std::fmt::Display for ViewUnreadable {
 
 /// A `/proc` directory fd proven to be procfs's root, and the only way to read `/proc`: every
 /// read is an `openat2` beneath it that cannot cross a mount, so nothing mounted over `/proc`
-/// or below it after the check is ever read. Needs Linux 5.6 (`openat2`); on an older kernel
-/// every read fails naming that.
+/// or below it after the check is ever read. Needs `openat2` (Linux 5.6, and not filtered by
+/// seccomp): [`open`](Self::open) fails, flagged so [`ViewUnreadable::unsupported`] names it.
 #[derive(Debug)]
 pub(crate) struct ProcDir(OwnedFd);
 
 impl ProcDir {
     /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
     pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
-        let fd = openat2(
-            CWD,
-            "/proc",
-            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::NO_MAGICLINKS,
-        )
-        .map_err(|e| ViewUnreadable::new("/proc could not be opened", Some(openat2_error(e))))?;
+        let fd = open_proc_root().map_err(|e| ViewUnreadable {
+            openat2_refused: match e {
+                rustix::io::Errno::NOSYS => Some("ENOSYS"),
+                rustix::io::Errno::PERM => Some("EPERM"),
+                _ => None,
+            },
+            ..ViewUnreadable::new("/proc could not be opened", Some(e.into()))
+        })?;
         let fs =
             rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
         if fs.f_type != PROC_SUPER_MAGIC {
@@ -114,7 +130,7 @@ impl ProcDir {
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
         )
-        .map_err(openat2_error)
+        .map_err(io::Error::from)
     }
 
     /// Read the file at `path` under this `/proc`.
@@ -148,13 +164,19 @@ impl ProcDir {
 /// The inode of procfs's root directory (`PROC_ROOT_INO`).
 const PROC_ROOT_INO: u64 = 1;
 
-/// `ENOSYS` from `openat2` is a kernel older than 5.6; say so instead of a bare errno.
-fn openat2_error(errno: rustix::io::Errno) -> io::Error {
-    if errno == rustix::io::Errno::NOSYS {
-        io::Error::new(io::ErrorKind::Unsupported, "openat2 requires Linux kernel >= 5.6")
-    } else {
-        errno.into()
+/// The `openat2` of `/proc` itself, with a test seam: a forced errno replaces the syscall.
+fn open_proc_root() -> Result<OwnedFd, rustix::io::Errno> {
+    #[cfg(test)]
+    if let Some(errno) = fault::forced_openat2_errno() {
+        return Err(errno);
     }
+    openat2(
+        CWD,
+        "/proc",
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
 }
 
 /// This process's [`ProcView`], from `self/status`'s `NSpid` read through one `/proc` dirfd.
@@ -347,6 +369,8 @@ pub(crate) mod fault {
         static FORCE_PROC_VIEW: Cell<Option<ForcedView>> = const { Cell::new(None) };
         static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
+        static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
+        static FORCE_SELF_STAT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     }
 
     /// Disarms every forced value on drop, even unconsumed — so a test that panics before
@@ -359,7 +383,31 @@ pub(crate) mod fault {
             FORCE_PROC_VIEW.with(|f| f.set(None));
             FORCE_FDINFO.with(|f| f.set(None));
             FORCE_STATUS.with(|f| f.take());
+            FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
+            FORCE_SELF_STAT.with(|f| f.take());
         }
+    }
+
+    /// Make EVERY [`ProcDir::open`](super::ProcDir::open) on THIS thread fail as its `openat2`
+    /// answering `errno`, as on a kernel older than 5.6 (`NOSYS`) or under a seccomp filter
+    /// (`PERM`), until the guard drops.
+    pub(crate) fn force_openat2_errno(errno: rustix::io::Errno) -> Forced {
+        FORCE_OPENAT2_ERRNO.with(|f| f.set(Some(errno)));
+        Forced(())
+    }
+
+    pub(crate) fn forced_openat2_errno() -> Option<rustix::io::Errno> {
+        FORCE_OPENAT2_ERRNO.with(|f| f.get())
+    }
+
+    /// Make the NEXT read of this process's own `stat` on THIS thread return `bytes`.
+    pub(crate) fn force_self_stat_once(bytes: &[u8]) -> Forced {
+        FORCE_SELF_STAT.with(|f| *f.borrow_mut() = Some(bytes.to_vec()));
+        Forced(())
+    }
+
+    pub(crate) fn take_forced_self_stat() -> Option<Vec<u8>> {
+        FORCE_SELF_STAT.with(|f| f.take())
     }
 
     /// Make the NEXT [`proc_view`](super::proc_view) on THIS thread read `text` as its

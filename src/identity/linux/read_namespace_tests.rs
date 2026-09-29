@@ -8,11 +8,13 @@ use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: `/proc/1` is the outer
-/// init. `current()` must carry this process's own start token, not the outer init's, and the
-/// by-pid re-reads must be `Unknown`, not the outer init's token compared and found different.
+/// init. Also an inner-namespace child, whose pid the outer `/proc` may not hold or may give
+/// to another process, and a spawn, whose child cannot be identified.
 ///
 /// Mutants: "`current_token` reads `/proc/<getpid()>/stat`" — the outer init's token;
-/// "`read_stat` ignores the view" — `of(1)` resolves the outer init.
+/// "`read_stat` ignores the view" — `of(1)` resolves the outer init; "an unavailable view
+/// resolves a live child to `Gone`" - `of(child)` is `Gone`; "`spawn_identity_error` names no
+/// cause" - the spawn's error carries no view.
 #[test]
 fn namespaces_an_outer_procfs_gives_current_its_own_token_and_reads_unknown() {
     if !ns::enabled() {
@@ -66,4 +68,37 @@ fn fixture_outer_procfs_inner() {
     assert!(matches!(ProcessId::of(1), Resolved::Unknown));
     assert_eq!(current.exists(), Existence::Unknown);
     assert_eq!(current.is_alive(), Liveness::Unknown);
+
+    // A live child of the inner namespace: `kill(pid, 0)` finds it, the outer `/proc` says
+    // nothing reliable about it.
+    let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
+        .expect("spawn cat");
+    let got = ProcessId::of(child.id());
+    child.kill().expect("kill the child");
+    child.wait().expect("reap the child");
+    assert!(
+        matches!(got, Resolved::Unknown),
+        "an inner-namespace child: got {got:?}"
+    );
+
+    // A pid no process can hold is gone whatever `/proc` shows.
+    assert!(matches!(
+        ProcessId::of(super::read_tests::NO_PROCESS_CAN_HOLD),
+        Resolved::Gone
+    ));
+
+    // A spawn cannot identify its child, and says the view is why.
+    let mut cmd = crate::command::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::test_child::leaked_writer_stdin())
+        .expect("set stdin pipe");
+    match cmd.spawn() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => assert!(
+            detail.contains(
+                "the spawned child identity could not be read: this process's /proc is an outer pid namespace's"
+            ),
+            "{detail}"
+        ),
+        other => panic!("expected Unassessable naming the view, got {:?}", other.map(|_| ())),
+    }
 }

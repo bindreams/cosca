@@ -20,7 +20,7 @@ fn blocker() -> Command {
 }
 
 /// [`blocker`] for a test that drives a kill-then-reap; see [`fault::teardown_blocker_stdin`].
-fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
+pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
     let fault::TeardownBlockerParts {
         argv,
         stdin,

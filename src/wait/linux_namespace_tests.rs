@@ -33,7 +33,7 @@ fn fixture_status_mounted_over() {
     }
     ns::enter_private_mount_ns();
     // A live foreign process: killed through `kill`, which goes through `open_verified`. Its
-    // identity is read before the mount, since a `/proc` with a file mounted over is not read.
+    // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
     let id = ProcessId::of(child.id())

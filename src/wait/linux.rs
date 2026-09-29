@@ -4,16 +4,20 @@
 //!
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
-//! the checked `/proc` view cannot be built, and a live target is `Unassessable`.
+//! the checked `/proc` view cannot be built, and `open_verified` is `Unsupported` naming `openat2`.
 
 use std::os::fd::AsFd;
+
+/// The `op` of an `Unsupported` from `open_verified`: every caller (wait, kill, terminate, on an
+/// owned child or a foreign process) reaches it, so it names what they share.
+const WAIT_OR_SIGNAL: &str = "waiting on or signalling a process";
 use std::time::Instant;
 
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId};
+use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId, ViewUnreadable};
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
 ///
@@ -35,7 +39,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
         // waits. Errno alone can't tell, so re-verify.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, what, e),
         Err(rustix::io::Errno::NOSYS) => Err(Error::Unsupported {
-            op: "foreign process wait/kill".into(),
+            op: WAIT_OR_SIGNAL.into(),
             platform: "linux",
             detail: "cosca requires pidfd_open (Linux ≥ 5.3), refused here: pidfd_open answered ENOSYS".into(),
         }),
@@ -97,7 +101,7 @@ fn verify_without_pidfd(
             None,
             Some(errno),
         )),
-        ProcView::Unassessable(why) => Err(unassessable(id, what, &why.reason, why.source, Some(errno))),
+        ProcView::Unassessable(why) => Err(view_unreadable(id, what, why, Some(errno))),
     }
 }
 
@@ -113,8 +117,7 @@ fn verify_pidfd_target(
     pidfd: rustix::fd::OwnedFd,
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    let proc_dir =
-        crate::identity::ProcDir::open().map_err(|why| unassessable(id, what, &why.reason, why.source, None))?;
+    let proc_dir = crate::identity::ProcDir::open().map_err(|why| view_unreadable(id, what, why, None))?;
     match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.
@@ -138,6 +141,23 @@ fn verify_pidfd_target(
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
         Existence::Unknown => Err(unassessable(id, what, "the OS refused the existence query", None, None)),
+    }
+}
+
+/// `why`, the `/proc` view that could not be established, as an error for `id`:
+/// [`Error::Unsupported`] naming `openat2` when that is missing, else [`unassessable`].
+fn view_unreadable(
+    id: ProcessId,
+    what: &'static str,
+    why: ViewUnreadable,
+    pidfd_errno: Option<rustix::io::Errno>,
+) -> Error {
+    match why.unsupported(WAIT_OR_SIGNAL) {
+        Some(unsupported) => {
+            log::warn!("wait: pid {} {what}: {unsupported}", id.pid());
+            unsupported
+        }
+        None => unassessable(id, what, &why.reason, why.source, pidfd_errno),
     }
 }
 
@@ -371,3 +391,7 @@ mod linux_tests;
 #[cfg(test)]
 #[path = "linux_namespace_tests.rs"]
 mod linux_namespace_tests;
+
+#[cfg(test)]
+#[path = "linux_openat2_tests.rs"]
+mod linux_openat2_tests;
