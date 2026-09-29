@@ -1853,7 +1853,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
     });
     if deny_pidfd {
         match spawned.expect_err("a spawn without a pidfd must fail") {
-            cosca::error::Error::Unsupported { op, .. } => assert_eq!(op, "spawn adoption"),
+            cosca::error::Error::Unsupported { op, .. } => assert_eq!(op, "spawn"),
             other => panic!("slots {slots:?}: expected Unsupported, got {other:?}"),
         }
         let own_dir = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
