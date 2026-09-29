@@ -224,6 +224,10 @@ fn foreign_kill_surfaces_permission_denied() {
 
 #[cfg(unix)]
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn is_alive_is_false_for_a_real_zombie() {
     // Spawn a RAW std child (std does NOT reap on drop), take it foreign, drive it to a
     // zombie, then — before reaping — assert is_alive()==Dead while the identity still
@@ -301,6 +305,10 @@ impl common::Target for AlreadyDead {
 
 /// A target that dies before connecting makes `accept_or_die` panic naming it, not hang.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -318,6 +326,10 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
 /// hook, which runs once the watches are in place, closes its stdin so it exits. This reaches the
 /// OS exit notification itself (pidfd, kqueue `NOTE_EXIT`, process handle).
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     use std::net::TcpListener;
     use std::process::Stdio;
@@ -358,6 +370,10 @@ fn accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
 /// A std child reaped by its own `wait` is reported exited by `Target::has_exited`, so it takes the
 /// same path as above with a real pid.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn a_reaped_std_child_is_reported_exited() {
     use common::Target as _;
     let mut child = std::process::Command::new(common::testbin())
@@ -371,6 +387,10 @@ fn a_reaped_std_child_is_reported_exited() {
 /// A target that connects and exits without waiting for the ack is dead whether or not its
 /// connection reached the accept queue: the exit alone decides.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -388,6 +408,10 @@ fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_d
 
 /// The ack is written on the accepted connection; the opted-in target sends its tag only after it.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_acks_the_connection_it_accepts() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -409,6 +433,10 @@ fn accept_or_die_acks_the_connection_it_accepts() {
 /// panicked over: Linux `pidfd_open` ESRCH, macOS `EV_ADD` ESRCH, Windows `OpenProcess` failing
 /// with `ERROR_INVALID_PARAMETER`. The target is alive throughout.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
     use std::net::TcpListener;
     use std::process::Stdio;
@@ -442,6 +470,10 @@ fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
 /// start token, which is what a reissued pid looks like) is reported as the descendant being gone,
 /// never watched.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn accept_or_die_also_does_not_watch_a_reissued_pid() {
     use std::net::TcpListener;
     use std::process::Stdio;

@@ -18,21 +18,19 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
 
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut child = {
-        // Raw tokio bypasses cosca's spawn path, so its internal `spawn_lock()` is taken here by
-        // hand: a macOS fork must not transiently inherit another test's fd-marker write end.
-        // Wrapping a *cosca* spawn this way would self-deadlock — the mutex is not reentrant.
-        let _guard = crate::child::spawn::spawn_lock();
-        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args([
-                "--test-threads=1",
-                "--exact",
-                crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
-            ])
-            .env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the rendezvous fixture")
+        // Raw tokio bypasses cosca's spawn path, so `spawn_tokio` takes `spawn_lock()` for it.
+        crate::test_spawn::spawn_tokio(
+            ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args([
+                    "--test-threads=1",
+                    "--exact",
+                    crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
+                ])
+                .env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("spawn the rendezvous fixture")
     };
     let pid = child.id().expect("tokio owns an un-reaped child");
 
@@ -64,15 +62,14 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
 /// libtest filter that matches nothing. See `test_child::spawn_a_process_that_exits` for why the
 /// filter is mandatory (an unfiltered re-exec runs the whole suite, including this test).
 fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
-    // Raw tokio, so it bypasses cosca's spawn path and its internal `spawn_lock()` — taken here
-    // by hand instead. A cosca spawn must NOT be wrapped this way (the mutex is not reentrant).
-    let _guard = crate::child::spawn::spawn_lock();
-    ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", "__cosca_no_such_test__"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn")
+    // Raw tokio bypasses cosca's spawn path; `spawn_tokio` takes `spawn_lock()` for it.
+    crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn")
 }
 
 // `done_ok` is the whole diagnostic: an already-reaped child is legal for `Drop` (the user may

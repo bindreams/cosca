@@ -38,6 +38,10 @@ pub(crate) fn held_by_this_thread() -> bool {
 /// [`Command::spawn`] under `spawn_lock`.
 pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Child> {
     let _held = Held::take();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned std spawn: `_held` is spawn_lock"
+    )]
     cmd.spawn()
 }
 
@@ -58,9 +62,13 @@ pub(crate) fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
 }
 
 /// `tokio::process::Command::spawn` under `spawn_lock`.
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub(crate) fn spawn_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<::tokio::process::Child> {
     let _held = Held::take();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned tokio spawn: `_held` is spawn_lock"
+    )]
     cmd.spawn()
 }
 

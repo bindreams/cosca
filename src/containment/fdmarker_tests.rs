@@ -345,6 +345,10 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
     )
     .expect("unique child fd");
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -374,6 +378,10 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
     let handle = prepared.handle;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd); // the Command owns the write end; dropping it closes the supervisor's copy
 
@@ -420,6 +428,10 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
         .stdout(std::process::Stdio::piped());
     let prepared = super::install(&mut cmd, &[]).expect("install");
     let handle = prepared.handle;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -508,6 +520,10 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     cmd.arg("-c").arg(format!(
         "echo $$; read _go; exec {marker_fd}>&-; echo closed; read _ignored"
     ));
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn bash");
     drop(cmd);
 
@@ -651,6 +667,10 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
         });
     }
     let prepared = super::install(&mut cmd, &[]).expect("install");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
 
@@ -707,6 +727,10 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     cmd.arg("-c").arg(format!(
         r#"echo $$; exec {marker_fd}>&-; echo closed; while read x; do echo "$x"; done"#
     ));
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = cmd.spawn().expect("spawn bash");
     drop(cmd);
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -777,6 +801,10 @@ fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_sign
 #[test]
 fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
     let _serialize = test_spawn_lock();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut child = member_command(0).spawn().expect("spawn member"); // pgid == the child's own pid
     await_member_ready(&mut child);
     let pid = child.id() as crate::identity::RawPid;
@@ -863,6 +891,10 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // an unreaped zombie throughout"). That's what keeps `pgid` allocated across the gap, so
     // clippy's zombie-processes lint is a false positive here, not a real leak.
     #[allow(clippy::zombie_processes)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut p_child = p_cmd.spawn().expect("spawn P");
     drop(p_cmd);
     await_member_ready(&mut p_child); // P's own group exists before T and Q ask to join it.
@@ -889,6 +921,10 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // `pgid`. Q is born into `pgid` too, holding no marker.
     let mut t_cmd = member_command(pgid);
     let prepared = super::install(&mut t_cmd, &[]).expect("install marker on T");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut t_child = t_cmd.spawn().expect("spawn T");
     drop(t_cmd);
     // T is the member pass 2's own holder scan must find, so the scan runs behind T's
@@ -896,6 +932,10 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     await_member_ready(&mut t_child);
 
     let mut q_cmd = member_command(pgid);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
     let mut q_child = q_cmd.spawn().expect("spawn Q");
     // Q's announcement proves it is a live member of `pgid`, blocked on its stdin, before the
     // signal fires. It does NOT make a non-success exit proof of the signal: `wait()` closes Q's

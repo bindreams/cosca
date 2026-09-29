@@ -294,6 +294,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             .collect();
         fd_map::install(&mut std_cmd, mappings).map_err(Error::Io)?;
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "spawn_lock is held by `_guard`, taken at the top of this block"
+        )]
         let c = std_cmd.spawn().map_err(Error::Io)?;
         drop(std_cmd);
         (prepared, c)
@@ -330,6 +334,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             let _guard = spawn_lock();
             // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
             // resolution or the post-spawn attach has nothing to do with a breakaway request.
+            #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
             let spawned = std_cmd.spawn().map_err(Error::Io);
             #[cfg(windows)]
             let spawned =

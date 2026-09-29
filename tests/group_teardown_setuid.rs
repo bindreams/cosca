@@ -139,6 +139,10 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
 /// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn rerun_unprivileged() {
     use std::os::unix::process::CommandExt as _;
 

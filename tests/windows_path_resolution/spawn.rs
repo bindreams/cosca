@@ -34,6 +34,10 @@ use windows::Win32::System::Threading::{
 /// the loader recorded, is printed only.
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
     canary("Windows and Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
@@ -288,6 +292,10 @@ impl std::fmt::Display for SuspendedSpawn {
 
 /// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created
 /// from, and terminate it before it runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;

@@ -66,6 +66,10 @@ fn fork_counting_writers(fds: &[RawFd], seen_fd: RawFd, hold_fd: RawFd) -> libc:
     pid
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the `false` arm is the deliberately unlocked control spawn"
+)]
 fn run(spawn_under_the_lock: bool) -> Outcome {
     use std::os::unix::process::CommandExt;
 

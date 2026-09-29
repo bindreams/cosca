@@ -274,6 +274,7 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` in this block")]
     let spawned = {
         // Every fork in this process holds it; see `crate::child::spawn::spawn_lock`.
         let _guard = crate::child::spawn::spawn_lock();

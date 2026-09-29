@@ -33,15 +33,13 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
 
     // A real, short-lived child this handle owns, never awaited — mirroring an ordinary drop and
     // `reaper_tests::bare_job`'s own fixture.
-    let proc = {
-        let _guard = crate::child::spawn::spawn_lock();
+    let proc = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
             .args(["--exact", "__cosca_no_such_test__"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn a child that exits")
-    };
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn a child that exits");
     let pid = proc.id().expect("a freshly spawned child has a pid");
 
     let child = Child {
@@ -115,15 +113,13 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
         "test setup: this leaf must be the one Drop leaves alone"
     );
 
-    let proc = {
-        let _guard = crate::child::spawn::spawn_lock();
+    let proc = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
             .args(["--exact", "__cosca_no_such_test__"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn a child that exits")
-    };
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn a child that exits");
     let pid = proc.id().expect("a freshly spawned child has a pid");
 
     let child = Child {

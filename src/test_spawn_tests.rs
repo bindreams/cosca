@@ -70,6 +70,7 @@ fn status_forks_under_the_lock() {
 #[test]
 fn a_plain_spawn_forks_outside_the_lock() {
     let held = lock_held_at_fork(|cmd| {
+        #[allow(clippy::disallowed_methods, reason = "control: the deliberately unlocked raw spawn")]
         cmd.spawn().expect("spawn").wait().expect("wait");
     });
     assert_eq!(held, Some(false));

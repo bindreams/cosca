@@ -28,6 +28,22 @@ fn calls_rustix_pipe() {
     let _ = rustix::pipe::pipe();
 }
 
+// Raw process spawns =====
+
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+fn calls_std_command_spawn_output_status() {
+    let _ = std::process::Command::new("x").spawn();
+    let _ = std::process::Command::new("x").output();
+    let _ = std::process::Command::new("x").status();
+}
+
+#[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]
+async fn calls_tokio_command_spawn_output_status() {
+    let _ = tokio::process::Command::new("x").spawn();
+    let _ = tokio::process::Command::new("x").output().await;
+    let _ = tokio::process::Command::new("x").status().await;
+}
+
 // Tokio timers =====
 
 #[allow(dead_code, reason = "exists only to be flagged by clippy::disallowed_methods")]

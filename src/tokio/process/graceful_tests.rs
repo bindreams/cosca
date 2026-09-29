@@ -23,13 +23,13 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
     // Held for the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write
     // end is transiently open would inherit it into this not-yet-`exec`'d process, and a
     // concurrent sweep could then find and SIGKILL it — see that module's docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "trap '' TERM; echo r; exec cat"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn");
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; echo r; exec cat"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn");
     let mut buf = [0u8; 1];
     child
         .stdout

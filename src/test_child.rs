@@ -249,6 +249,10 @@ pub(crate) fn run_fixture(fixture: &str) {
                 Ok(())
             });
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "spawn_lock is held by `guard`, taken earlier in this fn"
+        )]
         let child = cmd.spawn().expect("spawn fixture child");
         drop(fd);
         drop(guard);
@@ -277,10 +281,7 @@ pub(crate) fn run_fixture(fixture: &str) {
             );
         }
         cmd.env(scratch::FIXTURE_SCRATCH_ROOT_ENV, scratch.path());
-        let child = {
-            let _guard = crate::child::spawn::spawn_lock();
-            cmd.spawn().expect("spawn fixture child")
-        };
+        let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
         finish_fixture_command(fixture, child);
     }
 }
@@ -411,10 +412,7 @@ fn write_gate_passed() {
 /// Spawns `cmd` (from [`fixture_command`]) under `spawn_lock()` and waits for it; panics as
 /// [`run_fixture_with_cwd`] documents.
 fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn fixture child")
-    };
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     finish_fixture_command(fixture, child);
 }
 
@@ -535,13 +533,13 @@ pub(crate) fn strip_crate_prefix(path: &'static str) -> &'static str {
 /// running sweep could then find and signal this bystander child. `spawn_lock()` is the same
 /// lock every cosca-originated spawn in this test binary already takes.
 pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
-    let _guard = crate::child::spawn::spawn_lock();
-    std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", "__cosca_no_such_test__"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn")
+    crate::test_spawn::spawn(
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "__cosca_no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn")
 }
 
 /// `more.com` by its `System32` path (no `PATH` lookup): blocks reading stdin and exits 0 on EOF,
@@ -712,14 +710,15 @@ fn fixture_survives_group_signal() {
     // as a plain `u32`.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
-    let _survivor = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
-        .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
-        .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
-        .creation_flags(CREATE_NEW_PROCESS_GROUP)
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn a grandchild the group signal cannot reach");
+    let _survivor = crate::test_spawn::spawn(
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
+            .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
+            .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .stdout(std::process::Stdio::null()),
+    )
+    .expect("spawn a grandchild the group signal cannot reach");
 }
 
 /// The fully-qualified libtest path of [`fixture_registers_then_blocks`], for callers that

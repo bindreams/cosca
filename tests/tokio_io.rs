@@ -1070,6 +1070,10 @@ async fn accept_or_die_async_acks_the_connection_it_accepts() {
 
 /// Async twin of `accept_or_die_also_reports_a_gone_descendant_as_dead`.
 #[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
     let (listener, mut target) = bind_and_spawn(&["sleep-marker"], false);

@@ -1632,6 +1632,10 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
 

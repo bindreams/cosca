@@ -117,13 +117,14 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 /// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
 fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
     use std::os::windows::io::AsRawHandle;
-    let child = std::process::Command::new("cmd")
-        .args(["/C", "more"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn cmd /C more");
+    let child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more");
     let raw = child.as_raw_handle();
     let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
     (child, job)

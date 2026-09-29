@@ -159,6 +159,10 @@ fn cosca_outcome(e: &cosca::error::Error) -> String {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "helper binary, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str) -> Spawned {
     let exe = std::env::current_exe().expect("current_exe");
     let (outcome, mut child, pid) = match vehicle {

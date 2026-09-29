@@ -13,13 +13,25 @@
 # Every public tokio timer constructor and re-arm, banned for the deadline contract (principle 13).
 # `tokio::time::advance`/`pause` (paused-clock tests) are deliberately not banned.
 #
-# Both bans are guarded by .github/scripts/check-disallowed-methods.sh: every path below needs a
+# Raw process spawns -----
+#
+# std/tokio `Command::spawn/output/status` fork without holding spawn_lock; library tests take
+# them via crate::test_spawn.
+#
+# All three bans are guarded by .github/scripts/check-disallowed-methods.sh: every path below needs a
 # call in .github/fixtures/disallowed-methods.
 disallowed-methods = [
     # Flag-less pipe constructors
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },
     { path = "nix::unistd::pipe", reason = "nix::unistd::pipe wraps libc::pipe, so its fds lack close-on-exec the same way. Use nix::unistd::pipe2(OFlag::O_CLOEXEC) where available, or std::io::pipe()." },
     { path = "rustix::pipe::pipe", reason = "rustix::pipe::pipe is a pipe/pipe2 call with no flags, so its fds lack close-on-exec. Use rustix::pipe::pipe_with(PipeFlags::CLOEXEC) or std::io::pipe().", allow-invalid = true },
+    # Raw process spawns
+    { path = "std::process::Command::spawn", reason = "A raw spawn forks without spawn_lock, so a concurrent fork that never execs can inherit its transient descriptors and stall it. In library tests use crate::test_spawn::spawn; production spawns hold spawn_lock and carry an #[allow] naming it." },
+    { path = "std::process::Command::output", reason = "Command::output spawns without spawn_lock. In library tests use crate::test_spawn::output." },
+    { path = "std::process::Command::status", reason = "Command::status spawns without spawn_lock. In library tests use crate::test_spawn::status." },
+    { path = "tokio::process::Command::spawn", reason = "A raw tokio spawn forks without spawn_lock. In library tests use crate::test_spawn::spawn_tokio.", allow-invalid = true },
+    { path = "tokio::process::Command::output", reason = "tokio's Command::output spawns without spawn_lock; take it via crate::test_spawn instead.", allow-invalid = true },
+    { path = "tokio::process::Command::status", reason = "tokio's Command::status spawns without spawn_lock; take it via crate::test_spawn instead.", allow-invalid = true },
     # Raw tokio timers
     { path = "tokio::time::timeout", reason = "Deadlines are armed via crate::tokio::wait::arm_at (principle 13): a duration-based timeout re-derives the deadline and can arm late or on the wrong clock. Use arm_at(at, fut) with an instant from deadline_from." },
     { path = "tokio::time::timeout_at", reason = "tokio::time::timeout_at bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut), its one sanctioned caller (principle 13)." },

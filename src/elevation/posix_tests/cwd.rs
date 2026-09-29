@@ -195,9 +195,7 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path().join("gone");
     std::fs::create_dir(&dir).expect("mkdir");
-    let mut child = {
-        // Every fork in this binary holds it; see `crate::test_child::run_fixture_with_cwd`.
-        let _guard = crate::child::spawn::spawn_lock();
+    let mut child = crate::test_spawn::spawn(
         std::process::Command::new(std::env::current_exe().expect("current_exe"))
             .args([
                 "--test-threads=1",
@@ -208,10 +206,9 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
             .current_dir(&dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the fixture")
-    };
+            .stderr(std::process::Stdio::piped()),
+    )
+    .expect("spawn the fixture");
     std::fs::remove_dir(&dir).expect("rmdir the fixture's cwd");
     child
         .stdin

@@ -68,6 +68,10 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// and a concurrent sweep can then confirm and SIGKILL it before it gets there. A single
 /// wrapper, not a `let _guard = ...;` line the caller must remember, closes that gap for
 /// every call site at once — including any added later.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 pub fn output_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     let _guard = cosca::test_spawn_lock();
     cmd.output()
@@ -75,6 +79,10 @@ pub fn output_locked(cmd: &mut std::process::Command) -> std::io::Result<std::pr
 
 /// The `.status()` sibling of [`output_locked`] — see there for why raw spawns in this test
 /// surface must go through one of these two, not a bare `std::process::Command` call.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
     let _guard = cosca::test_spawn_lock();
     cmd.status()

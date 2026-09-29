@@ -120,6 +120,10 @@ fn measure_this_token() {
 /// Read-only: `PROCESS_QUERY_LIMITED_INFORMATION` plus `TOKEN_QUERY`, nothing else.
 #[test]
 #[ignore = "platform probe; opt in with --ignored and COSCA_PROBE_INSPECT_PID=<pid>"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn measure_another_process_token() {
     // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
     // on trust from the caller — see the image-identity check below for why that distinction
@@ -234,6 +238,10 @@ fn measure_another_process_token() {
 /// a misleading "elevation just works".
 #[test]
 #[ignore = "platform probe; opt in with --ignored"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn measure_uac_policy() {
     const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
     let mut any = false;

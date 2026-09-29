@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression check for the root clippy.toml's disallowed-methods bans (pipes and tokio timers).
+# Regression check for the root clippy.toml's disallowed-methods bans (pipes, raw process spawns and tokio timers).
 # Runs clippy on the standalone .github/fixtures/disallowed-methods crate, which calls every
 # banned path, against the REAL root clippy.toml (via CLIPPY_CONF_DIR, not a copy), and asserts a
 # clippy::disallowed_methods diagnostic for each path clippy.toml lists. Reads
@@ -18,6 +18,12 @@ expected_paths=(
     "libc::pipe"
     "nix::unistd::pipe"
     "rustix::pipe::pipe"
+    "std::process::Command::spawn"
+    "std::process::Command::output"
+    "std::process::Command::status"
+    "tokio::process::Command::spawn"
+    "tokio::process::Command::output"
+    "tokio::process::Command::status"
     "tokio::time::timeout"
     "tokio::time::timeout_at"
     "tokio::time::sleep"

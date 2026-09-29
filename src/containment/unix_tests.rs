@@ -69,15 +69,12 @@ fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::ExitStatusExt as _;
     // Spawn a child in its own private group (pgid == child pid) so we can
     // SIGKILL it without disturbing the test runner's own group.
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs: a fork landing while
-    // that module's marker write end is transiently open would inherit it into this
-    // not-yet-`exec`'d process, and a concurrent sweep could then find and SIGKILL it.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("cat")
-        .stdin(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("spawn cat");
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .expect("spawn cat");
     // Closed right after the kill: only a real `SIGKILL` can end the child before then, so a
     // `kill_group` that signals nothing exits 0 and fails the assertion instead of hanging `wait()`.
     let stdin = child.stdin.take().expect("piped stdin");
@@ -111,18 +108,15 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
 
-    let mut child = {
-        // Held for the fork itself, see `kill_group_on_owned_group_succeeds`.
-        let _guard = crate::child::spawn::spawn_lock();
+    let mut child = crate::test_spawn::spawn(
         std::process::Command::new("sh")
             .arg("-c")
             .arg("while read x; do (echo spawned; exec cat) & done")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .expect("spawn the leader")
-    };
+            .process_group(0),
+    )
+    .expect("spawn the leader");
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let pgid = child.id() as i32;
@@ -165,13 +159,12 @@ fn term_group_on_owned_group_succeeds() {
     // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
     // closed right after the call, so a `term_group` that delivers nothing exits 0 and fails the
     // assertion instead of hanging `wait()`.
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("cat")
-        .stdin(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("spawn cat");
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .expect("spawn cat");
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(term_group(pgid).is_ok(), "term_group on owned group must succeed");
@@ -194,12 +187,7 @@ fn term_group_on_owned_group_succeeds() {
 #[test]
 fn kill_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let child = std::process::Command::new("true")
-        .process_group(0)
-        .spawn()
-        .expect("spawn true");
+    let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();
     await_zombie(pid);
 
@@ -226,12 +214,7 @@ fn kill_group_on_an_all_zombie_group_is_ok() {
 #[test]
 fn term_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let child = std::process::Command::new("true")
-        .process_group(0)
-        .spawn()
-        .expect("spawn true");
+    let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();
     await_zombie(pid);
 

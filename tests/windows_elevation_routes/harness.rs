@@ -688,6 +688,10 @@ pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
 /// itself could never even be launched measured nothing, no matter how many report lines come back.
 /// Always attempts to delete what it created, on every path, and reports whether each `/delete`
 /// succeeded rather than discarding that result.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let mut any_create_exited = false;
@@ -871,6 +875,10 @@ impl ScratchAccount {
     /// `/delete`'s result is printed either way — "account not found" is the expected, silent case
     /// on a clean host, but a genuine permissions failure here should be visible rather than
     /// swallowed into `/add`'s own error.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+    )]
     pub(crate) fn create(user: &str, admin: bool) -> Result<Self, String> {
         match std::process::Command::new("net")
             .args(["user", user, "/delete"])
@@ -939,6 +947,10 @@ impl ScratchAccount {
 }
 
 impl Drop for ScratchAccount {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+    )]
     fn drop(&mut self) {
         match std::process::Command::new("net")
             .args(["user", &self.user, "/delete"])

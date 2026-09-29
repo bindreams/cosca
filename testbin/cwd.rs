@@ -116,6 +116,10 @@ mod probe {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "helper binary, not library test code: spawn_lock is crate-private and does not reach it"
+    )]
     pub(crate) fn std_output(cmd: &mut std::process::Command) -> std::io::Result<(bool, Vec<u8>)> {
         cmd.output().map(|out| (out.status.success(), out.stdout))
     }

@@ -78,6 +78,10 @@ fn does_create_process_with_logon_elevate() {
 /// `CreateProcessWithLogonW` returning `Ok` are both necessary but not sufficient: the child can
 /// still start and exit without ever writing its report. The caller must count only this, not
 /// account creation, as "measured".
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
     let role = if account.admin {
         "local ADMINISTRATOR"

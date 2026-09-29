@@ -38,6 +38,10 @@ fn testbin_write_fd_writes_to_the_target_fd() {
 /// on stdout proves the read direction of the fd→`File` path. The child sees EOF when the write
 /// end drops — a real close event, not a timer.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn testbin_read_fd_copies_the_source_fd_to_stdout() {
     let mut child = {
         let _guard = cosca::test_spawn_lock();

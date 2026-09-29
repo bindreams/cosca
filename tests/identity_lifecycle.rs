@@ -34,6 +34,10 @@ fn helper_block_on_stdin() {
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn spawn_blocking_child() -> Child {
     let exe = std::env::current_exe().expect("current_exe");
     Command::new(exe)
@@ -94,6 +98,10 @@ fn created_at_is_present_and_not_in_the_future() {
 /// An exited-but-unreaped (zombie) child must still resolve by identity on EVERY platform.
 /// Exit is proven by stdout EOF — the child's write end closes at process exit.
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn identity_resolves_an_exited_unreaped_child() {
     // RAW std::process::Command: argv[0] is the exe path, so the testbin mode is args[1].
     let mut child = Command::new(common::testbin())
@@ -185,6 +193,10 @@ fn helper_write_own_record() {
 
 #[test]
 #[cfg(feature = "serde")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn an_identity_written_by_another_process_restores_and_names_that_process() {
     use cosca::Process;
 

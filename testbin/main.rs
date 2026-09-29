@@ -193,6 +193,10 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
+#[allow(
+    clippy::disallowed_methods,
+    reason = "helper binary, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
     if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
@@ -210,6 +214,10 @@ fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandc
 #[allow(dead_code)]
 struct KeptGrandchild(std::process::Child);
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "helper binary, not library test code: spawn_lock is crate-private and does not reach it"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "linux")]

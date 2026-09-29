@@ -743,15 +743,15 @@ fn a_relative_exact_program_reaches_the_script_dot_slash_prefixed() {
 #[cfg(unix)]
 fn sh_exit_code(script: &[u8]) -> Option<i32> {
     use std::os::unix::ffi::OsStrExt;
-    let _guard = crate::child::spawn::spawn_lock();
-    std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(OsStr::from_bytes(script))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run /bin/sh")
-        .code()
+    crate::test_spawn::status(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(OsStr::from_bytes(script))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("run /bin/sh")
+    .code()
 }
 
 /// An executable script at `path` that exits with `code`.

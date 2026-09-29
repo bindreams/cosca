@@ -216,11 +216,7 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     if already_elevated {
         fixture.env(FIXTURE_ALREADY_ELEVATED_ENV, "1");
     }
-    let mut child = {
-        // Every fork in this binary holds it; see `cwd_and_path_tools`.
-        let _guard = crate::child::spawn::spawn_lock();
-        fixture.spawn().expect("spawn the fixture")
-    };
+    let mut child = crate::test_spawn::spawn(&mut fixture).expect("spawn the fixture");
     let _restore = crate::test_child::RestoreMode::new(&p, 0o755);
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let gate = child.stdin.take().expect("stdin").write_all(b"x");
