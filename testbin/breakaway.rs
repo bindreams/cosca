@@ -201,10 +201,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
     // The real edge: the child connected and tagged, so it is running and its job membership is
     // settled. No timer anywhere.
     let ctrl = child.as_mut().map(|child| {
-        let mut sock = {
-            let _ = &mut *child;
-            listener.accept().unwrap().0
-        };
+        let mut sock = crate::accept::accept_or_die(listener, child);
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("read the child's tag");
         assert_eq!(&tag, b"C", "wrong child tag");
