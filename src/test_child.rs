@@ -15,6 +15,10 @@
 ///   alive. Dropping it (or `std::process::Child::wait()`, which closes the piped stdin before
 ///   it waits) is a deliberate EOF release.
 ///
+/// A `cat` backgrounded inside an `sh -c` script gets `/dev/null` as stdin (POSIX, for a
+/// non-interactive shell) unless it is redirected explicitly, and would exit at once. Write it
+/// `exec 3<&0; cat <&3 3<&- &`: `<&3` gives it the real pipe and `3<&-` closes the spare copy.
+///
 /// Neither `cat` nor `findstr` is proof of life by itself: `Existence::Present` is
 /// zombie-inclusive, and `SIGKILL`/`TerminateProcess` land asynchronously. A liveness claim needs
 /// an echo round trip through a piped stdout, or (Windows, where `findstr` does not echo) a
@@ -35,6 +39,8 @@ pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
 /// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
+// Gated with its consumers: `tokio::wait_tests`, and the Unix-only cgroup and kqueue tests.
+#[cfg(any(unix, feature = "tokio"))]
 pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
     let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
     cmd.args(&BLOCKER_ARGV[1..])
@@ -88,7 +94,7 @@ pub(crate) fn member_command(pgid: i32) -> std::process::Command {
     cmd
 }
 
-/// Blocks until an [`member_command`] child has announced itself, and checks that the
+/// Blocks until a [`member_command`] child has announced itself, and checks that the
 /// announcement came from that child.
 #[cfg(unix)]
 pub(crate) fn await_member_ready(child: &mut std::process::Child) {
@@ -105,6 +111,18 @@ pub(crate) fn await_member_ready(child: &mut std::process::Child) {
     // Hand the pipe back rather than dropping it: the member outlives this call, and closing
     // the read end under a live child would make any later write to it a `SIGPIPE`.
     child.stdout = Some(out.into_inner());
+}
+
+/// Proves a `cat` blocker is alive and responsive: writes a byte to its stdin and reads it back
+/// from its stdout. A killed-but-unreaped `cat` cannot echo.
+#[cfg(unix)]
+pub(crate) fn assert_echoes(stdin: &mut impl std::io::Write, stdout: &mut impl std::io::Read) {
+    stdin.write_all(b"x").expect("write to the blocker");
+    let mut echo = [0u8; 1];
+    stdout
+        .read_exact(&mut echo)
+        .expect("the blocker must still be alive to echo");
+    assert_eq!(&echo, b"x");
 }
 
 /// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and
@@ -303,13 +321,10 @@ pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_TEST: &str = "test_child::fixture_survives_group_signal";
 
-/// The env var carrying the `127.0.0.1:<port>` address the GRANDCHILD (a re-exec'd
-/// [`fixture_registers_then_blocks`]) connects back to and tags once it exists in its own
-/// process group — [`fixture_survives_group_signal`] itself never connects; it only forwards
-/// this address to the grandchild and exits. Its mere presence also tells
-/// `fixture_survives_group_signal` it was re-exec'd deliberately rather than picked up by an
-/// ordinary, unfiltered suite run — one var serves both roles, since the fixture needs the
-/// address either way.
+/// The env var carrying the `127.0.0.1:<port>` address the grandchild (a re-exec'd
+/// [`fixture_registers_then_blocks`]) connects back to; [`fixture_survives_group_signal`] only
+/// forwards it. Its presence also tells that fixture it was re-exec'd deliberately rather than
+/// picked up by an ordinary, unfiltered suite run.
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR";
 
@@ -335,7 +350,7 @@ pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_S
 /// tree member despite its own process group (job membership and process group are independent
 /// Win32 concepts), so it shows up as a `MembersRemain` survivor even though the signal itself
 /// never reaches it, and it stays that way for as long as the caller holds its control socket
-/// open — never via a chosen sleep duration. Mirrors [`spawn_a_process_that_exits`]'s
+/// open. Mirrors [`spawn_a_process_that_exits`]'s
 /// filtered-re-exec idiom (see its own doc for why the filter is mandatory) put to a second use.
 #[cfg(windows)]
 #[test]
@@ -351,9 +366,7 @@ fn fixture_survives_group_signal() {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
     let _survivor = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        // `[1..]`: `fixture_argv`'s slot 0 is the placeholder libtest itself would drop as the
-        // binary name — `std::process::Command` supplies its own argv[0] from `new()` above, so
-        // passing the full array here would leave the placeholder as a real argv[1], not dropped.
+        // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
         .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
         .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)

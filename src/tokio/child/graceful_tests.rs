@@ -10,10 +10,7 @@ fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     crate::test_child::held_contained_blocker_async(crate::Stdio::pipe())
 }
 
-/// Async twin of `child::graceful_tests::assert_still_running` — see there for the full
-/// rationale: `Existence::Present` is zombie-inclusive and cannot tell a killed-but-unreaped
-/// `blocker` from a genuinely running one, and on Windows `is_alive()` cannot reliably detect a
-/// kill either (`TerminateProcess` is asynchronous). Consumes `stdin` and reaps the child.
+/// Async twin of `child::graceful_tests::assert_still_running`; consumes `stdin` and reaps the child.
 async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate::tokio::ChildStdin) {
     use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     #[cfg(unix)]

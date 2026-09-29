@@ -14,32 +14,19 @@ fn blocker() -> (crate::Child, std::io::PipeWriter) {
     crate::test_child::held_contained_blocker(crate::Stdio::pipe())
 }
 
-/// Proves a [`blocker`] is genuinely still running, not merely still resolvable — see
-/// [`blocker`]'s own doc for why `Existence::Present` cannot tell those apart. On Unix,
-/// round-trips a byte through `cat`'s piped stdout, over the same stdin writer [`blocker`]'s
-/// caller already holds; a killed-but-unreaped `cat` cannot produce an echo.
+/// Proves a [`blocker`] is genuinely still running, not merely resolvable. On Unix, round-trips
+/// a byte through `cat`'s piped stdout over the stdin writer the caller holds; a killed-but-unreaped
+/// `cat` cannot echo.
 ///
-/// On Windows, `findstr` does not echo, and `is_alive()` cannot reliably detect a kill either:
-/// `TerminateProcess` is asynchronous, so a check that races it can still observe `Alive` for a
-/// window after the call returns — measured letting a spurious `self.kill()` (the fail-fast
-/// mutant this assertion exists to catch) through undetected. Instead: write a line containing
-/// `x`, close stdin (EOF — `findstr` can only finish reading and exit once its input ends), then
-/// require BOTH a clean exit (`status.success()`, `findstr`'s own "a match was found" code) AND
-/// the echoed match on stdout — a killed process can produce neither. This consumes `stdin` and
-/// reaps the child; callers on Windows must not also `wait()` a *different* status from it
-/// afterward (`Child::wait()`'s SharedChild-backed caching still permits a redundant `wait()`
-/// call, just not one expecting a fresh status).
+/// On Windows, `findstr` does not echo and `is_alive()` races the asynchronous `TerminateProcess`.
+/// Instead, write a line containing `x`, close stdin, and require both a clean exit (`findstr`'s
+/// "a match was found" code) and the echoed match on stdout; a killed process produces neither.
+/// This consumes `stdin` and reaps the child.
 fn assert_still_running(child: &mut crate::Child, mut stdin: std::io::PipeWriter) {
     #[cfg(unix)]
     {
-        use std::io::{Read as _, Write as _};
         let mut stdout = child.stdout().expect("piped stdout");
-        stdin.write_all(b"x").expect("write to the blocker");
-        let mut echo = [0u8; 1];
-        stdout
-            .read_exact(&mut echo)
-            .expect("the blocker must still be alive to echo");
-        assert_eq!(&echo, b"x");
+        crate::test_child::assert_echoes(&mut stdin, &mut stdout);
     }
     #[cfg(windows)]
     {
@@ -289,8 +276,7 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
         matches!(err, crate::error::Error::Unassessable { source: Some(_), .. }),
         "got {err:?}"
     );
-    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE — same
-    // assertion shape as the pre-existing NoConsole/Unsupported fail-fast test below.
+    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
     assert_still_running(&mut child, stdin);
     cleanup(&mut child);
 }
@@ -409,15 +395,12 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // passing vacuously: had the test reaped the root itself, a mutant that skips the function's own
 // reap would still read `Gone`.
 //
-// `exec 3<&0; cat <&3 3<&-`: a non-interactive shell gives a backgrounded command `/dev/null` as
-// stdin unless it is redirected explicitly, so a bare `cat &` would see EOF and exit at once.
-// Without a kernel drain edge, the fixture still exercises the root-only watch, asserted below.
+// The `exec 3<&0; cat <&3 3<&- &` idiom is explained at `test_child::BLOCKER_ARGV`. Without a
+// kernel drain edge, the fixture still exercises the root-only watch, asserted below.
 #[cfg(unix)]
 #[test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
-    use std::io::Read;
-
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     let mut cmd = crate::Command::new();
     cmd.args([

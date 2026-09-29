@@ -628,20 +628,13 @@ fn the_kill_filter_excludes_this_process_and_pid_one() {
 /// end, so a blocking read on it returns EOF exactly when `cat` dies — a real event, not a
 /// timer.
 ///
-/// The orphan is `cat`, not `sleep 600`: `hard_kill()` below is the mechanism under test, and a
-/// `sleep`-based orphan has its own 600s timer completely independent of it — a broken
-/// `hard_kill()` would still let the EOF read resolve once that timer alone ends the orphan,
-/// proving nothing. `cat` needs its OWN stdin explicitly redirected (`exec 3<&0; cat <&3 ...
-/// 3<&-`), not a bare `cat &`: a non-interactive shell gives an asynchronous command with no
-/// explicit stdin redirect of its own `/dev/null`, not the shell's stdin, so a bare `cat &`
-/// would see EOF and exit right away instead of blocking (measured elsewhere in this crate's
-/// history: `cat >/dev/null &` reaches its own intended blocked state in 0.01s, i.e. never).
+/// The orphan is a `cat` blocked on a held stdin (see `test_child::BLOCKER_ARGV` for the
+/// backgrounding idiom), so only `hard_kill()` can end it.
 #[test]
 fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
-    // `cat` inherits the marker across sh's fork and its own exec, same as `sleep` did;
-    // `echo $!` publishes it.
+    // `cat` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
     cmd.arg("-c")
         .arg("exec 3<&0; cat <&3 3<&- & echo $!")
         .stdin(std::process::Stdio::piped())
@@ -661,9 +654,8 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
 
-    // Taken out and held past the EOF read below: `child.wait()` (which closes its OWN piped
-    // stdin before it waits — see `test_child::member_command`'s doc) must
-    // not be what ends the orphan; only `hard_kill()`'s own real signal may.
+    // Held past the kill: `child.wait()` closes the child's own stdin, and only `hard_kill()` may
+    // end the orphan.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
@@ -679,11 +671,8 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
-    // Written and dropped before the read below, deterministically instead of racing a hang
-    // against nextest's bound: `cat` DOES echo its stdin to stdout, so if `hard_kill()` failed to
-    // reach the orphan, the still-alive `cat` echoes this byte before exiting on its own EOF,
-    // making `rest` non-empty — a fast, deterministic failure. If the kill landed, the write/drop
-    // is a no-op past a dead pipe (EPIPE, ignored).
+    // If `hard_kill()` missed the orphan, the live `cat` echoes this byte and then exits on the
+    // EOF, so `rest` below is non-empty. If the kill landed, this writes to a dead pipe.
     crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
     drop(stdin);
 
@@ -788,9 +777,6 @@ fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_sign
 #[test]
 fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
     let _serialize = test_spawn_lock();
-    // `member_command`/`await_member_ready` below: a real happens-before edge from the member's
-    // own announcement, not a `/bin/sleep 600` chosen to outlast the immediate liveness checks
-    // that follow.
     let mut child = member_command(0).spawn().expect("spawn member"); // pgid == the child's own pid
     await_member_ready(&mut child);
     let pid = child.id() as crate::identity::RawPid;

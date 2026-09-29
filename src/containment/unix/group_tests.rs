@@ -142,16 +142,12 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
         "a group we own must never report refusers"
     );
     let status = child.wait().expect("wait after state()'s own SIGKILL");
-    // NOT `!status.success()`: `std::process::Child::wait()` itself closes the piped stdin
-    // before it waits, so `member_command`'s trailing `read _ignored` hits EOF and `sh` exits
-    // non-zero (`read`'s own EOF failure) EVEN IF `state()` never sent anything — a mutant that
-    // returns `Cleared` without actually converging would still pass a bare `!success()` check.
-    // Only a real delivered `SIGKILL` proves `state()` converged.
+    // Not `!status.success()`: `Child::wait()` closes the piped stdin (see `member_command`), so
+    // the leader exits non-zero on EOF even if `state()` never signalled it.
     assert_eq!(
         status.signal(),
         Some(libc::SIGKILL),
-        "state() must have actually delivered SIGKILL, not just probed (or relied on `wait()`'s \
-         own stdin-close to end the leader by EOF instead), got {status:?}"
+        "state() must have actually delivered SIGKILL, not just probed, got {status:?}"
     );
 }
 
