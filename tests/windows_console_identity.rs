@@ -58,9 +58,10 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(argv_head)
         .args(["report-console-identity", addr.as_str(), me.as_str()])
+        .env(common::ACK_ENV, "1")
         .creation_flags(flags);
-    let child = common::spawn_locked(&mut cmd).expect("spawn identity probe child");
-    let (sock, _) = listener.accept().expect("accept report socket");
+    let mut child = common::spawn_locked(&mut cmd).expect("spawn identity probe child");
+    let sock = common::accept_or_die(&listener, &mut child);
     let report = read_report_line(&sock);
     Probe { child, sock, report }
 }
@@ -270,9 +271,10 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
         addr.as_str(),
         me.as_str(),
     ]);
+    cmd.env(common::ACK_ENV, "1");
     configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn cosca identity probe child");
-    let (sock, _) = listener.accept().expect("accept report socket");
+    let mut child = cmd.spawn().expect("spawn cosca identity probe child");
+    let sock = common::accept_or_die(&listener, &mut child);
     let report = read_report_line(&sock);
     CoscaProbe { child, sock, report }
 }
