@@ -92,6 +92,17 @@ pub(crate) fn capture() -> Relay {
         slots
             .borrow()
             .iter()
+            .filter(|(id, _)| {
+                #[cfg(windows)]
+                {
+                    **id != TypeId::of::<crate::wait::backend::armed_probe::Armed>()
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = id;
+                    true
+                }
+            })
             .map(|(id, entry)| (*id, entry.clone_entry()))
             .collect()
     }))
