@@ -6,6 +6,23 @@ use crate::child::spawn::fault;
 use crate::error::Error;
 use crate::tokio::Command;
 
+/// [`blocker`] for a test that drives a kill-then-blocking-reap: the stdin writer is released
+/// between the two, so a kill that did nothing fails `assert_killed` instead of hanging the reap.
+/// See `child::spawn_tests::teardown_blocker`.
+fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
+    let mut cmd = Command::new();
+    #[cfg(unix)]
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    #[cfg(windows)]
+    {
+        cmd.args([crate::test_child::windows_more()]);
+        cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout null");
+    }
+    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    cmd.stdin(stdin).expect("set stdin pipe");
+    (cmd, teardown)
+}
+
 // A child only a real kill ends — see `child::spawn_tests::blocker`.
 fn blocker() -> Command {
     let mut cmd = Command::new();
@@ -22,7 +39,7 @@ fn blocker() -> Command {
 #[tokio::test]
 async fn identity_failure_reaps_the_spawned_child() {
     fault::set_force_identity_vanished(true);
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
 
@@ -32,12 +49,13 @@ async fn identity_failure_reaps_the_spawned_child() {
         "identity-vanish surfaces as an Io error, got {err:?}"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
 }
 
 #[tokio::test]
 async fn attach_failure_reaps_the_spawned_child() {
     fault::set_force_attach_failure(true);
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     let err = cmd.spawn().err();
     fault::set_force_attach_failure(false);
 
@@ -47,6 +65,7 @@ async fn attach_failure_reaps_the_spawned_child() {
         "a real attach failure surfaces as Error::Containment, got {err:?}"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
 }
 
 /// The async mirror of `child::spawn::exact_posix_tests`: tokio builds its command through the
@@ -515,6 +534,17 @@ fn opted_out_blocker() -> crate::command::Command {
     cmd
 }
 
+/// [`opted_out_blocker`] for a test that drives a kill-then-blocking-reap: see [`teardown_blocker`].
+#[cfg(target_os = "linux")]
+fn opted_out_teardown_blocker() -> (crate::command::Command, fault::TeardownBlocker) {
+    let mut cmd = crate::command::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    cmd.stdin(stdin).expect("set stdin pipe");
+    cmd.kill_on_drop(false);
+    (cmd, teardown)
+}
+
 /// An occupied temp leaf whose child entered it, attached to the next spawn on this thread.
 #[cfg(target_os = "linux")]
 fn attach_entered_leaf(leaf_path: &std::path::Path) {
@@ -622,7 +652,8 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-password-leaf");
     attach_entered_leaf(&leaf_path);
-    let mut child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let mut child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.detach();
 
@@ -630,6 +661,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     assert!(
         matches!(
@@ -743,10 +775,12 @@ async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
         attached: crate::containment::Attached::Delegated,
         graceful: crate::graceful::GracefulMechanism::Process,
     });
-    let child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     let reaped = reaped(pid);
     if !reaped {
@@ -773,10 +807,12 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
     });
-    let child = super::spawn_uncommitted(&mut opted_out_blocker()).expect("spawn");
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
     let detail = err.to_string();

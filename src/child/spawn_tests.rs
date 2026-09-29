@@ -24,56 +24,21 @@ fn blocker() -> Command {
 /// no-kill mutant cannot hang the reap; it fails [`TeardownBlocker::assert_killed`] instead,
 /// because the released child then exits by itself with status 0. Keep the guard alive through
 /// the assertion: dropping it clears the seam.
-fn teardown_blocker() -> (Command, TeardownBlocker) {
+///
+/// Windows runs `more.com` (exit 0 on stdin EOF, unlike `findstr x`, whose exit 1 is what a kill
+/// reports) with a null stdout, because `more` echoes.
+fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
     let mut cmd = Command::new();
     #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     #[cfg(windows)]
-    cmd.args([crate::test_child::windows_more()]);
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    #[cfg(unix)]
-    let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-    #[cfg(windows)]
-    let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-    cmd.stdin(crate::stdio::Stdio::from_file(reader))
-        .expect("set stdin pipe");
-    // `more` echoes its input.
-    cmd.stdout(crate::stdio::Stdio::null()).expect("null stdout");
-    let release = fault::set_between_kill_and_wait(move || drop(writer));
-    let reaps = fault::record_teardown_reaps();
-    (
-        cmd,
-        TeardownBlocker {
-            _release: release,
-            reaps,
-        },
-    )
-}
-struct TeardownBlocker {
-    _release: fault::ArmedBetweenKillAndWait,
-    reaps: fault::TeardownReaps,
-}
-impl TeardownBlocker {
-    /// Every child the teardown reaped was ended by its kill: `SIGKILL` on Unix, on Windows the
-    /// exit code 1 of `TerminateProcess` (`more` exits 0 by itself).
-    fn assert_killed(&self) {
-        let reaps = self.reaps.recorded();
-        assert!(!reaps.is_empty(), "the teardown must have reaped the child");
-        for (pid, status) in reaps {
-            #[cfg(unix)]
-            assert_eq!(
-                std::os::unix::process::ExitStatusExt::signal(&status),
-                Some(libc::SIGKILL),
-                "pid {pid} must be SIGKILLed by kill_unadopted, not merely reaped once it exits on its own: {status:?}"
-            );
-            #[cfg(windows)]
-            assert_eq!(
-                status.code(),
-                Some(1),
-                "pid {pid} must be terminated by kill_unadopted, not merely reaped once it exits on its own"
-            );
-        }
+    {
+        cmd.args([crate::test_child::windows_more()]);
+        cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout null");
     }
+    let (stdin, teardown) = fault::teardown_blocker_stdin();
+    cmd.stdin(stdin).expect("set stdin pipe");
+    (cmd, teardown)
 }
 
 /// An arbitrary status, told apart from another by its raw value.
@@ -723,7 +688,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-password-leaf");
     attach_entered_leaf(&leaf_path);
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
@@ -735,6 +700,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     });
     let mark = crate::log_capture::mark();
     let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     assert!(
         matches!(
@@ -864,12 +830,13 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
         attached: crate::containment::Attached::Delegated,
         graceful: crate::graceful::GracefulMechanism::Process,
     });
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     let reaped = reaped(pid);
     if !reaped {
@@ -896,12 +863,13 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         )),
         graceful: crate::graceful::GracefulMechanism::Process,
     });
-    let mut cmd = blocker();
+    let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
     let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
 
     assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
     let detail = err.to_string();
