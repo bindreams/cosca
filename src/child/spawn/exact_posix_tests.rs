@@ -84,7 +84,9 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
     // Created 0o700 so the chmod is what makes `dir` traversable to a dropped uid, whatever the
     // ambient umask; the umask is process-global, so a test must not change it.
     std::fs::DirBuilder::new().mode(0o700).create(dir).expect("mkdir");
+    if dir.file_name().is_some_and(|n| n != "sub") {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    }
     std::fs::write(dir.join(marker), "").expect("write marker");
     let tool = dir.join("tool");
     // Under the lock for the reason `cwd_and_path_tools` gives.
