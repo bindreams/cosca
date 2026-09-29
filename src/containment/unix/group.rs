@@ -412,11 +412,13 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// **How `open_verified`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
-/// - `Error::Unsupported` (`pidfd_open` answered `ENOSYS`: a kernel before 5.3, or a seccomp
-///   policy blocking the syscall) and `Error::Io` (every other `pidfd_open` or `poll` failure,
-///   such as the `EPERM` a seccomp profile may return instead) fall back to `check_or_signal`'s plain
-///   `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
-///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
+/// - `Error::Unsupported` (`pidfd_open` refused: `ENOSYS` from a kernel before 5.3 or a filter, or
+///   `EPERM`/`EACCES`/`ENODEV`, which only a filter or LSM produces) and `Error::Io` (a transient
+///   `pidfd_open` failure such as `EMFILE`, or a `poll` failure) fall back to `check_or_signal`'s
+///   plain `kill(2)`. Main still returns `Io` for the filter errnos
+///   ([#341](https://github.com/bindreams/cosca/issues/341)). "We couldn't even ask" must not
+///   become `Reached::Unknown` on the containers this fallback exists for; `kill(2)` observes
+///   envelopes this module controls directly.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.

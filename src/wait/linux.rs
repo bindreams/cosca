@@ -1,7 +1,10 @@
 //! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` from `pidfd_open` =>
-//! `Unsupported`; any other `pidfd_open` failure, such as a seccomp `EPERM`, is `Io`.
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race). A refused `pidfd_open` is
+//! `Unsupported`: `ENOSYS` (no such syscall, or a filter), or an errno only a filter or LSM can
+//! produce (`EPERM`, `EACCES`, `ENODEV`). A transient failure (`EMFILE`, `ENFILE`, `ENOMEM`) is
+//! `Io` and names the syscall. Main still returns `Io` for the filter errnos, and an `Io` without
+//! the syscall's name ([#341](https://github.com/bindreams/cosca/issues/341)).
 //!
 //! cosca requires Linux >= 5.6 (see the crate root's "Platform requirements"). The syscalls
 //! behind it: `pidfd_open` needs 5.3; `waitid(P_PIDFD)`, 5.4; the `/proc` checks behind
@@ -38,7 +41,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
         Err(rustix::io::Errno::NOSYS) => Err(Error::Unsupported {
             op: "foreign process wait/kill".into(),
             platform: "linux",
-            detail: "cosca requires Linux >= 5.6, and pidfd_open (Linux >= 5.3) is not available here".into(),
+            detail: "cosca requires pidfd_open (Linux ≥ 5.3), refused here: pidfd_open answered ENOSYS".into(),
         }),
         Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }

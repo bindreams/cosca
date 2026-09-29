@@ -10,12 +10,14 @@
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
 //! Each requirement comes from a different syscall:
 //!
-//! - `pidfd_open` needs 5.3. cosca requires a pidfd for every child it spawns on Linux. A kernel
-//!   or seccomp profile that refuses the call is unsupported.
+//! - `pidfd_open` needs 5.3. cosca requires a pidfd for every child it spawns on Linux. A kernel,
+//!   seccomp profile or LSM that refuses the call (`ENOSYS`, `EPERM`, `EACCES`, `ENODEV`) is
+//!   unsupported; a transient failure such as `EMFILE` is an I/O error.
 //! - `waitid(P_PIDFD)` needs 5.4. It is how cosca reaps through a pidfd; waiting only polls the
 //!   pidfd.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's identity.
+//!   checked `/proc` view uses it to read a process's identity. A refusal
+//!   (`ENOSYS`, `EPERM`) is unsupported.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14; without it the
 //! mechanism is not used, see `KillUnsupported` in `containment::cgroup::degrade`) and assumes
