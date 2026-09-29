@@ -1,8 +1,7 @@
 //! `cosca::test_spawn_lock()` is the same non-reentrant lock a cosca spawn takes itself. An
 //! integration test that holds it across a `cosca::Command::spawn` must get a named panic, not a
 //! hang. The check is compiled in only under `debug_assertions`, so this file is too; nothing in
-//! CI runs the integration binaries in release. Only macOS and Windows spawns take the lock
-//! (Linux's std spawn path does not), so the spawn test is gated to them.
+//! CI runs the integration binaries in release.
 #![cfg(debug_assertions)]
 
 /// `#[expect]` fails the build if the guard stops being `#[must_use]`. The `let _ =` form is
@@ -13,7 +12,6 @@ fn discarding_the_test_guard_is_linted() {
     cosca::test_spawn_lock();
 }
 
-#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
     let outer = cosca::test_spawn_lock();
