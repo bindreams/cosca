@@ -1,0 +1,136 @@
+[
+ {
+  "name": "M1 no clock advance in wait_until (frozen-clock test)",
+  "expect": "red",
+  "timeout": 240,
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait.rs",
+    "        test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());\n",
+    ""
+   ]
+  ],
+  "filters": [
+   "block_until_exit_terminates_under_a_frozen_clock"
+  ]
+ },
+ {
+  "name": "M2 truncate instead of ceil",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait.rs",
+    "let ms = ceil_millis(d).min(",
+    "let ms = d.as_millis().min("
+   ]
+  ],
+  "filters": [
+   "arms_the_ceiling"
+  ]
+ },
+ {
+  "name": "M3 trust first WAIT_TIMEOUT",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait.rs",
+    "if waited != WAIT_TIMEOUT || remaining(deadline) == Some(Duration::ZERO) {",
+    "if true {"
+   ]
+  ],
+  "filters": [
+   "never_reports",
+   "re_arms_past",
+   "arms_the_ceiling"
+  ]
+ },
+ {
+  "name": "M4 stale remaining hoisted out of loop",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait.rs",
+    "    loop {\n        #[cfg(test)]\n        let call_start",
+    "    let stale = remaining(deadline);\n    loop {\n        #[cfg(test)]\n        let call_start"
+   ],
+   [
+    "src/wait.rs",
+    "let waited = wait(win32_timeout_ms(remaining(deadline)));",
+    "let waited = wait(win32_timeout_ms(stale));"
+   ]
+  ],
+  "filters": [
+   "re_arms_past_a_clamped_timeout"
+  ]
+ },
+ {
+  "name": "M5 block_until_exit_or_cancel ignores its grace",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait/windows.rs",
+    "Some(g) => crate::wait::deadline_from(g),",
+    "Some(_g) => crate::wait::deadline_from(Duration::from_secs(2)),"
+   ]
+  ],
+  "filters": [
+   "block_until_exit_or_cancel_arms_the_ceiling"
+  ]
+ },
+ {
+  "name": "M6 RawChild::wait_deadline arms a different deadline",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/child/spawn/windows_raw/proc.rs",
+    "crate::wait::wait_until(Some(Some(deadline)),",
+    "crate::wait::wait_until(Some(Some(deadline + std::time::Duration::from_secs(1))),"
+   ]
+  ],
+  "filters": [
+   "wait_deadline_arms_the_ceiling"
+  ]
+ },
+ {
+  "name": "M7 wait_drained_raw arms a different deadline",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/containment/windows.rs",
+    "let waited = crate::wait::wait_until(deadline,",
+    "let waited = crate::wait::wait_until(deadline.map(|d| d.map(|i| i + std::time::Duration::from_secs(1))),"
+   ]
+  ],
+  "filters": [
+   "wait_drained_raw_arms_the_ceiling"
+  ]
+ }
+]
