@@ -513,6 +513,8 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     );
 
     // The watch resolved on the STALE identity, so it must not have touched this live child.
+    child.kill().expect("mutant");
+    child.wait().expect("mutant reap");
     assert_child_still_alive(&mut child);
     // A `std` `Child` neither kills nor reaps on drop.
     kill_and_reap(&mut child);
