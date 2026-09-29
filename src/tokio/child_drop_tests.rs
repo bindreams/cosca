@@ -52,6 +52,7 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
         id: ProcessId::from_parts_for_test(pid, 0),
         kill_on_drop: false,
         containment: crate::containment::Containment::CgroupV2,
+        tree_killed: Default::default(),
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
     };
@@ -132,6 +133,7 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
         id: ProcessId::from_parts_for_test(pid, 0),
         kill_on_drop: false,
         containment: crate::containment::Containment::CgroupV2,
+        tree_killed: Default::default(),
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
     };

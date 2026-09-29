@@ -97,7 +97,79 @@ pub(crate) fn set_session(std_cmd: &mut std::process::Command) {
 /// verdict. `Attached::Cgroup` (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
 pub(crate) fn kill_group(pgid: i32) -> Result<(), Error> {
+    #[cfg(test)]
+    if let Some(outcome) = fault::intercept_kill_group(pgid) {
+        return outcome;
+    }
     signal_group(pgid, Signal::SIGKILL)
+}
+
+/// Test seam for [`kill_group`]. Thread-local, with an RAII reset.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
+    /// assert a kill was not issued without a real `killpg` ever reaching a recyclable number.
+    pub(crate) fn record_kill_group() -> KillGroupRecorder {
+        KILLED.with(|k| *k.borrow_mut() = Some(Vec::new()));
+        KillGroupRecorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct KillGroupRecorder(());
+
+    impl KillGroupRecorder {
+        /// From now on the intercepted `kill_group` reports the ordinary `Unassessable` refusal of a
+        /// group it could not fully assess, as a live member that refuses the signal would cause.
+        pub(crate) fn fail_with_unassessable(&self) {
+            FAIL.with(|f| f.set(true));
+        }
+
+        /// The groups `kill_group` was asked to kill since the recorder was made.
+        pub(crate) fn killed(&self) -> Vec<i32> {
+            KILLED.with(|k| k.borrow().clone().expect("the recorder is live"))
+        }
+
+        /// Asserts `pgid` was killed, and nothing else was. More than once is fine: a macOS fd
+        /// marker's sweep re-sends `killpg` on a later pass while a holder still confirms the group.
+        #[track_caller]
+        pub(crate) fn assert_killed_only(&self, pgid: i32) {
+            let killed = self.killed();
+            assert!(
+                !killed.is_empty() && killed.iter().all(|g| *g == pgid),
+                "expected only killpg({pgid}), at least once, got {killed:?}"
+            );
+        }
+    }
+
+    impl Drop for KillGroupRecorder {
+        fn drop(&mut self) {
+            KILLED.with(|k| *k.borrow_mut() = None);
+            FAIL.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn intercept_kill_group(pgid: i32) -> Option<Result<(), crate::error::Error>> {
+        KILLED.with(|k| {
+            k.borrow_mut().as_mut().map(|killed| {
+                killed.push(pgid);
+                if FAIL.with(|f| f.get()) {
+                    Err(crate::error::Error::Unassessable {
+                        detail: "forced by a test".into(),
+                        source: None,
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        })
+    }
 }
 
 /// Send the graceful signal to the whole process group, then confirm no live

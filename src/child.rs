@@ -29,6 +29,10 @@ mod graceful;
 #[path = "child_tests.rs"]
 mod child_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/drop_reaped_tests.rs"]
+mod drop_reaped_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -81,6 +85,8 @@ pub struct Child {
     kill_on_drop: bool,
     containment: Containment,
     attached: crate::containment::Attached,
+    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,
 }
@@ -100,6 +106,7 @@ impl Child {
             kill_on_drop,
             containment: attachment.containment,
             attached: attachment.attached,
+            tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
         }
@@ -171,6 +178,9 @@ impl Child {
     }
 
     /// Block until the child exits, returning its status.
+    ///
+    /// Reaps the root; a later drop then skips number-named kills, so call
+    /// [`kill_tree`](Child::kill_tree) first to end descendants (see `Drop`).
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
         self.proc.wait().map_err(Error::Io)
     }
@@ -279,7 +289,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        let group_result = self.attached.hard_kill();
+        let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
@@ -502,6 +512,95 @@ impl Child {
     }
 }
 
+/// Whether the root has been reaped, from its inputs: this handle's own reap, or the root's number
+/// reading `Gone` or as another process.
+#[cfg(unix)]
+pub(crate) fn root_reaped(own_reap: bool, id: ProcessId, now: crate::identity::Resolved<ProcessId>) -> bool {
+    own_reap
+        || match now {
+            crate::identity::Resolved::Found(now) => now != id,
+            crate::identity::Resolved::Gone => true,
+            crate::identity::Resolved::Unknown => false,
+        }
+}
+
+#[cfg(unix)]
+pub(crate) fn root_identity_now(pid: crate::identity::RawPid) -> crate::identity::Resolved<ProcessId> {
+    #[cfg(test)]
+    if let Some(forced) = fault::take_forced_root_read() {
+        return forced;
+    }
+    ProcessId::of(pid)
+}
+
+/// Test seam for [`root_identity_now`]. Thread-local, with an RAII reset.
+#[cfg(all(test, unix))]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    use crate::identity::{ProcessId, Resolved};
+
+    thread_local! {
+        static FORCED: Cell<Option<Resolved<ProcessId>>> = const { Cell::new(None) };
+        static ROOT_TEARDOWNS: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// From now on every root teardown a drop starts on THIS thread (`ProcHandle::teardown_on_drop`:
+    /// a kill by pid and a wait by pid) is counted. It still runs.
+    pub(crate) fn record_root_teardowns() -> RootTeardownRecorder {
+        ROOT_TEARDOWNS.with(|c| c.set(Some(0)));
+        RootTeardownRecorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct RootTeardownRecorder(());
+
+    impl RootTeardownRecorder {
+        pub(crate) fn count(&self) -> u32 {
+            ROOT_TEARDOWNS.with(|c| c.get().expect("the recorder is live"))
+        }
+    }
+
+    impl Drop for RootTeardownRecorder {
+        fn drop(&mut self) {
+            ROOT_TEARDOWNS.with(|c| c.set(None));
+        }
+    }
+
+    pub(crate) fn note_root_teardown() {
+        ROOT_TEARDOWNS.with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
+    }
+
+    /// The next drop-time read of a root's number on THIS thread answers `read`. Standing in for
+    /// an OS refusal (`Unknown`), which cannot be provoked without a live process on the number.
+    pub(crate) fn force_next_root_read(read: Resolved<ProcessId>) -> ForcedRootRead {
+        FORCED.with(|f| f.set(Some(read)));
+        ForcedRootRead(())
+    }
+
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct ForcedRootRead(());
+
+    impl Drop for ForcedRootRead {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.set(None));
+        }
+    }
+
+    pub(super) fn take_forced_root_read() -> Option<Resolved<ProcessId>> {
+        FORCED.with(|f| f.take())
+    }
+}
+
+/// With `kill_on_drop` set (the default), hard-kills the contained tree, then kills and reaps the
+/// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
+///
+/// Once the root is reaped the drop skips kills named by its number and warns; see
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -510,6 +609,16 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
+        //
+        // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
+        // this handle's own reap, or the number no longer reading as this root. A foreign reap
+        // landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
+        // its number, until `teardown_on_drop` below.
+        #[cfg(unix)]
+        let view = crate::containment::DropView::read(self.id, self.proc.has_reaped(), &self.tree_killed);
+        #[cfg(unix)]
+        let tree = self.attached.hard_kill_for_drop(view);
+        #[cfg(not(unix))]
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             // A live member refused, or couldn't be confirmed — visible, not silently
@@ -525,6 +634,11 @@ impl Drop for Child {
         // not collect, since tokio owns that child and its own reaping. `src/tokio/` mirrors this
         // surface by hand with nothing enforcing parity, so both differences are deliberate, not
         // drift.
+        // A reaped root is neither killed nor waited for: its number may name another child by now.
+        #[cfg(unix)]
+        if view.root_reaped {
+            return;
+        }
         self.proc.teardown_on_drop();
     }
 }

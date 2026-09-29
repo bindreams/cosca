@@ -72,6 +72,8 @@ pub struct Child {
     id: ProcessId,
     kill_on_drop: bool,
     containment: Containment,
+    /// Whether this handle already hard-killed the tree; see [`crate::containment::TreeKilled`].
+    tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// `Child`). Drives the universal-teardown kill mapping.
@@ -98,6 +100,7 @@ impl Child {
             id,
             kill_on_drop,
             containment: attachment.containment,
+            tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
         }
@@ -125,7 +128,7 @@ impl Child {
     /// separately.
     #[cfg(unix)]
     pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
-        self.os.attached.hard_kill()
+        self.os.attached.hard_kill_marking(&self.tree_killed)
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -488,7 +491,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        let group_result = self.os.attached.hard_kill();
+        let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
         // covers that, so its failure is contract-relevant.
@@ -665,6 +668,64 @@ impl Child {
 #[path = "child_drop_tests.rs"]
 mod child_drop_tests;
 
+/// Test seam counting what a drop does to the root by its number. Thread-local, with an RAII reset.
+#[cfg(all(test, unix))]
+pub(crate) mod drop_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+    }
+
+    /// From now on `Drop` on THIS thread counts the root kills it starts and the tokio `Child`s it
+    /// forgets. It still does both.
+    pub(crate) fn record() -> Recorder {
+        COUNTS.with(|c| c.set(Some((0, 0))));
+        Recorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct Recorder(());
+
+    impl Recorder {
+        /// Root kills started (`start_kill`, then the reaper's wait by pid).
+        pub(crate) fn kills(&self) -> u32 {
+            COUNTS.with(|c| c.get().expect("the recorder is live").0)
+        }
+
+        /// tokio `Child`s forgotten instead of dropped.
+        pub(crate) fn forgets(&self) -> u32 {
+            COUNTS.with(|c| c.get().expect("the recorder is live").1)
+        }
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            COUNTS.with(|c| c.set(None));
+        }
+    }
+
+    pub(super) fn note_root_kill() {
+        COUNTS.with(|c| {
+            if let Some((k, f)) = c.get() {
+                c.set(Some((k + 1, f)));
+            }
+        });
+    }
+
+    pub(super) fn note_forget() {
+        COUNTS.with(|c| {
+            if let Some((k, f)) = c.get() {
+                c.set(Some((k, f + 1)));
+            }
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "child_drop_reaped_tests.rs"]
+mod child_drop_reaped_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
@@ -716,6 +777,9 @@ impl Child {
 ///
 /// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
 /// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
+///
+/// Once the root is reaped the drop skips kills named by its number and warns; see
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop).
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -790,6 +854,19 @@ impl Drop for Child {
         // group (console control events stop at that boundary). On Unix this and `terminate_tree`
         // have the same radius. The contract either way: the tree is signalled before `drop`
         // returns.
+        //
+        // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
+        // this handle's own state, or the number no longer reading as this root (tokio's state
+        // cannot see a foreign reap until it is polled). Accepted gaps: a foreign reap landing
+        // after this read, and tokio's orphan queue reaping by number afterwards. Read before the
+        // handle is dismembered below.
+        #[cfg(unix)]
+        let own_reap = self.os.proc_mut().is_reaped();
+        #[cfg(unix)]
+        let view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
+        #[cfg(unix)]
+        let tree = self.os.attached.hard_kill_for_drop(view);
+        #[cfg(not(unix))]
         let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
@@ -802,10 +879,22 @@ impl Drop for Child {
         // without touching this function. On every early return below it drops in group order,
         // on this thread — exactly where it dropped before the reap moved off it.
         let mut os = std::mem::take(&mut self.os);
-        // Already reaped: no signal to issue and no exit to wait for.
+        // Already reaped: no signal to issue and no exit to wait for. tokio's own state says so, or
+        // only the root's number does (a reap outside this handle): then the number may name
+        // another child, so tokio's `Child` must not run its own drop, which reaps by pid.
+        #[cfg(unix)]
+        if view.root_reaped {
+            if !own_reap {
+                forget_reaped_elsewhere(&mut os, pid);
+            }
+            return;
+        }
+        #[cfg(not(unix))]
         if os.proc_mut().is_reaped() {
             return;
         }
+        #[cfg(all(test, unix))]
+        drop_fault::note_root_kill();
         // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
         // higher-integrity elevated child), and asserting would panic inside a destructor.
         //
@@ -841,6 +930,21 @@ impl Drop for Child {
             #[cfg(test)]
             force_glue_panic: false,
         });
+    }
+}
+
+/// Release the backend of a root that something else reaped, without letting tokio's `Child` drop:
+/// that would `try_wait` on the root's number and could reap another child that reused it. The
+/// stdio goes first, so its descriptors close; what the forget leaks is the pidfd and the reactor
+/// registration, or the `SIGCHLD` watch. This is a foreign reap, so it is logged at `debug`.
+#[cfg(unix)]
+fn forget_reaped_elsewhere(os: &mut OsResources, pid: u32) {
+    if let Some(ProcSource::Tokio(mut child)) = os.proc.take() {
+        drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+        log::debug!("async child {pid} was reaped outside its handle; dropping it would reap by that number, so it is forgotten");
+        #[cfg(test)]
+        drop_fault::note_forget();
+        std::mem::forget(child);
     }
 }
 

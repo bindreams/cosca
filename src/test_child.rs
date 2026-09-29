@@ -142,6 +142,15 @@ pub(crate) fn assert_echoes(stdin: &mut impl std::io::Write, stdout: &mut impl s
     assert_eq!(&echo, b"x");
 }
 
+/// Block until `pid` has exited without reaping it: a zombie, which still pins its group number.
+#[cfg(unix)]
+pub(crate) fn wait_until_zombie(pid: u32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable.
+    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+}
+
 /// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and
 /// `BrokenPipe` (the kill under test already landed, so the write goes nowhere) are both
 /// expected; any other error is a fixture fault and panics.
