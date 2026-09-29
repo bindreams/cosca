@@ -181,7 +181,9 @@ pub(crate) struct CgroupLeaf {
     /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
-    /// Whether the spawn was abandoned before its verdict: the leaf is already dealt with.
+    /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
+    /// abandoned before its verdict, or an async `Drop` released it
+    /// ([`release_without_waiting`](Self::release_without_waiting)).
     pub(super) abandoned: bool,
     /// Whether the caller still wants cosca to manage the tree. Cleared by `disarm`, for
     /// `detach()` and `kill_on_drop(false)`. `Drop` kills only while this and `entered` both hold.
@@ -281,17 +283,6 @@ impl CgroupLeaf {
     /// if it still fails after that.
     pub(crate) fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
-    }
-
-    /// Whether this leaf's `Drop` may still block waiting for a drain: the child entered, `Drop`
-    /// is disarmed, and a kill this handle already fired (`hard_kill`/`Child::kill_tree`) means
-    /// `Drop`'s disarmed-but-killed branch waits for that kill's drain exactly as an armed
-    /// `Drop`'s does (see the table on [`Drop`](#impl-Drop-for-CgroupLeaf) above). `Child::drop`
-    /// (async) reads this to decide whether that wait needs routing off the dropping thread and
-    /// onto the reaper pool, so it never blocks a runtime worker.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn disarmed_kill_may_block_drop(&self) -> bool {
-        self.child_entered() && !self.armed.load(Ordering::Relaxed) && self.killed.load(Ordering::Relaxed)
     }
 
     /// The leaf's directory: names the leaf in a caller's own message, since `hard_kill` returns
@@ -626,6 +617,12 @@ impl CgroupLeaf {
     /// or a cgroupfs remounted `ro`). That is a teardown-mechanism failure and is returned, the
     /// same way every sibling mechanism's is (`Attached::hard_kill`): a caller that reads
     /// `Child::kill_tree() -> Ok(())` over a live tree has been told the opposite of the truth.
+    ///
+    /// **Kernel requirement.** The kill is complete only with the fix `b69bb476dee9` ("cgroup:
+    /// fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable kernel that
+    /// carries it (confirmed in 6.1.129, 6.12.16 and 6.13.4; tagged `Cc: stable # v5.14+`). On a
+    /// kernel without it, a child forked while this write runs can escape the kill and keep
+    /// running. cosca does not probe for the fix.
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
         match self.dir.write("cgroup.kill", KILL_PAYLOAD) {
@@ -659,6 +656,9 @@ impl CgroupLeaf {
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
         use event_listener::Listener as _;
+
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
 
         // Only the bounded arm advances the frozen clock, so only it is checked.
         #[cfg(test)]
@@ -787,6 +787,8 @@ impl CgroupLeaf {
 
     /// Block until the leaf drains, on the watch held since creation.
     fn block_until_drained(&mut self) -> Result<(), crate::error::Error> {
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a cgroup leaf to drain");
         // Stops and joins the pump first: the watch is then this `Drop`'s alone.
         match self.watch.get_mut() {
             Some(watch) => watch.wait(),
@@ -1627,6 +1629,10 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
         Delivery::Queued | Delivery::Decided => Ok(()),
     }
 }
+
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+#[path = "leaf/release.rs"]
+mod release;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]

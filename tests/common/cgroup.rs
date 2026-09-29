@@ -1,15 +1,5 @@
 //! cgroup v2 helpers for the Linux cgroup lane.
 
-/// Fail a lane test run outside the lane. It is `#[ignore]`d, so reaching this means it was
-/// requested explicitly, and an unset `COSCA_TEST_CGROUP` is a misconfigured invocation.
-pub fn require_lane() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset: run it \
-         in a delegated cgroup with COSCA_TEST_CGROUP=1"
-    );
-}
-
 /// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
 /// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
 /// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.
@@ -33,7 +23,7 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
 /// first read: `cgroup.events` changing, and the leaf's removal (`IN_DELETE` on its parent). The
 /// second matters because removing a cgroup can cancel the `populated` notification the kernel
 /// postponed (see cosca's `DrainWatch`), and the handle's own `Drop` may remove the leaf
-/// concurrently: the async handle drops it on a reaper thread. `ENOENT` or `ENODEV` from any step
+/// concurrently: an async drop removes a drained leaf on its own thread. `ENOENT` or `ENODEV` from any step
 /// means it is gone, which is the goal.
 pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
     wait_drained(leaf);

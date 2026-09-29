@@ -224,6 +224,13 @@ impl Child {
     /// classified, never signaled, and the group can report cleared regardless. No fix
     /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
     /// value is not trustworthy evidence either.
+    ///
+    /// **Under [`CgroupV2`](crate::Containment::CgroupV2), a kernel requirement.** Complete
+    /// containment assumes the fix `b69bb476dee9` ("cgroup: fix race between fork and
+    /// cgroup.kill"): mainline 6.14 and later, or a stable kernel that carries it (confirmed in
+    /// 6.1.129, 6.12.16 and 6.13.4). On a kernel without it, a child forked while `cgroup.kill`
+    /// runs can escape the kill and keep running, and `wait_tree` waits for it. cosca does not
+    /// probe for the fix. A member stuck in uninterruptible I/O (D state) outlives the kill too.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
@@ -503,11 +510,10 @@ impl Drop for Child {
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
-        // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals, handing
-        // the wait to its own reaper threads rather than parking a runtime worker, and it must
-        // not collect, since tokio owns that child and its own reaping. `src/tokio/` mirrors this
-        // surface by hand with nothing enforcing parity, so both differences are deliberate, not
-        // drift.
+        // (`cosca::tokio::Child`'s `Drop`) diverges twice, deliberately: it only signals and
+        // never waits, rather than parking a runtime worker, and it must not collect, since tokio
+        // owns that child and its own reaping. `src/tokio/` mirrors this surface by hand with
+        // nothing enforcing parity, so both differences are deliberate, not drift.
         self.proc.teardown_on_drop();
     }
 }

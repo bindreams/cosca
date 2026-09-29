@@ -118,10 +118,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
     // tokio's own `kill_on_drop` is intentionally left at its `false` default: cosca's
-    // `Child::drop` is the SOLE owner of the kill, and the reaper's `run_teardown` of the
-    // wait-and-release that follows it. Forwarding the builder's `kill_on_drop` to `tcmd` would
-    // add a second, unsequenced kill inside that release region, where nothing orders it against
-    // the wait.
+    // `Child::drop` is the SOLE owner of the kill, and it releases tokio's `Child` right after.
+    // Forwarding the builder's `kill_on_drop` to `tcmd` would add a second, unsequenced kill
+    // inside that release, where nothing orders it against the tree kill.
 
     // Merge pre-pass: a piped STD slot targeted by a merge cannot stay tokio-owned (tokio's
     // internal pipe end is not ours to dup into the merging slots), so build OUR pipe for it

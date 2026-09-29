@@ -420,20 +420,18 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
 /// Runs in a copy of this test binary: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsRawFd;
 
     use crate::containment::cgroup::fault as cgroup_fault;
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
 
     const NAME: &str =
         "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
     const INNER: &str = "COSCA_TEST_FAILED_CLOSED_STDIO_INNER";
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
     if std::env::var_os(INNER).is_none() {
         let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
             .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])

@@ -23,6 +23,8 @@ env:
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
+  # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
+  COSCA_TEST_CGROUP: "0"
 
 jobs:
   lint:
@@ -253,19 +255,19 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      # Live cgroup v2 containment tests are gated behind COSCA_TEST_CGROUP
-      # (a no-op without it). They need a cgroup the supervisor may create child
-      # cgroups under. We make a fresh leaf directly under the unified root cgroup:
+      # Live cgroup v2 containment tests belong to the CGROUP group: on unless
+      # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need
+      # COSCA_TEST_CGROUP_CONSENT=1 and fail without it. They need a cgroup the supervisor may
+      # create child cgroups under. We make a fresh leaf directly under the unified root cgroup:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
       # leaf. We move our shell into it and run only the cgroup-named tests there
       # (as root, single-threaded) — across the `spawn_io` integration binary, the
       # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
       # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
-      # post-fork failure path), and `tokio_io`; its cgroup tests that
-      # cannot be a no-op are `#[ignore]`d, hence `--run-ignored all`. With the marker
-      # set the tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable
-      # — never a silent skip.
+      # post-fork failure path), and `tokio_io`. `--run-ignored all` is for the one test that
+      # needs `unshare(CLONE_FILES)`, which container seccomp profiles refuse. The tests assert
+      # CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
       #
       # Also selected by exact name: the two `graceful_tree_members_remain_still_reaps_an_already_exited_root`
       # tests, whose `MembersRemain` branch only runs against a real cgroup v2 here.
@@ -282,7 +284,8 @@ jobs:
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            export COSCA_TEST_CGROUP=1
+            # The cgroup tests: a delegated cgroup on a throwaway runner, so consent is given.
+            export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))"

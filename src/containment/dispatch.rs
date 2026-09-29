@@ -286,19 +286,22 @@ impl Attached {
         }
     }
 
-    /// Whether a disarmed handle's resource-drop may still block waiting for a drain, because a
-    /// kill this handle already fired needs that drain waited for before the resource gives up
-    /// (see [`CgroupLeaf::disarmed_kill_may_block_drop`](crate::containment::cgroup::CgroupLeaf::disarmed_kill_may_block_drop)).
-    /// The async `Child::drop` reads this to route that wait off the dropping thread and onto
-    /// the reaper pool instead of letting it block a runtime worker. `false` for every other
-    /// mechanism: a pgroup/`TreeWalk`/fd-marker drop never itself blocks, and a Job Object's
-    /// disarmed handle close is a fast, non-blocking `CloseHandle`.
+    /// Give up the containment resource without waiting for anything: what an async
+    /// `Child::drop` does with it, where a plain drop could block.
+    ///
+    /// A cgroup leaf goes through `CgroupLeaf::release_without_waiting`
+    /// (`rmdir`, and `cgroup.kill` plus one drain read if that fails), and is left behind, with a
+    /// warning, if it has not drained. A Job Object is dropped in place, which closes its handle:
+    /// a kill-on-drop drop has already terminated it in `hard_kill` (`TerminateJobObject`, then
+    /// `CloseHandle`), leaving nothing to close; one still armed (`KILL_ON_JOB_CLOSE` set) is
+    /// killed by the kernel on close; a disarmed one is closed and killed by nothing. Every other
+    /// mechanism drops in place too, which is bounded.
     #[cfg(feature = "tokio")]
-    pub(crate) fn disarmed_kill_may_block_drop(&self) -> bool {
+    pub(crate) fn release_without_waiting(self) {
         match self {
             #[cfg(target_os = "linux")]
-            Attached::Cgroup(leaf) => leaf.disarmed_kill_may_block_drop(),
-            _ => false,
+            Attached::Cgroup(leaf) => leaf.release_without_waiting(),
+            other => drop(other),
         }
     }
 
@@ -327,6 +330,10 @@ impl Attached {
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<crate::containment::TreeDrain, Error> {
+        // Whatever the mechanism: a caller inside an async `Drop` is refused even where the
+        // mechanism has no drain edge to wait on.
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for the contained tree to drain");
         match self {
             #[cfg(target_os = "linux")]
             Attached::Cgroup(leaf) => leaf.wait_drained(deadline),

@@ -66,15 +66,12 @@ fn holds_under_a_diverged_view_is_an_error() {
 ///
 /// Mutant: `holds_via` compares the member's path to the leaf's for equality.
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_holds_via_counts_a_member_nested_under_the_leaf() {
     use crate::containment::cgroup::test_support::occupied_leaf;
     use crate::containment::TreeDrain;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_enablement::require_group("CGROUP") {
+        return;
+    }
     let (leaf, mut member, _own) = occupied_leaf();
     let pid = member.id();
     let nested = leaf.leaf_path.join("nested");

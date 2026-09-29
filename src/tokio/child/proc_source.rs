@@ -100,15 +100,15 @@ impl ProcSource {
     /// caller's own successful kill is what bounds the wait.
     /// **Invariant:** no `wait()` future for this child is in flight when this runs.
     ///
-    /// `done_ok` is `false` for every caller: both reach here only past an
-    /// [`is_reaped`](ProcSource::is_reaped) check or on a child that was never awaited, so an
+    /// `done_ok` is `false`: the caller reaches here on a child that was never awaited, so an
     /// already-reaped one is a broken precondition, not a case to return quietly from — the shape
     /// this entry exists to remove.
+    ///
+    /// Unix only: its one caller is [`wait_and_reap_blocking`](super::Child::wait_and_reap_blocking).
+    #[cfg(unix)]
     pub(crate) fn wait_and_reap(&mut self, pid: u32) {
         match self {
             ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
-            #[cfg(windows)]
-            ProcSource::Raw(r) => r.wait_and_reap(),
         }
     }
 
