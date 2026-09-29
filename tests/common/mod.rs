@@ -132,7 +132,7 @@ mod log_capture {
     use std::sync::{Mutex, OnceLock};
 
     struct CaptureLog;
-    static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static RECORDS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
     impl log::Log for CaptureLog {
@@ -142,7 +142,7 @@ mod log_capture {
         fn log(&self, record: &log::Record<'_>) {
             let text = record.args().to_string();
             eprintln!("[{}] {text}", record.level());
-            RECORDS.lock().unwrap().push(text);
+            RECORDS.lock().unwrap().push((record.level(), text));
         }
         fn flush(&self) {}
     }
@@ -161,10 +161,24 @@ mod log_capture {
     }
 
     pub fn contains_since(mark: usize, needle: &str) -> bool {
-        RECORDS.lock().unwrap()[mark..].iter().any(|m| m.contains(needle))
+        RECORDS.lock().unwrap()[mark..].iter().any(|(_, m)| m.contains(needle))
+    }
+
+    /// The levels of every record emitted at or after `mark` that contains `needle`: the twin of
+    /// the library's own `log_capture::levels_since`. A level is what decides whether an
+    /// embedder's sink shows a message by default, which [`contains_since`] cannot see.
+    pub fn levels_since(mark: usize, needle: &str) -> Vec<log::Level> {
+        RECORDS.lock().unwrap()[mark..]
+            .iter()
+            .filter(|(_, m)| m.contains(needle))
+            .map(|(level, _)| *level)
+            .collect()
     }
 }
-pub use log_capture::{contains_since, install as install_log_capture, mark as log_mark};
+pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
+
+pub mod test_enablement;
+pub use test_enablement::require_group;
 
 /// Is `pid` attached to OUR console? `None` when the probe found no console at all, so a
 /// broken or console-less probe can never satisfy an "absent" assertion — the two are

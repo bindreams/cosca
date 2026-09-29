@@ -1000,6 +1000,8 @@ impl Marker {
         &self,
         deadline: Option<Option<Instant>>,
     ) -> Result<crate::containment::TreeDrain, Error> {
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a marked tree to drain");
         self.check_read_end_still_valid()?;
         // This process is the supervisor: it must have closed its own copy of the write end at
         // spawn time (`install`'s contract), or the edge could never fire. A deliberately

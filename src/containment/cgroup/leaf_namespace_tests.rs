@@ -7,11 +7,9 @@ use crate::identity::ProcDir;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
-fn require_cgroup() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+/// Whether to run: the `CGROUP` group is on, as well as the `NAMESPACES` one.
+fn enabled() -> bool {
+    ns::enabled() && crate::test_support::require_group("CGROUP")
 }
 
 /// `holds_via` reads through the `/proc` dirfd it is given. The dirfd is opened, THEN a tmpfs is
@@ -21,10 +19,9 @@ fn require_cgroup() {
 /// Mutant: `holds_via` reads `/proc/{pid}/cgroup` by absolute path.
 #[test]
 fn namespaces_cgroup_membership_is_read_through_the_given_proc_dirfd() {
-    if !ns::enabled() {
+    if !enabled() {
         return;
     }
-    require_cgroup();
     ns::run(fixture_path!(fixture_leaf_overmount));
 }
 
@@ -64,10 +61,9 @@ fn fixture_leaf_overmount() {
 /// Mutant: `holds` keeps only the source's kind.
 #[test]
 fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
-    if !ns::enabled() {
+    if !enabled() {
         return;
     }
-    require_cgroup();
     ns::run(fixture_path!(fixture_leaf_no_proc));
 }
 

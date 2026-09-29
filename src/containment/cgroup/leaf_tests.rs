@@ -235,10 +235,9 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 }
 
 // CgroupLeaf::wait_drained real-mechanism test -----
-// Linux + cgroup-v2 only, and only when CI provisions a delegated leaf (COSCA_TEST_CGROUP=1) —
-// the same gating convention `tests/spawn_io.rs`'s `linux_cgroup_v2_*` tests already use: a true
-// no-op without the marker, but a loud panic (never a silent pass) if the marker is set and no
-// usable delegated cgroup v2 leaf actually exists.
+// Linux + cgroup-v2 only. The `CGROUP` group (`crate::test_support`) runs them unless
+// `COSCA_TEST_CGROUP=0`, which CI's ordinary jobs set; enabled, they need
+// `COSCA_TEST_CGROUP_CONSENT=1` and fail loudly if no usable delegated cgroup v2 leaf exists.
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
@@ -259,13 +258,12 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        // Unprovisioned: not a CI-cgroup environment — true no-op, never a false "ok".
+    if !crate::test_support::require_group("CGROUP") {
         return;
     }
     let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
         panic!(
-            "COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created \
+            "the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created \
              ({e}) — is this process running inside a writable, delegated cgroup v2 slice with \
              cgroup.kill support (kernel >= 5.14)?"
         )
@@ -445,11 +443,11 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
-    if std::env::var_os("COSCA_TEST_CGROUP").is_none() {
-        return; // unprovisioned: not a CI-cgroup environment.
+    if !crate::test_support::require_group("CGROUP") {
+        return;
     }
     let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
-        panic!("COSCA_TEST_CGROUP is set but no usable delegated cgroup v2 leaf could be created ({e})")
+        panic!("the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created ({e})")
     });
     // SAFETY: `procs_fd` is open for as long as `leaf` lives.
     let flags = unsafe { libc::fcntl(leaf.procs_fd(), libc::F_GETFD) };
@@ -1144,40 +1142,6 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     );
 }
 
-/// The predicate `Child::drop` (async) uses to route a disarmed leaf's drain wait off the
-/// dropping thread and onto the reaper pool: true only once the child entered, `Drop` is
-/// disarmed, and a kill this handle already fired means `Drop` still waits for that kill's drain
-/// (see `a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains` above) —
-/// false for an armed leaf (its own `Drop` kills and waits synchronously by design) and false for
-/// a disarmed leaf nothing has killed yet (nothing to wait for).
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
-fn disarmed_kill_may_block_drop_is_true_only_once_entered_disarmed_and_killed() {
-    use crate::containment::cgroup::test_support::FakeLeaf;
-
-    // Not populated: if `Drop` runs at the end of this test, its drain wait (armed or disarmed)
-    // reads already-drained and returns at once, so no hook is needed to avoid a hang.
-    let fake = FakeLeaf::new("cosca-disarmed-predicate-leaf", false);
-    let leaf = entered_leaf_at(fake.leaf.clone());
-    assert!(
-        !leaf.disarmed_kill_may_block_drop(),
-        "an armed leaf's own Drop kills and waits itself; it never needs routing"
-    );
-
-    leaf.disarm();
-    assert!(
-        !leaf.disarmed_kill_may_block_drop(),
-        "a disarmed leaf nothing has killed yet has no drain to wait for"
-    );
-
-    leaf.hard_kill().expect("kill the tree");
-    assert!(
-        leaf.disarmed_kill_may_block_drop(),
-        "a disarmed leaf this handle already killed still waits for the drain in Drop, and that \
-         wait must be routed off the caller's thread"
-    );
-}
-
 /// #194 follow-up: in `Drop`'s never-killed branch, a first `rmdir` that fails is not always the
 /// caller's tree left running by request — a leaf can drain on its own (no kill needed) yet still
 /// hold an empty child cgroup a grandchild left behind. `cgroup.events` already reading
@@ -1432,10 +1396,6 @@ fn entered_real_leaf() -> (
 ) {
     use std::os::unix::process::CommandExt;
 
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
-    );
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("create a real leaf");
     let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
@@ -1529,9 +1489,11 @@ fn drop_under_a_mount(
 /// rather than retrying forever.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
 
     let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
@@ -1556,9 +1518,11 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
 /// real tree through the held leaf, and reports the leaf it cannot remove.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
 
     crate::log_capture::install();
     let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
@@ -1602,9 +1566,11 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 /// leaf. `Drop` kills, drains and removes the real leaf through the held directories.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
 
     let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
@@ -1631,12 +1597,10 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
 /// could not be watched. The half-made leaf is removed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
     let result = crate::containment::cgroup::try_create_leaf();
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
@@ -2344,16 +2308,13 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
 /// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
     use crate::containment::TreeDrain;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     // The member reports through a channel of its own, so the leaf's has nothing queued.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the member's channel");
@@ -2388,17 +2349,14 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
 /// nothing in the leaf is cosca's to kill: the occupant survives.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it() {
     use std::io::{Read, Write};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     use crate::containment::TreeDrain;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
@@ -2729,15 +2687,12 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 /// not cosca's to kill. It survives — proven by an echo — and the leaf is reported, not killed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child() {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
     // The occupant reports through a channel of its own, so the leaf's receives nothing.
@@ -3302,16 +3257,13 @@ fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
 /// the spawn fails closed — its child killed — and the read's own error is the reason given.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     use crate::containment::TreeDrain;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     // The child reports through a channel of its own, so the leaf's has nothing queued.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the child's channel");
@@ -3358,10 +3310,6 @@ fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fau
     use crate::containment::cgroup::test_support::occupied_leaf;
     use crate::containment::TreeDrain;
 
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
     let (mut leaf, mut child, _own) = occupied_leaf();
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_leaf_busy(true);
@@ -3390,8 +3338,10 @@ fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fau
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     assert_a_non_same_proc_view_fails_closed(
         crate::identity::proc_view_fault::ForcedView::Diverged,
         "outer pid namespace",
@@ -3400,8 +3350,10 @@ fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     assert_a_non_same_proc_view_fails_closed(
         crate::identity::proc_view_fault::ForcedView::Unassessable,
         "could not be established",
@@ -3435,12 +3387,10 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 /// regression hangs this test in `drop`.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     // Placed: killed through, drained, swept. Nothing received: swept without a kill.
     for placed in [true, false] {
         let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
@@ -3601,4 +3551,60 @@ fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
     let a = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     assert_ne!(a, b);
+}
+
+// Blocking waits refuse to run inside a bounded section -----
+//
+// These sit here, not in `bounded_tests`, because the waits are private to `leaf`. A wait that
+// lost its `assert_may_block` returns at once on the inputs below, so each test fails on "did not
+// panic" rather than hanging.
+
+/// `end_child` waits for a child's exit, so it refuses a section before it looks at its input.
+///
+/// Mutant: drop the assert from `end_child`.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn end_child_refuses_inside_a_section() {
+    let received = crate::containment::cgroup::Received {
+        report: None,
+        pid: None,
+        pidfd: None,
+        proc_dir: None,
+    };
+    let _section = crate::bounded::Section::enter();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::end_child(&received)));
+    assert!(refused.is_err(), "end_child must refuse inside a bounded section");
+}
+
+/// `fail_closed` waits for the killed child's exit, so it refuses a section before it signals
+/// anything.
+///
+/// Mutant: drop the assert from `fail_closed`.
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[test]
+fn fail_closed_refuses_inside_a_section() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-bounded-fail-closed");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .expect("spawn");
+    let channel = leaf.report.take().expect("the channel");
+    let refused = {
+        let _section = crate::bounded::Section::enter();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            leaf.fail_closed(child.id(), channel, "the test cannot decide")
+        }))
+    };
+    // A refusal happens before the kill, so the child is still ours to end.
+    _ = child.kill();
+    child.wait().expect("reap the child");
+    assert!(refused.is_err(), "fail_closed must refuse inside a bounded section");
 }

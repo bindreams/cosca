@@ -11,22 +11,11 @@ use std::path::Path;
 use rustix::mount::{mount, mount_bind, mount_change, MountPropagationFlags};
 use rustix::thread::{unshare_unsafe, UnshareFlags};
 
-const GROUP: &str = "COSCA_TEST_NAMESPACES";
-const CONSENT: &str = "COSCA_TEST_NAMESPACES_CONSENT";
-
-/// Whether the caller should run the group's body. `false` only for an explicit
-/// `COSCA_TEST_NAMESPACES=0`; otherwise panics unless consent was given.
+/// Whether the caller should run the group's body: `false` only for an explicit
+/// `COSCA_TEST_NAMESPACES=0`; otherwise panics unless `COSCA_TEST_NAMESPACES_CONSENT=1`. The
+/// group's shared gate is [`require_group`](crate::test_support::require_group).
 pub(crate) fn enabled() -> bool {
-    if std::env::var_os(GROUP).is_some_and(|v| v == "0") {
-        return false;
-    }
-    assert!(
-        std::env::var_os(CONSENT).is_some_and(|v| v == "1"),
-        "this test unshares namespaces and mounts, which must never run on a developer host. \
-         Run it in a container, VM or CI's root lane with {CONSENT}=1, or switch the group off \
-         with {GROUP}=0"
-    );
-    true
+    crate::test_support::require_group("NAMESPACES")
 }
 
 /// Re-exec this binary on `fixture`, to run as the child half of a test.

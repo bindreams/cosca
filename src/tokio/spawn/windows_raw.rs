@@ -16,9 +16,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{
-    TerminateProcess, WaitForSingleObject, INFINITE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-};
+use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, STARTF_USESTDHANDLES, STARTUPINFOEXW};
 
 use crate::child::spawn::windows_raw as sync_raw;
 use crate::child::spawn::{attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock};
@@ -191,24 +189,6 @@ impl RawAsyncChild {
     /// `true` once this backend has collected the child's exit status, so no wait remains.
     pub(crate) fn is_reaped(&self) -> bool {
         self.exited.is_some()
-    }
-
-    /// Wait for the child's exit; the caller has already signalled it. **Never kills:** a second
-    /// `TerminateProcess` on an already-exiting child returns `ACCESS_DENIED`, and the classified
-    /// kill decision (including a genuinely-undeniable runas child) was already made by
-    /// [`start_kill`](RawAsyncChild::start_kill)'s `can_terminate` probe.
-    pub(crate) fn wait_and_reap(&mut self) {
-        if self.exited.is_some() {
-            return;
-        }
-        // SAFETY: our live, owned process handle; INFINITE is bounded by the caller's kill.
-        let waited = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
-        debug_assert!(
-            waited == WAIT_OBJECT_0,
-            "raw async teardown did not observe child {} exit: {waited:?}",
-            self.pid
-        );
-        let _ = waited;
     }
 
     /// Install the per-instance test wait observer on THIS child (see `WaitObserver`).

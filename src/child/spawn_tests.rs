@@ -420,7 +420,6 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsRawFd;
@@ -430,10 +429,9 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use crate::test_spawn::spawn;
     use crate::test_stdio::RestoreStdio;
 
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let Some(done) = own_process(
         test_path!(cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio),
         spawn,
