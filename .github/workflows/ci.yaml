@@ -297,3 +297,24 @@ jobs:
       - name: Run setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
         run: cargo nextest run --locked --target ${{ matrix.target }} --test group_teardown_setuid --run-ignored only --profile ci
+
+      # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
+      # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
+      # helper must all be reachable by that uid: every directory above the checkout is made
+      # traversable and `target` readable. `sudo -E` keeps COSCA_TEST_SETUID_HELPER. The binary is
+      # run directly because nextest archives extract into a root-only tempdir; libtest exits 0
+      # when a filter matches nothing, so the log must show the test passing.
+      - name: Run setuid-root process-group teardown test as root (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          set -euxo pipefail
+          BIN=$(cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "group_teardown_setuid") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -x "$BIN"
+          chmod -R a+rX "$PWD/target"
+          d="$PWD"
+          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
+          sudo -E "$BIN" --ignored --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
+          cat "$RUNNER_TEMP/setuid-root.log"
+          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"

@@ -24,6 +24,16 @@
 //! implemented for Linux and macOS (see that module), so this gap does not exist on Windows
 //! regardless.
 //!
+//! # Running as root
+//! Root may signal the setuid helper, so the scenario needs an unprivileged caller. Started as
+//! root, the test re-executes this binary as uid 65534 (`nobody`), running only itself, and
+//! requires that run to pass. Both this test binary (so every directory on its path, e.g. the
+//! cargo target dir) and `COSCA_TEST_SETUID_HELPER` must be reachable by uid 65534: a `0700` home
+//! directory on the path makes the re-run fail to start. The re-run identifies itself by
+//! `COSCA_TEST_SETUID_RERUN` holding its parent's pid; a value inherited from elsewhere is an
+//! error, not proof of a re-run. The CI "Run setuid-root process-group teardown test as root"
+//! step exercises this path.
+//!
 //! # Gating
 //! This test is `#[ignore]`d by default, so an ordinary `cargo nextest run` — locally, or in every
 //! CI step that doesn't explicitly ask for it — counts it in the final `... skipped` tally, never
@@ -90,14 +100,44 @@ fn probe_kill0(pid: u32) -> Result<(), Option<i32>> {
 /// The uid this test re-executes itself as when started as root: `nobody`.
 const UNPRIVILEGED: u32 = 65534;
 
-/// Set in the re-executed child. The child then prints [`RERAN`] before its body, because libtest
-/// exits 0 when the filter matches no test.
+/// Set by the parent to its own pid; the re-executed child accepts it only if it equals its
+/// parent's pid (see [`rerun_role`]). The child then prints [`RERAN`] because libtest exits 0 when
+/// the filter matches no test.
 const RERUN_ENV: &str = "COSCA_TEST_SETUID_RERUN";
 const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
 
-/// Re-executes this test binary as [`UNPRIVILEGED`], running only this test, and requires it to
-/// pass. The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
-/// executable by anyone) and this binary must be reachable by that uid; if they are not, the
+/// The libtest `--exact` name of `$name`; a rename that misses this call site fails to compile
+/// instead of matching zero tests.
+macro_rules! test_path {
+    ($name:ident) => {{
+        let _: fn() = $name;
+        stringify!($name)
+    }};
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Role {
+    /// Started by a user or harness: no marker.
+    Fresh,
+    /// Re-executed by [`rerun_unprivileged`] in another process.
+    Rerun,
+}
+
+/// Classifies this process from the inherited [`RERUN_ENV`] value and its parent's pid. A value
+/// that is not the parent's pid was inherited from something else (a shell export, an outer
+/// harness) and is an error, never proof that this is the re-run.
+fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> {
+    match inherited {
+        None => Ok(Role::Fresh),
+        Some(v) if v == parent_pid.to_string() => Ok(Role::Rerun),
+        Some(v) => Err(format!(
+            "{RERUN_ENV}={v:?} is set in this process's environment but is not the pid of its parent ({parent_pid}), so it was inherited, not set by the re-run; unset it"
+        )),
+    }
+}
+
+/// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
+/// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
 fn rerun_unprivileged() {
     use std::os::unix::process::CommandExt as _;
@@ -105,12 +145,12 @@ fn rerun_unprivileged() {
     let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
         .args([
             "--exact",
-            "kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running",
+            test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(RERUN_ENV, "1")
+        .env(RERUN_ENV, std::process::id().to_string())
         .uid(UNPRIVILEGED)
         .gid(UNPRIVILEGED)
         .output()
@@ -122,6 +162,22 @@ fn rerun_unprivileged() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn rerun_role_without_the_variable_is_fresh() {
+    assert_eq!(rerun_role(None, 42), Ok(Role::Fresh));
+}
+
+#[test]
+fn rerun_role_accepts_the_parents_pid() {
+    assert_eq!(rerun_role(Some("42"), 42), Ok(Role::Rerun));
+}
+
+#[test]
+fn rerun_role_rejects_an_inherited_value_naming_the_variable() {
+    let err = rerun_role(Some("1"), 42).unwrap_err();
+    assert!(err.contains(RERUN_ENV) && err.contains("inherited"), "{err}");
 }
 
 /// One accepted control connection, classified by its first line:
@@ -171,18 +227,24 @@ fn accept_one(listener: &TcpListener) -> Handshake {
             run --test group_teardown_setuid --run-ignored only` — see this file's module docs"]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let helper = gated();
+    let role = rerun_role(
+        std::env::var(RERUN_ENV).ok().as_deref(),
+        std::os::unix::process::parent_id(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     // Root may signal anything, so the setuid helper would not be unsignalable and this scenario
-    // would not exist. Run it as the unprivileged caller it is about instead of failing.
+    // would not exist. Re-run as the unprivileged caller it is about.
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
         // Without this a re-run that is still root would re-execute itself without end.
-        assert!(
-            std::env::var_os(RERUN_ENV).is_none(),
+        assert_eq!(
+            role,
+            Role::Fresh,
             "the unprivileged re-run is still root: dropping to uid {UNPRIVILEGED} did not take effect"
         );
         return rerun_unprivileged();
     }
-    if std::env::var_os(RERUN_ENV).is_some() {
+    if role == Role::Rerun {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         writeln!(out, "\n{RERAN}")
