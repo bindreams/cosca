@@ -109,6 +109,111 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
+// Deadline contract for `wait_drained_raw`: never report `MembersRemain` before the real
+// deadline. Seams are documented in `crate::wait`.
+
+/// A live job with one still-running member: `cmd /C more`, blocked reading its own piped
+/// stdin until EOF. Mirrors `wait_drained_raw_tracks_a_real_member_through_exit` above.
+fn spawn_job_member() -> (std::process::Child, super::JobHandle) {
+    use std::os::windows::io::AsRawHandle;
+    let child = std::process::Command::new("cmd")
+        .args(["/C", "more"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cmd /C more");
+    let raw = child.as_raw_handle();
+    let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
+    (child, job)
+}
+
+fn let_member_exit(mut child: std::process::Child) {
+    drop(child.stdin.take());
+    child.wait().expect("wait for cmd /C more to exit");
+}
+
+/// A never-draining job armed with a sub-millisecond remainder rounds up to 1ms, reports
+/// `MembersRemain` only at the deadline, and derives its argument from the site's own deadline.
+///
+/// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
+/// Mutant: ignore the site's deadline -> `requested` is not 5ms.
+#[test]
+fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
+    use std::time::{Duration, Instant};
+    let (child, job) = spawn_job_member();
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    let deadline = at + Duration::from_millis(5);
+    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let reached = Instant::now() >= deadline;
+    let arms = crate::wait::wait_ms_probe::take();
+    let_member_exit(child);
+    assert_eq!(
+        verdict.expect("a live never-exiting member must not report a wait failure"),
+        crate::containment::TreeDrain::MembersRemain
+    );
+    assert!(reached, "the call returned before the real deadline");
+    let first = arms.first().expect("at least one armed wait");
+    assert_eq!(first.remaining, Duration::from_micros(500));
+    assert_eq!(first.ms, 1);
+    assert_eq!(
+        first.requested,
+        Duration::from_millis(5),
+        "the site must pass the time left to its own deadline (clock frozen at the deadline's origin)"
+    );
+}
+
+/// An early, unclamped `WAIT_TIMEOUT` hours before the deadline is not trusted: the site
+/// re-arms and reports the real drain.
+///
+/// Mutant: return `MembersRemain` on the first `WAIT_TIMEOUT` -> one arm, wrong verdict.
+#[test]
+fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
+    use std::time::{Duration, Instant};
+    let (mut child, job) = spawn_job_member();
+    let stdin = child.stdin.take().expect("piped stdin");
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin)); // EOF -> member exits for real
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let arms = crate::wait::wait_ms_probe::take();
+    child.wait().expect("reap the member after it exits");
+    assert_eq!(
+        verdict.expect("a genuinely-drained job must not report a wait failure"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+    assert!(arms.len() >= 2, "expected a re-arm, got {} arm(s)", arms.len());
+}
+
+/// A wait clamped below the deadline re-arms, recomputing `remaining` each round.
+///
+/// Mutant: return `MembersRemain` on the first `WAIT_TIMEOUT` -> one arm, wrong verdict.
+/// Mutant: hoist `remaining` above the loop -> `remaining` does not shrink.
+#[test]
+fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
+    use std::time::{Duration, Instant};
+    let (mut child, job) = spawn_job_member();
+    let stdin = child.stdin.take().expect("piped stdin");
+    let job_handle = job.as_handle().expect("freshly created job handle must be live");
+    crate::wait::wait_ms_probe::take();
+    let _clamp = crate::wait::wait_clamp_seam::set(5);
+    crate::wait::wait_ms_probe::on_second_arm(move || drop(stdin));
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let verdict = super::wait_drained_raw(job_handle, Some(Some(deadline)), None);
+    let arms = crate::wait::wait_ms_probe::take();
+    child.wait().expect("reap the member after it exits");
+    assert_eq!(
+        verdict.expect("a genuinely-drained job must not report a wait failure"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+    crate::wait::wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
+}
+
 /// Live coverage of the `Ok(true)` arm against a real console. `Ok(false)` needs the DETACHED
 /// helper in the integration suite (a different process); `Err` is not provokable live, hence
 /// the fault seam exercised below. This test does NOT guard the integration test against

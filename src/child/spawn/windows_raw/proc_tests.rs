@@ -1,8 +1,47 @@
 use std::os::windows::ffi::OsStrExt;
+use std::time::{Duration, Instant};
 
-use windows::Win32::System::Threading::{EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
+use windows::Win32::System::Threading::{CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
 
 use super::{create_process, win32_io_error, RawChild};
+
+/// Kills and reaps the wrapped `RawChild` when dropped — including during a panicking unwind —
+/// so a deadline-contract test fixture never leaks a live process if an assertion fails
+/// partway through. `RawChild::kill`/`wait` are both idempotent (an already-exited/-killed
+/// child is success), so this is safe even if a test also kills it explicitly on its own
+/// happy path.
+struct KillOnDrop(RawChild);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = RawChild;
+    fn deref(&self) -> &RawChild {
+        &self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A `CREATE_SUSPENDED` process: its thread never runs, so it never exits on its own. Held in
+/// `KillOnDrop` so a panic mid-test still kills and reaps it.
+fn spawn_suspended() -> KillOnDrop {
+    let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect(); // never actually runs
+    let mut si = STARTUPINFOEXW::default();
+    let (proc, pid) = create_process(
+        None,
+        &mut cmdline,
+        &mut si,
+        None,
+        &None,
+        EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
+    )
+    .expect("spawn suspended");
+    KillOnDrop(RawChild::new(proc, pid))
+}
 
 fn spawn_long_lived_runas() -> RawChild {
     // A real, NON-elevated child wrapped with the runas flag. `ping -n 5 127.0.0.1` runs
@@ -79,4 +118,83 @@ fn a_refused_cwd_is_reported_as_its_win32_code() {
     };
     assert_eq!(err.raw_os_error(), Some(267), "{err:?}");
     assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err:?}");
+}
+
+// Deadline contract for `RawChild::wait_deadline`: never report "still running" before the real
+// deadline. Seams are documented in `crate::wait`.
+
+/// A suspended child armed with a sub-millisecond remainder rounds up to 1ms, reports `None`
+/// only at the deadline, and derives its argument from the caller's deadline.
+///
+/// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
+/// Mutant: ignore the caller's deadline -> `requested` is not 5ms.
+#[test]
+fn wait_deadline_arms_the_ceiling_of_the_remaining_duration() {
+    let child = spawn_suspended();
+    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    let deadline = at + Duration::from_millis(5);
+    let result = child.wait_deadline(deadline);
+    let reached = Instant::now() >= deadline;
+    let arms = crate::wait::wait_ms_probe::take();
+    let status = result.expect("a live suspended child must not report a wait failure");
+    assert!(status.is_none(), "a suspended child never exits");
+    assert!(reached, "the call returned before the real deadline");
+    let first = arms.first().expect("at least one armed wait");
+    assert_eq!(first.remaining, Duration::from_micros(500));
+    assert_eq!(first.ms, 1);
+    assert_eq!(
+        first.requested,
+        Duration::from_millis(5),
+        "the site must pass the time left to the caller's deadline (clock frozen at its origin)"
+    );
+}
+
+/// An early, unclamped `WAIT_TIMEOUT` hours before the deadline is not trusted: the site
+/// re-arms and reports the real exit.
+///
+/// Mutant: return `None` on the first `WAIT_TIMEOUT` -> one arm, wrongly reports running.
+#[test]
+fn wait_deadline_never_reports_still_running_before_the_deadline() {
+    let child = spawn_suspended();
+    let raw_handle = child.handle(); // Copy; valid until `child` drops after the call
+    crate::wait::wait_ms_probe::take();
+    let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
+    crate::wait::wait_ms_probe::on_second_arm(move || {
+        // SAFETY: `child` outlives `wait_deadline`, which returns after this hook runs.
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let result = child.wait_deadline(deadline);
+    let arms = crate::wait::wait_ms_probe::take();
+    let status = result.expect("a genuinely-terminated child must not report a wait failure");
+    assert!(status.is_some(), "an early WAIT_TIMEOUT was trusted");
+    assert!(arms.len() >= 2, "expected a re-arm, got {} arm(s)", arms.len());
+}
+
+/// A wait clamped below the deadline re-arms, recomputing `remaining` each round.
+///
+/// Mutant: return `None` on the first `WAIT_TIMEOUT` -> one arm, wrongly reports running.
+/// Mutant: hoist `remaining` above the loop -> `remaining` does not shrink.
+#[test]
+fn wait_deadline_re_arms_past_a_clamped_timeout() {
+    let child = spawn_suspended();
+    let raw_handle = child.handle();
+    crate::wait::wait_ms_probe::take();
+    let _clamp = crate::wait::wait_clamp_seam::set(5);
+    crate::wait::wait_ms_probe::on_second_arm(move || {
+        // SAFETY: see `wait_deadline_never_reports_still_running_before_the_deadline`.
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let result = child.wait_deadline(deadline);
+    let arms = crate::wait::wait_ms_probe::take();
+    let status = result.expect("a genuinely-terminated child must not report a wait failure");
+    assert!(status.is_some(), "a clamped WAIT_TIMEOUT was trusted");
+    crate::wait::wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
 }

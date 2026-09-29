@@ -1,5 +1,7 @@
 //! Non-reaping, race-free death-watch and hard-kill for a `ProcessId`. `block_until_exit`
-//! blocks the calling thread in ONE kernel syscall until exit or timeout (no sleep-poll).
+//! blocks the calling thread until exit or timeout, never a sleep-poll: one kernel syscall on
+//! Linux/macOS; on Windows, one or more `WaitForSingleObject`/`WaitForMultipleObjects` calls in
+//! a row, only ever re-armed against the caller's own real deadline (see `wait_until`).
 //! NEVER reaps: the target's real parent collects the zombie.
 
 use std::time::{Duration, Instant};
@@ -116,19 +118,11 @@ pub(crate) mod test_clock {
     }
 
     /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
-    /// unfrozen clock already tracks real time on its own). Called automatically around every
-    /// completed round of a real, blocking wait keyed to a real `Instant` deadline — macOS's
-    /// `block_on_kqueue` after each `kevent` call, and the Linux cgroup drain loop's bounded arm
-    /// (`CgroupLeaf::wait_drained`) after each `wait_deadline` call — so a frozen clock a test
-    /// forgot to (or a bug failed to) advance explicitly can never make a GENUINELY elapsed real
-    /// wait invisible to `remaining`: even with no test hook ever calling [`advance`], `now`
-    /// eventually catches up to whatever real time was actually spent blocked in the kernel,
-    /// turning what would otherwise be an unbounded spin under a never-advancing mock clock
-    /// into, at worst, a wait bounded by the real timeouts genuinely requested — never a true
-    /// infinite loop.
-    ///
-    /// Genuinely dead code on Windows, which has neither caller.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// unfrozen clock already tracks real time on its own). Called after every real, blocking
+    /// wait keyed to a real `Instant` deadline — macOS's `block_on_kqueue` (`kevent`), the Linux
+    /// cgroup drain loop (`CgroupLeaf::wait_drained`), and Windows' `wait_until` — so a frozen
+    /// clock never hides a genuinely elapsed wait from `remaining`, and a re-arm loop under it
+    /// cannot spin forever.
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
         FROZEN.with(|f| {
             if let Some(cur) = f.get() {
@@ -225,6 +219,227 @@ pub(crate) fn instant_near_ceiling(start: Instant) -> Instant {
             return at;
         }
         step /= 2;
+    }
+}
+
+/// `d` rounded UP to whole milliseconds. `Duration::as_millis()` floors, so a sub-millisecond
+/// remainder would arm a non-blocking `0` poll instead of a wait. Pure and portable; call
+/// [`win32_timeout_ms`], which adds the clamp every call site needs.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+fn ceil_millis(d: Duration) -> u128 {
+    d.as_nanos().div_ceil(1_000_000)
+}
+
+/// Win32 `INFINITE` (`u32::MAX`); local because this module is portable.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+const WIN32_INFINITE: u32 = u32::MAX;
+
+/// The millisecond timeout ONE Win32 wait call (`WaitForSingleObject`/`WaitForMultipleObjects`)
+/// should be armed with for a REMAINING duration: `None` -> [`WIN32_INFINITE`]; `Some(d)` -> `d`
+/// ceiled to whole milliseconds ([`ceil_millis`]) and clamped to `WIN32_INFINITE - 1` (~49.7
+/// days), so a finite deadline never collides with the "no timeout" sentinel.
+///
+/// This is not a retry loop, and a `WAIT_TIMEOUT` from a wait armed with it is never proof the
+/// deadline passed. Per Microsoft's [Wait Functions and Time-out Intervals], "If the time-out
+/// interval is less than the resolution of the system clock, the wait may time out in less than
+/// the specified length of time", so even an unclamped, ceiled wait can return early; the clamp
+/// is a second, independent way for a wait to undershoot. Every site therefore rechecks the real
+/// deadline after each `WAIT_TIMEOUT` and re-arms, which `wait_until` does for all of them.
+///
+/// [Wait Functions and Time-out Intervals]: https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
+    match remaining {
+        None => WIN32_INFINITE,
+        Some(requested) => {
+            #[cfg(test)]
+            let d = remaining_override_seam::take().unwrap_or(requested);
+            #[cfg(not(test))]
+            let d = requested;
+            let ms = ceil_millis(d).min(win32_wait_clamp() as u128) as u32;
+            debug_assert!(
+                ms != WIN32_INFINITE,
+                "a finite remaining duration must never clamp up to the Win32 INFINITE sentinel"
+            );
+            #[cfg(test)]
+            wait_ms_probe::record(ms, d, requested);
+            ms
+        }
+    }
+}
+
+/// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other
+/// than `WAIT_TIMEOUT`, or the real `deadline` has passed (`WAIT_TIMEOUT` then). A `WAIT_TIMEOUT`
+/// is never trusted: the remaining time is recomputed from `deadline` each round and the wait
+/// re-armed (see [`win32_timeout_ms`]). `None`/`Some(None)` is unbounded.
+///
+/// Reads only the clock after `wait` returns, so `GetLastError` still holds `wait`'s error.
+#[cfg(windows)]
+pub(crate) fn wait_until(
+    deadline: Option<Option<Instant>>,
+    mut wait: impl FnMut(u32) -> windows::Win32::Foundation::WAIT_EVENT,
+) -> windows::Win32::Foundation::WAIT_EVENT {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+    loop {
+        #[cfg(test)]
+        let call_start = Instant::now();
+        let waited = wait(win32_timeout_ms(remaining(deadline)));
+        #[cfg(test)]
+        test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+        if waited != WAIT_TIMEOUT || remaining(deadline) == Some(Duration::ZERO) {
+            return waited;
+        }
+    }
+}
+
+/// The clamp [`win32_timeout_ms`] applies to a finite `remaining` (production:
+/// `WIN32_INFINITE - 1`); [`wait_clamp_seam`] lowers it so tests reach the re-arm path quickly.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+fn win32_wait_clamp() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = wait_clamp_seam::get() {
+        return v;
+    }
+    WIN32_INFINITE - 1
+}
+
+// Test seams =====
+// For the Windows wait sites: thread-local, each guard restores the production default on drop,
+// including mid-panic.
+
+/// Overrides the clamp [`win32_timeout_ms`] applies. Portable, so pure unit tests can use it.
+#[cfg(test)]
+pub(crate) mod wait_clamp_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE_MS: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+    #[must_use]
+    pub(crate) fn set(ms: u32) -> Guard {
+        OVERRIDE_MS.with(|c| c.set(Some(ms)));
+        Guard(())
+    }
+    pub(crate) fn get() -> Option<u32> {
+        OVERRIDE_MS.with(|c| c.get())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE_MS.with(|c| c.set(None));
+        }
+    }
+}
+
+/// Forces the NEXT [`win32_timeout_ms`] call with a `Some` remaining to use a chosen duration,
+/// so a ceiling-versus-truncation divergence shows in the recorded `ms` alone instead of
+/// depending on landing on a sub-millisecond remainder by chance. Consumed once; the guard
+/// clears an unconsumed override on drop.
+#[cfg(test)]
+pub(crate) mod remaining_override_seam {
+    use std::cell::Cell;
+    use std::time::Duration;
+    thread_local! {
+        static OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+    #[must_use]
+    pub(crate) fn set(d: Duration) -> Guard {
+        OVERRIDE.with(|c| c.set(Some(d)));
+        Guard(())
+    }
+    pub(crate) fn take() -> Option<Duration> {
+        OVERRIDE.with(|c| c.take())
+    }
+    pub(crate) struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(None));
+        }
+    }
+}
+
+/// Records every wait a site arms via [`win32_timeout_ms`]: the `ms` chosen, the `remaining` it
+/// was computed from (after any [`remaining_override_seam`] substitution), and the `requested`
+/// remaining the site itself passed in. Tests assert `ms == expected_ms(remaining, clamp)`
+/// exactly, that `remaining` strictly shrinks across re-arms (recomputed each round, not
+/// hoisted), and that `requested` derives from the site's real deadline.
+#[cfg(test)]
+pub(crate) mod wait_ms_probe {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Arm {
+        pub(crate) ms: u32,
+        pub(crate) remaining: Duration,
+        pub(crate) requested: Duration,
+    }
+
+    thread_local! {
+        static RECORDED: RefCell<Vec<Arm>> = const { RefCell::new(Vec::new()) };
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn record(ms: u32, remaining: Duration, requested: Duration) {
+        let count = RECORDED.with(|r| {
+            let mut r = r.borrow_mut();
+            r.push(Arm {
+                ms,
+                remaining,
+                requested,
+            });
+            r.len()
+        });
+        // Runs on the waiting thread before the second real wait starts.
+        if count == 2 {
+            if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
+        }
+    }
+
+    /// Run `hook` when the SECOND arm is recorded: ends a wait through a real event exactly when
+    /// the site has re-armed past its first `WAIT_TIMEOUT`.
+    // Only Windows tests register a hook.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn on_second_arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Drain everything recorded on this thread, and drop any unconsumed hook.
+    // Only Windows tests read the probe back.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn take() -> Vec<Arm> {
+        HOOK.with(|h| *h.borrow_mut() = None);
+        RECORDED.with(|r| r.take())
+    }
+
+    /// Assert a clamped wait re-armed (at least two arms), that each armed exactly
+    /// `expected_ms(remaining, clamp)`, and that `remaining` shrank strictly across arms.
+    // Only Windows tests call it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    #[track_caller]
+    pub(crate) fn assert_rearmed_with_fresh_remaining(arms: &[Arm], clamp: u32) {
+        assert!(arms.len() >= 2, "expected a re-arm, got {} arm(s)", arms.len());
+        for arm in arms {
+            assert_eq!(arm.ms, expected_ms(arm.remaining, clamp), "{arm:?}");
+        }
+        for pair in arms.windows(2) {
+            assert!(
+                pair[1].remaining < pair[0].remaining,
+                "remaining must be recomputed each round: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// The `ms` a site must arm for `remaining` under `clamp`: `ceil(remaining)` in whole
+    /// milliseconds, capped at `clamp`. Independent of `ceil_millis`.
+    // Only Windows tests call it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn expected_ms(remaining: Duration, clamp: u32) -> u32 {
+        let ceil = remaining.as_nanos().div_ceil(1_000_000);
+        u32::try_from(ceil.min(u128::from(clamp))).expect("capped at a u32 clamp")
     }
 }
 

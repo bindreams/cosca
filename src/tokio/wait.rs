@@ -94,9 +94,11 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
 /// Non-reaping and signal-free; identity-verified (a stale/recycled id reports exited).
 /// `Duration::ZERO` performs the sync backend's one-shot non-blocking probe.
 ///
-/// **Windows:** Graces >= ~49.7 days (`INFINITE - 1` ms) are silently clamped to that cap —
-/// a platform limit. A debug_assert surfaces this clamping in tests. On production, the clamp
-/// is silent; a use case needing a genuinely unbounded watch composes `wait()` (unbounded,
+/// **Windows:** a single `WaitForMultipleObjects` call is capped at ~49.7 days
+/// (`INFINITE - 1` ms — `WaitForMultipleObjects` reserves `INFINITE` itself as the "no
+/// timeout" sentinel), but a grace longer than that is still honored correctly: the backend
+/// re-arms past the cap rather than reporting the process still alive once the cap elapses. A
+/// use case needing a genuinely unbounded watch still composes `wait()` (unbounded,
 /// cancellable) with its own escalation instead of a grace.
 #[cfg(windows)]
 pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
