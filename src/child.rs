@@ -509,12 +509,10 @@ impl Child {
 /// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
 /// statement about any member or any input — so it, alone, is treated as a mechanism failure
 /// here.
-// Both `Drop` impls used to call this directly, in a `debug_assert!` principle 7 forbids
-// (asserting on a real OS outcome) — now removed in favor of the existing `log::warn!` path. On
-// Linux/Windows its only remaining non-test caller is macOS-only (`fdmarker.rs`'s
-// `combine_group_errors`), so this warns as dead code there without the allowance below. Still
-// unit-tested everywhere (`child_tests.rs`, `tokio/child_drop_tests.rs`).
-#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+// Its only non-test caller is macOS-only (`fdmarker.rs`'s `combine_group_errors`); the `Drop`
+// impls no longer assert on it (principle 7). The tests that use it are feature- or OS-gated, so
+// it is dead code on every other lane, including `--no-default-features` test builds.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
     matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
 }
