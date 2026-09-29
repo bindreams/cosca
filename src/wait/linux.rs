@@ -1,8 +1,11 @@
-//! Linux death-watch + kill via pidfd (kernel >= 5.3). `pidfd_open` returns a fd that
+//! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` on < 5.3 => Unsupported.
-//! The `/proc` checks behind `open_verified` use `openat2` (kernel >= 5.6); on 5.3 to 5.5 a live
-//! target is `Unassessable`.
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` from `pidfd_open` =>
+//! Unsupported.
+//!
+//! cosca requires Linux >= 5.6 (see the crate root's "Platform requirements"). The syscalls
+//! behind it: `pidfd_open` needs 5.3; `waitid(P_PIDFD)`, 5.4; the `/proc` checks behind
+//! `open_verified` use `openat2`, 5.6. On 5.3 to 5.5 a live target is `Unassessable`.
 
 use std::os::fd::AsFd;
 use std::time::Instant;
@@ -35,7 +38,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
         Err(rustix::io::Errno::NOSYS) => Err(Error::Unsupported {
             op: "foreign process wait/kill".into(),
             platform: "linux",
-            detail: "pidfd_open requires Linux kernel >= 5.3".into(),
+            detail: "cosca requires Linux >= 5.6, and pidfd_open (Linux >= 5.3) is not available here".into(),
         }),
         Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }

@@ -587,7 +587,8 @@ impl Command {
 
     /// Contain the child's whole process tree using the strongest mechanism
     /// available, so dropping or `kill_tree`-ing the child tears down every
-    /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
+    /// descendant. See [`crate::Containment`] for the per-OS mechanisms, and the crate root's
+    /// "Platform requirements" for the Linux kernel they assume.
     ///
     /// # Linux: the child must stay this process's to reap
     /// Until `spawn` returns, cosca tells by the child's pid whether it entered its cgroup, and may

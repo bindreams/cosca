@@ -83,6 +83,12 @@ process:
 - a cgroup, since `cgroup.kill` names no PID;
 - on Windows, a process handle or Job Object.
 
+On Linux cosca requires a pidfd for every child it spawns. When `pidfd_open` is refused (a kernel
+before 5.3, or a seccomp profile that blocks it), spawn fails with `Error::Unsupported`, and cosca
+never reaps by pid. macOS has no pidfd, so it reaps by pid, only while the process is an unreaped
+child. A macOS `Drop` that cannot confirm its child is ours leaks the child with a `warn` naming
+the pid; it never reaps on a guess.
+
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
 zombie until the group kill is done.
 

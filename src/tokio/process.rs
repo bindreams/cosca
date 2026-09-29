@@ -72,7 +72,8 @@ impl Process {
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
     /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (incl.
-    /// `Unsupported` on Linux < 5.3). Dropping the future cancels the watch on every
+    /// `Unsupported` where the Linux requirements are unmet: see the crate root's "Platform
+    /// requirements"). Dropping the future cancels the watch on every
     /// platform (the Windows watcher is released via its cancel event).
     ///
     /// # Runtime

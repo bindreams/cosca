@@ -6,6 +6,8 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 The API is not stable; expect breaking changes in any 0.x release.
 
+Platform requirements, including Linux 5.6 or newer, are in the crate documentation.
+
 The design rules every change follows are in [docs/principles.md](docs/principles.md).
 
 ## Running tests

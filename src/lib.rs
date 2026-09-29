@@ -4,6 +4,22 @@
 //! spawn it into an owned [`Child`], or attach to an already-running process by
 //! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
+//!
+//! # Platform requirements
+//!
+//! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
+//! Each requirement comes from a different syscall:
+//!
+//! - `pidfd_open` needs 5.3. cosca requires a pidfd for every child it spawns on Linux. A kernel
+//!   or seccomp profile that refuses the call is unsupported.
+//! - `waitid(P_PIDFD)` needs 5.4. It is how a pidfd waits without a pid-reuse race.
+//! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
+//!   checked `/proc` view uses it to read a process's identity.
+//!
+//! [`Containment::CgroupV2`] additionally assumes kernel commit `b69bb476dee9` ("cgroup: fix race
+//! between fork and cgroup.kill"): mainline 6.14, or a stable kernel that carries it (for example
+//! 6.1.129, 6.12.16, 6.13.4). cosca does not probe for it. What its absence costs is described
+//! under [`Command::kill_on_drop`].
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
