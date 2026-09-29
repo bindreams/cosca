@@ -216,7 +216,7 @@ fn a_child_killed_before_reporting_its_pid_is_left_unreaped_and_named() {
 fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let mut std_cmd = std::process::Command::new("true");
     let guard = super::super::spawn_lock();
-    let handshake = super::install(&mut std_cmd, &guard).expect("install");
+    let handshake = super::register(&mut std_cmd).open(&guard).expect("open");
     let result = handshake.run(
         || Err::<(), _>(std::io::Error::other("failed before the fork")),
         |()| None,

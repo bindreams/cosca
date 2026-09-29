@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
-use crate::child::spawn::{build_std_command, dup, resolve_identity, resolve_stdio, PipeOwnership};
+#[cfg(not(target_os = "linux"))]
+use crate::child::spawn::build_std_command;
+use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
 #[cfg(unix)]
@@ -118,6 +120,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         return Ok(child);
     }
 
+    #[cfg(target_os = "linux")]
+    let (std_cmd, handshake) =
+        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)?;
+    #[cfg(not(target_os = "linux"))]
     let std_cmd = build_std_command(cmd)?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
@@ -334,10 +340,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         let _guard = crate::child::spawn::spawn_lock();
 
         // Linux: the child is held before `exec` until the parent has opened its pidfd; the
-        // pidfd itself is dropped here, as tokio's child has no place for it. Registered before
-        // `fd_map`'s hook, which may `dup2` a mapping onto the channel's descriptor number.
+        // pidfd itself is dropped here, as tokio's child has no place for it. Its hook was
+        // registered first of all, so `fd_map`'s, which may `dup2` a mapping onto the channel's
+        // descriptor number, runs after it is done.
         #[cfg(target_os = "linux")]
-        let handshake = crate::child::spawn::pidfd_handshake::install(tcmd.as_std_mut(), &_guard)?;
+        let handshake = handshake.open(&_guard)?;
 
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
