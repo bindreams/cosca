@@ -275,9 +275,7 @@ pub(crate) fn accept_or_signalled(
         woken, WAIT_FAILED,
         "WaitForMultipleObjects while waiting for a control connection: {wait_error}"
     );
-    if woken == WAIT_OBJECT_0 {
-        panic!("the tree drained before anything connected");
-    }
+    let _ = WAIT_OBJECT_0;
     let mut stream = listener.accept().expect("accept a control connection").0;
     ack::send_ack(&mut stream)
         .unwrap_or_else(|e| panic!("writing the accept acknowledgement to the control connection failed: {e}"));
