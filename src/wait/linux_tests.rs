@@ -143,8 +143,11 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
     }
 }
 
+/// The start of every `Unassessable` message.
+const UNASSESSABLE: &str = "identity could not be confirmed";
+
 /// `Unassessable` carrying `needles` in its message, with an OS error as `source()` iff
-/// `expect_source`, logged once at `warn` (`marker` finds the record).
+/// `expect_source`, logged once at `warn` on this thread (`marker` finds the record).
 fn assert_unassessable_with_cause(
     result: Result<bool, crate::error::Error>,
     needles: &[&str],
@@ -167,8 +170,12 @@ fn assert_unassessable_with_cause(
         expect_source,
         "source() must be the OS error behind the cause, when there is one: {text}"
     );
+    let levels: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, marker)
+        .into_iter()
+        .map(|(level, _)| level)
+        .collect();
     assert_eq!(
-        crate::log_capture::levels_since(mark, marker),
+        levels,
         vec![log::Level::Warn],
         "the verdict must be logged once, at warn: {text}"
     );
@@ -264,14 +271,19 @@ fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
 #[test]
 fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     crate::log_capture::install();
-    let what = "einval-arm-exists-unknown probe";
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait, what);
+    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait);
     drop(forced_exists);
     drop(forced_errno);
-    assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], true, what, mark);
+    assert_unassessable_with_cause(
+        result.map(|fd| fd.is_some()),
+        &["existence query"],
+        true,
+        UNASSESSABLE,
+        mark,
+    );
 }
 
 /// Twin for the post-open re-verify: a real pidfd on a live child, `exists()` forced `Unknown`.
@@ -428,14 +440,11 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
 /// The SUCCESS path with the pidfd's fdinfo `Pid:` forced: the target's pid as the mounted
 /// procfs numbers it. `ProcessId::current()` is a live target, so `pidfd_open` really succeeds.
 ///
-/// `what` is unique per test: it is the marker a test finds its own log record by, since every
-/// test using `ProcessId::current()` shares one pid.
 fn open_verified_current_with_fdinfo(
     answer: Result<PidfdTarget, i32>,
-    what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
-    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait, what);
+    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait);
     drop(forced);
     result
 }
@@ -446,19 +455,42 @@ fn open_verified_current_with_fdinfo(
 fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
     crate::log_capture::install();
     let own = std::process::id();
-    for (named, what) in [
-        (0, "fdinfo-names-pid-0 probe"),
-        (own + 1, "fdinfo-names-other-pid probe"),
-    ] {
+    for named in [0, own + 1] {
         let mark = crate::log_capture::mark();
-        let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(named)), what);
+        let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(named)));
         assert_unassessable_with_cause(
             result.map(|fd| fd.is_some()),
             &["outer pid namespace", &format!("numbers the target {named}")],
             false,
-            what,
+            UNASSESSABLE,
             mark,
         );
+    }
+}
+
+/// An `Unassessable` verdict ends with what the operation left undone.
+///
+/// Mutants: two operations' consequences swapped; the consequence dropped from the message.
+#[test]
+fn an_unassessable_verdict_ends_with_what_its_operation_left_undone() {
+    use super::PidfdOp;
+
+    crate::log_capture::install();
+    for (op, consequence) in [
+        (PidfdOp::Wait, "its exit cannot be observed"),
+        (PidfdOp::Kill, "no signal was sent"),
+        (PidfdOp::Terminate, "no signal was sent"),
+        (PidfdOp::GroupTeardown, "process-group teardown verification"),
+    ] {
+        let forced = crate::identity::proc_view_fault::force_fdinfo_once(Ok(PidfdTarget::Pid(0)));
+        let result = super::open_verified(ProcessId::current(), op);
+        drop(forced);
+        match result {
+            Err(e @ Error::Unassessable { .. }) => {
+                assert!(e.to_string().ends_with(&format!("; {consequence}")), "{op:?}: {e}")
+            }
+            other => panic!("{op:?}: expected Unassessable, got {other:?}"),
+        }
     }
 }
 
@@ -466,14 +498,13 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
 #[test]
 fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
     crate::log_capture::install();
-    let what = "fdinfo-unreadable probe";
     let mark = crate::log_capture::mark();
-    let result = open_verified_current_with_fdinfo(Err(libc::EACCES), what);
+    let result = open_verified_current_with_fdinfo(Err(libc::EACCES));
     assert_unassessable_with_cause(
         result.map(|fd| fd.is_some()),
         &["fdinfo could not be read"],
         true,
-        what,
+        UNASSESSABLE,
         mark,
     );
 }
@@ -482,9 +513,9 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 /// through the same `/proc` dirfd.
 #[test]
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
-    let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())), "fdinfo-matches probe");
+    let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())));
     assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
-    let unforced = super::open_verified(ProcessId::current(), super::PidfdOp::Wait, "test probe");
+    let unforced = super::open_verified(ProcessId::current(), super::PidfdOp::Wait);
     assert!(
         matches!(unforced, Ok(Some(_))),
         "the real fdinfo must match too, got {unforced:?}"
@@ -495,7 +526,7 @@ fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
 /// Mutant: "`Reaped` is `Unassessable`".
 #[test]
 fn open_verified_reports_gone_when_the_pidfds_fdinfo_says_the_target_was_reaped() {
-    let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Reaped), "fdinfo-reaped probe");
+    let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Reaped));
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -509,7 +540,7 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
         .found()
         .expect("the unreaped child has an identity");
     child.wait().expect("reap the child");
-    let result = super::verify_pidfd_target(id, pidfd, "reaped-after-open probe");
+    let result = super::verify_pidfd_target(id, pidfd, super::PidfdOp::Wait);
     assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
@@ -518,18 +549,23 @@ fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
 #[test]
 fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     crate::log_capture::install();
-    let what = "success-path-exists-unknown probe";
     let mark = crate::log_capture::mark();
     let forced = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait, what);
+    let result = super::open_verified(ProcessId::current(), super::PidfdOp::Wait);
     drop(forced);
-    assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], false, what, mark);
+    assert_unassessable_with_cause(
+        result.map(|fd| fd.is_some()),
+        &["existence query"],
+        false,
+        UNASSESSABLE,
+        mark,
+    );
 }
 
 // `pidfd_open` refusals =====
 
-/// A live child of this test process that blocks until the returned gate is dropped, and is
-/// killed and reaped when the first value drops. A target no test's mutant can hurt beyond it.
+/// A live child that blocks until the returned gate drops and is killed and reaped when the first
+/// value drops.
 fn live_child() -> (
     crate::containment::cgroup::test_support::KillOnDrop,
     std::io::PipeWriter,
@@ -546,9 +582,8 @@ fn live_child() -> (
 
 /// `open` on a live child with `pidfd_open` forced to `errno`, and the error it answers.
 ///
-/// A forced errno the code under test does not consume would let `open` act on the live child;
-/// `open` must therefore be zero-wait, so that outcome fails the caller's assertion at once
-/// instead of hanging.
+/// `open` must be zero-wait: an unconsumed forced errno then fails the assertion instead of
+/// hanging on the live child.
 fn refused_with(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result<(), Error>) -> Error {
     let (_child, _gate, id) = live_child();
     let forced = super::fault::force_pidfd_open_errno_once(errno);
@@ -561,11 +596,10 @@ fn refused_with(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result
 }
 
 fn open_op(op: super::PidfdOp) -> impl FnOnce(ProcessId) -> Result<(), Error> {
-    move |id| super::open_verified(id, op, "test probe").map(drop)
+    move |id| super::open_verified(id, op).map(drop)
 }
 
-/// Every refusal is `Unsupported` in the policy's message shape. `EACCES` is the seccomp or LSM
-/// answer of kernels since 6.9; `ENODEV` and `EPERM` can only come from a filter.
+/// Every refusal is `Unsupported` in the policy's message shape.
 ///
 /// Mutants: `EACCES` (or any other) missing from `refusal_name`; the detail carries a guessed
 /// cause; a different `Errno` name.

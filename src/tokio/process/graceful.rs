@@ -14,6 +14,8 @@ impl Process {
     ///
     /// A watch failure surfaces only after the kill runs; a kill error wins over it.
     /// Dropping this future mid-grace cancels the watch and performs no further signalling.
+    /// On Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)), naming the step it hit:
+    /// terminate, the grace wait, or the kill.
     ///
     /// # Runtime
     ///
@@ -45,7 +47,8 @@ impl Process {
     /// A grace-watch failure does not strand the tree: the hard sweep still runs, and the
     /// watch error is surfaced afterward; a sweep failure would win over it. Dropping this
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
-    /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
+    /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown). On Linux the watch
+    /// error includes a refused `pidfd_open` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
         let watch = crate::tokio::wait::grace_wait(self.id(), grace).await;

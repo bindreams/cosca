@@ -121,6 +121,27 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// An operation isn't available on this platform / in this build.
+    ///
+    /// # A refused `pidfd_open` on Linux
+    ///
+    /// Every Linux operation that observes or signals a process by identity needs a pidfd
+    /// (kernel 5.3 or later): [`Process::wait`](crate::Process::wait),
+    /// [`wait_timeout`](crate::Process::wait_timeout), [`kill`](crate::Process::kill),
+    /// [`terminate`](crate::Process::terminate), the `graceful_shutdown*` family, and their
+    /// `tokio` twins. When `pidfd_open` is refused they fail with this variant,
+    /// with `op` naming the operation that needed it (`process wait`, `process kill`,
+    /// `process terminate`) and `detail` naming the errno.
+    ///
+    /// - `ENOSYS`: the kernel predates 5.3, or a seccomp filter hides the syscall.
+    /// - `EPERM` and `EACCES`: the kernel's own `pidfd_open` never returns them, so a seccomp
+    ///   filter or an LSM is answering.
+    /// - `ENODEV`: documented by `pidfd_open(2)` for a kernel without the anonymous-inode
+    ///   filesystem. Such a kernel fails at boot, so in practice a filter or LSM is answering;
+    ///   either way no pidfd is possible.
+    ///
+    /// Any other failure is transient and surfaces as [`Error::Io`], prefixed `pidfd_open:`
+    /// (`EMFILE`, `ENFILE`, `ENOMEM`). A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
+    /// for a non-leader thread) is not an error: the operation reports it as exited.
     #[error("{op} is not supported on {platform}: {detail}")]
     Unsupported {
         op: String,

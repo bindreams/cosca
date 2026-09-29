@@ -412,10 +412,8 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// **How `open_verified`'s answers map here.**
 /// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
-/// - `Error::Unsupported` (`pidfd_open` refused: `ENOSYS` from a kernel < 5.3 or a filter, or
-///   `EPERM`, `EACCES` or `ENODEV` from a seccomp or LSM filter) and `Error::Io` (a transient
-///   `pidfd_open` failure such as `EMFILE`, or a `poll` failure) fall back to `check_or_signal`'s plain
-///   `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
+/// - `Error::Unsupported` (`pidfd_open` refused) and `Error::Io` (a transient `pidfd_open`
+///   failure, or a `poll` failure) fall back to `check_or_signal`'s plain `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
 ///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
@@ -447,11 +445,7 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// (`classify_member`) let it through to the attempt.
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId) -> Reached {
-    match crate::wait::backend::open_verified(
-        id,
-        crate::wait::backend::PidfdOp::GroupTeardown,
-        "process-group teardown verification",
-    ) {
+    match crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::GroupTeardown) {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
             Ok(()) => Reached::Yes,
