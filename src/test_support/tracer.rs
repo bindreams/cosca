@@ -426,9 +426,20 @@ impl TracerHelper<'_> {
 /// The exit status of a tracee spawned to catch `SIGTERM`, once it gets one.
 pub(crate) const SIGTERM_EXIT: i32 = 15;
 
+/// What [`uh_tracee_fixture`] writes to its stdout once its handlers and ignores are set up.
+pub(crate) const TRACEE_READY: &[u8] = b"uh-tracee: ready\n";
+/// What its `SIGTSTP` handler writes to stdout.
+pub(crate) const TRACEE_HANDLED_SIGTSTP: &str = "uh-tracee: handled SIGTSTP\n";
+
 /// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
 /// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
 pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
+    spawn_tracee_with(if catch_sigterm { "SIGTERM" } else { "" }, "", false)
+}
+
+/// [`spawn_tracee`] with the signals it `catch`es and `ignore`s, each a comma-separated list of
+/// `SIGTERM` or `SIGTSTP`; and, with `pipe_stdout`, its stdout piped instead of null.
+pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) -> crate::Child {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
@@ -438,33 +449,66 @@ pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
             "--exact",
             crate::test_child::fixture_path!(uh_tracee_fixture),
         ])
-        .env("COSCA_UH_ROLE", "tracee");
-    if catch_sigterm {
-        cmd.env("COSCA_UH_CATCH", "SIGTERM");
-    }
+        .env("COSCA_UH_ROLE", "tracee")
+        .env("COSCA_UH_CATCH", catch)
+        .env("COSCA_UH_IGNORE", ignore);
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("stdout null");
+    let stdout = if pipe_stdout {
+        crate::Stdio::pipe()
+    } else {
+        crate::Stdio::null()
+    };
+    cmd.stdout(stdout).expect("stdout");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
     cmd.spawn().expect("spawn the tracee fixture")
 }
 
-/// The tracee: reads stdin until EOF or one byte, then exits 0. A no-op unless
-/// `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
+/// The tracee: sets up the signals named by `COSCA_UH_CATCH` and `COSCA_UH_IGNORE`, writes
+/// [`TRACEE_READY`] to stdout, then reads stdin until EOF or one byte, then exits 0. A no-op
+/// unless `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
 #[test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
     }
-    if std::env::var("COSCA_UH_CATCH").as_deref() == Ok("SIGTERM") {
-        extern "C" fn exit_on_sigterm(_: libc::c_int) {
-            // SAFETY: `_exit` is async-signal-safe.
-            unsafe { libc::_exit(SIGTERM_EXIT) }
-        }
-        // SAFETY: the handler calls only `_exit`; this process runs no other test.
-        let previous = unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
-        assert_ne!(previous, libc::SIG_ERR, "install the SIGTERM handler");
+    extern "C" fn exit_on_sigterm(_: libc::c_int) {
+        // SAFETY: `_exit` is async-signal-safe.
+        unsafe { libc::_exit(SIGTERM_EXIT) }
     }
+    extern "C" fn note_sigtstp(_: libc::c_int) {
+        write_stdout(TRACEE_HANDLED_SIGTSTP.as_bytes());
+    }
+    let install = |name: &str, action: libc::sighandler_t| {
+        let signal = match name {
+            "SIGTERM" => libc::SIGTERM,
+            "SIGTSTP" => libc::SIGTSTP,
+            other => panic!("the tracee fixture cannot set up {other:?}"),
+        };
+        // SAFETY: the handlers call only async-signal-safe functions; this process runs no other
+        // test.
+        let previous = unsafe { libc::signal(signal, action) };
+        assert_ne!(previous, libc::SIG_ERR, "set up {name}");
+    };
+    let names = |var: &str| std::env::var(var).unwrap_or_default();
+    for name in names("COSCA_UH_CATCH").split(',').filter(|n| !n.is_empty()) {
+        let handler = if name == "SIGTERM" {
+            exit_on_sigterm as *const () as libc::sighandler_t
+        } else {
+            note_sigtstp as *const () as libc::sighandler_t
+        };
+        install(name, handler);
+    }
+    for name in names("COSCA_UH_IGNORE").split(',').filter(|n| !n.is_empty()) {
+        install(name, libc::SIG_IGN);
+    }
+    write_stdout(TRACEE_READY);
     let _ = sys::read_byte(0);
+}
+
+/// `write(2)` to fd 1, async-signal-safe. A failed write is ignored: the reader is gone.
+fn write_stdout(bytes: &[u8]) {
+    // SAFETY: `bytes` is a valid buffer.
+    let _ = unsafe { libc::write(1, bytes.as_ptr().cast(), bytes.len()) };
 }
 
 /// The helper's entry point. A no-op unless `COSCA_UH_ROLE=helper`.
