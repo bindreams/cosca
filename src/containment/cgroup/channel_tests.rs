@@ -23,7 +23,7 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
     // async-signal-safe operations (two writes and a close).
     unsafe {
         cmd.pre_exec(move || {
-            let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, slot);
+            _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, slot);
             Ok(())
         });
     }
@@ -58,7 +58,7 @@ fn placement_report_records_a_successful_write() {
     // closure closes only the child's copy.
     unsafe {
         cmd.pre_exec(move || {
-            let _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(fd, slot);
+            _ = crate::containment::cgroup::place_self_in_cgroup_pre_exec(fd, slot);
             Ok(())
         });
     }
@@ -88,7 +88,7 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
         block_on(gate);
         // SAFETY: the channel's child end is this child's inherited copy; its parent holds
         // its own end.
-        let _ = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
+        _ = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
     });
     let pid = guard.pid();
     let (polling_tx, polling_rx) = std::sync::mpsc::channel();

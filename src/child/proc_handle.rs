@@ -84,7 +84,7 @@ impl ProcHandle {
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
                     StdTeardown::ReapBlocking => {
-                        let _ = s.wait();
+                        _ = s.wait();
                     }
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
                     // child is still running (an elevated child we cannot signal), warn.

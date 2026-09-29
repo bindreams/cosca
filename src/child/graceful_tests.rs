@@ -61,8 +61,8 @@ fn cleanup(child: &mut crate::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = child.kill_tree();
-        let _ = child.wait();
+        _ = child.kill_tree();
+        _ = child.wait();
     }
 }
 
@@ -526,7 +526,7 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     );
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    let _ = child.kill_tree();
+    _ = child.kill_tree();
 }
 
 // A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held

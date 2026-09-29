@@ -145,7 +145,7 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => {
-                let _ = self.wait();
+                _ = self.wait();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
@@ -154,7 +154,7 @@ impl RawChild {
                         self.pid
                     );
                 } else {
-                    let _ = self.wait();
+                    _ = self.wait();
                 }
             }
             Err(e) => log::warn!("terminating child {} on drop failed: {e:?}", self.pid),

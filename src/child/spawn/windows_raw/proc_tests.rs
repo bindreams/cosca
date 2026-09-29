@@ -21,8 +21,8 @@ impl std::ops::Deref for KillOnDrop {
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        _ = self.0.kill();
+        _ = self.0.wait();
     }
 }
 
@@ -164,7 +164,7 @@ fn wait_deadline_never_reports_still_running_before_the_deadline() {
     crate::wait::wait_ms_probe::on_second_arm(move || {
         // SAFETY: `child` outlives `wait_deadline`, which returns after this hook runs.
         unsafe {
-            let _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
+            _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
         }
     });
     let deadline = Instant::now() + Duration::from_secs(3600);
@@ -188,7 +188,7 @@ fn wait_deadline_re_arms_past_a_clamped_timeout() {
     crate::wait::wait_ms_probe::on_second_arm(move || {
         // SAFETY: see `wait_deadline_never_reports_still_running_before_the_deadline`.
         unsafe {
-            let _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
+            _ = windows::Win32::System::Threading::TerminateProcess(raw_handle, 1);
         }
     });
     let deadline = Instant::now() + Duration::from_secs(3600);

@@ -281,7 +281,7 @@ fn spawn_with_ace_cmdline(granted: u32, cmdline: &str) -> RestrictedChild {
     let mut needed = 0u32;
     // SAFETY: a null buffer with length 0 is the documented size query; it fails with
     // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
     // u64-backed so the TOKEN_USER cast below is 8-aligned.
     let mut sid_buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
     // SAFETY: `sid_buf` is at least `needed` bytes.

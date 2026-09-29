@@ -66,7 +66,7 @@ pub(super) fn integrity_level() -> Option<u32> {
     // is read via addr_of! + read_unaligned — never a misaligned reference.
     unsafe {
         let mut ret = 0u32;
-        let _ = GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut ret);
+        _ = GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut ret);
         if ret == 0 {
             log::debug!("could not size the integrity-level token info; integrity unknown");
             return None;

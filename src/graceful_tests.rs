@@ -63,8 +63,8 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
         group.is_ok(),
         "the two console mechanisms must take one path: {other:?} vs {group:?}"
     );
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    _ = child.kill_tree();
+    _ = child.wait();
 }
 
 // The dispatcher's half of `uac_elevated_attachment_has_no_in_process_route`, which pins only
@@ -90,6 +90,6 @@ fn signal_refuses_a_child_cosca_did_not_create() {
         "the refusal must say whose child this is not: {detail}"
     );
     assert!(detail.contains("kill()"), "the refusal must name the remedy: {detail}");
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    _ = child.kill_tree();
+    _ = child.wait();
 }

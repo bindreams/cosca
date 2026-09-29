@@ -195,7 +195,7 @@ pub(crate) mod fault_observer {
     }
     pub(crate) fn notify_released() {
         if let Some(tx) = RELEASE_TX.lock().unwrap().as_ref() {
-            let _ = tx.send(());
+            _ = tx.send(());
         }
     }
 }
@@ -597,7 +597,7 @@ async fn job_wait_tree_drained(
             // SAFETY: `self.0` is this struct's own `DuplicateHandle`-created handle, never
             // shared or aliased anywhere else.
             unsafe {
-                let _ = CloseHandle(self.0);
+                _ = CloseHandle(self.0);
             }
         }
     }
@@ -746,7 +746,7 @@ pub(crate) mod armed_deadline_seam {
     pub(crate) fn notify(armed: Armed) {
         NOTIFY.with(|n| {
             if let Some(tx) = n.borrow().as_ref() {
-                let _ = tx.send(armed);
+                _ = tx.send(armed);
             }
         });
     }

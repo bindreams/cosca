@@ -176,8 +176,8 @@ fn nested_attach_is_delegated() {
         let (containment, attached) = (attachment.containment, attachment.attached);
         // Reap before asserting: `attached` is owned and independent of `child`, so a
         // failing assertion must not leak the helper (the nested arms don't touch it).
-        let _ = child.kill();
-        let _ = child.wait();
+        _ = child.kill();
+        _ = child.wait();
         assert_eq!(
             containment,
             Containment::Delegated,
@@ -519,7 +519,7 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         ChildReport::WriteFailed => {
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
             // no-op. The slot's pipe lives as long as `leaf`.
-            let _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
         }
         ChildReport::NotReported => {}
     }

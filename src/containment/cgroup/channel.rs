@@ -289,7 +289,7 @@ impl ReportChannel {
         // Drained first: closing with messages unread gives the child `ECONNRESET`, not `EPIPE`.
         self.drain();
         // Nothing to do if nobody holds the child's end any more.
-        let _ = rustix::net::send(
+        _ = rustix::net::send(
             &self.read,
             &[PROCEED],
             rustix::net::SendFlags::NOSIGNAL | rustix::net::SendFlags::DONTWAIT,

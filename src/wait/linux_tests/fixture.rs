@@ -8,7 +8,8 @@
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-use crate::containment::cgroup::test_support::{fork_running, KillOnDrop};
+use crate::child::spawn::{spawn_lock, SpawnLockGuard};
+use crate::containment::cgroup::test_support::{fork_running_locked, KillOnDrop};
 use crate::identity::ProcessId;
 
 // Child exit codes ====================================================================
@@ -297,6 +298,10 @@ pub(super) struct ReapedLeaderFixture {
     /// `M`'s pid, for a caller that verifies `M`'s death itself. `M` is not this process's child,
     /// so a pidfd, not `waitid`, is how.
     pub(super) m_pid: libc::pid_t,
+    /// Held from before the pipes exist until after `block_w` is closed (declared last, so it
+    /// drops last): no other fork can inherit `block_w` and keep `M` from seeing EOF.
+    #[allow(dead_code, reason = "held only for its Drop; the unlock is the point")]
+    lock: SpawnLockGuard,
 }
 
 impl ReapedLeaderFixture {
@@ -322,8 +327,11 @@ pub(super) fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
 /// thread-group-leader task attached: the shape `pidfd_open` answers `EINVAL` (< Linux 6.16) or
 /// `ESRCH` (>= 6.16) to. Returns `L`'s identity and the fixture that tears down `L`/`M`.
 ///
-/// Callers hold `spawn_lock()`.
+/// Takes `spawn_lock()` itself and keeps it in the fixture until `block_w` is closed, so no other
+/// fork pins `block_w` and delays `M`'s EOF. Callers must NOT hold it (it is not reentrant), and
+/// must not fork or spawn while the fixture lives.
 pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderFixture), FixtureError> {
+    let lock = spawn_lock();
     // `rendezvous`: test<->L handshake, so L's identity is read while L is alive. `m_ready`: M
     // reports its pid; M holds the write end until `_exit`, so EOF proves M exited. `block`: M
     // reads it; the test closes the write end to release M (no group signals).
@@ -347,7 +355,7 @@ pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderF
     let (block_r, block_w) = raw_pipe();
     let force_close_range_failure = FORCE_L_CLOSE_RANGE_FAILURE.with(|f| f.replace(false));
 
-    let l = fork_running(|| {
+    let l = fork_running_locked(&lock, || {
         let mut keep = [rendezvous_l, block_r, block_w, m_ready_w];
         keep.sort_unstable();
         close_range_except_or_exit(&keep, ChildStep::CloseRange.exit_code(), force_close_range_failure);
@@ -406,6 +414,7 @@ pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderF
             m_ready_r: OwnedFd::from_raw_fd(m_ready_r),
             l: Some(l),
             m_pid: 0,
+            lock,
         }
     };
 

@@ -202,7 +202,7 @@ fn already_elevated(c: &mut Command) -> Result<Command, Error> {
 /// returning, so a captured line would never be printed.
 fn report(line: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "{line}");
+    _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// Restores a directory's mode on drop, so the tempdir can be removed even after a panic.
@@ -210,7 +210,7 @@ struct RestoreMode(std::path::PathBuf);
 impl Drop for RestoreMode {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
     }
 }
 

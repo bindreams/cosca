@@ -55,7 +55,7 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
     // wait_tree never reaps — the root's exit still needs collecting either way.
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// Deadline-not-met case: on a drain-observable mechanism, `wait_tree_timeout` against a tree
@@ -75,8 +75,8 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    _ = child.kill_tree();
+    _ = child.wait();
 }
 
 /// `Duration::ZERO` against a still-alive tree: a one-shot, non-blocking probe (see
@@ -97,8 +97,8 @@ fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    _ = child.kill_tree();
+    _ = child.wait();
 }
 
 /// `Duration::ZERO` against an ALREADY-drained tree: the one-shot probe must still observe and
@@ -131,7 +131,7 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
             "got {err:?}"
         );
     }
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// `Unsupported` on a non-drainable mechanism — explicitly REQUESTING `ContainMode::TreeWalk`,
@@ -172,5 +172,5 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
             .expect_err("TreeWalk, honored as requested, has no kernel drain edge");
         assert!(matches!(err2, crate::error::Error::Unsupported { .. }), "got {err2:?}");
     }
-    let _ = treewalk_child.wait();
+    _ = treewalk_child.wait();
 }

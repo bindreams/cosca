@@ -105,7 +105,7 @@ impl RawAsyncChild {
                 // The task is on the blocking pool and about to park on the handle wait.
                 #[cfg(test)]
                 if let Some(tx) = started {
-                    let _ = tx.send(());
+                    _ = tx.send(());
                 }
                 let result = wait_handle_or_cancel(
                     HANDLE(proc.as_raw_handle()),
@@ -113,7 +113,7 @@ impl RawAsyncChild {
                 );
                 #[cfg(test)]
                 if let (Some(tx), Ok(outcome)) = (outcome_tx, result.as_ref()) {
-                    let _ = tx.send(*outcome);
+                    _ = tx.send(*outcome);
                 }
                 result
             });

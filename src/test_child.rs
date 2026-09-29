@@ -422,7 +422,7 @@ fn fixture_registers_then_blocks() {
     sock.write_all(b"R").expect("write registration tag");
     sock.flush().expect("flush registration tag");
     let mut sink = [0u8; 1];
-    let _ = sock.read(&mut sink);
+    _ = sock.read(&mut sink);
 }
 
 /// The fully-qualified libtest path of [`fixture_control_block`].
@@ -457,7 +457,7 @@ fn fixture_control_block() {
     sock.write_all(b"R").expect("write readiness tag");
     sock.flush().expect("flush readiness tag");
     let mut sink = [0u8; 1];
-    let _ = sock.read(&mut sink);
+    _ = sock.read(&mut sink);
 }
 
 /// Spawn [`fixture_control_block`] through `cosca::tokio` and return its handle plus the control

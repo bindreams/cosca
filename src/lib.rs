@@ -5,6 +5,11 @@
 //! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
 
+// `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
+// at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
+// result on purpose with `_ = expr;`.
+#![warn(clippy::let_underscore_must_use)]
+
 pub mod containment;
 pub mod elevation;
 pub mod error;
@@ -29,10 +34,18 @@ pub use child::Child;
 /// fork-bystander-inherits-a-live-marker window `containment::fdmarker`'s module docs
 /// describe, for a raw spawn that bypasses `cosca::Command` entirely. `#[doc(hidden)]`: not
 /// public API, present only for this crate's own `tests/` binaries to link against.
+///
+/// Returns a guard: hold it for the raw spawn. Re-taking the lock on the same thread (a
+/// `cosca::Command::spawn` under it, say) panics under `debug_assertions` instead of deadlocking.
 #[doc(hidden)]
-pub fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
-    child::spawn::spawn_lock()
+pub fn test_spawn_lock() -> TestSpawnLockGuard {
+    TestSpawnLockGuard(child::spawn::spawn_lock())
 }
+
+/// Holds [`test_spawn_lock`]'s lock until dropped.
+#[doc(hidden)]
+#[must_use = "if unused the spawn lock is released immediately; bind the guard for the whole window"]
+pub struct TestSpawnLockGuard(#[allow(dead_code, reason = "held only for its Drop")] child::spawn::SpawnLockGuard);
 
 mod command;
 // Off Windows only the `Exact` completion (`resolve::exact`) is consumed, so the lib build sees

@@ -105,7 +105,7 @@ impl Watcher {
             return;
         };
         // An eventfd write fails only on counter overflow, which one write cannot reach.
-        let _ = rustix::io::write(&pump.stop, &1u64.to_ne_bytes());
+        _ = rustix::io::write(&pump.stop, &1u64.to_ne_bytes());
         if pump.thread.join().is_err() {
             log::warn!(
                 "the drain pump of cgroup leaf {} panicked",

@@ -50,8 +50,8 @@ fn members_lists_a_live_owned_group() {
         .unwrap_or_else(|| panic!("leader {} missing from {listed:?}", child.id()));
     assert!(is_alive(leader), "a running leader's token must resolve to Alive");
 
-    let _ = child.kill();
-    let _ = child.wait();
+    _ = child.kill();
+    _ = child.wait();
 }
 
 /// Once the leader has exited unreaped, the kernel still lists it in the group,
@@ -122,8 +122,8 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
         "listing token must match a fresh live read"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    _ = child.kill();
+    _ = child.wait();
 }
 
 /// A group we own holds no refusers once SIGKILLed — and `state` really did deliver the
@@ -353,7 +353,6 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
     crate::log_capture::install();
-    let _guard = crate::child::spawn::spawn_lock();
     let (gate_r, gate_w) = std::io::pipe().expect("pipe");
     let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
     let child = fork_running(|| block_on(gate_r_fd));
@@ -363,7 +362,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     let worker = std::thread::spawn(move || {
         // SAFETY: SYS_gettid takes no arguments and always succeeds.
         tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) } as u32).unwrap();
-        let _ = stop_rx.recv();
+        _ = stop_rx.recv();
     });
     let tid = tid_rx.recv().unwrap();
     let id = ProcessId::of(tid).found().expect("the live worker's tid resolves");
@@ -378,7 +377,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
         crate::log_capture::levels_since(mark, &format!("pid {tid} is a live thread, not a thread-group leader")),
         vec![log::Level::Warn]
     );
-    let _ = stop_tx.send(());
+    _ = stop_tx.send(());
     worker.join().unwrap();
     drop(gate_w);
 }

@@ -660,7 +660,7 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
             // no-op. The slot's channel lives as long as `leaf`.
             PlacementReport::WriteFailed(_) => {
-                let _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+                _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
             }
             // SAFETY: the slot's channel lives as long as `leaf`.
             PlacementReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
@@ -892,7 +892,7 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
             let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
             // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
             // no-op. The slot's channel lives as long as `leaf`.
-            let _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
             assert!(
                 leaf.take_placement(std::process::id()).expect("decidable").is_err(),
                 "a failed write is not a placement"
@@ -1768,7 +1768,7 @@ fn dropping_the_leaf_stops_and_joins_its_pump() {
 
     let fake = FakeLeaf::new("cosca-pumped-leaf", true);
     let leaf = std::sync::Arc::new(crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone()));
-    let _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
+    _ = leaf.wait_drained(Some(Some(std::time::Instant::now())));
     assert_eq!(
         fault::pumps_of("cosca-pumped-leaf"),
         (0, 0),
@@ -2051,7 +2051,7 @@ fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter()
 
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
     // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a no-op.
-    let _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+    _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
 
     let mut child = std::process::Command::new("/bin/true").spawn().expect("spawn");
     let pid = child.id();
@@ -2524,7 +2524,7 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     let guard = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
-        let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
+        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
     });
     // SAFETY: the parent's own copy, closed once; the child keeps its own.
     unsafe { libc::close(procs_fd) };
@@ -2932,7 +2932,7 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(true);
     let guard = fork_running(move || {
         // SAFETY: this child's inherited copy of the channel's child end.
-        let _ = unsafe { slot.send_intent() };
+        _ = unsafe { slot.send_intent() };
         block_on(gate);
     });
     crate::containment::cgroup::fault::set_force_child_pidfd_failure(false);
@@ -3344,7 +3344,7 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
     let guard = fork_running(move || {
         block_on(gate);
         // SAFETY: this child's inherited copies of the channel's ends and the pipe.
-        let _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
+        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
     });
     // SAFETY: the parent's own copy, closed once.
     unsafe { libc::close(procs_fd) };

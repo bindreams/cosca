@@ -46,7 +46,7 @@ impl Prepared {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
             // The spawn fails either way; an undecidable verdict has already killed the child.
-            let _ = leaf.take_placement(pid);
+            _ = leaf.take_placement(pid);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;

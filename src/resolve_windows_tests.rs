@@ -142,7 +142,7 @@ mod current_user_sid {
             let mut needed = 0u32;
             // SAFETY: a null buffer with length 0 is the documented size query; it fails with
             // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-            let _ = unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut needed) };
+            _ = unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut needed) };
             // u64-backed so the `TOKEN_USER` cast in `Self::sid` is 8-aligned, as `TOKEN_USER`
             // requires.
             let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
@@ -327,7 +327,7 @@ fn token_has_privilege(token: HANDLE, luid: LUID) -> bool {
     let mut needed = 0u32;
     // SAFETY: a null buffer with length 0 is the documented size query; it fails with
     // ERROR_INSUFFICIENT_BUFFER and writes the required size.
-    let _ = unsafe { GetTokenInformation(token, TokenPrivileges, None, 0, &mut needed) };
+    _ = unsafe { GetTokenInformation(token, TokenPrivileges, None, 0, &mut needed) };
     // u32-backed so the `TOKEN_PRIVILEGES` cast below is 4-aligned, as it requires.
     let mut buf = vec![0u32; (needed as usize).div_ceil(4).max(1)];
     // SAFETY: `buf` is at least `needed` bytes.
