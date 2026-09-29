@@ -16,7 +16,7 @@ use super::Job;
 /// this is the OS shell, exactly like `windows_tests.rs`'s fixture.
 fn spawn_blocker() -> std::process::Child {
     crate::test_spawn::spawn(
-        &mut std::process::Command::new("cmd")
+        std::process::Command::new("cmd")
             .args(["/C", "more"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())

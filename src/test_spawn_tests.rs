@@ -9,13 +9,13 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::process::Command;
 
-/// A `/bin/true` command whose `pre_exec` writes one byte to `report_fd`: 1 if the fork ran
+/// A `/usr/bin/true` command whose `pre_exec` writes one byte to `report_fd`: 1 if the fork ran
 /// inside a locked section of [`super`], else 0. `pre_exec` runs in the forked child, so the byte
 /// is the child's inherited copy of the forking thread's state at the instant of the fork.
 fn true_reporting_lock_held(report_fd: std::os::fd::RawFd) -> Command {
     use std::os::unix::process::CommandExt;
 
-    let mut cmd = Command::new("/bin/true");
+    let mut cmd = Command::new("/usr/bin/true");
     // SAFETY: the closure reads a const-initialised thread-local `Cell<bool>` and calls
     // `write(2)`, both async-signal-safe.
     unsafe {
@@ -80,7 +80,7 @@ fn a_plain_spawn_forks_outside_the_lock() {
 async fn spawn_tokio_forks_under_the_lock() {
     let (mut report_read, report_write) = std::io::pipe().expect("open the report pipe");
     let report_fd = report_write.as_raw_fd();
-    let mut cmd = ::tokio::process::Command::new("/bin/true");
+    let mut cmd = ::tokio::process::Command::new("/usr/bin/true");
     // SAFETY: as in `true_reporting_lock_held`.
     unsafe {
         cmd.pre_exec(move || {
