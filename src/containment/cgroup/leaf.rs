@@ -198,6 +198,33 @@ pub(crate) struct CgroupLeaf {
     kill_attempt_failed: AtomicBool,
 }
 
+/// [`CgroupLeaf::holds`]'s error for a `/proc` view that could not be established: `message` names
+/// the view, and `source` is the OS error behind it, kept whole.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ViewRefused {
+    message: String,
+    source: Option<io::Error>,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for ViewRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)?;
+        match &self.source {
+            Some(source) => write!(f, ": {source}"),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ViewRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
+}
+
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
 #[cfg(target_os = "linux")]
 const RELEASED: &str = "the leaf's spawn-side resources are released once its placement verdict is taken";
@@ -404,15 +431,49 @@ impl CgroupLeaf {
 
     /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
     /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
+    ///
+    /// Reads through the `/proc` dirfd that [`ProcView::Same`] carries. A `Diverged` or
+    /// `Unassessable` view is an `Err` (`/proc/{pid}` may name another process), which
+    /// [`decide_unwaitable`](Self::decide_unwaitable) treats as unreadable membership.
     fn holds(&self, pid: u32) -> io::Result<bool> {
-        let Some(leaf) = &self.cgroup_path else {
+        if self.cgroup_path.is_none() {
             return Ok(false);
-        };
+        }
         #[cfg(test)]
         if fault::take_force_membership_unreadable() {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
-        let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+        let proc_dir = match crate::identity::proc_view() {
+            crate::identity::ProcView::Same(dir) => dir,
+            crate::identity::ProcView::Diverged => {
+                return Err(io::Error::other(format!(
+                    "this process's /proc is an outer pid namespace's, so pid {pid}'s cgroup membership cannot be read"
+                )));
+            }
+            crate::identity::ProcView::Unassessable(why) => {
+                let kind = why.source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
+                return Err(io::Error::new(
+                    kind,
+                    ViewRefused {
+                        message: format!(
+                            "the /proc view could not be established, so pid {pid}'s cgroup membership cannot be read: \
+                             {}",
+                            why.reason
+                        ),
+                        source: why.source,
+                    },
+                ));
+            }
+        };
+        self.holds_via(&proc_dir, pid)
+    }
+
+    /// [`holds`](Self::holds), reading `{pid}/cgroup` through `proc_dir` alone.
+    fn holds_via(&self, proc_dir: &crate::identity::ProcDir, pid: u32) -> io::Result<bool> {
+        let Some(leaf) = &self.cgroup_path else {
+            return Ok(false);
+        };
+        let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
         let path = parse_v2_relative_path(&text)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
         Ok(is_at_or_under(path, leaf))
@@ -1574,3 +1635,11 @@ mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf_state_tests.rs"]
 mod leaf_state_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_namespace_tests.rs"]
+mod leaf_namespace_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_holds_tests.rs"]
+mod leaf_holds_tests;

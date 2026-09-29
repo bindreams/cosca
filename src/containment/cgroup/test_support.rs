@@ -331,6 +331,64 @@ pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containme
     leaf
 }
 
+/// A fresh real leaf and a `sleep` child that placed itself in it, with the channel it reported
+/// on, before any verdict is taken.
+///
+/// The child leads its own process group, as a contained child does: the fail-closed kill
+/// targets the child's group as well as its pid, and a child left in the runner's group would
+/// never exercise the group half of it.
+#[cfg(target_os = "linux")]
+pub(crate) fn occupied_leaf() -> (
+    crate::containment::cgroup::CgroupLeaf,
+    MemberGuard,
+    crate::containment::cgroup::ReportChannel,
+) {
+    use std::os::unix::process::CommandExt;
+
+    let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
+    let own = crate::containment::cgroup::ReportChannel::new().expect("open the member's channel");
+    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("300").process_group(0);
+    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+    // on descriptors `leaf` and `own` keep open across the spawn.
+    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    let member = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn the member")
+    };
+    (leaf, MemberGuard(member), own)
+}
+
+/// The member `sleep` of [`occupied_leaf`]: SIGKILLed and reaped on drop, so a test that fails
+/// before its own teardown ends the child at once instead of leaving it to sleep out its 300 s.
+/// Declared after the leaf it lives in, so it drops first.
+#[cfg(target_os = "linux")]
+pub(crate) struct MemberGuard(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for MemberGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::DerefMut for MemberGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MemberGuard {
+    fn drop(&mut self) {
+        _ = self.0.kill();
+        _ = self.0.wait();
+    }
+}
+
 /// A temp-directory stand-in for a cgroup leaf, `<tempdir>/<name>`.
 ///
 /// Its `cgroup.events` is a symlink to a file outside the leaf, so removing the leaf leaves that

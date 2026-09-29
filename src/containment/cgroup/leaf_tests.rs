@@ -3344,6 +3344,67 @@ fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
 
+/// A real leaf member must not read as "in the leaf" when the `/proc` view is not `Same`: `holds`
+/// errors naming the view, so the verdict fails closed and the child is killed.
+///
+/// Mutant: `holds` reads `/proc/{pid}/cgroup` without the view check.
+#[cfg(target_os = "linux")]
+fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fault::ForcedView, cause: &str) {
+    use std::os::unix::process::ExitStatusExt;
+
+    use crate::containment::cgroup::test_support::occupied_leaf;
+    use crate::containment::TreeDrain;
+
+    assert!(
+        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
+        "requires COSCA_TEST_CGROUP and a delegated cgroup"
+    );
+    let (mut leaf, mut child, _own) = occupied_leaf();
+    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
+    crate::containment::cgroup::fault::set_force_leaf_busy(true);
+    let forced_view = crate::identity::proc_view_fault::force_proc_view_once(view);
+    let err = match leaf.take_placement(child.id()) {
+        Err(e) => e,
+        Ok(verdict) => panic!("{view:?} must fail closed, got {verdict:?}"),
+    };
+    drop(forced_view);
+    assert!(
+        !crate::containment::cgroup::fault::take_force_leaf_busy(),
+        "the seam must be consumed by decide_unwaitable"
+    );
+    assert!(matches!(err, crate::error::Error::Containment { .. }), "got {err:?}");
+    assert!(err.to_string().contains("could not be read"), "got {err}");
+    assert!(err.to_string().contains(cause), "the view must be named: {err}");
+    assert!(!leaf.entered, "{view:?} must never leave `entered` true");
+
+    assert_eq!(
+        child.wait().expect("reap the child").signal(),
+        Some(libc::SIGKILL),
+        "the child must be killed"
+    );
+    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
+    assert_a_non_same_proc_view_fails_closed(
+        crate::identity::proc_view_fault::ForcedView::Diverged,
+        "outer pid namespace",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
+    assert_a_non_same_proc_view_fails_closed(
+        crate::identity::proc_view_fault::ForcedView::Unassessable,
+        "could not be established",
+    );
+}
+
 /// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
 /// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
 #[cfg(target_os = "linux")]

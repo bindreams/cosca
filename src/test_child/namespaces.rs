@@ -138,3 +138,9 @@ pub(crate) fn mount_tmpfs(target: &Path) {
     )
     .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
 }
+
+/// Make `root` this process's `/`, so an absolute path such as `/proc` is looked up beneath it.
+/// The working directory stays where it was.
+pub(crate) fn chroot_into(root: &Path) {
+    rustix::process::chroot(root).unwrap_or_else(|e| panic!("chroot {}: {e}", root.display()));
+}
