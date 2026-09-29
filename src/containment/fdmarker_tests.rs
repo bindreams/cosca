@@ -684,7 +684,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     // reach the orphan, the still-alive `cat` echoes this byte before exiting on its own EOF,
     // making `rest` non-empty — a fast, deterministic failure. If the kill landed, the write/drop
     // is a no-op past a dead pipe (EPIPE, ignored).
-    let _ = std::io::Write::write_all(&mut stdin, b"x");
+    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
     drop(stdin);
 
     // The proof: `cat` is the pipe's sole remaining writer, so EOF fires exactly on its

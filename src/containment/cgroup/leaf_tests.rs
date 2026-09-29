@@ -1442,8 +1442,7 @@ fn drop_under_a_mount(
         let mut stdin = member_stdin;
         let _guard = on_each_drain_block(move |_| {
             if let Some(mut s) = stdin.take() {
-                use std::io::Write as _;
-                let _ = s.write_all(b"x");
+                crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
             }
         });
         let mark = crate::log_capture::mark();
@@ -1508,8 +1507,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
         let mut stdin = member.stdin.take();
         let _guard = on_each_drain_block(move |_| {
             if let Some(mut s) = stdin.take() {
-                use std::io::Write as _;
-                let _ = s.write_all(b"x");
+                crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
             }
         });
         let mark = crate::log_capture::mark();
@@ -3135,7 +3133,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 
     drop(leaf);
 
-    let _ = stdin.write_all(b"x"); // EPIPE (a dead descendant) is expected and ignored
+    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
     drop(stdin);
     let mut rest = Vec::new();
     stdout
@@ -3196,7 +3194,7 @@ fn fail_closed_kills_the_childs_whole_process_group() {
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
-    let _ = stdin.write_all(b"x"); // EPIPE (a dead descendant) is expected and ignored
+    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
     drop(stdin);
     let mut rest = Vec::new();
     stdout

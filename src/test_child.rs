@@ -107,6 +107,48 @@ pub(crate) fn await_member_ready(child: &mut std::process::Child) {
     child.stdout = Some(out.into_inner());
 }
 
+/// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and
+/// `BrokenPipe` (the kill under test already landed, so the write goes nowhere) are both
+/// expected; any other error is a fixture fault and panics.
+pub(crate) fn write_to_possibly_dead_stdin(stdin: &mut impl std::io::Write, bytes: &[u8]) {
+    match stdin.write_all(bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing to the held stdin failed for a reason other than a dead reader: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod write_to_possibly_dead_stdin_tests {
+    use super::write_to_possibly_dead_stdin;
+
+    struct FailsWith(std::io::ErrorKind);
+    impl std::io::Write for FailsWith {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_dead_reader_is_expected() {
+        write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::BrokenPipe), b"x");
+    }
+
+    #[test]
+    fn a_live_reader_is_expected() {
+        write_to_possibly_dead_stdin(&mut Vec::new(), b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "other than a dead reader")]
+    fn any_other_error_panics() {
+        write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::PermissionDenied), b"x");
+    }
+}
+
 // Re-exec fixtures =====
 
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
