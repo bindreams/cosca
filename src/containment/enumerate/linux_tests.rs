@@ -59,3 +59,45 @@ fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
     let ppid = std::os::unix::process::parent_id();
     assert!(process_parents().expect("the snapshot").contains(&(me, ppid)));
 }
+
+const OPENAT2_REQUIRED: &str = "cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered ";
+
+/// Without `openat2` no view can be checked: the snapshot is `Unsupported`, naming the requirement
+/// as a spawn does, and logged at `warn` with it. Mutant: "report every unreadable view as
+/// `Unassessable`" - the requirement is missing from both the error and the warning.
+#[test]
+fn a_snapshot_without_openat2_is_unsupported_naming_it_and_warned_about() {
+    for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        let forced = crate::identity::proc_view_fault::force_openat2_errno(errno);
+        let got = process_parents();
+        drop(forced);
+        let records = crate::log_capture::records_since_on_current_thread(mark, "enumerate::process_parents");
+
+        match got {
+            Err(crate::error::Error::Unsupported { op, detail, platform }) => {
+                assert_eq!(platform, "linux");
+                assert_eq!(detail, format!("{OPENAT2_REQUIRED}{name}"), "{errno}");
+                assert!(!op.contains("foreign"), "{op}");
+            }
+            other => panic!("{errno}: expected Unsupported, got {other:?}"),
+        }
+        assert!(
+            records
+                .iter()
+                .any(|(level, m)| *level == log::Level::Warn && m.contains(&format!("{OPENAT2_REQUIRED}{name}"))),
+            "{errno}: {records:?}"
+        );
+    }
+}
+
+/// Another `/proc` open failure is not the requirement. Mutant: "every open failure is
+/// `Unsupported`".
+#[test]
+fn a_snapshot_with_another_open_failure_is_not_unsupported() {
+    let forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOENT);
+    let got = process_parents();
+    drop(forced);
+    assert!(matches!(got, Err(crate::error::Error::Unassessable { .. })), "{got:?}");
+}

@@ -22,7 +22,8 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 ///
 /// # Errors
 ///
-/// [`Error::Unassessable`], naming the cause, when no trustworthy snapshot can be taken (Linux:
+/// [`Error::Unassessable`], naming the cause (Linux without `openat2`: [`Error::Unsupported`] naming
+/// that requirement), when no trustworthy snapshot can be taken (Linux:
 /// `/proc` is not this pid namespace's, or cannot be listed; Windows: the ToolHelp snapshot
 /// failed; macOS: `proc_listallpids` failed). An empty `Ok` means the host has no processes, never
 /// "the snapshot failed": a tree walk over a failed snapshot would find no descendants and skip

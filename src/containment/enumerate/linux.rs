@@ -8,11 +8,20 @@ use crate::identity::RawPid;
 /// [`Error::Unassessable`], naming why, when `/proc` cannot be trusted or listed: an outer pid
 /// namespace's `/proc` lists pids that mean nothing to the caller, and the tree walk signals by
 /// pid. Never an empty snapshot standing in for that: a walk over one finds no descendants.
+/// [`Error::Unsupported`] instead, naming the `openat2` requirement, when that is why no view
+/// can be checked.
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
-    let dir = crate::identity::proc_view()
-        .into_dir()
-        .map_err(|why| unassessable(&why.reason, why.source))?;
+    let dir =
+        crate::identity::proc_view()
+            .into_dir()
+            .map_err(|why| match why.unsupported("listing the process table") {
+                Some(unsupported) => {
+                    log::warn!("enumerate::process_parents: {unsupported}");
+                    unsupported
+                }
+                None => unassessable(&why.reason, why.source),
+            })?;
     let pids = dir
         .pids()
         .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
