@@ -44,10 +44,10 @@ pub type RawPid = u32;
 /// A raw, per-process kernel start value. Opaque: its only meaning is identity
 /// (exact equality). Interpreted into a wall-clock time only by `created_at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct StartToken(u64);
+pub(crate) struct StartToken(u64);
 
 impl StartToken {
-    fn from_raw(v: u64) -> StartToken {
+    pub(crate) fn from_raw(v: u64) -> StartToken {
         StartToken(v)
     }
 
@@ -225,6 +225,15 @@ impl ProcessId {
 /// `macos/kinfo.rs`. Containment's process-group listing reads it too.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::kinfo;
+
+/// The assert-free start-time read every `exit_only` start check uses, and the purpose that
+/// names each read.
+#[cfg(target_os = "macos")]
+pub(crate) use backend::{pbi_start_quiet, ReadPurpose};
+
+/// The `pbi_start_quiet` forcing seam.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::quiet_fault;
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see
