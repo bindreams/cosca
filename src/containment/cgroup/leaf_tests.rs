@@ -2239,7 +2239,7 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
             .spawn()
             .expect("spawn");
         let stdin = child.stdin.take().expect("piped stdin");
-        crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
+        let _armed = crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
             let mut stdin = stdin;
             _ = stdin.write_all(b"x"); // EPIPE (a dead child) is expected and ignored
             drop(stdin);
@@ -2356,7 +2356,7 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killi
         .spawn()
         .expect("spawn the child");
     let child_stdin = child.stdin.take().expect("piped stdin");
-    crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
+    let _armed = crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
         let mut child_stdin = child_stdin;
         _ = child_stdin.write_all(b"x"); // EPIPE (a dead child) is expected and ignored
         drop(child_stdin);
@@ -2751,7 +2751,7 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
     // No handle owns the child once its spawn is abandoned: the leaf reaps it.
     drop(child);
 
-    crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
+    let _armed = crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
         let mut stdin = stdin;
         _ = stdin.write_all(b"x"); // EPIPE (a dead child) is expected and ignored
         drop(stdin);
@@ -2858,7 +2858,7 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
     let pidfd = pidfd_of(pid);
     drop(child);
 
-    crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
+    let _armed = crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
         let mut stdin = stdin;
         let _ = stdin.write_all(b"x"); // EPIPE (a dead child) is expected and ignored
         drop(stdin);
@@ -3277,7 +3277,7 @@ fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
     let mut child = cmd.spawn().expect("spawn the child");
     let stdin = child.stdin.take().expect("piped stdin");
-    crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
+    let _armed = crate::containment::cgroup::fault::set_between_kill_and_wait(move || {
         let mut stdin = stdin;
         _ = stdin.write_all(b"x"); // EPIPE (a dead child) is expected and ignored
         drop(stdin);

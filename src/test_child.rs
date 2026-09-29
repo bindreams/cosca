@@ -509,6 +509,21 @@ pub(crate) fn windows_more() -> std::path::PathBuf {
         .join("more.com")
 }
 
+/// A contained [`windows_more`] child blocked reading a piped stdin the caller holds, never via a
+/// chosen duration (`ping -n 30`): it ends only by a real kill, or by the caller closing the pipe
+/// (exit 0, see [`windows_more`]). Stdout is nulled because `more` echoes its input.
+#[cfg(windows)]
+pub(crate) fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = crate::Command::new();
+    cmd.args([windows_more()]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
 /// The argv for re-executing this test binary against one fixture through `cosca::Command`,
 /// whose `args` is the **full** argv — libtest drops slot 0 as the binary name, so a filter or
 /// option placed there is silently eaten and `--exact` degrades to substring matching.
