@@ -96,3 +96,16 @@ fn no_record() -> io::Result<Peek> {
     debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
     Err(io::Error::other("a blocking waitid on the pidfd returned no record"))
 }
+
+pub(super) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<super::Reaped, Foreign>> {
+    let fd = pidfd(target);
+    loop {
+        match waitid_record(fd, WaitIdOptions::EXITED) {
+            Ok(Some(record)) if is_exit_record(record.si_code) => return Ok(Ok(reaped_from_record(record))),
+            // A ptrace stop, reported whatever the options say: not an exit; wait again.
+            Ok(Some(_)) | Ok(None) => continue,
+            Err(Errno::CHILD) => return Ok(Err(Foreign::Gone)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+}

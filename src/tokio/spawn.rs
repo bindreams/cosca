@@ -33,6 +33,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         )));
     }
 
+    // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
+    #[cfg(target_os = "linux")]
+    crate::wait::backend::probe_pidfd_support()?;
+
     let kill_on_drop = cmd.kill_on_drop_flag();
 
     // Elevation runs before fds are taken (mirrors sync). POSIX rewrites into a DERIVED command and
@@ -322,6 +326,18 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
         }
 
+        // Serialize the spawn against the raw backend's inheritable-handle window via the shared
+        // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
+        // `CreateProcessW` spawn on another thread (mirrors the sync std path). On Linux the lock
+        // also spans the pidfd handshake's channel, from its creation to its helper's join.
+        let _guard = crate::child::spawn::spawn_lock();
+
+        // Linux: the child is held before `exec` until the parent has opened its pidfd; the
+        // pidfd itself is dropped here, as tokio's child has no place for it. Registered before
+        // `fd_map`'s hook, which may `dup2` a mapping onto the channel's descriptor number.
+        #[cfg(target_os = "linux")]
+        let handshake = crate::child::spawn::pidfd_handshake::install(tcmd.as_std_mut(), &_guard)?;
+
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
         #[cfg(unix)]
@@ -338,11 +354,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             fd_map::install(tcmd.as_std_mut(), mappings).map_err(Error::Io)?;
         }
 
-        // Serialize the spawn against the raw backend's inheritable-handle window via the shared
-        // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
-        // `CreateProcessW` spawn on another thread (mirrors the sync std path).
         let c = {
-            let _guard = crate::child::spawn::spawn_lock();
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
             // the wrong domain for this attribution.
             //
@@ -352,11 +364,21 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
             // other containment — a process group, a session, a tree walk, none, or a spawn that
             // degraded — nothing reaches the child, and it keeps running.
-            #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-            let spawned = tcmd.spawn().map_err(Error::Io);
-            #[cfg(windows)]
-            let spawned =
-                spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            #[cfg(target_os = "linux")]
+            let spawned = {
+                #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
+                let held = handshake.run(|| tcmd.spawn(), |c| c.id());
+                held.map(|held| held.child)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let spawned = {
+                #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
+                let spawned = tcmd.spawn().map_err(Error::Io);
+                #[cfg(windows)]
+                let spawned =
+                    spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+                spawned
+            };
             #[cfg(all(test, target_os = "linux"))]
             let spawned = crate::child::spawn::fault::post_fork_failure(
                 spawned,
@@ -474,6 +496,10 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/pidfd_tests.rs"]
+mod pidfd_tests;
 
 /// Say what a failed tokio spawn may have left behind of its child: nothing, a zombie nothing
 /// reaps, or a process nothing can reach.

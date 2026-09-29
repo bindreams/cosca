@@ -124,3 +124,49 @@ fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
         assert_refused(result, "spawn", name);
     }
 }
+
+/// The refusal is found BEFORE the fork. The filter also makes any fork fail, so a spawn that got
+/// as far as forking would fail `Io`, not `Unsupported`; and this thread ends with no child, live
+/// or zombie, and the program never ran.
+///
+/// Mutant: the pre-fork probe is skipped.
+#[test]
+fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
+    use std::io::Read;
+
+    for (code, name) in REFUSALS {
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let mut cmd = cosca::Command::new();
+        cmd.args(["sh", "-c", "echo ran"]);
+        cmd.stdout(cosca::Stdio::from_file(std::fs::File::from(
+            std::os::fd::OwnedFd::from(writer),
+        )))
+        .expect("set stdout");
+        let (result, waitid) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_and_forks_on_this_thread(code);
+                    let result = cmd.spawn();
+                    // `__WNOTHREAD`: only this thread's children. ECHILD: it has none.
+                    // SAFETY: a `waitid` with no output buffer, `WNOWAIT`: it consumes nothing.
+                    let rc = unsafe {
+                        libc::waitid(
+                            libc::P_ALL,
+                            0,
+                            std::ptr::null_mut(),
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WNOTHREAD,
+                        )
+                    };
+                    (result, (rc, std::io::Error::last_os_error().raw_os_error()))
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+        assert_refused(result, "spawn", name);
+        assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
+        drop(cmd);
+        let mut out = String::new();
+        reader.read_to_string(&mut out).expect("read to EOF");
+        assert_eq!(out, "", "{name}: the program must not have run");
+    }
+}
