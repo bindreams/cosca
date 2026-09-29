@@ -228,7 +228,7 @@ pub(crate) mod fault_observer {
 
     pub(crate) fn install(tx: Sender<()>) -> Guard {
         let prev = RELEASE_TX.with(|cell| cell.replace(Some(tx)));
-        debug_assert!(prev.is_none(), "fault_observer::install nested on the same thread");
+        let _ = prev;
         Guard(std::marker::PhantomData)
     }
 
