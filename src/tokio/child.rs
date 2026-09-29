@@ -768,7 +768,7 @@ impl Drop for Child {
             let _ = p.entered.send(std::thread::current().id());
         }
         // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
-        // only the root). A no-op for an uncontained child.
+        // only the root); a no-op for an uncontained child.
         //
         // MUST stay on the dropping thread, before the handle is dismembered: on Windows a job
         // object's kill is the only signal reaching a nested descendant that leads its own console
@@ -777,10 +777,7 @@ impl Drop for Child {
         // returns.
         let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
-            // A genuine mechanism failure (`is_teardown_mechanism_failure`) is a REAL OS outcome
-            // (an `EACCES`/`EIO` on `cgroup.kill`, say) principle 7 forbids asserting on — it is
-            // handled and logged here, at `warn`, in every build, not only when
-            // `debug_assertions` happen to be off.
+            // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         let _ = tree;

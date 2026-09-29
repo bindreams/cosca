@@ -121,13 +121,10 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
     drop(child);
 }
 
-/// A failed `cgroup.kill` write reached during `Child::drop`'s OWN teardown — not a caller's own
-/// `kill_tree()` — is a real OS outcome (`EACCES`/`EIO`, say), which this crate's own principle 7
-/// forbids asserting on: it must be handled and logged, in every build, never a `debug_assert!`
-/// that panics only when `debug_assertions` happen to be on. Forced via the same EISDIR technique
-/// `hard_kill_propagates_a_kill_the_kernel_refused`
-/// (`containment/cgroup/leaf_tests.rs`) uses: `open(O_WRONLY)` on a real directory always fails,
-/// no test-only production branch needed.
+/// A failed `cgroup.kill` write during `Child::drop`'s own teardown is a real OS outcome: Drop
+/// must warn, not panic. Forced via the EISDIR technique of
+/// `hard_kill_propagates_a_kill_the_kernel_refused` (`containment/cgroup/leaf_tests.rs`):
+/// `open(O_WRONLY)` on a directory always fails.
 #[cfg(target_os = "linux")]
 #[test]
 fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
@@ -147,8 +144,7 @@ fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
 
     let mut cmd = crate::Command::new();
     cmd.args(["sleep", "30"]);
-    // `kill_on_drop` defaults to true, and the override above is consumed on THIS spawn — `Drop`
-    // below takes the armed path this test targets, through the real public API.
+    // The override is consumed by this spawn; `kill_on_drop` defaults to true.
     let child = cmd.spawn().expect("spawn");
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from

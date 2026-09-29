@@ -496,11 +496,9 @@ impl Drop for Child {
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             // A live member refused, or couldn't be confirmed — visible, not silently
-            // discarded, on the RAII teardown path most callers actually hit. A genuine
-            // mechanism failure (`is_teardown_mechanism_failure`) is a REAL OS outcome (an
-            // `EACCES`/`EIO` on `cgroup.kill`, say) principle 7 forbids asserting on — it is
-            // handled and logged here, at `warn`, in every build, not only when
-            // `debug_assertions` happen to be off.
+            // discarded, on the RAII teardown path most callers actually hit. A mechanism
+            // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
+            // logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns

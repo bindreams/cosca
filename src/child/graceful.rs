@@ -208,7 +208,7 @@ impl Child {
         // everyone it can, refusers or not), so the grace wait is still meaningful and the sweep
         // can still reach the rest. `Error::Unassessable { source: Some(_), .. }` — `group::
         // state`'s OWN listing failed, before any member was even examined — is deliberately
-        // EXCLUDED from this arm and falls through to fail-fast below: `crate::child::
+        // EXCLUDED from this arm and falls through to fail-fast below: `containment::fdmarker::
         // is_teardown_mechanism_failure` classifies that identical shape as a genuine
         // teardown-mechanism failure, not an ordinary #61 outcome, for the same reason (no
         // delivery was even attempted) — holding for a grace wait and sweep that reflect nothing
@@ -341,7 +341,7 @@ pub(crate) mod fault {
     /// PRE-EXISTING console-less-caller shape (`NoConsole`/`Unsupported`) this task must not
     /// touch; `UnassessableMechanism` models `Error::Unassessable { source: Some(_), .. }` —
     /// `group::state`'s own listing failure, `crate::containment::fdmarker::is_teardown_mechanism_failure`'s
-    /// classification for the identical shape reaching `Child::drop` — which this task's
+    /// classification for the identical shape reaching `combine_group_errors` — which this task's
     /// `graceful_shutdown_tree` match must treat the SAME way (fail-fast), not fold into the
     /// per-member `Unassessable{source: None}` hold-and-continue case.
     #[derive(Clone, Copy, PartialEq, Eq, Default)]

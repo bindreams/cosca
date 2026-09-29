@@ -169,8 +169,7 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
 
 /// Async twin of the sync `drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure`
 /// (`child_tests.rs`): a failed `cgroup.kill` write reached during `Child::drop`'s OWN teardown
-/// is a real OS outcome principle 7 forbids asserting on — it must warn and return normally, in
-/// every build, never a `debug_assert!` that panics only when `debug_assertions` happen to be on.
+/// is a real OS outcome: Drop must warn and return normally.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
@@ -190,10 +189,9 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
 
     let mut cmd = crate::tokio::Command::new();
     cmd.args(["sleep", "30"]);
-    // `kill_on_drop` defaults to true, and the override above is consumed on THIS spawn — `Drop`
-    // below takes the armed path this test targets, through the real public API. The tree-kill
-    // call in that path runs synchronously on the dropping thread, before any reaper-pool
-    // hand-off, so no probe is needed to observe it.
+    // The override is consumed by this spawn; `kill_on_drop` defaults to true. The tree-kill call
+    // in Drop runs synchronously on the dropping thread, before any reaper-pool hand-off, so no
+    // probe is needed to observe it.
     let mut child = cmd.spawn().expect("spawn");
 
     // Pin that the forced failure is the mechanism class this test claims (a raw `EISDIR` from
