@@ -5,6 +5,10 @@ nextest-version = { required = "0.9.137" }
 filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+[[profile.default.overrides]]
+filter = 'binary(graceful) | binary(windows_breakaway) | binary(windows_console) | binary(windows_testbin_ack)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [profile.ci]
 fail-fast = false
 
