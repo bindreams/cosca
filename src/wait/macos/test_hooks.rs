@@ -140,6 +140,8 @@ fn reset() {
     REQUESTED_TIMEOUTS.with(|v| v.borrow_mut().clear());
     LAST_EVENT_DATA.with(|c| c.set(None));
     TIMEOUT_OVERRIDE.with(|c| c.set(None));
+    AWAIT_EVENTS.with(|e| e.borrow_mut().clear());
+    AWAIT_TIMEOUTS.with(|v| v.borrow_mut().clear());
     CLAMP_OVERRIDE.with(|c| c.set(None));
     IN_HOOK.with(|f| f.set(false));
     GUARD_ACTIVE.with(|f| f.set(false));
@@ -184,5 +186,104 @@ impl HookGuard {
 impl Drop for HookGuard {
     fn drop(&mut self) {
         reset();
+    }
+}
+
+// The `await_reapable` seams =====
+
+type OnceHook = Box<dyn FnOnce()>;
+type RoundHookOnce = (u32, OnceHook);
+
+thread_local! {
+    static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
+    static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
+    static FORCE_ESRCH_REGISTRATION: Cell<bool> = const { Cell::new(false) };
+    static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
+    static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
+    static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
+}
+
+/// Record the timeout one `await_reapable` `kevent` call was armed with. Kept apart from
+/// [`record_kevent_call`]'s log: a test that counts `block_on_kqueue` rounds must not see the
+/// rounds of a child's wait on the same thread.
+pub(crate) fn record_await_kevent(requested: Option<Duration>) {
+    AWAIT_TIMEOUTS.with(|v| v.borrow_mut().push(requested));
+}
+
+/// The timeout each `await_reapable` `kevent` call on this thread was armed with, in order.
+pub(crate) fn await_requested_timeouts() -> Vec<Option<Duration>> {
+    AWAIT_TIMEOUTS.with(|v| v.borrow().clone())
+}
+
+/// Record one event the `await_reapable` loop got back: its `filter` and `fflags`.
+pub(crate) fn record_event(filter: i16, fflags: u32) {
+    AWAIT_EVENTS.with(|e| e.borrow_mut().push((filter, fflags)));
+}
+
+/// Every event the `await_reapable` loop got back on this thread since the last call, in order.
+pub(crate) fn take_events() -> Vec<(i16, u32)> {
+    AWAIT_EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
+}
+
+/// The next `await_reapable` on this thread sees its `EVFILT_PROC` registration answered `ESRCH`
+/// without calling `kevent`.
+pub(crate) fn force_proc_registration_esrch_once() -> ForcedOnce {
+    FORCE_ESRCH_REGISTRATION.with(|f| f.set(true));
+    ForcedOnce(|| FORCE_ESRCH_REGISTRATION.with(|f| f.set(false)))
+}
+
+pub(crate) fn take_forced_esrch_registration() -> bool {
+    FORCE_ESRCH_REGISTRATION.with(Cell::take)
+}
+
+/// Run `hook` on the waiting thread just before the wait's next re-peek.
+pub(crate) fn on_before_repeek(hook: impl FnOnce() + 'static) {
+    ON_BEFORE_REPEEK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn fire_before_repeek() {
+    if let Some(hook) = ON_BEFORE_REPEEK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Run `hook` on the waiting thread just before the next re-peek that follows an `ESRCH`
+/// registration (the backoff's re-peeks).
+pub(crate) fn on_esrch_repeek(hook: impl FnOnce() + 'static) {
+    ON_ESRCH_REPEEK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn fire_esrch_repeek() {
+    if let Some(hook) = ON_ESRCH_REPEEK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Run `hook` on the waiting thread just before round `round`'s blocking `kevent` in the
+/// `await_reapable` loop.
+pub(crate) fn on_kevent_round(round: u32, hook: impl FnOnce() + 'static) {
+    ON_KEVENT_ROUND.with(|h| *h.borrow_mut() = Some((round, Box::new(hook))));
+}
+
+pub(crate) fn fire_kevent_round(round: u32) {
+    let hook = ON_KEVENT_ROUND.with(|h| {
+        let mut slot = h.borrow_mut();
+        match slot.as_ref() {
+            Some((r, _)) if *r == round => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Disarms an unconsumed force on drop.
+#[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
+pub(crate) struct ForcedOnce(fn());
+
+impl Drop for ForcedOnce {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }

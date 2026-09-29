@@ -266,3 +266,6 @@ fn a_zero_return_with_time_left_is_logged_by_kind() {
     assert_eq!(levels(REARM), [log::Level::Debug]);
     assert_eq!(levels(EARLY), [log::Level::Warn]);
 }
+
+#[path = "macos_tests/await_reapable.rs"]
+mod await_reapable;
