@@ -97,7 +97,54 @@ pub(crate) fn set_session(std_cmd: &mut std::process::Command) {
 /// verdict. `Attached::Cgroup` (Linux cgroup v2, `cgroup.kill`) is fork-proof where this
 /// mechanism structurally cannot be; prefer it when that atomicity matters.
 pub(crate) fn kill_group(pgid: i32) -> Result<(), Error> {
+    #[cfg(test)]
+    if fault::intercept_kill_group(pgid) {
+        return Ok(());
+    }
     signal_group(pgid, Signal::SIGKILL)
+}
+
+/// Test seam for [`kill_group`]. Thread-local, with an RAII reset.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
+    }
+
+    /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
+    /// assert a kill was not issued without a real `killpg` ever reaching a recyclable number.
+    pub(crate) fn record_kill_group() -> KillGroupRecorder {
+        KILLED.with(|k| *k.borrow_mut() = Some(Vec::new()));
+        KillGroupRecorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct KillGroupRecorder(());
+
+    impl KillGroupRecorder {
+        /// The groups `kill_group` was asked to kill since the recorder was made.
+        pub(crate) fn killed(&self) -> Vec<i32> {
+            KILLED.with(|k| k.borrow().clone().expect("the recorder is live"))
+        }
+    }
+
+    impl Drop for KillGroupRecorder {
+        fn drop(&mut self) {
+            KILLED.with(|k| *k.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn intercept_kill_group(pgid: i32) -> bool {
+        KILLED.with(|k| match k.borrow_mut().as_mut() {
+            Some(killed) => {
+                killed.push(pgid);
+                true
+            }
+            None => false,
+        })
+    }
 }
 
 /// Send the graceful signal to the whole process group, then confirm no live

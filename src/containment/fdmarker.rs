@@ -745,6 +745,40 @@ pub(crate) mod fault {
         FORCE_ROOT_KILL_NOOP.with(|f| f.get())
     }
 
+    thread_local! {
+        static HOLDER_KILLS: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// From now on `kill_holder` on THIS thread records each marker holder it signals, so a test
+    /// can tell that the sweep ran without waiting for a process to die.
+    pub(crate) fn record_holder_kills() -> HolderKillRecorder {
+        HOLDER_KILLS.with(|k| *k.borrow_mut() = Some(Vec::new()));
+        HolderKillRecorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct HolderKillRecorder(());
+
+    impl HolderKillRecorder {
+        pub(crate) fn killed(&self) -> Vec<u32> {
+            HOLDER_KILLS.with(|k| k.borrow().clone().expect("the recorder is live"))
+        }
+    }
+
+    impl Drop for HolderKillRecorder {
+        fn drop(&mut self) {
+            HOLDER_KILLS.with(|k| *k.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn note_holder_kill(pid: u32) {
+        HOLDER_KILLS.with(|k| {
+            if let Some(killed) = k.borrow_mut().as_mut() {
+                killed.push(pid);
+            }
+        });
+    }
+
     /// Every `install` failure log line (`"fd marker: pipe() failed"`, etc.) carries no
     /// per-call discriminator — there is no handle yet to key on, since `install` hasn't
     /// succeeded. Two DIFFERENT tests asserting on the same literal text via `log_capture`
@@ -925,6 +959,11 @@ impl Marker {
         self.pgid.is_some()
     }
 
+    /// The group `killpg` targets, if this mode created one.
+    pub(crate) fn pgid(&self) -> Option<i32> {
+        self.pgid
+    }
+
     /// Test-only: force the group channel's pgid, to drive `unix::signal_group`'s real
     /// `pgid <= 0` guard — a real, privilege-free `Error::Unassessable { source: None, .. }`
     /// path — deterministically through the REAL public `Child::kill_tree`/`Drop` path.
@@ -981,6 +1020,18 @@ impl Marker {
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
     pub(crate) fn hard_kill(&self) -> Result<(), Error> {
+        self.hard_kill_impl(true)
+    }
+
+    /// [`hard_kill`](Self::hard_kill) without any `killpg` on `self.pgid`: the root's identity
+    /// kill, the ppid walk and the marker-holder sweep all still run. For a caller whose root is
+    /// already reaped, so the group number may name an unrelated group (#382); every remaining
+    /// channel names its target by identity, not by number.
+    pub(crate) fn hard_kill_without_group_signal(&self) -> Result<(), Error> {
+        self.hard_kill_impl(false)
+    }
+
+    fn hard_kill_impl(&self, group_signal: bool) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1002,6 +1053,7 @@ impl Marker {
                 &mut group_result,
                 &mut incomplete,
                 first_pass,
+                group_signal,
             );
             first_pass = false;
             if !progressed {
@@ -1028,6 +1080,7 @@ impl Marker {
             &mut seen,
             &mut group_result,
             &mut incomplete,
+            true,
             true,
         );
         Self::finish_sweep(self.handle, group_result, incomplete)
@@ -1200,6 +1253,7 @@ impl Marker {
         group_result: &mut Result<(), Error>,
         incomplete: &mut bool,
         first_pass: bool,
+        group_signal: bool,
     ) -> bool {
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
@@ -1319,7 +1373,9 @@ impl Marker {
                         .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
                 });
             let should_fire = first_pass || live_holder_confirms_pgid;
-            if should_fire {
+            if !group_signal {
+                // The caller asked for no `killpg` at all (`hard_kill_without_group_signal`).
+            } else if should_fire {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
@@ -1470,6 +1526,8 @@ impl Marker {
                 true
             }
             MarkerQuery::Held => {
+                #[cfg(test)]
+                fault::note_holder_kill(id.pid());
                 crate::containment::treewalk::kill_by_identity(id, signal)
                     == crate::containment::treewalk::KillOutcome::NotAttempted
             }

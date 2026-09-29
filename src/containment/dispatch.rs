@@ -286,6 +286,52 @@ impl Attached {
         }
     }
 
+    /// The group number [`hard_kill`](Self::hard_kill) would `killpg`, for the mechanisms whose
+    /// number is the root's own and so can name an unrelated group once the root is reaped
+    /// ([`carries_recyclable_pgid`](Self::carries_recyclable_pgid)); `None` for the rest.
+    #[cfg(unix)]
+    pub(crate) fn recyclable_pgid(&self) -> Option<i32> {
+        match self {
+            Attached::ProcessGroup(pgid) => Some(*pgid),
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.pgid(),
+            _ => None,
+        }
+    }
+
+    /// [`hard_kill`](Self::hard_kill) for a drop, given whether the root is already reaped
+    /// (#382, principle 4). A mechanism that names its tree by the root's group number
+    /// ([`recyclable_pgid`](Self::recyclable_pgid)) must not `killpg` it once the root is
+    /// reaped, because nothing pins that number and it may name an unrelated group. It logs the
+    /// `warn` saying so. Any channel that names its target by identity still runs: a macOS fd
+    /// marker still sweeps its marker holders. Cgroup, Job Object and `TreeWalk` never skip.
+    ///
+    /// The async `Child`'s drop shares this, so the two drops decide and word it alike.
+    #[cfg(unix)]
+    pub(crate) fn hard_kill_for_drop(&self, root_reaped: bool) -> Result<(), crate::error::Error> {
+        let Some(pgid) = self.recyclable_pgid().filter(|_| root_reaped) else {
+            return self.hard_kill();
+        };
+        #[cfg(target_os = "macos")]
+        if let Attached::FdMarker(m) = self {
+            log::warn!(
+                "Child::drop: the root is already reaped, so this drop does not kill its process group \
+                 (pgid {pgid}), whose number may now name an unrelated group. Descendants that outlived \
+                 the waited-on root and no longer hold the fd marker are not torn down by this drop; \
+                 call kill_tree() before wait() to end them \
+                 (https://github.com/bindreams/cosca/issues/382)"
+            );
+            return m.hard_kill_without_group_signal();
+        }
+        log::warn!(
+            "Child::drop: the root is already reaped, so this drop does not kill its process group \
+             (pgid {pgid}), whose number may now name an unrelated group. Descendants that outlived \
+             the waited-on root are not torn down by this drop; call kill_tree() before wait() to end \
+             them (https://github.com/bindreams/cosca/issues/382)"
+        );
+        Ok(())
+    }
+
     /// Whether this child holds an actionable tree-teardown mechanism.
     pub(crate) fn is_actionable(&self) -> bool {
         match self {

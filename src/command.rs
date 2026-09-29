@@ -550,6 +550,17 @@ impl Command {
     /// mechanism descendants are killed, not waited for. To wait explicitly, call
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
+    /// **Once the root has been reaped (by [`wait`](crate::Child::wait), say), the drop does not
+    /// kill a tree contained by a process group or a macOS fd marker's group.** Both name their
+    /// tree by the root's process-group number, and nothing pins that number after the reap: it
+    /// may already belong to an unrelated group, which the kill would hit. The drop logs a `warn`
+    /// naming the group instead. A descendant that outlived the waited-on root keeps running:
+    /// call [`kill_tree`](crate::Child::kill_tree) **before** `wait()` to end it. (A macOS fd
+    /// marker still sweeps the descendants that hold the marker, which names them by identity;
+    /// only its group kill is skipped.) A cgroup, a Job
+    /// Object and a tree walk name their tree without the number, so the drop still kills them
+    /// after a reap. See [#382](https://github.com/bindreams/cosca/issues/382).
+    ///
     /// **Where the two handles differ is the wait.** The sync [`Child`](crate::Child) blocks
     /// until the root has exited, so after `drop` returns the child is gone. The async
     /// [`Child`](crate::tokio::Child) signals and returns — parking a runtime worker in a
