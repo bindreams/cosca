@@ -614,6 +614,26 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     kill_and_reap(&mut child);
 }
 
+// `armed_probe` reaches the blocking watch: a live target at the point the real wait would be
+// entered notifies once and is force-released. Zero grace keeps it deterministic: the seam fires
+// before the wait whatever the deadline, and without the relay the expired deadline ends the wait
+// at once with no notification.
+//
+// Mutant: make `relayed_probe::capture` skip the `Armed` probe -> no notification.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _guard = crate::wait::backend::armed_probe::install(tx);
+    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
+    assert!(!exited, "a live child must report still-alive");
+    assert_eq!(rx.try_iter().count(), 1, "the wait armed on an unsignalled target once");
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
+}
+
 // `fault_observer` is thread-local: a watch on another thread must not notify this thread's
 // observer. Deterministic: the other watch is joined on its own OS thread and runtime before the
 // channel is checked.
