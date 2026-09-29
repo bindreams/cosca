@@ -5,9 +5,17 @@
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 
+#[cfg(test)]
+#[path = "linux/read_tests.rs"]
+mod read_tests;
+
+#[cfg(test)]
+#[path = "linux/read_namespace_tests.rs"]
+mod read_namespace_tests;
+
 use std::time::{Duration, SystemTime};
 
-use self::proc_view::ProcDir;
+use self::proc_view::{ProcDir, ProcView};
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
 use super::{Liveness, RawPid, Resolved, StartToken};
@@ -28,11 +36,21 @@ fn signal_probe(pid: RawPid) -> SignalProbe {
     }
 }
 
-/// Classify a failed `/proc/<pid>/stat` read. `ErrorKind` alone is not enough: under a
-/// `hidepid` mount another user's `/proc/<pid>` is invisible, so a LIVE process yields
-/// `ENOENT`; and a task that exits mid-read yields `ESRCH`, which has no `ErrorKind`.
+/// `pid`'s `stat` through a `/proc` that is shown to describe this process's own pid namespace,
+/// else `Unknown` unless `kill(pid, 0)` says the pid is gone: an outer namespace's `/proc/<pid>`
+/// names another process, so what it says is no answer about `pid`.
 fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
-    read_stat_with(pid, || std::fs::read(format!("/proc/{pid}/stat")))
+    match proc_view::proc_view() {
+        ProcView::Same(dir) => read_stat_in(&dir, pid),
+        ProcView::Diverged => read_stat_unavailable(pid, "this process's /proc is an outer pid namespace's".into()),
+        ProcView::Unassessable(why) => {
+            read_stat_unavailable(pid, format!("the /proc view could not be established: {why}"))
+        }
+    }
+}
+
+fn read_stat_unavailable(pid: RawPid, reason: String) -> Resolved<Vec<u8>> {
+    read_stat_with(pid, || Err(std::io::Error::other(reason)))
 }
 
 /// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup.
@@ -40,6 +58,9 @@ fn read_stat_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
     read_stat_with(pid, || proc_dir.read(&format!("{pid}/stat")))
 }
 
+/// Classify a failed `stat` read. `ErrorKind` alone is not enough: under a `hidepid` mount
+/// another user's `/proc/<pid>` is invisible, so a LIVE process yields `ENOENT`; and a task
+/// that exits mid-read yields `ESRCH`, which has no `ErrorKind`.
 fn read_stat_with(pid: RawPid, read: impl FnOnce() -> std::io::Result<Vec<u8>>) -> Resolved<Vec<u8>> {
     match read() {
         Ok(bytes) => Resolved::Found(bytes),
@@ -105,19 +126,28 @@ pub(super) fn is_running_in(proc_dir: &ProcDir, pid: RawPid, start: StartToken) 
     }
 }
 
-/// Our own start token, read by pid — deliberately NOT via `/proc/self`.
+/// Our own start token.
 ///
-/// `ProcessId` is the pair `(std::process::id(), token)`, so the token must come from the
-/// same namespace view as that pid. `/proc/self` and `/proc/<getpid()>` diverge exactly when
-/// the reading task's pid namespace is not the one `/proc` was mounted from (`unshare --pid
-/// --fork` without `--mount-proc`): there `getpid()` is 1 while `/proc` still shows the outer
-/// namespace. Reading `/proc/self` there would pair the caller's real token with the inner
-/// pid 1, and `exists()`/`is_alive()` — which re-read BY PID — would then report the running
-/// caller as `Gone`/`Dead`. Keeping both halves by-pid keeps the pair self-consistent.
+/// `ProcessId` is the pair `(std::process::id(), token)`. Where `/proc` is this process's own
+/// namespace's, the token is read by pid, so it is the same read `exists()`/`is_alive()` repeat.
+/// Where it is an outer namespace's (`unshare --pid --fork` without `--mount-proc`: `getpid()`
+/// is 1 while `/proc` shows the outer namespace), `/proc/<getpid()>` names another process, so
+/// the token comes from `self`, which the kernel resolves for the reader itself. Those
+/// re-reads then answer `Unknown`, never `Gone` or `Dead` for the running caller.
 ///
 /// `hidepid` never hides a task from itself, so this read cannot be denied to us.
 pub(super) fn current_token() -> Resolved<StartToken> {
-    start_token(std::process::id())
+    let pid = std::process::id();
+    match proc_view::proc_view() {
+        ProcView::Same(dir) => start_token_in(&dir, pid),
+        ProcView::Diverged | ProcView::Unassessable(_) => match ProcDir::open() {
+            Ok(dir) => start_token_from(pid, read_stat_with(pid, || dir.read("self/stat"))),
+            Err(why) => {
+                log::debug!("own start token unreadable: {why}");
+                Resolved::Unknown
+            }
+        },
+    }
 }
 
 pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
