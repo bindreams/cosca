@@ -121,7 +121,7 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
         #[cfg(test)]
         let _read_guard = read_tx.map(crate::wait::read_probe::install);
         #[cfg(test)]
-        let _released_guard = released_tx.map(fault_observer::install);
+        let _released_guard = released_tx.map(fault_observer::install).map(std::mem::ManuallyDrop::new);
         let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
