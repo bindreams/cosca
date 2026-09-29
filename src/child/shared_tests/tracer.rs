@@ -128,15 +128,52 @@ mod macos {
         );
     }
 
+    /// The failure bound of a fixture that blocks on a traced child: if it is still running after
+    /// `BOUND`, name the step it is in on the real stderr and abort, so the driver's assertion
+    /// prints where it hung instead of the job timing out. Never a synchronisation: a passing
+    /// fixture drops the guard long before.
+    pub(super) struct Watchdog(
+        #[allow(dead_code, reason = "dropping the sender ends the watchdog")] std::sync::mpsc::Sender<()>,
+    );
+
+    const BOUND: Duration = Duration::from_secs(8);
+
+    pub(super) fn watchdog(name: &'static str) -> Watchdog {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                eprintln!(
+                    "WATCHDOG: {name} still running after {BOUND:?}; last step: {}",
+                    step_name()
+                );
+                std::process::abort();
+            }
+        });
+        Watchdog(tx)
+    }
+
+    static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+
+    pub(super) fn step(name: &'static str) {
+        eprintln!("step: {name}");
+        *STEP.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    fn step_name() -> &'static str {
+        *STEP.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Attach to `blocker`'s child with `PT_ATTACHEXC` and wait, without consuming it, until its
     /// stop is visible. `waitid` cannot block here: under `PT_ATTACHEXC` the stop raises a Mach
     /// exception with no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks
     /// with a capped backoff.
     fn attach_and_confirm_stop(blocker: &Blocker) {
+        step("attach");
         let pid = blocker.shared.id();
         // SAFETY: a plain ptrace request on this test's own child.
         let r = unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid as libc::pid_t, std::ptr::null_mut(), 0) };
         assert_eq!(r, 0, "PT_ATTACHEXC: {}", std::io::Error::last_os_error());
+        step("confirm the stop");
         let mut interval = Duration::from_millis(1);
         loop {
             // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
@@ -185,8 +222,11 @@ mod macos {
                 try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped
             ));
         }
+        let _dog = watchdog("try_wait on a stopped tracee");
+        step("spawn");
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
+        step("try_wait");
         assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
         assert!(format!("{:?}", b.shared).contains("N"));
         // Clean-up: PT_KILL sets SRUN, then SIGKILL through the handle wakes the thread asleep in
@@ -216,11 +256,15 @@ mod macos {
                 a_child_this_process_traces_is_reaped_fully
             ));
         }
+        let _dog = watchdog("reaped fully");
+        step("spawn");
         let mut b = Blocker::spawn();
         attach_and_confirm_stop(&b);
         // A stopped child never reads its stdin's EOF.
+        step("continue");
         continue_tracee(&b);
         b.end_child();
+        step("wait");
         let status = b.shared.wait().expect("wait");
         assert!(status.success(), "{status:?}");
         // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
@@ -253,6 +297,8 @@ mod macos {
             ));
         }
         crate::log_capture::install();
+        let _dog = watchdog("failed start read");
+        step("spawn");
         let mut b = Blocker::spawn();
         attach_and_confirm_stop(&b);
         continue_tracee(&b);
