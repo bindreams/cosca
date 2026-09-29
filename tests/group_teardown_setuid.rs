@@ -163,12 +163,18 @@ enum Handshake {
     Privileged { pid: u32, sock: BufReader<TcpStream> },
 }
 
-fn accept_one(listener: &TcpListener) -> Handshake {
-    let (stream, _) = listener.accept().expect("accept control connection");
-    let mut reader = BufReader::new(stream);
+/// Reads the one handshake line a control member writes before it blocks. Split out of
+/// `classify` below so it can run INSIDE `accept_tree`'s `on_accept` — before the socket
+/// becomes a death-watch for a later accept, its handshake line must already be drained (see
+/// `accept_tree`'s own doc).
+fn read_handshake_line(stream: &mut TcpStream) -> String {
+    let mut reader = BufReader::new(&mut *stream);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read control handshake line");
-    let line = line.trim_end_matches('\n');
+    line.trim_end_matches('\n').to_string()
+}
+
+fn classify(line: &str, stream: TcpStream) -> Handshake {
     if let Some(reason) = line.strip_prefix("F ") {
         panic!(
             "setuid helper provisioning failed: {reason}\n\
@@ -177,11 +183,14 @@ fn accept_one(listener: &TcpListener) -> Handshake {
         );
     }
     if line == "R" {
-        return Handshake::Root(reader);
+        return Handshake::Root(BufReader::new(stream));
     }
     if let Some(pid_str) = line.strip_prefix("P ") {
         let pid: u32 = pid_str.parse().expect("privileged helper reported a non-numeric pid");
-        return Handshake::Privileged { pid, sock: reader };
+        return Handshake::Privileged {
+            pid,
+            sock: BufReader::new(stream),
+        };
     }
     panic!("unexpected control handshake line: {line:?}");
 }
@@ -235,7 +244,8 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     cmd.stdout(cosca::Stdio::null()).expect("null stdout");
     cmd.stderr(cosca::Stdio::null()).expect("null stderr");
     cmd.contain();
-    let child = cmd.spawn().expect("spawn contained root");
+    cmd.env(common::ACK_ENV, "1");
+    let mut child = cmd.spawn().expect("spawn contained root");
 
     // The pgid-based mechanism specifically — NOT cgroup v2 (whose `cgroup.kill` bypasses the
     // ordinary kill(2) permission check entirely and would not reproduce the bug at all) and NOT
@@ -255,8 +265,12 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let mut root_sock = None;
     let mut priv_pid = None;
     let mut priv_sock = None;
-    for _ in 0..2 {
-        match accept_one(&listener) {
+    let mut lines = Vec::new();
+    let streams = common::accept_tree(&listener, &mut child, 2, |s| {
+        lines.push(read_handshake_line(s));
+    });
+    for (line, stream) in lines.into_iter().zip(streams) {
+        match classify(&line, stream) {
             Handshake::Root(s) => root_sock = Some(s),
             Handshake::Privileged { pid, sock } => {
                 priv_pid = Some(pid);
