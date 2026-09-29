@@ -224,17 +224,17 @@ pub(crate) mod fault_observer {
     /// `!Send` — see `crate::wait::backend::armed_probe::Guard`'s own doc for why: dropping it
     /// on another thread would clear THAT thread's slot instead of the one it was installed on.
     #[must_use = "dropping this immediately uninstalls the observer; bind it for its duration"]
-    pub(crate) struct Guard(Option<Sender<()>>, std::marker::PhantomData<*const ()>);
+    pub(crate) struct Guard(std::marker::PhantomData<*const ()>);
 
     pub(crate) fn install(tx: Sender<()>) -> Guard {
         let prev = RELEASE_TX.with(|cell| cell.replace(Some(tx)));
         debug_assert!(prev.is_none(), "fault_observer::install nested on the same thread");
-        Guard(prev, std::marker::PhantomData)
+        Guard(std::marker::PhantomData)
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            RELEASE_TX.with(|cell| *cell.borrow_mut() = self.0.take());
+            RELEASE_TX.with(|cell| *cell.borrow_mut() = None);
         }
     }
 
