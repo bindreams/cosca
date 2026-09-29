@@ -136,7 +136,11 @@ pub(crate) fn block_on_kqueue<T: Copy>(
     let mut events = [placeholder()];
     #[cfg(test)]
     let mut round: u32 = 0;
+    #[cfg(test)]
+    let mut check = crate::wait::test_clock::RoundCheck::new("block_on_kqueue");
     loop {
+        #[cfg(test)]
+        check.round();
         #[cfg(test)]
         test_hooks::fire_round_hook(round, kq);
         #[cfg(test)]
