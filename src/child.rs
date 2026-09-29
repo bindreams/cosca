@@ -189,7 +189,8 @@ impl Child {
         )
     }
 
-    /// Hard-kill the process. Returns `Ok(())` if already dead.
+    /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike [`Process::kill`](crate::Process::kill), this
+    /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).

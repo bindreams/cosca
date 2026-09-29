@@ -1,8 +1,8 @@
 //! A real seccomp filter on the calling thread, for tests of a syscall a sandbox refuses.
 
 /// Make `pidfd_open` fail with `errno` (a positive `libc` constant) on the calling thread and
-/// every process it forks, as a seccomp-filtered container does. A seccomp filter is per thread:
-/// a test keeps its own `pidfd_open` by running the denied code on a thread of its own.
+/// every process it forks, as a seccomp-filtered container does. Run the denied code on its own
+/// thread to keep the test's own `pidfd_open`.
 pub fn deny_pidfd_open_on_this_thread(errno: i32) {
     // `seccomp_data.nr`, the syscall number, is at offset 0.
     let filter = [

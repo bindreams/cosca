@@ -127,11 +127,10 @@ pub(crate) mod std_wait_seam {
 }
 
 /// Block until the process with identity `id` exits. `Ok(true)` = exited; `Ok(false)`
-/// = the timeout elapsed while it was still alive; `Err` = a wait failure (incl.
-/// `Unsupported` on Linux when `pidfd_open` is refused: a kernel < 5.3, or a filter answering
-/// `ENOSYS`, `EPERM`, `EACCES` or `ENODEV`; `Io` for a transient one, such as `EMFILE`).
-/// `None` = block until exit; `Some(ZERO)` =
-/// poll once; an overflowing `Duration` saturates to unbounded. Non-reaping.
+/// = the timeout elapsed while it was still alive; `Err` = a wait failure (on Linux a refused
+/// `pidfd_open` is [`Error::Unsupported`], a transient one [`Error::Io`]; see
+/// [`Error::Unsupported`]). `None` = block until exit; `Some(ZERO)` = poll once; an overflowing
+/// `Duration` saturates to unbounded. Non-reaping.
 ///
 /// Cross-privilege divergence: when the caller lacks rights to wait on a *live* foreign
 /// process, macOS surfaces the permission failure as `Err` whereas Windows cannot open the
@@ -147,7 +146,8 @@ pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Resu
 }
 
 /// Hard-kill the process with identity `id` (`SIGKILL` / `TerminateProcess`),
-/// identity-verified. Already-dead ⇒ `Ok`; a real failure (no rights / `EPERM`) ⇒ `Err`.
+/// identity-verified. Already-dead ⇒ `Ok`; a real failure (no rights / `EPERM`) ⇒ `Err`. On
+/// Linux a refused `pidfd_open` is [`Error::Unsupported`].
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     backend::kill(id)
 }
@@ -155,7 +155,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 /// Send the graceful termination signal (`SIGTERM`) to the process with identity `id`,
 /// identity-verified. Signal-only — does not wait or reap. Already-dead ⇒ `Ok`; a real
 /// failure (no rights / `EPERM`) ⇒ `Err`. Windows has no per-process graceful signal ⇒
-/// `Unsupported`.
+/// `Unsupported`, as is a refused `pidfd_open` on Linux.
 ///
 /// This is one mechanism, not the crate's whole graceful surface: on Windows a child that
 /// leads its own console process group is addressed through that group instead.

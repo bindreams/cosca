@@ -1,11 +1,8 @@
 //! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). `pidfd_open` failures split two ways:
-//! a REFUSAL is [`Error::Unsupported`], naming the operation and the errno: `ENOSYS` (a kernel
-//! older than 5.3, or a filter) and every errno the kernel's own `pidfd_open` cannot produce, so
-//! only a seccomp filter or LSM can: `EPERM`, `EACCES` and `ENODEV`. A transient or state errno
-//! stays [`Error::Io`], prefixed `pidfd_open:` (`EMFILE`, `ENFILE`, `ENOMEM`); `ESRCH`, `EINVAL`
-//! and `ENOENT` mean gone, and are re-verified.
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race). A refused `pidfd_open` is
+//! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
+//! classification is documented once, on [`Error::Unsupported`].
 //! The `/proc` checks behind `open_verified` use `openat2` (kernel >= 5.6); on 5.3 to 5.5 a live
 //! target is `Unassessable`.
 
@@ -22,11 +19,7 @@ use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, Proce
 ///
 /// Every `/proc` read goes through one checked `/proc` dirfd shown to describe `id`'s pid
 /// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
-pub(crate) fn open_verified(
-    id: ProcessId,
-    op: PidfdOp,
-    what: &'static str,
-) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+pub(crate) fn open_verified(id: ProcessId, op: PidfdOp) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
         "pid {} exceeds i32::MAX; pidfd cast would truncate",
@@ -34,13 +27,13 @@ pub(crate) fn open_verified(
     );
     let raw = Pid::from_raw(id.pid() as i32).expect("a resolvable ProcessId is never pid 0");
     match pidfd_open_checked(raw) {
-        Ok(pidfd) => verify_pidfd_target(id, pidfd, what),
+        Ok(pidfd) => verify_pidfd_target(id, pidfd, op),
         Err(rustix::io::Errno::SRCH) => Ok(None),
         // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
         // ENOENT (>= 6.16) means either a reaped process-group leader whose pid lives on as a PGID
         // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
         // waits. Errno alone can't tell, so re-verify.
-        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, what, e),
+        Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => verify_without_pidfd(id, op, e),
         Err(e) => match refusal_name(e) {
             Some(name) => Err(pidfd_open_unsupported(op, name)),
             None => Err(Error::Io(crate::error::io_context(
@@ -52,8 +45,7 @@ pub(crate) fn open_verified(
 }
 
 /// The operation that needed a pidfd, named in [`Error::Unsupported`]. It names what the caller
-/// asked for, whoever owns the target: [`Process`](crate::Process) and
-/// [`Child`](crate::Child) reach the same three.
+/// asked for, whoever owns the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PidfdOp {
     /// Waiting for exit: `wait`, `wait_timeout`, and the grace wait of `graceful_shutdown*`.
@@ -75,12 +67,19 @@ impl PidfdOp {
             PidfdOp::GroupTeardown => "process-group teardown",
         }
     }
+
+    /// What is left undone when this operation cannot go ahead, for an [`Error::Unassessable`].
+    fn consequence(self) -> &'static str {
+        match self {
+            PidfdOp::Wait => "its exit cannot be observed",
+            PidfdOp::Kill | PidfdOp::Terminate => "no signal was sent",
+            PidfdOp::GroupTeardown => "process-group teardown verification",
+        }
+    }
 }
 
-/// The name of `errno` if `pidfd_open` answering it is a refusal: the environment does not let
-/// this process open a pidfd at all. `ENOSYS` is a kernel without the syscall or a filter;
-/// `EPERM`, `EACCES` and `ENODEV` are errnos the kernel's own `pidfd_open` never returns, so
-/// only a seccomp filter or an LSM can be answering. `pidfd_open(2)` documents none of them.
+/// The name of `errno` if `pidfd_open` answering it is a refusal: no pidfd is possible here.
+/// The classification is documented on [`Error::Unsupported`].
 fn refusal_name(errno: rustix::io::Errno) -> Option<&'static str> {
     match errno {
         rustix::io::Errno::NOSYS => Some("ENOSYS"),
@@ -116,7 +115,7 @@ fn pidfd_open_unsupported(op: PidfdOp, errno_name: &str) -> Error {
 /// No pidfd to cross-check against, so the view comes from [`proc_view`](crate::identity::proc_view).
 fn verify_without_pidfd(
     id: ProcessId,
-    what: &'static str,
+    op: PidfdOp,
     errno: rustix::io::Errno,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     if id.signal_says_no_such_process() {
@@ -129,12 +128,12 @@ fn verify_without_pidfd(
                 Liveness::Dead => Ok(None),
                 Liveness::Alive => Err(Error::NotThreadGroupLeader {
                     pid: id.pid(),
-                    detail: what.into(),
+                    detail: op.consequence().into(),
                     source: std::io::Error::from(errno),
                 }),
                 Liveness::Unknown => Err(unassessable(
                     id,
-                    what,
+                    op,
                     "the OS refused the liveness query",
                     None,
                     Some(errno),
@@ -142,7 +141,7 @@ fn verify_without_pidfd(
             },
             Existence::Unknown => Err(unassessable(
                 id,
-                what,
+                op,
                 "the OS refused the existence query",
                 None,
                 Some(errno),
@@ -150,12 +149,12 @@ fn verify_without_pidfd(
         },
         ProcView::Diverged => Err(unassessable(
             id,
-            what,
+            op,
             "this process's /proc is an outer pid namespace's",
             None,
             Some(errno),
         )),
-        ProcView::Unassessable(why) => Err(unassessable(id, what, &why.reason, why.source, Some(errno))),
+        ProcView::Unassessable(why) => Err(unassessable(id, op, &why.reason, why.source, Some(errno))),
     }
 }
 
@@ -169,10 +168,10 @@ fn verify_without_pidfd(
 fn verify_pidfd_target(
     id: ProcessId,
     pidfd: rustix::fd::OwnedFd,
-    what: &'static str,
+    op: PidfdOp,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     let proc_dir =
-        crate::identity::ProcDir::open().map_err(|why| unassessable(id, what, &why.reason, why.source, None))?;
+        crate::identity::ProcDir::open().map_err(|why| unassessable(id, op, &why.reason, why.source, None))?;
     match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.
@@ -180,7 +179,7 @@ fn verify_pidfd_target(
         Ok(PidfdTarget::Pid(pid)) => {
             return Err(unassessable(
                 id,
-                what,
+                op,
                 &format!(
                     "the mounted /proc numbers the target {pid} (0 = invisible), so it is an outer pid namespace's"
                 ),
@@ -188,14 +187,14 @@ fn verify_pidfd_target(
                 None,
             ));
         }
-        Err(why) => return Err(unassessable(id, what, &why.reason, why.source, None)),
+        Err(why) => return Err(unassessable(id, op, &why.reason, why.source, None)),
     }
     // A pid recycled before open means the original is already gone. An unassessable pid
     // (hidepid, EPERM) is NOT gone and must not be treated as one.
     match exists_checked(id, &proc_dir) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
-        Existence::Unknown => Err(unassessable(id, what, "the OS refused the existence query", None, None)),
+        Existence::Unknown => Err(unassessable(id, op, "the OS refused the existence query", None, None)),
     }
 }
 
@@ -204,7 +203,7 @@ fn verify_pidfd_target(
 /// caller that only prints it; `source()` is the OS error behind `why`, else the errno.
 fn unassessable(
     id: ProcessId,
-    what: &'static str,
+    op: PidfdOp,
     why: &str,
     source: Option<std::io::Error>,
     pidfd_errno: Option<rustix::io::Errno>,
@@ -216,7 +215,7 @@ fn unassessable(
     if let Some(errno) = pidfd_errno {
         detail.push_str(&format!(" (pidfd_open: {errno})"));
     }
-    detail.push_str(&format!("; {what}"));
+    detail.push_str(&format!("; {}", op.consequence()));
     log::warn!("wait: {detail}");
     Error::Unassessable {
         detail,
@@ -273,7 +272,8 @@ pub(crate) mod fault {
     use crate::identity::{Existence, Liveness};
     use std::cell::Cell;
     thread_local! {
-        static FORCE_PIDFD_OPEN_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
+        static FORCE_PIDFD_OPEN_ERRNO: std::cell::RefCell<std::collections::VecDeque<Option<rustix::io::Errno>>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
         static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
         static FORCE_ALIVE: Cell<Option<Liveness>> = const { Cell::new(None) };
         static BETWEEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -311,18 +311,26 @@ pub(crate) mod fault {
     /// Force the NEXT `pidfd_open` inside `open_verified` on THIS thread to fail with `errno`,
     /// consumed the first time it's read.
     pub(crate) fn force_pidfd_open_errno_once(errno: rustix::io::Errno) -> ForcedPidfdOpenErrno {
-        FORCE_PIDFD_OPEN_ERRNO.with(|f| f.set(Some(errno)));
+        force_pidfd_open_script([Some(errno)])
+    }
+
+    /// Script the next `pidfd_open` calls inside `open_verified` on THIS thread, one entry per
+    /// call: `Some(errno)` fails it, `None` lets it through. Calls past the script run for real.
+    pub(crate) fn force_pidfd_open_script(
+        script: impl IntoIterator<Item = Option<rustix::io::Errno>>,
+    ) -> ForcedPidfdOpenErrno {
+        FORCE_PIDFD_OPEN_ERRNO.with(|f| *f.borrow_mut() = script.into_iter().collect());
         ForcedPidfdOpenErrno(())
     }
 
     impl Drop for ForcedPidfdOpenErrno {
         fn drop(&mut self) {
-            FORCE_PIDFD_OPEN_ERRNO.with(|f| f.set(None));
+            FORCE_PIDFD_OPEN_ERRNO.with(|f| f.borrow_mut().clear());
         }
     }
 
     pub(crate) fn take_forced_pidfd_open_errno() -> Option<rustix::io::Errno> {
-        FORCE_PIDFD_OPEN_ERRNO.with(|f| f.take())
+        FORCE_PIDFD_OPEN_ERRNO.with(|f| f.borrow_mut().pop_front().flatten())
     }
 
     /// Disarms the forced `Existence` on drop; see [`ForcedPidfdOpenErrno`].
@@ -369,7 +377,7 @@ pub(crate) mod fault {
 }
 
 pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>) -> Result<bool, Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Wait, "its exit cannot be observed")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Wait)? else {
         return Ok(true);
     };
     loop {
@@ -401,7 +409,7 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Kill, "no signal was sent")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Kill)? else {
         return Ok(());
     };
     match pidfd_send_signal(&pidfd, Signal::KILL) {
@@ -412,7 +420,7 @@ pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
 }
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Terminate, "no signal was sent")? else {
+    let Some(pidfd) = open_verified(id, PidfdOp::Terminate)? else {
         return Ok(());
     };
     match pidfd_send_signal(&pidfd, Signal::TERM) {

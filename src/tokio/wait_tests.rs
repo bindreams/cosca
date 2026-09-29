@@ -406,9 +406,8 @@ async fn wait_exit_resolves_for_exited_unreaped_child() {
     child.wait().expect("reap");
 }
 
-/// The async watch reports a refused `pidfd_open` as `process wait`, in the policy's shape.
-/// The child is killed first, so a forced errno that is not consumed lets the watch resolve
-/// `Ok` at once (never hang) and fails the assertion.
+/// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
+/// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
 ///
 /// Mutants: `exit_watch` names another `PidfdOp`; the forced errno is not consumed.
 #[cfg(target_os = "linux")]
