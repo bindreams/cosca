@@ -571,8 +571,6 @@ impl CgroupLeaf {
                     deadline: Some(at),
                 } => {
                     #[cfg(test)]
-                    check.round();
-                    #[cfg(test)]
                     let call_start = std::time::Instant::now();
                     #[cfg_attr(not(test), allow(unused_variables))]
                     let woken = wait_deadline_seamed(listener, at);

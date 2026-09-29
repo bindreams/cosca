@@ -469,8 +469,6 @@ pub(crate) fn rearm_until<T, E>(
     #[cfg(test)]
     let mut check = test_clock::RoundCheck::new("rearm_until");
     loop {
-        #[cfg(test)]
-        check.round();
         let remaining_now = remaining(deadline);
         #[cfg(test)]
         let round_start = Instant::now();
