@@ -1,4 +1,7 @@
-use super::{deadline_from, instant_near_ceiling, remaining, test_clock};
+use super::{
+    ceil_millis, deadline_from, instant_near_ceiling, remaining, remaining_override_seam, test_clock, wait_clamp_seam,
+    wait_ms_probe, win32_timeout_ms,
+};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -40,4 +43,101 @@ fn remaining_pins_the_exact_zero_boundary() {
     assert_eq!(remaining(deadline), Some(Duration::from_nanos(1)));
     test_clock::advance(Duration::from_nanos(1));
     assert_eq!(remaining(deadline), Some(Duration::ZERO));
+}
+
+// `ceil_millis`/`win32_timeout_ms` tests: pure and portable.
+
+/// Mutant: `d.as_millis()` instead of ceiling -> 500us floors to 0.
+#[test]
+fn ceil_millis_rounds_up_sub_millisecond_remainders() {
+    assert_eq!(ceil_millis(Duration::from_nanos(1)), 1);
+    assert_eq!(ceil_millis(Duration::from_micros(500)), 1);
+    assert_eq!(ceil_millis(Duration::from_micros(999)), 1);
+    assert_eq!(ceil_millis(Duration::from_micros(1500)), 2);
+    assert_eq!(ceil_millis(Duration::from_micros(2001)), 3);
+}
+
+/// A zero remainder stays a poll, not a wait.
+///
+/// Mutant: round zero up to 1 -> fails.
+#[test]
+fn ceil_millis_zero_stays_zero() {
+    assert_eq!(ceil_millis(Duration::ZERO), 0);
+}
+
+/// Mutant: add a millisecond of slack -> whole milliseconds grow.
+#[test]
+fn ceil_millis_whole_milliseconds_are_unchanged() {
+    assert_eq!(ceil_millis(Duration::from_millis(1)), 1);
+    assert_eq!(ceil_millis(Duration::from_millis(7)), 7);
+    assert_eq!(ceil_millis(Duration::from_secs(3)), 3_000);
+}
+
+/// Mutant: map `None` to a finite value -> an unbounded wait gets a deadline.
+#[test]
+fn win32_timeout_ms_unbounded_is_the_win32_infinite_sentinel() {
+    assert_eq!(win32_timeout_ms(None), u32::MAX);
+}
+
+/// Mutant: truncate instead of ceiling -> 500us arms 0.
+#[test]
+fn win32_timeout_ms_ceils_rather_than_truncates() {
+    assert_eq!(win32_timeout_ms(Some(Duration::from_micros(500))), 1);
+    assert_eq!(win32_timeout_ms(Some(Duration::ZERO)), 0);
+    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(7))), 7);
+}
+
+/// A finite remainder never arms `INFINITE`, even at exactly `u32::MAX` ms.
+///
+/// Mutant: drop the clamp -> `u32::MAX` (the sentinel) instead of `u32::MAX - 1`.
+#[test]
+fn win32_timeout_ms_never_returns_the_infinite_sentinel_for_a_finite_remaining() {
+    let ms = win32_timeout_ms(Some(Duration::from_millis(u64::from(u32::MAX))));
+    assert_ne!(ms, u32::MAX);
+    assert_eq!(ms, u32::MAX - 1);
+}
+
+/// Mutant: ignore the clamp seam -> the 1s remainder arms 1000, not 5.
+#[test]
+fn win32_timeout_ms_honors_the_clamp_seam() {
+    let guard = wait_clamp_seam::set(5);
+    assert_eq!(win32_timeout_ms(Some(Duration::from_secs(1))), 5);
+    drop(guard);
+    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(3))), 3);
+}
+
+/// The override applies to exactly one call.
+///
+/// Mutant: leave the override armed after `take` -> the second call sees 3, not 999.
+#[test]
+fn remaining_override_seam_is_consumed_exactly_once() {
+    let guard = remaining_override_seam::set(Duration::from_millis(3));
+    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(999))), 3);
+    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(999))), 999);
+    drop(guard);
+}
+
+/// An unconsumed override does not outlive its guard.
+///
+/// Mutant: make the guard's `Drop` a no-op -> the stale 3 leaks into the next call.
+#[test]
+fn remaining_override_seam_guard_clears_an_unconsumed_override_on_drop() {
+    let guard = remaining_override_seam::set(Duration::from_millis(3));
+    drop(guard);
+    assert_eq!(win32_timeout_ms(Some(Duration::from_millis(999))), 999);
+}
+
+/// The probe pairs what a site asked for with what was armed.
+///
+/// Mutant: record the overridden duration as `requested` -> `requested` is 3ms, not 999ms.
+#[test]
+fn wait_ms_probe_records_the_requested_remaining_beside_the_armed_one() {
+    wait_ms_probe::take();
+    let _override = remaining_override_seam::set(Duration::from_millis(3));
+    win32_timeout_ms(Some(Duration::from_millis(999)));
+    let arms = wait_ms_probe::take();
+    assert_eq!(arms.len(), 1);
+    assert_eq!(arms[0].ms, 3);
+    assert_eq!(arms[0].remaining, Duration::from_millis(3));
+    assert_eq!(arms[0].requested, Duration::from_millis(999));
 }

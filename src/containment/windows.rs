@@ -27,7 +27,7 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     THREAD_SUSPEND_RESUME,
 };
 
@@ -913,20 +913,13 @@ pub(crate) fn wait_drained_raw(
             wait_set.push(c);
         }
 
-        // A ZERO (or already-elapsed) deadline yields `ms == 0` here, which
-        // `WaitForMultipleObjects` treats as a genuine non-blocking poll of the handles just
-        // opened above — the ZERO-probe semantics fall out of the real API rather than a
-        // pre-emptive return, so this round's `handles` (real, live members) still get one
-        // real look before `WAIT_TIMEOUT` reports `MembersRemain` below.
-        let ms: u32 = match remaining {
-            None => INFINITE,
-            Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
-        };
-
+        // An elapsed deadline arms `ms == 0`, a real non-blocking poll of the handles just
+        // opened, so a ZERO deadline still gets one look before `MembersRemain`.
+        // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
         // SAFETY: every handle in `handles` was just opened above and stays open for the
         // duration of this call; `cancel`, if present, is kept alive by its caller for the
         // same duration.
-        let waited = unsafe { WaitForMultipleObjects(&wait_set, false, ms) };
+        let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&wait_set, false, ms) });
         let wait_failed = (waited == WAIT_FAILED).then(io::Error::last_os_error);
         for h in &handles {
             // SAFETY: each handle was opened above; closing after the wait releases it
@@ -937,6 +930,7 @@ pub(crate) fn wait_drained_raw(
         }
 
         if waited == WAIT_TIMEOUT {
+            // `wait_until` returns WAIT_TIMEOUT only once the real deadline has passed.
             return Ok(TreeDrain::MembersRemain);
         }
         if let Some(e) = wait_failed {

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateEventW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
@@ -68,12 +68,9 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
             });
         }
     }
-    let ms: u32 = match crate::wait::remaining(deadline) {
-        None => INFINITE,
-        Some(d) => d.as_millis().min((INFINITE - 1) as u128) as u32,
-    };
+    // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: `handle` is a live process handle held for the wait's duration.
-    let waited = unsafe { WaitForSingleObject(handle, ms) };
+    let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForSingleObject(handle, ms) });
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_err = (waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT).then(std::io::Error::last_os_error);
     close(handle);
@@ -170,19 +167,9 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
-    let ms = match grace {
-        None => INFINITE,
-        // Capped at INFINITE-1 (~49.7 days) — the cancel event releases large graces early;
-        // a debug_assert flags the rare clamp.
-        Some(d) => {
-            let clamped = d.as_millis().min((INFINITE - 1) as u128) as u32;
-            debug_assert!(
-                d.as_millis() <= (INFINITE - 1) as u128,
-                "Windows grace clamped to INFINITE-1 ms (~49.7 days): {}",
-                d.as_secs()
-            );
-            clamped
-        }
+    let deadline: Option<Option<Instant>> = match grace {
+        None => None,
+        Some(g) => crate::wait::deadline_from(g),
     };
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
     // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
@@ -212,8 +199,9 @@ pub(crate) fn block_until_exit_or_cancel(
         }
     }
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
+    // A WAIT_TIMEOUT is never trusted: recheck the real deadline each round (see win32_timeout_ms).
     // SAFETY: both handles are live for the wait's duration.
-    let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
+    let waited = crate::wait::wait_until(deadline, |ms| unsafe { WaitForMultipleObjects(&handles, false, ms) });
     // Capture BEFORE close(): CloseHandle would overwrite GetLastError.
     let wait_failed = (waited == WAIT_FAILED).then(std::io::Error::last_os_error);
     close(handle);
@@ -415,3 +403,7 @@ pub(crate) mod armed_probe {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod windows_tests;

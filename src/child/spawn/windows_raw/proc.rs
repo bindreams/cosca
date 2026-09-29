@@ -92,24 +92,20 @@ impl RawChild {
 
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry). The wait is on a
     /// real external event (child exit); the timeout is the caller's deadline, not a sync bet.
+    ///
+    /// Armed in rounds via `win32_timeout_ms`; WAIT_TIMEOUT is never trusted (Win32 waits may
+    /// time out early); rechecked each round (principle 13).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            // Cap below INFINITE so a >49-day deadline never becomes an unbounded wait; the loop
-            // re-arms against the true deadline if the OS wait returns early on the cap.
-            let millis = u32::try_from(remaining.as_millis()).unwrap_or(INFINITE - 1);
-            // SAFETY: `handle` is our live, owned process handle.
-            let r = unsafe { WaitForSingleObject(self.handle(), millis) };
-            if r == WAIT_OBJECT_0 {
-                return Ok(Some(exit_status(self.handle())?));
-            } else if r == WAIT_TIMEOUT {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                continue; // capped wait elapsed before the deadline; re-arm
-            } else {
-                return Err(io::Error::last_os_error());
-            }
+        // SAFETY: `handle` is our live, owned process handle.
+        let r = crate::wait::wait_until(Some(Some(deadline)), |ms| unsafe {
+            WaitForSingleObject(self.handle(), ms)
+        });
+        if r == WAIT_OBJECT_0 {
+            Ok(Some(exit_status(self.handle())?))
+        } else if r == WAIT_TIMEOUT {
+            Ok(None)
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
