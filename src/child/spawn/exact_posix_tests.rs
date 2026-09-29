@@ -204,7 +204,6 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().mode(0o700).create(&p).expect("mkdir p");
     }
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
     let (mut fixture, _exe_copy) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
