@@ -28,6 +28,41 @@ fn tracee_with(catch_sigterm: bool) -> Option<(crate::Child, std::io::PipeWriter
     Some((child, stdin))
 }
 
+/// A tracee that `catch`es and `ignore`s the named signals (see [`super::spawn_tracee_with`]),
+/// its stdin, and its stdout, read up to [`super::TRACEE_READY`]: its handlers are installed, so
+/// no stop of it can come before them.
+fn setup_tracee(catch: &str, ignore: &str) -> Option<(crate::Child, std::io::PipeWriter, std::io::PipeReader)> {
+    use std::io::Read as _;
+    if !crate::test_support::require_group("TRACER") {
+        return None;
+    }
+    let mut child = super::spawn_tracee_with(catch, ignore, true);
+    let stdin = child.stdin().expect("the tracee's stdin is piped");
+    let mut stdout = child.stdout().expect("the tracee's stdout is piped");
+    let mut seen = Vec::new();
+    let mut byte = [0u8];
+    while !seen.ends_with(super::TRACEE_READY) {
+        assert_eq!(
+            stdout.read(&mut byte).expect("read the tracee's stdout"),
+            1,
+            "the tracee ended before it was ready: {seen:?}"
+        );
+        seen.push(byte[0]);
+    }
+    Some((child, stdin, stdout))
+}
+
+/// Whether the tracee's `SIGTSTP` handler ran. Call once the tracee has ended, so its stdout
+/// is at EOF.
+fn sigtstp_handled(mut stdout: std::io::PipeReader) -> bool {
+    use std::io::Read as _;
+    let mut text = String::new();
+    stdout
+        .read_to_string(&mut text)
+        .expect("read the tracee's stdout to EOF");
+    text.contains(super::TRACEE_HANDLED_SIGTSTP)
+}
+
 /// A report as the helper wrote it.
 fn label(report: Report) -> String {
     match report {
@@ -1173,6 +1208,99 @@ fn s3_keeps_a_stop_signal_until_after_the_detach() {
     end_stopped(tracee);
 }
 
+/// `kinfo_proc` reports another process's dispositions, which is what the helper's choice
+/// between keeping and passing on a stop signal reads. Mutants: a disposition read as
+/// `Default`; `Caught` and `Ignored` swapped; the bit read at `signal` instead of `signal - 1`.
+#[test]
+fn sigcatch_and_sigignore_are_populated_for_another_process() {
+    let Some((tracee, stdin, _stdout)) = setup_tracee("SIGTSTP", "SIGTERM") else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    assert_eq!(sys::disposition(pid, libc::SIGTSTP), Ok(sys::Disposition::Caught));
+    assert_eq!(sys::disposition(pid, libc::SIGTERM), Ok(sys::Disposition::Ignored));
+    assert_eq!(sys::disposition(pid, libc::SIGTTIN), Ok(sys::Disposition::Default));
+    assert_eq!(sys::disposition(pid, libc::SIGTTOU), Ok(sys::Disposition::Default));
+    drop(stdin);
+    assert_exited_cleanly(tracee);
+}
+
+/// The handler runs before any detach: nothing here sends the helper a signal byte. Mutants: S3
+/// keeps a caught stop signal; S3 keeps every stop signal.
+#[test]
+fn s3_passes_a_caught_stop_signal_through() {
+    let Some((mut tracee, stdin, stdout)) = setup_tracee("SIGTSTP", "") else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
+    expect(&mut th, &TO_S3);
+    send(pid, libc::SIGTSTP);
+    expect(&mut th, &["S3s", "blocking S3 eof"]);
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    assert_handed_back(pid);
+    drop(th);
+    assert_exited_cleanly(tracee);
+    assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
+}
+
+/// A stop signal the tracee ignores is passed on at once too: `issignal` drops it. Mutants: S3
+/// keeps an ignored stop signal; S3 keeps every stop signal.
+#[test]
+fn s3_passes_an_ignored_stop_signal_through() {
+    let Some((mut tracee, stdin, stdout)) = setup_tracee("", "SIGTSTP") else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
+    expect(&mut th, &TO_S3);
+    send(pid, libc::SIGTSTP);
+    expect(&mut th, &["S3s", "blocking S3 eof"]);
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    assert_handed_back(pid);
+    drop(th);
+    assert_exited_cleanly(tracee);
+    assert!(!sigtstp_handled(stdout), "an ignored SIGTSTP ran a handler");
+}
+
+/// The peek is injected, the `PT_CONTINUE` real, as in [`s2_passes_a_stopping_signal_through`].
+/// Mutants: S2 keeps a caught stop signal; S2 keeps every stop signal.
+#[test]
+fn s2_passes_a_caught_stop_signal_through() {
+    let Some((mut tracee, stdin, stdout)) = setup_tracee("SIGTSTP", "") else {
+        return;
+    };
+    let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTSTP");
+    expect(&mut th, &["S2", "S2s"]);
+    drop(stdin);
+    expect(&mut th, &["S2b", "S2b*", &err("NOTE_EXIT", "S2b"), DONE]);
+    drop(th);
+    assert_exited_cleanly(tracee);
+    assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
+}
+
+/// As [`s4_keeps_a_stop_signal_until_after_the_detach`], for a caught `SIGTSTP`: passed on at
+/// S4, so the helper re-sends nothing. Mutants: S4 keeps a caught stop signal; S4 keeps every
+/// stop signal.
+#[test]
+fn s4_passes_a_caught_stop_signal_through() {
+    let Some((mut tracee, stdin, stdout)) = setup_tracee("SIGTSTP", "") else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL,S4sigstop:0", libc::SIGTSTP);
+    expect(&mut th, &["S4", "S4b*", "S4s"]);
+    send(pid, libc::SIGSTOP);
+    expect(&mut th, &["S4b*", "detached", DONE]);
+    drop(th);
+    drop(stdin);
+    assert_job_stopped(pid, libc::SIGSTOP);
+    end_stopped(tracee);
+    assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
+}
+
 /// Mutant: a later stop signal replaces the kept one.
 #[test]
 fn s3_keeps_only_the_first_stop_signal() {
@@ -1279,6 +1407,20 @@ fn s3_a_pass_through_on_an_exiting_tracee_waits_for_note_exit() {
     assert_exited_cleanly(tracee);
 }
 
+/// The tracee is gone when its disposition is read. Mutant: S3 fails on `ESRCH` from the read.
+#[test]
+fn s3_a_disposition_read_on_an_exiting_tracee_waits_for_note_exit() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "S3:SIGCHLD,S3stop:SIGTSTP,S3disp:ESRCH").attach(&mut tracee);
+    expect(&mut th, &TO_S3);
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    assert_handed_back(pid);
+    drop(th);
+    assert_exited_cleanly(tracee);
+}
+
 fn s3_fails(force: &str) {
     let Some((mut tracee, stdin)) = tracee() else { return };
     let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
@@ -1311,6 +1453,12 @@ fn s3_a_failed_stop_peek_fails() {
 #[test]
 fn s3_a_settling_stop_peeks_again() {
     s3_fails("S3:SIGCHLD,S3stop:settling,S3stop:EINVAL");
+}
+
+/// Mutant: S3 reads a failed disposition read as the default action.
+#[test]
+fn s3_a_failed_disposition_read_fails() {
+    s3_fails("S3:SIGCHLD,S3stop:SIGTSTP,S3disp:EINVAL");
 }
 
 /// Mutant: S3 ignores a failed pass-through.

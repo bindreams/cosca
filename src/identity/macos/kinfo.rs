@@ -1,7 +1,7 @@
 //! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
 //! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
 //! definition for these structs, so this is a minimal faithful local one. Only
-//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read; everything else is layout.
+//! `p_un.p_starttime`, `p_stat`, `p_sigignore`, `p_sigcatch` and `eproc.e_ppid` are read; everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 
@@ -35,6 +35,25 @@ impl kinfo_proc {
             .try_into()
             .expect("kp_eproc is 352 bytes; E_PPID_OFFSET + LEN fits with room to spare (see the tripwire below)");
         libc::pid_t::from_ne_bytes(bytes)
+    }
+}
+
+/// Read only by the test-only tracer helper (`test_support::tracer`).
+#[cfg(test)]
+impl extern_proc {
+    /// The signals the process has set to `SIG_IGN` (`p_sigignore`), bit `signal - 1` each.
+    pub(crate) fn sig_ignored(&self, signal: libc::c_int) -> bool {
+        Self::has(self.p_sigignore, signal)
+    }
+
+    /// The signals the process has a handler for (`p_sigcatch`), bit `signal - 1` each.
+    pub(crate) fn sig_caught(&self, signal: libc::c_int) -> bool {
+        Self::has(self.p_sigcatch, signal)
+    }
+
+    fn has(mask: u32, signal: libc::c_int) -> bool {
+        debug_assert!((1..=32).contains(&signal), "signal {signal} is outside the 32-bit mask");
+        mask & (1 << (signal - 1)) != 0
     }
 }
 
@@ -127,7 +146,7 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
-pub(super) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
+pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     read_record(pid, libc::KERN_PROC_PID)
 }
 
