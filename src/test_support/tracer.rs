@@ -430,6 +430,12 @@ pub(crate) const SIGTERM_EXIT: i32 = 15;
 pub(crate) const TRACEE_READY: &[u8] = b"uh-tracee: ready\n";
 /// What its `SIGTSTP` handler writes to stdout.
 pub(crate) const TRACEE_HANDLED_SIGTSTP: &str = "uh-tracee: handled SIGTSTP\n";
+/// What its `SIGUSR1` handler writes to stdout. The fixture raises `SIGUSR1` at itself for each
+/// byte read from its stdin. XNU delivers a process-directed signal to the same thread each
+/// time, and that thread runs the handlers in order, so a tick read means a `SIGTSTP` handler
+/// pending before the byte was sent has already written its line. (The thread that reads stdin
+/// need not be that thread, so a tick written by the reader would prove nothing.)
+pub(crate) const TRACEE_TICK: &str = "uh-tracee: tick\n";
 
 /// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
 /// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
@@ -464,7 +470,8 @@ pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) ->
 }
 
 /// The tracee: sets up the signals named by `COSCA_UH_CATCH` and `COSCA_UH_IGNORE`, writes
-/// [`TRACEE_READY`] to stdout, then reads stdin until EOF or one byte, then exits 0. A no-op
+/// [`TRACEE_READY`] to stdout, then answers each stdin byte with a `SIGUSR1`, whose handler writes
+/// [`TRACEE_TICK`], until EOF, then exits 0. A no-op
 /// unless `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
 #[test]
 fn uh_tracee_fixture() {
@@ -478,10 +485,14 @@ fn uh_tracee_fixture() {
     extern "C" fn note_sigtstp(_: libc::c_int) {
         write_stdout(TRACEE_HANDLED_SIGTSTP.as_bytes());
     }
+    extern "C" fn note_tick(_: libc::c_int) {
+        write_stdout(TRACEE_TICK.as_bytes());
+    }
     let install = |name: &str, action: libc::sighandler_t| {
         let signal = match name {
             "SIGTERM" => libc::SIGTERM,
             "SIGTSTP" => libc::SIGTSTP,
+            "SIGUSR1" => libc::SIGUSR1,
             other => panic!("the tracee fixture cannot set up {other:?}"),
         };
         // SAFETY: the handlers call only async-signal-safe functions; this process runs no other
@@ -501,8 +512,12 @@ fn uh_tracee_fixture() {
     for name in names("COSCA_UH_IGNORE").split(',').filter(|n| !n.is_empty()) {
         install(name, libc::SIG_IGN);
     }
+    install("SIGUSR1", note_tick as *const () as libc::sighandler_t);
     write_stdout(TRACEE_READY);
-    let _ = sys::read_byte(0);
+    while sys::read_byte(0).is_some() {
+        // SAFETY: `kill` to this process is always sound.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0, "raise SIGUSR1");
+    }
 }
 
 /// `write(2)` to fd 1, async-signal-safe. A failed write is ignored: the reader is gone.

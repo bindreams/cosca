@@ -63,6 +63,24 @@ fn sigtstp_handled(mut stdout: std::io::PipeReader) -> bool {
     text.contains(super::TRACEE_HANDLED_SIGTSTP)
 }
 
+/// Reads the tracee's stdout up to and including its [`super::TRACEE_TICK`] and returns what
+/// preceded the tick.
+fn read_until_tick(stdout: &mut std::io::PipeReader) -> String {
+    use std::io::Read as _;
+    let mut seen = Vec::new();
+    let mut byte = [0u8];
+    while !seen.ends_with(super::TRACEE_TICK.as_bytes()) {
+        assert_eq!(
+            stdout.read(&mut byte).expect("read the tracee's stdout"),
+            1,
+            "the tracee ended before it ticked: {seen:?}"
+        );
+        seen.push(byte[0]);
+    }
+    seen.truncate(seen.len() - super::TRACEE_TICK.len());
+    String::from_utf8(seen).expect("the tracee writes UTF-8")
+}
+
 /// A report as the helper wrote it.
 fn label(report: Report) -> String {
     match report {
@@ -1282,34 +1300,36 @@ fn s2_passes_a_caught_stop_signal_through() {
 }
 
 /// As [`s4_keeps_a_stop_signal_until_after_the_detach`], for a caught `SIGTSTP`: passed on at
-/// S4, so the helper re-sends nothing. Mutants: S4 keeps a caught stop signal; S4 keeps every
-/// stop signal.
+/// S4, so the helper re-sends nothing. The test's own `SIGSTOP` waits for the handler: the
+/// tracee answers a byte with a `SIGUSR1` tick, which its handler thread runs after the pending
+/// `SIGTSTP` handler (see [`super::TRACEE_TICK`]). Mutants: S4 passes on signal 0 (a tick with no handler line
+/// before it); S4 keeps a caught stop signal; S4 keeps every stop signal.
 #[test]
 fn s4_passes_a_caught_stop_signal_through() {
-    let Some((mut tracee, stdin, stdout)) = setup_tracee("SIGTSTP", "") else {
+    use std::io::Write as _;
+    let Some((mut tracee, mut stdin, mut stdout)) = setup_tracee("SIGTSTP", "") else {
         return;
     };
     let pid = tracee.id().pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL,S4sigstop:0", libc::SIGTSTP);
     expect(&mut th, &["S4", "S4b*", "S4s"]);
+    stdin.write_all(b"x").expect("ask the tracee for a tick");
+    let before_tick = read_until_tick(&mut stdout);
+    assert!(
+        before_tick.contains(super::TRACEE_HANDLED_SIGTSTP),
+        "the SIGTSTP handler had not run when the tracee ticked: {before_tick:?}"
+    );
     send(pid, libc::SIGSTOP);
     expect(&mut th, &["S4b*", "detached", DONE]);
     drop(th);
     drop(stdin);
-    // Nothing was kept: the tracee is stopped by S4's `SIGSTOP` at most (macOS 26), never by a
-    // re-sent `SIGTSTP`; on macOS 15 it runs on and exits at the closed stdin.
-    let info = await_change(pid);
-    if info.si_code == libc::CLD_STOPPED {
-        assert_eq!(
-            info.si_status,
-            libc::SIGSTOP,
-            "the detached tracee is stopped by a re-sent signal"
-        );
+    // Nothing was kept, so no re-sent `SIGTSTP` stops the tracee: it is stopped by the test's
+    // `SIGSTOP` (macOS 26), or on macOS 15 runs on and exits at the closed stdin.
+    if await_change(pid).si_code == libc::CLD_STOPPED {
         end_stopped(tracee);
     } else {
         assert_exited_cleanly(tracee);
     }
-    assert!(sigtstp_handled(stdout), "the SIGTSTP handler did not run");
 }
 
 /// Mutant: a later stop signal replaces the kept one.
