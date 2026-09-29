@@ -17,7 +17,7 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use super::{block_until_drained, probe};
+use super::{arm, block_until_drained, drain_kqueue, probe, DrainOutcome};
 use crate::containment::TreeDrain;
 
 fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -103,6 +103,59 @@ fn probe_reports_drained_even_with_bytes_still_buffered() {
     nix::unistd::write(&w, b"noise from a member").expect("write");
     drop(w);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
+}
+
+#[test]
+fn drain_kqueue_reports_spurious_for_an_armed_empty_pipe() {
+    // Nothing is pending, so `interpret_read_event` never runs.
+    let (_child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let kq = arm(marker.as_fd(), false).expect("arm");
+    let outcome = drain_kqueue(&kq, marker.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Spurious),
+        "an empty pipe with a live holder must be Spurious, got {outcome:?}"
+    );
+}
+
+#[test]
+fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
+    let (marker_r, marker_w) = std::io::pipe().expect("pipe");
+    let queued = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::from_file(std::fs::File::from(OwnedFd::from(marker_w))))
+        .expect("marker pipe");
+    let child = cmd.spawn().expect("spawn /bin/sh");
+
+    let kq = arm(marker_r.as_fd(), false).expect("arm");
+    let outcome = drain_kqueue(&kq, marker_r.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Declined),
+        "a full pipe with a live holder must be Declined, got {outcome:?}"
+    );
+    assert_eq!(
+        fionread(marker_r.as_fd()),
+        queued,
+        "suppress_drain=true must leave the bytes buffered"
+    );
+
+    // Killed through the `Child` handle before it is reaped (`docs/principles.md` §10).
+    child.kill().expect("kill the holder");
+    child.wait().expect("reap");
+}
+
+#[test]
+fn drain_kqueue_reports_drained_once_the_write_end_is_closed() {
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let kq = arm(marker.as_fd(), false).expect("arm");
+    drop(stdin); // cat exits, closing the last write end
+    child.wait().expect("reap");
+    let outcome = drain_kqueue(&kq, marker.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Drained(TreeDrain::AllMarkersClosed)),
+        "a closed write end must be Drained, got {outcome:?}"
+    );
 }
 
 #[test]
@@ -612,18 +665,11 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     child.wait().expect("reap");
 }
 
-/// Fills a marker pipe's write end `w` to the kernel's TRUE capacity, synchronously, in THIS
-/// process — no separate writer process to race, so no growth can ever happen after this
-/// returns. Marks `w` non-blocking and writes until `EAGAIN`, with a first write of 1 MiB
-/// (comfortably past any plausible pipe capacity) so XNU grows the buffer to its maximum inside
-/// that ONE syscall: several-small-writes (an earlier version of this helper, via `head`) let
-/// the buffer's growth straddle two writes, which is exactly why a `FIONREAD` reading taken
-/// between them could climb further right after — measured 16384, then 65536. `r` is the SAME
-/// pipe's read end, used only to query `FIONREAD` — on macOS that ioctl reads 0 on the write end
-/// of a pipe regardless of how much is actually buffered (measured: the write end alone reported
-/// 0 right after filling it to capacity), so the byte count must come from the read end even
-/// though nothing here ever reads from it. Returns the `FIONREAD` count once full. Shared by
-/// this module's own tests and by `deadline`'s.
+/// Fills `w` to the kernel's true capacity, synchronously, in this process, and returns the
+/// `FIONREAD` count read off `r`, the same pipe's read end (on macOS the write end always reads
+/// 0). The first write is 1 MiB so XNU grows the buffer to its maximum inside one syscall;
+/// smaller writes let the growth straddle two of them (measured 16384, then 65536). Shared with
+/// `deadline`.
 fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
     let fd = w.as_raw_fd();
     // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
@@ -689,31 +735,32 @@ fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
-    // The async counterpart to the sync past-the-clamp test above — but with the OPPOSITE
-    // expectation, because `wait_tree_drained` has no deadline at all (see its doc): draining on
-    // a stuck writer's behalf forever is exactly the unbounded CPU spin this primitive must not
-    // have, so past the clamp it does not drain.
+    // `wait_tree_drained` has no deadline, so past the clamp it must not drain: draining for a
+    // stuck writer forever is the unbounded CPU spin this primitive exists to avoid.
     //
-    // THIS process fills the pipe itself (`fill_pipe_to_capacity`) instead of racing a separate
-    // writer process across several partial writes — by the time the child below ever sees fd
-    // 3, the pipe is ALREADY at the kernel's true, final capacity, so nobody can grow it
-    // further. The child is a single `cat`, spawned through `crate::Command` exactly like every
-    // other fixture in this file, and NEVER itself writes to the marker (`exec cat >/dev/null`,
-    // blocked on a stdin the test holds open) — it exists only to hold the write end past
-    // `fill_pipe_to_capacity` returning, so the wait below has a live holder to observe. A
-    // single child killed through the `Child` handle cosca returned, before that handle reaps
-    // it, is `docs/principles.md` §10's own exemption from the sandbox-only rule.
+    // The seam below is a thread-local, so this needs the current-thread runtime that
+    // `#[tokio::test]` defaults to.
+    assert_eq!(
+        ::tokio::runtime::Handle::current().runtime_flavor(),
+        ::tokio::runtime::RuntimeFlavor::CurrentThread,
+        "declined_hook is thread-local: the future must be polled on this thread"
+    );
+
+    // This process fills the pipe before `arm`, so nothing can grow it afterwards. The child
+    // never writes; it only holds the write end open so the wait has a live holder.
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
     let queued_before = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
+    // The pipe is full, so its measured capacity is `queued_before`.
+    let clamp = super::LOW_WATER_MARK.min(queued_before as isize);
     assert!(
-        queued_before >= 16384,
-        "the pipe must be filled to at least its un-grown 16 KiB capacity, got {queued_before}"
+        queued_before as isize >= clamp,
+        "the pipe must be filled to the low-water clamp ({clamp}), got {queued_before}"
     );
 
     let mut cmd = crate::Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
     cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
-    // Moves `marker_w` in — this test's own copy is gone from here on, before `arm` ever runs.
+    // Moves `marker_w` in: this test's own copy is gone before `arm` runs.
     cmd.fd(
         3,
         crate::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(marker_w))),
@@ -727,54 +774,33 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
         "the holder already exited before this test could observe it"
     );
 
-    // Drive `wait_tree_drained` with no clock anywhere in this check. `declined_hook` (a
-    // `#[cfg(test)]` thread-local, installed by its own RAII guard — never a parameter on
-    // `wait_tree_drained_inner`'s production signature) fires every time the watch loop sees a
-    // GENUINE, interpreted non-EOF event and still does not resolve — never a spurious wakeup
-    // with nothing pending at all, which `interpret_read_event` never even ran against (see
-    // `DrainOutcome`'s own doc in `marker_eof.rs`) — the exact "saw readiness, declined to
-    // drain" edge that proves the race below has genuinely reached and passed judgment on a
-    // real event. `#[tokio::test]` defaults to a current-thread runtime, so this thread-local,
-    // set before `fut` is ever polled, is visible from inside that poll. `tokio::select!` polls
-    // both branches with the REAL task waker — not a hand-rolled one — so the reactor
-    // registration and wake-up are exactly what any other caller of this future gets, not a
-    // synthetic substitute this test would have to trust on faith.
+    // `declined_hook` fires when the watch loop gets a genuine non-EOF event and does not
+    // resolve: proof the race below reached and passed judgment on a real event. `select!`
+    // polls with the task's real waker, so the reactor registration is the one any caller gets.
     let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
     let _declined_guard = crate::tokio::wait::declined_hook::DeclinedGuard::install(declined_tx);
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
     let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx));
 
-    // One manual poll, deterministic rather than raced: it runs exactly through `arm` (which
-    // reports the newly armed kqueue's own fd on `armed_tx`, synchronously, before this call
-    // returns) and no further — the very next thing the future does is register with the
-    // reactor and await its readiness, which cannot resolve within THIS SAME poll call, so
-    // `Poll::Pending` is the only outcome a correct implementation can produce here.
-    // `Waker::noop` is fine: nothing schedules a wakeup for this poll, and nothing needs one —
-    // the future is driven again, for real, by the `select!` below.
+    // One manual poll runs through `arm` (which sends the new kqueue's fd on `armed_tx`) and
+    // stops at the reactor await, so `Pending` is the only correct outcome. The no-op waker is
+    // fine: the `select!` below drives the future for real.
     match std::future::Future::poll(
         fut.as_mut(),
         &mut std::task::Context::from_waker(std::task::Waker::noop()),
     ) {
         std::task::Poll::Pending => {}
-        std::task::Poll::Ready(res) => panic!(
-            "wait_tree_drained_for_test resolved on its very first poll, before this test could \
-             even check the armed knote's own readiness: {res:?}"
-        ),
+        std::task::Poll::Ready(res) => panic!("wait_tree_drained_for_test resolved on its first poll: {res:?}"),
     }
     let armed_kq_fd = armed_rx.recv().expect("watch armed");
 
-    // The pipe was already filled to its clamp (above) BEFORE `arm` ever ran, so a knote armed
-    // correctly (without `EV_DISABLE`) must be immediately ready — checked with a zero-timeout
-    // `kevent` on a separate, freshly created probe kqueue registered for `EVFILT_READ` on the
-    // watched kqueue's own fd (kqueues are themselves pollable). Non-consuming: this touches
-    // only the probe kqueue's own queue, never the real one `fut` owns or its reactor
-    // registration. Catches an `EV_DISABLE`-shaped mutant right here instead of only via the
-    // `.config/nextest.toml` backstop below, which exists solely for the case nothing
-    // in-process can catch: both `select!` arms left pending forever.
+    // The pipe was full before `arm`, so a correctly armed knote is already ready. A zero-timeout
+    // `kevent` on a separate probe kqueue checks that without touching `fut`'s queue. This
+    // catches an `EV_DISABLE` arm in-process; the nextest override covers what it cannot.
     assert!(
         kqueue_fd_is_already_readable(armed_kq_fd),
-        "a knote armed without EV_DISABLE on a pipe already at its low-water clamp must be \
-         immediately readable, but the probe kqueue reported it as not-readable"
+        "a knote armed without EV_DISABLE on a full pipe must be immediately readable, but the \
+         probe kqueue reported it as not-readable"
     );
 
     ::tokio::select! {
@@ -785,8 +811,7 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
         ),
         _ = declined_rx.recv() => {} // provably saw the real readiness edge and declined to drain on it
     }
-    // Catches a mutant that drained SOME bytes before declining — a bare "never resolved" cannot
-    // tell that apart from the correct, fully-unbounded, never-drains behavior.
+    // Distinguishes a mutant that drained some bytes before declining from correct behavior.
     let queued_after = fionread(fd);
     assert_eq!(
         queued_after, queued_before,

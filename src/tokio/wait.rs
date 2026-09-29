@@ -319,20 +319,13 @@ pub(crate) async fn wait_tree_deadline(
     }
 }
 
-/// Test-only structural seam: reports every time [`wait_tree_drained_inner`]'s watch loop sees a
-/// GENUINE, interpreted non-EOF event and still does not resolve
-/// (`DrainOutcome::Declined` — never a spurious wakeup with nothing pending,
-/// `DrainOutcome::Spurious`; see that type's own doc). A thread-local, not a parameter threaded
-/// through the production signatures — the seam pattern this crate uses elsewhere (e.g.
-/// `wait::fault`, `wait::macos::test_hooks::HookGuard`): `#[cfg(test)]`-only, installed by an
-/// RAII guard that resets it on `Drop` (including during unwinding), never compiled into a
-/// non-test build. `#[tokio::test]` defaults to a current-thread runtime, so a thread-local set
-/// on the test's own thread before `.await`ing the watched future is visible from inside that
-/// future's poll — it runs on the same OS thread.
-///
-/// A clock-free test races the watched future against this seam (`tokio::select!`, not a
-/// `tokio::time::timeout`) to prove it has genuinely reached and passed judgment on a real
-/// event.
+/// Test seam: fires every time [`wait_tree_drained_inner`]'s watch loop gets
+/// `DrainOutcome::Declined` (a genuine non-EOF event, retrieved and interpreted, that did not
+/// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
+/// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
+/// `wait::macos::test_hooks::HookGuard`, so no production signature carries it. It relies on a
+/// current-thread runtime (`#[tokio::test]`'s default): the future is polled on the installing
+/// thread.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod declined_hook {
     use std::cell::RefCell;
@@ -343,19 +336,18 @@ pub(crate) mod declined_hook {
         static DECLINED: RefCell<Option<UnboundedSender<()>>> = const { RefCell::new(None) };
     }
 
-    /// Fire this thread's installed hook, if any. Called only from inside
+    /// Fire this thread's installed hook, if any. Called only from
     /// [`super::wait_tree_drained_inner`]'s `DrainOutcome::Declined` arm.
     pub(crate) fn notify() {
         DECLINED.with(|d| {
             if let Some(tx) = d.borrow().as_ref() {
-                let _ = tx.send(());
+                let sent = tx.send(());
+                debug_assert!(sent.is_ok(), "declined_hook receiver dropped before the hook fired");
             }
         });
     }
 
-    /// RAII installer: sets this thread's hook target, and clears it on `Drop` — including
-    /// during unwinding, so a panicking test never leaves a stale sender for whatever runs on
-    /// this thread next.
+    /// RAII installer: clears the hook on `Drop`, including during unwinding.
     #[must_use]
     pub(crate) struct DeclinedGuard {
         _private: (),
@@ -363,14 +355,24 @@ pub(crate) mod declined_hook {
 
     impl DeclinedGuard {
         pub(crate) fn install(tx: UnboundedSender<()>) -> Self {
-            DECLINED.with(|d| *d.borrow_mut() = Some(tx));
+            DECLINED.with(|d| {
+                let mut slot = d.borrow_mut();
+                debug_assert!(slot.is_none(), "a declined_hook is already installed on this thread");
+                *slot = Some(tx);
+            });
             Self { _private: () }
         }
     }
 
     impl Drop for DeclinedGuard {
         fn drop(&mut self) {
-            DECLINED.with(|d| *d.borrow_mut() = None);
+            DECLINED.with(|d| {
+                let prev = d.borrow_mut().take();
+                debug_assert!(
+                    prev.is_some(),
+                    "declined_hook slot was cleared before its guard dropped"
+                );
+            });
         }
     }
 }
@@ -403,10 +405,9 @@ async fn wait_tree_drained_watched(
 /// — threaded through to both `arm` and `drain_kqueue` (see [`wait_tree_deadline`]'s own doc for
 /// why arming this wrong is a real, observable divergence, not a cosmetic one).
 ///
-/// `armed`, if given, reports the raw fd of the kqueue this call just armed — test-only use (see
-/// [`wait_tree_drained_for_test`]). A `DrainOutcome::Declined` (a genuine, interpreted non-EOF
-/// event, never `Spurious` — see that type's own doc) fires [`declined_hook::notify`] in test
-/// builds; there is no such seam in a non-test build at all.
+/// `armed`, if given, receives the raw fd of the kqueue this call just armed (test-only; see
+/// [`wait_tree_drained_for_test`]). That fd is valid only while this future is alive.
+/// `DrainOutcome::Declined` fires [`declined_hook::notify`] in test builds only.
 #[cfg(target_os = "macos")]
 async fn wait_tree_drained_inner(
     read_end: std::os::fd::BorrowedFd<'_>,
@@ -420,7 +421,11 @@ async fn wait_tree_drained_inner(
     use ::tokio::io::Interest;
     let kq = crate::containment::marker_eof::arm(read_end, unbounded_wait)?;
     if let Some(tx) = armed {
-        let _ = tx.send(kq.as_fd().as_raw_fd());
+        let sent = tx.send(kq.as_fd().as_raw_fd());
+        debug_assert!(
+            sent.is_ok(),
+            "the `armed` receiver was dropped before the kqueue was armed"
+        );
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {

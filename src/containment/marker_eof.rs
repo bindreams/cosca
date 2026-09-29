@@ -254,11 +254,13 @@ fn interpret_read_event(
 /// `crate::tokio::wait`'s `wait_tree_drained_inner`, which DOES distinguish them — only
 /// `Declined` fires its `#[cfg(test)]` seam. `block_until_drained` calls `interpret_read_event`
 /// directly, through `wait::backend::block_on_kqueue`, never `drain_kqueue` itself.
+#[derive(Debug)]
 pub(crate) enum DrainOutcome {
     /// `EV_EOF` — a terminal verdict.
     Drained(TreeDrain),
-    /// A genuine, non-EOF event was retrieved and interpreted by `interpret_read_event` (past
-    /// the low-water clamp, not draining) — not merely a wakeup with nothing to interpret.
+    /// A genuine non-EOF event was retrieved and interpreted (at/past the low-water clamp) and
+    /// did not resolve the wait; its bytes were discarded when `suppress_drain` is false and
+    /// left buffered when true.
     Declined,
     /// `kevent` reported nothing pending at all; `interpret_read_event` never ran.
     Spurious,
