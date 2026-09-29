@@ -17,6 +17,8 @@ pub(crate) mod spawn;
 
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
+#[path = "child/shared.rs"]
+pub(crate) mod shared;
 use proc_handle::ProcHandle;
 
 #[path = "child/lifecycle.rs"]
@@ -243,12 +245,12 @@ impl Child {
         // absent pgid returns `ESRCH`, which `containment::unix::signal_group`/`verify` already
         // treat as `Cleared` — so this only asserts on POSITIVE evidence of an actual recycle
         // (see `root_pid_was_recycled`), never on a mere reap. That positive-evidence case is
-        // reachable on the ORDINARY spawn-then-teardown path for any fast-exiting child, not
-        // only via an explicit `wait()` before `kill_tree()`/`terminate_tree()`: `std`'s
-        // `SharedChild::new` (inside `Command::spawn`, see `child/spawn.rs`'s own comment on
-        // this) can reap a fast-exiting leader itself, before the caller ever gets a `Child`
-        // handle back — this assert can therefore fire on the very first call the caller makes,
-        // whatever ordering they use. Gated to mechanisms that carry a recyclable pgid: a
+        // reachable without an explicit `wait()` before `kill_tree()`/`terminate_tree()`:
+        // `SharedChild::adopt` (inside `Command::spawn`) reaps nothing, but something else in
+        // the process can (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` reaper) — and then the
+        // kernel may recycle the leader's pid before the caller ever gets a `Child` handle back,
+        // so this assert can fire on the very first call the caller makes, whatever ordering
+        // they use. Gated to mechanisms that carry a recyclable pgid: a
         // recycled pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid),
         // Delegated (no mechanism), TreeWalk (re-resolves identity per member, immune to this
         // by construction), or a macOS FdMarker whose mode created no pgid — asserting it there
