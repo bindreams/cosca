@@ -8,7 +8,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::error::Error;
-use crate::identity::{Existence, ProcessId};
+use crate::identity::{Existence, Liveness, ProcessId};
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
 pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<rustix::fd::OwnedFd>, Error> {
@@ -21,40 +21,24 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
     let pidfd = match pidfd_open_checked(raw) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::SRCH) => return Ok(None),
-        // `pidfd_open` requires the pid number to resolve to a THREAD-GROUP LEADER task
-        // (`pid_has_task(pid, PIDTYPE_TGID)`, v6.15 kernel/fork.c:2114); a pid number that
-        // resolves to something else fails this even though it is not gone. Two concrete cases
-        // (not exhaustive — e.g. a pid held only as a session ID, or reused as another
-        // process's tid, land here too; `exists()` below tells all of them apart the same way):
-        //   - A process-group leader that has exited and been REAPED, while another member
-        //     of its group is still alive, keeps its number's `struct pid` alive as that
-        //     group's PGID — resolvable, but with no thread-group-leader task attached.
-        //     Before Linux 6.16 this is EINVAL; 6.16 (commit 8cf4b738) changes it to ESRCH,
-        //     already handled above.
-        //   - A LIVE thread that is not its process's thread-group leader (a non-leader tid)
-        //     fails the same check for the opposite reason — the task exists but was never a
-        //     leader. Before 6.16 this is ALSO EINVAL (indistinguishable from the reaped-
-        //     leader case by errno alone); 6.16+ gives ENOENT.
-        // One errno can mean either "gone" or "live", so re-verify identity instead of
-        // guessing: `Gone` confirms the reaped-leader case (report exited, matching the SRCH
-        // arm above). `Present` confirms a live, non-leader task — reporting that as exited
-        // would be an early verdict, so this keeps an error, but not the bare errno: on 6.16+
-        // that is a plain `NotFound` (from `ENOENT`) for a process that is very much still
-        // running, which a caller treating `NotFound` as "gone" would misread as exited.
-        // `live_non_leader_error` names the real cause instead. `Unknown` (the OS refused the
-        // existence query) gets the same treatment as the post-open re-verify below — never
-        // treated as "gone" either.
+        // pidfd_open needs a pid that resolves to a thread-group leader task. EINVAL (< 6.16) /
+        // ENOENT (>= 6.16) means either a reaped process-group leader whose pid lives on as a PGID
+        // (gone), or a non-leader tid: live, or a ptraced zombie thread kept until its tracer
+        // waits. Errno alone can't tell, so re-verify via exists() and is_alive(). Unknown is
+        // never treated as gone.
         Err(e @ (rustix::io::Errno::INVAL | rustix::io::Errno::NOENT)) => {
             return match exists_checked(id) {
                 Existence::Gone => Ok(None),
-                Existence::Present => Err(live_non_leader_error(id, what, e)),
-                Existence::Unknown => {
-                    log::warn!("wait: pid {} identity could not be confirmed; {what}", id.pid());
-                    Err(Error::Unassessable {
-                        detail: format!("pid {} identity could not be confirmed; {what}", id.pid()),
-                        source: None,
-                    })
-                }
+                Existence::Present => match alive_checked(id) {
+                    Liveness::Dead => Ok(None),
+                    Liveness::Alive => Err(Error::NotThreadGroupLeader {
+                        pid: id.pid(),
+                        detail: what.into(),
+                        source: std::io::Error::from(e),
+                    }),
+                    Liveness::Unknown => Err(identity_unassessable(id, what, Some(e))),
+                },
+                Existence::Unknown => Err(identity_unassessable(id, what, Some(e))),
             };
         }
         Err(rustix::io::Errno::NOSYS) => {
@@ -71,39 +55,24 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
     match exists_checked(id) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
-        Existence::Unknown => {
-            // The decision site `read_stat`-s debug-level probe relies on.
-            log::warn!("wait: pid {} identity could not be confirmed; {what}", id.pid());
-            Err(Error::Unassessable {
-                detail: format!("pid {} identity could not be confirmed; {what}", id.pid()),
-                source: None,
-            })
-        }
+        Existence::Unknown => Err(identity_unassessable(id, what, None)),
     }
 }
 
-/// `id` resolves to a live task, but `pidfd_open` refused it: on Linux, that means it names a
-/// thread that exists but is not its process's thread-group leader. `source` is folded into the
-/// message (not just `#[source]`'d) so the cause survives even where a caller only prints the
-/// error, not its chain: the bare errno alone reads as a plain "not found" — `source` is
-/// `NotFound` on 6.16+ (`ENOENT`) for a process that is very much still running — which a
-/// caller treating `NotFound` as "gone" would misread as exited.
-fn live_non_leader_error(id: ProcessId, what: &'static str, source: rustix::io::Errno) -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "pid {} names a live thread, not a thread-group leader; {what} (pidfd_open: {source})",
-            id.pid()
-        ),
-    ))
+/// `id`'s existence or liveness could not be established: logs at `warn` and builds the
+/// `Unassessable` error. Never treated as gone. `errno` is the `pidfd_open` failure that made the
+/// query necessary, if any.
+fn identity_unassessable(id: ProcessId, what: &'static str, errno: Option<rustix::io::Errno>) -> Error {
+    let cause = errno.map_or(String::new(), |e| format!(" (pidfd_open: {e})"));
+    log::warn!("wait: pid {} identity could not be confirmed{cause}; {what}", id.pid());
+    Error::Unassessable {
+        detail: format!("pid {} identity could not be confirmed{cause}; {what}", id.pid()),
+        source: errno.map(std::io::Error::from),
+    }
 }
 
-/// `pidfd_open`, seamed for tests: a forced errno (armed via
-/// [`fault::force_pidfd_open_errno_once`]) stands in for the real syscall exactly once, so a
-/// test can drive `open_verified`'s `EINVAL`/`ENOENT` arm deterministically regardless of which
-/// errno the host kernel actually produces for a given scenario (see `linux_tests.rs`'s module
-/// doc for why the real-syscall path alone cannot exercise it on a >= 6.16 kernel). Compiles to
-/// a direct call in a non-test build — no seam, no overhead.
+/// `pidfd_open`, with a test seam: a forced errno (see [`fault::force_pidfd_open_errno_once`])
+/// replaces the syscall once.
 #[cfg(test)]
 fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
     match fault::take_forced_pidfd_open_errno() {
@@ -116,11 +85,8 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
     pidfd_open(raw, PidfdFlags::empty())
 }
 
-/// `id.exists()`, seamed for tests: a forced [`Existence`] (armed via
-/// [`fault::force_exists_once`]) stands in for the real `/proc` read exactly once, so a test can
-/// drive either of `open_verified`'s `Existence::Unknown` arms deterministically — reproducing
-/// "the OS refused the query" (`hidepid`, a permission race) without needing a host that
-/// actually refuses it. Compiles to a direct call in a non-test build — no seam, no overhead.
+/// `id.exists()`, with a test seam: a forced [`Existence`] (see [`fault::force_exists_once`])
+/// replaces the `/proc` read once, to drive the `Unknown` arms.
 #[cfg(test)]
 fn exists_checked(id: ProcessId) -> Existence {
     match fault::take_forced_exists() {
@@ -133,18 +99,32 @@ fn exists_checked(id: ProcessId) -> Existence {
     id.exists()
 }
 
+/// `id.is_alive()`, with a test seam: a forced [`Liveness`] (see [`fault::force_alive_once`])
+/// replaces the `/proc` read once.
+#[cfg(test)]
+fn alive_checked(id: ProcessId) -> Liveness {
+    match fault::take_forced_alive() {
+        Some(liveness) => liveness,
+        None => id.is_alive(),
+    }
+}
+#[cfg(not(test))]
+fn alive_checked(id: ProcessId) -> Liveness {
+    id.is_alive()
+}
+
 #[cfg(test)]
 pub(crate) mod fault {
-    use crate::identity::Existence;
+    use crate::identity::{Existence, Liveness};
     use std::cell::Cell;
     thread_local! {
         static FORCE_PIDFD_OPEN_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
         static FORCE_EXISTS: Cell<Option<Existence>> = const { Cell::new(None) };
+        static FORCE_ALIVE: Cell<Option<Liveness>> = const { Cell::new(None) };
     }
 
-    /// Disarms the forced errno on drop, even if it was never consumed — so a test that panics
-    /// before its own `pidfd_open_checked` call (or whose code path never reaches one at all)
-    /// cannot leave a forced errno armed for whatever test runs next on this thread.
+    /// Disarms the forced errno on drop, so an unconsumed force can't leak into the next test on
+    /// this thread.
     #[must_use = "dropping this immediately disarms the forced errno; bind it for the probe's duration"]
     pub(crate) struct ForcedPidfdOpenErrno(());
 
@@ -165,8 +145,7 @@ pub(crate) mod fault {
         FORCE_PIDFD_OPEN_ERRNO.with(|f| f.take())
     }
 
-    /// Disarms the forced `Existence` on drop, even if it was never consumed — same reasoning
-    /// as [`ForcedPidfdOpenErrno`].
+    /// Disarms the forced `Existence` on drop; see [`ForcedPidfdOpenErrno`].
     #[must_use = "dropping this immediately disarms the forced existence; bind it for the probe's duration"]
     pub(crate) struct ForcedExists(());
 
@@ -185,6 +164,27 @@ pub(crate) mod fault {
 
     pub(crate) fn take_forced_exists() -> Option<Existence> {
         FORCE_EXISTS.with(|f| f.take())
+    }
+
+    /// Disarms the forced `Liveness` on drop; see [`ForcedPidfdOpenErrno`].
+    #[must_use = "dropping this immediately disarms the forced liveness; bind it for the probe's duration"]
+    pub(crate) struct ForcedAlive(());
+
+    /// Force the NEXT `id.is_alive()` inside `open_verified` on THIS thread to answer `liveness`,
+    /// consumed the first time it's read.
+    pub(crate) fn force_alive_once(liveness: Liveness) -> ForcedAlive {
+        FORCE_ALIVE.with(|f| f.set(Some(liveness)));
+        ForcedAlive(())
+    }
+
+    impl Drop for ForcedAlive {
+        fn drop(&mut self) {
+            FORCE_ALIVE.with(|f| f.set(None));
+        }
+    }
+
+    pub(crate) fn take_forced_alive() -> Option<Liveness> {
+        FORCE_ALIVE.with(|f| f.take())
     }
 }
 

@@ -312,13 +312,8 @@ fn main() {
         }
         #[cfg(target_os = "linux")]
         "report-tid-block-stdin" => {
-            // Report a LIVE NON-LEADER thread id: this process's own pid is the thread-group
-            // leader, so a second thread's tid is provably not it. Spawns a worker thread,
-            // reads its tid back over an mpsc channel (a real happens-before edge — no data
-            // race with the thread that owns it), reports `<tid>\n` on the control socket,
-            // then blocks on stdin until EOF (the caller closes its write end) or a byte —
-            // a real event, never a timer. The worker thread parks forever, so the tid it
-            // reported stays live for as long as this process runs.
+            // Report the tid of a parked worker thread (live, and not the thread-group leader) as
+            // `<tid>\n`, then block on stdin.
             let addr = &args[2];
             let (tx, rx) = std::sync::mpsc::channel();
             let _worker = std::thread::spawn(move || {
@@ -335,6 +330,31 @@ fn main() {
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = std::io::stdin().read(&mut buf); // blocks until stdin EOFs / a byte arrives
+        }
+        #[cfg(target_os = "linux")]
+        "traced-worker" => {
+            // Lets a ptracing parent attach before the worker exists. On a first stdin byte, spawn
+            // a worker thread and report its tid as `<tid>\n`; on a second, let it exit; then
+            // block on stdin, so the leader outlives the worker.
+            let addr = &args[2];
+            let mut stdin = std::io::stdin();
+            let mut byte = [0u8; 1];
+            stdin.read_exact(&mut byte).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+            let _worker = std::thread::spawn(move || {
+                // SAFETY: SYS_gettid takes no arguments and always succeeds.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                tx.send(tid as libc::pid_t).expect("send tid to the main thread");
+                let _ = exit_rx.recv();
+            });
+            let tid = rx.recv().expect("recv tid from the worker thread");
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            writeln!(sock, "{tid}").unwrap();
+            sock.flush().unwrap();
+            stdin.read_exact(&mut byte).unwrap();
+            exit_tx.send(()).unwrap();
+            let _ = stdin.read(&mut byte); // blocks until stdin EOFs
         }
         #[cfg(target_os = "macos")]
         "control-block-mixed-cloexec-marker" => {
