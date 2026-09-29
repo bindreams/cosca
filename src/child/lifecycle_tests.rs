@@ -180,16 +180,11 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     let _ = treewalk_child.wait();
 }
 
-// `Child::wait_deadline`'s own recheck loop (site 5 of the "deadline-windows-never-early" bug
-// family; see docs/principles.md #13, and this function's own doc):
-// a `None` ("still running") from the underlying backend must never be trusted as proof the
-// real `deadline` passed. Portable — this loop is cosca's own code, not Windows-specific — even
-// though the bug it defends against (`shared_child`'s Windows `wait_deadline_noreap` only
-// rechecking when ITS OWN per-call timeout was clamped) only manifests on Windows.
+// Deadline contract for `Child::wait_deadline`'s recheck loop: a backend `None` is never trusted
+// before the real deadline. Portable; seams are documented in `crate::wait`.
 
-/// A live, uncontained child that blocks reading its own piped stdin until EOF — it never
-/// exits on its own. `cat` (Unix) / `cmd /C more` (Windows, already used by this crate's
-/// Windows-only wait tests, e.g. `src/wait/windows_tests.rs`) — no new external dependency.
+/// A live, uncontained child that blocks on its piped stdin until EOF, so it never exits on its
+/// own (`cat` on Unix, `cmd /C more` on Windows).
 fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
@@ -203,28 +198,39 @@ fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
     (child, stdin)
 }
 
-/// `early_none_seam` fakes the OBSERVABLE effect of `shared_child`'s own early-`WAIT_TIMEOUT`
-/// bug deterministically — there is no seam into that third-party dependency's internals to
-/// force ITS bug directly (upstream tracking: cosca #237, not filed here). The loop's FIRST
-/// iteration receives a synthetic `None` without ever calling the real underlying wait; a hook
-/// fires the instant that's consumed, closing the fixture's piped stdin so it exits for real.
-/// The loop's SECOND (real) iteration must then correctly detect that genuine exit — the
-/// synthetic `None` must never be returned to the caller as "still running".
+/// A synthetic early `None` hours before the deadline is not trusted: the loop re-arms and
+/// reports the real exit.
 ///
-/// Mutant: keep the `early_none_seam::take()` consultation but drop the loop, i.e. return the
-/// first result (`let status = ...; return Ok(status)`) -> fails deterministically: the forced
-/// `None` is returned at once, hours before the real deadline. The fixture is a `Child`, whose
-/// `Drop` kills and reaps it, so a failed assertion leaks nothing.
+/// Mutant: return the first backend result (no loop) -> the forced `None` is returned.
 #[test]
 fn wait_deadline_never_reports_still_running_before_the_deadline() {
     let (child, stdin) = spawn_never_exiting();
     let _seam = crate::wait::early_none_seam::arm(move || drop(stdin)); // EOF -> exits for real
-    let deadline = std::time::Instant::now() + Duration::from_secs(3600); // hours off
-    let result = child.wait_deadline(deadline);
-    let status = result.expect("a genuinely-exiting child must not report a wait failure");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+    let status = child
+        .wait_deadline(deadline)
+        .expect("a genuinely-exiting child must not report a wait failure");
+    assert!(status.is_some(), "a synthetic early None was trusted");
+}
+
+/// Under a frozen test clock a finite deadline still ends: each real wait advances the clock.
+///
+/// Mutant: drop `advance_by_elapsed_if_frozen` from the loop -> `remaining` never shrinks and the
+/// loop re-arms forever.
+#[test]
+fn wait_deadline_terminates_under_a_frozen_clock() {
+    let (child, _stdin) = spawn_never_exiting();
+    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    let deadline = at + Duration::from_millis(50);
+    let status = child
+        .wait_deadline(deadline)
+        .expect("a live child must not report a wait failure");
     assert!(
-        status.is_some(),
-        "must report exited once the child genuinely exits, not falsely conclude still-running \
-         from an early, synthetic None"
+        status.is_none(),
+        "a never-exiting child is still running at the deadline"
+    );
+    assert!(
+        std::time::Instant::now() >= deadline,
+        "returned before the real deadline"
     );
 }

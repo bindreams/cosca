@@ -34,24 +34,13 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     ///
-    /// A FIFTH site sharing the "deadline windows never early" bug shape (see
-    /// docs/principles.md #13): the Windows-backend (`Raw`) arm of
-    /// `self.proc.wait_deadline` is `RawChild::wait_deadline`, cosca's own code (fixed
-    /// separately). The std-backend (`Std`) arm forwards to
-    /// `shared_child::SharedChild::wait_deadline`, which on Windows
-    /// (`shared_child::sys::windows::wait_deadline_noreap`) recheck-loops only while ITS OWN
-    /// per-call timeout was capped by the ~49.7-day Win32 clamp — a "recheck only when
-    /// clamped" mistake (an un-clamped `WAIT_TIMEOUT` can still fire early on real hardware;
-    /// see this crate's own `win32_timeout_ms` doc for the Microsoft citation). `shared_child`
-    /// is a third-party dependency (upstream tracking: cosca #237, not filed here), so this
-    /// loop is cosca's OWN defensive recheck around EITHER backend's result: a `None` this
-    /// function receives is never trusted until the REAL clock genuinely reaches `deadline`,
-    /// regardless of which backend produced it (harmless, and a no-op extra check, on the
-    /// already-correct `Raw` arm and on non-Windows platforms). `test` builds can simulate the
-    /// std backend's bug's observable effect via `crate::wait::early_none_seam`, since there is
-    /// no seam into the third-party dependency's own internals to force it directly.
+    /// A `None` from the backend is never trusted until the real clock reaches `deadline`
+    /// (principle 13): `shared_child`'s Windows `wait_deadline` may report `None` early, and a
+    /// recheck here costs nothing on the other backends.
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         loop {
+            #[cfg(test)]
+            let call_start = Instant::now();
             #[cfg(test)]
             let status = if crate::wait::early_none_seam::take() {
                 None
@@ -60,15 +49,15 @@ impl Child {
             };
             #[cfg(not(test))]
             let status = self.proc.wait_deadline(deadline).map_err(Error::Io)?;
+            #[cfg(test)]
+            crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
 
             if status.is_some() {
                 return Ok(status);
             }
-            if Instant::now() >= deadline {
+            if crate::wait::remaining(Some(Some(deadline))) == Some(Duration::ZERO) {
                 return Ok(None);
             }
-            // A `None` this early does not prove `deadline` has genuinely passed (see this
-            // function's doc) — re-arm rather than trust it.
         }
     }
 
