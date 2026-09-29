@@ -1072,7 +1072,14 @@ async fn accept_or_die_async_acks_the_connection_it_accepts() {
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
-    let (listener, mut target) = bind_and_spawn(&["sleep-marker"], false);
+    let (listener, _addr) = common::bind_async_listener();
+    let mut cmd = cosca::tokio::Command::new();
+    // Alive and silent until its stdin closes: the target must outlive the assertion below, and
+    // `hold-until-stdin-eof` ends only when the test lets go of `target_stdin`.
+    cmd.args([common::testbin().to_string(), "hold-until-stdin-eof".to_string()]);
+    cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
+    let mut target = cmd.spawn().expect("spawn the live target");
+    let target_stdin = target.stdin().expect("the target's piped stdin");
     let mut gone = common::spawn_locked(
         std::process::Command::new(common::testbin())
             .arg("hold-until-stdin-eof")
@@ -1090,6 +1097,7 @@ async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
         panic_message_of(async move { common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await })
             .await;
     assert_died_before_connecting(&message, gone_id.pid());
+    drop(target_stdin);
 }
 
 /// Only the GRANDCHILD dies (root alive, connected): the panic names the grandchild the root
