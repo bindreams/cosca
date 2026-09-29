@@ -17,6 +17,7 @@ thread_local! {
     static REQUESTED_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static LAST_EVENT_DATA: Cell<Option<isize>> = const { Cell::new(None) };
     static TIMEOUT_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+    static CLAMP_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
     // Set for the duration of any hook call, cleared right after — lets `fire_round_hook` and
     // `fire_post_event_hook` catch a hook that re-enters `block_on_kqueue` (which would try to
     // fire a hook of its own while the outer one's `RefCell` borrow is still held) with a clear
@@ -112,6 +113,16 @@ pub(crate) fn take_timeout_override() -> Option<Duration> {
     TIMEOUT_OVERRIDE.with(|c| c.take())
 }
 
+/// Lower the per-call `kevent` timeout clamp to `d` until the guard resets, so a test reaches
+/// the re-arm path without a multi-year deadline. Read by `block_on_kqueue`'s clamp.
+pub(crate) fn set_clamp_override(d: Duration) {
+    CLAMP_OVERRIDE.with(|c| c.set(Some(d)));
+}
+
+pub(crate) fn clamp_override() -> Option<Duration> {
+    CLAMP_OVERRIDE.with(Cell::get)
+}
+
 /// Clear every seam back to its default (no hooks, zero counters, no recorded data).
 /// Idempotent — safe to call whether or not anything was ever installed.
 fn reset() {
@@ -123,6 +134,7 @@ fn reset() {
     TIMEOUT_OVERRIDE.with(|c| c.set(None));
     AWAIT_EVENTS.with(|e| e.borrow_mut().clear());
     AWAIT_TIMEOUTS.with(|v| v.borrow_mut().clear());
+    CLAMP_OVERRIDE.with(|c| c.set(None));
     IN_HOOK.with(|f| f.set(false));
     GUARD_ACTIVE.with(|f| f.set(false));
 }
