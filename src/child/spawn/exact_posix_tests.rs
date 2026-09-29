@@ -93,8 +93,8 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
 
 const FIXTURE_UNREACHABLE_CWD_TEST: &str =
     "child::spawn::exact_posix_tests::fixture_spawn_exact_tool_in_an_unreachable_cwd";
-/// The fixture's own directory as a path, which it must fail to reach. Its presence alone does not
-/// mark a deliberate re-exec; the fixture also requires [`crate::test_child::is_fixture_reexec`].
+/// The fixture's own directory as a path, which it must fail to reach. A deliberate re-exec also
+/// needs [`crate::test_child::is_fixture_reexec`].
 const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
 /// The `current_dir()` the fixture sets, if any.
 const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
