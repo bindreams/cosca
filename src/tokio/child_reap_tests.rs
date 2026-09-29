@@ -134,3 +134,24 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
         "the child was reaped by the wait() above"
     );
 }
+
+// `waitid` failing with anything but EINTR is a real OS outcome, not a contract violation: it must
+// be logged at warn and the wait abandoned, in every build. A pid that is not this process's child
+// makes `waitid` fail with ECHILD while tokio still owns the real child (`id()` is `Some`).
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_and_reap_warns_and_returns_when_waitid_fails() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut child = spawn_a_tokio_child_that_exits();
+    assert!(child.id().is_some(), "tokio owns an un-reaped child");
+    let not_our_child = i32::MAX as u32;
+
+    super::wait_and_reap(&mut child, not_our_child, true);
+
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &format!("waitid on pid {not_our_child} failed")),
+        [log::Level::Warn]
+    );
+    child.wait().await.expect("reap the real child");
+}
