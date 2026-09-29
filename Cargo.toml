@@ -94,9 +94,13 @@ windows = { version = "0.62", features = [
 getrandom = { version = "0.4", features = ["std"] }
 # `get_osfhandle`/`isatty`: the testbin maps CRT fds to OS handles and classifies devices.
 libc = "0.2"
+# `Win32_Networking_WinSock` is compile-time bindings only, for the testbin's `WSAEventSelect`-based
+# death-watched accept (`tests/common/accept.rs`, included by `#[path]`): a `[[bin]]` target cannot
+# see the dev-dependencies' feature.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
