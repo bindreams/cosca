@@ -1,6 +1,8 @@
 name: CI
 on:
   pull_request:
+  workflow_call:
+  workflow_dispatch:
 jobs:
   mutants:
     runs-on: windows-latest
