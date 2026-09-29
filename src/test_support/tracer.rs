@@ -69,11 +69,12 @@ pub(crate) enum Report {
     /// The helper reaped the tracee, so XNU has handed the zombie back to the test.
     Reaped,
     /// The tracee is no longer traced and is the test's child again. Every signal that stopped
-    /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal
+    /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal is
     /// re-sent after the detach, unless a later `SIGCONT` cancelled it (see [`machine`]).
-    /// Whether it runs depends on the OS (measured on CI: stopped by `SIGSTOP` on macOS 26,
-    /// running on macOS 15), so the test ends it with `SIGKILL` through its handle, which ends
-    /// it either way.
+    /// Measured on CI: on macOS 15 the tracee runs, or is job-stopped by the re-sent signal; on
+    /// macOS 26 it may instead stay stopped by the detach's `SIGSTOP`, against which XNU discards
+    /// the re-sent one. So the test ends it with `SIGKILL` through its handle, which ends it
+    /// either way.
     Detached,
     /// The protocol failed in `state`.
     Error { cause: Cause, state: String },
@@ -421,8 +422,12 @@ impl TracerHelper<'_> {
     }
 }
 
+/// The exit status of a tracee spawned to catch `SIGTERM`, once it gets one.
+pub(crate) const SIGTERM_EXIT: i32 = 15;
+
 /// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
-pub(crate) fn spawn_tracee() -> crate::Child {
+/// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
+pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
@@ -433,6 +438,9 @@ pub(crate) fn spawn_tracee() -> crate::Child {
             crate::test_child::fixture_path!(uh_tracee_fixture),
         ])
         .env("COSCA_UH_ROLE", "tracee");
+    if catch_sigterm {
+        cmd.env("COSCA_UH_CATCH", "SIGTERM");
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("stdout null");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
@@ -445,6 +453,15 @@ pub(crate) fn spawn_tracee() -> crate::Child {
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
+    }
+    if std::env::var("COSCA_UH_CATCH").as_deref() == Ok("SIGTERM") {
+        extern "C" fn exit_on_sigterm(_: libc::c_int) {
+            // SAFETY: `_exit` is async-signal-safe.
+            unsafe { libc::_exit(SIGTERM_EXIT) }
+        }
+        // SAFETY: the handler calls only `_exit`; this process runs no other test.
+        let previous = unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
+        assert_ne!(previous, libc::SIG_ERR, "install the SIGTERM handler");
     }
     let _ = sys::read_byte(0);
 }

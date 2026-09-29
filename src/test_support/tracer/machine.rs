@@ -15,11 +15,12 @@
 //! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`
 //! delivers to a still-traced tracee (xnu `kern_sig.c`, `issignal`). So the helper keeps the
 //! first stop signal that stops the tracee, releases the tracee without it (`S2k`, `S3k`,
-//! `S4k`), and re-sends it with `kill(2)` after `PT_DETACH` (`S4r`). A `SIGCONT` passed on later
-//! drops it, since it would have continued the stopped tracee. Every other signal is delivered at
-//! once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). A `SIGSTOP` in S2 or S4 is taken for the one
-//! the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a client's own `SIGSTOP`
-//! there is indistinguishable from it.
+//! `S4k`), and re-sends it with `kill(2)` after `PT_DETACH` (`S4r`); XNU discards it only if
+//! the detach left the tracee stopped (measured on CI: sometimes on macOS 26). A `SIGCONT`
+//! passed on later drops it, since it would have continued the stopped tracee. Every other
+//! signal is delivered at once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). A `SIGSTOP` in S2 or S4
+//! is taken for the one the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a
+//! client's own `SIGSTOP` there is indistinguishable from it.
 //!
 //! | State | Event or result | Next | Report |
 //! |---|---|---|---|
@@ -34,7 +35,7 @@
 //! | S1h | backoff timeout, `SSTOP` sampled | S1hs: S1h with no more timeouts | |
 //! | S1h | `pbi_status` fails otherwise | done | `error` |
 //! | S1h | signal byte | S2 | |
-//! | S1h | EOF | exit; XNU kills the still-traced tracee | |
+//! | S1h | EOF | done, which exits at once; XNU kills the still-traced tracee | |
 //! | S1h | `NOTE_EXIT` | S5 | |
 //! | S2 Release | a `SIGSTOP` (the attach's) holds the tracee: `PT_CONTINUE` succeeds | S3 | `attached` |
 //! | S2 | the tracee stopped by another stop signal | keep it, release the tracee; S2k, then S2b | |

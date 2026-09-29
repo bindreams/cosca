@@ -15,10 +15,15 @@ use super::{sys, Cause, Mode, Report, TracerHelper, Until};
 
 /// The tracee and its stdin, or `None` with the `TRACER` group turned off.
 fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
+    tracee_with(false)
+}
+
+/// [`tracee`], catching `SIGTERM` if `catch_sigterm` (see [`super::spawn_tracee`]).
+fn tracee_with(catch_sigterm: bool) -> Option<(crate::Child, std::io::PipeWriter)> {
     if !crate::test_support::require_group("TRACER") {
         return None;
     }
-    let mut child = super::spawn_tracee();
+    let mut child = super::spawn_tracee(catch_sigterm);
     let stdin = child.stdin().expect("the tracee's stdin is piped");
     Some((child, stdin))
 }
@@ -251,8 +256,9 @@ fn dropping_a_helper_that_awaits_the_tracees_exit_kills_it_and_fails() {
     drop(stdin);
     let message = panic_of(|| drop(th));
     assert!(message.contains("waited in S6"), "{message}");
-    // Killed or exited on its own, depending on when the helper died: not asserted.
-    tracee.wait().expect("wait for the tracee");
+    // Killed, exited on its own, or not handed back, depending on when the helper died: its
+    // handle's drop copes with each, and nothing is asserted.
+    drop(tracee);
 }
 
 // S-1 ==========================================================================================
@@ -376,6 +382,7 @@ fn s1h_eof_exits_and_xnu_kills_the_tracee() {
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
     drop(th.session.signal_tx.take());
+    expect(&mut th, &[DONE]);
     assert_eq!(th.session.next_report(), None);
     drop(th);
     drop(stdin);
@@ -428,6 +435,7 @@ fn s1h_a_lone_sigchld_reads_as_the_timeout() {
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S1h:SIGCHLD").attach(&mut tracee);
     expect(&mut th, &HELD);
     drop(th.session.signal_tx.take());
+    expect(&mut th, &[DONE]);
     assert_eq!(th.session.next_report(), None);
     drop(th);
     drop(stdin);
@@ -472,18 +480,27 @@ fn s2_a_tracee_not_stopped_yet_backs_off() {
     assert_exited_cleanly(tracee);
 }
 
-/// The peek is injected, the `PT_CONTINUE` real: it delivers `SIGTERM`, and the tracee dies
-/// in S2b. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
+/// The peek is injected, the `PT_CONTINUE` real, and the tracee exits in S2b. The real stop is
+/// the attach's `SIGSTOP`, and XNU acts on a signal `PT_CONTINUE` passes from it with the stop
+/// signal's properties (`issignal`): it discards a default-action one, so this tracee catches
+/// `SIGTERM`. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
 #[test]
 fn s2_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_with(true) else {
+        return;
+    };
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM");
     expect(&mut th, &["S2", "S2s"]);
     // A tracee released without the signal then exits on its own instead.
     drop(stdin);
     expect(&mut th, &["S2b", "S2b*", &err("NOTE_EXIT", "S2b"), DONE]);
     drop(th);
-    assert_terminated(tracee);
+    let status = tracee.wait().expect("wait for the tracee");
+    assert_eq!(
+        status.code(),
+        Some(super::SIGTERM_EXIT),
+        "expected the SIGTERM handler's exit, got {status:?}"
+    );
 }
 
 /// The peek is injected; the test's own `SIGSTOP`, pending on the held tracee, stands in for the
@@ -1076,8 +1093,9 @@ fn s6_a_lone_sigchld_is_ignored() {
 
 // Signals ======================================================================================
 
-/// After the detach, with the tracee's stdin closed: it is job-stopped, as the kept signal
-/// left it.
+/// After the detach, with the tracee's stdin closed: it is job-stopped by the kept `signal`, or
+/// by the detach's own `SIGSTOP`, which XNU discards the re-sent signal against when it leaves
+/// the tracee stopped (measured on CI: sometimes on macOS 26, never on macOS 15).
 fn assert_job_stopped(pid: u32, signal: i32) {
     let info = await_change(pid);
     eprintln!(
@@ -1086,7 +1104,12 @@ fn assert_job_stopped(pid: u32, signal: i32) {
         info.si_status,
         sys::pbi_status(pid)
     );
-    assert_eq!(info.si_code, libc::CLD_STOPPED, "the detached tracee is not stopped");
+    assert!(
+        info.si_code == libc::CLD_STOPPED && [signal, libc::SIGSTOP].contains(&info.si_status),
+        "the detached tracee is not stopped by {signal} or SIGSTOP: si_code {}, si_status {}",
+        info.si_code,
+        info.si_status
+    );
 }
 
 /// Holds the tracee at S1hs, posts it `signal` (a traced, stopped tracee only posts it;
@@ -1176,7 +1199,11 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
         info.si_code != libc::CLD_STOPPED || info.si_status != libc::SIGTSTP,
         "the dropped SIGTSTP stopped the tracee"
     );
-    end_detached(tracee);
+    if info.si_code == libc::CLD_STOPPED {
+        end_detached(tracee);
+    } else {
+        assert_exited_cleanly(tracee);
+    }
 }
 
 /// Mutants: S4 passes a stop signal on; S4 detaches from any stop.
@@ -1325,16 +1352,11 @@ fn a_failed_attached_write_ends_the_run() {
 #[test]
 fn a_failed_pass_through_trace_write_ends_the_run() {
     let Some((mut tracee, stdin)) = tracee() else { return };
-    let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM,gone:state S2s");
+    let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM,S2cont:ok,gone:state S2s");
     expect(&mut th, &["S2", DONE]);
     drop(th);
     drop(stdin);
-    // The delivered SIGTERM, or XNU's SIGKILL if the helper exited first.
-    let status = tracee.wait().expect("wait for the tracee");
-    assert!(
-        matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
-        "expected SIGTERM or SIGKILL, got {status:?}"
-    );
+    assert_sigkilled(tracee);
 }
 
 /// Mutant: S3's pass-through ignores a failed trace write.
