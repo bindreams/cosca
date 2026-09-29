@@ -518,7 +518,10 @@ fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_l
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
 #[test]
 fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
-    let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-then-exit", false));
+    // Contained: the root exits at once, orphaning a live grandchild that holds the test's stdio.
+    // Unwinding drops the `Child`, and the containment is what kills that grandchild; without it
+    // nextest reports the test as `LEAK` (Windows).
+    let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(message.contains("died before it connected"), "got: {message:?}");
     assert!(

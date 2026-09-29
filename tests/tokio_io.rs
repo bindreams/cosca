@@ -1121,7 +1121,11 @@ async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting
 /// root.
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
-    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |_| {})).await;
+    // Contained, as in the sync sibling: the containment is what reaps the orphaned grandchild.
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |cmd| {
+        cmd.contain();
+    }))
+    .await;
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(message.contains("died before it connected"), "got: {message:?}");
     assert!(
