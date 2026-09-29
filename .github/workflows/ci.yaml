@@ -43,9 +43,11 @@ jobs:
             if cargo test --locked --lib "$T" -- --exact > "$RUNNER_TEMP/amp-$i.log" 2>&1; then
               pass=$((pass+1))
             else
-              fail=$((fail+1)); echo "=== amplified run $i FAILED"; grep -E "panicked|assert|handler" "$RUNNER_TEMP/amp-$i.log" | head -5
+              fail=$((fail+1)); echo "=== amplified run $i FAILED"; if [ "$fail" -le 3 ]; then cat "$RUNNER_TEMP/amp-$i.log"; fi
             fi
+            grep -h "test result" "$RUNNER_TEMP/amp-$i.log" >> "$RUNNER_TEMP/amp-results.txt" || true
           done
+          sort "$RUNNER_TEMP/amp-results.txt" | sed -E 's/finished in .*//' | uniq -c
           echo "AMPLIFIED pass=$pass fail=$fail"
       - name: Unmodified, 300 runs
         if: ${{ !cancelled() }}
@@ -55,7 +57,9 @@ jobs:
             if cargo test --locked --lib "$T" -- --exact > "$RUNNER_TEMP/plain-$i.log" 2>&1; then
               pass=$((pass+1))
             else
-              fail=$((fail+1)); echo "=== plain run $i FAILED"; grep -E "panicked|assert|handler" "$RUNNER_TEMP/plain-$i.log" | head -5
+              fail=$((fail+1)); echo "=== plain run $i FAILED"; if [ "$fail" -le 3 ]; then cat "$RUNNER_TEMP/plain-$i.log"; fi
             fi
+            grep -h "test result" "$RUNNER_TEMP/plain-$i.log" >> "$RUNNER_TEMP/plain-results.txt" || true
           done
+          sort "$RUNNER_TEMP/plain-results.txt" | sed -E 's/finished in .*//' | uniq -c
           echo "PLAIN pass=$pass fail=$fail"
