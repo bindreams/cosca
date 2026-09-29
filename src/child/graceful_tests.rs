@@ -14,6 +14,39 @@ fn blocker() -> (crate::Child, std::io::PipeWriter) {
     crate::test_child::held_contained_blocker(crate::Stdio::pipe())
 }
 
+/// A [`blocker`] for a test whose only end is a real kill: the Windows one is `more.com`, which
+/// exits 0 when its stdin closes (`findstr x` exits 1, the same as a kill), so
+/// [`assert_killed`] can tell the two apart.
+fn kill_only_blocker() -> (crate::Child, std::io::PipeWriter) {
+    #[cfg(unix)]
+    {
+        blocker()
+    }
+    #[cfg(windows)]
+    {
+        crate::test_child::windows_blocker()
+    }
+}
+
+/// The root died to the kill under test, not by exiting on its own once the fixture's stdin was
+/// released: `SIGKILL` on Unix, any non-zero exit on Windows (`more.com` exits 0 on EOF).
+fn assert_killed(status: std::process::ExitStatus) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the root must be SIGKILLed by the sweep, not exit on its own: {status:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "the root must be killed by the sweep, not exit on its own: {status:?}"
+    );
+}
+
 /// Proves a [`blocker`] is genuinely still running, not merely resolvable. On Unix, round-trips
 /// a byte through `cat`'s piped stdout over the stdin writer the caller holds; a killed-but-unreaped
 /// `cat` cannot echo.
@@ -152,17 +185,20 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
 // which is exactly the ordering this test needs and nothing more.
 #[test]
 fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
-    let (child, stdin) = blocker();
+    let (child, stdin) = kill_only_blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::Containment);
     // A successful sweep is fresher, positive proof the group cleared, superseding the held
     // refusal — the call must report `Ok`, not resurface the disproved `Containment` error.
+    // Released between the sweep and the reap: were the sweep a no-op, the reap would block on a
+    // `cat`/`more` nothing else ends. It then exits 0 by itself and `assert_killed` fails.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect("a successful sweep must supersede the forced terminate refusal");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    assert_killed(status);
     // Matches the TERMINATE trace specifically, not the pre-existing watch-error trace (both
     // share the same "graceful_shutdown_tree({pid})" prefix, so a bare prefix match would
     // pass even if the wrong log line fired). No `armed()` check here: `take_force_terminate`
@@ -194,7 +230,6 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
-    drop(stdin); // cleanup only: the sweep above already reaped the blocker for real
 }
 
 // Same hold-and-continue contract as the `Containment` test above, but for the OTHER
@@ -204,17 +239,20 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 // per forced-error shape.
 #[test]
 fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
-    let (child, stdin) = blocker();
+    let (child, stdin) = kill_only_blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::UnassessablePerMember);
     // Same supersession as the `Containment` test above: the sweep's success disproves the
     // held per-member-unconfirmed state, so the call must report `Ok`.
+    // Released between the sweep and the reap: were the sweep a no-op, the reap would block on a
+    // `cat`/`more` nothing else ends. It then exits 0 by itself and `assert_killed` fails.
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect("a successful sweep must supersede the forced unassessable state");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    assert_killed(status);
     assert!(
         crate::log_capture::contains_since(
             mark,
@@ -240,7 +278,6 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
-    drop(stdin); // cleanup only: the sweep above already reaped the blocker for real
 }
 
 // `Error::Unassessable { source: Some(_), .. }` — group::state's OWN listing failed, no
@@ -285,9 +322,13 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
     {
-        // `exec` keeps the signalled root process `sleep` itself, so the SIGTERM assertion below
-        // still means what it means. It dies to the default disposition well within grace.
-        cmd.args(["sh", "-c", "echo r; exec sleep 30"]);
+        // `exec` keeps the signalled root process `cat` itself, so the SIGTERM assertion below
+        // still means what it means. `cat` blocks on the stdin this test holds and has no other
+        // end than SIGTERM: were the SIGTERM missing, the tree would sit out `grace` in the
+        // cgroup lane and the root-only watch in the others. The `AfterTerminate` release below
+        // instead lets it exit 0 at once, so the missing SIGTERM fails the signal assertion.
+        cmd.args(["sh", "-c", "echo r; exec cat"]);
+        cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     }
     #[cfg(windows)]
@@ -303,6 +344,8 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     cmd.contain();
     #[allow(unused_mut)]
     let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    let stdin = child.stdin().expect("piped stdin");
     #[cfg(unix)]
     {
         let mut readiness = [0u8; 1];
@@ -324,6 +367,10 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
     );
     let armed = term_fault::ArmedKillTreeError::arm();
+    // Released once `terminate_tree` has returned, before any watch: SIGTERM is then already
+    // pending on the root, so it beats the EOF this release causes.
+    #[cfg(unix)]
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
     let result = child.graceful_shutdown_tree(Duration::from_secs(30));
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
@@ -359,7 +406,19 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         );
         drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-        cleanup(&mut child); // the forced failure means the real sweep never ran
+        _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        let status = child.wait().expect("the root was observed exited, so it is reaped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "the root must die to the SIGTERM, not exit on its own, got {status:?}"
+            );
+        }
+        #[cfg(windows)]
+        let _ = status;
     }
 }
 

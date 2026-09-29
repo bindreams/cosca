@@ -38,21 +38,6 @@ fn signal_refuses_a_child_with_no_mechanism() {
     assert!(detail.contains("contain"), "the refusal must name the remedy: {detail}");
 }
 
-// A Windows child that blocks reading a piped stdin the caller holds, never via a chosen duration
-// (`ping -n 30`): it ends only by a real kill (or the caller closing the pipe). Stdout is nulled
-// because `more` echoes its input.
-#[cfg(windows)]
-fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
-    let mut cmd = crate::Command::new();
-    cmd.args([crate::test_child::windows_more()]);
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    (child, stdin)
-}
-
 // `OtherConsoleGroup` shares `ConsoleGroup`'s arm — the flag word says the child's group lives
 // in another console, but a child may re-attach to ours after it starts, so the signal is
 // attempted rather than refused. No spawn through the public containment API can carry this
@@ -63,7 +48,7 @@ fn windows_blocker() -> (crate::Child, std::io::PipeWriter) {
 #[cfg(windows)]
 #[test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
-    let (child, _stdin) = windows_blocker();
+    let (child, _stdin) = crate::test_child::windows_blocker();
     let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id());
     let group = super::signal(GracefulMechanism::ConsoleGroup, child.id());
     assert!(
@@ -88,7 +73,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 #[cfg(windows)]
 #[test]
 fn signal_refuses_a_child_cosca_did_not_create() {
-    let (child, _stdin) = windows_blocker();
+    let (child, _stdin) = crate::test_child::windows_blocker();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;
     let err = super::signal(mechanism, child.id()).expect_err("a child cosca did not create must not be signalled");
     let crate::error::Error::Unsupported { detail, .. } = &err else {
