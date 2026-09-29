@@ -14,6 +14,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
+  # something as root opt out (principles 9 and 10).
+  COSCA_TEST_ROOT: "0"
 
 jobs:
   lint:
