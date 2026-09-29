@@ -164,6 +164,7 @@ impl RawChild {
                         "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
                         self.pid
                     );
+                    let _ = self.reap();
                 } else {
                     let _ = self.reap();
                 }
