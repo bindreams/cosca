@@ -340,7 +340,7 @@ pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containme
 #[cfg(target_os = "linux")]
 pub(crate) fn occupied_leaf() -> (
     crate::containment::cgroup::CgroupLeaf,
-    std::process::Child,
+    MemberGuard,
     crate::containment::cgroup::ReportChannel,
 ) {
     use std::os::unix::process::CommandExt;
@@ -357,7 +357,36 @@ pub(crate) fn occupied_leaf() -> (
         let _guard = crate::child::spawn::spawn_lock();
         cmd.spawn().expect("spawn the member")
     };
-    (leaf, member, own)
+    (leaf, MemberGuard(member), own)
+}
+
+/// The member `sleep` of [`occupied_leaf`]: SIGKILLed and reaped on drop, so a test that fails
+/// before its own teardown ends the child at once instead of leaving it to sleep out its 300 s.
+/// Declared after the leaf it lives in, so it drops first.
+#[cfg(target_os = "linux")]
+pub(crate) struct MemberGuard(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for MemberGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::DerefMut for MemberGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MemberGuard {
+    fn drop(&mut self) {
+        _ = self.0.kill();
+        _ = self.0.wait();
+    }
 }
 
 /// A temp-directory stand-in for a cgroup leaf, `<tempdir>/<name>`.
