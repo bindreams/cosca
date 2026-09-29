@@ -122,6 +122,7 @@ pub(crate) fn block_until_exit_or_cancel(
     deadline: Option<Instant>,
     cancel: &OwnedHandle,
 ) -> Result<bool, Error> {
+    let deadline = deadline.map(|d| d.max(Instant::now()));
     let handle = match crate::identity::windows_open_classified(
         id.pid(),
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
