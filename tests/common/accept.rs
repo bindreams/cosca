@@ -437,8 +437,13 @@ fn try_accept_now(listener: &::tokio::net::TcpListener) -> Option<TcpStream> {
     let dup = std::os::fd::AsFd::as_fd(listener).try_clone_to_owned();
     #[cfg(windows)]
     let dup = std::os::windows::io::AsSocket::as_socket(listener).try_clone_to_owned();
-    // The dup shares the listener's file description, so it is already non-blocking.
     let std_listener = TcpListener::from(dup.expect("duplicate the listener for the final accept"));
+    // A Unix dup shares the listener's file description and is already non-blocking. A Windows
+    // duplicate is a new socket object that does NOT inherit the mode (measured in CI: without
+    // this the accept below blocked forever), so set it explicitly on every platform.
+    std_listener
+        .set_nonblocking(true)
+        .expect("set the duplicated listener nonblocking for the final accept");
     match std_listener.accept() {
         Ok((stream, _)) => Some(blocking_std(stream)),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
