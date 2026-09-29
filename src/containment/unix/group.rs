@@ -681,8 +681,7 @@ pub(crate) fn state(pgid: i32, signal: Signal) -> GroupState {
 #[cfg(test)]
 pub(crate) mod fault {
     thread_local! {
-        static AFTER_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
+        static AFTER_LISTING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     }
 
     /// Run `hook` in the NEXT `converge` on this thread, once `members(pgid)` has returned and
@@ -690,32 +689,15 @@ pub(crate) mod fault {
     /// saw can still fork a process the listing did not. Whether that fork can succeed is what
     /// tells apart a group that a prior `killpg` has doomed from one that only `converge`'s
     /// per-member resend will reach.
-    ///
-    /// The returned guard clears the slot on drop, so a hook whose fire point was never reached
-    /// cannot leak into a later test on this thread. Arming over a live hook is a test bug.
     #[cfg(target_os = "linux")]
     pub(crate) fn set_after_listing(hook: impl FnOnce() + 'static) -> ArmedAfterListing {
-        let previous = AFTER_LISTING.with(|h| h.borrow_mut().replace(Box::new(hook)));
-        debug_assert!(previous.is_none(), "an after-listing hook is already armed");
-        ArmedAfterListing
+        crate::oneshot_hook::arm(&AFTER_LISTING, hook)
     }
     pub(crate) fn run_after_listing() {
-        let hook = AFTER_LISTING.with(|h| h.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
+        crate::oneshot_hook::fire(&AFTER_LISTING);
     }
-    /// Clears the [`set_after_listing`] slot on drop.
     #[cfg(target_os = "linux")]
-    #[must_use]
-    pub(crate) struct ArmedAfterListing;
-    #[cfg(target_os = "linux")]
-    impl Drop for ArmedAfterListing {
-        fn drop(&mut self) {
-            let hook = AFTER_LISTING.with(|h| h.borrow_mut().take());
-            drop(hook);
-        }
-    }
+    pub(crate) type ArmedAfterListing = crate::oneshot_hook::Armed;
 }
 
 #[cfg(test)]

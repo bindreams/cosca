@@ -2333,6 +2333,7 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
                 Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
             }
         };
+        crate::containment::cgroup::fault::run_before_exit_wait();
         assert!(
             err.to_string().contains("the child and its process group were killed"),
             "got {err}"
@@ -2438,6 +2439,7 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killi
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
+    crate::containment::cgroup::fault::run_before_exit_wait();
     assert_eq!(
         child.wait().expect("reap the child").signal(),
         Some(libc::SIGKILL),
@@ -2831,6 +2833,7 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
         drop(stdin);
     });
     drop(leaf);
+    crate::containment::cgroup::fault::run_before_exit_wait();
 
     assert!(
         crate::containment::cgroup::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
@@ -2931,6 +2934,7 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
     drop(child);
 
     drop(leaf);
+    crate::containment::cgroup::fault::run_before_exit_wait();
 
     assert!(
         crate::containment::cgroup::fault::take_reaped_orphans().contains(&(pid, Some(libc::SIGKILL))),
@@ -3356,6 +3360,7 @@ fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
         Err(e) => e,
         Ok(verdict) => panic!("an unreadable membership must fail closed, got {verdict:?}"),
     };
+    crate::containment::cgroup::fault::run_before_exit_wait();
     assert!(
         !crate::containment::cgroup::fault::membership_unreadable_armed(),
         "the seam must be consumed by the membership read"
