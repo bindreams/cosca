@@ -201,7 +201,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 
 // `Error::Unassessable { source: Some(_), .. }` — group::state's OWN listing failed, no
 // signal was ever attempted — must fail fast, the SAME disposition
-// `crate::child::is_teardown_mechanism_failure` gives the identical error shape reaching
+// `crate::containment::fdmarker::is_teardown_mechanism_failure` gives the identical error shape reaching
 // `Child::drop`. Regression test: folding this shape into the same hold-and-continue arm as
 // the ordinary per-member case would silently disagree with the classifier for the same
 // underlying error.

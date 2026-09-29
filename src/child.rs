@@ -485,38 +485,6 @@ impl Child {
     }
 }
 
-/// Whether a `hard_kill`/`terminate` result is still a genuine teardown MECHANISM failure —
-/// as opposed to `Error::Containment` (a live member refused the signal), both ORDINARY,
-/// expected outcomes after #61's fix and specifically the scenario it exists to report
-/// honestly, not bugs. Shared by both `Child::drop` impls (sync here, async in
-/// `src/tokio/child.rs`) so the classification has exactly one implementation instead of two
-/// hand-copied ones drifting apart.
-///
-/// **`Error::Unassessable` is NOT uniformly one or the other — it splits on `source`.**
-/// `group::decide` produces `source: None` when the group WAS listed successfully but one or
-/// more of its individual members could not be confirmed cleared (`check_or_signal` /
-/// `check_or_signal_linux_sigkill` returning `Reached::Unknown` for a live-or-unknown member)
-/// — an ordinary, expected outcome of the feature this issue adds, not a bug. `signal_group`'s
-/// `pgid <= 0` guard ALSO produces `source: None`, for a different but equally ORDINARY
-/// reason: a directly and deliberately TESTED input-validation refusal
-/// (`kill_group_and_term_group_reject_non_positive_pgid`, Task 5), not a "should never
-/// happen" internal contract violation — this function never got as far as attempting
-/// anything, the same way `group::decide`'s per-member case never got a confirmable answer.
-/// Neither provenance indicates the teardown MECHANISM'S OWN plumbing broke, which is the
-/// actual line this classifier draws. `group::state` produces `source: Some(io_error)` when
-/// `converge` itself returned `Err` — the listing syscall (`members()`'s `sysctl`/`/proc`
-/// scan) failed outright, before any member was even examined. THAT is a failure of the
-/// mechanism's own plumbing, the same class as `Error::Io`/`Error::Unsupported`, not a
-/// statement about any member or any input — so it, alone, is treated as a mechanism failure
-/// here.
-// Its only non-test caller is macOS-only (`fdmarker.rs`'s `combine_group_errors`); the `Drop`
-// impls no longer assert on it (principle 7). The tests that use it are feature- or OS-gated, so
-// it is dead code on every other lane, including `--no-default-features` test builds.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn is_teardown_mechanism_failure(e: &Error) -> bool {
-    matches!(e, Error::Io(_) | Error::Unsupported { .. }) || matches!(e, Error::Unassessable { source: Some(_), .. })
-}
-
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {

@@ -389,7 +389,7 @@ pub(crate) mod fault {
     /// `UnassessableMechanism` exercise fail-fast paths: `Unsupported` models the
     /// PRE-EXISTING console-less-caller shape (`NoConsole`/`Unsupported`) this task must not
     /// touch; `UnassessableMechanism` models `Error::Unassessable { source: Some(_), .. }` —
-    /// `group::state`'s own listing failure, `crate::child::is_teardown_mechanism_failure`'s
+    /// `group::state`'s own listing failure, `crate::containment::fdmarker::is_teardown_mechanism_failure`'s
     /// classification for the identical shape reaching `Child::drop` — which this task's
     /// `graceful_shutdown_tree` match must treat the SAME way (fail-fast), not fold into the
     /// per-member `Unassessable{source: None}` hold-and-continue case.
