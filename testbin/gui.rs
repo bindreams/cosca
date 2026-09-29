@@ -10,6 +10,10 @@
 //! console-subsystem testbin so the two differ in exactly one thing: the image's subsystem.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+/// The accept handshake (see the module doc).
+#[path = "ack.rs"]
+mod ack;
+
 /// The `report-console-identity` mode, shared verbatim with `testbin/main.rs`.
 #[cfg(windows)]
 #[path = "console_identity.rs"]
@@ -30,7 +34,7 @@ fn main() {
         console_identity::run(&addr, caller_pid);
         return;
     }
-    let mut sock = std::net::TcpStream::connect(&first).expect("connect control socket");
+    let mut sock = crate::ack::connect_control(&first).expect("connect control socket");
     sock.write_all(b"G").expect("write tag");
     sock.flush().expect("flush tag");
     // Blocks until the socket closes (our death, or the test dropping its end).
