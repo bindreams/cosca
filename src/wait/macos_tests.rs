@@ -90,3 +90,57 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
 
 #[path = "macos_tests/await_reapable.rs"]
 mod await_reapable;
+
+/// A deadline beyond XNU's `kevent` `tv_sec` limit still returns the child's exit. The child is
+/// ended from the round hook, so the exit is pending or imminent when `kevent` is called.
+///
+/// Mutant: drop the clamp in `kevent_timeout` -> `Io(EINVAL)` at once.
+#[test]
+fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
+    use std::time::Duration;
+
+    let _guard = crate::child::spawn::spawn_lock();
+    let mut child = crate::test_child::held_std_blocker(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn blocker");
+    drop(_guard);
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let mut stdin = child.stdin.take();
+    let _hooks = super::test_hooks::HookGuard::install(move |_, _| drop(stdin.take()));
+    let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)));
+    let exited = super::block_until_exit(id, deadline).expect("a far deadline is not an error");
+    assert!(exited, "the child was ended, so the wait reports its exit");
+    let requested = super::test_hooks::requested_timeouts();
+    assert_eq!(
+        requested[0],
+        Some(Duration::from_secs(i32::MAX as u64)),
+        "the first kevent is armed with the clamp, not the far remaining time"
+    );
+    child.wait().expect("reap");
+}
+
+/// A remaining time above the clamp is re-armed from the real deadline: every `kevent` gets at
+/// most the clamp, and the wait still ends only at the deadline.
+///
+/// Mutant: drop the clamp -> a single call carries the whole remaining time.
+#[test]
+fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
+    use crate::wait::test_clock::FrozenClockGuard;
+    use nix::sys::event::Kqueue;
+    use std::time::Duration;
+
+    let kq = Kqueue::new().expect("kqueue");
+    let (_clock, at) = FrozenClockGuard::install();
+    let deadline = Some(Some(at + Duration::from_millis(50)));
+    let _hooks = super::test_hooks::HookGuard::install(|_, _| {});
+    let clamp = Duration::from_millis(10);
+    super::test_hooks::set_clamp_override(clamp);
+    let verdict = super::block_on_kqueue(&kq, deadline, true, |_, _| Ok(None)).expect("bounded wait");
+    assert!(verdict, "an event-less wait ends by its deadline");
+    let requested = super::test_hooks::requested_timeouts();
+    assert!(requested.len() >= 2, "one call cannot cover 50ms under a 10ms clamp");
+    assert!(
+        requested.iter().all(|t| t.is_some_and(|t| t <= clamp)),
+        "every call is capped: {requested:?}"
+    );
+}
