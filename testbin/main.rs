@@ -24,7 +24,11 @@ mod console_identity;
 /// The death-watched accept shared with `tests/`: a plain `accept()` on a child's ack socket would
 /// hang forever if that child died before connecting.
 #[cfg(windows)]
-#[allow(dead_code, unused_imports)] // shared with tests/, which uses the parts this binary does not
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared with tests/, which uses the parts this binary does not"
+)]
 #[path = "../tests/common/accept.rs"]
 mod accept;
 
@@ -162,6 +166,20 @@ fn install_ignore_break() {
     unsafe { SetConsoleCtrlHandler(Some(ignore), true) }.expect("install ctrl handler");
 }
 
+/// `set_current_dir`s THIS process — never a spawned child — to `dir`. The one legitimate call
+/// site `clippy.toml`'s `disallowed-methods` exempts here: `cosca_testbin` is a freshly spawned,
+/// single-purpose PROCESS per invocation, never the shared multithreaded `cargo test` binary, so
+/// mutating its own cwd races nothing. Both `report-bare-argv0-cwd-spawn*` arms route through
+/// this one function so the `#[expect]` lives in exactly one place.
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "testbin is a dedicated single-purpose process per invocation; mutating its own cwd races no concurrent test — see this function's doc"
+)]
+fn chdir_this_process(dir: impl AsRef<std::path::Path>) {
+    std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+}
+
 /// Shared body of `control-echo-pid` and the grandchild arm of `spawn-orphan-escapee`'s
 /// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
 /// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
@@ -192,7 +210,6 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
-#[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     #[allow(
         clippy::disallowed_methods,
@@ -211,7 +228,10 @@ fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandc
 
 /// Holds a grandchild's `Child` for the rest of the arm (see [`spawn_reported_grandchild`]); never
 /// waited on, on purpose.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the field is only held, never read: keeping the `Child` alive keeps its pid from being reissued"
+)]
 struct KeptGrandchild(std::process::Child);
 
 fn main() {
@@ -545,7 +565,10 @@ fn main() {
             // pgid addresses both.
             let addr = args[2].clone();
             let setuid_helper = args[3].clone();
-            #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills/refuses us
+            #[allow(
+                clippy::zombie_processes,
+                reason = "grandchild must outlive us; containment kills/refuses us"
+            )]
             #[allow(
                 clippy::disallowed_methods,
                 reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
@@ -677,7 +700,6 @@ fn main() {
         "orphan-relay" => {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
             #[allow(
                 clippy::disallowed_methods,
                 reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
@@ -996,7 +1018,7 @@ fn main() {
             // else, so a caller sees the real cause instead of a silent miscount.
             let dir = &args[2];
             let program = args[3].as_str();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let mut c = cosca::Command::new();
             c.args([program, "exit", "0"]).fd(3, cosca::Stdio::pipe_out()).unwrap();
@@ -1025,7 +1047,7 @@ fn main() {
             // process builds one just for this probe.
             let dir = &args[2];
             let program = args[3].clone();
-            std::env::set_current_dir(dir).expect("chdir to the decoy directory");
+            chdir_this_process(dir);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

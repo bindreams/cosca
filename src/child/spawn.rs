@@ -209,7 +209,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // configured n>=3. The n>=3 collection is Unix-only: on Windows the routing
         // above (any fd>=3 goes to the raw backend) guarantees `fds` holds no fd>=3,
         // so the push is dead code there — cfg-gate it to make that explicit.
-        #[cfg_attr(not(unix), allow(unused_mut))]
+        #[cfg_attr(not(unix), allow(unused_mut, reason = "the n>=3 push below is unix-only"))]
         let mut v: Vec<Fd> = std_slots.to_vec();
         #[cfg(unix)]
         for &fd in fds.keys() {
@@ -537,7 +537,13 @@ fn enter_in_child(std_cmd: &mut std::process::Command, dir: &std::path::Path) ->
     // after it.
     unsafe {
         std_cmd.pre_exec(move || {
-            if libc::chdir(dir.as_ptr()) == 0 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "this closure runs in the forked child, between fork and exec, so the chdir \
+                          moves that child's cwd and never this process's — see this function's doc"
+            )]
+            let status = libc::chdir(dir.as_ptr());
+            if status == 0 {
                 Ok(())
             } else {
                 Err(std::io::Error::last_os_error())
@@ -698,7 +704,10 @@ pub(crate) enum PipeOwnership {
     /// resolved child ends (the caller assigns `Stdio::piped()`), and a merge into a piped
     /// STD target is rejected (its end is tokio's, not ours to dup). fd >= 3 pipes are OURS
     /// on every path: they resolve like `Owned` and produce parent ends.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async spawn path constructs Deferred")
+    )]
     Deferred,
 }
 

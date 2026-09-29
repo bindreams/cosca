@@ -13,7 +13,15 @@ tokio = { version = "1", default-features = false, features = ["time", "process"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", default-features = false }
+nix = { version = "0.31", default-features = false, features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+# `libc::chdir` is the CRT `_chdir` here. `windows` and `windows-sys` are versioned like the root
+# crate's own dependency graph; their `Win32_System_Environment` feature is what puts the
+# `SetCurrentDirectory*` paths in reach of the ban.
+libc = "0.2"
+windows = { version = "0.62", features = ["Win32_System_Environment"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Environment"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["pipe"] }
+rustix = { version = "1", features = ["pipe", "process", "fs"] }

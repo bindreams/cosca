@@ -8,7 +8,10 @@
 /// covered by the lib crate's lint (`spawn_lock_tests`), which this crate does not enable.
 #[test]
 fn discarding_the_test_guard_is_linted() {
-    #[expect(unused_must_use)]
+    #[expect(
+        unused_must_use,
+        reason = "the point of this test: discarding the guard must be flagged; the `let _ =` form is covered by the lib crate's lint"
+    )]
     cosca::test_spawn_lock();
 }
 

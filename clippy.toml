@@ -18,8 +18,21 @@
 # std/tokio `Command::spawn/output/status` fork without holding spawn_lock. Library tests use
 # crate::test_spawn; `tests/` uses the wrappers in tests/common/locked.rs.
 #
-# Every path below needs a call in .github/fixtures/disallowed-methods (checked by
-# .github/scripts/check-disallowed-methods.sh).
+# Process-cwd mutators -----
+#
+# Anything that changes the process's own cwd, as opposed to a `Command`'s spawn-time cwd. The cwd
+# is shared by every thread, so a change races every concurrently running test; exempt a site only
+# with a reasoned `#[expect]`. libc 0.2.189, windows 0.62.2 and windows-sys 0.61.2 declare no
+# `_wchdir`/`wchdir`, so there is nothing to ban for them.
+#
+# `allow-invalid = true` marks a path that is absent on some target/feature combination this crate
+# is linted with while its crate is linked there (Windows libc has no `fchdir`/`daemon`, macOS nix
+# has no `daemon`). Clippy skips a path whose crate is not linked at all; for one that is linked but
+# lacks the item it warns "does not refer to a reachable function", which `allow-invalid`
+# suppresses.
+#
+# .github/scripts/check-disallowed-methods.sh requires every path below to have a call in
+# .github/fixtures/disallowed-methods that fires on each target that has the item.
 disallowed-methods = [
     # Flag-less pipe constructors
     { path = "libc::pipe", reason = "libc::pipe's fds lack close-on-exec, so concurrently spawned children can inherit them and delay EOF. Use std::io::pipe(), which is atomic via pipe2 on Linux and the BSDs; on macOS it is pipe()+FD_CLOEXEC and still has a window, which a spawn can close with the opt-in tracked in cosca #248. Or use pipe2(O_CLOEXEC) where the platform has it." },
@@ -44,4 +57,19 @@ disallowed-methods = [
     { path = "tokio::time::Interval::reset_immediately", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
     { path = "tokio::time::Interval::reset_after", reason = "Re-arming an Interval derives the deadline from a duration, outside arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) with an instant from deadline_from (principle 13)." },
     { path = "tokio::time::Interval::reset_at", reason = "Re-arming an Interval bypasses arm_at's margin check and armed-deadline seam. Use arm_at(at, fut) (principle 13)." },
+    # Process-cwd mutators
+    { path = "std::env::set_current_dir", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "libc::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "libc::fchdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "libc::daemon", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "nix::unistd::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "nix::unistd::fchdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "nix::unistd::daemon", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "rustix::process::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "rustix::process::fchdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "rustix::fs::Dir::chdir", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryA", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "windows::Win32::System::Environment::SetCurrentDirectoryW", reason = "changes the process cwd, shared by all threads; use Command::current_dir" },
+    { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryA", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
+    { path = "windows_sys::Win32::System::Environment::SetCurrentDirectoryW", reason = "changes the process cwd, shared by all threads; use Command::current_dir", allow-invalid = true },
 ]

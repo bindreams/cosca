@@ -13,7 +13,7 @@
 //! Opt-in, by [`ACK_ENV`] in the target's environment (inherited by its descendants): a site
 //! that still uses a plain `accept()` sets nothing and its targets do not wait.
 
-#![allow(dead_code)] // the testbin only reads acks; `tests/common` only writes them
+#![allow(dead_code, reason = "the testbin only reads acks; `tests/common` only writes them")]
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};

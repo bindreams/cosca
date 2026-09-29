@@ -9,7 +9,13 @@ use std::path::PathBuf;
 /// path it touched, and the kernel's own reason: the caller degrades to a process group
 /// either way, but it degrades *stating which precondition was missing*.
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "produced and consumed only by the linux-gated cgroup leaf machinery"
+    )
+)]
 pub(crate) enum LeafError {
     /// `/proc/self/cgroup` could not be read (no procfs, or it is not mounted).
     #[error("could not read /proc/self/cgroup: {0}")]
@@ -81,7 +87,13 @@ pub(crate) enum LeafError {
 /// distinction is invisible there; several children sharing one leaf would share one channel, and
 /// the first report written would stand for all of them (see [`ReportChannel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "produced and consumed only by the linux-gated cgroup leaf machinery"
+    )
+)]
 pub(crate) enum PlacementReport {
     /// The child exited before reporting its placement outcome: its `pre_exec` may not have run,
     /// or may have been interrupted between the write and the send. It never exec'd either way.
@@ -111,7 +123,13 @@ impl fmt::Display for PlacementReport {
 
 /// What a child with nothing in its leaf reported: never a successful write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "produced and consumed only by the linux-gated cgroup leaf machinery"
+    )
+)]
 pub(crate) enum NotEntered {
     /// It exited before reporting its placement outcome (see [`PlacementReport::NotReported`]).
     NotReported,
@@ -134,7 +152,13 @@ impl fmt::Display for NotEntered {
 /// `cgroup.procs` and the child's `/proc` state are read only to diagnose a child that
 /// reported no successful write.
 #[derive(Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "produced and consumed only by the linux-gated cgroup leaf machinery"
+    )
+)]
 pub(crate) enum NotPlaced {
     /// `cgroup.procs` was read.
     Absent {
@@ -222,7 +246,13 @@ impl fmt::Display for NotPlaced {
 /// was unavailable.
 ///
 /// Logged at `warn` on every call; deduplication is the log handler's job.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "dispatch.rs's only call sites are behind cgroup::try_create_leaf/CgroupLeaf::take_placement, both linux-gated"
+    )
+)]
 pub(crate) fn log_degrade(reason: &dyn fmt::Display) {
     log::warn!("cgroup v2 containment: degrading to a process group — {reason}");
 }

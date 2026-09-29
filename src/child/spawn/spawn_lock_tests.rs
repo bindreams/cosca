@@ -59,10 +59,19 @@ fn another_thread_blocks_rather_than_panics() {
 /// lint stops firing, so the protection `MutexGuard` gave (rustc's `let_underscore_lock`) is kept.
 #[test]
 fn discarding_the_guard_is_linted() {
-    #[expect(unused_must_use)]
+    #[expect(
+        unused_must_use,
+        reason = "the point of this test: discarding the guard must be flagged"
+    )]
     spawn_lock();
-    #[expect(clippy::let_underscore_must_use)]
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the point of this test: `let _ =` on the guard must be flagged"
+    )]
     let _ = spawn_lock();
-    #[expect(clippy::let_underscore_must_use)]
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the point of this test: `let _ =` on the guard must be flagged"
+    )]
     let _ = crate::test_spawn_lock();
 }

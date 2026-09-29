@@ -78,6 +78,13 @@ mod probe {
         PathBuf::from(full.strip_prefix(r"\\?\").expect("a verbatim canonical path"))
     }
 
+    /// Moves THIS process's cwd — the one legitimate call site in this file. `cosca_testbin_cwd` is
+    /// a freshly spawned, single-purpose process, never the shared multithreaded `cargo test`
+    /// binary, so mutating its own cwd races nothing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "cosca_testbin_cwd is a dedicated single-purpose process per invocation; mutating its own cwd races no concurrent test"
+    )]
     pub(crate) fn set_cwd(path: &OsStr) -> Result<(), u32> {
         let r = std::env::set_current_dir(path);
         r.map_err(|e| e.raw_os_error().map_or(u32::MAX, |c| c as u32))

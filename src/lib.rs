@@ -7,7 +7,8 @@
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
-// result on purpose with `_ = expr;`.
+// result on purpose with `_ = expr;`. Crate-level, not in `[lints]`, which would extend it to the
+// tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
 pub mod containment;
@@ -56,7 +57,13 @@ mod command;
 // the search policy as dead. The module is deliberately NOT cfg-gated: keeping it platform-independent is what makes
 // its policy testable from a POSIX host, which is where most of this work happens. The allow
 // goes away when the POSIX and default spawn paths route through it too.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "off-windows only resolve::exact is consumed, so the lib build sees the search policy as dead"
+    )
+)]
 mod resolve;
 pub use command::Command;
 

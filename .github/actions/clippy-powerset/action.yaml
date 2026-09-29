@@ -12,6 +12,10 @@ inputs:
     description: "Rust target triple to lint; empty lints the host target"
     required: false
     default: ""
+  release:
+    description: "'true' lints with --release, which compiles `cfg(not(debug_assertions))` code"
+    required: false
+    default: "false"
 runs:
   using: composite
   steps:
@@ -27,9 +31,13 @@ runs:
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
+        RELEASE: ${{ inputs.release }}
       run: |
+        args=(--feature-powerset)
         if [[ -n "$TARGET" ]]; then
-          .github/scripts/clippy.sh --feature-powerset --target "$TARGET"
-        else
-          .github/scripts/clippy.sh --feature-powerset
+          args+=(--target "$TARGET")
         fi
+        if [[ "$RELEASE" == "true" ]]; then
+          args+=(--release)
+        fi
+        .github/scripts/clippy.sh "${args[@]}"
