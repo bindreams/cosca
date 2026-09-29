@@ -40,43 +40,89 @@ pub(crate) mod fault {
     }
 }
 
-/// Test-only seam for `Child::wait_deadline`'s recheck loop: forces the FIRST iteration to see a
-/// synthetic `None` without calling the backend, standing in for `shared_child`'s early
-/// `WAIT_TIMEOUT` (no seam into that dependency exists; tracked as cosca #237). A hook fires when
-/// the forced value is consumed, so a test can end the wait through a real event.
+/// Test-only seam on the std backend's `wait_deadline` call (`ProcHandle::Std`), standing in for
+/// `shared_child`'s early Windows `WAIT_TIMEOUT`. The scripted steps replace the first backend
+/// calls; once the script is spent the real backend runs. Every call made while a guard is live
+/// is recorded, so a test can assert what each round was armed with.
 #[cfg(test)]
-pub(crate) mod early_none_seam {
+pub(crate) mod std_wait_seam {
     use std::cell::{Cell, RefCell};
-    thread_local! {
-        static ARMED: Cell<bool> = const { Cell::new(false) };
-        static ON_CONSUMED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// One scripted backend call.
+    pub(crate) enum Step {
+        /// Return `None` at once without waiting.
+        EarlyNone,
+        /// Really wait, but only up to `Duration`, then return the backend's `None`.
+        Bounded(Duration),
+        /// Fail with a backend error.
+        Fail,
     }
-    /// Arm the seam and register the hook to run when it is consumed. The seam stays armed for
-    /// this thread until consumed or the returned guard drops (RAII, even mid-panic).
+
+    /// A backend call as observed: what it was armed with, and the real clock at entry.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Round {
+        pub(crate) armed: Instant,
+        pub(crate) entered: Instant,
+    }
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static SCRIPT: RefCell<VecDeque<Step>> = const { RefCell::new(VecDeque::new()) };
+        static ON_SCRIPT_END: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static ROUNDS: RefCell<Vec<Round>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Script the next backend calls and record every call until the guard drops. `on_script_end`
+    /// runs when the last step is consumed, so a test can end the wait through a real event.
     #[must_use]
-    pub(crate) fn arm(on_consumed: impl FnOnce() + 'static) -> Guard {
-        ARMED.with(|a| a.set(true));
-        ON_CONSUMED.with(|h| *h.borrow_mut() = Some(Box::new(on_consumed)));
+    pub(crate) fn arm(steps: impl IntoIterator<Item = Step>, on_script_end: impl FnOnce() + 'static) -> Guard {
+        ACTIVE.with(|a| {
+            debug_assert!(!a.get(), "std_wait_seam is not nestable");
+            a.set(true);
+        });
+        SCRIPT.with(|s| *s.borrow_mut() = steps.into_iter().collect());
+        ON_SCRIPT_END.with(|h| *h.borrow_mut() = Some(Box::new(on_script_end)));
+        ROUNDS.with(|r| r.borrow_mut().clear());
         Guard(())
     }
+
     pub(crate) struct Guard(());
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ARMED.with(|a| a.set(false));
-            ON_CONSUMED.with(|h| *h.borrow_mut() = None);
+
+    impl Guard {
+        /// Every backend call made since [`arm`].
+        pub(crate) fn rounds(&self) -> Vec<Round> {
+            ROUNDS.with(|r| r.borrow().clone())
         }
     }
-    /// If armed, disarm, run the registered hook, and report `true` (the caller should treat
-    /// this iteration as having received a synthetic `None`). Otherwise report `false` and do
-    /// nothing.
-    pub(crate) fn take() -> bool {
-        let was_armed = ARMED.with(|a| a.replace(false));
-        if was_armed {
-            if let Some(hook) = ON_CONSUMED.with(|h| h.borrow_mut().take()) {
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|a| a.set(false));
+            SCRIPT.with(|s| s.borrow_mut().clear());
+            ON_SCRIPT_END.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Record a backend call armed with `armed` and take its scripted step, if any.
+    pub(crate) fn next(armed: Instant) -> Option<Step> {
+        if !ACTIVE.with(Cell::get) {
+            return None;
+        }
+        ROUNDS.with(|r| {
+            r.borrow_mut().push(Round {
+                armed,
+                entered: Instant::now(),
+            })
+        });
+        let step = SCRIPT.with(|s| s.borrow_mut().pop_front());
+        if step.is_some() && SCRIPT.with(|s| s.borrow().is_empty()) {
+            if let Some(hook) = ON_SCRIPT_END.with(|h| h.borrow_mut().take()) {
                 hook();
             }
         }
-        was_armed
+        step
     }
 }
 
@@ -157,12 +203,10 @@ pub(crate) mod test_clock {
         });
     }
 
-    /// Advance the frozen instant by `real_elapsed` — a no-op if the clock isn't frozen (an
-    /// unfrozen clock already tracks real time on its own). Called after every real, blocking
-    /// wait keyed to a real `Instant` deadline — macOS's `block_on_kqueue` (`kevent`), the Linux
-    /// cgroup drain loop (`CgroupLeaf::wait_drained`), Windows' `wait_until`, and `Child::wait_deadline` — so a frozen
-    /// clock never hides a genuinely elapsed wait from `remaining`, and a re-arm loop under it
-    /// cannot spin forever.
+    /// Advance the frozen instant by `real_elapsed` (a no-op if the clock isn't frozen). Called
+    /// after every real, blocking wait keyed to a real `Instant` deadline, so a frozen clock never
+    /// hides a genuinely elapsed wait from `remaining` and a re-arm loop under it cannot spin
+    /// forever.
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
         FROZEN.with(|f| {
             if let Some(cur) = f.get() {
@@ -194,6 +238,20 @@ pub(crate) mod test_clock {
         /// Freeze the clock and return the guard plus the frozen instant.
         pub(crate) fn install() -> (Self, Instant) {
             let at = freeze_now();
+            (Self { _private: () }, at)
+        }
+
+        /// Freeze the clock `lag` BEHIND the real now, so real time is already ahead of it: a
+        /// wait that mixes the two clocks sees a real deadline that has passed while the frozen
+        /// one has not.
+        pub(crate) fn install_lagging(lag: Duration) -> (Self, Instant) {
+            let at = Instant::now()
+                .checked_sub(lag)
+                .expect("the platform's monotonic clock has run for less than the requested lag");
+            FROZEN.with(|f| {
+                debug_assert!(f.get().is_none(), "nesting FrozenClockGuard is not supported");
+                f.set(Some(at));
+            });
             (Self { _private: () }, at)
         }
     }
@@ -326,27 +384,50 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
     }
 }
 
-/// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other
-/// than `WAIT_TIMEOUT`, or the real `deadline` has passed (`WAIT_TIMEOUT` then). A `WAIT_TIMEOUT`
-/// is never trusted: the remaining time is recomputed from `deadline` each round and the wait
-/// re-armed (see [`win32_timeout_ms`]). `None`/`Some(None)` is unbounded.
+/// Run `round` until it yields `Some` or the real `deadline` has passed (`None` then). A `None`
+/// from a round is never trusted before the deadline: the remaining time is recomputed from
+/// `deadline` (on the test clock, see [`test_clock`]) immediately before every round, which must
+/// arm its blocking call with it, and the loop goes round again. At least one round runs, so a
+/// deadline already past still polls once. `None`/`Some(None)` is unbounded. A round's `Err` ends
+/// the loop.
 ///
-/// Reads only the clock after `wait` returns, so `GetLastError` still holds `wait`'s error.
+/// Owns the frozen-clock advance: a round must not advance it itself.
+pub(crate) fn rearm_until<T, E>(
+    deadline: Option<Option<Instant>>,
+    mut round: impl FnMut(Option<Duration>) -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    loop {
+        let remaining_now = remaining(deadline);
+        #[cfg(test)]
+        let round_start = Instant::now();
+        let out = round(remaining_now)?;
+        #[cfg(test)]
+        test_clock::advance_by_elapsed_if_frozen(round_start.elapsed());
+        if out.is_some() || remaining(deadline) == Some(Duration::ZERO) {
+            return Ok(out);
+        }
+    }
+}
+
+/// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other
+/// than `WAIT_TIMEOUT`, or the real `deadline` has passed (`WAIT_TIMEOUT` then), via
+/// [`rearm_until`]; see [`win32_timeout_ms`] for why a `WAIT_TIMEOUT` is never trusted.
+///
+/// The clock is read only after `wait` returns, so `GetLastError` still holds `wait`'s error.
 #[cfg(windows)]
 pub(crate) fn wait_until(
     deadline: Option<Option<Instant>>,
     mut wait: impl FnMut(u32) -> windows::Win32::Foundation::WAIT_EVENT,
 ) -> windows::Win32::Foundation::WAIT_EVENT {
     use windows::Win32::Foundation::WAIT_TIMEOUT;
-    loop {
-        #[cfg(test)]
-        let call_start = Instant::now();
-        let waited = wait(win32_timeout_ms(remaining(deadline)));
-        #[cfg(test)]
-        test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
-        if waited != WAIT_TIMEOUT || remaining(deadline) == Some(Duration::ZERO) {
-            return waited;
-        }
+    let waited = rearm_until(deadline, |remaining| {
+        let waited = wait(win32_timeout_ms(remaining));
+        Ok::<_, std::convert::Infallible>((waited != WAIT_TIMEOUT).then_some(waited))
+    });
+    match waited {
+        Ok(Some(event)) => event,
+        Ok(None) => WAIT_TIMEOUT,
+        Err(never) => match never {},
     }
 }
 
