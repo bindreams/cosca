@@ -21,7 +21,8 @@ fn spawn_term_ignoring_sleeper() -> std::process::Child {
     // concurrent sweep could then find and SIGKILL it — see that module's docs.
     let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sh")
-        .args(["-c", "trap '' TERM; echo r; exec sleep 30"])
+        .args(["-c", "trap '' TERM; echo r; exec cat"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn");
