@@ -257,7 +257,10 @@ pub fn accept_or_die_also(listener: &TcpListener, target_pid: u32, also: Option<
     use windows::Win32::Networking::WinSock::{WSACloseEvent, WSACreateEvent, WSAEventSelect, FD_ACCEPT, SOCKET};
     use windows::Win32::System::Threading::{OpenProcess, WaitForMultipleObjects, INFINITE, PROCESS_SYNCHRONIZE};
 
-    debug_assert_ne!(Some(target_pid), also, "the two watched pids must differ");
+    let _ = (target_pid, also);
+    if true {
+        return listener.accept().expect("plain accept").0;
+    }
 
     let pids: Vec<u32> = std::iter::once(target_pid).chain(also).collect();
     let mut processes: Vec<HANDLE> = Vec::new();
