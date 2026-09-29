@@ -23,11 +23,11 @@ pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
-/// A program that blocks reading its stdin and ends only by a real kill or the caller closing
-/// that pipe: `cat` on Unix; on Windows `more.com` by its `System32` path, so no `PATH` entry can
-/// stand in for it. Unlike `findstr x`, `more` exits 0 on EOF, so [`assert_killed`] can tell a
-/// kill from a natural end. Mirrors the library's `test_child::windows_more`, which this separate
-/// compilation unit cannot name. Spawn it with a piped stdin and a null stdout (`more` echoes).
+/// Blocks reading stdin; ends only by a kill or stdin EOF. `cat` on Unix; `more.com` on Windows
+/// (exits 0 on EOF, unlike `findstr x`). Spawn with piped stdin, null stdout.
+///
+/// This and [`assert_killed`] duplicate `test_child::windows_more` / `test_child::assert_killed`
+/// because `tests/` is a separate compilation unit that cannot name the library's `cfg(test)` items.
 pub fn stdin_blocker_program() -> std::path::PathBuf {
     #[cfg(unix)]
     {

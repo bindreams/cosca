@@ -139,6 +139,8 @@ impl Child {
             }
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait().await?;
         watch?;
         Ok(status)
@@ -436,37 +438,7 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
-    /// Where in `graceful_shutdown_tree` a test hook runs.
-    #[derive(Clone, Copy)]
-    pub(crate) enum HookPoint {
-        /// After `terminate_tree` returned `Ok` (or was held), before any drain or exit watch.
-        AfterTerminate,
-        /// After the sweep returned `Ok` (or was skipped), before the root is reaped.
-        BeforeReap,
-    }
-    thread_local! {
-        static AFTER_TERMINATE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        static BEFORE_REAP: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    }
-    fn slot(point: HookPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
-        match point {
-            HookPoint::AfterTerminate => &AFTER_TERMINATE,
-            HookPoint::BeforeReap => &BEFORE_REAP,
-        }
-    }
-    /// Drop `held` (a stdin a fixture blocks on) when `graceful_shutdown_tree` reaches `point`.
-    ///
-    /// A fixture whose only end is a real signal would otherwise hang the call's own blocking
-    /// wait if the signal under test never came. Released here instead, it ends by itself with
-    /// status 0, so the test's assertion on HOW it died fails at once. A real signal delivered
-    /// before `point` is already pending, so it always beats the release.
-    pub(crate) fn release_at(point: HookPoint, held: impl Sized + 'static) -> ArmedHook {
-        crate::oneshot_hook::arm(slot(point), move || drop(held))
-    }
-    pub(crate) fn run_hook(point: HookPoint) {
-        crate::oneshot_hook::fire(slot(point));
-    }
-    pub(crate) type ArmedHook = crate::oneshot_hook::Armed;
+    pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
     /// full rationale (a test harness thread is reused across test functions, so a seam armed

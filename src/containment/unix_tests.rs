@@ -78,10 +78,8 @@ fn kill_group_on_owned_group_succeeds() {
         .process_group(0)
         .spawn()
         .expect("spawn cat");
-    // Held across the kill below and closed right after it: the fixture has no lifetime of its
-    // own, so only a real `SIGKILL` can end it before the close. A `kill_group` that signals
-    // nothing then yields an EOF exit, which the assertion below rejects at once instead of
-    // `wait()` hanging on a child nothing will ever end.
+    // Closed right after the kill: only a real `SIGKILL` can end the child before then, so a
+    // `kill_group` that signals nothing exits 0 and fails the assertion instead of hanging `wait()`.
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(kill_group(pgid).is_ok(), "kill_group on owned group must succeed");
@@ -103,15 +101,13 @@ fn kill_group_on_owned_group_succeeds() {
 /// hook, fired in `converge` right after the listing, feeds it one line and reads one back from a
 /// stdout only the group holds. With the first `killpg` the shell is already dead, so the write
 /// finds no reader (`EPIPE`, ignored) and the read is EOF: empty. Without it the shell forks, and
-/// the read returns `spawned`. Every step waits on a pipe event; nothing is timed.
+/// the read returns `spawned`.
 ///
-/// Linux only: its `fork` refuses once a fatal signal is pending (`copy_process` checks after
-/// taking `tasklist_lock`, which `killpg` holds while delivering), which is the guarantee this
-/// proves the `killpg` provides. No such guarantee is asserted for other Unixes.
+/// Linux only: `fork` refuses once a fatal signal is pending; no such guarantee is asserted elsewhere.
 #[cfg(target_os = "linux")]
 #[test]
 fn kill_group_dooms_the_group_before_it_is_listed() {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -134,7 +130,7 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
     let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let record = seen.clone();
     let _armed = super::group::fault::set_after_listing(move || {
-        _ = stdin.write_all(b"x\n"); // EPIPE (a dead leader) is expected and ignored
+        crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x\n");
         let mut line = String::new();
         stdout.read_line(&mut line).expect("read to a line or EOF");
         *record.borrow_mut() = Some(line);
@@ -167,9 +163,8 @@ fn term_group_on_owned_group_succeeds() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
     // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
     // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
-    // held across the call and closed right after it, so it has no lifetime of its own: a
-    // `term_group` that delivers nothing yields an EOF exit, which the assertion below rejects at
-    // once instead of `wait()` hanging on a child nothing will ever end.
+    // closed right after the call, so a `term_group` that delivers nothing exits 0 and fails the
+    // assertion instead of hanging `wait()`.
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("cat")
