@@ -14,7 +14,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Baseline (must be green)
         shell: bash
-        run: cargo test --locked --features tokio --lib -- wait:: containment::windows child::spawn::windows_raw child::lifecycle tokio::wait
+        run: |
+          cargo test --locked --features tokio --lib -- wait:: containment::windows child::spawn::windows_raw child::lifecycle tokio::wait
       - name: Mutants
         shell: bash
         run: python .github/mutants.py .github/mutants.json
