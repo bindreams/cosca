@@ -595,12 +595,22 @@ impl CgroupLeaf {
         &self,
         deadline: Option<Option<std::time::Instant>>,
     ) -> Result<DrainStep, crate::error::Error> {
+        self.drain_step_on(deadline, crate::wait::now)
+    }
+
+    /// [`drain_step`](Self::drain_step) reading `now` from `clock`, for a wait whose timer runs
+    /// on another clock (tokio's).
+    pub(crate) fn drain_step_on(
+        &self,
+        deadline: Option<Option<std::time::Instant>>,
+        clock: impl FnOnce() -> std::time::Instant,
+    ) -> Result<DrainStep, crate::error::Error> {
         use crate::containment::TreeDrain;
 
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
+        if crate::wait::remaining_at(deadline, clock()) == Some(std::time::Duration::ZERO) {
             #[cfg(test)]
             fault::notify_drain_zero_remaining();
             return Ok(DrainStep::Done(TreeDrain::MembersRemain));

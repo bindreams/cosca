@@ -198,6 +198,12 @@ jobs:
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         run: cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
 
+      # The same lane with `tokio`: `tokio::wait_tests` pins `arm_at`'s calm-release arm (a deadline
+      # inside tokio's timer margin waits unbounded where debug builds assert).
+      - name: Unit tests (release — debug_assertions off, tokio feature)
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        run: cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }} --profile ci
+
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
       # backend) and `cfg(target_os = "macos")` code are otherwise never
       # linted: the `lint` job only runs on ubuntu-latest, so clippy never

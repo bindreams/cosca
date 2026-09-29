@@ -3,14 +3,55 @@
 //! armed and its kqueue fd registered; Windows has no pollable process handle, so a
 //! `spawn_blocking` watcher waits on the process handle AND a cancel event that a drop-guard
 //! signals — a dropped grace-wait releases its watcher promptly on every platform. The grace
-//! bound (`tokio::time::timeout` on Unix, the kernel wait's timeout on Windows) is a failure
-//! bound on a genuine external event: the child's exit. Unix needs the runtime's IO + time
-//! drivers (tokio panics otherwise) — documented on the public graceful methods.
+//! bound (on Unix `tokio::time::timeout_at`, via [`arm_at`], armed with the caller's deadline
+//! instant; the kernel wait's timeout on Windows) is a failure bound on a genuine external
+//! event: the child's exit. Unix needs the runtime's IO + time drivers (tokio panics otherwise)
+//! — documented on the public graceful methods.
 
 use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::ProcessId;
+
+/// The clock every async wait here runs on: tokio's, which is `std`'s unless a test pauses it.
+/// Deadlines are `std` instants read off this timeline, so the timer, the "already expired" checks
+/// and [`deadline_from`] agree on what "now" is.
+pub(crate) fn tokio_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = now_override::get() {
+        return now;
+    }
+    ::tokio::time::Instant::now().into_std()
+}
+
+/// The async twin of [`crate::wait::deadline_from`], on [`tokio_now`]'s clock.
+pub(crate) fn deadline_from(duration: Duration) -> Option<Option<std::time::Instant>> {
+    Some(crate::wait::deadline_at(tokio_now(), duration))
+}
+
+/// The ONLY place a bounded async wait is armed: `tokio::time::timeout_at(at, fut)`, with the
+/// caller's deadline instant (never a duration re-derived from it, which would arm later).
+/// `None` = the deadline elapsed first. `at` must clear
+/// [`crate::wait::TOKIO_TIMER_ROUNDING_MARGIN`], as every [`deadline_from`] result does; a
+/// violation `debug_assert`s, and in release waits unbounded with no timer.
+#[cfg(unix)]
+async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: F) -> Option<F::Output> {
+    let holds = crate::wait::clears_tokio_timer_margin(at);
+    debug_assert!(
+        holds,
+        "deadline_from's contract should prevent a deadline inside tokio's timer margin"
+    );
+    if !holds {
+        #[cfg(test)]
+        armed_deadline_seam::notify(armed_deadline_seam::Armed::Unbounded);
+        return Some(fut.await);
+    }
+    #[cfg(test)]
+    armed_deadline_seam::notify(armed_deadline_seam::Armed::At(at));
+    ::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), fut)
+        .await
+        .ok()
+}
 
 /// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
 /// (a stale/recycled id reports exited immediately). Cancellable: dropping the future
@@ -36,9 +77,15 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
         // fault seam there.
         return crate::wait::block_until_exit(id, Some(Duration::ZERO));
     }
-    match ::tokio::time::timeout(grace, wait_exit(id)).await {
-        Ok(watch) => watch.map(|()| true),
-        Err(_elapsed) => Ok(false),
+    // An overflowing `grace`, or one inside tokio's timer margin, is `Some(None)`: unbounded, no timer.
+    match deadline_from(grace) {
+        Some(Some(at)) => match arm_at(at, wait_exit(id)).await {
+            Some(watch) => watch.map(|()| true),
+            // The timer can win the first poll before the reactor reports an exit that was
+            // already pending: answer from one final non-blocking probe, as the sync twin does.
+            None => crate::wait::block_until_exit(id, Some(Duration::ZERO)),
+        },
+        _ => wait_exit(id).await.map(|()| true),
     }
 }
 
@@ -299,25 +346,30 @@ pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> 
 /// `Unassessable` write-end scan that a bounded caller should tolerate (its own deadline caps
 /// the risk), and `interpret_read_event` would stop draining a sustained writer at the low-water
 /// clamp, so a bounded wait could only ever expire into `MembersRemain` where the sync call
-/// drains through to the real edge. `tokio::time::timeout` still supplies the actual bound —
-/// the same pattern `grace_wait` uses over `wait_exit` — this only fixes what the ARMED kqueue
-/// itself is told.
+/// drains through to the real edge. [`arm_at`] still supplies the actual bound, armed with the
+/// caller's deadline instant — the same pattern `grace_wait` uses over `wait_exit` — this only
+/// fixes what the ARMED kqueue itself is told.
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_deadline(
     read_end: std::os::fd::BorrowedFd<'_>,
     deadline: Option<Option<std::time::Instant>>,
 ) -> Result<crate::containment::TreeDrain, Error> {
     use crate::containment::TreeDrain;
-    match crate::wait::remaining(deadline) {
-        None => {
+    match deadline {
+        None | Some(None) => {
             wait_tree_drained(read_end).await?;
             Ok(TreeDrain::AllMarkersClosed)
         }
-        Some(d) if d.is_zero() => crate::containment::marker_eof::probe(read_end),
-        Some(d) => match ::tokio::time::timeout(d, wait_tree_drained_inner(read_end, false, None)).await {
-            Ok(res) => res.map(|()| TreeDrain::AllMarkersClosed),
-            Err(_elapsed) => Ok(TreeDrain::MembersRemain),
-        },
+        Some(Some(at)) => {
+            if crate::wait::remaining_at(deadline, tokio_now()) == Some(Duration::ZERO) {
+                return crate::containment::marker_eof::probe(read_end);
+            }
+            match arm_at(at, wait_tree_drained_inner(read_end, false, None)).await {
+                Some(res) => res.map(|()| TreeDrain::AllMarkersClosed),
+                // As in `grace_wait`: one final probe, so an EOF already pending is not missed.
+                None => crate::containment::marker_eof::probe(read_end),
+            }
+        }
     }
 }
 
@@ -457,39 +509,47 @@ pub(crate) async fn cgroup_wait_tree_drained(
     use crate::containment::cgroup::DrainStep;
 
     loop {
-        match leaf.drain_step(deadline)? {
+        match leaf.drain_step_on(deadline, tokio_now)? {
             DrainStep::Done(drain) => return Ok(drain),
             DrainStep::Block {
                 listener,
                 deadline: None,
             } => {
                 #[cfg(test)]
-                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
-                    crate::containment::cgroup::fault::TokioWaitSitePark { deadline: None },
-                );
+                armed_deadline_seam::notify(armed_deadline_seam::Armed::Unbounded);
                 listener.await
             }
-            // A timeout is looked at by the next step, which reads the leaf once more. The seam
-            // reports `sleep.deadline()`, read back from the `Sleep`, so it reflects what was
-            // actually armed.
+            // The timeout is looked at by the next step, which reads the leaf once more.
             DrainStep::Block {
                 listener,
                 deadline: Some(at),
             } => {
-                let sleep = ::tokio::time::sleep_until(::tokio::time::Instant::from_std(at));
-                #[cfg(test)]
-                crate::containment::cgroup::fault::notify_tokio_wait_site_park(
-                    crate::containment::cgroup::fault::TokioWaitSitePark {
-                        deadline: Some(sleep.deadline().into_std()),
-                    },
-                );
-                ::tokio::select! {
-                    _ = listener => {}
-                    _ = sleep => {}
-                }
+                let _ = arm_at(at, listener).await;
             }
         }
     }
+}
+
+/// Re-express a [`tokio_now`]-clock `deadline` on the real clock, for the Windows job wait, which
+/// blocks in the kernel and so is measured in real time. Identical when tokio's clock is unpaused.
+#[cfg(any(windows, test))]
+pub(crate) fn to_real_clock_at(
+    deadline: Option<Option<std::time::Instant>>,
+    tokio_now: std::time::Instant,
+    real_now: std::time::Instant,
+) -> Option<Option<std::time::Instant>> {
+    match deadline {
+        Some(Some(at)) => Some(crate::wait::deadline_at(
+            real_now,
+            at.saturating_duration_since(tokio_now),
+        )),
+        other => other,
+    }
+}
+
+#[cfg(windows)]
+fn to_real_clock(deadline: Option<Option<std::time::Instant>>) -> Option<Option<std::time::Instant>> {
+    to_real_clock_at(deadline, tokio_now(), crate::wait::now())
 }
 
 /// Resolve when every process in the Windows job has EXITED (not reaped), or until `deadline`.
@@ -519,6 +579,8 @@ async fn job_wait_tree_drained(
 ) -> Result<crate::containment::TreeDrain, Error> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
+    // The kernel wait runs on the real clock, not tokio's.
+    let deadline = to_real_clock(deadline);
     // Duration::ZERO delegates to the sync one-shot probe — no thread-pool hop needed for a
     // call that cannot block (mirrors grace_wait's identical delegation).
     if crate::wait::remaining(deadline) == Some(std::time::Duration::ZERO) {
@@ -615,6 +677,8 @@ async fn job_wait_tree_drained(
 /// cancel event (job objects have no pollable handle). Every other mechanism delegates to the
 /// sync `Attached::wait_drained`, whose non-drainable arm returns `Unsupported` immediately —
 /// never blocking — so calling it directly here (no `spawn_blocking`) is safe.
+///
+/// `deadline` is on [`tokio_now`]'s clock (build it with [`deadline_from`]).
 pub(crate) async fn wait_tree_drained_dispatch(
     attached: &crate::containment::Attached,
     deadline: Option<Option<std::time::Instant>>,
@@ -639,6 +703,87 @@ pub(crate) async fn wait_tree_drained_dispatch(
             wait_tree_deadline(m.read_end(), deadline).await
         }
         other => other.wait_drained(deadline),
+    }
+}
+
+/// Test-only seam reporting each bounded arm and each unbounded park of the async waits.
+/// Thread-local, so concurrent tests do not see each other; [`install`]'s guard uninstalls on drop.
+#[cfg(all(test, unix))]
+pub(crate) mod armed_deadline_seam {
+    use std::cell::RefCell;
+    use std::sync::mpsc::Sender;
+    use std::time::Instant;
+
+    /// What a wait did when it went to sleep.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Armed {
+        /// `arm_at` armed a timer for this instant.
+        At(Instant),
+        /// Parked with no timer.
+        Unbounded,
+    }
+
+    thread_local! {
+        static NOTIFY: RefCell<Option<Sender<Armed>>> = const { RefCell::new(None) };
+    }
+
+    #[must_use]
+    pub(crate) struct Installed(());
+
+    pub(crate) fn install(tx: Sender<Armed>) -> Installed {
+        NOTIFY.with(|n| *n.borrow_mut() = Some(tx));
+        Installed(())
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            NOTIFY.with(|n| {
+                n.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(crate) fn notify(armed: Armed) {
+        NOTIFY.with(|n| {
+            if let Some(tx) = n.borrow().as_ref() {
+                let _ = tx.send(armed);
+            }
+        });
+    }
+}
+
+/// Test-only override of [`tokio_now`], to make a deadline already past on the timer's first poll.
+#[cfg(test)]
+pub(crate) mod now_override {
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    thread_local! {
+        static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Instant> {
+        NOW.with(Cell::get)
+    }
+
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) struct Installed(());
+
+    #[cfg(unix)]
+    pub(crate) fn install(now: Instant) -> Installed {
+        NOW.with(|n| {
+            debug_assert!(n.get().is_none(), "a now_override is already installed on this thread");
+            n.set(Some(now));
+        });
+        Installed(())
+    }
+
+    #[cfg(unix)]
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            NOW.with(|n| n.set(None));
+        }
     }
 }
 

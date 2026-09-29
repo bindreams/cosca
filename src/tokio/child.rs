@@ -624,7 +624,7 @@ impl Child {
         timeout: std::time::Duration,
     ) -> Result<crate::containment::TreeDrain, Error> {
         self.require_drainable()?;
-        let deadline = crate::wait::deadline_from(timeout);
+        let deadline = super::wait::deadline_from(timeout);
         super::wait::wait_tree_drained_dispatch(&self.os.attached, deadline).await
     }
 }
