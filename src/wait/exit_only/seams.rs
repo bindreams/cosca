@@ -43,12 +43,20 @@ pub(crate) enum ForcedReap {
 
 type StepHook = Box<dyn FnOnce()>;
 
+/// A registered step hook and the id its guard removes it by.
+struct RegisteredHook {
+    id: u64,
+    step: HolderStep,
+    hook: StepHook,
+}
+
 thread_local! {
     static FORCED_PEEK: RefCell<Option<io::Result<Peek>>> = const { RefCell::new(None) };
     static FORCED_REAP: Cell<Option<ForcedReap>> = const { Cell::new(None) };
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
-    static STEP_HOOKS: RefCell<Vec<(HolderStep, StepHook)>> = const { RefCell::new(Vec::new()) };
+    static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
+    static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
     static SIGNALS: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -97,7 +105,7 @@ pub(crate) fn step(step: HolderStep) {
     STEPS.with(|s| s.borrow_mut().push(step));
     let hook = STEP_HOOKS.with(|h| {
         let mut hooks = h.borrow_mut();
-        hooks.iter().position(|(s, _)| *s == step).map(|i| hooks.remove(i).1)
+        hooks.iter().position(|h| h.step == step).map(|i| hooks.remove(i).hook)
     });
     if let Some(hook) = hook {
         hook();
@@ -109,13 +117,27 @@ pub(crate) fn holder_steps() -> Vec<HolderStep> {
     STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
+/// Removes its own unfired step hook on drop, and no other.
+#[must_use = "dropping this immediately removes the hook; bind it for the probe's duration"]
+pub(crate) struct StepHookGuard(u64);
+
+impl Drop for StepHookGuard {
+    fn drop(&mut self) {
+        STEP_HOOKS.with(|h| h.borrow_mut().retain(|hook| hook.id != self.0));
+    }
+}
+
 /// Run `hook` on this thread just before its next `step`.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only Linux tests hook a holder step")
-)]
-pub(crate) fn on_holder_step(step: HolderStep, hook: impl FnOnce() + 'static) {
-    STEP_HOOKS.with(|h| h.borrow_mut().push((step, Box::new(hook))));
+pub(crate) fn on_holder_step(step: HolderStep, hook: impl FnOnce() + 'static) -> StepHookGuard {
+    let id = NEXT_HOOK_ID.with(|n| n.replace(n.get() + 1));
+    STEP_HOOKS.with(|h| {
+        h.borrow_mut().push(RegisteredHook {
+            id,
+            step,
+            hook: Box::new(hook),
+        });
+    });
+    StepHookGuard(id)
 }
 
 /// Count one signal cosca sent to a child on this thread.
