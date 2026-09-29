@@ -51,7 +51,8 @@ fn the_pid_list_contains_launchd_and_this_process() {
 /// window `spawn_lock()` exists to close host-wide within this process.
 #[test]
 fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
-    let out = crate::test_spawn::output(std::process::Command::new("/bin/ps").args(["-Ao", "pid="])).expect("run ps");
+    let out = crate::test_spawn::output_captured(std::process::Command::new("/bin/ps").args(["-Ao", "pid="]))
+        .expect("run ps");
     let ps_pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .filter_map(|s| s.parse().ok())

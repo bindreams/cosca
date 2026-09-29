@@ -27,7 +27,7 @@ fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::piped());
     install(&mut cmd, mappings).expect("install");
-    let out = crate::test_spawn::output(&mut cmd).expect("spawn /bin/sh");
+    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
     String::from_utf8(out.stdout).expect("utf8 stdout")
 }
@@ -191,7 +191,7 @@ fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(read_fd(raw)).stdout(Stdio::piped());
     install_preserved(&mut cmd, vec![owned]);
-    let out = crate::test_spawn::output(&mut cmd).expect("spawn");
+    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn");
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "preserved");
 }
@@ -210,7 +210,7 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
     cmd.arg("-c")
         .arg(format!("{} 2>/dev/null || echo CLOSED", read_fd(raw)))
         .stdout(Stdio::piped());
-    let out = crate::test_spawn::output(&mut cmd).expect("spawn");
+    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn");
     drop(owned); // keep it alive in the parent until after spawn, exactly like a real caller
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "CLOSED");
 }
@@ -354,7 +354,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
     )
     .expect("install");
 
-    let out = crate::test_spawn::output(&mut cmd).expect("spawn /bin/sh");
+    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
     assert_eq!(
         out.stdout, b"AAABBB",
@@ -444,7 +444,7 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
     )
     .expect("install");
 
-    let out = crate::test_spawn::output(&mut cmd).expect("spawn /bin/sh");
+    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
     assert_eq!(
         out.stdout, b"fd3-token",

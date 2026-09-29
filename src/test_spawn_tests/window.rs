@@ -3,9 +3,8 @@
 //!
 //! A raw spawn with a `Stdio::piped()` stdout holds the child-side write end of that pipe in the
 //! parent until `spawn` returns. The raw child is parked in `pre_exec`, so the spawn is
-//! provably mid-flight. The forker then reports how many write ends of that pipe its own forked
-//! child holds, found by the pipe's inode, which the raw child reports from its own stdout.
-//! Nothing here waits on a duration.
+//! mid-flight. The forker then reports how many write ends of that pipe its own forked child
+//! holds, found by the pipe's inode, which the raw child reports from its own stdout.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -16,30 +15,40 @@ use crate::containment::cgroup::test_support::block_on;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
-    /// The forker found the lock held and is about to block on it.
     Contended,
-    /// The forker has forked.
     Forked,
 }
 
 #[derive(Debug)]
 struct Outcome {
-    /// The first event the forker reported.
     first: Event,
-    /// Write ends of the raw child's stdout pipe open in the forker's child.
     writers: u8,
+    /// Whether the raw child's fork ran under `spawn_lock`, as its own `pre_exec` saw it. The
+    /// forker's `Contended` alone cannot show this: another test's spawn can hold the lock too.
+    raw_forked_under_the_lock: bool,
 }
 
-/// The `(st_dev, st_ino)` of every open FIFO in this process matching `identity`.
+/// Open FIFOs in this process whose (st_dev, st_ino) equals `identity`.
 fn pipe_fds(identity: [u64; 2]) -> Vec<RawFd> {
     std::fs::read_dir("/proc/self/fd")
         .expect("list /proc/self/fd")
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<RawFd>().ok())
+        .filter_map(|entry| {
+            entry
+                .expect("read a /proc/self/fd entry")
+                .file_name()
+                .to_str()?
+                .parse::<RawFd>()
+                .ok()
+        })
         .filter(|&fd| {
-            // SAFETY: `fstat` on an fd number writes only into `st`; a closed fd just fails.
+            // SAFETY: `fstat` on an fd number writes only into `st`.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
-            ok && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO && [st.st_dev, st.st_ino] == identity
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                // Only the `read_dir` handle's own fd, closed by now, can fail.
+                debug_assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                return false;
+            }
+            (st.st_mode & libc::S_IFMT) == libc::S_IFIFO && [st.st_dev, st.st_ino] == identity
         })
         .collect()
 }
@@ -66,11 +75,23 @@ fn fork_counting_writers(fds: &[RawFd], seen_fd: RawFd, hold_fd: RawFd) -> libc:
     pid
 }
 
+/// How the raw child is spawned.
+#[derive(Clone, Copy)]
+enum Spawner {
+    /// A plain `Command::spawn`, the unlocked control.
+    Unlocked,
+    /// [`crate::test_spawn::spawn`].
+    TestSpawn,
+    /// `spawn_locked` from `tests/common/locked.rs`.
+    Common,
+}
+
 #[allow(
     clippy::disallowed_methods,
-    reason = "the `false` arm is the deliberately unlocked control spawn"
+    reason = "`Spawner::Unlocked` is the deliberately unlocked control spawn"
 )]
-fn run(spawn_under_the_lock: bool) -> Outcome {
+fn run(spawner: Spawner) -> Outcome {
+    let spawn_under_the_lock = !matches!(spawner, Spawner::Unlocked);
     use std::os::unix::process::CommandExt;
 
     let (mut report_read, report_write) = std::io::pipe().expect("report pipe");
@@ -91,39 +112,38 @@ fn run(spawn_under_the_lock: bool) -> Outcome {
         let _report_write = report_write;
         let mut cmd = Command::new("/bin/true");
         cmd.stdout(Stdio::piped());
-        // SAFETY: `fstat`, `write` and `block_on` are async-signal-safe.
+        // SAFETY: `fstat`, `write`, `held_by_this_thread` (a const-initialised thread-local read)
+        // and `block_on` are async-signal-safe.
         unsafe {
             cmd.pre_exec(move || {
                 let mut st: libc::stat = std::mem::zeroed();
                 libc::fstat(1, &mut st);
-                let identity = [st.st_dev, st.st_ino];
-                libc::write(report_fd, identity.as_ptr().cast(), 16);
+                let report: [u64; 3] = [st.st_dev, st.st_ino, crate::test_spawn::held_by_this_thread().into()];
+                libc::write(report_fd, report.as_ptr().cast(), 24);
                 block_on(gate_fd);
                 Ok(())
             });
         }
-        if spawn_under_the_lock {
-            super::super::spawn(&mut cmd)
-        } else {
-            cmd.spawn()
+        match spawner {
+            Spawner::Unlocked => cmd.spawn(),
+            Spawner::TestSpawn => crate::test_spawn::spawn(&mut cmd),
+            Spawner::Common => super::locked::spawn_locked(&mut cmd),
         }
         .expect("raw spawn")
     });
 
-    let mut identity = [0u8; 16];
+    let mut report = [0u8; 24];
     report_read
-        .read_exact(&mut identity)
+        .read_exact(&mut report)
         .expect("the raw child must report its stdout pipe's identity");
-    let identity: [u64; 2] = [
-        u64::from_ne_bytes(identity[..8].try_into().unwrap()),
-        u64::from_ne_bytes(identity[8..].try_into().unwrap()),
-    ];
+    let word = |i: usize| u64::from_ne_bytes(report[i * 8..(i + 1) * 8].try_into().unwrap());
+    let (identity, raw_forked_under_the_lock) = ([word(0), word(1)], word(2) == 1);
 
     let (events, events_rx) = mpsc::channel::<Event>();
     let forker = std::thread::spawn(move || {
-        // The unlocked case forks without the lock. A fork that waited for it could deadlock with
-        // any other test's locked spawn: the unlocked raw child parked in `pre_exec` holds that
-        // spawn's exec-error pipe open, and this test opens its gate only after the fork.
+        // Unlocked: fork without the lock; waiting for it could deadlock with another test's locked
+        // spawn, since the parked raw child holds that spawn's exec-error pipe open until the gate
+        // opens.
         let guard = spawn_under_the_lock.then(|| {
             crate::child::spawn::spawn_lock_tracked(|| {
                 _ = events.send(Event::Contended);
@@ -169,16 +189,17 @@ fn run(spawn_under_the_lock: bool) -> Outcome {
     Outcome {
         first: first.expect("at least one event"),
         writers: writers[0],
+        raw_forked_under_the_lock,
     }
 }
 
 /// A raw spawn that skips `spawn_lock` lets a lock-respecting fork happen mid-spawn, and that
 /// fork's child inherits the raw child's `Stdio::piped()` write end. A reader of that pipe would
-/// wait for the fork to exit as well. This is the hazard the helper exists for; it also shows the
-/// next test's zero is a real measurement.
+/// wait for the fork to exit as well.
 #[test]
 fn an_unlocked_raw_spawn_leaks_its_piped_end_into_a_concurrent_fork() {
-    let outcome = run(false);
+    let outcome = run(Spawner::Unlocked);
+    assert!(!outcome.raw_forked_under_the_lock, "the control spawn takes no lock");
     assert_eq!(outcome.first, Event::Forked, "this forker never waits on the lock");
     assert!(
         outcome.writers >= 1,
@@ -186,11 +207,12 @@ fn an_unlocked_raw_spawn_leaks_its_piped_end_into_a_concurrent_fork() {
     );
 }
 
-/// The helper holds the lock through the whole window, so a fork under the lock waits for the
-/// spawn to finish and inherits nothing of it.
-#[test]
-fn a_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
-    let outcome = run(true);
+fn assert_fork_waits_out_the_spawn(spawner: Spawner) {
+    let outcome = run(spawner);
+    assert!(
+        outcome.raw_forked_under_the_lock,
+        "the raw spawn must hold spawn_lock through its fork, got {outcome:?}"
+    );
     assert_eq!(
         outcome.first,
         Event::Contended,
@@ -200,4 +222,16 @@ fn a_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
         outcome.writers, 0,
         "a fork that waited for the spawn must not inherit its piped end, got {outcome:?}"
     );
+}
+
+/// Locked helper: a fork under the lock waits out the spawn and inherits nothing.
+#[test]
+fn a_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
+    assert_fork_waits_out_the_spawn(Spawner::TestSpawn);
+}
+
+/// The same for the integration tests' `spawn_locked`, compiled from its real source.
+#[test]
+fn a_spawn_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
+    assert_fork_waits_out_the_spawn(Spawner::Common);
 }

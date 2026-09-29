@@ -13,10 +13,7 @@ fn a_live_process_has_a_state_under_the_ordinary_view() {
 /// Mutant: "the state is the field after the state" (`Z` becomes the next field).
 #[test]
 fn an_unreaped_exited_child_is_a_zombie() {
-    let mut child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new("true").spawn().expect("spawn true")
-    };
+    let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: a well-formed `waitid`; `info` is an owned, zeroed `siginfo_t`. WNOWAIT leaves
@@ -125,10 +122,9 @@ fn fixture_state_overmount() {
         return;
     }
     ns::enter_private_mount_ns();
-    let mut child = KillOnDrop(Some({
-        let _guard = crate::child::spawn::spawn_lock();
-        member_command(0).spawn().expect("spawn the member")
-    }));
+    let mut child = KillOnDrop(Some(
+        crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member"),
+    ));
     crate::test_child::await_member_ready(child.0.as_mut().expect("child"));
     let pid = child.0.as_ref().expect("child").id();
     assert!(proc_state(pid).is_some(), "the member has a state before the mount");

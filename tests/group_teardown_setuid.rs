@@ -63,6 +63,9 @@
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
@@ -139,26 +142,23 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
 /// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn rerun_unprivileged() {
     use std::os::unix::process::CommandExt as _;
 
-    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([
-            "--exact",
-            test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(RERUN_ENV, std::process::id().to_string())
-        .uid(UNPRIVILEGED)
-        .gid(UNPRIVILEGED)
-        .output()
-        .expect("re-execute this test as an unprivileged user");
+    let out = common::output_locked(
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RERUN_ENV, std::process::id().to_string())
+            .uid(UNPRIVILEGED)
+            .gid(UNPRIVILEGED),
+    )
+    .expect("re-execute this test as an unprivileged user");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.lines().any(|line| line == RERAN),

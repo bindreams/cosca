@@ -461,8 +461,9 @@ fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
     );
 
     // An unrelated program started while the leaf is alive lists its own open descriptors.
-    let out = crate::test_spawn::output(std::process::Command::new("/bin/sh").args(["-c", "ls -l /proc/$$/fd"]))
-        .expect("run sh");
+    let out =
+        crate::test_spawn::output_captured(std::process::Command::new("/bin/sh").args(["-c", "ls -l /proc/$$/fd"]))
+            .expect("run sh");
     assert!(out.status.success(), "ls failed: {out:?}");
     let fds = String::from_utf8_lossy(&out.stdout);
     let procs = leaf.leaf_path.join("cgroup.procs");
@@ -2507,7 +2508,7 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
         "containment::cgroup::leaf::leaf_tests::placement_hook_proceeds_when_the_parent_decided_without_the_exchange";
     const INNER: &str = "COSCA_TEST_DECIDED_ALONE";
     if std::env::var_os(INNER).is_none() {
-        let out = crate::test_spawn::output(
+        let out = crate::test_spawn::output_captured(
             std::process::Command::new(std::env::current_exe().expect("this test binary"))
                 .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
                 .env(INNER, "1"),

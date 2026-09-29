@@ -51,10 +51,6 @@ use common::{escape_report_field as escape_field, read_report_line, report_field
 /// Bind a report listener, spawn `exe` in `report-console-identity` mode with exactly `flags`
 /// through a RAW `std::process::Command` (cosca cannot express these flags in Task 1), and read
 /// the one report line the child writes before it blocks.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
@@ -63,10 +59,7 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     cmd.args(argv_head)
         .args(["report-console-identity", addr.as_str(), me.as_str()])
         .creation_flags(flags);
-    let child = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn identity probe child")
-    };
+    let child = common::spawn_locked(&mut cmd).expect("spawn identity probe child");
     let (sock, _) = listener.accept().expect("accept report socket");
     let report = read_report_line(&sock);
     Probe { child, sock, report }

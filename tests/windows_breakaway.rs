@@ -23,20 +23,13 @@ use common::{read_report_line, report_field, testbin};
 /// Run the `report-breakaway` helper for one job shape and one spawn vehicle, and return its
 /// report line. The helper blocks on the report socket until this function drops it, so every
 /// field describes a live measurement.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn breakaway_report(shape: &str, vehicle: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = std::process::Command::new(testbin());
     cmd.args(["report-breakaway", addr.as_str(), shape, vehicle])
         .env(common::ACK_ENV, "1");
-    let mut helper = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn breakaway helper")
-    };
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn breakaway helper");
     let sock = common::accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
     drop(sock);

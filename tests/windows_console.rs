@@ -33,19 +33,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `CreateProcess` returning, so a membership probe taken before it reads "absent" for every
 /// flag word, including one with no detaching flag at all — and a matrix asserted at that
 /// instant could never fail.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::process::Child, std::net::TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(exe);
     cmd.args(args).arg(&addr).creation_flags(flags);
-    let child = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn flag-matrix child")
-    };
+    let child = common::spawn_locked(&mut cmd).expect("spawn flag-matrix child");
     let (mut sock, _) = listener.accept().expect("accept");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
@@ -124,10 +117,6 @@ fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
 ///
 /// The helper connects before doing any work, so the read returns on socket EOF whether it
 /// reported or crashed — a real event, never a timer. `wait()` then supplies the real status.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn run_probe(detached: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -136,7 +125,7 @@ fn run_probe(detached: bool) -> String {
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    let mut helper = cmd.spawn().expect("spawn probe helper");
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");
@@ -237,10 +226,6 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
 /// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
 /// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
 /// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn run_lone_probe(detached: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -249,7 +234,7 @@ fn run_lone_probe(detached: bool) -> String {
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    let mut helper = cmd.spawn().expect("spawn lone probe helper");
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn lone probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");

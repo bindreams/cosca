@@ -58,10 +58,6 @@ impl Target for Helper {
     }
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: the spawn holds cosca::test_spawn_lock explicitly"
-)]
 fn run(case: &Case, seam: &str) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -82,8 +78,7 @@ fn run(case: &Case, seam: &str) -> Run {
             .env(common::ACK_ENV, "1")
             .env(SEAM_ENV, seam)
             .stderr(std::process::Stdio::piped());
-        let _guard = cosca::test_spawn_lock();
-        Helper::Std(cmd.spawn().expect("spawn the mode"))
+        Helper::Std(common::spawn_locked(&mut cmd).expect("spawn the mode"))
     };
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();

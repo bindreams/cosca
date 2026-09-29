@@ -1070,18 +1070,15 @@ async fn accept_or_die_async_acks_the_connection_it_accepts() {
 
 /// Async twin of `accept_or_die_also_reports_a_gone_descendant_as_dead`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
     let (listener, mut target) = bind_and_spawn(&["sleep-marker"], false);
-    let mut gone = std::process::Command::new(common::testbin())
-        .arg("hold-until-stdin-eof")
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("spawn the descendant");
+    let mut gone = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .arg("hold-until-stdin-eof")
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn the descendant");
     let gone_id = cosca::identity::ProcessId::of(gone.id())
         .found()
         .expect("the live descendant resolves");

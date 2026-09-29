@@ -302,7 +302,7 @@ pub(crate) fn alone(name: &str) -> bool {
     if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
         return true;
     }
-    let out = crate::test_spawn::output(
+    let out = crate::test_spawn::output_captured(
         std::process::Command::new(std::env::current_exe().expect("this test binary"))
             .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
             .env(ALONE, name),

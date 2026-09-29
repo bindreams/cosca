@@ -34,10 +34,6 @@ use windows::Win32::System::Threading::{
 /// the loader recorded, is printed only.
 #[test]
 #[ignore = "platform canary: needs a Windows runner"]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
     canary("Windows and Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
@@ -101,7 +97,7 @@ fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
                 }
                 // std::process is the route cosca actually takes, and it resolves the program
                 // itself before calling CreateProcessW — so it can disagree with the line above.
-                let ran = std::process::Command::new(program).output();
+                let ran = crate::common::output_locked(&mut std::process::Command::new(program));
                 match &ran {
                     Ok(o) => println!(
                         "  std::process as {tag} {program:?}: ran, {:?}, child said {:?}",
@@ -292,22 +288,19 @@ impl std::fmt::Display for SuspendedSpawn {
 
 /// Spawn `program` through `std::process` SUSPENDED, read the image the new process was created
 /// from, and terminate it before it runs.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 pub(crate) fn suspended_image(program: &str) -> Result<String, SuspendedSpawn> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
-    let mut child = std::process::Command::new(program)
-        .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(SuspendedSpawn::Refused)?;
+    let mut child = crate::common::spawn_locked(
+        std::process::Command::new(program)
+            .creation_flags(CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .map_err(SuspendedSpawn::Refused)?;
     let mut buf = vec![0u16; 32 * 1024];
     let mut len = buf.len() as u32;
     // SAFETY: the process handle is owned by `child` and alive; `buf` is a live allocation of

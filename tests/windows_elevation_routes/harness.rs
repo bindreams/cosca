@@ -688,33 +688,26 @@ pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
 /// itself could never even be launched measured nothing, no matter how many report lines come back.
 /// Always attempts to delete what it created, on every path, and reports whether each `/delete`
 /// succeeded rather than discarding that result.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let mut any_create_exited = false;
     let name = format!("cosca-probe-{}", std::process::id());
     for level in ["HIGHEST", "LIMITED"] {
         let tn = format!("{name}-{level}");
-        match std::process::Command::new("schtasks")
-            .args([
-                "/create",
-                "/tn",
-                &tn,
-                "/tr",
-                "cmd.exe /c exit 0",
-                "/sc",
-                "ONCE",
-                "/st",
-                "23:59",
-                "/rl",
-                level,
-                "/f",
-            ])
-            .output()
-        {
+        match crate::common::output_locked(std::process::Command::new("schtasks").args([
+            "/create",
+            "/tn",
+            &tn,
+            "/tr",
+            "cmd.exe /c exit 0",
+            "/sc",
+            "ONCE",
+            "/st",
+            "23:59",
+            "/rl",
+            level,
+            "/f",
+        ])) {
             Ok(out) => {
                 any_create_exited = true;
                 lines.push(format!(
@@ -726,10 +719,7 @@ pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
             }
             Err(e) => lines.push(format!("/rl {level} -> schtasks could not be run: {e}")),
         }
-        match std::process::Command::new("schtasks")
-            .args(["/delete", "/tn", &tn, "/f"])
-            .output()
-        {
+        match crate::common::output_locked(std::process::Command::new("schtasks").args(["/delete", "/tn", &tn, "/f"])) {
             Ok(out) => lines.push(format!("/rl {level} delete -> {}", out.status)),
             Err(e) => lines.push(format!("/rl {level} delete -> schtasks could not be run: {e}")),
         }
@@ -875,15 +865,8 @@ impl ScratchAccount {
     /// `/delete`'s result is printed either way — "account not found" is the expected, silent case
     /// on a clean host, but a genuine permissions failure here should be visible rather than
     /// swallowed into `/add`'s own error.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-    )]
     pub(crate) fn create(user: &str, admin: bool) -> Result<Self, String> {
-        match std::process::Command::new("net")
-            .args(["user", user, "/delete"])
-            .output()
-        {
+        match crate::common::output_locked(std::process::Command::new("net").args(["user", user, "/delete"])) {
             Ok(out) if out.status.success() => {
                 println!("PROBE scratch-account: deleted a leftover account {user} before creating it fresh");
             }
@@ -904,10 +887,9 @@ impl ScratchAccount {
             std::process::id() % 10_000,
             if admin { "A" } else { "S" }
         );
-        let out = std::process::Command::new("net")
-            .args(["user", user, &password, "/add"])
-            .output()
-            .map_err(|e| format!("could not run `net user`: {e}"))?;
+        let out =
+            crate::common::output_locked(std::process::Command::new("net").args(["user", user, &password, "/add"]))
+                .map_err(|e| format!("could not run `net user`: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "`net user {user} /add` failed: status={:?} stdout={} stderr={}",
@@ -929,10 +911,13 @@ impl ScratchAccount {
             admin,
         };
         if admin {
-            let out = std::process::Command::new("net")
-                .args(["localgroup", "Administrators", user, "/add"])
-                .output()
-                .map_err(|e| format!("could not run `net localgroup`: {e}"))?;
+            let out = crate::common::output_locked(std::process::Command::new("net").args([
+                "localgroup",
+                "Administrators",
+                user,
+                "/add",
+            ]))
+            .map_err(|e| format!("could not run `net localgroup`: {e}"))?;
             if !out.status.success() {
                 return Err(format!(
                     "adding {user} to Administrators failed: status={:?} stdout={} stderr={}",
@@ -947,15 +932,8 @@ impl ScratchAccount {
 }
 
 impl Drop for ScratchAccount {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-    )]
     fn drop(&mut self) {
-        match std::process::Command::new("net")
-            .args(["user", &self.user, "/delete"])
-            .output()
-        {
+        match crate::common::output_locked(std::process::Command::new("net").args(["user", &self.user, "/delete"])) {
             Ok(out) if out.status.success() => {}
             Ok(out) => println!(
                 "PROBE scratch-account: `net user {} /delete` in Drop FAILED: status={} stdout={} stderr={}",

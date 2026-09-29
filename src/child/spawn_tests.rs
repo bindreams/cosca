@@ -435,7 +435,7 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
     if std::env::var_os(INNER).is_none() {
-        let out = crate::test_spawn::output(
+        let out = crate::test_spawn::output_captured(
             std::process::Command::new(std::env::current_exe().expect("this test binary"))
                 .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
                 .env(INNER, "1"),

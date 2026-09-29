@@ -34,20 +34,17 @@ fn helper_block_on_stdin() {
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn spawn_blocking_child() -> Child {
     let exe = std::env::current_exe().expect("current_exe");
-    Command::new(exe)
-        .args(["--exact", "helper_block_on_stdin"])
-        .env(BLOCK_VAR, "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn blocking child")
+    common::spawn_locked(
+        Command::new(exe)
+            .args(["--exact", "helper_block_on_stdin"])
+            .env(BLOCK_VAR, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn blocking child")
 }
 
 #[test]
@@ -98,17 +95,14 @@ fn created_at_is_present_and_not_in_the_future() {
 /// An exited-but-unreaped (zombie) child must still resolve by identity on EVERY platform.
 /// Exit is proven by stdout EOF — the child's write end closes at process exit.
 #[test]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn identity_resolves_an_exited_unreaped_child() {
     // RAW std::process::Command: argv[0] is the exe path, so the testbin mode is args[1].
-    let mut child = Command::new(common::testbin())
-        .args(["exit", "0"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn");
+    let mut child = common::spawn_locked(
+        Command::new(common::testbin())
+            .args(["exit", "0"])
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn");
     let mut buf = Vec::new();
     child
         .stdout
@@ -193,26 +187,23 @@ fn helper_write_own_record() {
 
 #[test]
 #[cfg(feature = "serde")]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "integration test, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn an_identity_written_by_another_process_restores_and_names_that_process() {
     use cosca::Process;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("id.json");
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = Command::new(exe)
-        // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
-        // `--nocapture` is what lets the helper's marker reach our pipe at all.
-        .args(["helper_write_own_record", "--exact", "--nocapture"])
-        .env(RECORD_VAR, &path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn helper");
+    let mut child = common::spawn_locked(
+        Command::new(exe)
+            // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
+            // `--nocapture` is what lets the helper's marker reach our pipe at all.
+            .args(["helper_write_own_record", "--exact", "--nocapture"])
+            .env(RECORD_VAR, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn helper");
 
     // Synchronise on the pipe: read lines until the marker. libtest prints its own banner
     // first, so scan rather than reading a single line. EOF without the marker means the

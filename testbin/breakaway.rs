@@ -159,10 +159,6 @@ fn cosca_outcome(e: &cosca::error::Error) -> String {
     }
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "helper binary, not library test code: spawn_lock is crate-private and does not reach it"
-)]
 fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str) -> Spawned {
     let exe = std::env::current_exe().expect("current_exe");
     let (outcome, mut child, pid) = match vehicle {
@@ -172,7 +168,12 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
             cmd.args(["control-block", addr, "C"])
                 .env(crate::ack::ACK_ENV, "1")
                 .creation_flags(if request { CREATE_BREAKAWAY_FROM_JOB.0 } else { 0 });
-            match cmd.spawn() {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+            )]
+            let spawned = cmd.spawn();
+            match spawned {
                 Ok(c) => {
                     let pid = c.id();
                     ("Ok".to_string(), Some(ChildHandle::Raw(c)), Some(pid))

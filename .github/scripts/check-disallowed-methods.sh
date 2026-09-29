@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Regression check for the root clippy.toml's disallowed-methods bans (pipes, raw process spawns and tokio timers).
+# Regression check for the root clippy.toml's disallowed-methods bans.
 # Runs clippy on the standalone .github/fixtures/disallowed-methods crate, which calls every
 # banned path, against the REAL root clippy.toml (via CLIPPY_CONF_DIR, not a copy), and asserts a
 # clippy::disallowed_methods diagnostic for each path clippy.toml lists. Reads
 # --message-format=json, not clippy's rendered text, so it fails loudly instead of silently
 # passing if the `disallowed-methods` key is renamed, a path is typo'd, or a dependency upgrade
-# moves a function — any of which would otherwise leave the ban a silent no-op.
+# moves a function.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

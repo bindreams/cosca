@@ -2,8 +2,7 @@
 //!
 //! A raw spawn forks without going through `cosca::Command`, so it must take
 //! [`spawn_lock`](crate::child::spawn::spawn_lock) itself. Otherwise a fork that never `exec`s
-//! (the `cgroup` tests' `fork_running`) can land inside the spawn and inherit its transient
-//! descriptors: the CLOEXEC exec-error pipe write end, or a `Stdio::piped()` child-side end. Its
+//! can land inside the spawn and inherit its transient descriptors: the CLOEXEC exec-error pipe write end, or a `Stdio::piped()` child-side end. Its
 //! copy stays open until that fork exits, so the spawn (which reads the exec-error pipe to EOF)
 //! and any reader of the piped stream block until then.
 //!
@@ -11,11 +10,8 @@
 //! is not reentrant, and re-entry panics.
 
 use std::io;
-use std::process::{Child, Command};
-#[cfg(unix)]
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
-/// Holds `spawn_lock` for one spawn.
 struct Held {
     _guard: crate::child::spawn::SpawnLockGuard,
 }
@@ -28,8 +24,8 @@ impl Held {
     }
 }
 
-/// Whether the calling thread holds `spawn_lock`. In a `pre_exec` closure, whether the fork
-/// happened under the lock: a plain read of a const-initialised thread-local, async-signal-safe.
+/// Whether the calling thread holds `spawn_lock`. Async-signal-safe, so callable from `pre_exec`
+/// to learn whether the fork ran under the lock.
 #[cfg(unix)]
 pub(crate) fn held_by_this_thread() -> bool {
     crate::child::spawn::spawn_lock_held_by_this_thread()
@@ -38,25 +34,26 @@ pub(crate) fn held_by_this_thread() -> bool {
 /// [`Command::spawn`] under `spawn_lock`.
 pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Child> {
     let _held = Held::take();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the one sanctioned std spawn: `_held` is spawn_lock"
-    )]
+    #[allow(clippy::disallowed_methods, reason = "`_held` is spawn_lock")]
     cmd.spawn()
 }
 
-/// [`Command::output`] with `spawn_lock` held for the spawn only. Like `output` it captures
-/// stdout and stderr and gives the child a null stdin, but it OVERRIDES whatever the caller set
-/// for those three: `output` cannot be split into its spawn and its wait, and a stdio setting
-/// cannot be told apart from the default.
-#[cfg(unix)]
-pub(crate) fn output(cmd: &mut Command) -> io::Result<Output> {
+/// [`Command::output`] with `spawn_lock` held for the spawn only. Like `output`, it overrides
+/// stdin (null) and stdout/stderr (piped), discarding any caller setting.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
+)]
+pub(crate) fn output_captured(cmd: &mut Command) -> io::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     spawn(cmd)?.wait_with_output()
 }
 
 /// [`Command::status`] under `spawn_lock` for the spawn only; the wait runs unlocked.
-#[cfg(unix)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
+)]
 pub(crate) fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
     spawn(cmd)?.wait()
 }
@@ -65,11 +62,29 @@ pub(crate) fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
 #[cfg(feature = "tokio")]
 pub(crate) fn spawn_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<::tokio::process::Child> {
     let _held = Held::take();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the one sanctioned tokio spawn: `_held` is spawn_lock"
-    )]
+    #[allow(clippy::disallowed_methods, reason = "`_held` is spawn_lock")]
     cmd.spawn()
+}
+
+/// The tokio twin of [`output_captured`], with the same stdio override.
+#[cfg(feature = "tokio")]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
+)]
+pub(crate) async fn output_captured_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<Output> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    spawn_tokio(cmd)?.wait_with_output().await
+}
+
+/// The tokio twin of [`status`].
+#[cfg(feature = "tokio")]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the ban names it; only unix lib tests call it so far")
+)]
+pub(crate) async fn status_tokio(cmd: &mut ::tokio::process::Command) -> io::Result<ExitStatus> {
+    spawn_tokio(cmd)?.wait().await
 }
 
 #[cfg(test)]
