@@ -2,10 +2,10 @@
 **/*.rs.bk
 __pycache__/
 
-# .github/fixtures/disallowed-pipes is a standalone crate (its own Cargo.toml), built fresh by
-# .github/scripts/check-disallowed-pipes.sh — no reason to pin or track its throwaway lockfile.
-/.github/fixtures/disallowed-pipes/Cargo.lock
-/.github/fixtures/disallowed-pipes/target
+# .github/fixtures/disallowed-methods is a standalone crate (its own Cargo.toml), built fresh by
+# .github/scripts/check-disallowed-methods.sh — no reason to pin or track its throwaway lockfile.
+/.github/fixtures/disallowed-methods/Cargo.lock
+/.github/fixtures/disallowed-methods/target
 
 # Claude Code
 .claude/*.local.*

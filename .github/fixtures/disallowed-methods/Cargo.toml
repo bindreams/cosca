@@ -1,12 +1,15 @@
 [package]
-name = "disallowed-pipes-fixture"
+name = "disallowed-methods-fixture"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Regression fixture proving the root clippy.toml's pipe ban still fires; not part of the cosca package."
+description = "Regression fixture proving the root clippy.toml's disallowed-methods bans still fire; not part of the cosca package."
 
 [lib]
 doctest = false
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

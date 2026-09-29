@@ -48,9 +48,9 @@ async fn arm_at<F: std::future::Future>(at: std::time::Instant, fut: F) -> Optio
     }
     #[cfg(test)]
     armed_deadline_seam::notify(armed_deadline_seam::Armed::At(at));
-    ::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), fut)
-        .await
-        .ok()
+    #[expect(clippy::disallowed_methods, reason = "the one sanctioned timeout_at call")]
+    let armed = ::tokio::time::timeout_at(::tokio::time::Instant::from_std(at), fut);
+    armed.await.ok()
 }
 
 /// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
@@ -325,9 +325,10 @@ where
 /// `fdmarker`'s module doc), and this future stays genuinely asleep until that descriptor
 /// closes. A caller that wants such a writer to make forward progress toward closing the
 /// descriptor cannot get that from this primitive; a caller that merely wants a time bound on
-/// the wait itself can still layer one externally (e.g. `tokio::time::timeout`, the same
-/// pattern `grace_wait` already uses over `wait_exit` in this file) — that bounds the CALLER's
-/// patience, not the writer's blocked state.
+/// the wait itself can still bound it with a deadline instant (`grace_wait` bounds `wait_exit`
+/// this way in this file: `deadline_from`, then `arm_at`; outside the crate,
+/// `tokio::time::timeout_at`) — that bounds the CALLER's patience, not the writer's blocked
+/// state.
 ///
 /// Exited is not reaped: this says nothing about statuses. A caller wanting a status waits on
 /// the root as well.

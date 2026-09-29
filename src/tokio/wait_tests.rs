@@ -325,7 +325,7 @@ async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceilin
 // kernel events: a DECOY second NOTE_EXIT filter on the same kqueue supplies the first wake;
 // the scripted drain consumes it (keeping the kqueue level low, so clear_ready cannot miss a
 // wake) but reports "no exit" — the loop must re-await, and the target's real exit must still
-// resolve it. Every wake is a real kernel event; the 30 s timeout is the failure bound.
+// resolve it. Every wake is a real kernel event.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn watch_loop_survives_a_non_exit_drain_cycle() {
@@ -359,10 +359,7 @@ async fn watch_loop_survives_a_non_exit_drain_cycle() {
         }
         Ok(drained)
     });
-    ::tokio::time::timeout(Duration::from_secs(30), watch)
-        .await
-        .expect("the re-awaited loop must resolve on the target's exit")
-        .expect("watch");
+    watch.await.expect("watch");
     let mut target = target_cell
         .borrow_mut()
         .take()
@@ -755,10 +752,11 @@ async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
     let t0 = ::tokio::time::Instant::now();
 
     let mut fut = std::pin::pin!(grace_wait(id, grace));
-    ::tokio::select! {
-        biased;
-        r = &mut fut => panic!("grace_wait answered {r:?} before its deadline"),
-        () = ::tokio::time::sleep(grace - Duration::from_secs(1)) => {}
+    // The first poll arms the deadline at t0 + grace; the advance then stops one second short.
+    assert!(poll_once(fut.as_mut()).is_pending());
+    ::tokio::time::advance(grace - Duration::from_secs(1)).await;
+    if let std::task::Poll::Ready(r) = poll_once(fut.as_mut()) {
+        panic!("grace_wait answered {r:?} before its deadline");
     }
     let exited = fut.await.expect("grace_wait");
     assert!(!exited, "a live child is still alive when the deadline passes");
@@ -792,10 +790,10 @@ async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_yea
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
 
     let mut fut = std::pin::pin!(grace_wait(id, Duration::MAX));
-    ::tokio::select! {
-        biased;
-        r = &mut fut => panic!("an unbounded grace_wait answered {r:?}"),
-        () = ::tokio::time::sleep(Duration::from_secs(86_400 * 365)) => {}
+    assert!(poll_once(fut.as_mut()).is_pending());
+    ::tokio::time::advance(Duration::from_secs(86_400 * 365)).await;
+    if let std::task::Poll::Ready(r) = poll_once(fut.as_mut()) {
+        panic!("an unbounded grace_wait answered {r:?}");
     }
     assert!(rx.try_recv().is_err(), "no timer may be armed for an unbounded grace");
 
@@ -912,10 +910,10 @@ async fn arm_at_waits_unbounded_for_a_deadline_inside_the_timer_margin_in_releas
     assert_eq!(super::arm_at(violating, std::future::ready(7)).await, Some(7));
 
     let mut fut = std::pin::pin!(super::arm_at(violating, std::future::pending::<()>()));
-    ::tokio::select! {
-        biased;
-        r = &mut fut => panic!("an unbounded wait answered {r:?}"),
-        () = ::tokio::time::sleep(Duration::from_secs(86_400 * 365)) => {}
+    assert!(poll_once(fut.as_mut()).is_pending());
+    ::tokio::time::advance(Duration::from_secs(86_400 * 365)).await;
+    if let std::task::Poll::Ready(r) = poll_once(fut.as_mut()) {
+        panic!("an unbounded wait answered {r:?}");
     }
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![Armed::Unbounded; 2]);
 }

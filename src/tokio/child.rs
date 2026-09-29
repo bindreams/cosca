@@ -412,8 +412,9 @@ impl Child {
         crate::containment::windows::job_contains_pid(&self.os.attached, self.id.pid())
     }
 
-    /// Block until the child exits, returning its status. For a bounded wait use
-    /// `tokio::time::timeout(d, child.wait())`.
+    /// Block until the child exits, returning its status. For a bounded wait, fix a deadline
+    /// instant once (`let deadline = tokio::time::Instant::now() + d;`) and use
+    /// `tokio::time::timeout_at(deadline, child.wait())`, not a duration re-derived later.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
         self.proc_mut().wait().await
     }
