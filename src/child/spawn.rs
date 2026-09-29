@@ -98,7 +98,13 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let tree = child.containment().can_teardown().then(|| child.attached.hard_kill());
     let root_note = match child.kill() {
         Ok(()) => {
-            let _ = child.wait();
+            #[cfg(test)]
+            fault::run_between_kill_and_wait();
+            let _waited = child.wait();
+            #[cfg(test)]
+            if let Ok(status) = &_waited {
+                fault::record_teardown_reap(child.id().pid(), *status);
+            }
             "the elevated child was terminated".to_string()
         }
         Err(e) => {
@@ -1161,6 +1167,62 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             let reaps = TEARDOWN_REAPS.with(|r| r.borrow_mut().take());
             drop(reaps);
+        }
+    }
+
+    /// A stdin for a child that only a kill ends, plus the guard that makes a no-kill mutant fail
+    /// fast: the stdin's writer is released BETWEEN the code under test's kill and its blocking
+    /// wait ([`set_between_kill_and_wait`]), so a kill that did nothing lets the child exit 0 by
+    /// itself and [`TeardownBlocker::assert_killed`] fails, instead of the wait hanging. Keep the
+    /// guard alive through the assertion: dropping it clears the hook and the recorder.
+    ///
+    /// The child must exit 0 on stdin EOF: `cat` on Unix, `more.com` on Windows (whose `findstr x`
+    /// exits 1, which is what a kill reports) with a null stdout, because `more` echoes.
+    pub(crate) fn teardown_blocker_stdin() -> (crate::stdio::Stdio, TeardownBlocker) {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        #[cfg(unix)]
+        let reader = std::os::fd::OwnedFd::from(reader);
+        #[cfg(windows)]
+        let reader = std::os::windows::io::OwnedHandle::from(reader);
+        let release = set_between_kill_and_wait(move || drop(writer));
+        let reaps = record_teardown_reaps();
+        (
+            crate::stdio::Stdio::from_file(std::fs::File::from(reader)),
+            TeardownBlocker {
+                _release: release,
+                reaps,
+            },
+        )
+    }
+
+    /// See [`teardown_blocker_stdin`].
+    #[must_use]
+    pub(crate) struct TeardownBlocker {
+        _release: ArmedBetweenKillAndWait,
+        reaps: TeardownReaps,
+    }
+    impl TeardownBlocker {
+        /// Every child the teardown reaped was killed by its kill (`SIGKILL` on Unix, a non-zero
+        /// exit on Windows), not merely reaped once it exited on its own.
+        pub(crate) fn assert_killed(&self) {
+            let reaps = self.reaps.recorded();
+            assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+            for (pid, status) in reaps {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    assert_eq!(
+                        status.signal(),
+                        Some(libc::SIGKILL),
+                        "pid {pid} must be SIGKILLed by its teardown kill, not merely reaped once it exits on its own: {status:?}"
+                    );
+                }
+                #[cfg(windows)]
+                assert!(
+                    !status.success(),
+                    "pid {pid} must be killed by its teardown kill, not merely reaped once it exits on its own: {status:?}"
+                );
+            }
         }
     }
 

@@ -179,9 +179,8 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
 // of the watch seam. Uses `Duration::ZERO`, not a nonzero grace: the watch-error test's
 // `from_secs(30)` was safe there because that seam fires BEFORE the watch ever runs, so the
 // grace is never actually waited. This seam replaces `terminate_tree` itself, so with a
-// nonzero grace the watch WOULD really block for the full window — racing the "sleep 30"
-// fixture's own natural exit and violating the no-timed-synchronization rule. `ZERO` is
-// documented (`graceful_shutdown`'s own rustdoc) as "signals, polls once, then escalates",
+// nonzero grace the watch WOULD really block for the full window, a timed wait on a fixture
+// that only the sweep ends. `ZERO` is documented (`graceful_shutdown`'s own rustdoc) as "signals, polls once, then escalates",
 // which is exactly the ordering this test needs and nothing more.
 #[test]
 fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {

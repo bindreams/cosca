@@ -887,6 +887,9 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
         );
         return;
     }
+    // The caller's kill has succeeded: a test releases a fixture only that kill would end.
+    #[cfg(test)]
+    crate::child::spawn::fault::run_between_kill_and_wait();
     #[cfg(unix)]
     {
         // `nix` doesn't expose `waitid` on macOS (0.31 configures it out), so call `libc::waitid`
@@ -910,6 +913,8 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             debug_assert!(false, "waitid in wait_and_reap failed unexpectedly: {err}");
             break;
         }
+        #[cfg(test)]
+        crate::child::spawn::fault::record_teardown_reap(pid, exit_status_of(&info));
     }
     #[cfg(windows)]
     {
@@ -924,5 +929,31 @@ pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_
             waited == WAIT_OBJECT_0,
             "wait_and_reap did not observe the child's exit: {waited:?}"
         );
+        #[cfg(test)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            let mut code = 0u32;
+            // SAFETY: `h` is tokio's live process handle and `code` a valid out-parameter.
+            unsafe { windows::Win32::System::Threading::GetExitCodeProcess(HANDLE(h), &mut code) }
+                .expect("GetExitCodeProcess on an exited child");
+            crate::child::spawn::fault::record_teardown_reap(pid, std::process::ExitStatus::from_raw(code));
+        }
     }
+}
+
+/// The `ExitStatus` a `waitid(WEXITED | WNOWAIT)` reported, in the raw `wait` encoding.
+#[cfg(all(test, unix))]
+fn exit_status_of(info: &libc::siginfo_t) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    // SAFETY: `info` was filled in by a successful `waitid`, which sets `si_status`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let status = unsafe { info.si_status() };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let status = info.si_status;
+    let raw = match info.si_code {
+        libc::CLD_EXITED => status << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status, // CLD_KILLED: the signal number
+    };
+    std::process::ExitStatus::from_raw(raw)
 }
