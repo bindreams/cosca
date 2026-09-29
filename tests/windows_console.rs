@@ -38,10 +38,7 @@ fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::proces
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(exe);
     cmd.args(args).arg(&addr).creation_flags(flags);
-    let child = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn flag-matrix child")
-    };
+    let child = common::spawn_locked(&mut cmd).expect("spawn flag-matrix child");
     let (mut sock, _) = listener.accept().expect("accept");
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
@@ -128,7 +125,7 @@ fn run_probe(detached: bool) -> String {
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    let mut helper = cmd.spawn().expect("spawn probe helper");
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");
@@ -237,7 +234,7 @@ fn run_lone_probe(detached: bool) -> String {
     if detached {
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    let mut helper = cmd.spawn().expect("spawn lone probe helper");
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn lone probe helper");
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();
     sock.read_to_string(&mut report).expect("read report");

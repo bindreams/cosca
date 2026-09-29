@@ -38,13 +38,8 @@ fn fixture_status_mounted_over() {
     ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
 
     // A live foreign process: killed through `kill`, which goes through `open_verified`.
-    let mut child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn cat")
-    };
+    let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
+        .expect("spawn cat");
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");

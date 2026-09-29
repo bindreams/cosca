@@ -39,21 +39,17 @@ fn testbin_write_fd_writes_to_the_target_fd() {
 /// end drops — a real close event, not a timer.
 #[test]
 fn testbin_read_fd_copies_the_source_fd_to_stdout() {
-    let mut child = {
-        let _guard = cosca::test_spawn_lock();
+    // The lock is held for the spawn only: the window it closes (std marking its child-side pipe
+    // handles inheritable and calling CreateProcessW with bInheritHandles=TRUE, while a concurrent
+    // cosca raw-backend spawn has its own child ends marked inheritable; see `spawn_lock`'s doc)
+    // ends inside `spawn()`, which closes std's child-side copies before returning.
+    let mut child = common::spawn_locked(
         Command::new(common::testbin())
             .args(["read-fd", "0"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn")
-        // Guard dropped here, before the stdin write and wait below: holding it any longer would
-        // serialize every cosca spawn in this binary against this one for no reason — the window
-        // this lock closes (std marking its child-side pipe handles inheritable and calling
-        // CreateProcessW with bInheritHandles=TRUE, while a concurrent cosca raw-backend spawn has
-        // its own child ends marked inheritable — see `spawn_lock`'s doc) ends inside `spawn()`,
-        // which closes std's child-side copies before returning.
-    };
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn");
     child
         .stdin
         .take()
@@ -461,8 +457,8 @@ fn uncontained_raw_child_has_no_containment() {
 ///
 /// That process cannot be THIS test process, though: it cannot mutate its own cwd under
 /// `cosca::test_spawn_lock()` while it also calls `cosca::Command::spawn()`, because that spawn
-/// takes the exact same non-reentrant mutex internally (see `tests/common/mod.rs`'s
-/// `output_locked`/`status_locked` docs and `src/test_child.rs`) — holding the guard across the
+/// takes the exact same non-reentrant mutex internally (see `tests/common/locked.rs`'s
+/// docs and `src/test_child.rs`) — holding the guard across the
 /// call self-deadlocks the test process forever. Instead, this test plants the decoy in a tempdir
 /// and spawns the `cosca_testbin` helper's `report-bare-argv0-cwd-spawn` mode via one ordinary,
 /// single-level `cosca::Command::spawn()` call, passing the decoy directory as an argument. THAT

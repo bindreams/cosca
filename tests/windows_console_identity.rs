@@ -59,10 +59,7 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     cmd.args(argv_head)
         .args(["report-console-identity", addr.as_str(), me.as_str()])
         .creation_flags(flags);
-    let child = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn identity probe child")
-    };
+    let child = common::spawn_locked(&mut cmd).expect("spawn identity probe child");
     let (sock, _) = listener.accept().expect("accept report socket");
     let report = read_report_line(&sock);
     Probe { child, sock, report }

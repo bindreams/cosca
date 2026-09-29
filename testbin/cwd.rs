@@ -116,6 +116,10 @@ mod probe {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+    )]
     pub(crate) fn std_output(cmd: &mut std::process::Command) -> std::io::Result<(bool, Vec<u8>)> {
         cmd.output().map(|out| (out.status.success(), out.stdout))
     }

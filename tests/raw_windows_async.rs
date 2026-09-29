@@ -144,7 +144,7 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// That calling process cannot be THIS test process: mutating this process's own cwd under
 /// `cosca::test_spawn_lock()` while also calling `cosca::tokio::Command::spawn()` would
 /// self-deadlock, because that spawn takes the exact same non-reentrant mutex internally (see
-/// `tests/common/mod.rs`'s `output_locked`/`status_locked` docs and `src/test_child.rs`). Instead,
+/// `tests/common/locked.rs`'s docs and `src/test_child.rs`). Instead,
 /// this test plants the decoy in a tempdir and spawns the `cosca_testbin` helper's
 /// `report-bare-argv0-cwd-spawn-async` mode via one ordinary, single-level
 /// `cosca::tokio::Command::spawn()` call, passing the decoy directory as an argument. That helper

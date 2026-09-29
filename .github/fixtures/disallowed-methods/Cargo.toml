@@ -9,7 +9,7 @@ description = "Regression fixture proving the root clippy.toml's disallowed-meth
 doctest = false
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["time"] }
+tokio = { version = "1", default-features = false, features = ["time", "process", "rt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

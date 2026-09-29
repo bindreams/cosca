@@ -1656,7 +1656,7 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
             if deny {
                 run.env(DENY_PIDFD_ENV, "1");
             }
-            let out = run.output().expect("run this test with the slots closed");
+            let out = common::output_locked(&mut run).expect("run this test with the slots closed");
             let stdout = String::from_utf8_lossy(&out.stdout);
             (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
                 format!(

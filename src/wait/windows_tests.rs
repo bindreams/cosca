@@ -16,13 +16,14 @@ use crate::wait::{remaining_override_seam, wait_clamp_seam};
 /// dependency); the same fixture shape is already used by
 /// `src/containment/windows_tests.rs::wait_drained_raw_tracks_a_real_member_through_exit`.
 fn spawn_never_exiting() -> (std::process::Child, ProcessId) {
-    let child = std::process::Command::new("cmd")
-        .args(["/C", "more"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn cmd /C more");
+    let child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn cmd /C more");
     let handle = HANDLE(child.as_raw_handle());
     let id = crate::identity::windows_identity_from_handle(handle, child.id())
         .expect("the owned handle always yields an identity");

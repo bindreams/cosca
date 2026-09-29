@@ -29,10 +29,7 @@ fn breakaway_report(shape: &str, vehicle: &str) -> String {
     let mut cmd = std::process::Command::new(testbin());
     cmd.args(["report-breakaway", addr.as_str(), shape, vehicle])
         .env(common::ACK_ENV, "1");
-    let mut helper = {
-        let _guard = cosca::test_spawn_lock();
-        cmd.spawn().expect("spawn breakaway helper")
-    };
+    let mut helper = common::spawn_locked(&mut cmd).expect("spawn breakaway helper");
     let sock = common::accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
     drop(sock);

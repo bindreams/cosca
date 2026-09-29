@@ -65,6 +65,8 @@
 //! destroyed after the job. They must never be set on a machine anyone depends on.
 #![cfg(windows)]
 
+#[path = "common/mod.rs"]
+mod common;
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 

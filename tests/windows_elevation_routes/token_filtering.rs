@@ -132,10 +132,14 @@ fn measure_another_process_token() {
         // With no target named, go looking for the interesting one: the shell of a signed-in
         // user. `tasklist` is read-only.
         Err(_) => {
-            let out = std::process::Command::new("tasklist")
-                .args(["/fi", "IMAGENAME eq explorer.exe", "/fo", "csv", "/nh"])
-                .output()
-                .expect("tasklist must be runnable to find a target process");
+            let out = crate::common::output_locked(std::process::Command::new("tasklist").args([
+                "/fi",
+                "IMAGENAME eq explorer.exe",
+                "/fo",
+                "csv",
+                "/nh",
+            ]))
+            .expect("tasklist must be runnable to find a target process");
             let pid = String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .find_map(|l| l.split(',').nth(1)?.trim_matches('"').parse().ok())
@@ -247,9 +251,7 @@ fn measure_uac_policy() {
         "PromptOnSecureDesktop",
     ] {
         // `reg query` is read-only; nothing here writes to the registry.
-        let out = std::process::Command::new("reg")
-            .args(["query", KEY, "/v", name])
-            .output();
+        let out = crate::common::output_locked(std::process::Command::new("reg").args(["query", KEY, "/v", name]));
         match out {
             Ok(o) if o.status.success() => {
                 any = true;

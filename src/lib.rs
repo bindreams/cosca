@@ -27,6 +27,10 @@ pub use stdio::{Fd, Stdio};
 mod child;
 pub use child::Child;
 
+// Lets `tests/common/locked.rs`, which names `cosca::test_spawn_lock`, compile into the lib's tests.
+#[cfg(test)]
+extern crate self as cosca;
+
 /// Test-only: the same process-wide lock production spawns take internally
 /// (`child::spawn::spawn_lock`), exposed so this crate's OWN integration tests
 /// (`tests/*.rs`, a separate compilation unit that cannot name a `pub(crate)` item) can
@@ -75,6 +79,9 @@ mod test_privilege;
 
 #[cfg(all(test, target_os = "macos"))]
 mod test_support;
+
+#[cfg(test)]
+mod test_spawn;
 
 pub mod process;
 pub use process::{Process, Recursive};

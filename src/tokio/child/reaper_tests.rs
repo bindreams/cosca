@@ -72,15 +72,14 @@ fn private_pool(bound: usize) -> &'static super::LazyPool {
 /// test. The teardown never kills, so the child's own exit is what ends the wait.
 fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
     let proc = {
-        // The same lock every cosca-originated spawn in this binary takes: a macOS fork landing
-        // while another test's fd-marker write end is open would transiently inherit it.
-        let _guard = crate::child::spawn::spawn_lock();
-        ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(["--exact", "__cosca_no_such_test__"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn a child that exits")
+        // `spawn_tokio` takes the lock every cosca-originated spawn in this binary takes.
+        crate::test_spawn::spawn_tokio(
+            ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args(["--exact", "__cosca_no_such_test__"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("spawn a child that exits")
     };
     let pid = proc.id().expect("a freshly spawned child has a pid");
     super::ReapJob {

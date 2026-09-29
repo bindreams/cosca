@@ -290,6 +290,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             .collect();
         fd_map::install(tcmd.as_std_mut(), mappings).map_err(Error::Io)?;
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "spawn_lock is held by `_guard` at the top of this function"
+        )]
         let c = match tcmd.spawn().map_err(Error::Io) {
             Ok(c) => c,
             Err(e) => {
@@ -349,6 +353,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
             // other containment — a process group, a session, a tree walk, none, or a spawn that
             // degraded — nothing reaches the child, and it keeps running.
+            #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
             let spawned = tcmd.spawn().map_err(Error::Io);
             #[cfg(windows)]
             let spawned =

@@ -302,11 +302,12 @@ pub(crate) fn alone(name: &str) -> bool {
     if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
         return true;
     }
-    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-        .env(ALONE, name)
-        .output()
-        .expect("run the test alone");
+    let out = crate::test_spawn::output_captured(
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+            .env(ALONE, name),
+    )
+    .expect("run the test alone");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("1 passed"),
@@ -353,10 +354,7 @@ pub(crate) fn occupied_leaf() -> (
     // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
     // on descriptors `leaf` and `own` keep open across the spawn.
     unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let member = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn the member")
-    };
+    let member = crate::test_spawn::spawn(&mut cmd).expect("spawn the member");
     (leaf, MemberGuard(member), own)
 }
 

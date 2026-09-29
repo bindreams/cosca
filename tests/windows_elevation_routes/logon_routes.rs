@@ -91,13 +91,11 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
     // discarded: a silent icacls failure here would leave the scratch account unable to read or
     // write anything in `dir`, and every downstream failure (no report, an empty stdout capture)
     // would then be misdiagnosed as an elevation or seclogon result instead of a permissions one.
-    let granted = std::process::Command::new("icacls")
-        .args([
-            dir.path().to_str().unwrap(),
-            "/grant",
-            &format!("{}:(OI)(CI)F", account.user),
-        ])
-        .output();
+    let granted = crate::common::output_locked(std::process::Command::new("icacls").args([
+        dir.path().to_str().unwrap(),
+        "/grant",
+        &format!("{}:(OI)(CI)F", account.user),
+    ]));
     match &granted {
         Ok(out) if out.status.success() => {}
         Ok(out) => println!(

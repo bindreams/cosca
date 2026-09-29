@@ -194,6 +194,10 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment (or not) decides its fate
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+    )]
     let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
     if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
         // `connect_control` waits for the first ack: the harness has accepted this connection.
@@ -542,6 +546,10 @@ fn main() {
             let addr = args[2].clone();
             let setuid_helper = args[3].clone();
             #[allow(clippy::zombie_processes)] // intentional: grandchild must outlive us; containment kills/refuses us
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+            )]
             let _gc = std::process::Command::new(setuid_helper)
                 .args(["setuid-control-block", &addr, "P"])
                 .spawn()
@@ -656,6 +664,10 @@ fn main() {
                     Ok(())
                 });
             }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+            )]
             let mut relay = relay.spawn().unwrap();
             relay.wait().unwrap(); // its exit is the reparenting event
                                    // Same wire format as the grandchild, so the test parses one shape.
@@ -666,6 +678,10 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+            )]
             let _ = std::process::Command::new(&exe)
                 .args(["control-echo-pid", &addr, "G"])
                 .spawn()
@@ -957,7 +973,7 @@ fn main() {
             // PARENT test process, avoids mutating (and having to restore) the parent's own
             // process-global cwd under `cosca::test_spawn_lock()` — that lock is the exact SAME
             // non-reentrant mutex `cosca::Command::spawn()` already takes internally (see
-            // `tests/common/mod.rs`'s `output_locked`/`status_locked` docs and
+            // `tests/common/locked.rs`'s docs and
             // `src/test_child.rs`), so holding it across a `spawn()` call self-deadlocks. A
             // fresh, separately-cwd'd process sidesteps that entirely: no shared mutable state,
             // no lock held across a spawn, and the discrimination is unchanged —

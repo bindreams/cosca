@@ -12,11 +12,12 @@ async fn overlapped_pipe_reads_a_real_childs_output() {
     // The production seam: connect_task genuinely awaits the mandatory connect (immediate
     // here — the client is already open).
     let mut server = super::connect_task(server).await.expect("join").expect("connect");
-    let mut child = std::process::Command::new("cmd")
-        .args(["/C", "echo overlapped-e2e"])
-        .stdout(std::process::Stdio::from(client))
-        .spawn()
-        .expect("spawn writer child");
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("cmd")
+            .args(["/C", "echo overlapped-e2e"])
+            .stdout(std::process::Stdio::from(client)),
+    )
+    .expect("spawn writer child");
     let mut buf = Vec::new();
     server.read_to_end(&mut buf).await.expect("read to EOF");
     child.wait().expect("reap");
@@ -33,12 +34,13 @@ async fn overlapped_in_pipe_feeds_a_real_childs_input() {
     use tokio::io::AsyncWriteExt;
     let (server, client) = super::overlapped_in_pipe().expect("pipe pair");
     let mut server = super::connect_task(server).await.expect("join").expect("connect");
-    let mut child = std::process::Command::new("findstr")
-        .arg("^")
-        .stdin(std::process::Stdio::from(client))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn reader child");
+    let mut child = crate::test_spawn::spawn(
+        std::process::Command::new("findstr")
+            .arg("^")
+            .stdin(std::process::Stdio::from(client))
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn reader child");
     server.write_all(b"in-e2e\r\n").await.expect("write");
     drop(server); // buffered data first, then EOF (never disconnect(): it discards)
     let mut stdout = child.stdout.take().expect("piped stdout");

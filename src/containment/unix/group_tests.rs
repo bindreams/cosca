@@ -38,8 +38,7 @@ use crate::test_child::{await_member_ready, member_command};
 #[test]
 fn members_lists_a_live_owned_group() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = member_command(0).spawn().expect("spawn leader");
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
@@ -61,11 +60,7 @@ fn members_lists_a_live_owned_group() {
 fn members_marks_an_unreaped_leader_as_dead() {
     use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let child = std::process::Command::new("true")
-        .process_group(0)
-        .spawn()
-        .expect("spawn true");
+    let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();
     await_zombie(pid);
 
@@ -108,8 +103,7 @@ fn members_of_an_absent_group_is_empty() {
 #[test]
 fn members_token_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = member_command(0).spawn().expect("spawn leader");
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
@@ -133,8 +127,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     use std::os::unix::process::ExitStatusExt;
 
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let mut child = member_command(0).spawn().expect("spawn leader");
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
@@ -157,11 +150,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
 fn state_of_an_all_zombie_group_is_cleared() {
     use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    let child = std::process::Command::new("true")
-        .process_group(0)
-        .spawn()
-        .expect("spawn true");
+    let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
     let pid = child.id();
     await_zombie(pid);
     assert!(

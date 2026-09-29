@@ -139,14 +139,10 @@ fn nested_attach_is_delegated() {
         // the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write end
         // is transiently open would inherit it into this not-yet-`exec`'d process, and a
         // concurrent sweep could then find and SIGKILL it.
-        let _guard = crate::child::spawn::spawn_lock();
         #[cfg(unix)]
-        return std::process::Command::new("true").spawn().expect("spawn true");
+        return crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
         #[cfg(windows)]
-        return std::process::Command::new("cmd")
-            .args(["/C", "exit"])
-            .spawn()
-            .expect("spawn cmd");
+        return crate::test_spawn::spawn(std::process::Command::new("cmd").args(["/C", "exit"])).expect("spawn cmd");
     }
 
     for mode in [ContainMode::Strongest, ContainMode::TreeWalk] {

@@ -299,10 +299,7 @@ fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
 }
 
 fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd) {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new("true").spawn().expect("spawn true")
-    };
+    let child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
     let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
     (child, pidfd)

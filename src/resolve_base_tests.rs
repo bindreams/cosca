@@ -448,13 +448,11 @@ fn fixture_stat_errno_probe() {
 /// the probe passed its gate and reported.
 #[cfg(unix)]
 fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
+    let child = crate::test_spawn::spawn(
         crate::test_child::fixture_command(crate::test_child::fixture_path!(fixture_stat_errno_probe))
-            .env(FIXTURE_STAT_TARGET_ENV, target)
-            .spawn()
-            .expect("spawn the stat probe")
-    };
+            .env(FIXTURE_STAT_TARGET_ENV, target),
+    )
+    .expect("spawn the stat probe");
     let output = child.wait_with_output().expect("wait for the stat probe");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

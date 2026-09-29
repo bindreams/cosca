@@ -502,11 +502,7 @@ fn open_verified_reports_gone_when_the_pidfds_fdinfo_says_the_target_was_reaped(
 /// The real race: the target is reaped after `pidfd_open` succeeded and before the fdinfo read.
 #[test]
 fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        std::process::Command::new("true").spawn().expect("spawn true")
-    };
-    let mut child = child;
+    let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
     let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
     let id = ProcessId::of(child.id())

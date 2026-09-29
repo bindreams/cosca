@@ -432,11 +432,12 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
     if std::env::var_os(INNER).is_none() {
-        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-            .env(INNER, "1")
-            .output()
-            .expect("run the case");
+        let out = crate::test_spawn::output_captured(
+            std::process::Command::new(std::env::current_exe().expect("this test binary"))
+                .args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+                .env(INNER, "1"),
+        )
+        .expect("run the case");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),

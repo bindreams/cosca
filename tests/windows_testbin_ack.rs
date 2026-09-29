@@ -78,8 +78,7 @@ fn run(case: &Case, seam: &str) -> Run {
             .env(common::ACK_ENV, "1")
             .env(SEAM_ENV, seam)
             .stderr(std::process::Stdio::piped());
-        let _guard = cosca::test_spawn_lock();
-        Helper::Std(cmd.spawn().expect("spawn the mode"))
+        Helper::Std(common::spawn_locked(&mut cmd).expect("spawn the mode"))
     };
     let mut sock = common::accept_or_die(&listener, &mut helper);
     let mut report = String::new();

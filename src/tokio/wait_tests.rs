@@ -16,18 +16,14 @@ use crate::identity::ProcessId;
 // stdin) only as its last step, after an explicit `kill()`.
 fn std_blocker() -> std::process::Child {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let _guard = crate::child::spawn::spawn_lock();
-    crate::test_child::held_std_blocker(std::process::Stdio::null())
-        .spawn()
+    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
         .expect("spawn std blocker")
 }
 
 /// Like `std_blocker`, with stdout piped for the echo round trip in [`assert_child_still_alive`].
 /// Local to the tests that call `assert_child_still_alive`.
 fn std_blocker_with_stdout() -> std::process::Child {
-    let _guard = crate::child::spawn::spawn_lock();
-    crate::test_child::held_std_blocker(std::process::Stdio::piped())
-        .spawn()
+    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::piped()))
         .expect("spawn std blocker")
 }
 

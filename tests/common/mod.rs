@@ -16,6 +16,9 @@ pub mod cgroup;
 mod accept;
 pub use accept::*;
 
+mod locked;
+pub use locked::*;
+
 mod report;
 pub use report::*;
 
@@ -58,26 +61,6 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
         !status.success(),
         "{who} must be killed, not exit on its own: {status:?}"
     );
-}
-
-/// Run `cmd` under `cosca::test_spawn_lock()` and return its captured output — the ONLY way
-/// this test surface should fork a RAW `std::process::Command` (one not going through
-/// `cosca::Command`, which already takes this same lock internally). Cargo runs `#[test]` fns
-/// in one binary concurrently, and every test in `tests/macos_fdmarker.rs` runs a real
-/// `FdMarker` sweep; an unguarded raw fork can transiently inherit a live marker pre-`exec`,
-/// and a concurrent sweep can then confirm and SIGKILL it before it gets there. A single
-/// wrapper, not a `let _guard = ...;` line the caller must remember, closes that gap for
-/// every call site at once — including any added later.
-pub fn output_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
-    let _guard = cosca::test_spawn_lock();
-    cmd.output()
-}
-
-/// The `.status()` sibling of [`output_locked`] — see there for why raw spawns in this test
-/// surface must go through one of these two, not a bare `std::process::Command` call.
-pub fn status_locked(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
-    let _guard = cosca::test_spawn_lock();
-    cmd.status()
 }
 
 /// Block until `pid` — which MUST be an unreaped child of this process — has exited AND become

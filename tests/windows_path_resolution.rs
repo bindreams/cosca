@@ -39,6 +39,8 @@
 //! the ephemeral runner.
 #![cfg(windows)]
 
+#[path = "common/mod.rs"]
+mod common;
 #[path = "windows_path_resolution/dots_and_spaces.rs"]
 mod dots_and_spaces;
 #[path = "windows_path_resolution/harness.rs"]
