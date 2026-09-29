@@ -98,12 +98,9 @@ async fn grace_wait_true_for_exited_unreaped_child() {
 
 #[tokio::test]
 async fn grace_wait_false_for_live_child_at_zero_grace() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
+    let child = IndefiniteBlocker::spawn();
+    let exited = grace_wait(child.id(), Duration::ZERO).await.expect("grace_wait");
     assert!(!exited, "a live child at ZERO grace must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 #[tokio::test]
@@ -137,14 +134,12 @@ async fn grace_wait_true_when_child_dies_mid_wait() {
 #[cfg(windows)]
 #[test]
 fn cancel_event_releases_the_blocking_wait() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let child = IndefiniteBlocker::spawn();
+    let id = child.id();
     let cancel = crate::wait::backend::new_cancel_event().expect("event");
     crate::wait::backend::signal_cancel(&cancel);
     let exited = crate::wait::backend::block_until_exit_or_cancel(id, None, &cancel).expect("cancellable wait");
     assert!(!exited, "a live child with a signaled cancel must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 // The concurrent case: signal the cancel while the wait is (or is about to be) in flight.
@@ -154,8 +149,8 @@ fn cancel_event_releases_the_blocking_wait() {
 #[cfg(windows)]
 #[test]
 fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
-    let mut child = std_blocker();
-    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let child = IndefiniteBlocker::spawn();
+    let id = child.id();
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event().expect("event"));
     let watcher = std::thread::spawn({
         let cancel = cancel.clone();
@@ -164,32 +159,36 @@ fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
     crate::wait::backend::signal_cancel(&cancel);
     let exited = watcher.join().expect("watcher thread").expect("cancellable wait");
     assert!(!exited, "a live child with a signaled cancel must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 /// A child that blocks INDEFINITELY — no internal timeout at all, unlike `std_blocker`'s
-/// `ping -n 30`, whose liveness during a probe is only "generous enough," a real subprocess's
-/// own timer a slow/loaded test run could in principle outrun. `cmd /C more` blocks reading
-/// stdin forever with nothing writing to it; it never exits on its own. Kill-FREE cleanup
-/// (RAII, in `Drop`): closing stdin is `more.com`'s own graceful-exit signal, and `cmd.exe`
-/// exits once `more.com` (its child) has — no kill, no timing bet, and no risk of `Drop`
-/// itself hanging forever behind a kill that failed while stdin was still held open.
-#[cfg(windows)]
+/// `ping -n 30` / `sleep 30`, whose liveness during a probe is only "generous enough," a real
+/// subprocess's own timer a slow/loaded test run could in principle outrun. `cat` (Unix) /
+/// `cmd /C more` (Windows) block reading stdin forever with nothing writing to it; neither
+/// exits on its own. Kill-FREE cleanup (RAII, in `Drop`): closing stdin is the program's own
+/// graceful-exit signal (and on Windows `cmd.exe` exits once `more.com`, its child, has) — no
+/// kill, no timing bet, no orphaned grandchild, and no risk of `Drop` itself hanging behind a
+/// kill that failed while stdin was still held open.
 struct IndefiniteBlocker(std::process::Child);
 
-#[cfg(windows)]
 impl IndefiniteBlocker {
     fn spawn() -> Self {
         // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
         let _guard = crate::child::spawn::spawn_lock();
-        let child = std::process::Command::new("cmd")
-            .args(["/C", "more"])
+        #[cfg(unix)]
+        let mut cmd = std::process::Command::new("cat");
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "more"]);
+            cmd
+        };
+        let child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn indefinite blocker (cmd /C more)");
+            .expect("spawn indefinite blocker");
         Self(child)
     }
 
@@ -198,12 +197,10 @@ impl IndefiniteBlocker {
     }
 }
 
-#[cfg(windows)]
 impl Drop for IndefiniteBlocker {
     fn drop(&mut self) {
-        // Close stdin FIRST: EOF is `more.com`'s own exit signal, so the `wait()` below is
-        // bounded by a real, imminent exit already in motion — never by a kill that could fail
-        // and leave this Drop blocked forever still holding the handle.
+        // Close stdin FIRST: EOF is the program's own exit signal, so the `wait()` below is
+        // bounded by a real, imminent exit already in motion.
         drop(self.0.stdin.take());
         let _ = self.0.wait();
     }
