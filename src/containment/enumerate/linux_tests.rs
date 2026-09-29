@@ -1,7 +1,9 @@
 use super::process_parents;
 use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 
-fn snapshot_with(view: ForcedView) -> (Vec<(u32, u32)>, Vec<(log::Level, String)>) {
+type Records = Vec<(log::Level, String)>;
+
+fn snapshot_with(view: ForcedView) -> (Vec<(u32, u32)>, Records) {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let forced = force_proc_view_once(view);
