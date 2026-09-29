@@ -80,6 +80,20 @@ fn expect(th: &mut TracerHelper<'_>, pattern: &[&str]) {
                         lines.push(format!("@@HANG@@ {line}"));
                     }
                 }
+                let pids: Vec<String> = text
+                    .lines()
+                    .filter_map(|line| {
+                        let f: Vec<&str> = line.split_whitespace().collect();
+                        (f.len() > 2 && f[1] == helper.to_string()).then(|| f[0].to_string())
+                    })
+                    .collect();
+                for pid in &pids {
+                    let threads = std::process::Command::new("/bin/ps").args(["-M", "-p", pid]).output().expect("ps -M");
+                    lines.push(format!("@@HANG@@ threads of {pid}:\n{}", String::from_utf8_lossy(&threads.stdout)));
+                    if let Ok(n) = pid.parse::<u32>() {
+                        lines.push(format!("@@HANG@@ pbi_status {pid} = {:?}, peek = {:?}", super::sys::pbi_status(n), "n/a"));
+                    }
+                }
                 eprintln!("{}", lines.join("\n"));
             }
         });
