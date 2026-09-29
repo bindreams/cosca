@@ -272,6 +272,9 @@ async fn async_drop_tears_down_a_contained_tree() {
     remove_leftover_leaf(leaf);
 }
 
+// Only for the mechanisms that name their tree without the root's pgid (a macOS fd marker's holder
+// sweep, a Windows Job Object). A process group does not: see the Unix test below (#382).
+#[cfg(any(windows, target_os = "macos"))]
 #[tokio::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
@@ -298,6 +301,32 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
             leaf.display()
         );
     }
+}
+
+/// The contract for a bare process group (#382): once the root is reaped its number may name an
+/// unrelated group, so the drop does not `killpg` it and the grandchild keeps running. The
+/// grandchild exits when its control socket closes.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test]
+async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
+    use std::io::{Read as _, Write as _};
+    let (mut child, mut root, grand) = common::spawn_tree_async("spawn-grandchild", |cmd| {
+        cmd.contain_with(cosca::ContainMode::Session);
+    })
+    .await;
+    assert_eq!(child.containment(), cosca::Containment::Session);
+    root.write_all(b"x").expect("release the root so it exits");
+    child.wait().await.expect("wait reaps the root");
+    drop(child);
+
+    // Never signalled, so a read that would block proves it alive; a killed one gives EOF/reset.
+    grand.set_nonblocking(true).expect("nonblocking");
+    let mut buf = [0u8; 1];
+    let err = (&grand)
+        .read(&mut buf)
+        .expect_err("the grandchild is alive: no data, no EOF");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    drop(grand); // its socket closes, so the grandchild exits
 }
 
 #[tokio::test]

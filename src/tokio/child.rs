@@ -665,6 +665,10 @@ impl Child {
 mod child_drop_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child_drop_reaped_tests.rs"]
+mod child_drop_reaped_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
 
@@ -715,6 +719,14 @@ impl Child {
 ///
 /// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
 /// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
+///
+/// **Once the root has been reaped (by [`wait`](Child::wait), say), the drop skips the kill of a
+/// tree contained by a process group or a macOS fd marker's group, and logs a `warn` naming the
+/// pgid**, exactly as the sync [`Child`](crate::Child)'s drop does: nothing pins the root's number
+/// after the reap, so the group kill could hit an unrelated group that reused it. Call
+/// [`kill_tree`](Child::kill_tree) **before** `wait()` to end descendants. A cgroup, a Job Object
+/// and a tree walk name their tree without the number, and still kill.
+/// See [#382](https://github.com/bindreams/cosca/issues/382).
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -789,6 +801,17 @@ impl Drop for Child {
         // group (console control events stop at that boundary). On Unix this and `terminate_tree`
         // have the same radius. The contract either way: the tree is signalled before `drop`
         // returns.
+        //
+        // On Unix, without the `killpg` when the root is already reaped and the mechanism names
+        // its tree by the root's number (#382): nothing pins that number any more. Read before
+        // the handle is dismembered below; only this handle reaps, so a root still unreaped here
+        // stays a zombie, pinning its group, until the reaper collects it.
+        #[cfg(unix)]
+        let tree = {
+            let root_reaped = self.os.proc_mut().is_reaped();
+            self.os.attached.hard_kill_for_drop(root_reaped)
+        };
+        #[cfg(not(unix))]
         let tree = self.os.attached.hard_kill();
         if let Err(e) = &tree {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.

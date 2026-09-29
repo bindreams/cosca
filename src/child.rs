@@ -29,6 +29,10 @@ mod graceful;
 #[path = "child_tests.rs"]
 mod child_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/drop_reaped_tests.rs"]
+mod drop_reaped_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -171,6 +175,10 @@ impl Child {
     }
 
     /// Block until the child exits, returning its status.
+    ///
+    /// Reaps the root. Under a process-group or fd-marker containment, a later drop then no longer
+    /// kills the group: call [`kill_tree`](Child::kill_tree) first to end descendants (see this
+    /// type's `Drop`).
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
         self.proc.wait().map_err(Error::Io)
     }
@@ -501,6 +509,32 @@ impl Child {
     }
 }
 
+impl Child {
+    /// Whether the root has been reaped, read without reaping it. `Gone`, or a different process
+    /// under the root's number, means it was; a zombie still resolves to `self.id`. An OS refusal
+    /// to answer reads as not reaped, the state a handle nobody has waited on is in.
+    #[cfg(unix)]
+    fn root_is_reaped(&self) -> bool {
+        match ProcessId::of(self.id.pid()) {
+            crate::identity::Resolved::Found(now) => now != self.id,
+            crate::identity::Resolved::Gone => true,
+            crate::identity::Resolved::Unknown => false,
+        }
+    }
+}
+
+/// With `kill_on_drop` set (the default), hard-kills the contained tree, then kills and reaps the
+/// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
+///
+/// **Once the root has been reaped (by [`wait`](Child::wait), say), the drop skips the kill of a
+/// tree contained by a process group or a macOS fd marker's group, and logs a `warn` naming the
+/// pgid.** Nothing pins the root's number after the reap, so the group kill could hit an
+/// unrelated process group that reused it. Descendants that outlived the waited-on root are not
+/// torn down by the drop: call [`kill_tree`](Child::kill_tree) **before** `wait()` to end them.
+/// (A macOS fd marker still sweeps the descendants that hold the marker, which names them by
+/// identity; only its group kill is skipped.) A cgroup, a Job Object and a tree walk name their
+/// tree without the number, and still kill.
+/// See [#382](https://github.com/bindreams/cosca/issues/382).
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -509,6 +543,14 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
+        //
+        // Without the `killpg` when the root is already reaped and the mechanism names its tree by
+        // the root's number (#382): nothing pins that number any more, and it could hit an
+        // unrelated group. Only this handle reaps the root, so a root still unreaped here stays a
+        // zombie — pinning its group — until `teardown_on_drop` below.
+        #[cfg(unix)]
+        let tree = self.attached.hard_kill_for_drop(self.root_is_reaped());
+        #[cfg(not(unix))]
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {
             // A live member refused, or couldn't be confirmed — visible, not silently
