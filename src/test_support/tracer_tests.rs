@@ -1098,12 +1098,6 @@ fn s6_a_lone_sigchld_is_ignored() {
 /// the tracee stopped (measured on CI: sometimes on macOS 26, never on macOS 15).
 fn assert_job_stopped(pid: u32, signal: i32) {
     let info = await_change(pid);
-    eprintln!(
-        "@@cosca-uh-measure@@ kept={signal} si_code={} si_status={} pbi_status={:?}",
-        info.si_code,
-        info.si_status,
-        sys::pbi_status(pid)
-    );
     assert!(
         info.si_code == libc::CLD_STOPPED && [signal, libc::SIGSTOP].contains(&info.si_status),
         "the detached tracee is not stopped by {signal} or SIGSTOP: si_code {}, si_status {}",
@@ -1191,10 +1185,6 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
     drop(th);
     drop(stdin);
     let info = await_change(pid);
-    eprintln!(
-        "@@cosca-uh-measure@@ sigcont si_code={} si_status={}",
-        info.si_code, info.si_status
-    );
     assert!(
         info.si_code != libc::CLD_STOPPED || info.si_status != libc::SIGTSTP,
         "the dropped SIGTSTP stopped the tracee"
