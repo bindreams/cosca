@@ -66,24 +66,84 @@ fn kill_group_and_term_group_reject_non_positive_pgid() {
 #[test]
 fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt as _;
     // Spawn a child in its own private group (pgid == child pid) so we can
     // SIGKILL it without disturbing the test runner's own group.
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs: a fork landing while
     // that module's marker write end is transiently open would inherit it into this
     // not-yet-`exec`'d process, and a concurrent sweep could then find and SIGKILL it.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
-        .expect("spawn sleep");
+        .expect("spawn cat");
+    // Closed right after the kill: only a real `SIGKILL` can end the child before then, so a
+    // `kill_group` that signals nothing exits 0 and fails the assertion instead of hanging `wait()`.
+    let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(kill_group(pgid).is_ok(), "kill_group on owned group must succeed");
+    drop(stdin);
     let status = child.wait().expect("wait after kill_group");
-    assert!(
-        !status.success(),
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
         "kill_group must have actually killed the leader, got {status:?}"
     );
+}
+
+/// `kill_group`'s `killpg` dooms the group BEFORE `converge` lists it: a member cannot fork once
+/// its `SIGKILL` is pending, so the process the listing never saw is never created. Without that
+/// first `killpg`, `converge`'s per-member resend is the only delivery, and a member that forks
+/// in the window between the listing and its own signal leaves a survivor no one signals.
+///
+/// The leader is a shell that forks a process, writing `spawned`, for each line it reads. The
+/// hook, fired in `converge` right after the listing, feeds it one line and reads one back from a
+/// stdout only the group holds. With the first `killpg` the shell is already dead, so the write
+/// finds no reader (`EPIPE`, ignored) and the read is EOF: empty. Without it the shell forks, and
+/// the read returns `spawned`.
+///
+/// Linux only: `fork` refuses once a fatal signal is pending; no such guarantee is asserted elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_group_dooms_the_group_before_it_is_listed() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut child = {
+        // Held for the fork itself, see `kill_group_on_owned_group_succeeds`.
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("while read x; do (echo spawned; exec cat) & done")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the leader")
+    };
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let pgid = child.id() as i32;
+
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let record = seen.clone();
+    let _armed = super::group::fault::set_after_listing(move || {
+        crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x\n");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read to a line or EOF");
+        *record.borrow_mut() = Some(line);
+    });
+    kill_group(pgid).expect("kill_group on an owned group");
+
+    let status = child.wait().expect("reap the leader");
+    let line = seen.borrow_mut().take().expect("the hook ran in converge");
+    assert_eq!(
+        line, "",
+        "a member forked after the listing: the first killpg did not doom the group"
+    );
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
 }
 
 /// `term_group` on a real owned, LIVE (non-zombie) group succeeds, and the leader really did
@@ -100,21 +160,26 @@ fn kill_group_on_owned_group_succeeds() {
 /// closer until now.
 #[test]
 fn term_group_on_owned_group_succeeds() {
-    use std::os::unix::process::CommandExt;
-    // `sleep` has no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
-    // distinguishing "exited because of the signal" from "merely stayed reachable".
+    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
+    // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
+    // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
+    // closed right after the call, so a `term_group` that delivers nothing exits 0 and fails the
+    // assertion instead of hanging `wait()`.
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
-        .expect("spawn sleep");
+        .expect("spawn cat");
+    let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(term_group(pgid).is_ok(), "term_group on owned group must succeed");
+    drop(stdin);
     let status = child.wait().expect("wait after term_group");
-    assert!(
-        !status.success(),
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
         "term_group must have actually delivered SIGTERM and ended the leader, got {status:?}"
     );
 }

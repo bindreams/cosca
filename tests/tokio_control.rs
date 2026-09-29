@@ -583,24 +583,34 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     // `args` alone rather than the `executable()` helper above, which is load-bearing: an
     // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
     // its whole life, so no released pin could be observed through it at all.
-    #[cfg(windows)]
-    let argv = ["ping", "-n", "30", "127.0.0.1"];
-    #[cfg(unix)]
-    let argv = ["sleep", "30"];
-    let mut async_reaped = {
+    //
+    // Each child blocks on a piped stdin this test holds and releases right after the `kill()`, so
+    // a `kill()` that did nothing lets it exit 0 and fails `assert_killed` instead of hanging `wait()`.
+    let argv = [common::stdin_blocker_program()];
+    let (mut async_reaped, async_stdin) = {
         let mut cmd = cosca::tokio::Command::new();
-        cmd.args(argv);
-        cmd.spawn().expect("spawn async uncontained")
+        cmd.args(&argv);
+        cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
+        cmd.stdout(cosca::Stdio::null()).expect("set stdout null");
+        let mut child = cmd.spawn().expect("spawn async uncontained");
+        let stdin = child.stdin().expect("piped stdin");
+        (child, stdin)
     };
-    let sync_reaped = {
+    let (sync_reaped, sync_stdin) = {
         let mut cmd = cosca::Command::new();
-        cmd.args(argv);
-        cmd.spawn().expect("spawn sync uncontained")
+        cmd.args(&argv);
+        cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
+        cmd.stdout(cosca::Stdio::null()).expect("set stdout null");
+        let mut child = cmd.spawn().expect("spawn sync uncontained");
+        let stdin = child.stdin().expect("piped stdin");
+        (child, stdin)
     };
     async_reaped.kill().expect("kill");
-    async_reaped.wait().await.expect("reap");
+    drop(async_stdin);
+    common::assert_killed("the async child", async_reaped.wait().await.expect("reap"));
     sync_reaped.kill().expect("kill");
-    sync_reaped.wait().expect("reap");
+    drop(sync_stdin);
+    common::assert_killed("the sync child", sync_reaped.wait().expect("reap"));
     assert_eq!(
         refusal_shape(&async_reaped.terminate()),
         refusal_shape(&sync_reaped.terminate()),

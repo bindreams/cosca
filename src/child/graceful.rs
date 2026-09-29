@@ -110,6 +110,8 @@ impl Child {
             );
         }
         self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
         watch?;
         Ok(status)
@@ -229,6 +231,8 @@ impl Child {
             }
             Err(e) => return Err(e), // unchanged pre-existing behavior: no signal sent, no grace, no sweep
         };
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
 
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         //
@@ -306,6 +310,8 @@ impl Child {
                 return Err(sweep);
             }
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
         if let Some(e) = watch_err {
             return Err(e);
@@ -379,6 +385,8 @@ pub(crate) mod fault {
     pub(crate) fn forced_kill_tree_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
+
+    pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR`: a test that arms this seam expecting the sweep
     /// to skip (so the seam is never consumed by `take_force_kill_tree_error`) must still clear

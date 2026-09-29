@@ -570,6 +570,8 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// can safely work around on its own.
 pub(crate) fn converge(pgid: i32, signal: Signal) -> std::io::Result<GroupState> {
     let listed = members(pgid)?;
+    #[cfg(test)]
+    fault::run_after_listing();
     let mut refused = Vec::new();
     let mut unassessable = Vec::new();
     for m in &listed {
@@ -673,6 +675,29 @@ pub(crate) fn state(pgid: i32, signal: Signal) -> GroupState {
             source: Some(e),
         },
     }
+}
+
+/// Test-only seam inside [`converge`].
+#[cfg(test)]
+pub(crate) mod fault {
+    thread_local! {
+        static AFTER_LISTING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    }
+
+    /// Run `hook` in the NEXT `converge` on this thread, once `members(pgid)` has returned and
+    /// before any member is signalled or classified: the window in which a member the listing
+    /// saw can still fork a process the listing did not. Whether that fork can succeed is what
+    /// tells apart a group that a prior `killpg` has doomed from one that only `converge`'s
+    /// per-member resend will reach.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_after_listing(hook: impl FnOnce() + 'static) -> ArmedAfterListing {
+        crate::oneshot_hook::arm(&AFTER_LISTING, hook)
+    }
+    pub(crate) fn run_after_listing() {
+        crate::oneshot_hook::fire(&AFTER_LISTING);
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) type ArmedAfterListing = crate::oneshot_hook::Armed;
 }
 
 #[cfg(test)]

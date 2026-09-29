@@ -139,6 +139,8 @@ impl Child {
             }
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait().await?;
         watch?;
         Ok(status)
@@ -273,6 +275,8 @@ impl Child {
             }
             Err(e) => return Err(e), // unchanged pre-existing behavior: no signal sent, no grace, no sweep
         };
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::AfterTerminate);
 
         // Watch-Err ordering: sweep + reap first, then surface (see graceful_shutdown above).
         //
@@ -355,6 +359,8 @@ impl Child {
                 return Err(sweep);
             }
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait().await?;
         if let Some(e) = watch_err {
             return Err(e);
@@ -431,6 +437,8 @@ pub(crate) mod fault {
     pub(crate) fn forced_kill_tree_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
+
+    pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
     /// full rationale (a test harness thread is reused across test functions, so a seam armed

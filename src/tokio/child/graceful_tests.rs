@@ -10,6 +10,20 @@ fn blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
     crate::test_child::held_contained_blocker_async(crate::Stdio::pipe())
 }
 
+/// Async twin of `child::graceful_tests::kill_only_blocker`.
+async fn kill_only_blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    #[cfg(unix)]
+    {
+        crate::test_child::term_ignoring_blocker_async().await
+    }
+    #[cfg(windows)]
+    {
+        crate::test_child::windows_blocker_async(|cmd| {
+            cmd.contain();
+        })
+    }
+}
+
 /// Async twin of `child::graceful_tests::assert_still_running`; consumes `stdin` and reaps the child.
 async fn assert_still_running(child: &mut crate::tokio::Child, mut stdin: crate::tokio::ChildStdin) {
     use ::tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -64,17 +78,13 @@ async fn cleanup(child: &mut crate::tokio::Child) {
 
 #[tokio::test]
 async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
+    // Released between the sweep and the reap (see `release_at`).
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(30))
         .await
@@ -103,19 +113,19 @@ async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
         .wait()
         .await
         .expect("cached status — already reaped by the graceful op");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    crate::test_child::assert_killed("the swept root", status);
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["sleep", "30"]);
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     fault::set_force_watch_error(true);
+    // Released between the kill and the reap (see `release_at`).
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let err = child
         .graceful_shutdown(Duration::from_secs(30))
         .await
@@ -138,34 +148,27 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
         .wait()
         .await
         .expect("cached status — already reaped by the graceful op");
-    assert!(
-        !status.success(),
-        "escalated child cannot report success, got {status:?}"
-    );
+    crate::test_child::assert_killed("the escalated child", status);
 }
 
 // Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
 // `src/child/graceful_tests.rs` — see there for the full rationale.
 #[tokio::test]
 async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::Containment);
     // A successful sweep is fresher, positive proof the group cleared, superseding the held
     // refusal — the call must report `Ok`, not resurface the disproved `Containment` error.
+    // Released between the sweep and the reap (see `release_at`).
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
         .expect("a successful sweep must supersede the forced terminate refusal");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    crate::test_child::assert_killed("the root", status);
     assert!(
         crate::log_capture::contains_since(
             mark,
@@ -196,24 +199,20 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 // Async twin of `graceful_tree_unassessable_per_member_still_sweeps_and_reaps`.
 #[tokio::test]
 async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     term_fault::set_force_terminate(term_fault::Forced::UnassessablePerMember);
     // Same supersession as the `Containment` test above: the sweep's success disproves the
     // held per-member-unconfirmed state, so the call must report `Ok`.
+    // Released between the sweep and the reap (see `release_at`).
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .await
         .expect("a successful sweep must supersede the forced unassessable state");
-    assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    crate::test_child::assert_killed("the root", status);
     assert!(
         crate::log_capture::contains_since(
             mark,
@@ -266,7 +265,8 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
     {
-        cmd.args(["sh", "-c", "echo r; exec sleep 30"]);
+        cmd.args(["sh", "-c", "echo r; exec cat"]);
+        cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
         cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     }
     #[cfg(windows)]
@@ -281,6 +281,8 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
     }
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    #[cfg(unix)]
+    let stdin = child.stdin().expect("piped stdin");
     #[cfg(unix)]
     {
         use tokio::io::AsyncReadExt;
@@ -307,6 +309,10 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
         crate::containment::Containment::CgroupV2 | crate::containment::Containment::JobObject
     );
     let armed = term_fault::ArmedKillTreeError::arm();
+    // Released once `terminate_tree` has returned, before any watch: SIGTERM is then already
+    // pending on the root, so it beats the EOF this release causes.
+    #[cfg(unix)]
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
     let result = child.graceful_shutdown_tree(Duration::from_secs(30)).await;
     if authoritative {
         let status = result.expect("an authoritatively-drained tree must not invoke the sweep at all");
@@ -338,7 +344,26 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
         );
         drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-        cleanup(&mut child).await; // the forced failure means the real sweep never ran
+        _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
+        let status = child
+            .wait()
+            .await
+            .expect("the root was observed exited, so it is reaped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "the root must die to the SIGTERM, not exit on its own, got {status:?}"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            status.code(),
+            Some(0xC000013A_u32 as i32),
+            "the root must die to the console event, not to the cleanup sweep, got {status:?}"
+        );
     }
 }
 
@@ -461,17 +486,18 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+        cmd.contain();
+    });
     assert_eq!(
         child.graceful_mechanism(),
         crate::graceful::GracefulMechanism::ConsoleGroup,
         "the subject must be a child the signal would otherwise be sent to"
     );
     child.kill().expect("kill");
-    child.wait().await.expect("reap"); // tokio unpins the pid here
+    // Released only after the kill, so a no-op kill fails `assert_killed`.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap")); // tokio unpins the pid here
     let err = child.terminate().expect_err("an unpinned pid must not be signalled");
     assert!(
         matches!(err, crate::error::Error::Unassessable { source: None, .. }),
@@ -496,13 +522,14 @@ async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+        cmd.contain();
+    });
     let id = child.id();
     child.kill().expect("kill");
-    child.wait().await.expect("reap"); // tokio unpins the pid here
+    // Released only after the kill, so a no-op kill fails `assert_killed`.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap")); // tokio unpins the pid here
     let err = child
         .terminate_tree()
         .expect_err("an unpinned pid must not be signalled");
@@ -578,10 +605,9 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 #[tokio::test(start_paused = true)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
     const GRACE: Duration = Duration::from_secs(30);
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain_with(crate::ContainMode::TreeWalk);
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+    });
     assert_eq!(
         child.containment(),
         crate::Containment::TreeWalk,
@@ -589,7 +615,9 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     );
     let id = child.id();
     child.kill().expect("kill");
-    child.wait().await.expect("reap"); // tokio unpins the pid here
+    // Released only after the kill, so a no-op kill fails `assert_killed`.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap")); // tokio unpins the pid here
 
     let (armed_tx, armed_rx) = std::sync::mpsc::channel();
     // Held across the `.await` below: `blocking_watch` reads THIS thread's installed observer
@@ -636,16 +664,17 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
-    let mut cmd = crate::tokio::Command::new();
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]); // uncontained: leads no group of its own
-    let mut child = cmd.spawn().expect("spawn");
+    // Uncontained: leads no group of its own.
+    let (mut child, stdin) = crate::test_child::windows_blocker_async(|_| {});
     assert_eq!(
         child.graceful_mechanism(),
         crate::graceful::GracefulMechanism::None,
         "the subject must be a child whose refusal is permanent, not pid-dependent"
     );
     child.kill().expect("kill");
-    child.wait().await.expect("reap"); // tokio unpins the pid here
+    // Released only after the kill, so a no-op kill fails `assert_killed`.
+    drop(stdin);
+    crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap")); // tokio unpins the pid here
     let err = child.terminate().expect_err("a child that leads no group is refused");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
 }

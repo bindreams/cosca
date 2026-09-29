@@ -11,17 +11,22 @@ use std::time::Duration;
 
 use crate::wait::fault;
 
-/// A std child that ignores `SIGTERM`: `trap '' TERM` before `exec`, and ignored dispositions
-/// survive the exec. The readiness byte on stdout proves the trap is installed before any
-/// signal is sent (a real pipe event, not a sleep). Byte-identical to the sync twins' helper
-/// in `src/process/graceful_tests.rs`.
-fn spawn_term_ignoring_sleeper() -> std::process::Child {
+/// A std child that ignores `SIGTERM` (`trap '' TERM` before `exec`; an ignored disposition
+/// survives the exec) and blocks on the piped stdin the returned `std::process::Child` holds. The
+/// readiness byte on stdout proves the trap is installed before any signal is sent.
+///
+/// A test that never sends `SIGKILL` cannot hang on it: `std::process::Child::wait` closes that
+/// stdin before waiting, so the stranded `cat` exits 0 at once and fails the `SIGKILL` assertion.
+/// Taking the stdin out of the `Child`, or reaping through another handle, would lose that EOF.
+/// Identical to the sync twin's helper in `src/process/graceful_tests.rs`.
+fn spawn_term_ignoring_blocker() -> std::process::Child {
     // Held for the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write
     // end is transiently open would inherit it into this not-yet-`exec`'d process, and a
     // concurrent sweep could then find and SIGKILL it — see that module's docs.
     let _guard = crate::child::spawn::spawn_lock();
     let mut child = std::process::Command::new("sh")
-        .args(["-c", "trap '' TERM; echo r; exec sleep 30"])
+        .args(["-c", "trap '' TERM; echo r; exec cat"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn");
@@ -37,7 +42,7 @@ fn spawn_term_ignoring_sleeper() -> std::process::Child {
 
 #[tokio::test]
 async fn async_foreign_graceful_watch_error_still_escalates() {
-    let mut child = spawn_term_ignoring_sleeper();
+    let mut child = spawn_term_ignoring_blocker();
     let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
     fault::set_force_watch_error(true);
     let err = p
@@ -61,7 +66,7 @@ async fn async_foreign_graceful_watch_error_still_escalates() {
 
 #[tokio::test]
 async fn async_foreign_graceful_tree_watch_error_still_sweeps() {
-    let mut child = spawn_term_ignoring_sleeper();
+    let mut child = spawn_term_ignoring_blocker();
     let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
     fault::set_force_watch_error(true);
     let err = p
