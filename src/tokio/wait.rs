@@ -113,15 +113,11 @@ async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> 
     let armed_tx = crate::wait::backend::armed_probe::current();
     #[cfg(test)]
     let read_tx = crate::wait::read_probe::current();
-    #[cfg(test)]
-    let released_tx = fault_observer::current();
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _armed_guard = armed_tx.map(crate::wait::backend::armed_probe::install);
         #[cfg(test)]
         let _read_guard = read_tx.map(crate::wait::read_probe::install);
-        #[cfg(test)]
-        let _released_guard = released_tx.map(fault_observer::install);
         let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
