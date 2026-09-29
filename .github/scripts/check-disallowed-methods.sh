@@ -15,11 +15,11 @@ fixture_manifest="${repo_root}/.github/fixtures/disallowed-methods/Cargo.toml"
 
 # Kept in sync by hand with the root clippy.toml's disallowed-methods list; the check below fails
 # if the two differ in either direction, so a new ban cannot land without a fixture call. Clippy
-# skips a path whose crate isn't linked for the target, so the paths are split by the pass that can
-# reach them: the host pass (Linux) and a Windows pass, `--target x86_64-pc-windows-msvc`. Plain
-# `cargo clippy` type-checks that target; it needs its std installed (`rustup target add`), not a
-# Windows SDK.
-host_paths=(
+# skips a path whose crate isn't linked for the target, so each pass pins its target and lists the
+# paths reachable there, so the result does not depend on the runner OS. Plain `cargo clippy
+# --target` type-checks with the target's std (`rustup target add`); no linker or Windows SDK.
+linux_target="x86_64-unknown-linux-gnu"
+linux_paths=(
     "libc::pipe"
     "nix::unistd::pipe"
     "rustix::pipe::pipe"
@@ -43,11 +43,23 @@ host_paths=(
     "std::env::set_current_dir"
     "libc::chdir"
     "libc::fchdir"
+    "libc::daemon"
+    "nix::unistd::daemon"
     "nix::unistd::chdir"
     "nix::unistd::fchdir"
     "rustix::process::chdir"
     "rustix::process::fchdir"
     "rustix::fs::Dir::chdir"
+)
+# macOS: `nix::unistd::daemon` is absent there, `libc::daemon` is a different (Apple) item.
+darwin_target="aarch64-apple-darwin"
+darwin_paths=(
+    "std::env::set_current_dir"
+    "libc::chdir"
+    "libc::fchdir"
+    "libc::daemon"
+    "nix::unistd::chdir"
+    "nix::unistd::fchdir"
 )
 windows_target="x86_64-pc-windows-msvc"
 windows_paths=(
@@ -64,7 +76,7 @@ import sys, tomllib
 with open(sys.argv[1], "rb") as f:
     print("\n".join(e["path"] for e in tomllib.load(f)["disallowed-methods"]))
 ' "${repo_root}/clippy.toml" | LC_ALL=C sort)"
-expected="$(printf '%s\n' "${host_paths[@]}" "${windows_paths[@]}" | LC_ALL=C sort -u)"
+expected="$(printf '%s\n' "${linux_paths[@]}" "${darwin_paths[@]}" "${windows_paths[@]}" | LC_ALL=C sort -u)"
 if [[ "${listed}" != "${expected}" ]]; then
     echo "::error::clippy.toml's disallowed-methods and this script's path lists differ:" >&2
     diff <(echo "${listed}") <(echo "${expected}") >&2 || true
@@ -78,23 +90,19 @@ trap 'rm -f "${json_output}"; rm -rf "${fixture_target:?}"' EXIT
 failures=0
 checked=0
 
-# check_pass LABEL TARGET PATH...: lints the fixture (for TARGET, or the host if empty) and
-# requires a clippy::disallowed_methods diagnostic for each PATH. clippy exits non-zero when
+# check_pass LABEL TARGET PATH...: lints the fixture for TARGET and requires a
+# clippy::disallowed_methods diagnostic for each PATH. clippy exits non-zero when
 # disallowed_methods fires (that's the point, under -D warnings) — the JSON diagnostics are the
 # pass/fail signal here, not its exit status. Not --locked: the fixture's Cargo.lock isn't tracked
 # (see .gitignore), so it resolves fresh every run.
 check_pass() {
     local label="$1" target="$2"
     shift 2
-    local target_args=()
-    if [[ -n "${target}" ]]; then
-        target_args=(--target "${target}")
-    fi
     CARGO_TARGET_DIR="${fixture_target}" \
         CLIPPY_CONF_DIR="${repo_root}" \
         cargo clippy \
         --manifest-path "${fixture_manifest}" \
-        ${target_args[@]+"${target_args[@]}"} \
+        --target "${target}" \
         --message-format=json \
         -- -D warnings \
         >"${json_output}" || true
@@ -116,7 +124,8 @@ check_pass() {
     done
 }
 
-check_pass host "" "${host_paths[@]}"
+check_pass linux "${linux_target}" "${linux_paths[@]}"
+check_pass darwin "${darwin_target}" "${darwin_paths[@]}"
 check_pass windows "${windows_target}" "${windows_paths[@]}"
 
 if [[ "${failures}" -gt 0 ]]; then
