@@ -143,6 +143,39 @@ pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
     }
 }
 
+/// What a process does with a signal it is sent, as `sysctl(KERN_PROC_PID)` reports it in
+/// `kinfo_proc`'s `p_sigignore` and `p_sigcatch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Disposition {
+    /// `SIG_DFL`.
+    Default,
+    /// A handler runs.
+    Caught,
+    /// `SIG_IGN`.
+    Ignored,
+}
+
+/// `signal`'s disposition in `pid`. `Err(ESRCH)` if `pid` is gone, `Err(EPERM)` if the kernel
+/// refused the query.
+pub(super) fn disposition(pid: u32, signal: i32) -> Result<Disposition, i32> {
+    use crate::identity::{kinfo::kinfo, Resolved};
+    match kinfo(pid as _) {
+        Resolved::Found(info) => {
+            let (ignored, caught) = (info.kp_proc.sig_ignored(signal), info.kp_proc.sig_caught(signal));
+            debug_assert!(!(ignored && caught), "signal {signal} is both ignored and caught");
+            Ok(if caught {
+                Disposition::Caught
+            } else if ignored {
+                Disposition::Ignored
+            } else {
+                Disposition::Default
+            })
+        }
+        Resolved::Gone => Err(libc::ESRCH),
+        Resolved::Unknown => Err(libc::EPERM),
+    }
+}
+
 /// `<sys/proc_info.h>`: lists a process's thread handles. Not in `libc`.
 const PROC_PIDLISTTHREADS: libc::c_int = 6;
 
