@@ -122,40 +122,15 @@ fn a_second_wait_blocks_behind_the_holder() {
 
 // S3: gone before adoption =====
 
-/// S3: a child reaped elsewhere before adoption is answered `ECHILD` by every method, with no
-/// state written.
-#[cfg(target_os = "linux")]
-fn assert_every_method_answers_echild(shared: &crate::child::shared::SharedChild) {
-    assert!(is_echild(&shared.wait().expect_err("wait")));
-    assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
-    assert!(is_echild(&shared.wait_deadline(far()).expect_err("wait_deadline")));
-    assert!(is_echild(&shared.kill().expect_err("kill")));
-}
-
-#[cfg(target_os = "linux")]
-fn reap_by_number(pid: u32) {
-    let mut status = 0;
-    // SAFETY: `pid` is this test's own child, still unreaped (the forced errno was synthetic).
-    let r = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
-    assert_eq!(r, pid as i32, "reap the fixture: {}", io::Error::last_os_error());
-}
-
 /// S3: `pidfd_open` answering `ESRCH` is the gone path.
 ///
 /// Mutant: `adopt` fails on `ESRCH`.
 #[cfg(target_os = "linux")]
 #[test]
 fn adopt_on_esrch_takes_the_echild_path() {
-    let (child, stdin) = super::fixtures::spawn_std_blocker();
-    let pid = child.id();
-    let id = super::fixtures::identity_of(&child);
-    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::SRCH);
-    let shared = crate::child::shared::SharedChild::adopt(child, id).expect("ESRCH is gone, not a failure");
-    drop(forced);
-    assert_every_method_answers_echild(&shared);
-    // The forced `ESRCH` was synthetic: the child is still this test's own, unreaped.
-    drop(stdin);
-    reap_by_number(pid);
+    super::fixtures::assert_adoption_is_gone(|| {
+        crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::SRCH)
+    });
 }
 
 // S4: try_wait =====

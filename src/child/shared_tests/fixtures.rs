@@ -107,6 +107,56 @@ pub(super) fn confirm_exit(shared: &SharedChild) {
     }
 }
 
+// Adoption of a child that is gone =====
+
+/// Whether `e` is `ECHILD`.
+#[cfg(target_os = "linux")]
+fn is_echild(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD)
+}
+
+/// Block until `child`'s exit is visible, without consuming it.
+#[cfg(target_os = "linux")]
+fn confirm_exit_of(child: &std::process::Child) {
+    // SAFETY: an all-zero `siginfo_t` is a valid value, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
+}
+
+/// Adopt a child under the force `arm` installs, and expect the gone path: every method answers
+/// `ECHILD`. The child has already exited (and is not yet reaped) when it is adopted, so a force
+/// that is not applied leaves a handle whose methods answer at once with a status, and the
+/// assertions fail instead of blocking on a live child.
+#[cfg(target_os = "linux")]
+pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
+    let (child, stdin) = spawn_std_blocker();
+    let pid = child.id();
+    let id = identity_of(&child);
+    drop(stdin);
+    confirm_exit_of(&child);
+    let forced = arm();
+    let shared = SharedChild::adopt(child, id).expect("a gone answer is not a failure");
+    drop(forced);
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    assert!(is_echild(&shared.wait().expect_err("wait")));
+    assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
+    assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
+    assert!(is_echild(&shared.kill().expect_err("kill")));
+    // The force was synthetic: the child is still this test's own, unreaped.
+    let mut status = 0;
+    // SAFETY: `status` is a valid out-pointer.
+    let r = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+    assert_eq!(r, pid as i32, "reap the fixture: {}", io::Error::last_os_error());
+}
+
 // Threads =====
 
 /// A thread that parked in its holder's unlocked wait, and the ends that drive it.
