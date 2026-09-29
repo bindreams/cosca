@@ -398,7 +398,7 @@ fn main() {
                 }
             });
             let tid = rx.recv().expect("recv tid from the worker thread");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             writeln!(sock, "{tid}").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -422,7 +422,7 @@ fn main() {
                 let _ = exit_rx.recv();
             });
             let tid = rx.recv().expect("recv tid from the worker thread");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             writeln!(sock, "{tid}").unwrap();
             sock.flush().unwrap();
             stdin.read_exact(&mut byte).unwrap();
