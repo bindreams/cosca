@@ -407,7 +407,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // Fixture: the root shell ignores TERM (`trap ''` survives `exec`) and backgrounds a `cat` blocked
 // on a stdin this test holds open, so the tree cannot drain. It then writes a readiness byte (the
 // trap and background job are in place) and waits for a line on fd 4 before `exit 0`. The gate
-// keeps the exit from racing `spawn()`, where `SharedChild::new` can reap a fast-exiting child.
+// keeps the exit from racing `spawn()`.
 // The test releases it with `x\n`: `read` returns on the newline, so the release does not depend
 // on EOF, which a concurrent fork inheriting the write end would withhold. It then waits with
 // `block_until_exit`, which does not reap, so the root is an unreaped zombie when
@@ -486,7 +486,8 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // postcondition, because that postcondition does not translate. The Unix test proves an
 // already-exited root is best-effort REAPED (`waitpid`-collected) even when the sweep also
 // fails, so it never strands a zombie. Windows has no reap concept to strand: per the
-// `shared_child` crate's own comment on its Windows backend, "there's no such thing as reaping
+// `shared_child` crate's own comment on its Windows backend (the dependency `SharedChild`
+// replaced), "there's no such thing as reaping
 // child processes on Windows — instead, you close the child handle when you're done with it,
 // like a file", and `Child::wait()` never closes that handle on any Windows backend (raw or
 // std) — only `Child`'s own `Drop` does. A Windows process object stays resolvable exactly as
