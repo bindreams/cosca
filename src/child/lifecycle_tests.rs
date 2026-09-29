@@ -179,3 +179,58 @@ fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     }
     let _ = treewalk_child.wait();
 }
+
+// Deadline contract for `Child::wait_deadline`'s recheck loop: a backend `None` is never trusted
+// before the real deadline. Portable; seams are documented in `crate::wait`.
+
+/// A live, uncontained child that blocks on its piped stdin until EOF, so it never exits on its
+/// own (`cat` on Unix, `cmd /C more` on Windows).
+fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = crate::Command::new();
+    #[cfg(unix)]
+    cmd.args(["cat"]);
+    #[cfg(windows)]
+    cmd.args(["cmd", "/C", "more"]);
+    cmd.stdin(crate::Stdio::pipe_in()).expect("configure piped stdin");
+    cmd.stdout(crate::Stdio::null()).expect("configure null stdout");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin was just configured above");
+    (child, stdin)
+}
+
+/// A synthetic early `None` hours before the deadline is not trusted: the loop re-arms and
+/// reports the real exit.
+///
+/// Mutant: return the first backend result (no loop) -> the forced `None` is returned.
+#[test]
+fn wait_deadline_never_reports_still_running_before_the_deadline() {
+    let (child, stdin) = spawn_never_exiting();
+    let _seam = crate::wait::early_none_seam::arm(move || drop(stdin)); // EOF -> exits for real
+    let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+    let status = child
+        .wait_deadline(deadline)
+        .expect("a genuinely-exiting child must not report a wait failure");
+    assert!(status.is_some(), "a synthetic early None was trusted");
+}
+
+/// Under a frozen test clock a finite deadline still ends: each real wait advances the clock.
+///
+/// Mutant: drop `advance_by_elapsed_if_frozen` from the loop -> `remaining` never shrinks and the
+/// loop re-arms forever.
+#[test]
+fn wait_deadline_terminates_under_a_frozen_clock() {
+    let (child, _stdin) = spawn_never_exiting();
+    let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    let deadline = at + Duration::from_millis(50);
+    let status = child
+        .wait_deadline(deadline)
+        .expect("a live child must not report a wait failure");
+    assert!(
+        status.is_none(),
+        "a never-exiting child is still running at the deadline"
+    );
+    assert!(
+        std::time::Instant::now() >= deadline,
+        "returned before the real deadline"
+    );
+}

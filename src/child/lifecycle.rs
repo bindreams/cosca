@@ -33,8 +33,32 @@ impl Child {
 
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
+    ///
+    /// A `None` from the backend is never trusted until the real clock reaches `deadline`
+    /// (principle 13): `shared_child`'s Windows `wait_deadline` may report `None` early, and a
+    /// recheck here costs nothing on the other backends.
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
-        self.proc.wait_deadline(deadline).map_err(Error::Io)
+        loop {
+            #[cfg(test)]
+            let call_start = Instant::now();
+            #[cfg(test)]
+            let status = if crate::wait::early_none_seam::take() {
+                None
+            } else {
+                self.proc.wait_deadline(deadline).map_err(Error::Io)?
+            };
+            #[cfg(not(test))]
+            let status = self.proc.wait_deadline(deadline).map_err(Error::Io)?;
+            #[cfg(test)]
+            crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());
+
+            if status.is_some() {
+                return Ok(status);
+            }
+            if crate::wait::remaining(Some(Some(deadline))) == Some(Duration::ZERO) {
+                return Ok(None);
+            }
+        }
     }
 
     /// Block until every member of the contained tree has EXITED — not reaped; a status is
