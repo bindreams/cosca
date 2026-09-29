@@ -89,8 +89,10 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
     }
 }
 
+/// `deadline` (real clock, `None` = unbounded) is fixed by the caller before `spawn_blocking`, so
+/// a saturated blocking pool cannot delay it.
 #[cfg(windows)]
-async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, Error> {
+async fn blocking_watch(id: ProcessId, deadline: Option<std::time::Instant>) -> Result<bool, Error> {
     /// Signals the cancel event on drop (harmless after completion) so the blocking watcher
     /// returns promptly instead of parking out the grace, and `Runtime::drop` — which joins
     /// blocking tasks — does not stall.
@@ -102,16 +104,20 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
     }
     let cancel = std::sync::Arc::new(crate::wait::backend::new_cancel_event()?);
     let _guard = SignalOnDrop(cancel.clone());
-    // Test-only: `armed_probe` is thread-local (see its own doc for why), and this closure
-    // runs on a blocking-pool thread distinct from this one (the "arming" thread) — so read
-    // whatever THIS thread has installed now, while still on it (nothing before this point
-    // yields), and move the captured value into the closure to re-install on ITS thread.
+    // Test-only: `armed_probe` and `read_probe` are thread-local (see their docs for why), and
+    // this closure runs on a blocking-pool thread distinct from this one (the "arming" thread) —
+    // so read whatever THIS thread has installed now, while still on it (nothing before this
+    // point yields), and move the captured values into the closure to re-install on ITS thread.
     #[cfg(test)]
     let armed_tx = crate::wait::backend::armed_probe::current();
+    #[cfg(test)]
+    let read_tx = crate::wait::read_probe::current();
     let joined = ::tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _armed_guard = armed_tx.map(crate::wait::backend::armed_probe::install);
-        let result = crate::wait::backend::block_until_exit_or_cancel(id, grace, &cancel);
+        #[cfg(test)]
+        let _read_guard = read_tx.map(crate::wait::read_probe::install);
+        let result = crate::wait::backend::block_until_exit_or_cancel(id, deadline, &cancel);
         #[cfg(test)]
         fault_observer::notify_released();
         result
@@ -145,8 +151,10 @@ async fn blocking_watch(id: ProcessId, grace: Option<Duration>) -> Result<bool, 
 /// (`INFINITE - 1` ms — `WaitForMultipleObjects` reserves `INFINITE` itself as the "no
 /// timeout" sentinel), but a grace longer than that is still honored correctly: the backend
 /// re-arms past the cap rather than reporting the process still alive once the cap elapses. A
-/// use case needing a genuinely unbounded watch still composes `wait()` (unbounded,
-/// cancellable) with its own escalation instead of a grace.
+/// grace that overflows `Instant`, or lands within [`TOKIO_TIMER_ROUNDING_MARGIN`] of its
+/// ceiling, is unbounded (see [`deadline_from`]), as on Unix.
+///
+/// [`TOKIO_TIMER_ROUNDING_MARGIN`]: crate::wait::TOKIO_TIMER_ROUNDING_MARGIN
 #[cfg(windows)]
 pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, Error> {
     // Shared watch fault seam (take-semantics; the async fn body runs on the arming thread).
@@ -154,7 +162,9 @@ pub(crate) async fn grace_wait(id: ProcessId, grace: Duration) -> Result<bool, E
     if crate::wait::fault::take_force_watch_error() {
         return Err(crate::wait::fault::forced_watch_error());
     }
-    blocking_watch(id, Some(grace)).await
+    // Fixed before `spawn_blocking`; the blocking thread only recomputes against it.
+    let deadline = to_real_clock(deadline_from(grace)).flatten();
+    blocking_watch(id, deadline).await
 }
 
 /// Resolve when the process exits — UNBOUNDED, non-reaping, signal-free, identity-verified
@@ -766,11 +776,9 @@ pub(crate) mod now_override {
         NOW.with(Cell::get)
     }
 
-    #[cfg(unix)]
     #[must_use]
     pub(crate) struct Installed(());
 
-    #[cfg(unix)]
     pub(crate) fn install(now: Instant) -> Installed {
         NOW.with(|n| {
             debug_assert!(n.get().is_none(), "a now_override is already installed on this thread");
@@ -779,7 +787,6 @@ pub(crate) mod now_override {
         Installed(())
     }
 
-    #[cfg(unix)]
     impl Drop for Installed {
         fn drop(&mut self) {
             NOW.with(|n| n.set(None));
