@@ -19,13 +19,105 @@ fn blocker() -> Command {
     cmd
 }
 
+/// [`blocker`] for a test that drives `teardown_unadopted` to its kill-then-reap. Its stdin
+/// writer is not leaked but released BETWEEN the teardown's kill and its blocking reap, so a
+/// no-kill mutant cannot hang the reap; it fails [`TeardownBlocker::assert_sigkilled`] instead,
+/// because the released `cat` then exits by itself with status 0. Keep the guard alive through
+/// the assertion: dropping it clears the seam.
+#[cfg(unix)]
+fn teardown_blocker() -> (Command, TeardownBlocker) {
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    cmd.stdin(crate::stdio::Stdio::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(reader),
+    )))
+    .expect("set stdin pipe");
+    let release = fault::set_between_kill_and_wait(move || drop(writer));
+    let reaps = fault::record_teardown_reaps();
+    (
+        cmd,
+        TeardownBlocker {
+            _release: release,
+            reaps,
+        },
+    )
+}
+#[cfg(unix)]
+struct TeardownBlocker {
+    _release: fault::ArmedBetweenKillAndWait,
+    reaps: fault::TeardownReaps,
+}
+#[cfg(unix)]
+impl TeardownBlocker {
+    /// Every child the teardown reaped was SIGKILLed by its kill, not merely reaped once it
+    /// exited on its own.
+    fn assert_sigkilled(&self) {
+        let reaps = self.reaps.recorded();
+        assert!(!reaps.is_empty(), "the teardown must have reaped the child");
+        for (pid, signal) in reaps {
+            assert_eq!(
+                signal,
+                Some(libc::SIGKILL),
+                "pid {pid} must be SIGKILLed by kill_unadopted, not merely reaped once it exits on its own"
+            );
+        }
+    }
+}
+/// Windows has no `ExitStatusExt::signal`, so the kill-then-reap seam is Unix only: the blocker
+/// keeps its leaked writer and there is nothing to assert.
+#[cfg(not(unix))]
+fn teardown_blocker() -> (Command, TeardownBlocker) {
+    (blocker(), TeardownBlocker)
+}
+#[cfg(not(unix))]
+struct TeardownBlocker;
+#[cfg(not(unix))]
+impl TeardownBlocker {
+    fn assert_sigkilled(&self) {}
+}
+
+/// A hook whose fire point was never reached must not outlive its guard: it would fire in an
+/// unrelated later teardown on this thread, and its released fixture would be silently gone.
+#[cfg(unix)]
+#[test]
+fn an_unfired_between_kill_and_wait_hook_is_cleared_when_its_guard_drops() {
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = fired.clone();
+    drop(fault::set_between_kill_and_wait(move || seen.set(true)));
+    fault::run_between_kill_and_wait();
+    assert!(!fired.get(), "a dropped guard must take its hook with it");
+    assert_eq!(std::rc::Rc::strong_count(&fired), 1, "the hook itself must be dropped");
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+#[should_panic(expected = "already armed")]
+fn arming_over_a_live_between_kill_and_wait_hook_is_refused() {
+    let _first = fault::set_between_kill_and_wait(|| {});
+    let _second = fault::set_between_kill_and_wait(|| {});
+}
+
+#[cfg(unix)]
+#[test]
+fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
+    fault::record_teardown_reap(1, Some(9));
+    let recorder = fault::record_teardown_reaps();
+    assert_eq!(recorder.recorded(), vec![], "a reap from before arming is not recorded");
+    fault::record_teardown_reap(2, Some(9));
+    assert_eq!(recorder.recorded(), vec![(2, Some(9))]);
+    drop(recorder);
+    let later = fault::record_teardown_reaps();
+    assert_eq!(later.recorded(), vec![], "a dropped recorder leaves nothing behind");
+}
+
 // A failed sync spawn must fully reap its child, not leak it. Each error arm is forced via the seam
 // (which records the child's real identity); `fault::assert_child_reaped` then proves it was reaped.
 
 #[test]
 fn identity_failure_reaps_the_spawned_child() {
+    let (mut cmd, teardown) = teardown_blocker();
     fault::set_force_identity_vanished(true);
-    let mut cmd = blocker();
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
 
@@ -35,12 +127,13 @@ fn identity_failure_reaps_the_spawned_child() {
         "identity-vanish surfaces as an Io error, got {err:?}"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_sigkilled();
 }
 
 #[test]
 fn attach_failure_reaps_the_spawned_child() {
+    let (mut cmd, teardown) = teardown_blocker();
     fault::set_force_attach_failure(true);
-    let mut cmd = blocker();
     let err = cmd.spawn().err();
     fault::set_force_attach_failure(false);
 
@@ -50,6 +143,7 @@ fn attach_failure_reaps_the_spawned_child() {
         "a real attach failure surfaces as Error::Containment, got {err:?}"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_sigkilled();
 }
 
 /// A reap that FAILS during teardown must leave a trace in a release build, where the
@@ -160,9 +254,10 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
     let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
     for (marker, force_arm) in markers.into_iter().zip(force_arms) {
         let mark = crate::log_capture::mark();
+        let (mut cmd, teardown) = teardown_blocker();
         force_arm(true);
         set_failure(marker);
-        let outcome = std::panic::catch_unwind(|| blocker().spawn().err());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.spawn().err()));
         force_arm(false);
         assert_eq!(
             take_failure(),
@@ -183,6 +278,7 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
             "{marker}: a failed teardown step must be logged"
         );
         fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+        teardown.assert_sigkilled();
     }
 }
 
