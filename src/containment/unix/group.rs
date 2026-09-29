@@ -409,24 +409,20 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// even if the pid number is reused by something else in between — no gap remains, unlike
 /// `check_or_signal`'s plain-`kill(2)` path.
 ///
-/// **Falls back to `check_or_signal`'s plain `kill(2)` on `Error::Unsupported` OR
-/// `Error::Io`, not `Reached::Unknown`.** `open_verified` returns `Unsupported` when
-/// `pidfd_open` answers `ENOSYS` — kernel < 5.3, or a seccomp/sandbox policy blocking the
-/// syscall entirely. It returns `Error::Io` for every OTHER `pidfd_open`/`poll` failure —
-/// which, in the same seccomp/sandbox case, is exactly what a policy that returns `EPERM`
-/// (rather than `ENOSYS`) on the blocked syscall produces instead (verified against
-/// `open_verified`'s own match arms in `src/wait/linux.rs`: only `Errno::NOSYS` maps to
-/// `Unsupported`; every other errno, including `EPERM`, falls into the generic `Error::Io`
-/// arm). A seccomp profile is free to pick either errno for a denied syscall, so treating only
-/// `Unsupported` as fallback-eligible silently reclassifies "we couldn't even ask" as
-/// `Reached::Unknown` on exactly the containers this fallback exists for (a seccomp-restricted
-/// container, e.g. Docker's default profile). Both variants get the SAME
-/// treatment: fall back to `check_or_signal`'s plain `kill(2)`, which observes envelopes IT
-/// controls directly rather than trusting `open_verified`'s errno classification a second
-/// time. Only `Error::Unassessable` — identity genuinely denied by `id.exists()`, or the pid
-/// overflows the pidfd interface — stays `Reached::Unknown`: that is a statement about the
-/// PID's identity, not about whether the kernel can open a pidfd at all, and no fallback
-/// resolves it.
+/// **How `open_verified`'s answers map here.**
+/// - `Ok(None)` (already gone) is `Reached::Yes`. That includes a reaped process-group leader
+///   (`pidfd_open` `EINVAL`/`ENOENT`, then `id.exists()` says `Gone`) and a ptraced zombie thread.
+/// - `Error::Unsupported` (`pidfd_open` answered `ENOSYS`: kernel < 5.3, or a seccomp policy
+///   blocking the syscall) and `Error::Io` (every other `pidfd_open` or `poll` failure, such as
+///   the `EPERM` a seccomp profile may return instead) fall back to `check_or_signal`'s plain
+///   `kill(2)`. "We couldn't even ask" must not become `Reached::Unknown` on the containers this
+///   fallback exists for; `kill(2)` observes envelopes this module controls directly.
+/// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
+///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
+///   that owns it, which is not the member that was listed.
+/// - `Error::Unassessable` (identity denied by `id.exists()` or `id.is_alive()`, or the pid
+///   overflows the pidfd interface) is `Reached::Unknown`: a statement about the pid's identity,
+///   not about whether the kernel can open a pidfd, which no fallback resolves.
 ///
 /// **Why this never signals via the already-open pidfd when `id.exists()` answers `Unknown`
 /// inside `open_verified`.** This looks tempting — `pidfd_open` already succeeded, so
@@ -479,8 +475,15 @@ fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId) ->
             );
             check_or_signal(pid, id, Some(Signal::SIGKILL))
         }
-        // Only `Error::Unassessable` reaches here: identity genuinely denied by `id.exists()`,
-        // or the pid overflows the pidfd interface — a statement about the PID itself, which
+        Err(e @ crate::error::Error::NotThreadGroupLeader { .. }) => {
+            log::warn!(
+                "containment::unix::group: pid {} is a live thread, not a thread-group leader, so it \
+                 is not signalled: {e}",
+                id.pid()
+            );
+            Reached::Unknown
+        }
+        // `Error::Unassessable`, or a variant added later: a statement about the PID itself, which
         // no kill(2) fallback resolves. Conservative, not a guess.
         Err(e) => {
             log::warn!("containment::unix::group: open_verified for pid {}: {e}", id.pid());

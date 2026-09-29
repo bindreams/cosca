@@ -154,6 +154,17 @@ pub enum Error {
         #[source]
         source: Option<std::io::Error>,
     },
+    /// The pid names a live thread that is not its process's thread-group leader, so it is not
+    /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
+    /// Not "gone": the thread is running. `source` is the OS error that refused it; compare
+    /// [`raw_os_error`](std::io::Error::raw_os_error), not the message.
+    #[error("pid {pid} names a live thread, not a thread-group leader; {detail}")]
+    NotThreadGroupLeader {
+        pid: u32,
+        detail: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// A persisted process identity could not be produced or restored — see
     /// [`RecordErrorKind`] for why. `source` carries the OS error when the failure was a
     /// failed read of this host's boot session rather than a rejected record.

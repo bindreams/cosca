@@ -342,3 +342,43 @@ fn pid1_uid() -> u32 {
 fn pid1_uid() -> u32 {
     0
 }
+
+/// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
+/// never sent to the `kill(2)` fallback (a `kill` on a tid signals its whole thread group). The
+/// `pid` argument is a disposable child, so a regression that fell back would land on it, never on
+/// this test process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
+    use crate::containment::cgroup::test_support::{block_on, fork_running};
+
+    crate::log_capture::install();
+    let _guard = crate::child::spawn::spawn_lock();
+    let (gate_r, gate_w) = std::io::pipe().expect("pipe");
+    let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
+    let child = fork_running(|| block_on(gate_r_fd));
+
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        // SAFETY: SYS_gettid takes no arguments and always succeeds.
+        tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) } as u32).unwrap();
+        let _ = stop_rx.recv();
+    });
+    let tid = tid_rx.recv().unwrap();
+    let id = ProcessId::of(tid).found().expect("the live worker's tid resolves");
+    let mark = crate::log_capture::mark();
+
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
+    let reached = super::check_or_signal_linux_sigkill(child.pid(), id);
+    drop(forced);
+
+    assert!(matches!(reached, super::Reached::Unknown), "got {reached:?}");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, &format!("pid {tid} is a live thread, not a thread-group leader")),
+        vec![log::Level::Warn]
+    );
+    let _ = stop_tx.send(());
+    worker.join().unwrap();
+    drop(gate_w);
+}
