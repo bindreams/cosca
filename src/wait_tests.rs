@@ -1,6 +1,6 @@
 use super::{
-    ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, remaining,
-    remaining_override_seam, rearm_until, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
+    ceil_millis, clears_tokio_timer_margin, deadline_at, deadline_from, instant_near_ceiling, rearm_until, remaining,
+    remaining_override_seam, test_clock, wait_clamp_seam, wait_ms_probe, win32_timeout_ms, TOKIO_TIMER_ROUNDING_MARGIN,
 };
 use std::time::{Duration, Instant};
 
