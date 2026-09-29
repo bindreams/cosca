@@ -17,6 +17,10 @@ env:
   # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
   # something as root opt out (principles 9 and 10).
   COSCA_TEST_ROOT: "0"
+  # One place for values several jobs share. `.config/nextest.toml` requires the same nextest.
+  NEXTEST_VERSION: "0.9.137"
+  # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`.
+  PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
 
 jobs:
   lint:
@@ -36,7 +40,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.137
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
@@ -124,7 +128,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.137
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -321,3 +325,149 @@ jobs:
           sudo -E "$BIN" --ignored --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
           cat "$RUNNER_TEMP/setuid-root.log"
           grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"
+
+  # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
+  # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest
+  # archive in a container, so it needs no toolchain. Before nextest, `root-lane-check.sh` fails the
+  # lane unless its EXPECT_* privilege state holds.
+  #
+  # What each lane adds:
+  #   root:           the base case.
+  #   unshare -r:     root in a fresh user namespace, which holds `CAP_DAC_READ_SEARCH`.
+  #   DAC_READ_SEARCH: root with that capability added directly.
+  #   foreign TMPDIR: an ambient `TMPDIR` the dropped identity cannot search.
+  #   uid 1000:       not root, `CAP_DAC_OVERRIDE` ambient. The exec-child test runs (its
+  #                   precondition is a DAC bypass, not uid 0), but a non-root `execve` regains
+  #                   nothing, so only the root lanes catch a deleted `no_new_privs`.
+  # Capability masks: `CAP_DAC_OVERRIDE` is 0x2, `CAP_DAC_READ_SEARCH` is 0x4.
+  resolve_root_lanes:
+    name: Root lane (${{ matrix.lane }})
+    runs-on: ubuntu-24.04 # matches the `ubuntu:24.04` run image's glibc
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: root
+            docker_flags: ""
+            prefix: ""
+            expect_uid: "0"
+            expect_capeff_has: "0x2"
+            expect_capeff_lacks: "0x4"
+            expect_capamb: "0x0"
+          - lane: root, unshare -r
+            docker_flags: "--cap-add SYS_ADMIN" # `unshare -r` needs it
+            prefix: "unshare -r "
+            expect_uid: "0"
+            expect_capeff_has: "0x6"
+            expect_capeff_lacks: "0x0"
+            expect_capamb: "0x0"
+            expect_userns: "1"
+          - lane: root, DAC_READ_SEARCH
+            docker_flags: "--cap-add DAC_READ_SEARCH"
+            prefix: ""
+            expect_uid: "0"
+            expect_capeff_has: "0x6"
+            expect_capeff_lacks: "0x0"
+            expect_capamb: "0x0"
+          - lane: root, foreign TMPDIR
+            docker_flags: ""
+            prefix: ""
+            expect_uid: "0"
+            expect_capeff_has: "0x2"
+            expect_capeff_lacks: "0x4"
+            expect_capamb: "0x0"
+            foreign_tmpdir: "true"
+          - lane: uid 1000, CAP_DAC_OVERRIDE ambient
+            docker_flags: ""
+            prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
+            expect_uid: "1000"
+            expect_capeff_has: "0x2"
+            expect_capeff_lacks: "0x4"
+            expect_capamb: "0x2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Archive the privilege tests
+        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane.tar.zst"
+
+      # The container is the sandbox, so consent is given here.
+      - name: Run lane
+        run: |
+          set -euxo pipefail
+          docker run --rm --network none ${{ matrix.docker_flags }} \
+            -v "$PWD":/repo:ro \
+            -v "$RUNNER_TEMP":/artifacts:ro \
+            -v "$(command -v cargo-nextest)":/usr/local/bin/cargo-nextest:ro \
+            -e COSCA_TEST_ROOT=1 \
+            -e COSCA_TEST_ROOT_CONSENT=1 \
+            -e PRIVILEGE_TESTS \
+            -e FOREIGN_TMPDIR="${{ matrix.foreign_tmpdir }}" \
+            -e PREFIX="${{ matrix.prefix }}" \
+            -e EXPECT_UID="${{ matrix.expect_uid }}" \
+            -e EXPECT_CAPEFF_HAS="${{ matrix.expect_capeff_has }}" \
+            -e EXPECT_CAPEFF_LACKS="${{ matrix.expect_capeff_lacks }}" \
+            -e EXPECT_CAPAMB="${{ matrix.expect_capamb }}" \
+            -e EXPECT_USERNS="${{ matrix.expect_userns }}" \
+            ubuntu:24.04 \
+            bash /repo/.github/scripts/root-lane.sh
+
+  # Root on macOS, where a fixture drops by changing uid and re-execs a copy of the test binary.
+  # No container on macOS runners, so this runs under `sudo`.
+  resolve_root_lane_macos:
+    name: Root lane (macOS, sudo -E)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Archive the privilege tests
+        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane-macos.tar.zst"
+
+      # Two directories:
+      # - `TMPDIR`, root-owned 0755. The ambient `TMPDIR` must be searchable by uid 65534, which
+      #   the runner user's own per-app `TMPDIR` is not. It is not writable by 65534 either, so a
+      #   fixture that ignores its scratch directory fails.
+      # - nextest's extraction directory, root-owned 0700. The test binary then sits somewhere uid
+      #   65534 cannot enter, so a fixture passes only if the driver re-execs a copy of it.
+      - name: Create root-owned scratch and extraction directories
+        run: |
+          set -euxo pipefail
+          COSCA_ROOT_TMPDIR="$(sudo mktemp -d /tmp/cosca-root-scratch.XXXXXX)"
+          sudo chown root:wheel "$COSCA_ROOT_TMPDIR"
+          sudo chmod 0755 "$COSCA_ROOT_TMPDIR"
+          COSCA_EXTRACT_DIR="$(sudo mktemp -d /tmp/cosca-root-extract.XXXXXX)"
+          sudo chown root:wheel "$COSCA_EXTRACT_DIR"
+          sudo chmod 0700 "$COSCA_EXTRACT_DIR"
+          {
+            echo "COSCA_EXTRACT_DIR=$COSCA_EXTRACT_DIR"
+            echo "TMPDIR=$COSCA_ROOT_TMPDIR"
+          } >> "$GITHUB_ENV"
+
+      # `sudo -E` keeps `TMPDIR`; the runner is ephemeral and single-tenant, so consent is given
+      # here. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned.
+      - name: Run root lane (macOS)
+        env:
+          COSCA_TEST_ROOT: "1"
+          COSCA_TEST_ROOT_CONSENT: "1"
+        run: |
+          set -euxo pipefail
+          sudo -E bash -euxc '
+            test "$(id -u)" = 0
+            test "$(stat -f %u "$TMPDIR")" = 0
+            exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"

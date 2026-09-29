@@ -2,24 +2,45 @@
 //! control), so a fixture that needs an `EACCES` precondition can rely on it for every caller,
 //! root included.
 
-/// Whether the tests that only mean something as root run: the `COSCA_TEST_ROOT` group of
-/// principles 9 and 10. On unless `COSCA_TEST_ROOT=0`. An enabled group fails, rather than
-/// skips, when the caller is not root or has not given `COSCA_TEST_ROOT_CONSENT=1`. CI's ordinary
-/// jobs opt out; the root jobs (#218) do not.
+/// Whether the tests that only mean something with a DAC bypass run: the `COSCA_TEST_ROOT` group of
+/// `docs/principles.md`'s "Tests fail loudly and never silently skip" and "System-affecting tests
+/// run in a sandbox" sections. On unless `COSCA_TEST_ROOT=0`. An enabled group fails, rather than
+/// skips, when the caller has no DAC bypass (see [`holds_dac_bypass`]) or has not given
+/// `COSCA_TEST_ROOT_CONSENT=1`. CI's ordinary jobs opt out; the root jobs (#218) do not.
 pub(crate) fn root_tests_enabled() -> bool {
     if std::env::var("COSCA_TEST_ROOT").is_ok_and(|v| v == "0") {
         return false;
     }
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
     assert!(
-        unsafe { libc::geteuid() } == 0,
-        "the root tests need root: run the suite as root in a sandbox, or set COSCA_TEST_ROOT=0 to opt out"
+        holds_dac_bypass(),
+        "the root tests need a DAC bypass (CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH effective on Linux, uid 0 elsewhere): \
+         run the suite as root or with that capability in a sandbox, or set COSCA_TEST_ROOT=0 to opt out"
     );
     assert!(
         std::env::var("COSCA_TEST_ROOT_CONSENT").is_ok_and(|v| v == "1"),
         "the root tests run as root: set COSCA_TEST_ROOT_CONSENT=1 (in a sandbox) or COSCA_TEST_ROOT=0"
     );
     true
+}
+
+/// Whether this thread can bypass DAC: an effective DAC capability on Linux, so a non-root caller
+/// holding one (ambient, say) qualifies and a root caller without one does not; uid 0 elsewhere.
+fn holds_dac_bypass() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::thread::capabilities(None).is_ok_and(|sets| bypasses_dac(sets.effective))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bypasses_dac(effective: rustix::thread::CapabilitySet) -> bool {
+    use rustix::thread::CapabilitySet;
+    effective.intersects(CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH)
 }
 
 /// Makes `cmd`'s child give up DAC bypass in its own `pre_exec`, after `fork` and before `exec`.
@@ -91,3 +112,7 @@ fn drop_dac_bypass() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "test_privilege_tests.rs"]
+mod test_privilege_tests;
