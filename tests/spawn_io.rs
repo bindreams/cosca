@@ -1852,7 +1852,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
             .expect("the spawning thread")
     });
     if deny_pidfd {
-        match spawned.err().expect("a spawn without a pidfd must fail") {
+        match spawned.expect_err("a spawn without a pidfd must fail") {
             cosca::error::Error::Unsupported { op, .. } => assert_eq!(op, "spawn adoption"),
             other => panic!("slots {slots:?}: expected Unsupported, got {other:?}"),
         }
