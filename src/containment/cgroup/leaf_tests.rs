@@ -3344,45 +3344,28 @@ fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
 
-/// An occupied leaf whose child genuinely IS a leaf member (placed for real, same as the
-/// `..._unreadable_membership_fails_closed` twin above) must still fail closed — never read as
-/// "in the leaf" — once this process's own `/proc` view is DIVERGED: `holds` refuses to answer
-/// `Ok(true)` off a `/proc/{pid}` that may belong to another pid namespace, the same
-/// `Err`/fail-closed path an unreadable membership already takes.
+/// A real leaf member must not read as "in the leaf" when the `/proc` view is not `Same`: `holds`
+/// errors naming the view, so the verdict fails closed and the child is killed.
 ///
-/// Mutant: "read /proc/{pid}/cgroup without the view check" — dropping `holds`'s `proc_view`
-/// gate and reading `/proc/{pid}/cgroup` unconditionally would read the child's REAL (in-leaf)
-/// membership here and answer `Ok(true)`, marking the spawn entered on a namespace the caller
-/// cannot trust.
+/// Mutant: `holds` reads `/proc/{pid}/cgroup` without the view check.
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
-fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fault::ForcedView, cause: &str) {
+    use std::os::unix::process::ExitStatusExt;
 
+    use crate::containment::cgroup::test_support::occupied_leaf;
     use crate::containment::TreeDrain;
 
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the child's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("300").process_group(0);
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut child = cmd.spawn().expect("spawn the child");
-
+    let (mut leaf, mut child, _own) = occupied_leaf();
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_leaf_busy(true);
-    let forced_view =
-        crate::identity::proc_view_fault::force_proc_view_once(crate::identity::proc_view_fault::ForcedView::Diverged);
+    let forced_view = crate::identity::proc_view_fault::force_proc_view_once(view);
     let err = match leaf.take_placement(child.id()) {
         Err(e) => e,
-        Ok(verdict) => panic!("a diverged proc_view must fail closed, got {verdict:?}"),
+        Ok(verdict) => panic!("{view:?} must fail closed, got {verdict:?}"),
     };
     drop(forced_view);
     assert!(
@@ -3391,11 +3374,8 @@ fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
     );
     assert!(matches!(err, crate::error::Error::Containment { .. }), "got {err:?}");
     assert!(err.to_string().contains("could not be read"), "got {err}");
-    assert!(
-        err.to_string().contains("outer pid namespace"),
-        "the view must be named: {err}"
-    );
-    assert!(!leaf.entered, "a diverged view must never leave `entered` true");
+    assert!(err.to_string().contains(cause), "the view must be named: {err}");
+    assert!(!leaf.entered, "{view:?} must never leave `entered` true");
 
     assert_eq!(
         child.wait().expect("reap the child").signal(),
@@ -3405,62 +3385,24 @@ fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
     assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
 
-/// Twin of the test above for an UNASSESSABLE `proc_view` — the OS refused the query, or
-/// `/proc` could not be read at all. The same "never answer `Ok(true)` without a trustworthy
-/// view" rule applies; `Unassessable` is not `Same` any more than `Diverged` is.
-///
-/// Mutant: "read /proc/{pid}/cgroup without the view check" (same as the `Diverged` twin
-/// above).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
+fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
+    assert_a_non_same_proc_view_fails_closed(
+        crate::identity::proc_view_fault::ForcedView::Diverged,
+        "outer pid namespace",
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
-    use crate::containment::TreeDrain;
-
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "requires COSCA_TEST_CGROUP and a delegated cgroup"
-    );
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the child's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("300").process_group(0);
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut child = cmd.spawn().expect("spawn the child");
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    crate::containment::cgroup::fault::set_force_leaf_busy(true);
-    let forced_view = crate::identity::proc_view_fault::force_proc_view_once(
+    assert_a_non_same_proc_view_fails_closed(
         crate::identity::proc_view_fault::ForcedView::Unassessable,
+        "could not be established",
     );
-    let err = match leaf.take_placement(child.id()) {
-        Err(e) => e,
-        Ok(verdict) => panic!("an unassessable proc_view must fail closed, got {verdict:?}"),
-    };
-    drop(forced_view);
-    assert!(
-        !crate::containment::cgroup::fault::take_force_leaf_busy(),
-        "the seam must be consumed by decide_unwaitable"
-    );
-    assert!(matches!(err, crate::error::Error::Containment { .. }), "got {err:?}");
-    assert!(err.to_string().contains("could not be read"), "got {err}");
-    assert!(
-        err.to_string().contains("forced by a test"),
-        "the cause must be named: {err}"
-    );
-    assert!(!leaf.entered, "an unassessable view must never leave `entered` true");
-
-    assert_eq!(
-        child.wait().expect("reap the child").signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed"
-    );
-    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
 
 /// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,

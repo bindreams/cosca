@@ -138,3 +138,9 @@ pub(crate) fn mount_tmpfs(target: &Path) {
     )
     .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
 }
+
+/// Make `root` this process's `/` (and its working directory), so `/proc` is absent.
+pub(crate) fn chroot_into(root: &Path) {
+    rustix::process::chroot(root).unwrap_or_else(|e| panic!("chroot {}: {e}", root.display()));
+    std::env::set_current_dir("/").expect("chdir /");
+}

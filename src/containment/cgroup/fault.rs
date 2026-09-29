@@ -23,7 +23,6 @@ thread_local! {
     static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
     static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
     static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
-    static BETWEEN_VIEW_AND_MEMBERSHIP_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -277,30 +276,6 @@ pub(crate) fn take_force_membership_unreadable() -> bool {
 }
 pub(crate) fn membership_unreadable_armed() -> bool {
     FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.get())
-}
-
-/// Clears the hook set by [`between_view_and_membership_read`] on drop, consumed or not.
-#[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
-pub(crate) struct BetweenViewAndMembershipRead(());
-
-/// Run `hook` once on THIS thread, after `holds` has checked that `/proc` is this process's own
-/// namespace's and before it reads `{pid}/cgroup`: the window in which a `/proc` looked up by path
-/// could differ from the one that was checked.
-pub(crate) fn between_view_and_membership_read(hook: impl FnOnce() + 'static) -> BetweenViewAndMembershipRead {
-    BETWEEN_VIEW_AND_MEMBERSHIP_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    BetweenViewAndMembershipRead(())
-}
-
-impl Drop for BetweenViewAndMembershipRead {
-    fn drop(&mut self) {
-        BETWEEN_VIEW_AND_MEMBERSHIP_READ.with(|h| h.borrow_mut().take());
-    }
-}
-
-pub(crate) fn run_between_view_and_membership_read() {
-    if let Some(hook) = BETWEEN_VIEW_AND_MEMBERSHIP_READ.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
 }
 
 /// Make the NEXT placement write return `ret` without writing — 0, which no file a test can open
