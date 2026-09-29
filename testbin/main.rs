@@ -8,11 +8,13 @@ use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
 
-/// The accept handshake (see the module doc).
-// Also loaded by `accept` below, which includes `tests/common/accept.rs` and so this file.
-#[cfg_attr(windows, allow(clippy::duplicate_mod))]
+/// The accept handshake (see the module doc). On Windows `accept` below includes it, so it is
+/// declared once, there.
+#[cfg(not(windows))]
 #[path = "ack.rs"]
 mod ack;
+#[cfg(windows)]
+use accept::ack;
 
 /// The `report-console-identity` mode, shared verbatim with the GUI-subsystem fixture.
 #[cfg(windows)]
