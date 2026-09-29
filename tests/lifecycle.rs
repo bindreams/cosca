@@ -136,9 +136,10 @@ fn nested_member_kill_tree_is_unsupported_end_to_end() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "report-nested-kill-tree", &addr])
+        .env(common::ACK_ENV, "1")
         .contain();
-    let child = cmd.spawn().expect("spawn reporter");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn reporter");
+    let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read report");
     assert_eq!(

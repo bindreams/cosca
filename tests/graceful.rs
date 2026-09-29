@@ -554,9 +554,10 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
     let mut cmd = cosca::Command::new();
     cmd.executable(common::testbin())
         .args(["cosca_testbin", "report-nested-terminate", &addr])
+        .env(common::ACK_ENV, "1")
         .contain();
-    let child = cmd.spawn().expect("spawn reporter");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn reporter");
+    let mut sock = common::accept_or_die(&listener, &mut child);
     let mut r = String::new();
     sock.read_to_string(&mut r).expect("read report");
 

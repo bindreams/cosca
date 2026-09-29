@@ -95,8 +95,9 @@ fn probe(backend: Backend, intent: Intent) -> String {
                     cmd.detached();
                 }
             }
-            let child = cmd.spawn().expect("spawn creation-flag probe child");
-            let (sock, _) = listener.accept().expect("accept report socket");
+            cmd.env(common::ACK_ENV, "1");
+            let mut child = cmd.spawn().expect("spawn creation-flag probe child");
+            let sock = common::accept_or_die(&listener, &mut child);
             let report = read_report_line(&sock);
             drop(sock);
             let _ = child.kill();
@@ -110,6 +111,10 @@ fn probe(backend: Backend, intent: Intent) -> String {
                 .build()
                 .expect("build a current-thread runtime");
             rt.block_on(async {
+                listener
+                    .set_nonblocking(true)
+                    .expect("set the listener nonblocking for tokio");
+                let listener = ::tokio::net::TcpListener::from_std(listener).expect("wrap the listener for tokio");
                 let mut cmd = cosca::tokio::Command::new();
                 cmd.args(&argv);
                 if backend.is_raw() {
@@ -124,8 +129,9 @@ fn probe(backend: Backend, intent: Intent) -> String {
                         cmd.detached();
                     }
                 }
+                cmd.env(common::ACK_ENV, "1");
                 let mut child = cmd.spawn().expect("spawn async creation-flag probe child");
-                let (sock, _) = listener.accept().expect("accept report socket");
+                let sock = common::accept_or_die_async(&listener, &mut child).await;
                 let report = read_report_line(&sock);
                 drop(sock);
                 let _ = child.kill();
@@ -270,12 +276,15 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
 
     let spawn_one = |hidden: bool| -> (cosca::Child, TcpStream) {
         let mut cmd = cosca::Command::new();
-        cmd.executable(testbin()).args(report_argv(&addr, &me)).contain();
+        cmd.executable(testbin())
+            .args(report_argv(&addr, &me))
+            .env(common::ACK_ENV, "1")
+            .contain();
         if hidden {
             cmd.no_window();
         }
-        let child = cmd.spawn().expect("spawn contained raw-backend child");
-        let (sock, _) = listener.accept().expect("accept");
+        let mut child = cmd.spawn().expect("spawn contained raw-backend child");
+        let sock = common::accept_or_die(&listener, &mut child);
         let report = read_report_line(&sock);
         assert_eq!(
             report_field(&report, "argv0"),
@@ -311,18 +320,25 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
 async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend() {
     use cosca::GracefulMechanism;
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, addr) = common::bind_async_listener();
     let me = std::process::id().to_string();
 
-    let spawn_one = |hidden: bool| -> (cosca::tokio::Child, TcpStream) {
+    async fn spawn_one(
+        listener: &::tokio::net::TcpListener,
+        addr: &str,
+        me: &str,
+        hidden: bool,
+    ) -> (cosca::tokio::Child, TcpStream) {
         let mut cmd = cosca::tokio::Command::new();
-        cmd.executable(testbin()).args(report_argv(&addr, &me)).contain();
+        cmd.executable(testbin())
+            .args(report_argv(addr, me))
+            .env(common::ACK_ENV, "1")
+            .contain();
         if hidden {
             cmd.no_window();
         }
-        let child = cmd.spawn().expect("spawn contained async raw-backend child");
-        let (sock, _) = listener.accept().expect("accept");
+        let mut child = cmd.spawn().expect("spawn contained async raw-backend child");
+        let sock = common::accept_or_die_async(listener, &mut child).await;
         let report = read_report_line(&sock);
         assert_eq!(
             report_field(&report, "argv0"),
@@ -330,11 +346,11 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
             "this leg must have reached the raw backend: {report}"
         );
         (child, sock)
-    };
+    }
 
-    let (plain, plain_sock) = spawn_one(false);
+    let (plain, plain_sock) = spawn_one(&listener, &addr, &me, false).await;
     assert_eq!(plain.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    let (hidden, hidden_sock) = spawn_one(true);
+    let (hidden, hidden_sock) = spawn_one(&listener, &addr, &me, true).await;
     assert_eq!(
         hidden.graceful_mechanism(),
         GracefulMechanism::OtherConsoleGroup,

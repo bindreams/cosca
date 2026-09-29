@@ -27,12 +27,13 @@ fn breakaway_report(shape: &str, vehicle: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = std::process::Command::new(testbin());
-    cmd.args(["report-breakaway", addr.as_str(), shape, vehicle]);
+    cmd.args(["report-breakaway", addr.as_str(), shape, vehicle])
+        .env(common::ACK_ENV, "1");
     let mut helper = {
         let _guard = cosca::test_spawn_lock();
         cmd.spawn().expect("spawn breakaway helper")
     };
-    let (sock, _) = listener.accept().expect("accept report socket");
+    let sock = common::accept_or_die(&listener, &mut helper);
     let report = read_report_line(&sock);
     drop(sock);
     helper.wait().expect("reap breakaway helper");
@@ -179,4 +180,34 @@ fn a_forbidding_job_yields_a_typed_containment_error_via_the_raw_backend() {
     let r = breakaway_report("forbid", "exec");
     assert_eq!(report_field(&r, "limits"), "none", "wrong job shape: {r}");
     assert_eq!(report_field(&r, "spawn"), "Containment", "{r}");
+}
+
+/// Regression test for `common::accept_or_die`'s reason to exist: a dead-before-connecting
+/// target must panic, not hang the caller forever — and specifically on the "died" message, not
+/// merely on ANY panic. Its own file, not `windows_breakaway.rs`'s topic, but this is the one
+/// Windows-only, raw-`std::process::Command` file already carrying exactly the imports needed.
+#[test]
+fn accept_or_die_panics_loudly_when_the_target_dies_first() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut child = {
+        let _guard = cosca::test_spawn_lock();
+        std::process::Command::new(testbin())
+            .args(["--not-a-real-mode"]) // testbin exits immediately on an unknown mode
+            .spawn()
+            .expect("spawn a child that exits immediately")
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        common::accept_or_die(&listener, &mut child)
+    }));
+    let payload = result.expect_err("accept_or_die must panic, not hang, when the target dies before connecting");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    assert!(
+        message.contains("died before it connected"),
+        "expected a \"died before it connected\" panic, got: {message:?}"
+    );
+    child.wait().expect("reap the already-exited child");
 }

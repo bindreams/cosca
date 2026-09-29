@@ -205,3 +205,27 @@ pub(crate) fn notify_armed() {
         ARMED_HOOK.with(|h| *h.borrow_mut() = Some(hook));
     }
 }
+
+/// Accepts `n` connections from a tree rooted at `target`, in arrival order (the tag, if any, is
+/// `on_accept`'s to read and demux). Every accept watches `target` through [`accept_or_die`].
+///
+/// Every accepted socket is HELD (returned, never dropped) until all `n` have arrived: testbin's
+/// `control-*` modes exit when their socket closes, so a dropped member would make the watched
+/// root exit and be correctly reported. The same rule binds any caller doing its own accepts.
+///
+/// `on_accept` runs on each socket right after it is accepted, before the next accept, so a caller
+/// can demux by tag inline.
+pub fn accept_tree(
+    listener: &TcpListener,
+    target: &mut impl Target,
+    n: usize,
+    mut on_accept: impl FnMut(&mut TcpStream),
+) -> Vec<TcpStream> {
+    let mut socks: Vec<TcpStream> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut s = accept_or_die(listener, target);
+        on_accept(&mut s);
+        socks.push(s);
+    }
+    socks
+}

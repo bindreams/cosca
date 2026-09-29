@@ -533,3 +533,58 @@ fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
         "got: {message:?}"
     );
 }
+
+/// `accept_tree` must fail promptly when the first member to connect is the grandchild and the
+/// root then dies before ever connecting. Every accept has to keep watching the ROOT, not a
+/// connected peer's socket: the peer is healthy and silent.
+///
+/// The root is alive (`sleep-marker`, never touches the network) throughout the first accept, so
+/// it can only resolve through the grandchild's connection. The armed hook, which runs once a
+/// later accept's watch is in place, then kills the root: the exit is observed after arming.
+#[cfg(unix)]
+#[test]
+fn accept_tree_panics_when_the_root_dies_before_connecting_after_another_member_already_did() {
+    use std::cell::Cell;
+    use std::net::TcpListener;
+    use std::rc::Rc;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+
+    // Plays "the grandchild": connects, tags 'G', and blocks, alive and silent for the whole test.
+    let mut grandchild = std::process::Command::new(common::testbin())
+        .args(["control-block", &addr, "G"])
+        .env(common::ACK_ENV, "1")
+        .spawn()
+        .expect("spawn the grandchild");
+    // Plays "the root": alive, but never connects.
+    let mut root = std::process::Command::new(common::testbin())
+        .args(["sleep-marker"])
+        .spawn()
+        .expect("spawn a root that stays alive without ever connecting");
+    let root_pid = root.id();
+
+    let member_connected = Rc::new(Cell::new(false));
+    let (in_hook, in_accept) = (member_connected.clone(), member_connected.clone());
+    let message = common::with_armed_hook(
+        move || {
+            if in_hook.get() {
+                // SAFETY: `root_pid` is our own unreaped child.
+                assert_eq!(unsafe { libc::kill(root_pid as libc::pid_t, libc::SIGKILL) }, 0);
+            }
+        },
+        || {
+            panic_message_of(|| {
+                common::accept_tree(&listener, &mut root, 2, |s| {
+                    let mut tag = [0u8; 1];
+                    s.read_exact(&mut tag).expect("read tag");
+                    assert_eq!(&tag, b"G", "the root never connects in this scenario");
+                    in_accept.set(true);
+                })
+            })
+        },
+    );
+    root.wait().expect("reap the root");
+    grandchild.kill().expect("kill the grandchild");
+    grandchild.wait().expect("reap the grandchild");
+    assert_died_before_connecting(&message, root_pid);
+}

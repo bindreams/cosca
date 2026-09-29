@@ -29,14 +29,19 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
                 crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
             ])
             .env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
+            .env(crate::test_child::ack::ACK_ENV, "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the rendezvous fixture")
     };
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let target = crate::Process::from_pid(pid)
+        .found()
+        .expect("resolve the freshly spawned fixture's pid")
+        .id();
 
-    let (mut sock, _) = listener.accept().expect("accept the fixture's rendezvous connection");
+    let mut sock = crate::test_child::accept_or_die(&listener, target);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read the fixture's readiness tag");
 

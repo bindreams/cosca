@@ -65,25 +65,29 @@ impl Member {
 fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let child = cosca::Command::new()
+    let mut child = cosca::Command::new()
         .executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
+        .env(common::ACK_ENV, "1")
         .contain_with(mode)
         .spawn()
         .expect("spawn the orphan tree");
 
-    let mut root = None;
-    let mut grand = None;
-    for _ in 0..2 {
-        let (s, _) = listener.accept().expect("accept");
+    let mut lines = Vec::new();
+    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
             .expect("read tag+pid");
+        lines.push(line);
+    });
+    let mut root = None;
+    let mut grand = None;
+    for (line, sock) in lines.into_iter().zip(socks) {
         let (tag, pid) = line.trim().split_at(1);
         let m = Member {
             pid: pid.parse().expect("member pid"),
-            sock: s,
+            sock,
         };
         match tag {
             "R" => root = Some(m),
@@ -193,19 +197,19 @@ fn dropping_a_marked_child_kills_the_reparented_orphan() {
 /// check, since the marker would still be created — only the ability to actually REACH and
 /// kill the reparented orphan depends on the restructuring being right.
 #[cfg(feature = "tokio")]
-fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Member, Member) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
+async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Member, Member) {
+    let (listener, addr) = common::bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
+        .env(common::ACK_ENV, "1")
         .contain_with(mode);
-    let child = cmd.spawn().expect("spawn the orphan tree (tokio)");
+    let mut child = cmd.spawn().expect("spawn the orphan tree (tokio)");
 
     let mut root = None;
     let mut grand = None;
     for _ in 0..2 {
-        let (s, _) = listener.accept().expect("accept");
+        let s = common::accept_or_die_async(&listener, &mut child).await;
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
@@ -227,7 +231,7 @@ fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Me
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_spawn() {
-    let (mut child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest);
+    let (mut child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest).await;
     assert_escaped(child.id().pid(), grand.pid);
     child.kill_tree().expect("kill_tree");
     grand.assert_dead("the reparented setsid orphan (tokio spawn path)");
@@ -260,26 +264,30 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
+        .env(common::ACK_ENV, "1")
         .contain_with(cosca::ContainMode::TreeWalk);
     for slot in 64..=90 {
         cmd.fd(slot, cosca::Stdio::null()).expect("map a real child fd");
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .expect("spawn the orphan tree with a wide reserved-fd range");
 
-    let mut root = None;
-    let mut grand = None;
-    for _ in 0..2 {
-        let (s, _) = listener.accept().expect("accept");
+    let mut lines = Vec::new();
+    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
             .expect("read tag+pid");
+        lines.push(line);
+    });
+    let mut root = None;
+    let mut grand = None;
+    for (line, sock) in lines.into_iter().zip(socks) {
         let (tag, pid) = line.trim().split_at(1);
         let m = Member {
             pid: pid.parse().expect("member pid"),
-            sock: s,
+            sock,
         };
         match tag {
             "R" => root = Some(m),
@@ -311,9 +319,10 @@ fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let child = cosca::Command::new()
+    let mut child = cosca::Command::new()
         .executable(testbin())
         .args(["cosca_testbin", "control-block-mixed-cloexec-marker", &addr, "R"])
+        .env(common::ACK_ENV, "1")
         .contain()
         .spawn()
         .expect("spawn the mixed-cloexec holder");
@@ -321,7 +330,7 @@ fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
         .test_fdmarker_fd()
         .expect("Strongest containment on macOS must install an fd marker");
 
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     writeln!(sock, "{marker_fd}").expect("send the marker fd to the testbin child");
