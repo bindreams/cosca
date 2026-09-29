@@ -31,6 +31,10 @@
 # lacks the item it warns "does not refer to a reachable function", which `allow-invalid`
 # suppresses.
 #
+# These bans guard against accidental calls, not deliberate ones. A function declared locally in an
+# `extern` block (`extern "C" { fn chdir(..) }`, or ntdll's `RtlSetCurrentDirectory_U`) is a new item
+# at no listed path, so clippy cannot see it; code review covers it.
+#
 # .github/scripts/check-disallowed-methods.sh requires every path below to have a call in
 # .github/fixtures/disallowed-methods that fires on each target that has the item.
 disallowed-methods = [
