@@ -261,3 +261,204 @@ fn rearm_until_stops_at_a_round_error() {
     assert_eq!(out, Err("boom"));
     assert_eq!(rounds, 2);
 }
+
+// RoundCheck =====
+
+/// Two rounds with no advance between them, under a frozen clock, are a stalled re-arm.
+///
+/// Mutant: drop the check in `RoundCheck::round` -> no panic.
+#[test]
+#[should_panic(expected = "no progress")]
+fn round_check_panics_on_two_rounds_without_an_advance() {
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    let mut check = test_clock::RoundCheck::new("test");
+    check.round();
+    check.round();
+}
+
+/// An advance call between rounds is progress even when it advanced by zero.
+///
+/// Mutant: bump the generation only for a nonzero elapsed -> panics here.
+#[test]
+fn round_check_accepts_an_advance_of_zero_between_rounds() {
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    let mut check = test_clock::RoundCheck::new("test");
+    check.round();
+    test_clock::advance_by_elapsed_if_frozen(Duration::ZERO);
+    check.round();
+    test_clock::advance_by_elapsed_if_frozen(Duration::ZERO);
+    check.round();
+}
+
+/// Only the immediately previous round is compared: an advance before round two does not excuse
+/// round three.
+///
+/// Mutant: compare against the first round's generation -> no panic.
+#[test]
+#[should_panic(expected = "no progress")]
+fn round_check_compares_against_the_previous_round_only() {
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    let mut check = test_clock::RoundCheck::new("test");
+    check.round();
+    test_clock::advance_by_elapsed_if_frozen(Duration::ZERO);
+    check.round();
+    check.round();
+}
+
+/// An unfrozen clock advances on its own, so rounds without an advance are fine; and the clock is
+/// unfrozen once its guard drops.
+///
+/// Mutant: ignore `is_frozen` -> panics here.
+#[test]
+fn round_check_ignores_an_unfrozen_clock() {
+    {
+        let (_clock, _at) = test_clock::FrozenClockGuard::install();
+        assert!(test_clock::is_frozen());
+    }
+    assert!(!test_clock::is_frozen());
+    let mut check = test_clock::RoundCheck::new("test");
+    check.round();
+    check.round();
+}
+
+/// Two waits under one frozen guard that arm the same remaining are independent.
+///
+/// Mutant: keep the previous round across invocations (a thread-global last round) -> the second
+/// wait's first round is compared with the first wait's last.
+#[test]
+fn two_sequential_waits_with_the_same_remaining_do_not_trip_the_check() {
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    // Unbounded: no `remaining` is needed here, and a finite deadline would let a preempted
+    // round run it out and end the wait early.
+    for _ in 0..2 {
+        let mut rounds = 0;
+        let out = rearm_until(None, |_| {
+            rounds += 1;
+            Ok::<_, ()>((rounds == 2).then_some(()))
+        });
+        assert_eq!(out, Ok(Some(())));
+        assert_eq!(rounds, 2);
+    }
+}
+
+/// The probe holds no progress state: repeated remainings, with or without a `take()` between,
+/// are not its concern.
+///
+/// Mutant: make `wait_ms_probe::record` panic on a repeated remaining -> panics here.
+#[test]
+fn wait_ms_probe_does_not_judge_progress() {
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    wait_ms_probe::take();
+    let r = Duration::from_millis(7);
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::take();
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::take();
+}
+
+/// A remaining injected by the override seam, and a round that took no clock ticks, are not a
+/// stalled loop: the loop advanced.
+///
+/// Mutant: judge progress by the `remaining` values -> the injected 500us then the real hour
+/// differ, but a zero-elapsed round repeats the real one and panics.
+#[test]
+fn the_override_seam_and_a_zero_elapsed_round_do_not_trip_the_check() {
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    // The override seam needs a finite `remaining`; an hour is out of reach of any preemption.
+    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let _override = remaining_override_seam::set(Duration::from_micros(500));
+    wait_ms_probe::take();
+    let mut rounds = 0;
+    let out = rearm_until(deadline, |remaining| {
+        win32_timeout_ms(remaining);
+        rounds += 1;
+        Ok::<_, ()>((rounds == 3).then_some(()))
+    });
+    assert_eq!(out, Ok(Some(())));
+    wait_ms_probe::take();
+}
+
+/// `rearm_until` with its advance dropped fails at the second round.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `rearm_until` -> same panic, without
+/// the seam. Mutant: drop `rearm_until`'s `check.round()` -> the second round runs and fails the
+/// test with a different message, instead of the loop spinning forever.
+#[test]
+#[should_panic(expected = "no progress")]
+fn rearm_until_panics_when_its_advance_is_dropped() {
+    let (_clock, at) = test_clock::FrozenClockGuard::install();
+    let _skip = test_clock::SkipAdvanceGuard::install();
+    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let mut rounds = 0;
+    rearm_until(deadline, |_| {
+        rounds += 1;
+        assert!(rounds < 2, "the check let a second round run");
+        Ok::<Option<()>, ()>(None)
+    })
+    .ok();
+}
+
+/// The env var that arms [`fixture_round_check_violation_while_panicking`].
+const ROUND_CHECK_ABORT_MARKER: &str = "COSCA_FIXTURE_ROUND_CHECK_ABORT";
+
+/// The child half of [`round_check_aborts_when_it_fires_while_panicking`]: inert in an ordinary
+/// suite run. Stalls a [`test_clock::RoundCheck`] in a `Drop` that runs while its own panic
+/// unwinds.
+#[test]
+fn fixture_round_check_violation_while_panicking() {
+    struct StalledInDrop;
+    impl Drop for StalledInDrop {
+        fn drop(&mut self) {
+            let mut check = test_clock::RoundCheck::new("drop path");
+            check.round();
+            check.round();
+        }
+    }
+    if !crate::test_child::is_marked_fixture_reexec(ROUND_CHECK_ABORT_MARKER) {
+        return; // picked up by an ordinary suite run: deliberately inert
+    }
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    let _stalled = StalledInDrop;
+    panic!("the fixture's own failure");
+}
+
+/// A violation found while the thread is already panicking (a Drop path) cannot panic again, and
+/// must not be stored where nothing reads it or a spin could go on: it aborts the process with the
+/// message on the real stderr.
+///
+/// Mutant: store the violation and return -> the child exits with the test's own failure, not an
+/// abort. Mutant: panic regardless of `thread::panicking()` -> the message goes to libtest's
+/// capture, which an abort discards.
+#[test]
+fn round_check_aborts_when_it_fires_while_panicking() {
+    let output = crate::test_child::run_fixture_output(
+        crate::test_child::fixture_path!(fixture_round_check_violation_while_panicking),
+        ROUND_CHECK_ABORT_MARKER,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(crate::test_child::FIXTURE_GATE_PASSED_LINE),
+        "the fixture never passed its gate, so nothing ran:\n{stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "{:?}\n{stderr}",
+            output.status
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        !output.status.success() && output.status.code() != Some(101),
+        "an abort is neither a pass nor libtest's failure exit: {:?}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("drop path") && stderr.contains("no progress"),
+        "the abort names its site and cause on the real stderr:\n{stderr}"
+    );
+}

@@ -125,6 +125,27 @@ fn block_until_exit_terminates_under_a_frozen_clock() {
     assert!(reached, "the call returned before the real deadline");
 }
 
+/// `wait_until` with its frozen-clock advance dropped fails at the second round.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `rearm_until` -> same panic, without
+/// the seam. Mutant: drop `rearm_until`'s `check.round()` -> the second round fails the test with
+/// a different message, instead of the loop spinning forever.
+#[test]
+#[should_panic(expected = "no progress")]
+fn wait_until_panics_when_its_advance_is_dropped() {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+
+    let (_clock, at) = FrozenClockGuard::install();
+    let _skip = crate::wait::test_clock::SkipAdvanceGuard::install();
+    let deadline = Some(Some(at + Duration::from_secs(3600)));
+    let mut waits = 0;
+    crate::wait::wait_until(deadline, |_ms| {
+        waits += 1;
+        assert!(waits < 2, "the check let a second round run");
+        WAIT_TIMEOUT
+    });
+}
+
 // block_until_exit_or_cancel =====
 
 /// Same as `block_until_exit_arms_the_ceiling_of_the_remaining_duration`, for the grace wait.
