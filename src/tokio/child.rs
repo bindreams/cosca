@@ -68,10 +68,12 @@ impl OsResources {
     /// resource follows through [`Attached::release_without_waiting`], bounded on every
     /// mechanism. The pipes and merge targets close last.
     pub(crate) fn release_without_waiting(mut self) {
+        std::thread::spawn(move || {
         #[cfg(test)]
         fault::note_release();
         drop(self.proc.take());
         std::mem::take(&mut self.attached).release_without_waiting();
+        }).join().unwrap();
     }
 }
 
