@@ -24,6 +24,7 @@ pub const GC_PID_ADDR_ENV: &str = "COSCA_TEST_GC_PID_ADDR";
 
 thread_local! {
     static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };
+    static LAST_REPORTED_ID: Cell<Option<ProcessId>> = const { Cell::new(None) };
 }
 
 /// The pid of the grandchild most recently reported to this thread, if any. Lets a test that
@@ -32,8 +33,20 @@ pub fn last_reported_grandchild() -> Option<u32> {
     LAST_REPORTED.with(Cell::get)
 }
 
+/// The identity of the grandchild most recently reported to this thread and resolved. Lets a
+/// test that expects a helper to panic wait for that (orphaned) grandchild to be gone, safely
+/// against pid reuse.
+pub fn last_reported_grandchild_id() -> Option<ProcessId> {
+    LAST_REPORTED_ID.with(Cell::get)
+}
+
 fn record(pid: u32) {
     LAST_REPORTED.with(|c| c.set(Some(pid)));
+    LAST_REPORTED_ID.with(|c| c.set(None));
+}
+
+fn record_id(id: ProcessId) {
+    LAST_REPORTED_ID.with(|c| c.set(Some(id)));
 }
 
 fn parse_pid(line: &str) -> u32 {
@@ -46,7 +59,10 @@ fn parse_pid(line: &str) -> u32 {
 fn identify(pid: u32) -> ProcessId {
     record(pid);
     match ProcessId::of(pid) {
-        Resolved::Found(id) => id,
+        Resolved::Found(id) => {
+            record_id(id);
+            id
+        }
         // Unreaped (Unix) or handle-held (Windows) under the live root, so it still resolves;
         // gone means it was reaped, which only its death can explain.
         Resolved::Gone => died_before_connecting(pid),

@@ -519,9 +519,14 @@ fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_l
 #[test]
 fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
     // Contained: the root exits at once, orphaning a live grandchild that holds the test's stdio.
-    // Unwinding drops the `Child`, and the containment is what kills that grandchild; without it
-    // nextest reports the test as `LEAK` (Windows).
+    // Unwinding drops the `Child`, and the containment KILLS that grandchild; without it nextest
+    // reports the test as `LEAK` (Windows). The drop only sends the kill, so the test waits for
+    // the grandchild's exit (by identity, so a reissued pid is never waited on) before it ends.
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+    let id = common::last_reported_grandchild_id().expect("the root's grandchild was identified");
+    cosca::Process::from_id(id)
+        .wait()
+        .expect("wait for the orphaned grandchild");
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(message.contains("died before it connected"), "got: {message:?}");
     assert!(
