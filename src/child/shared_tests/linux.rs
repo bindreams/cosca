@@ -299,3 +299,43 @@ fn adopt_skips_the_identity_check_on_a_diverged_proc() {
 fn adopt_on_an_unassessable_proc_view_skips_the_identity_check() {
     adopt_under_view_with_exists_gone(crate::identity::proc_view_fault::ForcedView::Unassessable);
 }
+
+// The pidfd's number =====
+
+const SLOT_MARKER: &str = "COSCA_TEST_SHARED_STDIO_SLOT";
+const SLOT_CASE_ENV: &str = "COSCA_TEST_SHARED_STDIO_SLOT_CASE";
+
+/// The adopted pidfd never sits in a stdio slot, even when 0, 1 or 2 is closed at adoption: an
+/// application that restores its stdio with `dup2` afterwards would otherwise destroy it.
+/// Each case runs in a fresh re-exec, since a closed slot is process-wide.
+///
+/// Mutant: the pidfd kept at the lowest free number.
+#[test]
+fn an_adopted_pidfd_never_sits_in_a_stdio_slot() {
+    if !crate::test_child::is_marked_fixture_reexec(SLOT_MARKER) {
+        for case in ["0", "1", "2"] {
+            crate::test_child::run_fixture_case(
+                crate::test_child::fixture_path!(an_adopted_pidfd_never_sits_in_a_stdio_slot),
+                SLOT_MARKER,
+                SLOT_CASE_ENV,
+                case,
+            );
+        }
+        return;
+    }
+    let slot: i32 = std::env::var(SLOT_CASE_ENV).expect("case").parse().expect("slot");
+    let (child, stdin) = spawn_std_blocker();
+    let id = super::fixtures::identity_of(&child);
+    // SAFETY: fd juggling on the standard descriptors of this throwaway re-exec; `saved` is above
+    // 2, and the slot is restored below, as an application restoring its stdio would.
+    let saved = unsafe { libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 10) };
+    assert!(saved >= 10);
+    assert_eq!(unsafe { libc::close(slot) }, 0);
+    let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let fd = std::os::fd::AsRawFd::as_raw_fd(shared.pidfd.as_ref().expect("a pidfd"));
+    // Restore the slot first: the pidfd is still usable afterwards only if it never sat there.
+    assert_eq!(unsafe { libc::dup2(saved, slot) }, slot);
+    assert!(fd >= 3, "the pidfd took the closed stdio slot: {fd}");
+    drop(stdin);
+    shared.wait().expect("wait");
+}

@@ -548,7 +548,7 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
 /// `case_env`: for a fixture that changes process-wide state (a signal disposition, say) and so
 /// runs one case per re-exec. Panics with the fixture's output unless it passes and wrote its gate
 /// line. Build `fixture` with [`fixture_path!`].
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, case: &str) {
     let mut cmd = fixture_command(fixture);
     cmd.env(marker_env, std::process::id().to_string()).env(case_env, case);

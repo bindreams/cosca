@@ -147,6 +147,13 @@ pub(crate) fn open_own_child(pid: u32, id: Option<ProcessId>) -> Result<Option<r
             });
         }
     };
+    // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
+    // application may `dup2` its stdio back over it, destroying the pidfd.
+    let pidfd = if std::os::fd::AsRawFd::as_raw_fd(&pidfd) < 3 {
+        rustix::io::fcntl_dupfd_cloexec(&pidfd, 3).map_err(|e| Error::Io(std::io::Error::from(e)))?
+    } else {
+        pidfd
+    };
     if let Some(id) = id {
         if let ProcView::Same(proc_dir) = crate::identity::proc_view() {
             if exists_checked(id, &proc_dir) == Existence::Gone {
