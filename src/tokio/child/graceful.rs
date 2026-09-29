@@ -444,9 +444,15 @@ pub(crate) mod fault {
         /// After the sweep returned `Ok` (or was skipped), before the root is reaped.
         BeforeReap,
     }
-    type Hook = Option<Box<dyn FnOnce()>>;
     thread_local! {
-        static HOOKS: std::cell::RefCell<[Hook; 2]> = const { std::cell::RefCell::new([None, None]) };
+        static AFTER_TERMINATE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static BEFORE_REAP: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    }
+    fn slot(point: HookPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
+        match point {
+            HookPoint::AfterTerminate => &AFTER_TERMINATE,
+            HookPoint::BeforeReap => &BEFORE_REAP,
+        }
     }
     /// Drop `held` (a stdin a fixture blocks on) when `graceful_shutdown_tree` reaches `point`.
     ///
@@ -454,29 +460,13 @@ pub(crate) mod fault {
     /// wait if the signal under test never came. Released here instead, it ends by itself with
     /// status 0, so the test's assertion on HOW it died fails at once. A real signal delivered
     /// before `point` is already pending, so it always beats the release.
-    ///
-    /// The returned guard clears the slot on drop, so a release whose point was never reached
-    /// cannot fire in a later test on this thread. Arming over a live hook is a test bug.
     pub(crate) fn release_at(point: HookPoint, held: impl Sized + 'static) -> ArmedHook {
-        let previous = HOOKS.with(|h| h.borrow_mut()[point as usize].replace(Box::new(move || drop(held))));
-        debug_assert!(previous.is_none(), "a hook is already armed at this point");
-        ArmedHook(point)
+        crate::oneshot_hook::arm(slot(point), move || drop(held))
     }
     pub(crate) fn run_hook(point: HookPoint) {
-        let hook = HOOKS.with(|h| h.borrow_mut()[point as usize].take());
-        if let Some(hook) = hook {
-            hook();
-        }
+        crate::oneshot_hook::fire(slot(point));
     }
-    /// Clears the [`release_at`] slot on drop.
-    #[must_use]
-    pub(crate) struct ArmedHook(HookPoint);
-    impl Drop for ArmedHook {
-        fn drop(&mut self) {
-            let hook = HOOKS.with(|h| h.borrow_mut()[self.0 as usize].take());
-            drop(hook);
-        }
-    }
+    pub(crate) type ArmedHook = crate::oneshot_hook::Armed;
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR` — see the sync twin's identical guard for the
     /// full rationale (a test harness thread is reused across test functions, so a seam armed
