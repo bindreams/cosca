@@ -404,6 +404,16 @@ impl CgroupLeaf {
 
     /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
     /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
+    ///
+    /// Reads `{pid}/cgroup` through `openat` on the `/proc` dirfd that [`ProcView::Same`] carries,
+    /// so the `/proc` that was checked is the `/proc` that is read. On a `Diverged` or
+    /// `Unassessable` view (a pid namespace started without `--mount-proc`, `nsenter --mount` into
+    /// a foreign `/proc`, or no `/proc` at all) `/proc/{pid}` can name a process other than the
+    /// one `pid` means to this caller, and trusting it is how a spawn that never entered the leaf
+    /// could be marked entered, after which the caller waits on a leaf the child was never in.
+    /// The error names the view and, when there is one, the OS error behind it.
+    /// [`decide_unwaitable`](Self::decide_unwaitable) treats any `Err` as "membership could not be
+    /// read" and fails closed.
     fn holds(&self, pid: u32) -> io::Result<bool> {
         let Some(leaf) = &self.cgroup_path else {
             return Ok(false);
@@ -412,7 +422,23 @@ impl CgroupLeaf {
         if fault::take_force_membership_unreadable() {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
-        let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+        let proc_dir = match crate::identity::proc_view() {
+            crate::identity::ProcView::Same(dir) => dir,
+            crate::identity::ProcView::Diverged => {
+                return Err(io::Error::other(format!(
+                    "this process's /proc is an outer pid namespace's, so pid {pid}'s cgroup membership cannot be read"
+                )));
+            }
+            crate::identity::ProcView::Unassessable(why) => {
+                return Err(io::Error::new(
+                    why.source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind),
+                    format!("the /proc view could not be established, so pid {pid}'s cgroup membership cannot be read: {why}"),
+                ));
+            }
+        };
+        #[cfg(test)]
+        fault::run_between_view_and_membership_read();
+        let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
         let path = parse_v2_relative_path(&text)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
         Ok(is_at_or_under(path, leaf))
@@ -1574,3 +1600,7 @@ mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf_state_tests.rs"]
 mod leaf_state_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_namespace_tests.rs"]
+mod leaf_namespace_tests;
