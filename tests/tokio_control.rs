@@ -583,24 +583,40 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     // `args` alone rather than the `executable()` helper above, which is load-bearing: an
     // `executable()` spawn lands on the async RAW backend, and that one pins the child's pid for
     // its whole life, so no released pin could be observed through it at all.
+    //
+    // Each child blocks reading a piped stdin this test holds, never via a chosen duration
+    // (`sleep 30`/`ping -n 30`): only the `kill()` below ends it. Windows launches `more.com` by
+    // its `System32` path so no `PATH` entry can stand in for it.
     #[cfg(windows)]
-    let argv = ["ping", "-n", "30", "127.0.0.1"];
+    let argv = vec![format!(
+        r"{}\System32\more.com",
+        std::env::var("SystemRoot").expect("SystemRoot is set on Windows")
+    )];
     #[cfg(unix)]
-    let argv = ["sleep", "30"];
-    let mut async_reaped = {
+    let argv = vec!["cat".to_string()];
+    let (mut async_reaped, async_stdin) = {
         let mut cmd = cosca::tokio::Command::new();
-        cmd.args(argv);
-        cmd.spawn().expect("spawn async uncontained")
+        cmd.args(&argv);
+        cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
+        let mut child = cmd.spawn().expect("spawn async uncontained");
+        let stdin = child.stdin().expect("piped stdin");
+        (child, stdin)
     };
-    let sync_reaped = {
+    let (sync_reaped, sync_stdin) = {
         let mut cmd = cosca::Command::new();
-        cmd.args(argv);
-        cmd.spawn().expect("spawn sync uncontained")
+        cmd.args(&argv);
+        cmd.stdin(cosca::Stdio::pipe()).expect("set stdin pipe");
+        let mut child = cmd.spawn().expect("spawn sync uncontained");
+        let stdin = child.stdin().expect("piped stdin");
+        (child, stdin)
     };
     async_reaped.kill().expect("kill");
-    async_reaped.wait().await.expect("reap");
+    let status = async_reaped.wait().await.expect("reap");
+    assert!(!status.success(), "the async child must be killed, got {status:?}");
     sync_reaped.kill().expect("kill");
-    sync_reaped.wait().expect("reap");
+    let status = sync_reaped.wait().expect("reap");
+    assert!(!status.success(), "the sync child must be killed, got {status:?}");
+    drop((async_stdin, sync_stdin));
     assert_eq!(
         refusal_shape(&async_reaped.terminate()),
         refusal_shape(&sync_reaped.terminate()),

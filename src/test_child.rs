@@ -533,6 +533,18 @@ pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
         .expect("spawn")
 }
 
+/// `more.com` by its `System32` path, so no `PATH` entry can stand in for it: a Windows child that
+/// blocks reading its stdin and exits 0 when that closes. A test that holds a piped stdin open
+/// therefore has a fixture with no lifetime of its own, and one that closes the stdin after the
+/// call under test can tell a real kill (non-zero exit) from a natural end (0). `findstr x`
+/// cannot: it exits 1 on an empty input, which is also what a kill reports.
+#[cfg(windows)]
+pub(crate) fn windows_more() -> std::path::PathBuf {
+    std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows"))
+        .join("System32")
+        .join("more.com")
+}
+
 /// The argv for re-executing this test binary against one fixture through `cosca::Command`,
 /// whose `args` is the **full** argv — libtest drops slot 0 as the binary name, so a filter or
 /// option placed there is silently eaten and `--exact` degrades to substring matching.

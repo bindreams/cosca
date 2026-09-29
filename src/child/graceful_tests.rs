@@ -73,13 +73,7 @@ fn cleanup(child: &mut crate::Child) {
 // exists() stays true there while `child` still holds the process handle.)
 #[test]
 fn graceful_tree_watch_error_still_sweeps_and_reaps() {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let child = cmd.spawn().expect("spawn");
+    let (child, stdin) = blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -106,6 +100,7 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
     let _ = id;
     let status = child.wait().expect("cached status — already reaped by the graceful op");
     assert!(!status.success(), "swept root cannot report success, got {status:?}");
+    drop(stdin); // cleanup only: the sweep above already reaped the blocker for real
 }
 
 // The LONE-path twin of the same invariant (Unix-gated: graceful_shutdown is Unsupported on
@@ -115,9 +110,7 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
 #[cfg(unix)]
 #[test]
 fn graceful_lone_watch_error_still_escalates_and_reaps() {
-    let mut cmd = crate::Command::new();
-    cmd.args(["sleep", "30"]);
-    let child = cmd.spawn().expect("spawn");
+    let (child, stdin) = blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -144,6 +137,7 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
         !status.success(),
         "escalated child cannot report success, got {status:?}"
     );
+    drop(stdin); // cleanup only: the escalation above already reaped the blocker for real
 }
 
 // A term_group refusal must not strand the tree between the soft signal and the hard sweep:
@@ -158,13 +152,7 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
 // which is exactly the ordering this test needs and nothing more.
 #[test]
 fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let child = cmd.spawn().expect("spawn");
+    let (child, stdin) = blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -206,6 +194,7 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
+    drop(stdin); // cleanup only: the sweep above already reaped the blocker for real
 }
 
 // Same hold-and-continue contract as the `Containment` test above, but for the OTHER
@@ -215,13 +204,7 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 // per forced-error shape.
 #[test]
 fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let child = cmd.spawn().expect("spawn");
+    let (child, stdin) = blocker();
     let id = child.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -257,6 +240,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     );
     #[cfg(windows)]
     let _ = id;
+    drop(stdin); // cleanup only: the sweep above already reaped the blocker for real
 }
 
 // `Error::Unassessable { source: Some(_), .. }` — group::state's OWN listing failed, no

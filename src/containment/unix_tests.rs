@@ -66,22 +66,30 @@ fn kill_group_and_term_group_reject_non_positive_pgid() {
 #[test]
 fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt as _;
     // Spawn a child in its own private group (pgid == child pid) so we can
     // SIGKILL it without disturbing the test runner's own group.
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs: a fork landing while
     // that module's marker write end is transiently open would inherit it into this
     // not-yet-`exec`'d process, and a concurrent sweep could then find and SIGKILL it.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
-        .expect("spawn sleep");
+        .expect("spawn cat");
+    // Held across the kill below and closed right after it: the fixture has no lifetime of its
+    // own, so only a real `SIGKILL` can end it before the close. A `kill_group` that signals
+    // nothing then yields an EOF exit, which the assertion below rejects at once instead of
+    // `wait()` hanging on a child nothing will ever end.
+    let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(kill_group(pgid).is_ok(), "kill_group on owned group must succeed");
+    drop(stdin);
     let status = child.wait().expect("wait after kill_group");
-    assert!(
-        !status.success(),
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
         "kill_group must have actually killed the leader, got {status:?}"
     );
 }
@@ -100,21 +108,27 @@ fn kill_group_on_owned_group_succeeds() {
 /// closer until now.
 #[test]
 fn term_group_on_owned_group_succeeds() {
-    use std::os::unix::process::CommandExt;
-    // `sleep` has no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
-    // distinguishing "exited because of the signal" from "merely stayed reachable".
+    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
+    // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
+    // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
+    // held across the call and closed right after it, so it has no lifetime of its own: a
+    // `term_group` that delivers nothing yields an EOF exit, which the assertion below rejects at
+    // once instead of `wait()` hanging on a child nothing will ever end.
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
-        .expect("spawn sleep");
+        .expect("spawn cat");
+    let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(term_group(pgid).is_ok(), "term_group on owned group must succeed");
+    drop(stdin);
     let status = child.wait().expect("wait after term_group");
-    assert!(
-        !status.success(),
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
         "term_group must have actually delivered SIGTERM and ended the leader, got {status:?}"
     );
 }
