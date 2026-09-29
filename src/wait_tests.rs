@@ -142,6 +142,39 @@ fn wait_ms_probe_records_the_requested_remaining_beside_the_armed_one() {
     assert_eq!(arms[0].requested, Duration::from_millis(999));
 }
 
+/// Under a frozen clock, re-arming with the `remaining` the previous arm had made no progress:
+/// the probe fails the test on the spot instead of letting the loop spin to the nextest bound.
+///
+/// Mutant: drop the no-progress check in `wait_ms_probe::record` -> no panic.
+#[test]
+#[should_panic(expected = "no progress")]
+fn wait_ms_probe_panics_on_a_repeated_remaining_under_a_frozen_clock() {
+    wait_ms_probe::take();
+    let (_clock, _at) = test_clock::FrozenClockGuard::install();
+    let r = Duration::from_millis(7);
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::record(7, r, r);
+}
+
+/// A shrinking `remaining` under a frozen clock is progress, and an unfrozen clock advances on
+/// its own, so neither trips the check.
+///
+/// Mutant: fire on any second arm, or ignore whether the clock is frozen -> panics here.
+#[test]
+fn wait_ms_probe_accepts_a_shrinking_remaining_and_an_unfrozen_repeat() {
+    wait_ms_probe::take();
+    {
+        let (_clock, _at) = test_clock::FrozenClockGuard::install();
+        wait_ms_probe::record(7, Duration::from_millis(7), Duration::from_millis(7));
+        wait_ms_probe::record(6, Duration::from_millis(6), Duration::from_millis(6));
+    }
+    wait_ms_probe::take();
+    let r = Duration::from_millis(7);
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::record(7, r, r);
+    wait_ms_probe::take();
+}
+
 /// `ceiling - MARGIN` clears (adding the margin lands ON
 /// the ceiling, representable); one nanosecond later does not.
 #[test]

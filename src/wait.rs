@@ -131,6 +131,11 @@ pub(crate) mod test_clock {
         });
     }
 
+    /// Whether this thread's mock clock is frozen.
+    pub(crate) fn is_frozen() -> bool {
+        FROZEN.with(|f| f.get()).is_some()
+    }
+
     /// The mock "now": the frozen instant if [`FrozenClockGuard::install`] is active on this
     /// thread, else real `Instant::now()` (this module's unfrozen default, matching production
     /// behavior exactly).
@@ -379,7 +384,8 @@ pub(crate) mod remaining_override_seam {
 /// was computed from (after any [`remaining_override_seam`] substitution), and the `requested`
 /// remaining the site itself passed in. Tests assert `ms == expected_ms(remaining, clamp)`
 /// exactly, that `remaining` strictly shrinks across re-arms (recomputed each round, not
-/// hoisted), and that `requested` derives from the site's real deadline.
+/// hoisted), and that `requested` derives from the site's real deadline. Under a frozen clock a
+/// re-arm with an unchanged `remaining` panics ([`record`]): no progress.
 #[cfg(test)]
 pub(crate) mod wait_ms_probe {
     use std::cell::RefCell;
@@ -398,6 +404,14 @@ pub(crate) mod wait_ms_probe {
     }
 
     pub(crate) fn record(ms: u32, remaining: Duration, requested: Duration) {
+        // Every real wait advances a frozen clock, so a re-arm with the previous arm's `remaining`
+        // means the loop dropped that advance and would spin forever. Fail now, not at a bound.
+        let repeated = RECORDED.with(|r| r.borrow().last().is_some_and(|prev| prev.remaining == remaining));
+        assert!(
+            !(repeated && super::test_clock::is_frozen()),
+            "wait re-armed with the same remaining ({remaining:?}) under a frozen clock: no progress \
+             (the loop dropped its `advance_by_elapsed_if_frozen`)"
+        );
         let count = RECORDED.with(|r| {
             let mut r = r.borrow_mut();
             r.push(Arm {
