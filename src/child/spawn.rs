@@ -396,8 +396,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// killing and reaping it by pid is the race the owner rejected. The coordinator's recommendation,
 /// not yet decided: probe `pidfd_open(getpid())` before forking (`Unsupported` with no child), and
 /// hold the child at a `pre_exec` handshake until the parent has its pidfd. Until the owner
-/// answers, this leaves the child exactly as main does for any failed adoption: the by-pid
-/// teardown of [`teardown_unadopted`].
+/// answers, this kills and reaps the child by pid with [`teardown_unadopted`], which is the
+/// race the owner rejected. Main does not: when `SharedChild::new` fails it drops the child with
+/// no kill and no reap (#141), so the child runs on, or lingers as a zombie.
 fn teardown_after_failed_adoption(child: std::process::Child, error: Error) -> Error {
     #[cfg(test)]
     fault::capture(ProcessId::of(child.id()));
