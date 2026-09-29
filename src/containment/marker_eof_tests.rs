@@ -750,12 +750,7 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     // never writes; it only holds the write end open so the wait has a live holder.
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
     let queued_before = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
-    // The pipe is full, so its measured capacity is `queued_before`.
-    let clamp = super::LOW_WATER_MARK.min(queued_before as isize);
-    assert!(
-        queued_before as isize >= clamp,
-        "the pipe must be filled to the low-water clamp ({clamp}), got {queued_before}"
-    );
+    // The at-clamp precondition is enforced by the readiness probe below.
 
     let mut cmd = crate::Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
