@@ -117,6 +117,22 @@ enum ChildHandle {
     Cosca(#[allow(dead_code)] cosca::Child),
 }
 
+impl crate::accept::Target for ChildHandle {
+    fn pid(&self) -> u32 {
+        match self {
+            ChildHandle::Raw(c) => c.id(),
+            ChildHandle::Cosca(c) => c.id().pid(),
+        }
+    }
+
+    fn has_exited(&mut self) -> bool {
+        match self {
+            ChildHandle::Raw(c) => crate::accept::Target::has_exited(c),
+            ChildHandle::Cosca(c) => crate::accept::Target::has_exited(c),
+        }
+    }
+}
+
 impl Drop for ChildHandle {
     fn drop(&mut self) {
         if let ChildHandle::Raw(c) = self {
@@ -145,15 +161,13 @@ fn cosca_outcome(e: &cosca::error::Error) -> String {
 
 fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str) -> Spawned {
     let exe = std::env::current_exe().expect("current_exe");
-    let (outcome, child, pid) = match vehicle {
+    let (outcome, mut child, pid) = match vehicle {
         "raw" => {
             use std::os::windows::process::CommandExt;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.args(["control-block", addr, "C"]).creation_flags(if request {
-                CREATE_BREAKAWAY_FROM_JOB.0
-            } else {
-                0
-            });
+            cmd.args(["control-block", addr, "C"])
+                .env(crate::ack::ACK_ENV, "1")
+                .creation_flags(if request { CREATE_BREAKAWAY_FROM_JOB.0 } else { 0 });
             match cmd.spawn() {
                 Ok(c) => {
                     let pid = c.id();
@@ -164,6 +178,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
         }
         "argv" | "exec" => {
             let mut cmd = cosca::Command::new();
+            cmd.env(crate::ack::ACK_ENV, "1");
             if vehicle == "exec" {
                 cmd.executable(&exe).args(["cosca_testbin", "control-block", addr, "C"]);
             } else {
@@ -184,8 +199,8 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
     };
     // The real edge: the child connected and tagged, so it is running and its job membership is
     // settled. No timer anywhere.
-    let ctrl = child.as_ref().map(|_| {
-        let (mut sock, _) = listener.accept().expect("accept the child's control socket");
+    let ctrl = child.as_mut().map(|child| {
+        let mut sock = crate::accept::accept_or_die(listener, child);
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("read the child's tag");
         assert_eq!(&tag, b"C", "wrong child tag");
