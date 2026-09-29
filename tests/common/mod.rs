@@ -13,6 +13,12 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 
+mod accept;
+pub use accept::*;
+
+mod report;
+pub use report::*;
+
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
@@ -206,12 +212,12 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = cosca::Command::new();
-    cmd.executable(testbin()).args(&argv);
+    cmd.executable(testbin()).args(&argv).env(ACK_ENV, "1");
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn control child");
+    let mut sock = accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     (child, sock)
@@ -227,12 +233,12 @@ pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
     let addr = listener.local_addr().unwrap().to_string();
     let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
     let mut cmd = cosca::Command::new();
-    cmd.executable(exe).args([exe, addr.as_str()]);
+    cmd.executable(exe).args([exe, addr.as_str()]).env(ACK_ENV, "1");
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn gui control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn gui control child");
+    let mut sock = accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     assert_eq!(&tag, b"G", "wrong gui tag");
@@ -243,17 +249,21 @@ pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
 /// only way to construct a child whose flags say nothing excludes delivery while the OS puts it
 /// out of reach.
 #[cfg(all(windows, feature = "tokio"))]
-pub fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+pub async fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, TcpStream) {
+    let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = std_listener.local_addr().unwrap().to_string();
+    std_listener
+        .set_nonblocking(true)
+        .expect("set the listener nonblocking for tokio");
+    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
     let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
     let mut cmd = cosca::tokio::Command::new();
-    cmd.args([exe, addr.as_str()]);
+    cmd.args([exe, addr.as_str()]).env(ACK_ENV, "1");
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn async gui control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn async gui control child");
+    let mut sock = accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     assert_eq!(&tag, b"G", "wrong gui tag");
@@ -266,6 +276,15 @@ pub fn spawn_blocker() -> (cosca::Child, TcpStream) {
     spawn_control("control-block", &["R"], false)
 }
 
+/// The text of a caught panic payload; fails loudly when the payload is not a string.
+pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"))
+}
+
 /// Spawn a 2-level tree via a grandchild-spawning testbin `mode` (root tag "R" + one grandchild
 /// tag "G"), optionally contained, and return the owned `Child` plus BOTH accepted sockets (the
 /// two tag reads prove the 2-level tree is alive). The tree dies — and both sockets EOF — only
@@ -275,27 +294,37 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = cosca::Command::new();
-    cmd.executable(testbin()).args(["cosca_testbin", mode, addr.as_str()]);
+    cmd.executable(testbin())
+        .args(["cosca_testbin", mode, addr.as_str()])
+        .env(ACK_ENV, "1");
     if contain {
         cmd.contain();
     }
-    let child = cmd.spawn().expect("spawn tree");
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
+    cmd.env(GC_PID_ADDR_ENV, report.local_addr().unwrap().to_string());
+    let mut child = cmd.spawn().expect("spawn tree");
+    let grand = report_grandchild(&report, &mut child);
     // Demux by tag exactly like spawn_tree_async (accept order is not guaranteed, and a
-    // duplicate or foreign tag is a harness bug worth failing loudly on).
-    let (mut root, mut grand) = (None, None);
+    // duplicate or foreign tag is a harness bug worth failing loudly on). The root is watched
+    // throughout, the grandchild until it has connected: either dying first fails the helper.
+    let (mut root, mut grand_sock) = (None, None);
     for _ in 0..2 {
-        let (mut s, _) = listener.accept().expect("accept");
+        let watch_grand = grand_sock.is_none().then_some(grand);
+        let mut s = accept_or_die_also(&listener, &mut child, watch_grand);
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         match &tag {
             b"R" => root = Some(s),
-            b"G" => grand = Some(s),
+            b"G" => grand_sock = Some(s),
             other => panic!("unexpected tree tag {other:?}"),
         }
     }
     (
         child,
-        vec![root.expect("root R connected"), grand.expect("grandchild G connected")],
+        vec![
+            root.expect("root R connected"),
+            grand_sock.expect("grandchild G connected"),
+        ],
     )
 }
 
@@ -304,15 +333,29 @@ pub fn spawn_grandchild(contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     spawn_tree("spawn-grandchild", contain)
 }
 
+/// Binds a fresh `127.0.0.1:0` listener in tokio's async form, for the `*_async` helpers below —
+/// one definition so every caller sets non-blocking mode (required for `TcpListener::from_std`)
+/// the same way.
+#[cfg(feature = "tokio")]
+pub fn bind_async_listener() -> (::tokio::net::TcpListener, String) {
+    let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = std_listener.local_addr().unwrap().to_string();
+    std_listener
+        .set_nonblocking(true)
+        .expect("set the listener nonblocking for tokio");
+    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
+    (listener, addr)
+}
+
 /// Async analogue of `spawn_control`: spawn a testbin control child (it connects back and
 /// sends its tag before the helper returns), optionally contained.
 #[cfg(feature = "tokio")]
-pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca::tokio::Child, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca::tokio::Child, TcpStream) {
+    let (listener, addr) = bind_async_listener();
     let mut argv: Vec<String> = vec!["cosca_testbin".into(), mode.into(), addr];
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = cosca::tokio::Command::new();
+    cmd.env(ACK_ENV, "1");
     if contain {
         // Load the testbin as argv[0] via the std path (mode/addr stay at args[1..], so it behaves
         // identically) — keeps this shared helper on one code path across OSes. The async raw
@@ -324,8 +367,8 @@ pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca:
     } else {
         cmd.executable(testbin()).args(&argv); // uncontained → the async raw backend
     }
-    let child = cmd.spawn().expect("spawn async control child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = cmd.spawn().expect("spawn async control child");
+    let mut sock = accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     (child, sock)
@@ -335,24 +378,30 @@ pub fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (cosca:
 /// tag "G"), with builder configuration supplied by `configure` (containment mode, nesting).
 /// Returns the root and grandchild control sockets identified by tag (accept order is not
 /// guaranteed).
+///
+/// The root is watched throughout and the grandchild until it has connected, as in the sync
+/// `spawn_tree`: either dying first fails the helper instead of hanging it.
 #[cfg(feature = "tokio")]
-pub fn spawn_tree_async(
+pub async fn spawn_tree_async(
     mode: &str,
     configure: impl FnOnce(&mut cosca::tokio::Command),
 ) -> (cosca::tokio::Child, TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     // Load the testbin as argv[0] via the std path (mode/addr at args[1..], so it behaves
     // identically): these trees are usually contained and the sole uncontained caller is
     // backend-agnostic, so argv[0] keeps this helper on one code path across OSes. `configure`
     // applies the containment/nesting/kill_on_drop.
-    cmd.args([testbin(), mode, addr.as_str()]);
+    cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
     configure(&mut cmd);
-    let child = cmd.spawn().expect("spawn async tree");
+    let (report, report_addr) = bind_async_listener();
+    cmd.env(GC_PID_ADDR_ENV, report_addr);
+    let mut child = cmd.spawn().expect("spawn async tree");
+    let grand = report_grandchild_async(&report, &mut child).await;
     let (mut root, mut grandchild) = (None, None);
     for _ in 0..2 {
-        let (mut s, _) = listener.accept().expect("accept");
+        let watch_grand = grandchild.is_none().then_some(grand);
+        let mut s = accept_or_die_async_also(&listener, &mut child, watch_grand).await;
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         match &tag {
@@ -379,19 +428,29 @@ pub struct AsyncEchoTree {
     pub grand_pid: u32,
 }
 
-/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`.
+/// Spawn a contained [`AsyncEchoTree`] with the given `kill_on_drop`. Root and grandchild are
+/// watched as in `spawn_tree_async` above.
 #[cfg(feature = "tokio")]
-pub fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap().to_string();
+pub async fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
+    spawn_echo_tree_async_mode("spawn-grandchild-echo", kill_on_drop).await
+}
+
+/// [`spawn_echo_tree_async`] over any echo-tree testbin `mode`.
+#[cfg(feature = "tokio")]
+pub async fn spawn_echo_tree_async_mode(mode: &str, kill_on_drop: bool) -> AsyncEchoTree {
+    let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
-    cmd.args([testbin(), "spawn-grandchild-echo", addr.as_str()]);
+    cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
     cmd.contain();
     cmd.kill_on_drop(kill_on_drop);
-    let child = cmd.spawn().expect("spawn async echo tree");
+    let (report, report_addr) = bind_async_listener();
+    cmd.env(GC_PID_ADDR_ENV, report_addr);
+    let mut child = cmd.spawn().expect("spawn async echo tree");
+    let watched_grand = report_grandchild_async(&report, &mut child).await;
     let (mut root, mut grand) = (None, None);
     for _ in 0..2 {
-        let (mut s, _) = listener.accept().expect("accept");
+        let watch_grand = grand.is_none().then_some(watched_grand);
+        let mut s = accept_or_die_async_also(&listener, &mut child, watch_grand).await;
         match read_tag_and_pid(&mut s) {
             (b'R', _) => root = Some(s),
             (b'G', pid) => grand = Some((s, pid)),
@@ -410,27 +469,31 @@ pub fn spawn_echo_tree_async(kill_on_drop: bool) -> AsyncEchoTree {
 /// Async `control-block` blocker (uncontained): a child that connects, tags "R", and blocks on
 /// its socket. The accept/tag-read is sync std (the test side); the CHILD is async.
 #[cfg(feature = "tokio")]
-pub fn spawn_blocker_async() -> (cosca::tokio::Child, TcpStream) {
-    spawn_control_async("control-block", &["R"], false)
+pub async fn spawn_blocker_async() -> (cosca::tokio::Child, TcpStream) {
+    spawn_control_async("control-block", &["R"], false).await
 }
 
 /// Async analogue of `spawn_grandchild`, returning the root ("R") and grandchild ("G") control
 /// sockets identified by tag (accept order is not guaranteed).
 #[cfg(feature = "tokio")]
-pub fn spawn_grandchild_async(contain: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
-    spawn_grandchild_async_with(contain, true)
+pub async fn spawn_grandchild_async(contain: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+    spawn_grandchild_async_with(contain, true).await
 }
 
 /// `spawn_grandchild_async` with explicit `contain` and `kill_on_drop` flags, so a test can
 /// exercise the `kill_on_drop(false)` Drop early-return (attached still armed) without `detach()`.
 #[cfg(feature = "tokio")]
-pub fn spawn_grandchild_async_with(contain: bool, kill_on_drop: bool) -> (cosca::tokio::Child, TcpStream, TcpStream) {
+pub async fn spawn_grandchild_async_with(
+    contain: bool,
+    kill_on_drop: bool,
+) -> (cosca::tokio::Child, TcpStream, TcpStream) {
     spawn_tree_async("spawn-grandchild", |cmd| {
         if contain {
             cmd.contain();
         }
         cmd.kill_on_drop(kill_on_drop);
     })
+    .await
 }
 
 /// Read one `<tag><pid>\n` line from a freshly accepted `control-echo-pid` connection.

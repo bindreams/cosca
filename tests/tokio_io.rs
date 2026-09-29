@@ -16,7 +16,7 @@ async fn async_id_is_a_real_stable_identity() {
     // id() returns the stored ProcessId — a real, resolvable identity that survives wait (tokio's
     // own Child::id() would be None after reap).
     use std::io::Write as _;
-    let (mut child, mut sock) = common::spawn_blocker_async();
+    let (mut child, mut sock) = common::spawn_blocker_async().await;
     let id = child.id();
     let p = cosca::Process::from_id(id);
     assert_eq!(p.id(), id);
@@ -33,7 +33,7 @@ async fn async_id_is_a_real_stable_identity() {
 #[tokio::test]
 async fn async_try_wait_is_none_before_exit_then_some_after() {
     // A blocker child is structurally wedged on its never-written socket → still running.
-    let (mut child, mut sock) = common::spawn_blocker_async();
+    let (mut child, mut sock) = common::spawn_blocker_async().await;
     assert!(
         child.try_wait().expect("try_wait").is_none(),
         "wedged child must be running"
@@ -247,7 +247,7 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
 #[tokio::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     // The containment assert guards the EOFs below from passing for unrelated reasons.
     assert_ne!(
@@ -277,7 +277,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so `Drop` submits no job at all and the
     // tree teardown must come from attached.hard_kill() — proven by the grandchild's EOF.
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
@@ -303,7 +303,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 #[tokio::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
-    let (mut child, mut root, grand) = common::spawn_grandchild_async(true);
+    let (mut child, mut root, grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
     let root_id = child.id();
     child.detach();
@@ -335,7 +335,7 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     // containment resource's own drop, which
     // `async_kill_on_drop_false_leaves_a_contained_tree_running` covers separately.
     use std::io::{Read as _, Write as _};
-    let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false);
+    let (child, mut root, _grand) = common::spawn_grandchild_async_with(false, false).await;
     let root_id = child.id();
     drop(child); // kill_on_drop(false) → Drop early-returns; teardown must NOT run
     assert_eq!(
@@ -359,7 +359,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     // cgroup lane this is a process group, whose disarm is a no-op;
     // `linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running` pins the leaf's.
     use std::io::{Read as _, Write as _};
-    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false);
+    let (child, mut root, grand) = common::spawn_grandchild_async_with(true, false).await;
     assert_ne!(
         child.containment(),
         cosca::Containment::None,
@@ -390,7 +390,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
     common::cgroup::require_lane();
-    assert_async_opted_out_tree_survives(true, |mut child| child.detach());
+    assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
 }
 
 /// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
@@ -400,7 +400,7 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     common::cgroup::require_lane();
-    assert_async_opted_out_tree_survives(false, drop);
+    assert_async_opted_out_tree_survives(false, drop).await;
 }
 
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
@@ -430,7 +430,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_
         root,
         grand,
         grand_pid,
-    } = common::spawn_echo_tree_async(false);
+    } = common::spawn_echo_tree_async(false).await;
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
 
@@ -455,13 +455,13 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_kill_tree_still_waits_for_the_
 /// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
 /// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
 #[cfg(target_os = "linux")]
-fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
+async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl FnOnce(cosca::tokio::Child)) {
     let common::AsyncEchoTree {
         child,
         mut root,
         mut grand,
         grand_pid,
-    } = common::spawn_echo_tree_async(kill_on_drop);
+    } = common::spawn_echo_tree_async(kill_on_drop).await;
     assert_eq!(
         child.containment(),
         cosca::Containment::CgroupV2,
@@ -967,7 +967,7 @@ async fn async_fd3_source_merges_into_piped_stdin() {
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
     use std::io::Read as _;
-    let (child, mut root, mut grand) = common::spawn_grandchild_async(true);
+    let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     assert_eq!(
         child.containment(),
         cosca::Containment::JobObject,
@@ -984,4 +984,149 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
             other => panic!("{who} not torn down: {other:?}"),
         }
     }
+}
+
+// Death-watched accept =====
+
+/// Awaits `fut` on this test's own thread and returns the message it panicked with. The runtime is
+/// `current_thread`, so a spawned task runs on this thread and the thread-local
+/// `common::last_reported_grandchild` is visible to the test.
+async fn panic_message_of<T: Send + 'static>(fut: impl std::future::Future<Output = T> + Send + 'static) -> String {
+    let join_err = match ::tokio::spawn(fut).await {
+        Ok(_) => panic!("the future returned instead of panicking"),
+        Err(e) => e,
+    };
+    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
+    common::panic_message(join_err.into_panic())
+}
+
+fn assert_died_before_connecting(message: &str, pid: u32) {
+    assert!(
+        message.contains(&format!("the control target (pid {pid}) died before it connected")),
+        "expected pid {pid} to be reported as died before it connected, got: {message:?}"
+    );
+}
+
+/// Async sibling of the sync `spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
+/// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let message = panic_message_of(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+}
+
+/// Async sibling of `spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let message = panic_message_of(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+}
+
+fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
+    let (listener, addr) = common::bind_async_listener();
+    let mut cmd = cosca::tokio::Command::new();
+    let mut argv = vec![common::testbin().to_string()];
+    argv.extend(args.iter().map(|a| a.replace("{addr}", &addr)));
+    cmd.args(argv);
+    if ack {
+        cmd.env(common::ACK_ENV, "1");
+    }
+    (listener, cmd.spawn().expect("spawn"))
+}
+
+/// A target that dies before connecting makes `accept_or_die_async` panic naming it, not hang.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
+    let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
+    let pid = child.id().pid();
+    let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
+    assert_died_before_connecting(&message, pid);
+}
+
+/// A target that connects and exits without waiting for the ack is dead whether or not its
+/// connection reached the accept queue. The child is awaited to completion first.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+    let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
+    let pid = child.id().pid();
+    let status = child.wait().await.expect("wait for the target to exit");
+    assert!(status.success(), "control-once should exit 0, got {status}");
+    let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
+    assert_died_before_connecting(&message, pid);
+}
+
+/// An opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_acks_the_connection_it_accepts() {
+    use std::io::{Read as _, Write as _};
+    let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true);
+    let mut sock = common::accept_or_die_async(&listener, &mut child).await;
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("the acked target sends its tag");
+    assert_eq!(&tag, b"R");
+    sock.write_all(b"x").expect("release");
+    child.wait().await.expect("reap");
+}
+
+/// Async twin of `accept_or_die_also_reports_a_gone_descendant_as_dead`.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
+    use std::process::Stdio;
+    let (listener, mut target) = bind_and_spawn(&["sleep-marker"], false);
+    let mut gone = std::process::Command::new(common::testbin())
+        .arg("hold-until-stdin-eof")
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn the descendant");
+    let gone_id = cosca::identity::ProcessId::of(gone.id())
+        .found()
+        .expect("the live descendant resolves");
+    drop(gone.stdin.take());
+    gone.wait().expect("reap the descendant: its identity is now Gone");
+    drop(gone); // Windows: closing the handle is what makes `OpenProcess` fail for the pid
+
+    let message =
+        panic_message_of(async move { common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await })
+            .await;
+    assert_died_before_connecting(&message, gone_id.pid());
+}
+
+/// Only the GRANDCHILD dies (root alive, connected): the panic names the grandchild the root
+/// reported.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
+    assert_died_before_connecting(&message, grandchild);
+}
+
+/// [`spawn_echo_tree_async`]'s twin of the test above.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+    let message = panic_message_of(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
+    assert_died_before_connecting(&message, grandchild);
+}
+
+/// The root reports a live grandchild, then exits without connecting: the main loop fails on the
+/// root.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |_| {})).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+    assert!(
+        !message.contains(&format!("(pid {grandchild})")),
+        "the live grandchild must not be the one blamed: {message:?}"
+    );
+}
+
+/// The root connects to the report address and exits without reporting.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-eof", |_| {})).await;
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
 }
