@@ -430,6 +430,10 @@ pub(crate) const SIGTERM_EXIT: i32 = 15;
 pub(crate) const TRACEE_READY: &[u8] = b"uh-tracee: ready\n";
 /// What its `SIGTSTP` handler writes to stdout.
 pub(crate) const TRACEE_HANDLED_SIGTSTP: &str = "uh-tracee: handled SIGTSTP\n";
+/// What it writes to stdout for each byte read from its stdin. A signal the tracee was handed
+/// runs its handler on the tracee's next return to user mode, so a tick read means every
+/// handler pending before the byte was sent has already written its line.
+pub(crate) const TRACEE_TICK: &str = "uh-tracee: tick\n";
 
 /// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
 /// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
@@ -464,7 +468,8 @@ pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) ->
 }
 
 /// The tracee: sets up the signals named by `COSCA_UH_CATCH` and `COSCA_UH_IGNORE`, writes
-/// [`TRACEE_READY`] to stdout, then reads stdin until EOF or one byte, then exits 0. A no-op
+/// [`TRACEE_READY`] to stdout, then answers each stdin byte with [`TRACEE_TICK`] until EOF, then
+/// exits 0. A no-op
 /// unless `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
 #[test]
 fn uh_tracee_fixture() {
@@ -502,7 +507,9 @@ fn uh_tracee_fixture() {
         install(name, libc::SIG_IGN);
     }
     write_stdout(TRACEE_READY);
-    let _ = sys::read_byte(0);
+    while sys::read_byte(0).is_some() {
+        write_stdout(TRACEE_TICK.as_bytes());
+    }
 }
 
 /// `write(2)` to fd 1, async-signal-safe. A failed write is ignored: the reader is gone.
