@@ -35,7 +35,7 @@ impl Child {
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     ///
     /// A FIFTH site sharing the "deadline windows never early" bug shape (see
-    /// docs/principles.md #13 — PR #233, not yet merged): the Windows-backend (`Raw`) arm of
+    /// docs/principles.md #13): the Windows-backend (`Raw`) arm of
     /// `self.proc.wait_deadline` is `RawChild::wait_deadline`, cosca's own code (fixed
     /// separately). The std-backend (`Std`) arm forwards to
     /// `shared_child::SharedChild::wait_deadline`, which on Windows
