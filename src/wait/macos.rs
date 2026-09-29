@@ -230,6 +230,12 @@ fn as_duration(timeout: Option<libc::timespec>) -> Option<Duration> {
 #[path = "macos/test_hooks.rs"]
 pub(crate) mod test_hooks;
 
+#[path = "macos/await_reapable.rs"]
+mod await_reapable;
+#[cfg(test)]
+pub(crate) use await_reapable::await_reapable_on;
+pub(crate) use await_reapable::{await_reapable, Waited};
+
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
     use nix::sys::signal::{kill as nix_kill, Signal};
     use nix::unistd::Pid;

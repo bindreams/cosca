@@ -87,3 +87,6 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
     let verdict = super::block_on_kqueue(&kq, deadline, true, |_, _| Ok(None)).expect("bounded wait");
     assert!(verdict, "an event-less wait ends by its deadline");
 }
+
+#[path = "macos_tests/await_reapable.rs"]
+mod await_reapable;
