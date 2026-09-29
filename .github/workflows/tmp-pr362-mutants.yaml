@@ -1,0 +1,31 @@
+name: tmp-pr362-mutants
+on:
+  pull_request:
+jobs:
+  mutant:
+    name: ${{ matrix.mutant }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mutant: baseline
+            filter: the_armed_probe_reaches_the_blocking_watch_of_a_live_target the_relayed_observer_does_not_outlive_its_blocking_call wait_exit_drop_releases_the_windows_watcher a_watch_on_another_thread_does_not_notify_this_threads_observer
+          - mutant: skip_armed
+            filter: the_armed_probe_reaches_the_blocking_watch_of_a_live_target
+          - mutant: forget_relay
+            filter: the_relayed_observer_does_not_outlive_its_blocking_call
+          - mutant: skip_released
+            filter: wait_exit_drop_releases_the_windows_watcher a_watch_on_another_thread_does_not_notify_this_threads_observer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply mutant
+        shell: bash
+        run: python .github/tmp/mutate.py "${{ matrix.mutant }}" && git diff --stat
+      - name: Run tests
+        shell: bash
+        run: cargo test --locked --features tokio --lib -- ${{ matrix.filter }}
