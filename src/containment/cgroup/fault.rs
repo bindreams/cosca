@@ -2,6 +2,7 @@ use std::cell::Cell;
 
 /// A seam's hook, run with the child's pid.
 type PidHook = Box<dyn FnOnce(u32)>;
+type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
     static FORCE_LEAF_BUSY: Cell<bool> = const { Cell::new(false) };
@@ -39,7 +40,9 @@ thread_local! {
     static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static AFTER_FORK_STILL_LOCKED: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
+    static AFTER_FORK_STILL_LOCKED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    static ON_FORK_RUNNING_LOCK_CONTENDED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    static ON_FORK_RUNNING_CLEANUP: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
     static FORK_RUNNING_LOCK_HELD_REPORT_FD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
 }
 
@@ -460,8 +463,7 @@ pub(crate) fn run_before_exit_wait() {
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if
-/// `fork_running` never ran it (its `pidfd_open` can fail before the hook's own call site) — so
-/// an unrun hook can't leak into whichever `fork_running` call, on this thread, comes next.
+/// `fork_running` never ran it.
 #[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
 pub(crate) struct AfterForkStillLockedGuard(());
 impl Drop for AfterForkStillLockedGuard {
@@ -470,23 +472,58 @@ impl Drop for AfterForkStillLockedGuard {
     }
 }
 
-/// Run `hook` in the NEXT `fork_running` call on this thread, with the child's real pid, in the
-/// parent arm right after `fork()` returns and its `KillOnDrop` is built, still holding
-/// `spawn_lock`. Takes the pid (not `()`) so a test can also confirm the fork already happened by
-/// this point (a live process exists at that pid) — though that alone is a weak check: a mutant
-/// that hardcodes a literal pid, rather than passing the real one, defeats it while still
-/// compiling. A test wanting a real "still locked" proof asserts
-/// [`crate::child::spawn::spawn_lock_held_by_this_thread`] from inside the hook itself, which
-/// runs on the SAME (forking) thread. Shares `PidHook` (`AFTER_FINAL_READ`'s type) rather than a
-/// fresh single-use closure type, which is what tripped clippy's `type_complexity` under
-/// `-D warnings`.
-pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce(u32) + 'static) -> AfterForkStillLockedGuard {
+/// Run `hook` in the NEXT `fork_running` call on this thread, after `fork()` and `KillOnDrop`
+/// construction, still holding `spawn_lock`. Runs on the forking thread, so it may read
+/// [`crate::child::spawn::spawn_lock_held_by_this_thread`].
+pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce() + 'static) -> AfterForkStillLockedGuard {
     AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
     AfterForkStillLockedGuard(())
 }
-pub(crate) fn run_after_fork_still_locked(child_pid: u32) {
+pub(crate) fn run_after_fork_still_locked() {
     if let Some(hook) = AFTER_FORK_STILL_LOCKED.with(|h| h.borrow_mut().take()) {
-        hook(child_pid);
+        hook();
+    }
+}
+
+/// RAII: dropping this clears the hook [`set_fork_running_lock_contended`] armed.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningLockContendedGuard(());
+impl Drop for ForkRunningLockContendedGuard {
+    fn drop(&mut self) {
+        ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread if `spawn_lock` is already held when
+/// it goes to take it, just before it blocks on the lock.
+pub(crate) fn set_fork_running_lock_contended(hook: impl FnOnce() + 'static) -> ForkRunningLockContendedGuard {
+    ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForkRunningLockContendedGuard(())
+}
+pub(crate) fn run_fork_running_lock_contended() {
+    if let Some(hook) = ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// RAII: dropping this clears the hook [`set_fork_running_cleanup`] armed.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningCleanupGuard(());
+impl Drop for ForkRunningCleanupGuard {
+    fn drop(&mut self) {
+        ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread that fails its `pidfd_open`, at the
+/// start of the cleanup that kills and reaps the child. Runs on the forking thread.
+pub(crate) fn set_fork_running_cleanup(hook: impl FnOnce() + 'static) -> ForkRunningCleanupGuard {
+    ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForkRunningCleanupGuard(())
+}
+pub(crate) fn run_fork_running_cleanup() {
+    if let Some(hook) = ON_FORK_RUNNING_CLEANUP.with(|h| h.borrow_mut().take()) {
+        hook();
     }
 }
 
@@ -500,17 +537,9 @@ impl Drop for ForkRunningLockHeldReportFdGuard {
     }
 }
 
-/// Give the NEXT `fork_running` call on this thread a raw fd to report, as a single byte (`1` or
-/// `0`), whether `spawn_lock` was held — from the forking thread's own point of view, at the
-/// exact instant of the fork — via
-/// [`spawn_lock_held_by_this_thread`](crate::child::spawn::spawn_lock_held_by_this_thread)'s
-/// inherited copy. `fork_running` takes this fd once, itself, still holding `spawn_lock`, right
-/// before the fork — not the child, which only ever sees the already-resolved local value fork
-/// copies for it — so a concurrent `fork_running` elsewhere (serialized on the same lock) cannot
-/// observe or clear it first. Unlike a check the PARENT makes after the fork returns, reporting
-/// from the CHILD cannot be fooled by a lock dropped before the fork and re-acquired afterward:
-/// the child already forked away, with its own private copy of the flag, before any
-/// re-acquisition could happen.
+/// Give the NEXT `fork_running` call on this thread a pipe write fd; its child writes one byte
+/// (`1`/`0`) for whether it inherited `spawn_lock` as held. `fork_running` takes the fd once,
+/// before forking.
 pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) -> ForkRunningLockHeldReportFdGuard {
     FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(Some(fd)));
     ForkRunningLockHeldReportFdGuard(())

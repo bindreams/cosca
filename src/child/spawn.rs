@@ -381,20 +381,11 @@ pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
-    /// Whether THIS thread currently holds `SPAWN_MUTEX`, set and cleared only by
-    /// [`spawn_lock_tracked`]'s guard. A plain `Cell<bool>`: reading or writing it is a memory
-    /// access only, no allocation or syscall, so async-signal-safe — a forked child may read its
-    /// own inherited copy (whatever the forking thread's copy held at the instant of the fork)
-    /// from inside the child, after `fork()`, without waiting on anything external.
-    ///
-    /// `cfg`'d to match its one use (`fork_running`'s own acquisition and its test, both
-    /// Linux-only): a wider `#[cfg(test)]` alone would compile this on every OS while it stays
-    /// unused on most of them, a real `dead_code` warning, not a false one.
+    /// Whether THIS thread holds `SPAWN_MUTEX`; set and cleared only by [`spawn_lock_tracked`]'s guard.
     #[cfg(all(target_os = "linux", test))]
     static SPAWN_LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`spawn_lock`]'s guard, plus clearing the held-by-this-thread flag on drop.
 #[cfg(all(target_os = "linux", test))]
 pub(crate) struct TrackedSpawnLockGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -407,14 +398,19 @@ impl Drop for TrackedSpawnLockGuard {
     }
 }
 
-/// Locks the exact same mutex [`spawn_lock`] does — a real cosca spawn contending with this test
-/// helper's own fork blocks on, and is blocked by, the very same `Mutex` — while also recording,
-/// for [`spawn_lock_held_by_this_thread`], that this thread now holds it. Test-only: production
-/// spawns use the plain [`spawn_lock`]; only `fork_running`'s own test needs the thread-local
-/// record.
+/// Like [`spawn_lock`] (same mutex), but also records in a thread-local, for
+/// [`spawn_lock_held_by_this_thread`], that this thread holds it. `on_contended` runs first if the
+/// lock is already held, before this blocks on it.
 #[cfg(all(target_os = "linux", test))]
-pub(crate) fn spawn_lock_tracked() -> TrackedSpawnLockGuard {
-    let guard = SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+pub(crate) fn spawn_lock_tracked(on_contended: impl FnOnce()) -> TrackedSpawnLockGuard {
+    let guard = match SPAWN_MUTEX.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_contended();
+            SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(true));
     TrackedSpawnLockGuard { _guard: guard }
 }

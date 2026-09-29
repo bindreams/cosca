@@ -5,22 +5,14 @@
 /// inherited fds (stdout) open. The returned [`KillOnDrop`] SIGKILLs and reaps it on drop unless
 /// [`defused`](KillOnDrop::defuse).
 ///
-/// Forks under [`spawn_lock`](crate::child::spawn::spawn_lock), so this fork cannot land inside a
-/// concurrent cosca spawn's own inheritable-fd window: `fork_running`'s child never `exec`s, so it
-/// inherits EVERY fd this process has open at the moment of the fork — not just ones a spawn
-/// deliberately marks inheritable — including an fd that exists only transiently, opened non-
-/// `CLOEXEC`, inside another `spawn_lock` holder's own critical section. Held across the `fork()`
-/// call itself; released once the parent's `pidfd_open` resolves either way. In the `Ok` arm the
-/// release comes after [`KillOnDrop`] is built and the test hook has run: the hook runs while the
-/// lock is still held so a test can assert exactly that, and building the guard first means a hook
-/// that panics still unwinds through a guard that kills and reaps the child.
+/// Forks under [`spawn_lock`], so the never-exec child cannot inherit an fd another spawn holds
+/// transiently non-`CLOEXEC` inside its own `spawn_lock` section. Held across `fork()` until the
+/// parent's `pidfd_open` resolves.
 #[cfg(target_os = "linux")]
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
-    let guard = crate::child::spawn::spawn_lock_tracked();
-    // Taken once here, in the parent, still holding the lock and before the fork: `fork()`'s own
-    // memory copy hands the child this resolved LOCAL value, so the child never touches the fault
-    // module's thread-local itself, and a concurrent `fork_running` elsewhere (serialized on the
-    // same lock) can't observe or clear it first.
+    let guard =
+        crate::child::spawn::spawn_lock_tracked(crate::containment::cgroup::fault::run_fork_running_lock_contended);
+    // Taken before the fork: the child uses this captured value, not the thread-local.
     let report_fd = crate::containment::cgroup::fault::take_fork_running_lock_held_report_fd();
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
     // `_exit`s without unwinding or running destructors.
@@ -28,19 +20,20 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     match raw_pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
-            // Report to a test, if one asked (`report_fd`, captured above): whether THIS thread
-            // held `spawn_lock` at the exact instant of the fork, from the CHILD's own point of
-            // view. `held` reads this process's inherited copy of a thread-local flag
-            // `spawn_lock_tracked` sets — a plain memory read, no allocation or syscall, so
-            // async-signal-safe — then a raw `write(2)` reports it, also async-signal-safe.
-            // Unlike a check the PARENT makes after the fork returns, this cannot be fooled by a
-            // lock dropped before the fork and re-acquired afterward: the child already forked
-            // away before any re-acquisition.
+            // Report whether the forked copy saw the lock held: a plain `Cell` read and a raw
+            // `write(2)`, both async-signal-safe. Reading it in the child (not the parent) can't
+            // be fooled by drop-before/reacquire-after the fork.
             if let Some(fd) = report_fd {
                 let held: u8 = crate::child::spawn::spawn_lock_held_by_this_thread().into();
                 // SAFETY: `fd` is a pipe write end a test provided for exactly this; `held` is a
                 // valid one-byte buffer.
-                unsafe { libc::write(fd, (&raw const held).cast(), 1) };
+                let written = unsafe { libc::write(fd, (&raw const held).cast(), 1) };
+                if written != 1 {
+                    // No formatted panic (allocates) between fork and `_exit`: a distinct exit
+                    // code the test reads from the reaped status.
+                    // SAFETY: async-signal-safe.
+                    unsafe { libc::_exit(REPORT_WRITE_FAILED_EXIT) };
+                }
             }
             // Never dropped here: `MutexGuard::drop`'s unlock (an atomic swap, a `FUTEX_WAKE`
             // when contended) is not async-signal-safe, and this process's own copy of the lock
@@ -67,15 +60,14 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                         pidfd: Some(pidfd),
                     };
                     // Run only once `kod` exists, and only then release the lock: a seam that
-                    // panics (a test's own assertion) still unwinds through `kod`'s `Drop`, which
-                    // kills and reaps the child, instead of leaking it — running this before `kod`
-                    // was built left exactly that orphan behind on a failing test run.
-                    crate::containment::cgroup::fault::run_after_fork_still_locked(pid);
+                    // panics still unwinds through `kod`'s `Drop`, which kills and reaps the child.
+                    crate::containment::cgroup::fault::run_after_fork_still_locked();
                     drop(guard);
                     kod
                 }
                 Err(e) => {
                     drop(guard);
+                    crate::containment::cgroup::fault::run_fork_running_cleanup();
                     // The probe pidfd lets the test verify the reap without racing pid reuse. Its
                     // failure is reported but must not skip the kill/reap.
                     let probe = if crate::containment::cgroup::fault::take_force_fork_running_probe_pidfd_failure() {
@@ -123,6 +115,10 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
         }
     }
 }
+
+/// Exit code of a [`fork_running`] child whose lock-held report `write(2)` failed or was short.
+#[cfg(target_os = "linux")]
+pub(crate) const REPORT_WRITE_FAILED_EXIT: i32 = 113;
 
 /// SIGKILLs and reaps a forked child on drop unless [`defuse`](Self::defuse)d. Uses a pidfd, not
 /// the pid, which the kernel may recycle after a reap.
@@ -200,10 +196,17 @@ impl Drop for KillOnDrop {
 /// Reap `pid`, a child of this process.
 #[cfg(target_os = "linux")]
 pub(crate) fn reap(pid: u32) {
+    reap_status(pid);
+}
+
+/// [`reap`], returning the raw wait status.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap_status(pid: u32) -> i32 {
     let mut status = 0;
     // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
     let reaped = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
     assert_eq!(reaped, pid as i32, "waitpid: {}", std::io::Error::last_os_error());
+    status
 }
 
 /// A forked child that fails inside [`block_on`] cannot say why — no formatted panic, no

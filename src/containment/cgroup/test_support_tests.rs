@@ -1,4 +1,4 @@
-use super::{fork_running, reap};
+use super::{fork_running, reap, reap_status};
 
 /// A panic after `fork_running` must not leave the child unreaped: the guard's `Drop` reaps it
 /// during unwind. Checked via an independent pidfd, which reports `ECHILD` once the child is
@@ -274,55 +274,61 @@ fn defuse_disarms_the_guard() {
     );
 }
 
-/// `fork_running` must hold `spawn_lock()` across its `fork()`, not just release it before —
-/// otherwise a concurrent cosca spawn elsewhere in this test binary can inherit an fd that
-/// exists only inside that spawn's own `spawn_lock` section.
-///
-/// Two independent, deterministic checks, neither timing-dependent:
-///
-/// - **From the child, not the parent.** The child reports, over a pipe with a raw `write(2)`,
-///   its own inherited copy of a thread-local flag `spawn_lock_tracked` set on the forking
-///   thread right before the fork. A check the PARENT makes after the fork returns cannot tell
-///   "held across the fork" apart from "dropped just before the fork and re-acquired just after
-///   it" — both look identical from the parent's later vantage point — but the child already
-///   forked away, with its own copy of the flag, before any such re-acquisition could happen. A
-///   plain `Cell<bool>` read plus `write(2)` are both async-signal-safe.
-///   (A prior version of this test used a non-blocking `try_lock` from a second thread instead;
-///   that is provably unreliable outside this one test process — under plain `cargo test`, any
-///   OTHER test's own concurrent hold of the same process-global lock also makes `try_lock`
-///   refuse, for a reason that has nothing to do with `fork_running`. It failed to catch a
-///   before-the-fork mutant for the opposite reason: by the time the parent-side check ran, a
-///   mutant that drops the lock before the fork and re-acquires it in the parent arm had already
-///   made it true again.)
-/// - **From inside the post-fork hook itself.** The hook asserts
-///   `spawn_lock_held_by_this_thread()` — it runs on the forking thread, so this reads the SAME
-///   thread-local the fork used, not a copy. This is what actually catches a lock released right
-///   after the fork, before `pidfd_open` and the hook: `kill(pid, 0)` (still checked below, as a
-///   sanity check that `fork()` really happened) does NOT catch that: signal 0 to the pid the
-///   hook is handed succeeds whenever a real fork occurred, whether or not the lock is still held.
-///
-/// **Never hangs**, even if the fix regresses so the child never reports: the child exits by
-/// itself after reporting, and is reaped BEFORE the read below; the read end is `O_NONBLOCK`, so
-/// a missing byte (even with some unrelated fork still holding a copy of the write end) answers
-/// `WouldBlock`, read as "not reported" and failed loudly, never blocks forever. The pipe
-/// itself is opened while holding `spawn_lock` too, so an unrelated concurrent `fork_running`
-/// elsewhere in this binary — serialized on the very same lock — cannot fork and inherit its
-/// write end while this test is creating it.
+/// What the forked child of a `fork_running` lock probe reports, from its pipe.
+#[cfg(target_os = "linux")]
+fn read_report_byte(pipe: &mut impl std::io::Read) -> Option<u8> {
+    let mut byte = 0u8;
+    loop {
+        match pipe.read(std::slice::from_mut(&mut byte)) {
+            Ok(1) => return Some(byte),
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Nothing written, though the write ends are closed or the child is reaped: never a hang.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(e) => panic!("read failed unexpectedly: {e}"),
+        }
+    }
+}
+
+/// A `read` interrupted by a signal is retried, not reported as a failure.
 #[cfg(target_os = "linux")]
 #[test]
-fn fork_running_holds_spawn_lock_across_the_fork() {
-    use std::os::fd::AsRawFd;
-    use std::sync::mpsc;
+fn read_report_byte_retries_an_interrupted_read() {
+    struct InterruptedOnce(bool);
+    impl std::io::Read for InterruptedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !std::mem::replace(&mut self.0, true) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            buf[0] = 1;
+            Ok(1)
+        }
+    }
+    assert_eq!(read_report_byte(&mut InterruptedOnce(false)), Some(1));
+}
 
-    let (report_read, report_write) = {
-        let _lock = crate::child::spawn::spawn_lock();
-        std::io::pipe().expect("open the report pipe")
-    };
+/// Wait status as text, for assertion messages.
+#[cfg(target_os = "linux")]
+fn describe_status(status: i32) -> String {
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        if code == super::REPORT_WRITE_FAILED_EXIT {
+            format!("exit {code} (REPORT_WRITE_FAILED_EXIT: the child's report write failed)")
+        } else {
+            format!("exit {code}")
+        }
+    } else {
+        format!("raw wait status {status:#x}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_nonblocking(fd: std::os::fd::RawFd) {
     // SAFETY: fcntl(F_GETFL/F_SETFL) on a live, owned fd; no pointer args beyond the flags.
     unsafe {
-        let flags = libc::fcntl(report_read.as_raw_fd(), libc::F_GETFL);
+        let flags = libc::fcntl(fd, libc::F_GETFL);
         assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
-        let rc = libc::fcntl(report_read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let rc = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         assert_eq!(
             rc,
             0,
@@ -330,82 +336,192 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// `fork_running` must hold `spawn_lock()` across its `fork()`, otherwise a concurrent cosca spawn
+/// elsewhere in this test binary can inherit an fd that exists only inside that spawn's own
+/// `spawn_lock` section.
+///
+/// Two checks:
+///
+/// - The child reports, over a pipe, its inherited copy of the thread-local flag
+///   `spawn_lock_tracked` set on the forking thread. A parent-side check after the fork returns
+///   can't tell "held across the fork" from "dropped before it, re-acquired after".
+/// - The post-fork hook, on the forking thread, reports the same flag; it catches a lock released
+///   right after the fork, before `pidfd_open` and the hook. The test thread asserts it, so a
+///   failure names its cause instead of panicking on the fork thread.
+///
+/// The read end is `O_NONBLOCK` and the child is reaped before the read: once reaped, its byte is
+/// in the pipe or never will be, and a missing byte answers `WouldBlock` instead of hanging.
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_running_holds_spawn_lock_across_the_fork() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+
+    let (mut report_read, report_write) = std::io::pipe().expect("open the report pipe");
+    set_nonblocking(report_read.as_raw_fd());
     let report_write_fd = report_write.as_raw_fd();
 
-    let (tx_started, rx_started) = mpsc::channel::<u32>();
-    let (tx_release, rx_release) = mpsc::channel::<()>();
-
+    let (tx_hook, rx_hook) = mpsc::channel::<bool>();
     let fork_thread = std::thread::spawn(move || {
-        // Set on THIS thread, not the test's own: `fork_running` runs here, and the report seam
-        // is a thread-local — the forked child inherits whichever thread's own copy called
-        // `fork()`, not the test's.
+        // Set on THIS thread: the seams are thread-locals and `fork_running` runs here.
         let _report_guard = crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_write_fd);
-        let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move |child_pid| {
-            assert!(
-                crate::child::spawn::spawn_lock_held_by_this_thread(),
-                "spawn_lock must still be held when the post-fork hook runs"
-            );
-            tx_started
-                .send(child_pid)
-                .expect("the test thread is still waiting to receive");
-            // Not `.expect(...)`: a panic here, on this thread, must not matter — `fork_running`
-            // has already built the child's `KillOnDrop` before calling this hook, so however
-            // this recv ends, the caller below still reaps the child through `fork_thread`'s
-            // returned value or its own unwind.
-            let _ = rx_release.recv();
+        let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move || {
+            let _ = tx_hook.send(crate::child::spawn::spawn_lock_held_by_this_thread());
         });
-        // The child reports, runs this empty body, and `_exit`s on its own: the test then waits
-        // for that exit (an event) instead of killing it, which could land before the report.
+        // The child reports, runs this empty body, and `_exit`s on its own; the test waits for
+        // that exit instead of killing it, which could land before the report.
         fork_running(|| {})
     });
 
-    // Blocks until fork_running's hook is running — not a fixed duration.
-    let child_pid = rx_started
-        .recv()
-        .expect("fork_thread must reach the hook before this returns");
-
-    // SAFETY: signal 0 sends nothing; it only queries existence/permission.
-    assert_eq!(
-        unsafe { libc::kill(child_pid as i32, 0) },
-        0,
-        "the child must already exist by the time the hook runs: {}",
-        std::io::Error::last_os_error()
-    );
-
-    tx_release
-        .send(())
-        .expect("fork_thread's hook is still waiting to receive");
-
-    let guard = fork_thread.join().expect("fork_thread must not panic");
-
-    // Reaped BEFORE the read: the child exits by itself right after its report (or lack of one),
-    // so once it is reaped its byte is in the pipe or never will be. Killing it instead could
-    // land before it had run at all.
-    reap(guard.defuse());
+    let guard = match fork_thread.join() {
+        Ok(guard) => guard,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    // Reaped first: once reaped, the child's byte is in the pipe or never will be.
+    let status = reap_status(guard.defuse());
     drop(report_write);
 
-    let mut held = 0u8;
-    // SAFETY: `report_read`'s fd is an open, non-blocking read end; `held` is a valid one-byte
-    // buffer.
-    let n = unsafe { libc::read(report_read.as_raw_fd(), (&raw mut held).cast(), 1) };
-    let n = if n == -1 {
-        let e = std::io::Error::last_os_error();
-        assert_eq!(
-            e.kind(),
-            std::io::ErrorKind::WouldBlock,
-            "read failed unexpectedly: {e}"
-        );
-        0 // Deterministically "not reported" — never a hang.
-    } else {
-        n
-    };
-    assert_eq!(
-        n, 1,
-        "the child never reported whether it saw spawn_lock held (0 = not reported)"
+    let hook_saw_held = rx_hook.recv().expect("the post-fork hook must have run");
+    assert!(
+        hook_saw_held,
+        "spawn_lock must still be held when the post-fork hook runs"
     );
     assert_eq!(
-        held, 1,
-        "spawn_lock must have been held, from the forking thread's own point of view, at the \
-         exact instant of the fork"
+        read_report_byte(&mut report_read),
+        Some(1),
+        "the child must report that spawn_lock was held, from the forking thread's own point of \
+         view, at the exact instant of the fork (child ended: {})",
+        describe_status(status)
+    );
+}
+
+/// A failed report `write` in the child is not swallowed: the child exits with
+/// `REPORT_WRITE_FAILED_EXIT`, which the reaped status shows.
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_running_child_exits_with_a_dedicated_code_when_its_report_write_fails() {
+    use std::os::fd::AsRawFd;
+
+    // Writing to a pipe's read end fails with EBADF.
+    let (report_read, _report_write) = std::io::pipe().expect("open the report pipe");
+    let _report_guard =
+        crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_read.as_raw_fd());
+
+    let guard = fork_running(|| {});
+    let status = reap_status(guard.defuse());
+
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == super::REPORT_WRITE_FAILED_EXIT,
+        "a child whose report write failed must exit with REPORT_WRITE_FAILED_EXIT, got {}",
+        describe_status(status)
+    );
+}
+
+/// What a `fork_running` blocked behind a held `spawn_lock` reports, in order.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum LockProbe {
+    /// `fork_running` found the lock held and is about to block on it.
+    Contended,
+    /// `fork_running` has forked; whether the holder had released the lock by then.
+    Forked { holder_released: bool },
+}
+
+/// `fork_running` waits for a `spawn_lock` held by another thread: it sees the lock contended
+/// before it forks, and does not fork until the holder has released it.
+///
+/// The holder takes the real [`spawn_lock`](crate::child::spawn::spawn_lock). The forking thread
+/// reports `Contended` when its acquisition finds the lock held, and `Forked` from the post-fork
+/// hook. The test thread releases the holder only after `Contended`, so the first report proves
+/// the fork did not run ahead, and the holder's release flag is set before its unlock, so a fork
+/// that waited for the lock always sees it.
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_running_waits_for_a_held_spawn_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    let released = Arc::new(AtomicBool::new(false));
+    let (tx_held, rx_held) = mpsc::channel::<()>();
+    let (tx_release, rx_release) = mpsc::channel::<()>();
+    let holder = {
+        let released = Arc::clone(&released);
+        std::thread::spawn(move || {
+            let lock = crate::child::spawn::spawn_lock();
+            tx_held.send(()).expect("the test thread is waiting for the holder");
+            let _ = rx_release.recv();
+            released.store(true, Ordering::SeqCst);
+            drop(lock);
+        })
+    };
+    rx_held.recv().expect("the holder must take the lock");
+
+    let (tx_probe, rx_probe) = mpsc::channel::<LockProbe>();
+    let fork_thread = {
+        let released = Arc::clone(&released);
+        let tx_contended = tx_probe.clone();
+        std::thread::spawn(move || {
+            let _contended_guard = crate::containment::cgroup::fault::set_fork_running_lock_contended(move || {
+                let _ = tx_contended.send(LockProbe::Contended);
+            });
+            let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move || {
+                let _ = tx_probe.send(LockProbe::Forked {
+                    holder_released: released.load(Ordering::SeqCst),
+                });
+            });
+            fork_running(|| {})
+        })
+    };
+
+    // Whichever report comes first decides: a fork that ran ahead of the held lock reports
+    // `Forked` first, and would never report `Contended` at all.
+    let first = rx_probe.recv();
+    tx_release.send(()).expect("the holder is waiting to be released");
+    holder.join().expect("the holder must not panic");
+    let guard = match fork_thread.join() {
+        Ok(guard) => guard,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    reap(guard.defuse());
+
+    assert_eq!(
+        first,
+        Ok(LockProbe::Contended),
+        "fork_running must find spawn_lock held and wait, not fork first"
+    );
+    assert_eq!(
+        rx_probe.recv(),
+        Ok(LockProbe::Forked { holder_released: true }),
+        "fork_running must not fork before the holder released spawn_lock"
+    );
+}
+
+/// The `pidfd_open`-failure path releases `spawn_lock` before it kills and reaps the child, not
+/// at scope exit or unwind. Observed from the cleanup hook, which runs on the forking thread.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<bool>();
+    let fork_thread = std::thread::spawn(move || {
+        crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
+        let _cleanup_guard = crate::containment::cgroup::fault::set_fork_running_cleanup(move || {
+            let _ = tx.send(crate::child::spawn::spawn_lock_held_by_this_thread());
+        });
+        let _ = fork_running(|| {
+            // SAFETY: `pause` is async-signal-safe.
+            unsafe { libc::pause() };
+        });
+    });
+    let unwound = fork_thread.join();
+    assert!(unwound.is_err(), "the forced pidfd_open failure must panic");
+
+    let held_during_cleanup = rx.recv().expect("the cleanup hook must have run");
+    assert!(
+        !held_during_cleanup,
+        "spawn_lock must be released before the failure path's kill and reap"
     );
 }
