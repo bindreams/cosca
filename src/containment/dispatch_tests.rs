@@ -208,11 +208,19 @@ fn sync_kill_tree_backstop_is_load_bearing() {
     use crate::containment::fdmarker::fault;
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    cmd.args(["cat"]);
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args([crate::test_child::windows_more()]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    #[cfg(windows)]
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain_with(crate::ContainMode::TreeWalk);
-    let child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn().expect("spawn");
+    // Held across the backstop kill below and closed right after it: the fixture has no lifetime
+    // of its own, so only a real kill can end it before the close. A backstop that kills
+    // nothing then yields an EOF exit (0), which the assertion below rejects at once instead of
+    // `wait()` hanging on a child nothing will ever end.
+    let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
     let result = child.kill_tree();
     assert!(
@@ -220,6 +228,7 @@ fn sync_kill_tree_backstop_is_load_bearing() {
         "seam not consumed — hard_kill did not run on the arming thread"
     );
     result.expect("kill_tree via backstop");
+    drop(stdin);
     let status = child.wait().expect("reap");
     assert!(
         !status.success(),
@@ -236,11 +245,19 @@ async fn async_kill_tree_backstop_is_load_bearing() {
     use crate::containment::fdmarker::fault;
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
+    cmd.args(["cat"]);
     #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args([crate::test_child::windows_more()]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    #[cfg(windows)]
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mut child = cmd.spawn().expect("spawn");
+    // Held across the backstop kill below and closed right after it: the fixture has no lifetime
+    // of its own, so only a real kill can end it before the close. A backstop that kills
+    // nothing then yields an EOF exit (0), which the assertion below rejects at once instead of
+    // `wait()` hanging on a child nothing will ever end.
+    let stdin = child.stdin().expect("piped stdin");
     fault::set_force_root_kill_noop(true);
     let result = child.kill_tree();
     assert!(
@@ -248,6 +265,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
         "seam not consumed — hard_kill did not run on the arming thread"
     );
     result.expect("kill_tree via backstop");
+    drop(stdin);
     let status = child.wait().await.expect("reap");
     assert!(
         !status.success(),
