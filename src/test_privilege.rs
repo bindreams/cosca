@@ -1,94 +1,83 @@
-//! Test-only: drop whatever lets this process bypass DAC (discretionary access control), so a
-//! fixture that needs an `EACCES` precondition can rely on it holding for every caller — not just
-//! non-root ones.
+//! Test-only: start a fixture without the privilege that bypasses DAC (discretionary access
+//! control), so a fixture that needs an `EACCES` precondition can rely on it for every caller,
+//! root included.
 
-/// Makes DAC apply to the calling thread, and the threads and children it creates afterwards, for
-/// the rest of its life. On Linux this strips `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from
-/// the effective, permitted and inheritable capability sets (the ambient set follows for free —
-/// see below), sets `no_new_privs` so a uid-0 caller's later `execve` cannot regain either
-/// capability from the bounding set (see below for why that is otherwise live), and — when this
-/// thread holds `CAP_SETPCAP` — drops both from the bounding set too, so even a caller that does
-/// not set `no_new_privs` on its own children loses them for good. Elsewhere it drops root (if
-/// root) to an unprivileged uid/gid, the only DAC bypass a non-Linux caller can hold.
-///
-/// **Linux does not change uid.** Root's own `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` are
-/// themselves droppable capabilities, distinct from `CAP_SETUID`/`CAP_SETGID` — measured: root
-/// started with `--cap-drop SETUID,SETGID` (or `--cap-drop ALL`, or inside a fresh user namespace
-/// made with `unshare -r`) has neither of the latter two, so `setuid()` itself fails there. A
-/// fixture that called `setuid()` unconditionally and asserted its success — an earlier version
-/// of this function did — panics in exactly the lanes `main` (which asserts nothing) passes.
-/// Dropping only the two DAC capabilities, without touching uid at all, is both sufficient (a
-/// uid-0 caller stripped of both is already indistinguishable from unprivileged for DAC purposes)
-/// and — unlike a `setuid()` this thread may not be able to perform — always available: shedding
-/// a capability from a thread's own sets needs no privilege beyond already holding it.
-///
-/// A plain `setuid()` away from root, where available, clears the permitted, effective and
-/// ambient capability sets as a side effect (`capabilities(7)`, "Effect of User ID Changes on
-/// Capabilities", rule 1: a transition that leaves NONE of the real/effective/saved uid at 0,
-/// where at least one of them previously was, clears those three sets — the inheritable and
-/// bounding sets are untouched by any uid change). That rule never fires for a caller that was
-/// never uid 0 to begin with: an ambient capability carried by an ALREADY non-root caller
-/// survives a bare `setuid()` untouched, because the ambient set is copied back into the
-/// permitted and effective sets at every `execve` — including this process's own re-exec into the
-/// fixture that calls this function. On Linux, the explicit capability drop closes that gap
-/// directly, whether or not a uid change ever happens.
-///
-/// Call this ONLY at the very start of a freshly re-exec'd, single-test fixture process (see
-/// [`crate::test_child::run_fixture`]): it changes this thread's credentials permanently, which
-/// would corrupt every other concurrently running test if it ran inside the shared multi-test
-/// suite process instead. Asserted in debug via
-/// [`crate::test_child::parent_pid_matches`] — the same real-parent-pid check `run_fixture`'s own
-/// callers gate on, so a caller that reaches this function without having gone through that gate
-/// panics here instead of corrupting the shared process silently.
-pub(crate) fn drop_dac_bypass() -> std::io::Result<()> {
-    debug_assert!(
-        crate::test_child::parent_pid_matches(),
-        "drop_dac_bypass must only run in a freshly re-exec'd, single-test fixture process — \
-         this process's real parent does not match the pid run_fixture recorded"
-    );
-    if let Ok(msg) = std::env::var(INJECT_FAILURE_ENV) {
-        return Err(std::io::Error::other(msg));
+/// Whether the tests that only mean something as root run: the `COSCA_TEST_ROOT` group of
+/// principles 9 and 10. On unless `COSCA_TEST_ROOT=0`. An enabled group fails, rather than
+/// skips, when the caller is not root or has not given `COSCA_TEST_ROOT_CONSENT=1`. CI's ordinary
+/// jobs opt out; the root jobs (#218) do not.
+pub(crate) fn root_tests_enabled() -> bool {
+    if std::env::var("COSCA_TEST_ROOT").is_ok_and(|v| v == "0") {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    drop_root_uid()?;
-    #[cfg(target_os = "linux")]
-    drop_dac_capabilities()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    assert!(
+        unsafe { libc::geteuid() } == 0,
+        "the root tests need root: run the suite as root in a sandbox, or set COSCA_TEST_ROOT=0 to opt out"
+    );
+    assert!(
+        std::env::var("COSCA_TEST_ROOT_CONSENT").is_ok_and(|v| v == "1"),
+        "the root tests run as root: set COSCA_TEST_ROOT_CONSENT=1 (in a sandbox) or COSCA_TEST_ROOT=0"
+    );
+    true
+}
+
+/// Makes `cmd`'s child give up DAC bypass in its own `pre_exec`, after `fork` and before `exec`.
+///
+/// Credentials and capability sets belong to a thread on Linux. Only the single thread of a
+/// just-forked child speaks for the whole process, and everything it later `exec`s or spawns
+/// inherits the result. A fixture that dropped from inside a libtest worker thread would leave the
+/// thread-group leader, which `/proc/<pid>/...` permission checks consult, unreduced.
+///
+/// On Linux the child sheds `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` and sets `no_new_privs`,
+/// which stops a uid-0 `execve` from regaining them. Elsewhere a root child becomes
+/// [`UNPRIVILEGED`], the only DAC bypass there.
+///
+/// A failure fails `cmd.spawn()`. The hook runs in a forked child of a multithreaded process, so it
+/// makes only raw syscalls; its `debug_assert!`s carry literal messages for the same reason.
+pub(crate) fn drop_dac_bypass_before_exec(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the hook makes only async-signal-safe syscalls and allocates nothing on the success
+    // path.
+    unsafe {
+        cmd.pre_exec(drop_dac_bypass);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_dac_bypass() -> std::io::Result<()> {
+    use rustix::thread::CapabilitySet;
+    let dac = CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH;
+
+    // A thread may always shed its own capabilities, so bits it never held make this a no-op.
+    // Ambient needs no step of its own: the kernel keeps ambient a subset of permitted and
+    // inheritable.
+    let mut sets = rustix::thread::capabilities(None)?;
+    sets.effective.remove(dac);
+    sets.permitted.remove(dac);
+    sets.inheritable.remove(dac);
+    rustix::thread::set_capabilities(None, sets)?;
+
+    // The bounding set is left alone: `no_new_privs` alone disables the set-user-ID-root grant
+    // (`capabilities(7)`, "Effect of no_new_privs") that would give a uid-0 `execve` the bits back.
+    rustix::thread::set_no_new_privs(true)?;
+
+    let sets = rustix::thread::capabilities(None)?;
+    debug_assert!(
+        !sets.effective.intersects(dac) && !sets.permitted.intersects(dac) && !sets.inheritable.intersects(dac),
+        "a DAC capability survived the drop"
+    );
+    debug_assert!(rustix::thread::no_new_privs()?, "no_new_privs did not take");
     Ok(())
 }
 
-/// Test-only: when set, [`drop_dac_bypass`] returns `Err` immediately with this value as the
-/// message, skipping the real drop entirely. This is the seam each of `drop_dac_bypass`'s two
-/// call sites drives on its OWN — a mutant at either site (discarding the `Result`, or otherwise
-/// not propagating the `Err`) is only caught by a driver that goes through that SAME site, not by
-/// one that calls its downstream handler directly (measured: an earlier version of
-/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` called
-/// `report_and_exit_on_dac_bypass_failure` directly, and a mutant that dropped the call to
-/// `drop_dac_bypass` at the real call site entirely went undetected). Driven from
-/// `exact_posix_tests.rs::reports_and_exits_on_an_injected_dac_bypass_failure` (its
-/// `report_and_exit_on_dac_bypass_failure(drop_dac_bypass())` call site) and from
-/// `resolve_base_tests.rs::a_denied_candidate_fails_a_loadable_only_search_closed_reports_an_injected_dac_bypass_failure`
-/// (one of its three `.expect()` sites — the other two share the identical one-line pattern, so
-/// are not separately driven). A real failure IS forceable without this seam —
-/// `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just not portably enough
-/// to run as an ordinary `cargo test`.
-pub(crate) const INJECT_FAILURE_ENV: &str = "COSCA_FIXTURE_INJECT_DAC_BYPASS_FAILURE";
-
-/// The uid and gid a root fixture drops to: `nobody` on Linux, and the conventional unallocated
-/// id elsewhere. Unused on Linux, which never changes uid — see [`drop_dac_bypass`]. `pub(crate)`:
-/// [`crate::test_child::run_fixture`] also needs it, to `chown` the scratch root it hands each
-/// fixture to the identity the fixture will actually be running as once it drops.
+/// The uid and gid a root fixture drops to where there is no capability system to shed instead.
 #[cfg(not(target_os = "linux"))]
 pub(crate) const UNPRIVILEGED: libc::uid_t = 65534;
 
-/// The non-Linux half of [`drop_dac_bypass`]: root reaches an unsearchable directory anyway (it
-/// is the platform's only DAC bypass, with no separate capability system to strip), so a root
-/// fixture becomes [`UNPRIVILEGED`] first. A no-op for a caller that was never root.
 #[cfg(not(target_os = "linux"))]
-fn drop_root_uid() -> std::io::Result<()> {
-    // SAFETY: plain credential calls with valid arguments. libtest runs this on a thread of its
-    // own, not the main one, which is fine: Darwin's credentials are per-process, so the whole
-    // fixture process drops together — and the check that must run restricted happens on this
-    // same thread anyway.
+fn drop_dac_bypass() -> std::io::Result<()> {
+    // SAFETY: plain credential syscalls with valid arguments, in a single-threaded child.
     unsafe {
         if libc::geteuid() != 0 {
             return Ok(());
@@ -99,81 +88,6 @@ fn drop_root_uid() -> std::io::Result<()> {
         {
             return Err(std::io::Error::last_os_error());
         }
-    }
-    Ok(())
-}
-
-/// The Linux-only half of [`drop_dac_bypass`]: strips `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`
-/// from every capability set the calling thread could carry them in, via `rustix::thread` (a
-/// safe wrapper this crate already depends on for Linux — no reason to add a second capability
-/// crate for a test-only helper).
-#[cfg(target_os = "linux")]
-fn drop_dac_capabilities() -> std::io::Result<()> {
-    use rustix::thread::CapabilitySet;
-    let dac = CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH;
-
-    // Effective, permitted, inheritable: one call reads, one writes back all three at once. A
-    // thread may always shed its own capabilities from these three sets — no privilege needed,
-    // so dropping bits this thread never held (the common, non-root case) is a harmless no-op.
-    //
-    // No separate ambient step: the kernel enforces "a capability is never ambient unless it is
-    // also permitted AND inheritable" as an invariant of capset itself, so dropping a bit from
-    // either of those two here already clears it from ambient too (measured: `CapAmb` reads `0`
-    // afterwards with no `prctl(PR_CAP_AMBIENT, …)` call at all). An earlier version of this
-    // function called `PR_CAP_AMBIENT_LOWER` explicitly, redundantly — and on a kernel without
-    // ambient support (Linux < 4.3), or under a seccomp filter that refuses `PR_CAP_AMBIENT`
-    // specifically (the bounding-set and `no_new_privs` calls below are `prctl` too, and stay
-    // unaffected by such a filter), that call was the only step that failed: `main`, which never
-    // touches ambient, passes there; this function, for no reason once capset's own invariant
-    // already does the job, did not.
-    let mut sets = rustix::thread::capabilities(None)?;
-    sets.effective.remove(dac);
-    sets.permitted.remove(dac);
-    sets.inheritable.remove(dac);
-    rustix::thread::set_capabilities(None, sets)?;
-
-    // Bounding: prevents a uid-0 caller from regaining either capability at a LATER `execve` via
-    // the ordinary route — bounding only ever shrinks over a process's life. Needs `CAP_SETPCAP`,
-    // which this thread may not have — that is not a precondition failure, since bounding
-    // membership was never what let a `stat` through; only the effective set was. Best-effort,
-    // silently skipped otherwise (`no_new_privs` below is what covers that case instead).
-    if rustix::thread::capabilities(None)?
-        .effective
-        .contains(CapabilitySet::SETPCAP)
-    {
-        rustix::thread::remove_capability_from_bounding_set(CapabilitySet::DAC_OVERRIDE)?;
-        rustix::thread::remove_capability_from_bounding_set(CapabilitySet::DAC_READ_SEARCH)?;
-    }
-
-    // Without CAP_SETPCAP, the bounding set above is untouched, and a uid-0 thread's `execve` of
-    // an ordinary binary still regains everything in it: measured, a child this thread execs
-    // afterward has `CapEff` restored to the FULL bounding set, via the kernel's legacy
-    // set-user-ID-root compatibility grant (`capabilities(7)`) — "if the caller is uid 0, the
-    // exec'd program's permitted set becomes the bounding set" — which applies regardless of
-    // what this thread's OWN effective/permitted sets were reduced to. `no_new_privs` disables
-    // exactly that grant (same reference, "Effect of no_new_privs"), so the exec'd child inherits
-    // this thread's ALREADY-reduced set instead of the raw bounding set. It needs no privilege of
-    // its own and cannot be unset once set, which is exactly the "for the rest of its life"
-    // guarantee this function promises.
-    rustix::thread::set_no_new_privs(true)?;
-
-    // The precondition every caller of this function relies on, checked here rather than trusted:
-    // a caller three functions away that hits an unexpected `Ok(stat)` should not have to work out
-    // for itself whether this dropped anything. Checks permitted and inheritable too, not just
-    // effective: a `capset` that dropped effective but left a bit in permitted would still pass an
-    // effective-only check on THIS thread, yet a uid-0 `execve` recomputes the CHILD's permitted
-    // set from the parent's permitted (intersected with bounding) — measured, exactly that gap —
-    // so an effective-only postcondition would miss it even though the exec-time regain it exists
-    // to catch is real.
-    let sets = rustix::thread::capabilities(None)?;
-    if sets.effective.intersects(dac) || sets.permitted.intersects(dac) || sets.inheritable.intersects(dac) {
-        return Err(std::io::Error::other(format!(
-            "still holds {:?} somewhere in effective {:?}, permitted {:?} or inheritable {:?}",
-            dac, sets.effective, sets.permitted, sets.inheritable
-        )));
-    }
-    if !rustix::thread::no_new_privs()? {
-        return Err(std::io::Error::other("no_new_privs did not take"));
     }
     Ok(())
 }
