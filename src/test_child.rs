@@ -1,5 +1,174 @@
 //! Test-only child processes shared across the crate's unit tests.
 
+// Blocker fixtures =====
+
+/// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
+/// `findstr x` on Windows. Every fixture that needs a child "still alive at some later check"
+/// uses this instead of a fixed-duration `sleep`/`ping`, whose own timer would end the child on
+/// its own and let a mutant that skips the kill under test pass for the wrong reason. Stdin is
+/// what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
+///
+/// - [`leaked_writer_stdin`]: the write end is never closed, so only a kill by the code under
+///   test ends the child (teardown tests that own no handle on it).
+/// - [`held_std_blocker`], [`held_contained_blocker`] and [`held_contained_blocker_async`]: the
+///   caller holds the write end and must keep it for exactly as long as the child must stay
+///   alive. Dropping it (or `std::process::Child::wait()`, which closes the piped stdin before
+///   it waits) is a deliberate EOF release.
+///
+/// A `cat` backgrounded inside an `sh -c` script gets `/dev/null` as stdin (POSIX, for a
+/// non-interactive shell) unless it is redirected explicitly, and would exit at once. Write it
+/// `exec 3<&0; cat <&3 3<&- &`: `<&3` gives it the real pipe and `3<&-` closes the spare copy.
+///
+/// Neither `cat` nor `findstr` is proof of life by itself: `Existence::Present` is
+/// zombie-inclusive, and `SIGKILL`/`TerminateProcess` land asynchronously. A liveness claim needs
+/// an echo round trip through a piped stdout, or (Windows, where `findstr` does not echo) a
+/// clean exit after a closed stdin.
+pub(crate) const BLOCKER_ARGV: &[&str] = if cfg!(windows) { &["findstr", "x"] } else { &["cat"] };
+
+/// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
+/// [`BLOCKER_ARGV`]).
+pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    #[cfg(unix)]
+    let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+    #[cfg(windows)]
+    let file = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+    std::mem::forget(writer);
+    crate::stdio::Stdio::from_file(file)
+}
+
+/// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
+/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
+// Gated with its consumers: `tokio::wait_tests`, and the Unix-only cgroup and kqueue tests.
+#[cfg(any(unix, feature = "tokio"))]
+pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
+    let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
+    cmd.args(&BLOCKER_ARGV[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(stdout);
+    cmd
+}
+
+/// A spawned, contained [`BLOCKER_ARGV`] child and the write end of its stdin.
+pub(crate) fn held_contained_blocker(stdout: crate::Stdio) -> (crate::Child, std::io::PipeWriter) {
+    let mut cmd = crate::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(stdout).expect("set stdout");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
+/// Async twin of [`held_contained_blocker`].
+#[cfg(feature = "tokio")]
+pub(crate) fn held_contained_blocker_async(stdout: crate::Stdio) -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(stdout).expect("set stdout");
+    cmd.contain();
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    (child, stdin)
+}
+
+/// A process-group member that announces its own pid on a piped stdout and then blocks on a
+/// piped stdin. `pgid` is the group to join (`0` mints a new one of the member's own). The
+/// caller must take [`await_member_ready`] before using the member's identity: `spawn()`
+/// returning establishes neither that the image is running nor that its `setpgid` is visible.
+///
+/// `std::process::Child::wait()` closes the piped stdin before it waits, so `wait()` itself ends
+/// the member by EOF on its `read` (non-zero exit, no signal). An assertion that a real signal
+/// was the cause must check the status's `.signal()` and deliver the signal BEFORE `wait()`.
+#[cfg(unix)]
+pub(crate) fn member_command(pgid: i32) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .process_group(pgid);
+    cmd
+}
+
+/// Blocks until a [`member_command`] child has announced itself, and checks that the
+/// announcement came from that child.
+#[cfg(unix)]
+pub(crate) fn await_member_ready(child: &mut std::process::Child) {
+    use std::io::BufRead;
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("read the member's announcement");
+    let announced: crate::identity::RawPid = line.trim().parse().expect("the announcement carries a pid");
+    assert_eq!(
+        announced,
+        child.id(),
+        "the announcement must come from the member itself"
+    );
+    // Hand the pipe back rather than dropping it: the member outlives this call, and closing
+    // the read end under a live child would make any later write to it a `SIGPIPE`.
+    child.stdout = Some(out.into_inner());
+}
+
+/// Proves a `cat` blocker is alive and responsive: writes a byte to its stdin and reads it back
+/// from its stdout. A killed-but-unreaped `cat` cannot echo.
+#[cfg(unix)]
+pub(crate) fn assert_echoes(stdin: &mut impl std::io::Write, stdout: &mut impl std::io::Read) {
+    stdin.write_all(b"x").expect("write to the blocker");
+    let mut echo = [0u8; 1];
+    stdout
+        .read_exact(&mut echo)
+        .expect("the blocker must still be alive to echo");
+    assert_eq!(&echo, b"x");
+}
+
+/// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and
+/// `BrokenPipe` (the kill under test already landed, so the write goes nowhere) are both
+/// expected; any other error is a fixture fault and panics.
+pub(crate) fn write_to_possibly_dead_stdin(stdin: &mut impl std::io::Write, bytes: &[u8]) {
+    match stdin.write_all(bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing to the held stdin failed for a reason other than a dead reader: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod write_to_possibly_dead_stdin_tests {
+    use super::write_to_possibly_dead_stdin;
+
+    struct FailsWith(std::io::ErrorKind);
+    impl std::io::Write for FailsWith {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_dead_reader_is_expected() {
+        write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::BrokenPipe), b"x");
+    }
+
+    #[test]
+    fn a_live_reader_is_expected() {
+        write_to_possibly_dead_stdin(&mut Vec::new(), b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "other than a dead reader")]
+    fn any_other_error_panics() {
+        write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::PermissionDenied), b"x");
+    }
+}
+
+// Re-exec fixtures =====
+
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
 /// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
 /// cwd is `cwd` — proving whatever the fixture's body proves about a process's REAL cwd without
@@ -152,39 +321,43 @@ pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_TEST: &str = "test_child::fixture_survives_group_signal";
 
-/// The env var carrying the `127.0.0.1:<port>` address [`fixture_survives_group_signal`] connects
-/// back to and tags once the grandchild survivor exists in its own process group. Its mere
-/// presence also tells the fixture it was re-exec'd deliberately rather than picked up by an
-/// ordinary, unfiltered suite run — one var serves both roles, since the fixture needs the
-/// address either way.
+/// The env var carrying the `127.0.0.1:<port>` address the grandchild (a re-exec'd
+/// [`fixture_registers_then_blocks`]) connects back to; [`fixture_survives_group_signal`] only
+/// forwards it. Its presence also tells that fixture it was re-exec'd deliberately rather than
+/// picked up by an ordinary, unfiltered suite run.
 #[cfg(windows)]
 pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR";
 
 /// Windows-only fixture for the `root_exited`-on-`MembersRemain` regression (sync and async
 /// twins): a no-op when picked up by an ordinary, unfiltered suite run —
 /// [`FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV`] is unset there. Re-executed via `current_exe()
-/// --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`] with that var set, it instead spawns a
-/// grandchild a group `CTRL_BREAK` can never reach — `CREATE_NEW_PROCESS_GROUP` puts it in its
-/// own process group, the same isolation `graceful_shutdown_tree`'s own doc describes for a
-/// nested contained descendant — then connects to the caller's listener at that address and
-/// writes a single tag byte, proving the grandchild already exists (and is already in its own
-/// group) before the caller proceeds to call `graceful_shutdown_tree`. The tag goes out over a
-/// real TCP socket, not `print!`/`io::stdout()`: libtest captures the latter per-test and
-/// discards it for a passing test, so a stdout-based readiness byte never reaches the caller's
-/// piped reader at all — this is the same control-channel shape `tests/common`'s
-/// `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this reason, not a
-/// Windows-specific mechanism. The job object still tracks the grandchild as a tree member
-/// despite its own process group (job membership and process group are independent Win32
-/// concepts), so it shows up as a `MembersRemain` survivor even though the signal itself never
-/// reaches it. Mirrors [`spawn_a_process_that_exits`]'s filtered-re-exec idiom (see its own doc
-/// for why the filter is mandatory) put to a second use.
+/// --exact` [`FIXTURE_SURVIVES_GROUP_SIGNAL_TEST`] with that var set, it spawns a grandchild a
+/// group `CTRL_BREAK` can never reach — `CREATE_NEW_PROCESS_GROUP` puts it in its own process
+/// group, the same isolation `graceful_shutdown_tree`'s own doc describes for a nested
+/// contained descendant — then returns immediately, letting this intermediate process exit.
+///
+/// The grandchild is itself a re-exec'd [`fixture_registers_then_blocks`], given THIS fixture's
+/// OWN `addr` (forwarded via [`FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV`]) so it connects and
+/// blocks DIRECTLY against the caller's listener — never against a socket this short-lived
+/// intermediate process would itself own and then close on its own exit, which a
+/// caller-chosen `grace` can easily outlive. The grandchild's own connect-and-tag is thus the
+/// happens-before edge the caller blocks on: it cannot tag until its own code is running, in
+/// its own group. The tag goes out over a real TCP socket, not `print!`/`io::stdout()`: libtest
+/// captures the latter per-test and discards it for a passing test, so a stdout-based readiness
+/// byte never reaches the caller's piped reader at all — this is the same control-channel shape
+/// `tests/common`'s `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this
+/// reason, not a Windows-specific mechanism. The job object still tracks the grandchild as a
+/// tree member despite its own process group (job membership and process group are independent
+/// Win32 concepts), so it shows up as a `MembersRemain` survivor even though the signal itself
+/// never reaches it, and it stays that way for as long as the caller holds its control socket
+/// open. Mirrors [`spawn_a_process_that_exits`]'s
+/// filtered-re-exec idiom (see its own doc for why the filter is mandatory) put to a second use.
 #[cfg(windows)]
 #[test]
 fn fixture_survives_group_signal() {
     let Some(addr) = std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
-    use std::io::Write;
     use std::os::windows::process::CommandExt;
 
     // CREATE_NEW_PROCESS_GROUP (winbase.h). A scalar flag, so a raw constant needs no
@@ -192,14 +365,14 @@ fn fixture_survives_group_signal() {
     // as a plain `u32`.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     #[allow(clippy::zombie_processes)] // intentional: the grandchild must outlive us; containment kills it
-    let _survivor = std::process::Command::new("ping")
-        .args(["-n", "30", "127.0.0.1"])
+    let _survivor = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
+        .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
+        .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn a grandchild the group signal cannot reach");
-    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect readiness socket");
-    sock.write_all(b"R").expect("write readiness tag");
 }
 
 /// The fully-qualified libtest path of [`fixture_registers_then_blocks`], for callers that

@@ -25,14 +25,9 @@ fn quick_contained_cmd() -> crate::tokio::Command {
     cmd
 }
 
-fn long_lived_contained_cmd() -> crate::tokio::Command {
-    let mut cmd = crate::tokio::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    cmd
+/// Async twin of `child::lifecycle_tests::long_lived_contained_child`.
+fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
+    crate::test_child::held_contained_blocker_async(crate::Stdio::null())
 }
 
 #[tokio::test]
@@ -56,8 +51,7 @@ async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 
 #[tokio::test]
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let mut cmd = long_lived_contained_cmd();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200)).await;
     if drainable {
@@ -77,8 +71,7 @@ async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
 /// the full rationale.
 #[tokio::test]
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let mut cmd = long_lived_contained_cmd();
-    let mut child = cmd.spawn().expect("spawn");
+    let (mut child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO).await;
     if drainable {

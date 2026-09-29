@@ -32,17 +32,15 @@ fn await_zombie(pid: u32) {
     }
 }
 
+use crate::test_child::{await_member_ready, member_command};
+
 /// A group we lead lists the member we put in it, with a token that resolves to Alive.
 #[test]
 fn members_lists_a_live_owned_group() {
-    use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -109,14 +107,10 @@ fn members_of_an_absent_group_is_empty() {
 /// `ProcessId::of`'s live read, on both platforms.)
 #[test]
 fn members_token_matches_a_live_read_of_the_same_pid() {
-    use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
     let listed = members(pgid).expect("list the group");
@@ -136,22 +130,23 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
 /// signal, not just classify: the leader is dead afterward.
 #[test]
 fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
+
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut child = std::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
+    let mut child = member_command(0).spawn().expect("spawn leader");
+    await_member_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
         matches!(state(pgid, Signal::SIGKILL), GroupState::Cleared),
         "a group we own must never report refusers"
     );
     let status = child.wait().expect("wait after state()'s own SIGKILL");
-    assert!(
-        !status.success(),
+    // Not `!status.success()`: `Child::wait()` closes the piped stdin (see `member_command`), so
+    // the leader exits non-zero on EOF even if `state()` never signalled it.
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
         "state() must have actually delivered SIGKILL, not just probed, got {status:?}"
     );
 }

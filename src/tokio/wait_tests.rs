@@ -9,16 +9,79 @@ use std::time::Duration;
 use super::{grace_wait, wait_exit};
 use crate::identity::ProcessId;
 
-// A long-lived std child (leak-proof: killed + reaped by each test).
+// A long-lived std child (leak-proof: killed + reaped by each test) that only a kill or a closed
+// stdin ends; see `test_child::BLOCKER_ARGV`. Each test calls `wait()` (which closes the piped
+// stdin) only as its last step, after an explicit `kill()`.
 fn std_blocker() -> std::process::Child {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let _guard = crate::child::spawn::spawn_lock();
-    let mut cmd = std::process::Command::new(if cfg!(windows) { "ping" } else { "sleep" });
-    #[cfg(windows)]
-    cmd.args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null());
+    crate::test_child::held_std_blocker(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn std blocker")
+}
+
+/// Like `std_blocker`, with stdout piped for the echo round trip in [`assert_child_still_alive`].
+/// Local to `wait_exit_cancel_leaves_child_untouched` and (on Windows)
+/// `wait_exit_drop_releases_the_windows_watcher`.
+fn std_blocker_with_stdout() -> std::process::Child {
+    let _guard = crate::child::spawn::spawn_lock();
+    crate::test_child::held_std_blocker(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn std blocker")
+}
+
+/// Proves `child` (a [`std_blocker_with_stdout`]) is genuinely still alive: `is_alive()` alone
+/// races the asynchronous `SIGKILL`/`TerminateProcess`. On Unix, round-trips a byte through the
+/// piped stdout. On Windows, `findstr` does not echo: closes stdin and requires a clean exit and
+/// the echoed match, as `child::graceful_tests::assert_still_running` does, which reaps `child`.
+fn assert_child_still_alive(child: &mut std::process::Child) {
     #[cfg(unix)]
-    cmd.arg("30");
-    cmd.spawn().expect("spawn std blocker")
+    crate::test_child::assert_echoes(
+        child.stdin.as_mut().expect("piped stdin"),
+        child.stdout.as_mut().expect("piped stdout"),
+    );
+    #[cfg(windows)]
+    {
+        use std::io::{Read as _, Write as _};
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(b"x\r\n")
+            .expect("write to the blocker");
+        child.stdin = None; // close stdin: EOF, findstr can now finish and exit
+        let mut output = Vec::new();
+        child
+            .stdout
+            .as_mut()
+            .expect("piped stdout")
+            .read_to_end(&mut output)
+            .expect("read stdout to EOF");
+        let status = child.wait().expect("the blocker must exit after stdin closes");
+        assert!(
+            status.success(),
+            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
+        );
+        assert!(
+            output.windows(1).any(|w| w == b"x"),
+            "the blocker's stdout must contain the echoed match, got {output:?}"
+        );
+    }
+}
+
+/// Kills and reaps `child`. Windows discards errors: `assert_child_still_alive` already reaped it
+/// there, so a second kill or wait has nothing to act on.
+fn kill_and_reap(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 #[tokio::test]
@@ -232,7 +295,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
     use std::future::Future;
     // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
     // so the child must still be alive; it dies only by the test's own kill.
-    let mut child = std_blocker();
+    let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(wait_exit(id));
@@ -241,13 +304,8 @@ async fn wait_exit_cancel_leaves_child_untouched() {
             panic!("unbounded watch resolved at first poll on a live child: {r:?}");
         }
     } // <- future dropped here; on Windows the drop-guard releases the blocking watcher
-    assert_eq!(
-        id.is_alive(),
-        crate::identity::Liveness::Alive,
-        "a cancelled watch must not affect the child"
-    );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    assert_child_still_alive(&mut child); // a cancelled watch must not affect the child
+    kill_and_reap(&mut child);
 }
 
 // Proves release without a timeout: the watcher signals a channel when it returns; recv()
@@ -258,7 +316,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
     super::fault_observer::install_release_observer(tx);
-    let mut child = std_blocker();
+    let mut child = std_blocker_with_stdout();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(wait_exit(id));
@@ -269,13 +327,8 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     } // <- drop signals the cancel event
     rx.recv()
         .expect("the blocking watcher must return after the drop released it");
-    assert_eq!(
-        id.is_alive(),
-        crate::identity::Liveness::Alive,
-        "release must be signal-free"
-    );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    assert_child_still_alive(&mut child); // release must be signal-free
+    kill_and_reap(&mut child);
 }
 
 // `HandleIdentity::Different` is one of three outcomes `block_until_exit_or_cancel` can land on

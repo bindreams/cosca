@@ -6,6 +6,66 @@ use std::time::Duration;
 use super::fault as term_fault;
 use crate::wait::fault;
 
+/// A contained [`crate::test_child::BLOCKER_ARGV`] child with piped stdin and stdout, plus its
+/// stdin writer, which the caller must keep for exactly as long as the child must stay running.
+/// `Existence::Present` is not proof of life — it is zombie-inclusive on every platform — so a
+/// liveness claim goes through [`assert_still_running`].
+fn blocker() -> (crate::Child, std::io::PipeWriter) {
+    crate::test_child::held_contained_blocker(crate::Stdio::pipe())
+}
+
+/// Proves a [`blocker`] is genuinely still running, not merely resolvable. On Unix, round-trips
+/// a byte through `cat`'s piped stdout over the stdin writer the caller holds; a killed-but-unreaped
+/// `cat` cannot echo.
+///
+/// On Windows, `findstr` does not echo and `is_alive()` races the asynchronous `TerminateProcess`.
+/// Instead, write a line containing `x`, close stdin, and require both a clean exit (`findstr`'s
+/// "a match was found" code) and the echoed match on stdout; a killed process produces neither.
+/// This consumes `stdin` and reaps the child.
+fn assert_still_running(child: &mut crate::Child, mut stdin: std::io::PipeWriter) {
+    #[cfg(unix)]
+    {
+        let mut stdout = child.stdout().expect("piped stdout");
+        crate::test_child::assert_echoes(&mut stdin, &mut stdout);
+    }
+    #[cfg(windows)]
+    {
+        use std::io::{Read as _, Write as _};
+        stdin.write_all(b"x\r\n").expect("write to the blocker");
+        drop(stdin); // EOF: findstr can now finish reading and exit
+        let mut output = Vec::new();
+        child
+            .stdout()
+            .expect("piped stdout")
+            .read_to_end(&mut output)
+            .expect("read stdout to EOF");
+        let status = child.wait().expect("the blocker must exit after stdin closes");
+        assert!(
+            status.success(),
+            "the blocker must exit 0 (findstr's own 'a match was found' code), got {status:?}"
+        );
+        assert!(
+            output.windows(1).any(|w| w == b"x"),
+            "the blocker's stdout must contain the echoed match, got {output:?}"
+        );
+    }
+}
+
+/// Sweeps the tree and reaps the child. Windows discards errors: `assert_still_running` already
+/// reaped the child there, so a second kill or wait has nothing to act on.
+fn cleanup(child: &mut crate::Child) {
+    #[cfg(unix)]
+    {
+        child.kill_tree().expect("cleanup sweep");
+        child.wait().expect("reap");
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill_tree();
+        let _ = child.wait();
+    }
+}
+
 // A watch failure must not strand the tree between the soft signal and the hard sweep: the
 // sweep and reap still run, then the watch error surfaces. The reap is proven by identity on
 // all Unix — procfs and `sysctl KERN_PROC` are both zombie-inclusive, so a swept-but-unreaped
@@ -207,14 +267,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 // underlying error.
 #[test]
 fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let child = cmd.spawn().expect("spawn");
-    let id = child.id();
+    let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
@@ -223,16 +276,9 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
         matches!(err, crate::error::Error::Unassessable { source: Some(_), .. }),
         "got {err:?}"
     );
-    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE — same
-    // assertion shape as the pre-existing NoConsole/Unsupported fail-fast test below.
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Present,
-        "a listing-mechanism failure must return before any grace wait or sweep"
-    );
-    // Clean up: the child is still running by design (no sweep happened above).
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
+    assert_still_running(&mut child, stdin);
+    cleanup(&mut child);
 }
 
 // The invariant under test: only an AUTHORITATIVE drain-observable mechanism (cgroup v2, Windows
@@ -329,37 +375,47 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
         );
         drop(armed); // already disarmed by the sweep above; this is a no-op, kept for symmetry
         assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-        let _ = child.kill_tree(); // cleanup: the forced failure means the real sweep never ran
-        let _ = child.wait();
+        cleanup(&mut child); // the forced failure means the real sweep never ran
     }
 }
 
-// Regression test: on the `MembersRemain` branch — a drain-observable
-// mechanism whose tree does NOT fully drain within `grace` — `root_exited` must be freshly
-// computed by its own zero-duration probe of the root, not hardcoded `false`. Otherwise an
-// already-exited-but-unreaped root is stranded as a zombie when the subsequent hard sweep
-// also fails, because the best-effort reap below is gated on `root_exited`.
+// Regression test: on the `MembersRemain` branch (a drain-observable mechanism whose tree does
+// NOT fully drain within `grace`), `root_exited` must come from its own zero-duration probe of the
+// root, not be hardcoded `false`. Otherwise an already-exited-but-unreaped root is stranded as a
+// zombie when the hard sweep also fails, because the best-effort reap is gated on `root_exited`.
 //
-// Fixture: the root shell installs `trap '' TERM`, backgrounds `sleep 30` (which vastly
-// outlives `grace`, keeping the tree from fully draining and forcing `MembersRemain`
-// specifically), writes a single readiness byte, then exits on its own. The test blocks on
-// that byte before ever calling `graceful_shutdown_tree` — a genuine happens-before edge from a
-// real pipe event, not a sleep or a bet that the runner is fast: the root's own `trap`
-// installation has nothing else synchronizing it against `spawn()` returning, and the byte
-// cannot be written until both the trap and the background job are already in place.
-// On a mechanism with no kernel drain edge, this same fixture still exercises the pre-existing
-// root-only watch, which already computes `root_exited` correctly — asserted separately below
-// rather than skipped, per this crate's "never silently skip" testing convention.
+// Fixture: the root shell ignores TERM (`trap ''` survives `exec`) and backgrounds a `cat` blocked
+// on a stdin this test holds open, so the tree cannot drain. It then writes a readiness byte (the
+// trap and background job are in place) and waits for a line on fd 4 before `exit 0`. The gate
+// keeps the exit from racing `spawn()`, where `SharedChild::new` can reap a fast-exiting child.
+// The test releases it with `x\n`: `read` returns on the newline, so the release does not depend
+// on EOF, which a concurrent fork inheriting the write end would withhold. It then waits with
+// `block_until_exit`, which does not reap, so the root is an unreaped zombie when
+// `graceful_shutdown_tree` runs. Asserting `Present` at that point keeps the final `Gone` from
+// passing vacuously: had the test reaped the root itself, a mutant that skips the function's own
+// reap would still read `Gone`.
+//
+// The `exec 3<&0; cat <&3 3<&- &` idiom is explained at `test_child::BLOCKER_ARGV`. Without a
+// kernel drain edge, the fixture still exercises the root-only watch, asserted below.
 #[cfg(unix)]
 #[test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     let mut cmd = crate::Command::new();
-    cmd.args(["sh", "-c", "trap '' TERM; sleep 30 & echo r; exit 0"]);
+    cmd.args([
+        "sh",
+        "-c",
+        "trap '' TERM; exec 3<&0; cat <&3 >/dev/null 3<&- & echo r; read _ <&4; exit 0",
+    ]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.fd(4, crate::Stdio::pipe_in()).expect("set exit-gate pipe");
     cmd.contain();
     let mut child = cmd.spawn().expect("spawn");
+    // Held for the test's whole body: dropping it delivers EOF to the backgrounded `cat`.
+    let _stdin = child.stdin().expect("piped stdin");
+    let mut exit_gate = child.fd_write_end(4.into()).expect("exit-gate write end");
     let mut readiness = [0u8; 1];
     child
         .stdout()
@@ -367,6 +423,19 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
         .read_exact(&mut readiness)
         .expect("readiness byte");
     let id = child.id();
+    // The root is still blocked on `read _ <&4`: release it, then wait for its exit WITHOUT
+    // reaping.
+    exit_gate.write_all(b"x\n").expect("release the root's exit 0");
+    drop(exit_gate);
+    assert!(
+        crate::wait::block_until_exit(id, None).expect("the root must exit"),
+        "block_until_exit must observe the exit, not a timeout (None means unbounded)"
+    );
+    assert_eq!(
+        id.exists(),
+        crate::identity::Existence::Present,
+        "the exited root must still be an unreaped zombie before graceful_shutdown_tree runs"
+    );
     let drainable = child.containment().can_observe_drain();
     term_fault::set_force_kill_tree_error(true);
     let err = child
@@ -387,9 +456,9 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
             "non-drain-observable fallback branch — pre-existing, unaffected behavior"
         }
     );
-    // Cleanup: the forced sweep failure was a stub, so the SIGTERM-ignoring descendant is
-    // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    let _ = child.kill_tree();
+    // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
+    // real sweep now (the seam is consumed) kills it.
+    child.kill_tree().expect("cleanup sweep");
 }
 
 // Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above,
@@ -414,12 +483,16 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // Fixture: `test_child::fixture_survives_group_signal` (see its own doc) plays the Unix root
 // shell's role — it spawns a `CREATE_NEW_PROCESS_GROUP` grandchild the group `CTRL_BREAK` can
 // never reach (forcing `MembersRemain` on the drain-observable job object, exactly like the Unix
-// fixture's backgrounded, TERM-immune `sleep`), THEN connects back and tags over the TCP
-// listener below, proving the grandchild already exists in its own group before this test
-// proceeds — the same happens-before edge the Unix fixture's readiness-byte read supplies, over
-// the same control-channel shape `tests/common::spawn_tree` uses (a stdout byte would not work
-// here: libtest captures a passing test's own `print!` output and discards it, so it would never
-// reach a piped reader — see the fixture's own doc).
+// fixture's backgrounded, TERM-immune `cat`). The grandchild is itself a re-exec'd
+// `fixture_registers_then_blocks`, blocked on a control socket connected DIRECTLY to the
+// listener below — not to a socket the short-lived intermediate `fixture_survives_group_signal`
+// process would itself own and then close on its own exit. That connect-and-tag IS the
+// happens-before edge (the grandchild cannot tag until its own code is running, in its own
+// group), over the same control-channel shape `tests/common::spawn_tree` uses (a stdout byte
+// would not work here: libtest captures a passing test's own `print!` output and discards it, so
+// it would never reach a piped reader — see the fixture's own doc). `sock` is held for this
+// whole test: dropping it would deliver EOF and let the grandchild exit on its own, defeating
+// the MembersRemain fixture.
 #[cfg(windows)]
 #[test]
 fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
@@ -464,26 +537,13 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 // the requested grace, so there is nothing to synchronize on.
 #[test]
 fn graceful_tree_non_containment_terminate_error_fails_fast() {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    let child = cmd.spawn().expect("spawn");
-    let id = child.id();
+    let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("the forced Unsupported error must surface immediately");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     // Fails fast: no grace was waited, no sweep ran, so the child is STILL ALIVE.
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Present,
-        "a non-containment terminate error must return before any grace wait or sweep"
-    );
-    // Clean up: the child is still running by design (no sweep happened above).
-    let _ = child.kill_tree();
-    let _ = child.wait();
+    assert_still_running(&mut child, stdin);
+    cleanup(&mut child);
 }

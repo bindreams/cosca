@@ -6,14 +6,12 @@ use crate::child::spawn::fault;
 use crate::error::Error;
 use crate::tokio::Command;
 
-// A long-lived child, so a teardown leak would show as an alive process at the assert rather than
-// self-exiting.
+// A child only a real kill ends — see `child::spawn_tests::blocker`.
 fn blocker() -> Command {
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::test_child::leaked_writer_stdin())
+        .expect("set stdin pipe");
     cmd
 }
 
@@ -125,10 +123,7 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let mut cmd = crate::tokio::Command::new();
-                #[cfg(unix)]
-                cmd.args(["cat"]);
-                #[cfg(windows)]
-                cmd.args(["findstr", "x"]);
+                cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
                 cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
                 fault::set_force_attach_failure(true);
                 fault::set_force_kill_failure_leaving_child_alive_as("cosca-async-kill-fail-5d2c", kind);
@@ -509,11 +504,13 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
 // kill_on_drop(false) commits only with the spawn -----
 // Async twins of the sync `spawn_tests` of the same name.
 
-/// The sync command `spawn_uncommitted` takes: a long-lived child with `kill_on_drop(false)`.
+/// The sync command `spawn_uncommitted` takes: a [`blocker`] with `kill_on_drop(false)`.
 #[cfg(target_os = "linux")]
 fn opted_out_blocker() -> crate::command::Command {
     let mut cmd = crate::command::Command::new();
-    cmd.args(["sleep", "30"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::test_child::leaked_writer_stdin())
+        .expect("set stdin pipe");
     cmd.kill_on_drop(false);
     cmd
 }

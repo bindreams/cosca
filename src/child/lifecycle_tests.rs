@@ -29,15 +29,10 @@ fn quick_contained_child() -> crate::Child {
     cmd.spawn().expect("spawn")
 }
 
-/// A long-lived contained child, for the deadline-not-met case.
-fn long_lived_contained_child() -> crate::Child {
-    let mut cmd = crate::Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
-    cmd.contain();
-    cmd.spawn().expect("spawn")
+/// A contained [`crate::test_child::BLOCKER_ARGV`] child and its stdin writer, which the caller
+/// must keep for exactly as long as the child must stay running.
+fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
+    crate::test_child::held_contained_blocker(crate::Stdio::null())
 }
 
 /// Drained case: on a drain-observable mechanism, an unbounded `wait_tree()` against a tree
@@ -68,7 +63,7 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 /// non-drainable mechanism the same call must still fail `Unsupported`.
 #[test]
 fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
-    let child = long_lived_contained_child();
+    let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::from_millis(200));
     if drainable {
@@ -90,7 +85,7 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
 /// implementation checks `remaining == Duration::ZERO` before its first blocking syscall).
 #[test]
 fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
-    let child = long_lived_contained_child();
+    let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
     let result = child.wait_tree_timeout(Duration::ZERO);
     if drainable {

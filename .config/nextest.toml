@@ -97,3 +97,14 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # `default` so a local run is bounded the same way.
 filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
+# stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
+# detect that themselves; this bound only stops a hang from stalling the job. It covers the whole
+# lib test binary (the one that holds those fixtures), not a list of tests, so a new fixture user is
+# bounded without touching this file. The slowest legitimate test is the batch-gate oracle, ~30s
+# under load, so 60s x 5 leaves ample headroom. Earlier overrides in this file win for the tests
+# they name.
+filter = 'binary(cosca)'
+slow-timeout = { period = "60s", terminate-after = 5 }

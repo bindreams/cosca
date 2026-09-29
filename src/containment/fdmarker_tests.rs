@@ -33,6 +33,7 @@
 //! concurrently-running `hard_kill()`/`holders()` scan in THIS module could then find and
 //! SIGKILL that bystander.
 
+use crate::test_child::{await_member_ready, member_command};
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -622,17 +623,21 @@ fn the_kill_filter_excludes_this_process_and_pid_one() {
 /// `ProcessId::of` in the very next line races the kernel's own delivery-and-reap timing — a
 /// zombie orphan (signalled, not yet reaped by launchd) still resolves via `proc_pidinfo` with
 /// the SAME start token, so that check alone can pass before the kill has actually landed. `sh`
-/// backgrounds `sleep` without redirecting it, so `sleep` inherits `sh`'s piped stdout; once
-/// `sh` exits (`child.wait()`, above), the orphaned `sleep` is the pipe's ONLY remaining write
-/// end, so a blocking read on it returns EOF exactly when `sleep` dies — a real event, not a
+/// backgrounds `cat` without redirecting its stdout, so `cat` inherits `sh`'s piped stdout; once
+/// `sh` exits (`child.wait()`, above), the orphaned `cat` is the pipe's ONLY remaining write
+/// end, so a blocking read on it returns EOF exactly when `cat` dies — a real event, not a
 /// timer.
+///
+/// The orphan is a `cat` blocked on a held stdin (see `test_child::BLOCKER_ARGV` for the
+/// backgrounding idiom), so only `hard_kill()` can end it.
 #[test]
 fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
-    // `sleep` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
+    // `cat` inherits the marker across sh's fork and its own exec; `echo $!` publishes it.
     cmd.arg("-c")
-        .arg("sleep 600 & echo $!")
+        .arg("exec 3<&0; cat <&3 3<&- & echo $!")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     // setsid: the orphan leaves this process's session AND process group, so killpg misses it.
     // SAFETY: pre_exec runs post-fork, pre-exec; `libc::setsid` is async-signal-safe.
@@ -649,6 +654,9 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let mut child = cmd.spawn().expect("spawn sh");
     drop(cmd);
 
+    // Held past the kill: `child.wait()` closes the child's own stdin, and only `hard_kill()` may
+    // end the orphan.
+    let mut stdin = child.stdin.take().expect("piped stdin");
     let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     out.read_line(&mut line).expect("read orphan pid");
@@ -663,12 +671,13 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let marker = super::Marker::new(prepared, None, None, false);
     marker.hard_kill().expect("hard_kill");
 
-    // The proof: `sleep` is the pipe's sole remaining writer, so EOF fires exactly on its
-    // death — a real event, not a timer. This DOES block until then, unlike `Member::assert_dead`
-    // in Task 7: there is no alive/dead round trip available on a plain, un-echoing `sleep`, so
-    // there is no way to fail non-blockingly on the "still alive" branch here. Accepted
-    // deliberately for this one unit test (the integration tests in Task 7 use control sockets
-    // precisely to avoid this tradeoff at the suite's more expensive layer).
+    // If `hard_kill()` missed the orphan, the live `cat` echoes this byte and then exits on the
+    // EOF, so `rest` below is non-empty. If the kill landed, this writes to a dead pipe.
+    crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
+    drop(stdin);
+
+    // The proof: `cat` is the pipe's sole remaining writer, so EOF fires exactly on its
+    // death — a real event, not a timer.
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut out, &mut rest).expect("read to EOF on the orphan's stdout");
     assert!(rest.is_empty(), "unexpected trailing output from the orphan: {rest:?}");
@@ -767,11 +776,9 @@ fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_sign
 /// whole reason no separate liveness check is needed — see the function's doc).
 #[test]
 fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
-    use std::os::unix::process::CommandExt;
     let _serialize = test_spawn_lock();
-    let mut cmd = std::process::Command::new("/bin/sleep");
-    cmd.arg("600").process_group(0); // pgid == the child's own pid — `process_group` is safe.
-    let mut child = cmd.spawn().expect("spawn sleep");
+    let mut child = member_command(0).spawn().expect("spawn member"); // pgid == the child's own pid
+    await_member_ready(&mut child);
     let pid = child.id() as crate::identity::RawPid;
     let pgid = child.id() as i32;
 
@@ -792,21 +799,6 @@ fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() 
     );
 }
 
-/// A process-group member for the sweep tests: a `/bin/sh` that announces its own pid on a
-/// piped stdout and then blocks on a piped stdin. `pgid` is the group to join (`0` mints a new
-/// one of the member's own). The caller installs any marker on the returned command, spawns it,
-/// and must then take the readiness edge with [`await_member_ready`] before scanning for it.
-fn member_command(pgid: i32) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg("echo $$; read _ignored")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .process_group(pgid);
-    cmd
-}
-
 /// A shell for scripts that redirect or close `marker_fd`, which `safe_marker_fd`/`HIGH_FLOOR` in
 /// `fdmarker.rs` guarantee is always >= 64: the fd number sits BEFORE the operator, in the
 /// IO_NUMBER position, and a dash-family shell only recognizes a single-digit IO_NUMBER there —
@@ -814,30 +806,6 @@ fn member_command(pgid: i32) -> std::process::Command {
 /// "exec: 64: not found" rather than closing fd 64.
 fn high_fd_shell() -> std::process::Command {
     std::process::Command::new("/bin/bash")
-}
-
-/// Block until a [`member_command`] child has announced itself, and check that the announcement
-/// came from that child.
-///
-/// The edge a spawned member must be scanned behind. `spawn()` returning reports the fork and
-/// the exec hand-off; it does not establish that the member's image is running, that its
-/// descriptor table answers a `proc_pidfdinfo` query, or that its `setpgid` is visible to
-/// `getpgid` — the three states a holder scan and the group-signal gate assert against. A
-/// `/bin/sleep` member can announce none of that, so the only way to wait for it would be a
-/// clock.
-fn await_member_ready(child: &mut std::process::Child) {
-    let mut out = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-    let mut line = String::new();
-    out.read_line(&mut line).expect("read the member's announcement");
-    let announced: crate::identity::RawPid = line.trim().parse().expect("the announcement carries a pid");
-    assert_eq!(
-        announced,
-        child.id(),
-        "the announcement must come from the member itself"
-    );
-    // Hand the pipe back rather than dropping it: the member outlives this call, and closing
-    // the read end under a live child would make any later write to it a `SIGPIPE`.
-    child.stdout = Some(out.into_inner());
 }
 
 /// Item 1's central regression test: `sweep_pass`'s group-signal gate must re-fire on a LATER

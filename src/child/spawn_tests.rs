@@ -8,14 +8,14 @@ use super::fault;
 use crate::command::Command;
 use crate::error::Error;
 
-// A long-lived child, so a teardown leak would show as an alive process at the assert rather than
-// self-exiting.
+// A child only a real kill ends, so a teardown leak shows as an alive process at the assert
+// rather than a self-exit, and a mutant that skips the kill hangs instead of passing. See
+// `test_child::BLOCKER_ARGV` for why, and `leaked_writer_stdin` for the stdin.
 fn blocker() -> Command {
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(["sleep", "30"]);
-    #[cfg(windows)]
-    cmd.args(["ping", "-n", "30", "127.0.0.1"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::test_child::leaked_writer_stdin())
+        .expect("set stdin pipe");
     cmd
 }
 
@@ -124,10 +124,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
     let mut cmd = Command::new();
-    #[cfg(unix)]
-    cmd.args(["cat"]);
-    #[cfg(windows)]
-    cmd.args(["findstr", "x"]);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     fault::set_force_attach_failure(true);
