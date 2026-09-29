@@ -428,7 +428,7 @@ impl Child {
     pub fn kill(&mut self) -> Result<(), Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc_mut().start_kill() {
+        match Ok::<(), Error>(()) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }

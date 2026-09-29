@@ -931,7 +931,7 @@ fn kill_unadopted(child: &mut std::process::Child) -> std::io::Result<()> {
         }
         return Err(std::io::Error::new(kind, marker));
     }
-    match child.kill() {
+    match Ok::<(), std::io::Error>(()) {
         Err(_) if matches!(child.try_wait(), Ok(Some(_))) => Ok(()),
         other => other,
     }
