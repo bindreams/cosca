@@ -1,0 +1,75 @@
+[
+ {
+  "name": "N1 (#265) Child::wait_deadline no clock advance",
+  "expect": "red",
+  "timeout": 240,
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/child/lifecycle.rs",
+    "            crate::wait::test_clock::advance_by_elapsed_if_frozen(call_start.elapsed());\n",
+    ""
+   ]
+  ],
+  "filters": [
+   "wait_deadline_terminates_under_a_frozen_clock"
+  ]
+ },
+ {
+  "name": "N2 (#265) Child::wait_deadline trusts first None",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/child/lifecycle.rs",
+    "if crate::wait::remaining(Some(Some(deadline))) == Some(Duration::ZERO) {",
+    "if true {"
+   ]
+  ],
+  "filters": [
+   "child::lifecycle::lifecycle_tests::wait_deadline_never_reports"
+  ]
+ },
+ {
+  "name": "N3 (#245) observer anchor after the read (seq order)",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/wait/windows.rs",
+    "let before_identity_seq = deadline_observer::next_seq();",
+    "let before_identity_seq = u64::MAX;"
+   ]
+  ],
+  "filters": [
+   "grace_wait_windows_arms_the_wait_from_a_single_deadline"
+  ]
+ },
+ {
+  "name": "N4 (#245) grace_wait re-derives the deadline",
+  "expect": "red",
+  "cargo": [
+   "--features",
+   "tokio"
+  ],
+  "edits": [
+   [
+    "src/tokio/wait.rs",
+    "    blocking_watch(id, deadline).await",
+    "    let _ = deadline;\n    blocking_watch(id, crate::wait::deadline_from(grace)).await"
+   ]
+  ],
+  "filters": [
+   "grace_wait_windows_arms_the_wait_from_a_single_deadline"
+  ]
+ }
+]
