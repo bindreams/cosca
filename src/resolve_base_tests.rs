@@ -278,10 +278,8 @@ fn a_candidate_is_accepted_when_fully_qualified() {
     }
 }
 
-/// Reads the raw OS error [`crate::error::io_context`] wrapped: it keeps the original
-/// [`std::io::Error`] as `source()` precisely so the code survives being wrapped (several codes
-/// share one [`std::io::ErrorKind`]), and these fixtures rely on that to pin the exact errno
-/// rather than the coarser kind.
+/// The raw OS error [`crate::error::io_context`] wrapped: it keeps the original error as `source()`
+/// so the code survives, and several codes share one [`std::io::ErrorKind`].
 #[cfg(unix)]
 fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
     std::error::Error::source(e)
@@ -289,25 +287,12 @@ fn wrapped_raw_os_error(e: &std::io::Error) -> Option<i32> {
         .and_then(std::io::Error::raw_os_error)
 }
 
-/// Joins two directories into the `PATH` value [`search_tool`]'s `windows: true` expects to
-/// parse — deliberately not `std::env::join_paths`, which would use THIS HOST's own separator
-/// (`:` on Unix) rather than the Windows one every caller here means to test, splitting nothing
-/// at all once handed to [`split_path_var_windows`]. Not a bare `;`-joined string either: an
-/// ambient `TMPDIR` (every caller's tempdir is built under one) is not this crate's own to
-/// control, and a `;` inside one directory's own path would otherwise be misread as a THIRD
-/// entry's boundary. [`split_path_var_windows`] already has a rule for exactly this — a `"..."`
-/// quoted span is copied through literally, `;` included, with the quotes themselves stripped —
-/// so quoting BOTH entries here, unconditionally, means neither can ever be split on its own
-/// content, whether or not it happens to contain one.
+/// Joins two directories into the `PATH` value [`search_tool`]'s `windows: true` parses. Not
+/// `std::env::join_paths`, which uses the host's `:`. Each entry is quoted, which
+/// [`split_path_var_windows`] copies through literally, so a `;` in an ambient `TMPDIR` cannot split
+/// an entry.
 ///
-/// Panics if either directory's own path contains a literal `"`: unlike `;`, this grammar has no
-/// way to quote a `"` (there is no escape rule — `split_path_var_windows` toggles `in_quotes` on
-/// every one, unconditionally), so a component holding one genuinely cannot be expressed. Also
-/// not a real-world concern to guard for its own sake: NTFS forbids `"` in a file name outright,
-/// so a directory whose OWN name holds one can never exist to be joined in the first place. This
-/// assert exists for the same reason `locked_then_open`'s callers assert `drop_dac_bypass` ran —
-/// failing loudly on a precondition that should be unreachable is cheaper than a fixture that
-/// quietly tests the wrong thing if it somehow is.
+/// Panics on a `"` in either path: the grammar has no escape for one, and NTFS forbids it in a name.
 #[cfg(unix)]
 fn windows_path_var(first: &Path, second: &Path) -> std::ffi::OsString {
     use std::os::unix::ffi::OsStrExt;
@@ -336,9 +321,7 @@ fn windows_path_var_resolves_two_ordinary_directories() {
     assert_eq!(search_tool(&path, false).unwrap(), second.path().join("tool.exe"));
 }
 
-/// The precondition this crate cannot control — an ambient `TMPDIR` containing the Windows `PATH`
-/// separator — must still resolve correctly, not silently merge two entries into one: quoting is
-/// what makes that so, proven here against the real parser rather than trusted from its doc.
+/// An ambient `TMPDIR` containing the `PATH` separator must not merge two entries into one.
 #[cfg(unix)]
 #[test]
 fn windows_path_var_resolves_a_directory_whose_name_contains_the_separator() {
@@ -358,17 +341,9 @@ fn windows_path_var_refuses_a_component_holding_a_quote() {
 
 /// A `PATH` entry whose candidate cannot be checked, followed by one that holds the name.
 ///
-/// The first entry is a symlink to itself: resolving `<loop>/tool.exe` always yields `ELOOP`,
-/// the kernel's own loop-detection limit. That is not a DAC (discretionary access control)
-/// decision — no capability, root's `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` included, exempts a
-/// caller from it — so it fails identically for every uid. `ELOOP` is also already pinned as
-/// undeterminable, independently of this fixture, by
-/// [`only_a_denied_or_absent_execute_check_is_a_no`]; a too-long name would only be undeterminable
-/// by `is_absence` never having listed it, an omission a future change could close unnoticed.
-///
-/// The precondition this fixture means to build — a candidate `is_absence` cannot call absent —
-/// is asserted here rather than trusted, so a platform where it stops holding fails loudly instead
-/// of silently testing nothing.
+/// The first entry is a symlink to itself, so `<loop>/tool.exe` is `ELOOP` for every uid: the
+/// kernel's loop limit is not a DAC (discretionary access control) decision, which no capability
+/// overrides. The precondition, a candidate `is_absence` cannot call absent, is asserted.
 #[cfg(unix)]
 fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
     let root = tempfile::tempdir().unwrap();
@@ -387,76 +362,29 @@ fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
     (root, open, path)
 }
 
-/// Restores a directory's permissions on drop, so the tempdir can be removed whatever the test's
-/// outcome.
+/// A `chmod 0o000` directory, and the guard that unlocks it on drop.
 #[cfg(unix)]
-struct Locked(PathBuf);
+struct Locked(PathBuf, crate::test_child::RestoreMode);
 
 #[cfg(unix)]
 impl Locked {
     fn new(dir: PathBuf) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        let restore = crate::test_child::RestoreMode::new(&dir, 0o755);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        Locked(dir)
+        Locked(dir, restore)
     }
 }
 
-#[cfg(unix)]
-impl Drop for Locked {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)) {
-            log::warn!("could not unlock {:?}: {e}", self.0);
-        }
-    }
-}
-
-/// A tempdir built under [`crate::test_child::run_fixture`]'s scratch root rather than
-/// `tempfile::tempdir()`'s ambient `TMPDIR` — every caller of this function runs after
-/// [`crate::test_privilege::drop_dac_bypass`], whose post-drop identity the scratch root, not
-/// necessarily the ambient `TMPDIR`, is guaranteed reachable by (see `run_fixture`'s doc).
+/// A `PATH` entry whose candidate is refused with `EACCES`, followed by one that holds the name:
+/// the one failure whose kind is `PermissionDenied`.
 ///
-/// On Linux, that root is `/proc/<this process's own pid>/fd/<the fd number `run_fixture` env-
-/// carried>` — see [`crate::test_child::open_scratch_fd`]'s doc for why a `/proc` magic link,
-/// rather than the real path, is what makes the ambient `TMPDIR`'s own traversal bits irrelevant.
-/// Elsewhere, the real path `run_fixture` handed over directly.
-#[cfg(target_os = "linux")]
-fn fixture_scratch_tempdir() -> tempfile::TempDir {
-    let fd: i32 = std::env::var(crate::test_child::FIXTURE_SCRATCH_FD_ENV)
-        .expect("COSCA_FIXTURE_SCRATCH_FD must be set by run_fixture")
-        .parse()
-        .expect("COSCA_FIXTURE_SCRATCH_FD must be an fd number");
-    let root = format!("/proc/{}/fd/{fd}", std::process::id());
-    tempfile::Builder::new()
-        .tempdir_in(root)
-        .expect("tempdir_in the fixture scratch root")
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn fixture_scratch_tempdir() -> tempfile::TempDir {
-    let root = std::env::var_os(crate::test_child::FIXTURE_SCRATCH_ROOT_ENV)
-        .expect("COSCA_FIXTURE_SCRATCH_ROOT must be set by run_fixture");
-    tempfile::Builder::new()
-        .tempdir_in(root)
-        .expect("tempdir_in the fixture scratch root")
-}
-
-/// A `PATH` entry whose candidate cannot be checked because its directory is unreadable, followed
-/// by one that holds the name. Unlike [`loop_then_open`], this is a real permission denial — the
-/// one failure whose kind is `PermissionDenied`, as an unreadable `PATH` directory yields — not a
-/// stand-in on another errno.
-///
-/// DAC (discretionary access control) is what refuses the `stat` this builds towards, and DAC has
-/// bypasses: root's `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, or either capability carried ambient
-/// by an otherwise ordinary caller (`capabilities(7)`; ambient survives a bare `setuid`, unlike
-/// root's own capabilities — see [`crate::test_privilege::drop_dac_bypass`]'s doc). Every caller
-/// of this function must have already called that in a freshly re-exec'd, single-test process —
-/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`] is why. The precondition is
-/// asserted below regardless, so a caller that skipped the drop, or a bypass the drop does not yet
-/// cover, fails loudly instead of silently testing nothing.
+/// Only a caller without DAC bypass gets `EACCES`: root's, or either DAC capability, would see an
+/// empty directory. Callers therefore run in a fixture [`crate::test_child::run_fixture`] started
+/// without it, and the precondition is asserted.
 #[cfg(unix)]
 fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString) {
-    let root = fixture_scratch_tempdir();
+    let root = crate::test_child::fixture_scratch_tempdir();
     let locked = root.path().join("locked");
     let open = root.path().join("open");
     std::fs::create_dir(&locked).unwrap();
@@ -469,7 +397,7 @@ fn locked_then_open() -> (tempfile::TempDir, Locked, PathBuf, std::ffi::OsString
         e.raw_os_error(),
         Some(libc::EACCES),
         "precondition: {candidate:?} must be denied to this caller, not {e} — did the caller \
-         forget to drop_dac_bypass() first?"
+         forget run_fixture?"
     );
     let path = windows_path_var(&locked.0, &open);
     (root, locked, open, path)
@@ -492,47 +420,54 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
 #[cfg(unix)]
 const FIXTURE_STAT_TARGET_ENV: &str = "COSCA_FIXTURE_STAT_TARGET";
 
-/// Inert in an ordinary suite run. `stat`s [`FIXTURE_STAT_TARGET_ENV`] and exits with the raw
-/// errno (`0` on success) — nothing is written to stdout or stderr, so the PARENT
-/// ([`stat_errno_via_grandchild`]) learns the result from the exit code alone. That is the whole
-/// reason this fixture exists rather than a plain `ls`/`stat` command: `strerror()`'s text (what
-/// `ls`'s own stderr, and `std::io::Error`'s `Display`, both go through) is localized by
-/// `LANG`/`LC_ALL` — measured, `ls`'s English "Permission denied" becomes German "keine
-/// Berechtigung" — and this crate does not parse human text. An exit code has no locale.
+/// Prefix of the line the probe writes to its real stderr: `stat`'s raw errno, `0` on success.
+#[cfg(unix)]
+const STAT_ERRNO_PREFIX: &str = "COSCA_FIXTURE_STAT_ERRNO=";
+
+/// Inert in an ordinary suite run. `stat`s [`FIXTURE_STAT_TARGET_ENV`] and reports the raw errno on
+/// its real stderr as `STAT_ERRNO_PREFIX<n>`. A number carries no locale, unlike `strerror()` text,
+/// and unlike the exit status it cannot be confused with libtest's own codes.
 #[cfg(unix)]
 #[test]
 fn fixture_stat_errno_probe() {
+    use std::io::Write as _;
     let Some(target) = std::env::var_os(FIXTURE_STAT_TARGET_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
     if !crate::test_child::is_fixture_reexec() {
         return;
     }
-    std::process::exit(match std::fs::metadata(&target) {
-        Ok(_) => 0,
-        Err(e) => e.raw_os_error().unwrap_or(-1),
-    });
+    let errno = std::fs::metadata(&target)
+        .err()
+        .map_or(0, |e| e.raw_os_error().unwrap_or(-1));
+    writeln!(std::io::stderr(), "{STAT_ERRNO_PREFIX}{errno}").expect("report the errno");
 }
 
-/// Re-execs this test binary's [`fixture_stat_errno_probe`] against `target` in a FRESH child
-/// process — a genuine `execve`, not this thread's own `stat` — and returns the raw errno it
-/// exited with (`None` on success). Used by
-/// [`fixture_a_denied_candidate_is_denied_by_an_exec_child`], which needs to know whether an
-/// EXEC'D child, not this thread, can reach `target`.
+/// Re-execs [`fixture_stat_errno_probe`] against `target` in a fresh child, a real `execve` rather
+/// than this thread's own `stat`, and returns the errno it saw (`None` on success). Panics unless
+/// the probe passed its gate and reported.
 #[cfg(unix)]
 fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
-    let mut child = {
+    let child = {
         let _guard = crate::child::spawn::spawn_lock();
         crate::test_child::fixture_command(crate::test_child::fixture_path!(fixture_stat_errno_probe))
             .env(FIXTURE_STAT_TARGET_ENV, target)
             .spawn()
             .expect("spawn the stat probe")
     };
-    match child.wait().expect("wait for the stat probe").code() {
-        Some(0) => None,
-        Some(code) => Some(code),
-        None => panic!("the stat probe was terminated by a signal, not an exit"),
-    }
+    let output = child.wait_with_output().expect("wait for the stat probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stderr.contains(crate::test_child::FIXTURE_GATE_PASSED_LINE),
+        "the stat probe did not run: {output:?}"
+    );
+    let errno: i32 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix(STAT_ERRNO_PREFIX))
+        .unwrap_or_else(|| panic!("the stat probe reported no errno: {stderr}"))
+        .parse()
+        .expect("the reported errno is a number");
+    (errno != 0).then_some(errno)
 }
 
 /// Under `loadable_only`, a candidate whose existence cannot be determined fails the search closed:
@@ -548,11 +483,8 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
     }
 }
 
-/// The real-`EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]:
-/// [`locked_then_open`]'s denial is the production case (`resolve.rs`'s `Err(e) if
-/// input.loadable_only` arm), worth its own test rather than trusting the uid-independent `ELOOP`
-/// stand-in to speak for every errno a real deployment meets. Runs in a re-exec — see
-/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`].
+/// The `EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]: the
+/// production case (`resolve.rs`'s `Err(e) if input.loadable_only` arm). Runs in a re-exec.
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_fails_a_loadable_only_search_closed() {
@@ -561,51 +493,19 @@ fn a_denied_candidate_fails_a_loadable_only_search_closed() {
     ));
 }
 
-/// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]: a no-op when
-/// picked up by an ordinary, unfiltered suite run (see
-/// [`crate::test_child::is_fixture_reexec`]). Re-executed via `run_fixture`, it first drops any
-/// way this process could bypass DAC ([`crate::test_privilege::drop_dac_bypass`]), so
-/// [`locked_then_open`]'s `EACCES` precondition genuinely holds no matter which caller ran the
-/// suite.
+/// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]; inert unless
+/// [`crate::test_child::run_fixture`] started it.
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
-    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, _locked, _open, path) = locked_then_open();
     match search_tool(&path, true) {
         Err(Error::Io(e)) => assert_eq!(wrapped_raw_os_error(&e), Some(libc::EACCES), "{e}"),
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }
-}
-
-/// Pins [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s `.expect("drop DAC
-/// bypass")` — `crate::test_privilege::drop_dac_bypass`'s injection seam (see its doc) is what
-/// forces the failure this drives through; the other two `.expect("drop DAC bypass")` sites in
-/// this file share the identical one-line pattern and are not separately driven. Asserts the
-/// child's own panic MESSAGE, not an OS-generated string: `Error::other`'s payload is whatever
-/// plain text this test supplied, never `strerror()`'s locale-dependent wording.
-#[cfg(unix)]
-#[test]
-fn a_denied_candidate_fails_a_loadable_only_search_closed_reports_an_injected_dac_bypass_failure() {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        crate::test_child::fixture_command(crate::test_child::fixture_path!(
-            fixture_a_denied_candidate_fails_a_loadable_only_search_closed
-        ))
-        .env(crate::test_privilege::INJECT_FAILURE_ENV, "injected boom")
-        .spawn()
-        .expect("spawn the fixture")
-    };
-    let output = child.wait_with_output().expect("wait for the fixture");
-    assert!(!output.status.success(), "{output:?}");
-    // A failing libtest test's panic is replayed into ITS OWN stdout, not stderr — this fixture
-    // never wrote anything to its real stderr the way `report()`-style fixtures do.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("drop DAC bypass"), "{stdout}");
-    assert!(stdout.contains("injected boom"), "{stdout}");
 }
 
 /// An ordinary spawn skips it and goes on, as before, so one `PATH` entry whose candidate cannot be
@@ -617,11 +517,8 @@ fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
-/// The real-`EACCES` twin of [`an_undeterminable_candidate_is_skipped_by_an_ordinary_search`]: the
-/// production case an ordinary (non-`loadable_only`) search meets (`resolve.rs`'s `Err(e) =>
-/// log::warn!(...)` skip arm), so one `PATH` directory a caller cannot read must not break the
-/// whole search. Runs in a re-exec — see
-/// [`fixture_a_denied_candidate_is_skipped_by_an_ordinary_search`].
+/// The `EACCES` twin of [`an_undeterminable_candidate_is_skipped_by_an_ordinary_search`]: the
+/// production case (`resolve.rs`'s `Err(e) => log::warn!(...)` skip arm). Runs in a re-exec.
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
@@ -630,123 +527,53 @@ fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
     ));
 }
 
-/// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`] — see
-/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors.
+/// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`].
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
-    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, _locked, open, path) = locked_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
-/// The regain [`crate::test_privilege::drop_dac_bypass`]'s `no_new_privs` call exists to prevent,
-/// checked by observing the REAL consequence rather than trusting the kernel's own report of it.
-/// `drop_dac_bypass`'s postcondition already asks the kernel `no_new_privs()` and fails closed if
-/// that answer is `false` — which catches a mutant that deletes the `set_no_new_privs` CALL alone
-/// (measured: `--cap-drop SETPCAP`, deleting only the call fails this test, the other two real-
-/// `EACCES` tests, AND all three of `exact_posix_tests`'s own cwd-spawn tests
-/// (`an_exact_program_runs_in_a_cwd_that_has_no_path`,
-/// `a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path`,
-/// `an_already_elevated_exact_program_runs_in_a_cwd_that_has_no_path` — each re-execs its own
-/// fixture, which also calls `drop_dac_bypass`), all via that same postcondition, with no exec
-/// needed here). What that postcondition does NOT cover is a mutant that also removes ITS
-/// OWN check alongside the call: nothing then asks the kernel anything, so nothing here would
-/// notice — except this test, which does not ask the kernel's opinion on this thread's OWN state
-/// at all. It asks what a REAL uid-0 thread's `execve` of an ordinary binary actually grants a
-/// child, per the legacy set-user-ID-root compatibility rule, wholly independently of what this
-/// thread's own effective, permitted, inheritable, or self-reported `no_new_privs` state claims.
-/// Runs in a re-exec — see [`fixture_a_denied_candidate_is_denied_by_an_exec_child`].
+/// An `execve` from the fixture must not give DAC bypass back. `test_privilege` sets
+/// `no_new_privs` for exactly that: without it, a uid-0 `execve` regains the capabilities from the
+/// bounding set (`capabilities(7)`, set-user-ID-root compatibility). A non-root driver has nothing
+/// to regain, so this needs root; see [`crate::test_privilege::root_tests_enabled`].
 #[cfg(unix)]
 #[test]
 fn a_denied_candidate_is_denied_by_an_exec_child() {
+    if !crate::test_privilege::root_tests_enabled() {
+        return;
+    }
     crate::test_child::run_fixture(crate::test_child::fixture_path!(
         fixture_a_denied_candidate_is_denied_by_an_exec_child
     ));
 }
 
-/// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`] — see
-/// [`fixture_a_denied_candidate_fails_a_loadable_only_search_closed`]'s doc, which this mirrors,
-/// except the assertion: instead of THIS thread's own `stat`, it re-execs
-/// [`fixture_stat_errno_probe`] as a grandchild and requires THAT to be denied too.
+/// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`]: an exec'd probe must be
+/// denied too.
 #[cfg(unix)]
 #[test]
 fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
     }
-    crate::test_privilege::drop_dac_bypass().expect("drop DAC bypass");
     let (_root, locked, open, _path) = locked_then_open();
     assert_eq!(
-        stat_errno_via_grandchild(&grandchild_reachable_path(&open.join("tool.exe"))),
+        stat_errno_via_grandchild(&open.join("tool.exe")),
         None,
-        "positive control: an exec'd child must be able to reach an UNLOCKED directory the same \
-         way, or a denial below cannot be told apart from this path being unreachable outright"
+        "positive control: an exec'd child must reach the unlocked directory, or a denial below \
+         proves nothing"
     );
-    let errno = stat_errno_via_grandchild(&grandchild_reachable_path(&locked.0.join("tool.exe")));
+    let errno = stat_errno_via_grandchild(&locked.0.join("tool.exe"));
     assert_eq!(
         errno,
         Some(libc::EACCES),
-        "an exec'd child must not regain access to a directory this thread was just denied, got {errno:?}"
+        "an exec'd child must not regain access this process was denied"
     );
-}
-
-/// Rewrites a path built under [`crate::test_child::run_fixture`]'s scratch root so a GRANDCHILD
-/// (not this fixture) can resolve it. On Linux, `fixture_scratch_tempdir` builds paths under
-/// `/proc/<this fixture's own pid>/fd/<n>/...` — correct for THIS process's own use, but reading
-/// ANOTHER process's `/proc/<pid>/fd/<n>` entry is gated by `ptrace_may_access`
-/// (`PTRACE_MODE_READ_FSCREDS`), which requires the READER's capabilities to be a superset of the
-/// TARGET's. `capset` is per-thread: `drop_dac_bypass` only reduces the capabilities of the
-/// specific WORKER THREAD running this fixture's body, not the process's thread-group leader
-/// (whose credentials `/proc/<pid>/...` permission checks use) — so from the grandchild's
-/// perspective (itself reduced, having inherited the worker thread's capabilities via `fork`), the
-/// FIXTURE's own `/proc/<pid>` entry looks MORE privileged than the grandchild itself, and
-/// `ptrace_may_access` refuses it before ever reaching the locked directory's own permission bits.
-/// Measured: `stat`ing even the UNLOCKED `open/tool.exe` through the unrewritten path also failed
-/// with `EACCES` — a false positive the original assertion could not tell apart from the real one,
-/// which the positive control above now catches directly.
-///
-/// The grandchild inherits the SAME fd (see `run_fixture`'s doc on its `O_CLOEXEC` handling), so it
-/// can resolve the identical target through its OWN `/proc/self/fd/<n>` entry instead — reading
-/// one's OWN `/proc/self` needs no cross-process permission check at all. Rewriting the fixture's
-/// pid prefix to `self` in the path STRING (rather than re-deriving the path from scratch) keeps
-/// the rest of the path — the fd number, and every fixture-built subdirectory under it — identical,
-/// so it still names the exact same target the fixture itself built.
-///
-/// A no-op everywhere else: only Linux's `fixture_scratch_tempdir` builds a `/proc`-relative path
-/// in the first place, so elsewhere `locked_then_open`'s paths are already plain, real filesystem
-/// paths any process (grandchild included, since it inherits the SAME dropped identity via `fork`)
-/// can resolve directly.
-#[cfg(target_os = "linux")]
-fn grandchild_reachable_path(p: &Path) -> PathBuf {
-    let own_pid_prefix = format!("/proc/{}/", std::process::id());
-    let s = p
-        .to_str()
-        .expect("fixture scratch paths are built from valid UTF-8 components");
-    // `replacen` below silently no-ops if `own_pid_prefix` isn't a prefix of `s` — which would
-    // leave `p` unrewritten and, for a caller that then walked into that unrewritten path,
-    // indistinguishable from success (its ptrace-gated `/proc/<pid>/...` form can still resolve
-    // for as long as the fixture is alive, see this function's own doc). Asserted here rather
-    // than trusted, so a caller that passed a path NOT actually built under the fixture's scratch
-    // fd (e.g. `fixture_scratch_tempdir` silently falling back to an ambient `tempfile::tempdir()`
-    // instead of `/proc/<pid>/fd/<n>/...`) fails loudly instead of quietly resolving the wrong
-    // thing, or nothing at all, the same way either way.
-    debug_assert!(
-        s.starts_with(&own_pid_prefix),
-        "{p:?} is not under the fixture's own /proc/{}/... scratch root — did fixture_scratch_tempdir \
-         fall back to an ambient tempdir instead of the driver's fd-relative one?",
-        std::process::id(),
-    );
-    let rewritten = s.replacen(&own_pid_prefix, "/proc/self/", 1);
-    PathBuf::from(rewritten)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn grandchild_reachable_path(p: &Path) -> PathBuf {
-    p.to_path_buf()
 }
 
 /// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no

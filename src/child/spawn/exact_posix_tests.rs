@@ -82,6 +82,7 @@ fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
 fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("mkdir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
     std::fs::write(dir.join(marker), "").expect("write marker");
     let tool = dir.join("tool");
     // Under the lock for the reason `cwd_and_path_tools` gives.
@@ -92,9 +93,8 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
 
 const FIXTURE_UNREACHABLE_CWD_TEST: &str =
     "child::spawn::exact_posix_tests::fixture_spawn_exact_tool_in_an_unreachable_cwd";
-/// The fixture's own directory as a path, which it must fail to reach. Its presence alone does
-/// NOT mark a deliberate re-exec — see [`crate::test_child::is_fixture_reexec`], which the
-/// fixture also requires, for why a marker env var's bare presence is not enough on its own.
+/// The fixture's own directory as a path, which it must fail to reach. Its presence alone does not
+/// mark a deliberate re-exec; the fixture also requires [`crate::test_child::is_fixture_reexec`].
 const FIXTURE_UNREACHABLE_CWD_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD";
 /// The `current_dir()` the fixture sets, if any.
 const FIXTURE_CURRENT_DIR_ENV: &str = "COSCA_FIXTURE_UNREACHABLE_CWD_CURRENT_DIR";
@@ -116,7 +116,6 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     if !crate::test_child::is_fixture_reexec() {
         return;
     }
-    report_and_exit_on_dac_bypass_failure(crate::test_privilege::drop_dac_bypass());
     let mut gate = [0u8; 1];
     std::io::stdin().read_exact(&mut gate).expect("gate byte");
     if std::fs::metadata(&own_path).is_ok() {
@@ -153,78 +152,6 @@ fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     std::process::exit(code);
 }
 
-/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`]'s diagnostic and exit code for a
-/// [`crate::test_privilege::drop_dac_bypass`] failure, split out so the message text is checkable
-/// (below) without forcing that failure for real. It used to be forceable with root started under
-/// `--cap-drop SETUID,SETGID`, back when dropping DAC bypass meant `setuid()`; now that it means
-/// dropping two specific capabilities instead (see that function's doc for why), no plain
-/// `--cap-drop` combination reaches it that way any more — measured against every root/capability
-/// lane this repo's own mutation testing has exercised so far (see the PR that introduced this),
-/// not against CI, which does not yet run a root lane at all (tracked separately). A real failure
-/// IS still forceable — `strace -f -e trace=capset -e inject=capset:error=EPERM`, measured — just
-/// not portably enough to run as an ordinary `cargo test`;
-/// [`reports_and_exits_on_an_injected_dac_bypass_failure`] below exercises the reporting
-/// end-to-end via [`crate::test_privilege::INJECT_FAILURE_ENV`]'s seam instead.
-fn dac_bypass_failure(e: &std::io::Error) -> (String, i32) {
-    (format!("precondition: dropping DAC bypass: {e}"), PRECONDITION_FAILED)
-}
-
-#[test]
-fn dac_bypass_failure_names_the_precondition_and_keeps_the_error() {
-    let e = std::io::Error::other("boom");
-    let (msg, code) = dac_bypass_failure(&e);
-    assert_eq!(code, PRECONDITION_FAILED);
-    assert!(msg.contains("dropping DAC bypass"), "{msg}");
-    assert!(msg.contains("boom"), "{msg}");
-}
-
-/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`]'s own `drop_dac_bypass`-failure handling,
-/// factored out only so [`dac_bypass_failure`]'s message-and-code pair has one place to read from —
-/// NOT itself the seam [`reports_and_exits_on_an_injected_dac_bypass_failure`] drives: that drives
-/// [`crate::test_privilege::drop_dac_bypass`] itself via
-/// [`crate::test_privilege::INJECT_FAILURE_ENV`], through the REAL call site below, rather than
-/// calling this helper directly — a mutant that drops the real call to `drop_dac_bypass` at that
-/// call site entirely (measured) is invisible to a test that bypasses the call site.
-fn report_and_exit_on_dac_bypass_failure(result: std::io::Result<()>) {
-    if let Err(e) = result {
-        let (msg, code) = dac_bypass_failure(&e);
-        report(&msg);
-        std::process::exit(code);
-    }
-}
-
-/// Pins the wiring [`dac_bypass_failure_names_the_precondition_and_keeps_the_error`] cannot: that
-/// a `drop_dac_bypass` failure hit at the REAL call site inside
-/// [`fixture_spawn_exact_tool_in_an_unreachable_cwd`] — forced via
-/// [`crate::test_privilege::INJECT_FAILURE_ENV`], not a stand-in that calls
-/// [`report_and_exit_on_dac_bypass_failure`] directly — is reported to this process's REAL stderr
-/// (not swallowed by libtest's capture, which the child's `Stdio::null()` stdout would otherwise
-/// hide — see [`report`]'s doc) and exits `90`. The fixture's own gate ([`FIXTURE_UNREACHABLE_CWD_ENV`]
-/// plus `is_fixture_reexec()`) still needs satisfying, even though this run never reaches the
-/// stdin-gated part of the fixture's body: the injected error fires before that point.
-#[test]
-fn reports_and_exits_on_an_injected_dac_bypass_failure() {
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        crate::test_child::fixture_command(FIXTURE_UNREACHABLE_CWD_TEST)
-            .env(FIXTURE_UNREACHABLE_CWD_ENV, "/cosca-test-unreached")
-            .env(crate::test_privilege::INJECT_FAILURE_ENV, "injected boom")
-            // The real fixture reads a gate byte from stdin AFTER the point this injection
-            // fires, so this run should never reach that read — but a mutant that discards the
-            // injected error (W2) makes it fall through to the real stdin read instead, and an
-            // inherited interactive stdin (a real terminal) would then block forever rather than
-            // fail fast. Measured hanging exactly that way before this fix.
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the fixture")
-    };
-    let output = child.wait_with_output().expect("wait for the fixture");
-    assert_eq!(output.status.code(), Some(PRECONDITION_FAILED), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("dropping DAC bypass"), "{stderr}");
-    assert!(stderr.contains("injected boom"), "{stderr}");
-}
-
 /// The command `.elevate()` spawns from a process that is already root, on any host.
 fn already_elevated(c: &mut Command) -> Result<Command, Error> {
     use crate::elevation::plan::{BackendSet, Host, Os};
@@ -253,19 +180,14 @@ fn report(line: &str) {
     _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// Restores a directory's mode on drop, so the tempdir can be removed even after a panic.
-struct RestoreMode(std::path::PathBuf);
-impl Drop for RestoreMode {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
 /// Runs the fixture in `<root>/p/d` with `p` unsearchable, so its cwd has no path it can use —
 /// `getcwd` fails on macOS, and a `chdir` to the path fails everywhere. `d/tool` exits with
 /// [`CWD_TOOL_EXIT`] and `d/sub/tool` with [`PATH_TOOL_EXIT`], each only when run in its own
-/// directory. Returns the fixture's exit code, and its stderr prefixed with the gate write's result.
+/// directory. The fixture starts without DAC bypass, so `p` binds a root driver too. Returns the
+/// fixture's exit code, and its stderr prefixed with the gate write's result.
+///
+/// Root, `p`, `d` and `d/sub` are `chmod 0o755` explicitly: where a root driver drops uid, the
+/// fixture is not their owner, and `tempdir` and `create_dir` leave modes to the umask.
 ///
 /// The write can fail: a fixture that refused a precondition has exited before reading it. Its exit
 /// code and stderr then say why, so the write result is reported rather than panicked on.
@@ -275,20 +197,13 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("tempdir");
-    // Only matters on non-Linux, where `drop_dac_bypass` actually changes uid: `root` is then
-    // entered by `UNPRIVILEGED`, not its owner, so the OTHER-class bits this chmod sets are what
-    // let that identity in. On Linux, `drop_dac_bypass` strips capabilities but never changes
-    // uid — the fixture stays the SAME uid that owns `root` (whatever the driver's own uid is),
-    // so ordinary OWNER-bit access already applies with no DAC bypass needed at all, regardless
-    // of what this chmod sets. `tempfile::tempdir()` has no fixed mode of its own either way — it
-    // uses the OS default directory mode under the calling process's umask (commonly `0755`, not
-    // some tempdir-specific `0700`), so this chmod does not merely restate what `tempdir()`
-    // already gave `root`.
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod root");
     let (p, d) = (root.path().join("p"), root.path().join("p").join("d"));
+    std::fs::create_dir(&p).expect("mkdir p");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
-    let mut fixture = crate::test_child::fixture_command(FIXTURE_UNREACHABLE_CWD_TEST);
+    let (mut fixture, _exe_copy) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
     fixture
         .env(FIXTURE_UNREACHABLE_CWD_ENV, &d)
         .current_dir(&d)
@@ -305,7 +220,7 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
         let _guard = crate::child::spawn::spawn_lock();
         fixture.spawn().expect("spawn the fixture")
     };
-    let _restore = RestoreMode(p.clone());
+    let _restore = crate::test_child::RestoreMode::new(&p, 0o755);
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let gate = child.stdin.take().expect("stdin").write_all(b"x");
     let out = child.wait_with_output().expect("wait");
