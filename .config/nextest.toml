@@ -1,16 +1,15 @@
 nextest-version = { required = "0.9.137" }
 
-# A failure bound for every "must panic, not hang" death-watch regression test (the shared
-# `accept_or_die`/`accept_or_die_async` primitives in tests/process.rs and tests/tokio_io.rs, and
-# the per-helper "reverted to a plain accept" tests in the same two files plus
-# tests/windows_breakaway.rs): each asserts that a dead-before-connecting target panics rather
-# than hanging the caller. A mutant that broke that guarantee back into a hang would otherwise
-# wedge the whole run instead of just failing this one test — this bound turns that into a fast,
-# attributable failure. `[profile.default.overrides]` alone is enough: nextest applies it to
-# every profile, `ci` included, so a duplicate `[profile.ci.overrides]` entry for the same filter
-# would just be dead weight.
+# A failure bound for every "must panic, not hang" death-watch regression test: the shared
+# `accept_or_die`/`accept_or_die_async` primitives, the per-helper "reverted to a plain accept"
+# tests, and the "grandchild dies while the root lives" tests, all in tests/process.rs and
+# tests/tokio_io.rs. Each asserts that a target dying before it connects makes the helper panic
+# rather than hang. A mutant that broke that guarantee back into a hang would otherwise wedge the
+# whole run instead of just failing one test; this bound makes it a fast, attributable failure.
+# `[profile.default.overrides]` alone is enough: nextest applies it to every profile, `ci`
+# included.
 [[profile.default.overrides]]
-filter = 'test(/panics_loudly_when_the_target_dies_first|panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept/)'
+filter = 'test(/panics_loudly_when_the_target_dies_first|panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept|panics_when_the_grandchild_dies_before_connecting_while_the_root_lives|rejects_an_already_reaped_target/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 [profile.ci]
