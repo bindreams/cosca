@@ -3,10 +3,12 @@
 //!
 //! # Contract
 //!
-//! - `target_pid` must be a child the caller has NOT reaped (and, on Windows, the caller still
+//! - `target_pid` should be a child the caller has NOT reaped (and, on Windows, the caller still
 //!   holds its handle). A pid is only a stable name while its process is an unreaped child (a
 //!   zombie at worst) or a handle to it is open (docs/principles.md, principle 4); once it is
-//!   reaped the number can name a stranger and the watch would wait on the wrong process.
+//!   reaped the number can name a stranger and the watch would wait on the wrong process. A
+//!   `cosca::Child` reaps itself when it exits, so for those the guarantee is weaker: a target
+//!   that died AND whose pid was reissued before the watch armed is not detected.
 //! - `also`, when given, is a live descendant of `target_pid` whose parent is still alive: the
 //!   parent keeps it an unreaped zombie (Unix) or holds a handle to it (Windows). Opening it
 //!   after `target_pid` died is harmless: `target_pid` is in the same wait set, its death is
@@ -54,13 +56,12 @@ pub fn accept_or_die_also(listener: &TcpListener, target_pid: u32, also: Option<
         rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
     }
 
-    // An unreaped zombie still opens, so ESRCH for the target means it was already REAPED: the
-    // caller broke the contract, and the pid may by now name a stranger. Not a "died" report.
+    // An unreaped zombie still opens, so ESRCH means the target was already REAPED: by a caller
+    // who reaped it, or by a `cosca::Child`, which reaps its own child as soon as it exits. Either
+    // way it is dead, and a connection it made first may still be queued.
     let target_fd = match open(target_pid) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::SRCH) => panic!(
-            "pid {target_pid} was already reaped before accept_or_die watched it: the target must be an unreaped child"
-        ),
+        Err(rustix::io::Errno::SRCH) => return final_peek_or_die(listener, target_pid),
         Err(e) => panic!(
             "pidfd_open({target_pid}) for the death-watch: {}",
             std::io::Error::from(e)
