@@ -23,8 +23,7 @@ fn std_blocker() -> std::process::Child {
 }
 
 /// Like `std_blocker`, with stdout piped for the echo round trip in [`assert_child_still_alive`].
-/// Local to `wait_exit_cancel_leaves_child_untouched` and (on Windows)
-/// `wait_exit_drop_releases_the_windows_watcher`.
+/// Local to the tests that call `assert_child_still_alive`.
 fn std_blocker_with_stdout() -> std::process::Child {
     let _guard = crate::child::spawn::spawn_lock();
     crate::test_child::held_std_blocker(std::process::Stdio::piped())
@@ -494,7 +493,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
 #[cfg(windows)]
 #[tokio::test]
 async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
-    let mut child = std_blocker();
+    let mut child = std_blocker_with_stdout();
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw() ^ 1);
 
@@ -513,11 +512,10 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
         "the identity-mismatch fast path must never reach the real wait — armed_probe must not fire"
     );
 
-    // The child itself is still live throughout (the watch above resolved on the STALE
-    // identity, never touching this one) — kill-on-drop would also cover this, but clean up
-    // explicitly rather than leaving a live `ping` to the runtime's teardown.
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
+    // The watch resolved on the STALE identity, so it must not have touched this live child.
+    assert_child_still_alive(&mut child);
+    // A `std` `Child` neither kills nor reaps on drop.
+    kill_and_reap(&mut child);
 }
 
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
