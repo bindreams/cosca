@@ -211,8 +211,8 @@ explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent; any other value, unset in
 test rather than running it. The check may be a skuld fixture, but either way a missing consent is
 a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
 the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
-`COSCA_TEST_ROOT_CONSENT=1`. Only `COSCA_TEST_NAMESPACES` (tests that unshare mount and pid
-namespaces) has a consent variable so far, and some system-affecting groups have no
+`COSCA_TEST_ROOT_CONSENT=1`. `COSCA_TEST_NAMESPACES` (tests that unshare mount and pid
+namespaces) has a consent variable too; some system-affecting groups have no
 `COSCA_TEST_<GROUP>` at all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's

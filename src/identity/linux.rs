@@ -5,12 +5,10 @@
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 
-use std::os::fd::BorrowedFd;
 use std::time::{Duration, SystemTime};
 
-use rustix::fs::{Mode, OFlags};
-
 use super::probe::{classify_unreadable, SignalProbe};
+use self::proc_view::ProcDir;
 use super::stat_parse::parse_starttime_jiffies;
 use super::{Liveness, RawPid, Resolved, StartToken};
 
@@ -37,20 +35,9 @@ fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
     read_stat_with(pid, || std::fs::read(format!("/proc/{pid}/stat")))
 }
 
-/// [`read_stat`] through the `/proc` at `proc_dir` (`openat`), so a caller that verified that
-/// `/proc` reads exactly the mount it verified.
-fn read_stat_in(proc_dir: BorrowedFd<'_>, pid: RawPid) -> Resolved<Vec<u8>> {
-    read_stat_with(pid, || {
-        let fd = rustix::fs::openat(
-            proc_dir,
-            format!("{pid}/stat"),
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes)?;
-        Ok(bytes)
-    })
+/// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup.
+fn read_stat_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
+    read_stat_with(pid, || proc_dir.read(&format!("{pid}/stat")))
 }
 
 fn read_stat_with(pid: RawPid, read: impl FnOnce() -> std::io::Result<Vec<u8>>) -> Resolved<Vec<u8>> {
@@ -80,7 +67,7 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
 }
 
 /// [`start_token`], read through the `/proc` at `proc_dir`.
-pub(super) fn start_token_in(proc_dir: BorrowedFd<'_>, pid: RawPid) -> Resolved<StartToken> {
+pub(super) fn start_token_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<StartToken> {
     start_token_from(pid, read_stat_in(proc_dir, pid))
 }
 
@@ -110,7 +97,7 @@ pub(super) fn is_running(pid: RawPid, start: StartToken) -> Liveness {
 }
 
 /// [`is_running`], read through the `/proc` at `proc_dir`.
-pub(super) fn is_running_in(proc_dir: BorrowedFd<'_>, pid: RawPid, start: StartToken) -> Liveness {
+pub(super) fn is_running_in(proc_dir: &ProcDir, pid: RawPid, start: StartToken) -> Liveness {
     match read_stat_in(proc_dir, pid) {
         Resolved::Found(stat) => super::stat_parse::running_from_stat(&stat, start),
         Resolved::Gone => Liveness::Dead,

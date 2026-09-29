@@ -1,11 +1,10 @@
 //! Tests that need private mount or pid namespaces, run in a re-exec'd child of this test binary
 //! so the shared, multithreaded test process never changes its own namespaces.
 //!
-//! They need `CAP_SYS_ADMIN`, so they are a system-affecting group (`docs/principles.md` 9 and
-//! 10): on by default, `COSCA_TEST_NAMESPACES=0` switches the group off, and running it needs
+//! They need `CAP_SYS_ADMIN`, so they are a system-affecting group (see the
+//! system-affecting-tests principle in `docs/principles.md`): on by default, `COSCA_TEST_NAMESPACES=0` switches the group off, and running it needs
 //! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. Run them in a container,
-//! VM, or CI's root lane, never on a developer host: every mount here is made after
-//! [`enter_private_mount_ns`] and dies with the child.
+//! VM, or CI's root lane, never on a developer host.
 
 use std::path::Path;
 
@@ -30,17 +29,27 @@ pub(crate) fn enabled() -> bool {
     true
 }
 
-/// Re-exec this binary on `fixture` with `marker_env` set, to run as the child half of a test.
-pub(crate) fn run(fixture: &str, marker_env: &str) {
-    let mut cmd = super::fixture_command(fixture);
-    cmd.env(marker_env, "1");
-    super::run_fixture_command(fixture, cmd);
+/// Re-exec this binary on `fixture`, to run as the child half of a test.
+pub(crate) fn run(fixture: &str) {
+    super::run_fixture_command(fixture, super::fixture_command(fixture));
 }
 
-/// Whether this process is the re-exec'd child for `marker_env`; a fixture is also picked up by
-/// an ordinary suite run, where it must do nothing.
-pub(crate) fn is_child(marker_env: &str) -> bool {
-    std::env::var_os(marker_env).is_some_and(|v| v == "1")
+/// Whether this process is the re-exec'd child of [`run`]; a fixture is also picked up by an
+/// ordinary suite run, where it must do nothing.
+pub(crate) fn is_child() -> bool {
+    super::is_fixture_reexec()
+}
+
+/// [`is_child`] for a fixture that is pid 1 of a new pid namespace: its parent is outside the
+/// namespace, so `getppid()` is `0` and the parent-pid check of [`is_child`] cannot hold.
+pub(crate) fn is_child_in_new_pid_ns() -> bool {
+    let reexec = std::env::var_os(super::FIXTURE_PARENT_PID_ENV).is_some()
+        && std::process::id() == 1
+        && std::os::unix::process::parent_id() == 0;
+    if reexec {
+        super::write_gate_passed();
+    }
+    reexec
 }
 
 /// Give this process its own mount namespace, with nothing propagating back out.

@@ -1,41 +1,41 @@
 //! `open_verified` against REAL namespace layouts, in re-exec'd children that own private
 //! mount or pid namespaces (see `test_child::namespaces` for the group's gating).
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::linux_tests::LiveNonLeaderTid;
 use crate::error::Error;
-use crate::identity::{proc_view, ProcView, ProcessId};
+use crate::identity::{proc_view, ProcDir, ProcView, ProcessId};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
-const NO_NSPID_MARKER: &str = "COSCA_FIXTURE_STATUS_WITHOUT_NSPID";
-const OUTER_MARKER: &str = "COSCA_FIXTURE_PID_NS_OUTER";
-const INNER_MARKER: &str = "COSCA_FIXTURE_PID_NS_INNER";
 
-/// A kernel whose `self/status` has no `NS*` lines (no `CONFIG_PID_NS`; gVisor) must not break a
-/// live foreign wait or kill: the success path proves its target through the pidfd's fdinfo, not
-/// `NSpid`. Reproduced by bind-mounting an `NS*`-less status file over `/proc/<pid>/status`.
+/// A status file mounted over `/proc/<pid>/status` is a mount below the checked `/proc`, which no
+/// read crosses: the view is `Unassessable` naming the refused crossing. A live foreign kill does
+/// not depend on the view (the success path proves its target through the pidfd's fdinfo), so it
+/// keeps working.
 ///
-/// Mutant: "the success path requires a `Same` `proc_view()`" — every live `open_verified` is
-/// then `Unassessable`.
+/// Mutants: "the success path requires a `Same` `proc_view()`" — every live `open_verified` is
+/// then `Unassessable`; "read `status` with a plain `openat`" — the fake status is read as real.
 #[test]
-fn namespaces_a_status_file_without_nspid_keeps_live_foreign_kills_working() {
+fn namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working() {
     if !ns::enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_status_file_without_nspid), NO_NSPID_MARKER);
+    ns::run(fixture_path!(fixture_status_mounted_over));
 }
 
 #[test]
-fn fixture_status_file_without_nspid() {
-    if !ns::is_child(NO_NSPID_MARKER) {
+fn fixture_status_mounted_over() {
+    if !ns::is_child() {
         return;
     }
     ns::enter_private_mount_ns();
     let scratch = tempfile::tempdir().expect("tempdir");
     let status = scratch.path().join("status");
-    std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the NS*-less status");
+    std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
     ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
 
     // A live foreign process: killed through `kill`, which goes through `open_verified`.
@@ -49,27 +49,23 @@ fn fixture_status_file_without_nspid() {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    super::kill(id).expect("a live foreign kill must work without NSpid");
+    super::kill(id).expect("a live foreign kill must not depend on the /proc view");
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");
 
     let own = super::open_verified(ProcessId::current(), "test probe");
     assert!(matches!(own, Ok(Some(_))), "got {own:?}");
 
-    // Without a pidfd `NSpid` is all there is to go on. This kernel has pid namespaces
-    // (`self/ns/pid` exists), so an absent `NSpid` cannot be told from gVisor's: `Unassessable`.
     match proc_view() {
-        ProcView::Unassessable(why) => assert!(why.reason.contains("NSpid"), "{why}"),
-        other => panic!("NSpid absent with pid namespaces present must be Unassessable, got {other:?}"),
-    }
-
-    // Hide `self/ns/pid` too: now the kernel has no pid namespaces to diverge into.
-    let empty = scratch.path().join("empty-ns");
-    std::fs::create_dir(&empty).expect("mkdir");
-    ns::bind_over(&empty, &PathBuf::from(format!("/proc/{}/ns", std::process::id())));
-    match proc_view() {
-        ProcView::Same(_) => {}
-        other => panic!("no NSpid and no self/ns/pid is Same, got {other:?}"),
+        ProcView::Unassessable(why) => {
+            assert!(why.reason.contains("self/status could not be read"), "{why}");
+            assert_eq!(
+                why.source.as_ref().and_then(|e| e.raw_os_error()),
+                Some(libc::EXDEV),
+                "{why}"
+            );
+        }
+        other => panic!("a status mounted over below /proc must not be read, got {other:?}"),
     }
 }
 
@@ -77,28 +73,29 @@ fn fixture_status_file_without_nspid() {
 /// the outer one. Its `NSpid` has two entries, and the pidfd's fdinfo numbers it differently
 /// from its own `getpid()`.
 ///
-/// Mutant: "ignore the fdinfo mismatch" — the outer `/proc/1` is init, whose token equals this
-/// `ProcessId`'s, so `open_verified` answers `Ok(Some(pidfd))`.
+/// Mutant: "ignore the fdinfo mismatch" — the outer `/proc/1` is the outer init, whose start
+/// token differs from this `ProcessId`'s, so `open_verified` answers `Ok(None)` (gone) for a live
+/// target.
 #[test]
 fn namespaces_an_outer_procfs_is_diverged_and_unassessable() {
     if !ns::enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_pid_ns_outer), OUTER_MARKER);
+    ns::run(fixture_path!(fixture_pid_ns_outer));
 }
 
 #[test]
 fn fixture_pid_ns_outer() {
-    if !ns::is_child(OUTER_MARKER) {
+    if !ns::is_child() {
         return;
     }
     ns::enter_new_pid_ns_for_children();
-    ns::run(fixture_path!(fixture_pid_ns_inner), INNER_MARKER);
+    ns::run(fixture_path!(fixture_pid_ns_inner));
 }
 
 #[test]
 fn fixture_pid_ns_inner() {
-    if !ns::is_child(INNER_MARKER) {
+    if !ns::is_child_in_new_pid_ns() {
         return;
     }
     assert_eq!(
@@ -113,13 +110,20 @@ fn fixture_pid_ns_inner() {
     match super::open_verified(ProcessId::current(), "test probe") {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(detail.contains("outer pid namespace"), "{detail}");
+            assert!(
+                !detail.contains("numbers the target 1 "),
+                "the outer procfs must number this process differently from its own pid 1: {detail}"
+            );
         }
         other => panic!("the success path under an outer procfs must be Unassessable, got {other:?}"),
     }
 }
 
-const OVERMOUNT_SUCCESS_MARKER: &str = "COSCA_FIXTURE_OVERMOUNT_SUCCESS";
-const OVERMOUNT_EINVAL_MARKER: &str = "COSCA_FIXTURE_OVERMOUNT_EINVAL";
+
+fn fake_stat(pid: u32) -> String {
+    let zeros = ["0"; 18].join(" ");
+    format!("{pid} (fake) S {zeros} 999999999999 0 0\n")
+}
 
 /// Mount a tmpfs over `/proc` holding a `{pid}/stat` whose start token is not `pid`'s real one:
 /// what a `/proc` looked up by PATH would show if it changed after the view was checked.
@@ -127,9 +131,45 @@ fn overmount_proc_with_a_foreign_stat(pid: u32) {
     ns::mount_tmpfs(std::path::Path::new("/proc"));
     let dir = PathBuf::from(format!("/proc/{pid}"));
     std::fs::create_dir(&dir).expect("mkdir the fake pid dir");
-    let zeros = ["0"; 18].join(" ");
-    std::fs::write(dir.join("stat"), format!("{pid} (fake) S {zeros} 999999999999 0 0\n"))
-        .expect("write the fake stat");
+    std::fs::write(dir.join("stat"), fake_stat(pid)).expect("write the fake stat");
+}
+
+/// Bind a file with a foreign start token over `/proc/{pid}/stat` alone, leaving the rest of
+/// `/proc` as it was: a mount BELOW `/proc`, which a dirfd on `/proc` still crosses unless every
+/// read forbids it.
+fn overmount_stat_with_a_foreign_file(pid: u32) {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let file = scratch.path().join("stat");
+    std::fs::write(&file, fake_stat(pid)).expect("write the fake stat");
+    ns::bind_over(&file, &PathBuf::from(format!("/proc/{pid}/stat")));
+    // The bind keeps the file alive after the tempdir goes.
+    std::mem::forget(scratch);
+}
+
+/// A hook that runs `mount` and records that it ran, so a fixture whose hook never fired cannot
+/// pass vacuously.
+fn recording_hook(mount: impl FnOnce() + 'static) -> (Rc<Cell<bool>>, impl FnOnce() + 'static) {
+    let fired = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&fired);
+    (fired, move || {
+        mount();
+        flag.set(true);
+    })
+}
+
+fn assert_by_path_stat_is_fake(pid: u32) {
+    let by_path = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/{pid}/stat by path");
+    assert!(
+        by_path.contains("(fake)"),
+        "the overmount must be visible by path, else the fixture proves nothing: {by_path:?}"
+    );
+}
+
+fn assert_unassessable_existence(result: Result<Option<rustix::fd::OwnedFd>, Error>) {
+    match result {
+        Err(Error::Unassessable { detail, .. }) => assert!(detail.contains("existence query"), "{detail}"),
+        other => panic!("a stat that cannot be read through the checked dirfd must be Unassessable, got {other:?}"),
+    }
 }
 
 /// The start-token read goes through the `/proc` dirfd that was checked, not through `/proc`
@@ -143,18 +183,21 @@ fn namespaces_the_success_path_reads_through_the_checked_proc_dirfd() {
     if !ns::enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_overmount_success), OVERMOUNT_SUCCESS_MARKER);
+    ns::run(fixture_path!(fixture_overmount_success));
 }
 
 #[test]
 fn fixture_overmount_success() {
-    if !ns::is_child(OVERMOUNT_SUCCESS_MARKER) {
+    if !ns::is_child() {
         return;
     }
     ns::enter_private_mount_ns();
     let pid = std::process::id();
-    let _hook = super::fault::between_check_and_read(move || overmount_proc_with_a_foreign_stat(pid));
+    let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(pid));
+    let _hook = super::fault::between_check_and_read(hook);
     let result = super::open_verified(ProcessId::current(), "overmount probe");
+    assert!(fired.get(), "the between-check-and-read hook must have run");
+    assert_by_path_stat_is_fake(pid);
     assert!(matches!(result, Ok(Some(_))), "got {result:?}");
 }
 
@@ -164,22 +207,137 @@ fn namespaces_the_einval_arm_reads_through_the_checked_proc_dirfd() {
     if !ns::enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_overmount_einval), OVERMOUNT_EINVAL_MARKER);
+    ns::run(fixture_path!(fixture_overmount_einval));
 }
 
 #[test]
 fn fixture_overmount_einval() {
-    if !ns::is_child(OVERMOUNT_EINVAL_MARKER) {
+    if !ns::is_child() {
         return;
     }
     ns::enter_private_mount_ns();
     let worker = LiveNonLeaderTid::spawn();
     let tid = worker.id.pid();
-    let _hook = super::fault::between_check_and_read(move || overmount_proc_with_a_foreign_stat(tid));
+    let (fired, hook) = recording_hook(move || overmount_proc_with_a_foreign_stat(tid));
+    let _hook = super::fault::between_check_and_read(hook);
     let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
     let result = super::open_verified(worker.id, "overmount probe");
+    assert!(fired.get(), "the between-check-and-read hook must have run");
+    assert_by_path_stat_is_fake(tid);
     match result {
         Err(Error::NotThreadGroupLeader { pid, .. }) => assert_eq!(pid, tid),
         other => panic!("a live non-leader tid must stay NotThreadGroupLeader, got {other:?}"),
     }
+}
+
+/// A mount BELOW the checked `/proc`, over the very file that is read: crossing it would hand
+/// the fake token to the comparison. The read refuses to cross, and a live target whose stat
+/// cannot be read is `Unassessable`, never `Gone`.
+///
+/// Mutant: "open sub-paths with a plain `openat`" — the fake token is read and a live target
+/// reads as gone (`Ok(None)`).
+#[test]
+fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_success_path() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_stat_overmount_success));
+}
+
+#[test]
+fn fixture_stat_overmount_success() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    let pid = std::process::id();
+    let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(pid));
+    let _hook = super::fault::between_check_and_read(hook);
+    let result = super::open_verified(ProcessId::current(), "stat overmount probe");
+    assert!(fired.get(), "the between-check-and-read hook must have run");
+    assert_by_path_stat_is_fake(pid);
+    assert_unassessable_existence(result);
+}
+
+/// Same for the `EINVAL`/`ENOENT` arm.
+#[test]
+fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_einval_arm() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_stat_overmount_einval));
+}
+
+#[test]
+fn fixture_stat_overmount_einval() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    let worker = LiveNonLeaderTid::spawn();
+    let tid = worker.id.pid();
+    let (fired, hook) = recording_hook(move || overmount_stat_with_a_foreign_file(tid));
+    let _hook = super::fault::between_check_and_read(hook);
+    let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::NOENT);
+    let result = super::open_verified(worker.id, "stat overmount probe");
+    assert!(fired.get(), "the between-check-and-read hook must have run");
+    assert_by_path_stat_is_fake(tid);
+    assert_unassessable_existence(result);
+}
+
+/// A tmpfs mounted at `/proc` before the dirfd is opened is not procfs. Mutant: "no `fstatfs`
+/// magic check" — the fake `/proc` is trusted and its reads are taken for the kernel's.
+#[test]
+fn namespaces_a_tmpfs_at_proc_is_not_procfs() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_tmpfs_at_proc));
+}
+
+#[test]
+fn fixture_tmpfs_at_proc() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    let id = ProcessId::current();
+    ns::mount_tmpfs(std::path::Path::new("/proc"));
+    let opened = ProcDir::open();
+    assert!(
+        matches!(&opened, Err(why) if why.reason.contains("not procfs")),
+        "got {opened:?}"
+    );
+    match proc_view() {
+        ProcView::Unassessable(why) => assert!(why.reason.contains("not procfs"), "{why}"),
+        other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
+    }
+    match super::open_verified(id, "tmpfs /proc probe") {
+        Err(Error::Unassessable { detail, .. }) => assert!(detail.contains("not procfs"), "{detail}"),
+        other => panic!("a tmpfs at /proc must be Unassessable, got {other:?}"),
+    }
+}
+
+/// A procfs subtree bound over `/proc` has procfs's magic but is not its root. Mutant: "check
+/// the magic but not the root inode".
+#[test]
+fn namespaces_a_procfs_subtree_bound_over_proc_is_not_the_procfs_root() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_subtree_at_proc));
+}
+
+#[test]
+fn fixture_subtree_at_proc() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    ns::bind_over(std::path::Path::new("/proc/sys"), std::path::Path::new("/proc"));
+    let opened = ProcDir::open();
+    assert!(
+        matches!(&opened, Err(why) if why.reason.contains("not the root of procfs")),
+        "got {opened:?}"
+    );
 }

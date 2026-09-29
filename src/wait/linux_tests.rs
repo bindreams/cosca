@@ -5,7 +5,7 @@
 use std::os::fd::AsRawFd;
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, ProcessId};
+use crate::identity::{Existence, Liveness, PidfdTarget, ProcessId};
 
 #[path = "linux_tests/fixture.rs"]
 mod fixture;
@@ -103,9 +103,7 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval()
 }
 
 /// A reaped leader is exited whatever `/proc` view this process has: `kill(pid, 0)` answering
-/// `ESRCH` resolves the pid in this process's own namespace, needing no `/proc` at all. Without
-/// `/proc`, `exists()` already fell back to that probe before this stack, so a view that cannot
-/// be established must not turn an `ESRCH` into an error (pre-6.16 it used to be `Gone`).
+/// `ESRCH` needs no `/proc`.
 #[test]
 fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_whatever_the_proc_view() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
@@ -178,7 +176,6 @@ fn assert_unassessable_with_cause(
 
 /// A live non-leader tid under a DIVERGED view: `Unassessable` naming the view and the
 /// `pidfd_open` errno, never a raw errno (a bare `NotFound` from `ENOENT` on 6.16+ reads as "gone").
-
 #[test]
 fn block_until_exit_on_a_live_non_leader_tid_is_unassessable_when_the_proc_view_is_diverged() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
@@ -434,7 +431,7 @@ fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
 /// `what` is unique per test: it is the marker a test finds its own log record by, since every
 /// test using `ProcessId::current()` shares one pid.
 fn open_verified_current_with_fdinfo(
-    answer: Result<u32, i32>,
+    answer: Result<PidfdTarget, i32>,
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
@@ -445,7 +442,6 @@ fn open_verified_current_with_fdinfo(
 
 /// A pidfd whose fdinfo `Pid:` is not `id.pid()` (another pid, or `0` = invisible) describes a
 /// `/proc` that is not the target's namespace: `Unassessable`, never a stat comparison.
-
 #[test]
 fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
     crate::log_capture::install();
@@ -455,7 +451,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_names_another_pid() {
         (own + 1, "fdinfo-names-other-pid probe"),
     ] {
         let mark = crate::log_capture::mark();
-        let result = open_verified_current_with_fdinfo(Ok(named), what);
+        let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(named)), what);
         assert_unassessable_with_cause(
             result.map(|fd| fd.is_some()),
             &["outer pid namespace", &format!("numbers the target {named}")],
@@ -486,13 +482,37 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 /// through the same `/proc` dirfd.
 #[test]
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
-    let forced = open_verified_current_with_fdinfo(Ok(std::process::id()), "fdinfo-matches probe");
+    let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())), "fdinfo-matches probe");
     assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
     let unforced = super::open_verified(ProcessId::current(), "test probe");
     assert!(
         matches!(unforced, Ok(Some(_))),
         "the real fdinfo must match too, got {unforced:?}"
     );
+}
+
+/// A pidfd whose fdinfo says `Reaped` (forced): the target is gone, so `Ok(None)`, not `Unassessable`.
+/// Mutant: "`Reaped` is `Unassessable`".
+#[test]
+fn open_verified_reports_gone_when_the_pidfds_fdinfo_says_the_target_was_reaped() {
+    let result = open_verified_current_with_fdinfo(Ok(PidfdTarget::Reaped), "fdinfo-reaped probe");
+    assert!(matches!(result, Ok(None)), "got {result:?}");
+}
+
+/// The real race: the target is reaped after `pidfd_open` succeeded and before the fdinfo read.
+#[test]
+fn verify_pidfd_target_reports_gone_for_a_target_reaped_after_pidfd_open() {
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        std::process::Command::new("true").spawn().expect("spawn true")
+    };
+    let mut child = child;
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child pid is nonzero");
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
+    let id = ProcessId::of(child.id()).found().expect("the unreaped child has an identity");
+    child.wait().expect("reap the child");
+    let result = super::verify_pidfd_target(id, pidfd, "reaped-after-open probe");
+    assert!(matches!(result, Ok(None)), "got {result:?}");
 }
 
 /// The success path's own `Existence::Unknown` (the OS refused the stat read) is `Unassessable`,

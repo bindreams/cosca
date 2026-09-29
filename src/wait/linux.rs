@@ -2,22 +2,19 @@
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
 //! `pidfd_send_signal` is identity-bound (no pid-reuse race). `ENOSYS` on < 5.3 => Unsupported.
 
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::time::Instant;
 
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 
 use crate::error::Error;
-use crate::identity::{Existence, Liveness, ProcView, ProcessId};
+use crate::identity::{Existence, Liveness, PidfdTarget, ProcDir, ProcView, ProcessId};
 
 /// Open a pidfd for `id`, re-verifying identity. `Ok(None)` => already gone (treat as exited).
 ///
-/// Every `/proc` read the verdict rests on goes through ONE `/proc` dirfd, and only after that
-/// `/proc` is shown to describe `id`'s pid namespace; otherwise the answer is
-/// [`Error::Unassessable`] naming why — never a `Gone` read off a `/proc` that may be
-/// describing an unrelated process. The one `Gone` that needs no `/proc` is `kill(pid, 0)`
-/// answering `ESRCH`, which resolves `pid` in this process's own namespace.
+/// Every `/proc` read goes through one checked `/proc` dirfd shown to describe `id`'s pid
+/// namespace; otherwise [`Error::Unassessable`], never a `Gone` off a foreign `/proc`.
 pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     debug_assert!(
         id.pid() <= i32::MAX as u32,
@@ -54,9 +51,7 @@ pub(crate) fn open_verified(id: ProcessId, what: &'static str) -> Result<Option<
 ///   reads as "gone", and `containment::unix::group` treats `Io` as "no pidfd" and falls back to
 ///   `kill(2)`.
 ///
-/// Without a pidfd there is nothing to cross-check the view against, so this reads `NSpid`
-/// (`identity::linux::proc_view`). A kernel that omits `NSpid` while having pid namespaces
-/// (gVisor) is `Unassessable` here only.
+/// No pidfd to cross-check against, so the view comes from `NSpid` (`proc_view`).
 fn verify_without_pidfd(
     id: ProcessId,
     what: &'static str,
@@ -66,9 +61,9 @@ fn verify_without_pidfd(
         return Ok(None);
     }
     match crate::identity::proc_view() {
-        ProcView::Same(proc_dir) => match exists_checked(id, proc_dir.as_fd()) {
+        ProcView::Same(proc_dir) => match exists_checked(id, &proc_dir) {
             Existence::Gone => Ok(None),
-            Existence::Present => match alive_checked(id, proc_dir.as_fd()) {
+            Existence::Present => match alive_checked(id, &proc_dir) {
                 Liveness::Dead => Ok(None),
                 Liveness::Alive => Err(Error::NotThreadGroupLeader {
                     pid: id.pid(),
@@ -108,18 +103,18 @@ fn verify_without_pidfd(
 /// The pidfd's fdinfo `Pid:` is the target as the mounted procfs numbers it (`0` if invisible
 /// there). Equal to `id.pid()` means that procfs names the target under this number, so
 /// `{pid}/stat` describes it: the start token then tells a recycled pid from the original.
-/// Anything else is `Unassessable`. This does not read `NSpid`, which `CONFIG_PID_NS`-less
-/// kernels and gVisor omit.
+/// Anything else is `Unassessable`.
 fn verify_pidfd_target(
     id: ProcessId,
     pidfd: rustix::fd::OwnedFd,
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    let proc_dir = crate::identity::open_proc_dir()
-        .map_err(|e| unassessable(id, what, "/proc could not be opened", Some(e), None))?;
-    match crate::identity::pidfd_pid_in_view(proc_dir.as_fd(), pidfd.as_fd()) {
-        Ok(pid) if pid == id.pid() => {}
-        Ok(pid) => {
+    let proc_dir = crate::identity::ProcDir::open().map_err(|why| unassessable(id, what, &why.reason, why.source, None))?;
+    match crate::identity::pidfd_pid_in_view(&proc_dir, pidfd.as_fd()) {
+        Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
+        // Reaped after `pidfd_open`: gone, and nothing to signal.
+        Ok(PidfdTarget::Reaped) => return Ok(None),
+        Ok(PidfdTarget::Pid(pid)) => {
             return Err(unassessable(
                 id,
                 what,
@@ -134,10 +129,9 @@ fn verify_pidfd_target(
     }
     // A pid recycled before open means the original is already gone. An unassessable pid
     // (hidepid, EPERM) is NOT gone and must not be treated as one.
-    match exists_checked(id, proc_dir.as_fd()) {
+    match exists_checked(id, &proc_dir) {
         Existence::Present => Ok(Some(pidfd)),
         Existence::Gone => Ok(None),
-        // The decision site `read_stat`-s debug-level probe relies on.
         Existence::Unknown => Err(unassessable(id, what, "the OS refused the existence query", None, None)),
     }
 }
@@ -185,7 +179,7 @@ fn pidfd_open_checked(raw: Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno
 /// [`fault::force_exists_once`]) replaces the `/proc` read once, to drive the `Unknown` arms; runs
 /// [`fault::between_check_and_read`]'s hook first.
 #[cfg(test)]
-fn exists_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Existence {
+fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
     fault::run_between_hook();
     match fault::take_forced_exists() {
         Some(existence) => existence,
@@ -193,21 +187,21 @@ fn exists_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Existence {
     }
 }
 #[cfg(not(test))]
-fn exists_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Existence {
+fn exists_checked(id: ProcessId, proc_dir: &ProcDir) -> Existence {
     id.exists_in(proc_dir)
 }
 
 /// `id.is_alive_in(proc_dir)`, with a test seam: a forced [`Liveness`] (see
 /// [`fault::force_alive_once`]) replaces the `/proc` read once.
 #[cfg(test)]
-fn alive_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Liveness {
+fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
     match fault::take_forced_alive() {
         Some(liveness) => liveness,
         None => id.is_alive_in(proc_dir),
     }
 }
 #[cfg(not(test))]
-fn alive_checked(id: ProcessId, proc_dir: BorrowedFd<'_>) -> Liveness {
+fn alive_checked(id: ProcessId, proc_dir: &ProcDir) -> Liveness {
     id.is_alive_in(proc_dir)
 }
 
