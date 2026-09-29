@@ -467,15 +467,55 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 
 // The held refusal buys a shutdown window only where a tree drain can be observed. `TreeWalk`
 // has none, so the grace-wait watches the ROOT alone — and this refusal's precondition IS that
-// the root has already exited, so the watch resolves at once and the sweep follows immediately.
-// The assertion is on elapsed time because that is the entire claim: checking only for `Ok`
-// passes just as well in the world where the full grace is spent.
+// the root has already exited, so `block_until_exit_or_cancel`'s identity check must resolve
+// the wait without ever genuinely spending the grace. A real `WaitForMultipleObjects` call MAY
+// still be entered (the identity-verified handle can legitimately name an
+// already-exited-but-not-yet-destroyed process object — `HandleIdentity::Same` — and a wait on
+// that resolves near-instantly since it is already signaled), so the claim is not "no real wait
+// call happens" but "no real wait call ever genuinely blocks on a still-alive target."
+//
+// Two mutant shapes, two checks — and an explicit boundary on what these two checks prove:
+//
+// 1. `block_until_exit_or_cancel` fails to return early and genuinely enters its real wait on a
+//    still-alive target. Proven by `crate::wait::backend::armed_probe`, installed below (held
+//    across the `.await`) before the call: the call site polls the target non-blockingly the
+//    instant before its real wait and notifies iff that target is not already signaled — see
+//    the module's own doc for why this is thread-local, not a global (a concurrent, unrelated
+//    test under plain `cargo test`'s shared-process model must never see this test's observer).
+//    This root's precondition (already reaped, by the time this watch starts) does not pin
+//    down WHICH of `Opened::Gone`, an already-signalled `HandleIdentity::Same`, or
+//    `HandleIdentity::Different` it lands on, so this alone does not deterministically prove
+//    the `Different` mutant is caught — `grace_wait_resolves_immediately_on_an_identity_
+//    mismatch` (`src/tokio/wait_tests.rs`) proves that one directly, on a live child under a
+//    deliberately wrong identity.
+// 2. Something upstream of `block_until_exit_or_cancel` never reaches it at all — e.g. the
+//    TreeWalk arm's `grace_wait` call (`graceful.rs`) hollowed out to `{ sleep(grace).await;
+//    Ok(true) }`. `armed_probe` cannot see this: it is never called, so its "no notification"
+//    check passes VACUOUSLY. Proven instead by `#[tokio::test(start_paused = true)]`'s virtual
+//    clock: any EXPIRING tokio timer advances it (this crate's own waits are real OS syscalls on
+//    a `spawn_blocking` thread — tokio's own `inhibit_auto_advance` keeps the paused clock's
+//    auto-advance from firing early while a `spawn_blocking` call is outstanding, rather than
+//    mistaking it for idle time with only a timer left to resolve), so asserting the clock did
+//    not move across the call is a deterministic, non-elapsed-time proof that no tokio timer
+//    expired, whatever the mechanism.
+//
+// What these two checks do NOT prove: a mutant that spends real wall-clock time without ever
+// arming a tokio timer or entering `block_until_exit_or_cancel` — `std::thread::sleep(grace)` in
+// the TreeWalk arm, a `std::thread::sleep` inside `blocking_watch`'s closure, or a
+// `WaitForSingleObject(cancel, ms)` call on the cancel handle alone in the `Gone` arm — survives
+// both. Catching those is out of scope: cosca's deadline contract forbids asserting an upper
+// bound on elapsed real time (docs/principles.md §8), so no check here may depend on how long
+// anything took. The two checks above are exactly what's provable without one: no tokio timer
+// expires, and no real wait is entered on an unsignalled target.
+//
+// `GRACE` is 30s only to loosely match the nextest override's period for readability; neither
+// check depends on its size. The nextest `terminate-after` override for this exact test
+// (`.config/nextest.toml`) is a pure backstop against an unrelated hang (e.g. `cancel` itself
+// failing to release the watcher) — never part of either check.
 #[cfg(windows)]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
-    // Wide enough that the two worlds are three orders of magnitude apart, so the split below
-    // cannot be reached by jitter: this path is measured in milliseconds.
-    const GRACE: Duration = Duration::from_secs(10);
+    const GRACE: Duration = Duration::from_secs(30);
     let mut cmd = crate::tokio::Command::new();
     cmd.args(["ping", "-n", "30", "127.0.0.1"]);
     cmd.contain_with(crate::ContainMode::TreeWalk);
@@ -489,14 +529,25 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
     child.kill().expect("kill");
     child.wait().await.expect("reap"); // tokio unpins the pid here
 
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    // Held across the `.await` below: `blocking_watch` reads THIS thread's installed observer
+    // before dispatching to its blocking-pool thread — see `armed_probe`'s own doc.
+    let _armed_guard = crate::wait::backend::armed_probe::install(armed_tx);
+
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let started = std::time::Instant::now();
+    let before = ::tokio::time::Instant::now();
     child
         .graceful_shutdown_tree(GRACE)
         .await
         .expect("a swept tree supersedes the held refusal");
-    let elapsed = started.elapsed();
+    assert_eq!(
+        ::tokio::time::Instant::now() - before,
+        Duration::ZERO,
+        "the root-only watch must never advance the virtual clock — any use of `tokio::time` \
+         (a hollowed-out grace-wait sleeping the grace instead of watching the process, for \
+         instance) would move it, whether or not `armed_probe` below also caught it"
+    );
 
     // Non-vacuity, first: a `terminate_tree` that returned `Ok` would produce the same fast,
     // green run, and this test would then be measuring a path it never entered.
@@ -508,9 +559,10 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
         "the refusal must have reached the hold-and-continue arm"
     );
     assert!(
-        elapsed < GRACE / 2,
-        "the root-only watch must resolve at once on an already-exited root rather than spend \
-         the grace: took {elapsed:?} of {GRACE:?}"
+        armed_rx.try_recv().is_err(),
+        "the root-only watch must never genuinely enter its real wait on a still-alive target — \
+         a real wait call may fire (an already-exited handle can still resolve and return \
+         instantly), but it must never be armed against a live one"
     );
 }
 

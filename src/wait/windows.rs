@@ -184,6 +184,33 @@ pub(crate) fn block_until_exit_or_cancel(
             clamped
         }
     };
+    // Test-only seam proving (immediately, not by elapsed time) that this wait is never
+    // genuinely entered on a still-alive target — see `armed_probe`'s own doc for why it's
+    // gated on `is_armed()`.
+    #[cfg(test)]
+    if armed_probe::is_armed() {
+        // SAFETY: `handle` is a live, identity-verified process handle; ms=0 is a
+        // non-blocking poll, never a wait.
+        let already = unsafe { WaitForSingleObject(handle, 0) };
+        if already == WAIT_FAILED {
+            // Capture BEFORE anything else could overwrite GetLastError.
+            let e = std::io::Error::last_os_error();
+            // `handle` was identity-verified moments ago — a non-blocking poll on it failing
+            // is a contract violation, not "not yet signalled" (the WAIT_TIMEOUT case below).
+            // Must never reach `notify_armed_unsignalled`: folding an OS failure into "armed
+            // on an unsignalled target" would false-flag a correct run as the very regression
+            // this seam exists to catch.
+            debug_assert!(
+                false,
+                "armed_probe: non-blocking poll of an identity-verified handle failed: {e}"
+            );
+        } else if already != WAIT_OBJECT_0 {
+            armed_probe::notify_armed_unsignalled();
+            // Force the real wait below to return at once instead of genuinely spending
+            // `ms` — a bug this seam catches must fail fast, not hang out the grace.
+            signal_cancel(cancel);
+        }
+    }
     let handles = [handle, HANDLE(cancel.as_raw_handle())];
     // SAFETY: both handles are live for the wait's duration.
     let waited = unsafe { WaitForMultipleObjects(&handles, false, ms) };
@@ -284,4 +311,107 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
                  child use graceful_shutdown_tree (CTRL_BREAK to the group)"
             .into(),
     })
+}
+
+/// Test-only seam proving a root-only watch on an already-reaped root never reaches a live
+/// target — immediately, never by elapsed time. A `WAIT_TIMEOUT`-based counter could only ever
+/// be told apart from correct code by how long the call ran, which would make elapsed time the
+/// real assertion.
+///
+/// An already-reaped root does not pin down WHICH of `block_until_exit_or_cancel`'s three
+/// outcomes it lands on (`Opened::Gone`, an already-signalled `HandleIdentity::Same`, or
+/// `HandleIdentity::Different` — the last only if the OS recycles the pid in the window before
+/// the watch opens it), so this alone does not deterministically prove the `Different` mutant is
+/// caught. `grace_wait_resolves_immediately_on_an_identity_mismatch`
+/// (`src/tokio/wait_tests.rs`) proves that one directly: a genuinely live child watched under an
+/// identity naming the same pid but a wrong start token is `Different` on every run.
+///
+/// The call site (`block_until_exit_or_cancel`, just before the real wait) only polls and acts
+/// when [`is_armed`] is true. `block_until_exit_or_cancel` is the SAME function every other
+/// grace-wait test in the binary calls, several of them precisely to watch a genuinely
+/// still-alive target run its real wait to completion (e.g.
+/// `grace_wait_true_when_child_dies_mid_wait`); gating on `is_armed` is what keeps this seam
+/// from force-releasing THEIR waits too. Only once armed does it do a non-blocking
+/// `WaitForSingleObject(handle, 0)` on the TARGET — not `cancel` — the instant before the real
+/// wait would be entered. If that target is not ALREADY signaled (the process has not already
+/// exited), this is exactly the regression shape this test exists to catch: a real wait is
+/// about to be genuinely entered on a live target. [`notify_armed_unsignalled`] fires, and the
+/// call site immediately force-signals `cancel` so the real wait that follows returns at once
+/// instead of genuinely spending the grace — a caught bug fails fast, not slow.
+///
+/// `thread_local!`, NOT a process-global slot — a global (even one gated by `is_armed`) is
+/// still visible from every thread, so under plain `cargo test`'s shared-process, many-threads
+/// model (which cosca must pass) a concurrent, unrelated test's `block_until_exit_or_cancel`
+/// call on ANOTHER thread would see `is_armed() == true` while this test's guard is installed,
+/// find ITS OWN target unsignalled, and get force-cancelled too — cross-test interference.
+///
+/// `block_until_exit_or_cancel` runs inside `tokio::task::spawn_blocking`'s closure, on a
+/// blocking-pool thread distinct from the one that called `grace_wait` (the "arming" thread), so
+/// a thread-local written there is not, by itself, visible on the blocking-pool thread.
+/// `blocking_watch` (`src/tokio/wait.rs`) bridges the two threads: it reads [`current`] on the
+/// arming thread before `spawn_blocking`, then re-[`install`]s the cloned sender on the
+/// blocking-pool thread for that call's scope.
+#[cfg(test)]
+pub(crate) mod armed_probe {
+    use std::cell::RefCell;
+    use std::sync::mpsc::Sender;
+
+    thread_local! {
+        static ARMED_TX: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Installs `tx` as the CURRENT thread's observer for the guard's lifetime, restoring
+    /// whatever was there before (always `None` in every real use — this repo never nests two
+    /// installs on one thread) on drop, even on unwind, so a panicking test or a reused
+    /// blocking-pool thread never carries a stale observer forward.
+    // Consumers are the tokio TreeWalk fast-path test
+    // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`) and
+    // `grace_wait_resolves_immediately_on_an_identity_mismatch`, both `tokio`-only, so this is
+    // dead code in a `--no-default-features` (no `tokio`) build — same shape as
+    // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
+    //
+    // `!Send`, via the `PhantomData<*const ()>` marker: the whole point is that dropping it
+    // clears the thread-local slot IT WAS INSTALLED ON. A `Guard` sent to another thread and
+    // dropped there would restore `self.0` into THAT thread's cell instead — corrupting an
+    // unrelated thread's (possibly a live test's) observer state.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) struct Guard(Option<Sender<()>>, std::marker::PhantomData<*const ()>);
+
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn install(tx: Sender<()>) -> Guard {
+        let prev = ARMED_TX.with(|cell| cell.replace(Some(tx)));
+        debug_assert!(prev.is_none(), "armed_probe::install nested on the same thread");
+        Guard(prev, std::marker::PhantomData)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED_TX.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// The CURRENT thread's installed observer, if any — read on the arming thread, before
+    /// `spawn_blocking`, so `blocking_watch` can `move` it into that closure. Cloned, not
+    /// taken: the arming thread's own installation must survive for its guard's whole
+    /// lifetime, which may span more than one `blocking_watch` call (e.g. `wait_exit`'s retry
+    /// loop).
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn current() -> Option<Sender<()>> {
+        ARMED_TX.with(|cell| cell.borrow().clone())
+    }
+
+    /// Whether the CURRENT thread has an observer installed — gates the call site's poll and
+    /// forced cancel so they run only for the one test that opted in, never for any other
+    /// caller of `block_until_exit_or_cancel` in the same binary or on another thread.
+    pub(crate) fn is_armed() -> bool {
+        ARMED_TX.with(|cell| cell.borrow().is_some())
+    }
+
+    pub(crate) fn notify_armed_unsignalled() {
+        ARMED_TX.with(|cell| {
+            if let Some(tx) = cell.borrow().as_ref() {
+                let _ = tx.send(());
+            }
+        });
+    }
 }
