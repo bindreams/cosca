@@ -268,7 +268,7 @@ fn open_verified_is_unassessable_when_the_einval_arms_exists_is_unknown() {
     let mark = crate::log_capture::mark();
     let forced_errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let forced_exists = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), what);
+    let result = super::open_verified(ProcessId::current(), "foreign process wait", what);
     drop(forced_exists);
     drop(forced_errno);
     assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], true, what, mark);
@@ -435,7 +435,7 @@ fn open_verified_current_with_fdinfo(
     what: &'static str,
 ) -> Result<Option<rustix::fd::OwnedFd>, crate::error::Error> {
     let forced = crate::identity::proc_view_fault::force_fdinfo_once(answer);
-    let result = super::open_verified(ProcessId::current(), what);
+    let result = super::open_verified(ProcessId::current(), "foreign process wait", what);
     drop(forced);
     result
 }
@@ -484,7 +484,7 @@ fn open_verified_is_unassessable_when_the_pidfds_fdinfo_is_unreadable() {
 fn open_verified_accepts_a_live_target_whose_fdinfo_pid_matches() {
     let forced = open_verified_current_with_fdinfo(Ok(PidfdTarget::Pid(std::process::id())), "fdinfo-matches probe");
     assert!(matches!(forced, Ok(Some(_))), "got {forced:?}");
-    let unforced = super::open_verified(ProcessId::current(), "test probe");
+    let unforced = super::open_verified(ProcessId::current(), "foreign process wait", "test probe");
     assert!(
         matches!(unforced, Ok(Some(_))),
         "the real fdinfo must match too, got {unforced:?}"
@@ -521,7 +521,86 @@ fn open_verified_is_unassessable_when_the_success_paths_exists_is_unknown() {
     let what = "success-path-exists-unknown probe";
     let mark = crate::log_capture::mark();
     let forced = super::fault::force_exists_once(Existence::Unknown);
-    let result = super::open_verified(ProcessId::current(), what);
+    let result = super::open_verified(ProcessId::current(), "foreign process wait", what);
     drop(forced);
     assert_unassessable_with_cause(result.map(|fd| fd.is_some()), &["existence query"], false, what, mark);
+}
+
+// `pidfd_open` refusals that mean "this environment cannot do it" =====
+
+/// The `Unsupported` an `open_verified` call answers when `pidfd_open` is forced to `errno`.
+fn unsupported_for(errno: rustix::io::Errno, open: impl FnOnce(ProcessId) -> Result<(), Error>) -> Error {
+    let forced = super::fault::force_pidfd_open_errno_once(errno);
+    let result = open(ProcessId::current());
+    drop(forced);
+    match result {
+        Err(e @ Error::Unsupported { .. }) => e,
+        other => panic!("a pidfd_open answering {errno} must be Unsupported, got {other:?}"),
+    }
+}
+
+fn assert_unsupported_naming(err: &Error, op: &str, errno_name: &str) {
+    match err {
+        Error::Unsupported {
+            op: got,
+            platform,
+            detail,
+        } => {
+            assert_eq!(got, op, "the op must name the caller");
+            assert_eq!(*platform, "linux");
+            assert!(
+                detail.contains("pidfd_open") && detail.contains(errno_name),
+                "the detail must name pidfd_open and {errno_name}: {detail}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// A sandbox filter that answers `EPERM` or `ENODEV` to `pidfd_open` is as unsupported as one
+/// that answers `ENOSYS`: the spawn path can never work there, and no other route exists.
+///
+/// Mutant: `EPERM`/`ENODEV` fall through to `Io`.
+#[test]
+fn a_pidfd_open_refused_with_eperm_or_enodev_is_unsupported_naming_the_errno() {
+    for (errno, name) in [
+        (rustix::io::Errno::PERM, "EPERM"),
+        (rustix::io::Errno::NODEV, "ENODEV"),
+        (rustix::io::Errno::NOSYS, "ENOSYS"),
+    ] {
+        let err = unsupported_for(errno, |id| {
+            super::open_verified(id, "foreign process wait", "test probe").map(drop)
+        });
+        assert_unsupported_naming(&err, "foreign process wait", name);
+    }
+}
+
+/// Any other errno stays `Io`: `EMFILE` is a resource limit, not a missing capability.
+///
+/// Mutant: every errno is `Unsupported`.
+#[test]
+fn a_pidfd_open_refused_with_emfile_stays_io() {
+    let forced = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::MFILE);
+    let result = super::open_verified(ProcessId::current(), "foreign process wait", "test probe");
+    drop(forced);
+    match result {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE)),
+        other => panic!("EMFILE must stay Io, got {other:?}"),
+    }
+}
+
+/// Each foreign operation names itself in the `Unsupported` it answers, not one fixed
+/// "wait/kill" for all three.
+///
+/// Mutant: the op is a fixed string.
+#[test]
+fn each_foreign_operation_names_itself_when_pidfd_open_is_refused() {
+    let wait = unsupported_for(rustix::io::Errno::PERM, |id| {
+        super::block_until_exit(id, None).map(drop)
+    });
+    assert_unsupported_naming(&wait, "foreign process wait", "EPERM");
+    let kill = unsupported_for(rustix::io::Errno::PERM, super::kill);
+    assert_unsupported_naming(&kill, "foreign process kill", "EPERM");
+    let terminate = unsupported_for(rustix::io::Errno::PERM, super::terminate);
+    assert_unsupported_naming(&terminate, "foreign process terminate", "EPERM");
 }
