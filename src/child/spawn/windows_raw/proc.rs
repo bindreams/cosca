@@ -132,7 +132,7 @@ impl RawChild {
             // OpenProcess for PROCESS_TERMINATE, pid-reuse-safe because we still hold the handle)
             // separates the two WITHOUT racing a `try_wait`.
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
-                if self.runas && !self.can_terminate() {
+                if self.runas {
                     // (b) A genuinely higher-integrity runas child we cannot terminate. Do NOT
                     // block in wait(): surface the denial.
                     Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.0 as i32))
