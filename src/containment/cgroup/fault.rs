@@ -2,6 +2,7 @@ use std::cell::Cell;
 
 /// A seam's hook, run with the child's pid.
 type PidHook = Box<dyn FnOnce(u32)>;
+type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
     static FORCE_LEAF_BUSY: Cell<bool> = const { Cell::new(false) };
@@ -39,6 +40,10 @@ thread_local! {
     static FORCE_FORK_RUNNING_PROBE_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_WAITID_EINTR: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_ON_DROP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static AFTER_FORK_STILL_LOCKED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    static ON_FORK_RUNNING_LOCK_CONTENDED: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    static ON_FORK_RUNNING_CLEANUP: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    static FORK_RUNNING_LOCK_HELD_REPORT_FD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
 }
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
@@ -422,6 +427,92 @@ pub(crate) fn run_before_exit_wait() {
     if let Some(hook) = BEFORE_EXIT_WAIT.with(|h| h.borrow_mut().take()) {
         hook();
     }
+}
+
+/// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if
+/// `fork_running` never ran it.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct AfterForkStillLockedGuard(());
+impl Drop for AfterForkStillLockedGuard {
+    fn drop(&mut self) {
+        AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread, after `fork()` and `KillOnDrop`
+/// construction, still holding `spawn_lock`. Runs on the forking thread, so it may read
+/// [`crate::child::spawn::spawn_lock_held_by_this_thread`].
+pub(crate) fn set_after_fork_still_locked(hook: impl FnOnce() + 'static) -> AfterForkStillLockedGuard {
+    AFTER_FORK_STILL_LOCKED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    AfterForkStillLockedGuard(())
+}
+pub(crate) fn run_after_fork_still_locked() {
+    if let Some(hook) = AFTER_FORK_STILL_LOCKED.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// RAII: dropping this clears the hook [`set_fork_running_lock_contended`] armed.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningLockContendedGuard(());
+impl Drop for ForkRunningLockContendedGuard {
+    fn drop(&mut self) {
+        ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread if `spawn_lock` is already held when
+/// it goes to take it, just before it blocks on the lock.
+pub(crate) fn set_fork_running_lock_contended(hook: impl FnOnce() + 'static) -> ForkRunningLockContendedGuard {
+    ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForkRunningLockContendedGuard(())
+}
+pub(crate) fn run_fork_running_lock_contended() {
+    if let Some(hook) = ON_FORK_RUNNING_LOCK_CONTENDED.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// RAII: dropping this clears the hook [`set_fork_running_cleanup`] armed.
+#[must_use = "dropping this immediately clears the armed hook; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningCleanupGuard(());
+impl Drop for ForkRunningCleanupGuard {
+    fn drop(&mut self) {
+        ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Run `hook` in the NEXT `fork_running` call on this thread that fails its `pidfd_open`, at the
+/// start of the cleanup that kills and reaps the child. Runs on the forking thread.
+pub(crate) fn set_fork_running_cleanup(hook: impl FnOnce() + 'static) -> ForkRunningCleanupGuard {
+    ON_FORK_RUNNING_CLEANUP.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    ForkRunningCleanupGuard(())
+}
+pub(crate) fn run_fork_running_cleanup() {
+    if let Some(hook) = ON_FORK_RUNNING_CLEANUP.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// RAII: dropping this clears the fd [`set_fork_running_lock_held_report_fd`] registered, even if
+/// `fork_running` never consumed it, so it can't leak into a later call on this thread.
+#[must_use = "dropping this immediately clears the registered fd; bind it for the scope that needs it"]
+pub(crate) struct ForkRunningLockHeldReportFdGuard(());
+impl Drop for ForkRunningLockHeldReportFdGuard {
+    fn drop(&mut self) {
+        FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(None));
+    }
+}
+
+/// Give the NEXT `fork_running` call on this thread a pipe write fd; its child writes one byte
+/// (`1`/`0`) for whether it inherited `spawn_lock` as held. `fork_running` takes the fd once,
+/// before forking.
+pub(crate) fn set_fork_running_lock_held_report_fd(fd: std::os::fd::RawFd) -> ForkRunningLockHeldReportFdGuard {
+    FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.set(Some(fd)));
+    ForkRunningLockHeldReportFdGuard(())
+}
+pub(crate) fn take_fork_running_lock_held_report_fd() -> Option<std::os::fd::RawFd> {
+    FORK_RUNNING_LOCK_HELD_REPORT_FD.with(|f| f.take())
 }
 
 /// Count an abandoned child signalled by its bare pid on this thread.

@@ -375,8 +375,50 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 /// **Poison-tolerant:** a panic mid-spawn must not wedge every future spawn, so a poisoned lock is
 /// recovered rather than propagated (the guarded data is unit — there is no invariant to protect).
 pub(crate) fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
-    static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Whether THIS thread holds `SPAWN_MUTEX`; set and cleared only by [`spawn_lock_tracked`]'s guard.
+    #[cfg(all(target_os = "linux", test))]
+    static SPAWN_LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) struct TrackedSpawnLockGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(target_os = "linux", test))]
+impl Drop for TrackedSpawnLockGuard {
+    fn drop(&mut self) {
+        SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(false));
+    }
+}
+
+/// Like [`spawn_lock`] (same mutex), but also records in a thread-local, for
+/// [`spawn_lock_held_by_this_thread`], that this thread holds it. `on_contended` runs first if the
+/// lock is already held, before this blocks on it.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn spawn_lock_tracked(on_contended: impl FnOnce()) -> TrackedSpawnLockGuard {
+    let guard = match SPAWN_MUTEX.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_contended();
+            SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
+    SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(true));
+    TrackedSpawnLockGuard { _guard: guard }
+}
+
+/// Whether THIS thread currently holds `spawn_lock`'s mutex, per [`spawn_lock_tracked`].
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
+    SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
 
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
