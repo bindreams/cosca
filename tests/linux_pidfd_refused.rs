@@ -97,3 +97,28 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
         child.wait().expect("reap the child");
     }
 }
+
+/// `spawn` adopts its child through a pidfd; a refused `pidfd_open` fails the spawn with
+/// `Unsupported` naming `spawn`, with no fallback.
+///
+/// Mutants: the op is another; an errno missing from the refusals.
+#[test]
+fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
+    for (code, name) in REFUSALS {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut cmd = cosca::Command::new();
+        cmd.executable(common::testbin())
+            .args(["cosca_testbin", "control-block", addr.as_str(), "R"]);
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_open_on_this_thread(code);
+                    cmd.spawn()
+                })
+                .join()
+                .expect("the filtered thread")
+        });
+        assert_refused(result, "spawn", name);
+    }
+}
