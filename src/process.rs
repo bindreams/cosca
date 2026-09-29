@@ -95,7 +95,8 @@ impl Process {
     /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
     /// token) is rejected by the same token rule as [`children`](Self::children) — sound,
     /// modulo the per-OS same-tick residual the whole crate shares. `None` if there is no
-    /// resolvable parent or `self` itself was recycled.
+    /// resolvable parent or `self` itself was recycled, or if the process table cannot be read
+    /// (logged at `warn`, naming the cause; this method has no error channel).
     pub fn parent(&self) -> Option<Process> {
         // Anchor: a query against a recycled self pid is meaningless. An Unknown anchor
         // cannot rule that out either, so it is treated the same — the alternative is
@@ -111,7 +112,15 @@ impl Process {
                 return None;
             }
         }
-        let parents = crate::containment::enumerate::process_parents();
+        // A query, not a kill or a wait, and the return type has no error channel: an unreadable
+        // process table reads as "no parent", said at `warn` with its cause.
+        let parents = match crate::containment::enumerate::process_parents() {
+            Ok(parents) => parents,
+            Err(e) => {
+                log::warn!("Process::parent: {e} — reporting no parent");
+                return None;
+            }
+        };
         let ppid = parents
             .iter()
             .find(|&&(pid, _)| pid == self.id.pid())
@@ -145,7 +154,8 @@ impl Process {
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
     /// whole subtree. Identity-guarded against pid-reuse by the tree-walk token rule (a
     /// candidate is kept only if its start token orders at-or-after this process). Snapshot;
-    /// best-effort.
+    /// best-effort. Empty, with a `warn` naming the cause, if the process table cannot be read:
+    /// empty does not prove there are no children.
     pub fn children(&self, recursive: Recursive) -> Vec<Process> {
         // Anchor: a recycled self pid maps the whole query onto a stranger. An Unknown
         // anchor cannot rule that out either.
@@ -160,7 +170,16 @@ impl Process {
                 return Vec::new();
             }
         }
-        let parents = crate::containment::enumerate::process_parents();
+        // A query, not a kill or a wait, and the return type has no error channel: an unreadable
+        // process table reads as "no children", said at `warn` with its cause. Callers that act
+        // on the answer (`kill_tree`, `terminate_tree`) do not use this method; they error.
+        let parents = match crate::containment::enumerate::process_parents() {
+            Ok(parents) => parents,
+            Err(e) => {
+                log::warn!("Process::children: {e} — returning none");
+                return Vec::new();
+            }
+        };
         let ids = match recursive {
             Recursive::No => crate::containment::treewalk::children_of(self.id, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants(self.id, &parents),

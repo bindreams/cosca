@@ -311,8 +311,14 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute
 /// genuine descendants, kill the root FIRST then each descendant. SIGKILL on
 /// Unix; `TerminateProcess` on Windows. Best-effort; already-gone is success.
-pub(crate) fn hard_kill(root: ProcessId) {
-    let parents = crate::containment::enumerate::process_parents();
+///
+/// # Errors
+///
+/// [`Error::Unassessable`](crate::error::Error::Unassessable) when the process snapshot cannot be
+/// taken. Nothing is killed, the root included: killing the root first would reparent its
+/// descendants out of the ppid walk, so a retry could no longer find them.
+pub(crate) fn hard_kill(root: ProcessId) -> Result<(), crate::error::Error> {
+    let parents = crate::containment::enumerate::process_parents()?;
     let descendants = descendants(root, &parents);
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
@@ -339,6 +345,7 @@ pub(crate) fn hard_kill(root: ProcessId) {
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (root, descendants, skip_root);
+    Ok(())
 }
 
 /// Test-only: force the NEXT `hard_kill` on THIS thread to skip the root's identity kill
@@ -383,7 +390,8 @@ pub(crate) mod fault {
 ///
 /// Unix: the same snapshot + identity walk with SIGTERM (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
-/// reaches the whole genuine tree just like `hard_kill`.
+/// reaches the whole genuine tree just like `hard_kill`. `Unassessable` (nothing signalled) when
+/// the process snapshot cannot be taken.
 ///
 /// Windows: send `CTRL_BREAK_EVENT` to the root's process group (the root was
 /// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
@@ -397,7 +405,7 @@ pub(crate) mod fault {
 pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
     #[cfg(unix)]
     {
-        let parents = crate::containment::enumerate::process_parents();
+        let parents = crate::containment::enumerate::process_parents()?;
         let descendants = descendants(root, &parents);
         let _ = kill_by_identity(root, Signal::SIGTERM);
         for id in descendants {
@@ -419,3 +427,7 @@ pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
 #[cfg(test)]
 #[path = "treewalk_tests.rs"]
 mod treewalk_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "treewalk_view_tests.rs"]
+mod treewalk_view_tests;

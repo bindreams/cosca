@@ -5,6 +5,7 @@
 //! 1-second start-time granularity is useless as an ordering key, and it pulls a
 //! second major `windows` version.
 
+use crate::error::Error;
 use crate::identity::RawPid;
 
 #[cfg_attr(windows, path = "enumerate/windows.rs")]
@@ -18,7 +19,15 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 /// A `(pid, ppid)` pair for every currently-listable process. Best-effort: a
 /// process that vanishes mid-snapshot is simply absent. Only pid/ppid are read;
 /// each candidate's high-res start token is resolved later via `ProcessId::of`.
-pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
+///
+/// # Errors
+///
+/// [`Error::Unassessable`], naming the cause, when no trustworthy snapshot can be taken (Linux:
+/// `/proc` is not this pid namespace's, or cannot be listed; Windows: the ToolHelp snapshot
+/// failed; macOS: `proc_listallpids` failed). An empty `Ok` means the host has no processes, never
+/// "the snapshot failed": a tree walk over a failed snapshot would find no descendants and skip
+/// every kill and wait that depends on them.
+pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     backend::process_parents()
 }
 

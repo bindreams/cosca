@@ -190,10 +190,7 @@ impl Attached {
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(),
-            Attached::TreeWalk(root) => {
-                crate::containment::treewalk::hard_kill(*root);
-                Ok(())
-            }
+            Attached::TreeWalk(root) => crate::containment::treewalk::hard_kill(*root),
         }
     }
 

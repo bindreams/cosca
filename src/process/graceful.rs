@@ -55,9 +55,14 @@ impl Process {
     /// atomic against a forking tree and does not surface per-process failures — the `TreeWalk`
     /// contract. All platforms. For a guaranteed, failure-surfacing single-process kill use
     /// [`kill`](Process::kill).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unassessable`] when the process table cannot be read (on Linux, `/proc` is not
+    /// this pid namespace's): descendants cannot be found, so NOTHING is killed, the root
+    /// included, and the error names the cause.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        crate::containment::treewalk::hard_kill(self.id);
-        Ok(())
+        crate::containment::treewalk::hard_kill(self.id)
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root
@@ -65,6 +70,10 @@ impl Process {
     /// [`terminate`](Process::terminate), whose two absences — no pinned pid, and no way to
     /// learn whether a foreign pid leads a group — apply here too, so it returns `Unsupported`
     /// (use [`kill_tree`](Process::kill_tree) for a hard sweep).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unassessable`] when the process table cannot be read: nothing is signalled.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
