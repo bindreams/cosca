@@ -15,10 +15,6 @@ fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
 }
 
-fn echild(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ECHILD)
-}
-
 // S11: a zombie only its tracer sees =====
 
 /// S11: an unbounded holder whose reap finds nothing after a real exit blocks in
@@ -80,7 +76,7 @@ fn a_holder_in_its_blocking_waitid_holds_no_lock() {
         let shared = Arc::clone(&b.shared);
         move || {
             let _none = exit_seams::force_reap_once(ForcedReap::None);
-            exit_seams::on_holder_step(HolderStep::BlockingWaitid, move || {
+            let _hook = exit_seams::on_holder_step(HolderStep::BlockingWaitid, move || {
                 _ = at_waitid_tx.send(());
                 _ = release_rx.recv();
             });
@@ -190,34 +186,37 @@ fn a_deadline_condvar_wait_is_clamped_to_the_remaining_time() {
     );
 }
 
+/// A deadline beyond `MAX_BLOCK` is armed in pieces: no `poll` is armed with more than the cap,
+/// and the wait still returns the exit. The child is ended from the holder's `Poll` step, so the
+/// exit is what wakes the first (capped) poll.
+///
+/// Mutant: no clamp on the poll's remaining time: the recorded timeout is the whole distance.
+#[test]
+fn a_deadline_beyond_the_block_limit_is_armed_clamped() {
+    let (child, stdin) = spawn_std_blocker();
+    let id = super::fixtures::identity_of(&child);
+    let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let mut stdin = Some(stdin);
+    let _end = exit_seams::on_holder_step(HolderStep::Poll, move || drop(stdin.take()));
+    crate::wait::block_probe::take();
+    let deadline = Instant::now() + Duration::from_secs(u64::from(u32::MAX));
+    shared
+        .wait_deadline(deadline)
+        .expect("a far deadline is not an error")
+        .expect("the child was ended, so the wait reports its exit");
+    let armed = crate::wait::block_probe::take();
+    assert!(!armed.is_empty(), "the wait must have polled");
+    for a in armed {
+        let a = a.expect("a deadline wait arms a bounded poll");
+        assert!(a <= crate::wait::MAX_BLOCK, "armed {a:?}");
+    }
+}
+
 // Adoption =====
 
-fn assert_every_method_answers_echild(shared: &SharedChild) {
-    assert!(echild(&shared.wait().expect_err("wait")));
-    assert!(echild(&shared.try_wait().expect_err("try_wait")));
-    assert!(echild(&shared.wait_deadline(far()).expect_err("wait_deadline")));
-    assert!(echild(&shared.kill().expect_err("kill")));
-}
-
-fn reap_by_number(pid: u32) {
-    let mut status = 0;
-    // SAFETY: `pid` is this test's own child, still unreaped (the forced errno was synthetic).
-    let r = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
-    assert_eq!(r, pid as i32, "reap the fixture: {}", std::io::Error::last_os_error());
-}
-
-/// Adopt a blocker with `pidfd_open` forced to `errno`, expecting the gone path.
+/// Adopt with `pidfd_open` forced to `errno`, expecting the gone path.
 fn adopt_gone_on(errno: rustix::io::Errno) {
-    let (child, stdin) = spawn_std_blocker();
-    let pid = child.id();
-    let id = super::fixtures::identity_of(&child);
-    let forced = fault::force_pidfd_open_errno_once(errno);
-    let shared = SharedChild::adopt(child, id).expect("a gone errno is not a failure");
-    drop(forced);
-    assert_every_method_answers_echild(&shared);
-    // The forced errno was synthetic: the child is still this test's own, unreaped.
-    drop(stdin);
-    reap_by_number(pid);
+    super::fixtures::assert_adoption_is_gone(|| fault::force_pidfd_open_errno_once(errno));
 }
 
 /// `EINVAL` (before 6.16: a reaped leader whose number is held as a PGID, or reused by a
@@ -243,15 +242,7 @@ fn adopt_on_enoent_takes_the_gone_path() {
 /// Mutant: a by-number pidfd trusted unchecked.
 #[test]
 fn adopt_treats_a_pidfd_whose_identity_is_gone_as_gone() {
-    let (child, stdin) = spawn_std_blocker();
-    let pid = child.id();
-    let id = super::fixtures::identity_of(&child);
-    let forced = fault::force_exists_once(crate::identity::Existence::Gone);
-    let shared = SharedChild::adopt(child, id).expect("adopt");
-    drop(forced);
-    assert_every_method_answers_echild(&shared);
-    drop(stdin);
-    reap_by_number(pid);
+    super::fixtures::assert_adoption_is_gone(|| fault::force_exists_once(crate::identity::Existence::Gone));
 }
 
 /// A pid that is not our child answers `ECHILD` to the confirming `waitid`, even when a pidfd for
