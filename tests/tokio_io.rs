@@ -986,139 +986,154 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     }
 }
 
-/// Async sibling of the sync `spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
-/// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
-#[tokio::test]
-async fn spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
-    let result = ::tokio::spawn(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
-    let join_err = match result {
-        Ok(_) => panic!("spawn_control_async did not panic for a target that died before connecting"),
+// Death-watched accept =====
+
+/// Awaits `fut` on this test's own thread and returns the message it panicked with. The runtime is
+/// `current_thread`, so a spawned task runs on this thread and the thread-local
+/// `common::last_reported_grandchild` is visible to the test.
+async fn panic_message_of<T: Send + 'static>(fut: impl std::future::Future<Output = T> + Send + 'static) -> String {
+    let join_err = match ::tokio::spawn(fut).await {
+        Ok(_) => panic!("the future returned instead of panicking"),
         Err(e) => e,
     };
     assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
-    let payload = join_err.into_panic();
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    common::panic_message(join_err.into_panic())
+}
+
+fn assert_died_before_connecting(message: &str, pid: u32) {
     assert!(
-        message.contains("before it connected"),
-        "expected a \"before it connected\" panic, got: {message:?}"
+        message.contains(&format!("the control target (pid {pid}) died before it connected")),
+        "expected pid {pid} to be reported as died before it connected, got: {message:?}"
     );
+}
+
+/// Async sibling of the sync `spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
+/// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+    let message = panic_message_of(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
+    assert!(message.contains("died before it connected"), "got: {message:?}");
 }
 
 /// Async sibling of `spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
-    let result = ::tokio::spawn(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
-    let join_err = match result {
-        Ok(_) => panic!("spawn_tree_async did not panic for a target that died before connecting"),
-        Err(e) => e,
-    };
-    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
-    let payload = join_err.into_panic();
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
-    assert!(
-        message.contains("before it connected"),
-        "expected a \"before it connected\" panic, got: {message:?}"
-    );
+    let message = panic_message_of(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+}
+
+fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
+    let (listener, addr) = common::bind_async_listener();
+    let mut cmd = cosca::tokio::Command::new();
+    let mut argv = vec![common::testbin().to_string()];
+    argv.extend(args.iter().map(|a| a.replace("{addr}", &addr)));
+    cmd.args(argv);
+    if ack {
+        cmd.env(common::ACK_ENV, "1");
+    }
+    (listener, cmd.spawn().expect("spawn"))
 }
 
 /// Regression test for `common::accept_or_die_async`'s reason to exist: a dead-before-connecting
-/// target must panic (not hang) the task awaiting it, on the "before it connected" message
-/// specifically — and the error case is reported as itself, never folded into "died"/"exited".
-/// Uses `cosca::tokio::Command` directly (not a raw `tokio::process::Command`) since
-/// `accept_or_die_async` races the SAME `cosca::tokio::Child::wait()` every helper below uses,
-/// not a generic `AsyncRead`.
-#[tokio::test]
+/// target must panic (not hang) the task awaiting it, on the message naming the target.
+/// Named mutant: a plain `listener.accept().await` (hangs; only nextest's bound fails it).
+#[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    std_listener
-        .set_nonblocking(true)
-        .expect("set the listener nonblocking for tokio");
-    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
-    let mut cmd = cosca::tokio::Command::new();
-    cmd.executable(common::testbin())
-        .args(["cosca_testbin", "--not-a-real-mode"]); // exits immediately on an unknown mode
-    let mut child = cmd.spawn().expect("spawn a child that exits immediately");
-
-    let result = ::tokio::spawn(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
-
-    let join_err = match result {
-        Ok(_) => panic!("accept_or_die_async did not panic for a target that died before connecting"),
-        Err(e) => e,
-    };
-    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
-    let payload = join_err.into_panic();
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
-    assert!(
-        message.contains("before it connected"),
-        "expected a \"before it connected\" panic, got: {message:?}"
-    );
+    let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
+    let pid = child.id().pid();
+    let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
+    assert_died_before_connecting(&message, pid);
 }
 
-/// A target that connected and then exited must NOT be reported as having exited before it
-/// connected. A freshly registered tokio listener is not ready on its first poll, while
-/// `Child::wait()` on an already-exited child completes at once, so without the final
-/// non-blocking accept the exit arm wins with the connection still in the backlog.
+/// A target that connects and exits without waiting for the accept ack (not opted in) is dead
+/// whether or not its connection reached the accept queue: an exit arm firing is the verdict, and
+/// no accept attempt on the listener follows it. The child is awaited to completion BEFORE the
+/// tokio listener is polled, so the connection is queued and the exit known.
 ///
-/// Deterministic: the child is awaited to completion BEFORE the tokio listener even exists, so
-/// the connection is already queued in the std listener's backlog, the exit is already known, and
-/// the tokio wrapper's first poll has never seen a reactor event. Named mutant: the final accept
-/// removed (the exit arm panics directly).
-#[tokio::test]
-async fn accept_or_die_async_returns_the_connection_when_the_target_already_exited() {
-    use std::io::Read as _;
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = std_listener.local_addr().unwrap().to_string();
-    let mut cmd = cosca::tokio::Command::new();
-    cmd.executable(common::testbin())
-        .args(["cosca_testbin", "control-once", addr.as_str(), "R"]);
-    let mut child = cmd.spawn().expect("spawn a target that connects and exits immediately");
+/// Named mutant: a final non-blocking accept after the exit arm (it returns the queued
+/// connection instead of panicking).
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+    let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
+    let pid = child.id().pid();
     let status = child.wait().await.expect("wait for the target to exit");
     assert!(status.success(), "control-once should exit 0, got {status}");
-    std_listener
-        .set_nonblocking(true)
-        .expect("set the listener nonblocking for tokio");
-    let listener = ::tokio::net::TcpListener::from_std(std_listener).expect("wrap the listener for tokio");
+    let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
+    assert_died_before_connecting(&message, pid);
+}
 
+/// The ack: an opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
+/// Named mutant: not writing the ack (the tag read hangs; only nextest's bound fails it).
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_acks_the_connection_it_accepts() {
+    use std::io::{Read as _, Write as _};
+    let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true);
     let mut sock = common::accept_or_die_async(&listener, &mut child).await;
     let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag)
-        .expect("read the tag sent before the target exited");
-    assert_eq!(tag, *b"R");
+    sock.read_exact(&mut tag).expect("the acked target sends its tag");
+    assert_eq!(&tag, b"R");
+    sock.write_all(b"x").expect("release");
+    child.wait().await.expect("reap");
+}
+
+/// A gone descendant is reported dead, like the sync twin `accept_or_die_also_reports_a_gone_descendant_as_dead`.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
+    use std::process::Stdio;
+    let (listener, mut target) = bind_and_spawn(&["sleep-marker"], false);
+    let mut gone = std::process::Command::new(common::testbin())
+        .arg("hold-until-stdin-eof")
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn the descendant");
+    let gone_id = cosca::identity::ProcessId::of(gone.id())
+        .found()
+        .expect("the live descendant resolves");
+    drop(gone.stdin.take());
+    gone.wait().expect("reap the descendant: its identity is now Gone");
+
+    let message =
+        panic_message_of(async move { common::accept_or_die_async_also(&listener, &mut target, Some(gone_id)).await })
+            .await;
+    assert_died_before_connecting(&message, gone_id.pid());
 }
 
 /// Only the GRANDCHILD dies (root alive, connected): the helper must fail, not wait forever for
-/// a "G". Named mutant: the helper watching only the root.
-#[tokio::test]
+/// a "G", and the panic names the grandchild the root reported. Named mutant: the helper
+/// watching only the root.
+#[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
-    let result = ::tokio::spawn(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
-    let Err(join_err) = result else {
-        panic!("spawn_tree_async must panic, not hang or succeed");
-    };
-    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
-    let message = common::panic_message(join_err.into_panic());
-    assert!(message.contains("before it connected"), "got: {message:?}");
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
+    assert_died_before_connecting(&message, grandchild);
 }
 
 /// [`spawn_echo_tree_async`]'s twin of the test above.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
-    let result = ::tokio::spawn(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
-    let join_err = result
-        .err()
-        .expect("spawn_echo_tree_async must panic, not hang or succeed");
-    assert!(join_err.is_panic(), "expected the task to panic, got: {join_err:?}");
-    let message = common::panic_message(join_err.into_panic());
-    assert!(message.contains("before it connected"), "got: {message:?}");
+    let message = panic_message_of(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
+    assert_died_before_connecting(&message, grandchild);
+}
+
+/// The root reports a live grandchild, then exits without connecting: the main loop fails on the root.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |_| {})).await;
+    let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+    assert!(
+        !message.contains(&format!("(pid {grandchild})")),
+        "the live grandchild must not be the one blamed: {message:?}"
+    );
+}
+
+/// The root connects to the report address and exits without reporting.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-eof", |_| {})).await;
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
 }

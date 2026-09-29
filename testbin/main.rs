@@ -8,6 +8,10 @@ use std::io::BufRead;
 use std::io::{Read, Write};
 use std::process::exit;
 
+/// The accept handshake (see the module doc).
+#[path = "ack.rs"]
+mod ack;
+
 /// The `report-console-identity` mode, shared verbatim with the GUI-subsystem fixture.
 #[cfg(windows)]
 #[path = "console_identity.rs"]
@@ -151,7 +155,7 @@ fn install_ignore_break() {
 /// relay: publish `<tag><pid>\n`, then echo each byte received. `Ok(0)`/`Interrupted` are the
 /// only expected outcomes besides a live echo; anything else is a genuine test-harness bug.
 fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
-    let mut sock = std::net::TcpStream::connect(addr).unwrap();
+    let mut sock = crate::ack::connect_control(addr).unwrap();
     writeln!(sock, "{tag}{}", std::process::id()).unwrap();
     sock.flush().unwrap();
     let mut b = [0u8; 1];
@@ -166,10 +170,13 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 }
 
 /// Spawn `exe args` as a grandchild and, when the harness asked for it via `COSCA_TEST_GC_PID_ADDR`,
-/// report its pid there as one `<pid>\n` line on a throwaway connection. The harness watches that
-/// pid alongside this root's, so a grandchild that dies before it connects fails the harness
-/// instead of leaving it waiting on a live root forever. Unset, nothing is reported and other
-/// consumers of the `spawn-grandchild*` modes see no extra connection.
+/// report its pid there as one `<pid>\n` line on a throwaway connection, then wait for the
+/// harness's release (the second ack) before returning. The harness resolves the grandchild's
+/// identity while this root is held here, alive and still its parent, so the pid names the
+/// grandchild for certain. It then watches that identity alongside this root's, so a grandchild
+/// that dies before it connects fails the harness instead of leaving it waiting on a live root
+/// forever. Unset, nothing is reported and other consumers of the `spawn-grandchild*` modes see no
+/// extra connection.
 ///
 /// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
@@ -178,9 +185,11 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
     let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
     if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
-        let mut sock = std::net::TcpStream::connect(addr.to_str().unwrap()).unwrap();
+        // `connect_control` waits for the first ack: the harness has accepted this connection.
+        let mut sock = crate::ack::connect_control(addr.to_str().unwrap()).unwrap();
         writeln!(sock, "{}", gc.id()).unwrap();
         sock.flush().unwrap();
+        crate::ack::wait_for_ack(&mut sock); // the second: the grandchild's identity is captured
     }
     KeptGrandchild(gc)
 }
@@ -329,7 +338,7 @@ fn main() {
             // EOF-ing the test's read — a real exit event, never a timer.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -382,13 +391,13 @@ fn main() {
             let _ = stdin.read(&mut byte); // blocks until stdin EOFs
         }
         "control-once" => {
-            // Like control-block, but exits immediately after the tag instead of blocking — for
-            // proving `accept_or_die`'s "connect then exit immediately" race: the connection is
-            // in the listener's backlog and this process has already exited by the time a caller
-            // gets around to checking either.
+            // Like control-block, but exits immediately after the tag instead of blocking: the
+            // shape of a target that connects and dies before the harness accepts. Run without
+            // the accept handshake (the harness sets no `COSCA_TEST_ACCEPT_ACK`), this is a
+            // target that does not wait for the ack, which the harness reports as dead.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
         }
@@ -407,7 +416,7 @@ fn main() {
             // after the tag handshake below — this mode is simply told, never guesses.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
 
@@ -454,7 +463,7 @@ fn main() {
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
             // Become a control-block ourselves (no test-owned stdin → no EOF confound).
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -467,11 +476,30 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["--not-a-real-mode"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
+        }
+        "spawn-grandchild-report-then-exit" => {
+            // Reports a live grandchild's pid, then exits without ever connecting to the main
+            // address: the report accept succeeds and the main accepts must fail on the root.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
+        }
+        "spawn-grandchild-report-eof" => {
+            // Connects to the pid report address, then exits without reporting anything.
+            let addr = std::env::var("COSCA_TEST_GC_PID_ADDR").expect("COSCA_TEST_GC_PID_ADDR");
+            let _sock = crate::ack::connect_control(addr).unwrap();
+        }
+        "hold-until-stdin-eof" => {
+            // Alive and silent until the test closes our stdin, then exits 0: an exit the test
+            // triggers at a moment of its choosing, with no network involved.
+            let mut buf = [0u8; 64];
+            let mut stdin = std::io::stdin().lock();
+            while stdin.read(&mut buf).unwrap() > 0 {}
         }
         "spawn-grandchild-echo-dies" => {
             // spawn-grandchild-echo with a grandchild that dies at once, as in spawn-grandchild-dies.
@@ -508,7 +536,7 @@ fn main() {
                 .spawn()
                 .unwrap();
             // Become a control-block ourselves (no test-owned stdin → no EOF confound).
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R\n").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -524,7 +552,7 @@ fn main() {
             // harness always gets a definite answer instead of an ambiguous connect-refused.
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
 
             // The setuid-root file bit must already have made us effective-root at exec
             // time. If not, the copy is not actually setuid-root (wrong owner/mode) or the
@@ -594,7 +622,7 @@ fn main() {
             }
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block", &addr, "G"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -644,7 +672,7 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -666,7 +694,7 @@ fn main() {
             }
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             SOCK_FD.store(sock.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
             // SAFETY: the handler only calls async-signal-safe write(2).
             unsafe {
@@ -691,7 +719,7 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-term", &addr, "G"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -703,7 +731,7 @@ fn main() {
             install_ignore_break();
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -717,7 +745,7 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block-ignore-break", &addr, "G"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -761,7 +789,7 @@ fn main() {
 
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             ACK.set(Mutex::new(sock.try_clone().unwrap()))
                 .expect("this arm runs exactly once per process");
             // SAFETY: installing a console ctrl handler has no preconditions.
@@ -782,7 +810,7 @@ fn main() {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
             let _gc = spawn_reported_grandchild(&exe, &["control-block-ack-break", &addr, "G"]);
-            let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+            let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R").unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];
@@ -796,7 +824,7 @@ fn main() {
             // crate spawn below a nested member: Containment::Delegated, owning no tree teardown
             // of its own, yet leading its own console process group. Connect FIRST so a panic
             // anywhere below reaches the test as socket EOF instead of hanging it.
-            let mut report_sock = std::net::TcpStream::connect(&args[2]).unwrap();
+            let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let ack_addr = listener.local_addr().unwrap().to_string();
@@ -1002,7 +1030,7 @@ fn main() {
             // Connect FIRST — the test blocks on accept(), so a panic below must reach it as
             // socket EOF instead of hanging the suite. Sibling of `report-console-terminate`;
             // see there for why each token is whitespace-free.
-            let mut report_sock = std::net::TcpStream::connect(&args[2]).unwrap();
+            let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
 
             let mut list = [0u32; 1];
             // SAFETY: both calls are standard Win32; `list` is a valid writable slice.
@@ -1159,7 +1187,7 @@ fn main() {
 
             // Connect FIRST. The test blocks on accept(), so a panic anywhere below must still
             // reach it as socket EOF instead of hanging the suite.
-            let mut report_sock = std::net::TcpStream::connect(&args[2]).unwrap();
+            let mut report_sock = crate::ack::connect_control(&args[2]).unwrap();
 
             // Three-way: a zero return is also how this API reports failure, so "?" must never
             // be able to satisfy the test's `console=0` vacuity guard. The last error is
@@ -1360,7 +1388,7 @@ fn main() {
             let is_delegated = child.containment() == cosca::Containment::Delegated;
             let unsupported = matches!(child.kill_tree(), Err(cosca::error::Error::Unsupported { .. }));
             let _ = child.wait();
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(if is_delegated && unsupported { b"D" } else { b"O" })
                 .unwrap();
             sock.flush().unwrap();
@@ -1374,7 +1402,7 @@ fn main() {
             }
             let addr = &args[2];
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
-            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            let mut sock = crate::ack::connect_control(addr).unwrap();
             sock.write_all(tag.as_bytes()).unwrap();
             sock.flush().unwrap();
             let mut buf = [0u8; 1];

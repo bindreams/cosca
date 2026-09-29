@@ -63,7 +63,7 @@ fn console_pids() -> Option<Vec<u32>> {
 /// (`ERROR_INVALID_HANDLE`), `?` the probe itself failed — so a broken probe can never satisfy
 /// a test's `console=0` guard.
 pub fn run(report_addr: &str, caller_pid: u32) {
-    let mut sock = std::net::TcpStream::connect(report_addr).expect("connect report socket");
+    let mut sock = crate::ack::connect_control(report_addr).expect("connect report socket");
 
     let pids = console_pids();
     let (console, sees_caller) = match &pids {
