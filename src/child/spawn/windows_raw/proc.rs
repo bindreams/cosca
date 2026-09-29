@@ -123,7 +123,19 @@ impl RawChild {
     /// Hard-kill the process. An already-exited child is success (matches std's `kill`).
     pub(crate) fn kill(&self) -> io::Result<()> {
         // SAFETY: `handle` is our live, owned process handle; exit code 1 is the forced-kill code.
-        match unsafe { TerminateProcess(self.handle(), 1) } {
+        match unsafe {
+            {
+                #[cfg(test)]
+                let noop = fault::armed();
+                #[cfg(not(test))]
+                let noop = false;
+                if noop {
+                    Ok::<(), windows::core::Error>(())
+                } else {
+                    TerminateProcess(self.handle(), 1)
+                }
+            }
+        } {
             Ok(()) => Ok(()),
             // TerminateProcess reports ERROR_ACCESS_DENIED in two distinct situations: (a) the
             // target is already exiting/exited (the OS teardown window signals the denial before
@@ -324,6 +336,10 @@ pub(crate) mod fault {
             hook();
             STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
         }
+    }
+
+    pub(crate) fn armed() -> bool {
+        STATE.with(|s| s.borrow().armed)
     }
 
     pub(crate) fn probe_forced_unterminable() -> bool {
