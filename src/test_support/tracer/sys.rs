@@ -11,40 +11,20 @@ fn errno() -> i32 {
 /// The attach request. `PT_ATTACH`, not `PT_ATTACHEXC`: measured on CI, a tracee attached with
 /// `PT_ATTACHEXC` by a tracer that registers no exception port usually never reaches `SSTOP`
 /// (its `SIGSTOP` is turned into a Mach exception that nothing answers), so the stop every
-/// later request needs never comes. `PT_ATTACH` reparents the tracee to the tracer exactly as
-/// `PT_ATTACHEXC` does and stops it the BSD way.
+/// later request needs never comes.
 const ATTACH: libc::c_int = libc::PT_ATTACH;
 
-fn ptrace(request: libc::c_int, pid: u32) -> Result<(), i32> {
+/// `data` is the signal `PT_CONTINUE` delivers, 0 for none, and is ignored by the other requests.
+fn ptrace(request: libc::c_int, pid: u32, data: i32) -> Result<(), i32> {
     // `addr` is `(caddr_t)1`, "resume where it stopped", for PT_CONTINUE and PT_DETACH, and is
-    // ignored by the attach requests; `data` 0 delivers no signal. `dangling_mut::<c_char>()` is
-    // address 1 without an integer-to-pointer cast.
+    // ignored by the attach requests.
     // SAFETY: no pointer is dereferenced by these requests.
-    let rc = unsafe { libc::ptrace(request, pid as libc::pid_t, std::ptr::dangling_mut::<libc::c_char>(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(errno())
-    }
-}
-
-pub(super) fn attach(pid: u32) -> Result<(), i32> {
-    ptrace(ATTACH, pid)
-}
-
-pub(super) fn cont(pid: u32) -> Result<(), i32> {
-    ptrace(libc::PT_CONTINUE, pid)
-}
-
-/// `PT_CONTINUE` delivering `signal`: passes on the signal a traced stop intercepted.
-pub(super) fn cont_with(pid: u32, signal: i32) -> Result<(), i32> {
-    // SAFETY: as `ptrace` above; `data` is a signal number.
     let rc = unsafe {
         libc::ptrace(
-            libc::PT_CONTINUE,
+            request,
             pid as libc::pid_t,
             std::ptr::dangling_mut::<libc::c_char>(),
-            signal,
+            data,
         )
     };
     if rc == 0 {
@@ -54,13 +34,27 @@ pub(super) fn cont_with(pid: u32, signal: i32) -> Result<(), i32> {
     }
 }
 
-pub(super) fn detach(pid: u32) -> Result<(), i32> {
-    ptrace(libc::PT_DETACH, pid)
+pub(super) fn attach(pid: u32) -> Result<(), i32> {
+    ptrace(ATTACH, pid, 0)
 }
 
-pub(super) fn sigstop(pid: u32) -> Result<(), i32> {
-    // SAFETY: plain kill(2).
-    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) } == 0 {
+/// `PT_CONTINUE`, delivering `signal` (0 for none).
+pub(super) fn cont(pid: u32, signal: i32) -> Result<(), i32> {
+    ptrace(libc::PT_CONTINUE, pid, signal)
+}
+
+/// `PT_CONTINUE` delivering no signal.
+pub(super) fn resume(pid: u32) -> Result<(), i32> {
+    cont(pid, 0)
+}
+
+pub(super) fn detach(pid: u32) -> Result<(), i32> {
+    ptrace(libc::PT_DETACH, pid, 0)
+}
+
+pub(super) fn kill(pid: u32, signal: i32) -> Result<(), i32> {
+    // SAFETY: kill(2) has no memory preconditions.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
         Ok(())
     } else {
         Err(errno())
@@ -85,23 +79,13 @@ pub(super) fn reap(pid: u32) -> Result<(), i32> {
 /// Blocking `waitid(P_PID, pid, WEXITED | WNOWAIT)`: returns once the tracee is a zombie,
 /// without reaping it. `Err` carries the errno, or `EINVAL` for a record that is not an exit.
 pub(super) fn await_zombie(pid: u32) -> Result<(), i32> {
-    loop {
-        // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a valid out-pointer.
-        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
-            // CLD_EXITED, CLD_KILLED, CLD_DUMPED (<sys/signal.h>). Measured on CI: a WEXITED-only
-            // waitid by the tracer also returns a traced child's stop, so the code is checked.
-            return if matches!(info.si_code, 1..=3) {
-                Ok(())
-            } else {
-                Err(libc::EINVAL)
-            };
-        }
-        match errno() {
-            libc::EINTR => continue,
-            e => return Err(e),
-        }
+    let info = peek(pid, libc::WEXITED)?;
+    // CLD_EXITED, CLD_KILLED, CLD_DUMPED (<sys/signal.h>). Measured on CI: a WEXITED-only waitid
+    // by the tracer also returns a traced child's stop, so the code is checked.
+    if matches!(info.si_code, 1..=3) {
+        Ok(())
+    } else {
+        Err(libc::EINVAL)
     }
 }
 
@@ -130,20 +114,23 @@ pub(super) fn pbi_status(pid: u32) -> Result<u32, i32> {
 /// `waitid(P_PID, pid, WSTOPPED | WNOHANG | WNOWAIT)`: `Ok(Some(signal))` while the tracee is
 /// stopped by `signal`, `Ok(None)` while it runs or has exited. Does not consume the stop.
 pub(super) fn stop_signal(pid: u32) -> Result<Option<i32>, i32> {
+    peek(pid, libc::WSTOPPED | libc::WNOHANG).map(|info| (info.si_pid != 0).then_some(info.si_status))
+}
+
+/// `Ok` while `pid` is this process's unreaped child: a `waitid` peek that neither blocks nor
+/// reaps. `Err(ECHILD)` once it is reaped, or while another process traces it.
+pub(super) fn peek_child(pid: u32) -> Result<(), i32> {
+    peek(pid, libc::WEXITED | libc::WSTOPPED | libc::WNOHANG).map(drop)
+}
+
+/// `waitid(P_PID, pid, flags | WNOWAIT)`, retried on `EINTR`.
+pub(super) fn peek(pid: u32, flags: libc::c_int) -> Result<libc::siginfo_t, i32> {
     loop {
         // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a valid out-pointer.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &mut info,
-                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if rc == 0 {
-            return Ok((info.si_pid != 0).then_some(info.si_status));
+        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, flags | libc::WNOWAIT) } == 0 {
+            return Ok(info);
         }
         match errno() {
             libc::EINTR => continue,
@@ -152,7 +139,7 @@ pub(super) fn stop_signal(pid: u32) -> Result<Option<i32>, i32> {
     }
 }
 
-/// One blocking `read(2)` of a byte, retried on `EINTR`. `None` at EOF.
+/// `None` at EOF.
 pub(super) fn read_byte(fd: i32) -> Option<u8> {
     let mut byte = 0u8;
     loop {

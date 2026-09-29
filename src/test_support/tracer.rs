@@ -15,8 +15,8 @@
 //! - `COSCA_UH_MARKER` frames the reports.
 //!
 //! Its stdin is the *signal pipe*: the pid as a first `pid <n>` line, then one byte per signal,
-//! and EOF to end the session. Its stdout is the *report pipe*. The state machine is in
-//! [`machine`], its transition table in `machine`'s docs.
+//! and EOF to end the session. Its stdout is the *report pipe*. The state machine and its
+//! transition table are in [`machine`].
 //!
 //! **Entitlement (measured on CI).** macOS refuses `ptrace` attach with `EPERM` to an ad-hoc
 //! signed tracer unless the tracee carries `com.apple.security.get-task-allow` or the tracer
@@ -50,6 +50,15 @@ impl Mode {
     }
 }
 
+/// What ends a wait the helper reports with [`Report::Blocking`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Until {
+    /// The signal pipe's EOF, among other events.
+    Eof,
+    /// Only the tracee's exit.
+    Exit,
+}
+
 /// A report from the helper.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Report {
@@ -59,15 +68,19 @@ pub(crate) enum Report {
     Exited,
     /// The helper reaped the tracee, so XNU has handed the zombie back to the test.
     Reaped,
-    /// The tracee is no longer traced and is the test's child again. Any signal but `SIGSTOP`
-    /// that stopped it was delivered. Whether it runs depends on the OS (measured on CI: stopped
-    /// by `SIGSTOP` on macOS 26, running on macOS 15), so the test ends it with `SIGKILL` through
-    /// its handle, which ends it either way.
+    /// The tracee is no longer traced and is the test's child again. Every signal that stopped
+    /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal
+    /// re-sent after the detach, unless a later `SIGCONT` cancelled it (see [`machine`]).
+    /// Whether it runs depends on the OS (measured on CI: stopped by `SIGSTOP` on macOS 26,
+    /// running on macOS 15), so the test ends it with `SIGKILL` through its handle, which ends
+    /// it either way.
     Detached,
     /// The protocol failed in `state`.
     Error { cause: Cause, state: String },
     /// `COSCA_UH_TRACE=1` only: entry into the named state.
     State(String),
+    /// The helper is about to wait in `state` with no timeout.
+    Blocking { state: String, until: Until },
 }
 
 /// Why an [`Report::Error`] happened.
@@ -101,6 +114,16 @@ impl Report {
                     }
                 } else if let Some(name) = text.strip_prefix("state ") {
                     Report::State(name.to_string())
+                } else if let Some(rest) = text.strip_prefix("blocking ") {
+                    let until = match rest.rsplit_once(' ') {
+                        Some((state, "eof")) => (state, Until::Eof),
+                        Some((state, "exit")) => (state, Until::Exit),
+                        _ => panic!("malformed tracer helper blocking report: {text:?}"),
+                    };
+                    Report::Blocking {
+                        state: until.0.to_string(),
+                        until: until.1,
+                    }
                 } else {
                     panic!("unrecognized tracer helper report: {text:?}")
                 }
@@ -130,35 +153,56 @@ impl Reports {
             {
                 return None;
             }
-            let Some(idx) = line.find(self.marker.as_str()) else {
-                if !line.trim().is_empty() {
-                    let echo = format!("tracer helper stdout: {line}");
-                    eprint!("{echo}");
-                }
-                continue;
-            };
-            let text = line[idx + self.marker.len()..].trim();
-            // One formatted argument, so one `write`: the helper shares this stderr.
-            let echo = format!("tracer helper report: {text}\n");
-            eprint!("{echo}");
-            return Some(Report::parse(text));
+            if let Some(text) = self.echo(&line) {
+                return Some(Report::parse(text.trim()));
+            }
         }
+    }
+
+    /// Reads to EOF without parsing, and stops at a read error: for a test that is already
+    /// failing, where a panic would abort the process.
+    fn discard_rest(&mut self) {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        while self.rx.read_line(&mut line).is_ok_and(|n| n > 0) {
+            self.echo(&line);
+            line.clear();
+        }
+    }
+
+    /// Echoes `line` to stderr, and returns the report text if it is one.
+    fn echo<'l>(&self, line: &'l str) -> Option<&'l str> {
+        let Some(idx) = line.find(self.marker.as_str()) else {
+            if !line.trim().is_empty() {
+                // One formatted argument, so one `write`: the helper shares this stderr.
+                let echo = format!("tracer helper stdout: {line}");
+                eprint!("{echo}");
+            }
+            return None;
+        };
+        let text = &line[idx + self.marker.len()..];
+        let echo = format!("tracer helper report: {}\n", text.trim());
+        eprint!("{echo}");
+        Some(text)
     }
 }
 
-/// A running helper and its pipes. Its `Drop` is the only teardown: it closes the signal pipe,
-/// reads the report pipe to EOF (proof the helper has exited), then reaps the helper through its
-/// own handle.
+/// A running helper and its pipes. [`Session::finish`], or else its `Drop`, is the only
+/// teardown: it closes the signal pipe, reads the report pipe to EOF (proof the helper has
+/// exited), then reaps the helper through its own handle.
 ///
-/// EOF ends a helper that has reported `reaped`, `detached` or `error`, or has not attached yet,
-/// and one in S1h, S3 or S3x. S6 ignores it, and S5 blocks in `wait4`, until the tracee exits,
-/// so a test that drops a helper in those states ends its tracee first.
-/// Only a test that is already panicking kills the helper, through its handle.
+/// EOF ends the helper except while it waits for the tracee's exit (a `blocking <state> exit`
+/// report). Dropping it there would wait on a tracee the test may keep alive, so the teardown
+/// kills the helper instead, as it does for a test that is already failing, and then fails the
+/// test naming the state. XNU kills a tracee its killed tracer still traced.
 struct Session {
     helper: std::process::Child,
     signal_tx: Option<std::process::ChildStdin>,
     /// `None` once a test closes the report pipe (the EPIPE row's test).
     reports: Option<Reports>,
+    /// The state of the last report read, if it was a wait for the tracee's exit.
+    awaits_exit: Option<String>,
+    finished: bool,
     /// Holds the signed copy the helper runs from; removed after the helper is reaped.
     _exe_dir: tempfile::TempDir,
 }
@@ -169,25 +213,56 @@ impl Session {
     }
 
     fn next_report(&mut self) -> Option<Report> {
-        self.reports.as_mut().expect("the report pipe is already closed").next()
+        let report = self.reports.as_mut().expect("the report pipe is already closed").next();
+        self.awaits_exit = match &report {
+            Some(Report::Blocking {
+                state,
+                until: Until::Exit,
+            }) => Some(state.clone()),
+            _ => None,
+        };
+        report
+    }
+
+    /// Tears the helper down (see [`Session`]) and returns its exit status.
+    fn finish(&mut self) -> std::process::ExitStatus {
+        debug_assert!(!self.finished, "the tracer helper is already torn down");
+        self.finished = true;
+        let panicking = std::thread::panicking();
+        let stuck = self.awaits_exit.take();
+        if panicking || stuck.is_some() {
+            if let Err(e) = self.helper.kill() {
+                eprintln!("could not kill the tracer helper: {e}");
+            }
+        }
+        drop(self.signal_tx.take());
+        if let Some(reports) = &mut self.reports {
+            if panicking || stuck.is_some() {
+                reports.discard_rest();
+            } else {
+                while reports.next().is_some() {}
+            }
+        }
+        let status = self.helper.wait().expect("reap the tracer helper");
+        if let Some(state) = stuck {
+            if !panicking {
+                panic!(
+                    "the test dropped the tracer helper while it waited in {state} for the tracee's \
+                     exit, which EOF does not end; it was killed instead. Read its reports through \
+                     the terminal one first"
+                );
+            }
+        }
+        status
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            // The test failed, and may still hold the tracee's stdin, on which a helper blocked
-            // in S5's `wait4` depends: end the helper through its own handle instead. XNU then
-            // kills a tracee it still traced.
-            if let Err(e) = self.helper.kill() {
-                eprintln!("could not kill the tracer helper after a test failure: {e}");
-            }
+        if self.finished {
+            return;
         }
-        drop(self.signal_tx.take());
-        if let Some(reports) = &mut self.reports {
-            while reports.next().is_some() {}
-        }
-        let status = self.helper.wait().expect("reap the tracer helper");
+        let status = self.finish();
         // With its report pipe closed by the test, the helper's libtest fails to print its
         // summary, so only a helper that could report is held to a clean exit.
         if self.reports.is_some() && !std::thread::panicking() {
@@ -205,10 +280,6 @@ pub(crate) struct Pending {
 }
 
 /// Launches a helper for client tests, without transition traces or injections.
-#[allow(
-    dead_code,
-    reason = "UH's own tests use start_forced; UA's tracer tests are the first callers"
-)]
 pub(crate) fn start(mode: Mode) -> Pending {
     launch(mode, None)
 }
@@ -254,6 +325,8 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
             helper,
             signal_tx: Some(signal_tx),
             reports: Some(Reports { rx, marker }),
+            awaits_exit: None,
+            finished: false,
             _exe_dir: exe_dir,
         },
     }
@@ -296,42 +369,48 @@ fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl Pending {
-    /// Sends the tracee's pid (S-1 → S0).
+    /// Sends the tracee's pid (S-1 → S0). Panics unless `tracee` is still this process's
+    /// unreaped child, whose pid nothing else can hold.
     ///
-    /// Takes `&'a mut`: `Child::wait`/`try_wait` take `&self`, so only an exclusive borrow stops
-    /// the test from reaping the tracee, and letting its pid be reused, while the helper may
-    /// still attach to it or stop it.
+    /// Takes `&mut`: `Child::wait`/`try_wait` take `&self`, so only an exclusive borrow stops the
+    /// test from reaping the tracee (and freeing its pid for reuse) while the helper may still
+    /// act on it.
     pub(crate) fn attach(mut self, tracee: &mut crate::Child) -> TracerHelper<'_> {
         let pid = tracee.id().pid();
+        if let Err(e) = sys::peek_child(pid) {
+            panic!(
+                "attach: the tracee {pid} is not this process's unreaped child (waitid: errno {e}), \
+                 so its pid may name another process"
+            );
+        }
         let tx = self.session.signal_tx();
         writeln!(tx, "pid {pid}").expect("send the pid line to the tracer helper");
         tx.flush().expect("flush the pid line");
         TracerHelper {
             session: self.session,
-            tracee,
+            _tracee: std::marker::PhantomData,
         }
     }
 }
 
-/// A helper with its tracee. While it lives the test can reach the tracee only through it, and
-/// nothing here exposes `wait` or `try_wait`. Dropping it tears the helper down before the
-/// borrow of the tracee ends.
+/// A helper with its tracee. While it lives the test cannot reach the tracee. Dropping it tears
+/// the helper down before the borrow of the tracee ends.
 pub(crate) struct TracerHelper<'a> {
     session: Session,
-    #[allow(
-        dead_code,
-        reason = "held for the exclusive borrow; UA's kill_tracee is the first reader"
-    )]
-    tracee: &'a mut crate::Child,
+    _tracee: std::marker::PhantomData<&'a mut crate::Child>,
 }
 
 impl TracerHelper<'_> {
-    /// Blocks for the next report. Panics at EOF: a test reads only reports the protocol
-    /// promises.
+    /// Blocks for the next report, skipping [`Report::Blocking`]. Panics at EOF: a test reads
+    /// only reports the protocol promises.
     pub(crate) fn recv(&mut self) -> Report {
-        self.session
-            .next_report()
-            .expect("the tracer helper exited before the report this test waits for")
+        loop {
+            match self.session.next_report() {
+                Some(Report::Blocking { .. }) => {}
+                Some(report) => return report,
+                None => panic!("the tracer helper exited before the report this test waits for"),
+            }
+        }
     }
 
     /// Writes one signal byte.

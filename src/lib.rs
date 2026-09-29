@@ -70,7 +70,7 @@ mod test_child;
 #[cfg(all(test, unix))]
 mod test_privilege;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod test_support;
 
 pub mod process;
