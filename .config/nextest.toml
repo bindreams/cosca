@@ -86,3 +86,14 @@ slow-timeout = { period = "20s", terminate-after = 1 }
 # above.
 filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
 slow-timeout = { period = "15s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
+# that the armed kqueue is already readable (which catches an `EV_DISABLE` arm) and then awaits
+# its `declined_hook` in a `select!`. What nothing in-process catches is the kqueue being readable
+# while the watch loop never reaches the `Declined` arm: an event misclassified as `Spurious`, a
+# dropped `notify`, or a lost wakeup leaves both `select!` arms pending forever. This turns that
+# hang into a bounded per-test failure instead of the darwin job's 15-minute CI timeout. Under
+# `default` so a local run is bounded the same way.
+filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
+slow-timeout = { period = "20s", terminate-after = 3 }

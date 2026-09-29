@@ -280,7 +280,7 @@ where
 ///
 #[cfg(target_os = "macos")]
 pub(crate) async fn wait_tree_drained(read_end: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, true, None).await
+    wait_tree_drained_watched(read_end, None).await
 }
 
 /// Deadline-bounded, [`TreeDrain`](crate::containment::TreeDrain)-returning wrapper over
@@ -319,37 +319,125 @@ pub(crate) async fn wait_tree_deadline(
     }
 }
 
+/// Test seam: fires every time [`wait_tree_drained_inner`]'s watch loop gets
+/// `DrainOutcome::Declined` (a genuine non-EOF event, retrieved and interpreted, that did not
+/// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
+/// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
+/// `wait::macos::test_hooks::HookGuard`, so no production signature carries it. It relies on a
+/// current-thread runtime (`#[tokio::test]`'s default): the future is polled on the installing
+/// thread.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod declined_hook {
+    use std::cell::RefCell;
+
+    use ::tokio::sync::mpsc::UnboundedSender;
+
+    thread_local! {
+        static DECLINED: RefCell<Option<UnboundedSender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Fire this thread's installed hook, if any. Called only from
+    /// [`super::wait_tree_drained_inner`]'s `DrainOutcome::Declined` arm.
+    pub(crate) fn notify() {
+        DECLINED.with(|d| {
+            if let Some(tx) = d.borrow().as_ref() {
+                let sent = tx.send(());
+                debug_assert!(sent.is_ok(), "declined_hook receiver dropped before the hook fired");
+            }
+        });
+    }
+
+    /// RAII installer: clears the hook on `Drop`, including during unwinding.
+    #[must_use]
+    pub(crate) struct DeclinedGuard {
+        _private: (),
+    }
+
+    impl DeclinedGuard {
+        pub(crate) fn install(tx: UnboundedSender<()>) -> Self {
+            DECLINED.with(|d| {
+                let mut slot = d.borrow_mut();
+                debug_assert!(slot.is_none(), "a declined_hook is already installed on this thread");
+                *slot = Some(tx);
+            });
+            Self { _private: () }
+        }
+    }
+
+    impl Drop for DeclinedGuard {
+        fn drop(&mut self) {
+            DECLINED.with(|d| {
+                let prev = d.borrow_mut().take();
+                debug_assert!(
+                    prev.is_some(),
+                    "declined_hook slot was cleared before its guard dropped"
+                );
+            });
+        }
+    }
+}
+
 /// Test-only entry point that reports the instant its kqueue is armed, on a channel the
 /// CALLER owns — no shared/global observer state, so concurrently-running tests (this file
-/// has four) cannot steal each other's notification. Always the unbounded arm, matching
-/// [`wait_tree_drained`] (its own real caller): these tests exercise the no-deadline API.
+/// has four) cannot steal each other's notification.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) async fn wait_tree_drained_for_test(
     read_end: std::os::fd::BorrowedFd<'_>,
-    armed: std::sync::mpsc::Sender<()>,
+    armed: std::sync::mpsc::Sender<std::os::fd::RawFd>,
 ) -> Result<(), Error> {
-    wait_tree_drained_inner(read_end, true, Some(armed)).await
+    wait_tree_drained_watched(read_end, Some(armed)).await
+}
+
+/// The ONE call site for [`wait_tree_drained`]'s own "always unbounded" choice — shared with
+/// [`wait_tree_drained_for_test`] so a mutant on that literal breaks both identically. A test
+/// that instead called `wait_tree_drained_inner` with its OWN independent `true` would not
+/// notice a mutant that changed only the production caller's.
+#[cfg(target_os = "macos")]
+async fn wait_tree_drained_watched(
+    read_end: std::os::fd::BorrowedFd<'_>,
+    armed: Option<std::sync::mpsc::Sender<std::os::fd::RawFd>>,
+) -> Result<(), Error> {
+    wait_tree_drained_inner(read_end, true, armed).await
 }
 
 /// `unbounded_wait` must be the SAME expression the sync backend's `block_until_drained` uses
 /// (`crate::wait::remaining(deadline).is_none()`) for whichever deadline the caller is honoring
 /// — threaded through to both `arm` and `drain_kqueue` (see [`wait_tree_deadline`]'s own doc for
 /// why arming this wrong is a real, observable divergence, not a cosmetic one).
+///
+/// `armed`, if given, receives the raw fd of the kqueue this call just armed (test-only; see
+/// [`wait_tree_drained_for_test`]). That fd is valid only while this future is alive.
+/// `DrainOutcome::Declined` fires [`declined_hook::notify`] in test builds only.
 #[cfg(target_os = "macos")]
 async fn wait_tree_drained_inner(
     read_end: std::os::fd::BorrowedFd<'_>,
     unbounded_wait: bool,
-    armed: Option<std::sync::mpsc::Sender<()>>,
+    armed: Option<std::sync::mpsc::Sender<std::os::fd::RawFd>>,
 ) -> Result<(), Error> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use crate::containment::marker_eof::DrainOutcome;
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
     let kq = crate::containment::marker_eof::arm(read_end, unbounded_wait)?;
     if let Some(tx) = armed {
-        let _ = tx.send(());
+        let sent = tx.send(kq.as_fd().as_raw_fd());
+        debug_assert!(
+            sent.is_ok(),
+            "the `armed` receiver was dropped before the kqueue was armed"
+        );
     }
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
     watch_readable(&afd, move |kq| {
-        crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait).map(|d| d.map(|_| ()))
+        match crate::containment::marker_eof::drain_kqueue(kq, read_end, unbounded_wait)? {
+            DrainOutcome::Drained(_) => Ok(Some(())),
+            DrainOutcome::Declined => {
+                #[cfg(test)]
+                declined_hook::notify();
+                Ok(None)
+            }
+            DrainOutcome::Spurious => Ok(None),
+        }
     })
     .await
 }

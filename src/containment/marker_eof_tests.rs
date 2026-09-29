@@ -17,7 +17,7 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use super::{block_until_drained, probe};
+use super::{arm, block_until_drained, drain_kqueue, probe, DrainOutcome};
 use crate::containment::TreeDrain;
 
 fn test_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -103,6 +103,59 @@ fn probe_reports_drained_even_with_bytes_still_buffered() {
     nix::unistd::write(&w, b"noise from a member").expect("write");
     drop(w);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
+}
+
+#[test]
+fn drain_kqueue_reports_spurious_for_an_armed_empty_pipe() {
+    // Nothing is pending, so `interpret_read_event` never runs.
+    let (_child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let kq = arm(marker.as_fd(), false).expect("arm");
+    let outcome = drain_kqueue(&kq, marker.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Spurious),
+        "an empty pipe with a live holder must be Spurious, got {outcome:?}"
+    );
+}
+
+#[test]
+fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
+    let (marker_r, marker_w) = std::io::pipe().expect("pipe");
+    let queued = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    cmd.fd(3, crate::Stdio::from_file(std::fs::File::from(OwnedFd::from(marker_w))))
+        .expect("marker pipe");
+    let child = cmd.spawn().expect("spawn /bin/sh");
+
+    let kq = arm(marker_r.as_fd(), false).expect("arm");
+    let outcome = drain_kqueue(&kq, marker_r.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Declined),
+        "a full pipe with a live holder must be Declined, got {outcome:?}"
+    );
+    assert_eq!(
+        fionread(marker_r.as_fd()),
+        queued,
+        "suppress_drain=true must leave the bytes buffered"
+    );
+
+    // Killed through the `Child` handle before it is reaped (`docs/principles.md` §10).
+    child.kill().expect("kill the holder");
+    child.wait().expect("reap");
+}
+
+#[test]
+fn drain_kqueue_reports_drained_once_the_write_end_is_closed() {
+    let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
+    let kq = arm(marker.as_fd(), false).expect("arm");
+    drop(stdin); // cat exits, closing the last write end
+    child.wait().expect("reap");
+    let outcome = drain_kqueue(&kq, marker.as_fd(), true).expect("drain_kqueue");
+    assert!(
+        matches!(outcome, DrainOutcome::Drained(TreeDrain::AllMarkersClosed)),
+        "a closed write end must be Drained, got {outcome:?}"
+    );
 }
 
 #[test]
@@ -612,36 +665,162 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     child.wait().expect("reap");
 }
 
+/// Fills `w` to the kernel's true capacity, synchronously, in this process, and returns the
+/// `FIONREAD` count read off `r`, the same pipe's read end (on macOS the write end always reads
+/// 0). The first write is 1 MiB so XNU grows the buffer to its maximum inside one syscall;
+/// smaller writes let the growth straddle two of them (measured 16384, then 65536). Shared with
+/// `deadline`.
+fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
+    let fd = w.as_raw_fd();
+    // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
+    // well-formed pair on it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "fcntl F_SETFL O_NONBLOCK failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let buf = vec![0u8; 1 << 20];
+    loop {
+        match nix::unistd::write(w, &buf) {
+            Ok(_) => continue,
+            Err(nix::errno::Errno::EAGAIN) => break,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("write failed: {e}"),
+        }
+    }
+    fionread(r)
+}
+
+/// Whether `kq_fd` — assumed to be a kqueue's own fd, itself pollable — is ALREADY readable,
+/// checked with a zero-timeout `kevent` on a brand-new, separate probe kqueue registered for
+/// `EVFILT_READ` on it. Non-consuming: this touches only the probe kqueue's own queue, never
+/// `kq_fd`'s pending events or registrations.
+#[cfg(feature = "tokio")]
+fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let probe_kq = Kqueue::new().expect("probe kqueue");
+    let change = KEvent::new(
+        kq_fd as usize,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    let add_result = crate::wait::backend::add_with_receipt(&probe_kq, change).expect("register the probe knote");
+    assert_eq!(
+        add_result, 0,
+        "registering EVFILT_READ on the watched kqueue's own fd failed: errno {add_result}"
+    );
+
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_READ,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    let n = probe_kq
+        .kevent(&[], &mut events, Some(zero))
+        .expect("zero-timeout poll of the probe kqueue");
+    n > 0
+}
+
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
-    // The async counterpart to the sync past-the-clamp test above — but with the OPPOSITE
-    // expectation, because `wait_tree_drained` has no deadline at all
-    // (see its doc): draining on a stuck writer's behalf forever is exactly the unbounded CPU
-    // spin this primitive must not have, so past the clamp it does not drain and the writer's
-    // own `write()` blocks instead (the marker fd's documented misuse contract). >64 KiB exceeds
-    // the pipe's own buffer capacity, so the writer never reaches its own `exec 3>&-` and the
-    // future never resolves; the external `tokio::time::timeout` here bounds the TEST's
-    // patience, not the primitive's — it is the caller-supplied bound the primitive's doc says a
-    // caller wanting one must supply itself.
-    let (child, marker, stdin) = spawn_marker_holder("yes | head -c 200000 >&3; exec 3>&-; exec cat >/dev/null");
-    let outcome = ::tokio::time::timeout(
-        Duration::from_millis(300),
-        crate::tokio::wait::wait_tree_drained(marker.as_fd()),
+    // `wait_tree_drained` has no deadline, so past the clamp it must not drain: draining for a
+    // stuck writer forever is the unbounded CPU spin this primitive exists to avoid.
+    //
+    // The seam below is a thread-local, so this needs the current-thread runtime that
+    // `#[tokio::test]` defaults to.
+    assert_eq!(
+        ::tokio::runtime::Handle::current().runtime_flavor(),
+        ::tokio::runtime::RuntimeFlavor::CurrentThread,
+        "declined_hook is thread-local: the future must be polled on this thread"
+    );
+
+    // This process fills the pipe before `arm`, so nothing can grow it afterwards. The child
+    // never writes; it only holds the write end open so the wait has a live holder.
+    let (marker_r, marker_w) = std::io::pipe().expect("pipe");
+    let queued_before = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
+    // The at-clamp precondition is enforced by the readiness probe below.
+
+    let mut cmd = crate::Command::new();
+    cmd.executable("/bin/sh").args(["sh", "-c", "exec cat >/dev/null"]);
+    cmd.fd(0, crate::Stdio::pipe_in()).expect("stdin pipe");
+    // Moves `marker_w` in: this test's own copy is gone before `arm` runs.
+    cmd.fd(
+        3,
+        crate::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(marker_w))),
     )
-    .await;
+    .expect("marker pipe");
+    let child = cmd.spawn().expect("spawn /bin/sh");
+    let fd = marker_r.as_fd();
+    assert_eq!(
+        child.try_wait().expect("try_wait"),
+        None,
+        "the holder already exited before this test could observe it"
+    );
+
+    // `declined_hook` fires when the watch loop gets a genuine non-EOF event and does not
+    // resolve: proof the race below reached and passed judgment on a real event. `select!`
+    // polls with the task's real waker, so the reactor registration is the one any caller gets.
+    let (declined_tx, mut declined_rx) = ::tokio::sync::mpsc::unbounded_channel();
+    let _declined_guard = crate::tokio::wait::declined_hook::DeclinedGuard::install(declined_tx);
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let mut fut = std::pin::pin!(crate::tokio::wait::wait_tree_drained_for_test(fd, armed_tx));
+
+    // One manual poll runs through `arm` (which sends the new kqueue's fd on `armed_tx`) and
+    // stops at the reactor await, so `Pending` is the only correct outcome. The no-op waker is
+    // fine: the `select!` below drives the future for real.
+    match std::future::Future::poll(
+        fut.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) {
+        std::task::Poll::Pending => {}
+        std::task::Poll::Ready(res) => panic!("wait_tree_drained_for_test resolved on its first poll: {res:?}"),
+    }
+    let armed_kq_fd = armed_rx.recv().expect("watch armed");
+
+    // The pipe was full before `arm`, so a correctly armed knote is already ready. A zero-timeout
+    // `kevent` on a separate probe kqueue checks that without touching `fut`'s queue. This
+    // catches an `EV_DISABLE` arm in-process; the nextest override covers what it cannot.
     assert!(
-        outcome.is_err(),
-        "a writer stuck past the low-water clamp must not resolve the wait — it should never be drained"
+        kqueue_fd_is_already_readable(armed_kq_fd),
+        "a knote armed without EV_DISABLE on a full pipe must be immediately readable, but the \
+         probe kqueue reported it as not-readable"
+    );
+
+    ::tokio::select! {
+        biased;
+        res = &mut fut => panic!(
+            "a pipe proven at its low-water clamp resolved the wait anyway — \
+             it must never be drained: {res:?}"
+        ),
+        _ = declined_rx.recv() => {} // provably saw the real readiness edge and declined to drain on it
+    }
+    // Distinguishes a mutant that drained some bytes before declining from correct behavior.
+    let queued_after = fionread(fd);
+    assert_eq!(
+        queued_after, queued_before,
+        "the marker pipe's buffered byte count changed across the clock-free wait — \
+         wait_tree_drained must never drain past the low-water clamp on an unbounded wait"
     );
     assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Alive,
-        "the writer must still be blocked in its own write(), not exited"
+        child.try_wait().expect("try_wait"),
+        None,
+        "the holder must still be alive, not exited"
     );
-    drop(stdin);
-    child
-        .kill()
-        .expect("kill the writer, which can never finish its write() on its own");
+
+    // A single child, killed through the `Child` handle cosca returned, before that handle
+    // reaps it — `docs/principles.md` §10's own exemption.
+    child.kill().expect("kill the holder");
     child.wait().expect("reap");
 }
