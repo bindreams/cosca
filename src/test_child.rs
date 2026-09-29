@@ -426,6 +426,39 @@ fn finish_fixture_command(fixture: &str, child: std::process::Child) {
     );
 }
 
+/// Whether this process is the fixture re-exec that [`run_fixture_output`] started for `marker_env`:
+/// the marker holds the driver's pid, and so does the pid variable every [`fixture_command`] sets.
+/// Portable, unlike [`is_fixture_reexec`]; an inherited marker alone proves nothing. On `true`,
+/// writes [`FIXTURE_GATE_PASSED_LINE`].
+pub(crate) fn is_marked_fixture_reexec(marker_env: &str) -> bool {
+    let marker = std::env::var(marker_env).ok();
+    let driver = std::env::var(FIXTURE_PARENT_PID_ENV).ok();
+    let marked = marker.is_some() && marker == driver;
+    if marked {
+        write_gate_passed();
+    }
+    marked
+}
+
+/// Runs the libtest fixture at `fixture` in a FRESH re-exec of this binary with `marker_env` set
+/// to this process's pid (see [`is_marked_fixture_reexec`]), and returns its output whatever its
+/// exit status: for a fixture that is meant to die, unlike [`run_fixture_with_cwd`] which requires
+/// it to pass. Spawns under `spawn_lock()`. Build `fixture` with [`fixture_path!`].
+pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::process::Output {
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, std::process::id().to_string());
+    // libtest reads its settings from the environment when the command line does not say: an
+    // inherited `RUST_TEST_NOCAPTURE` turns the child's output capture off and changes what a
+    // fixture that dies can prove. `RUST_TEST_THREADS` is overridden by `--test-threads=1`; the
+    // time and shuffle variables cannot matter to one exact test.
+    cmd.env_remove("RUST_TEST_NOCAPTURE");
+    let child = {
+        let _guard = crate::child::spawn::spawn_lock();
+        cmd.spawn().expect("spawn fixture child")
+    };
+    child.wait_with_output().expect("wait for fixture child")
+}
+
 /// The directory [`run_fixture_with_cwd`]'s caller prepared, read from `marker_env`; `None` when it
 /// is unset or (on unix) [`parent_pid_matches`] says this is not a deliberate re-exec. Either way
 /// the fixture is also picked up by ordinary suite runs, where it must no-op.

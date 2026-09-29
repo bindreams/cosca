@@ -174,6 +174,10 @@ pub(crate) mod test_clock {
 
     thread_local! {
         static FROZEN: Cell<Option<Instant>> = const { Cell::new(None) };
+        /// Bumped by every [`advance_by_elapsed_if_frozen`] call, zero elapsed included.
+        static ADVANCES: Cell<u64> = const { Cell::new(0) };
+        static SKIP_ADVANCE: Cell<bool> = const { Cell::new(false) };
+        static ZERO_ELAPSED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Freeze this thread's mock clock at the real "now", and return that instant. Until
@@ -208,11 +212,124 @@ pub(crate) mod test_clock {
     /// hides a genuinely elapsed wait from `remaining` and a re-arm loop under it cannot spin
     /// forever.
     pub(crate) fn advance_by_elapsed_if_frozen(real_elapsed: Duration) {
+        if SKIP_ADVANCE.with(Cell::get) {
+            return;
+        }
+        ADVANCES.with(|a| a.set(a.get() + 1));
+        let real_elapsed = if ZERO_ELAPSED.with(Cell::get) {
+            Duration::ZERO
+        } else {
+            real_elapsed
+        };
         FROZEN.with(|f| {
             if let Some(cur) = f.get() {
                 f.set(Some(cur + real_elapsed));
             }
         });
+    }
+
+    pub(crate) fn is_frozen() -> bool {
+        FROZEN.with(|f| f.get()).is_some()
+    }
+
+    /// Makes [`advance_by_elapsed_if_frozen`] do nothing until dropped: the "advance dropped"
+    /// mutant, for tests that prove a loop's [`RoundCheck`] fires.
+    #[must_use]
+    pub(crate) struct SkipAdvanceGuard(());
+
+    impl SkipAdvanceGuard {
+        pub(crate) fn install() -> Self {
+            SKIP_ADVANCE.with(|s| s.set(true));
+            Self(())
+        }
+    }
+
+    impl Drop for SkipAdvanceGuard {
+        fn drop(&mut self) {
+            SKIP_ADVANCE.with(|s| s.set(false));
+        }
+    }
+
+    /// Pins every round's measured elapsed to zero until dropped: the frozen clock stays where it
+    /// is (so no deadline is ever reached) while [`advance_by_elapsed_if_frozen`] is still called,
+    /// which is what a real round that took no clock ticks looks like.
+    #[must_use]
+    pub(crate) struct ZeroElapsedGuard(());
+
+    impl ZeroElapsedGuard {
+        pub(crate) fn install() -> Self {
+            ZERO_ELAPSED.with(|z| z.set(true));
+            Self(())
+        }
+    }
+
+    impl Drop for ZeroElapsedGuard {
+        fn drop(&mut self) {
+            ZERO_ELAPSED.with(|z| z.set(false));
+        }
+    }
+
+    /// The exit code of a process that found a [`RoundCheck`] violation while panicking. Neither
+    /// `0` nor libtest's `101`, so a caller can tell it from a pass and from an ordinary failure.
+    pub(crate) const VIOLATION_EXIT_CODE: i32 = 113;
+    const _: () = assert!(VIOLATION_EXIT_CODE != 0 && VIOLATION_EXIT_CODE != 101);
+
+    /// Ends the process at once with `code`: no unwinding, no atexit handlers, and no `SIGABRT`,
+    /// whose crash report and core file a deliberate failure has no use for.
+    fn exit_now(code: i32) -> ! {
+        #[cfg(unix)]
+        // SAFETY: `_exit` takes no pointers and does not return.
+        unsafe {
+            libc::_exit(code)
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            // SAFETY: the pseudo-handle of the current process is always valid.
+            unsafe { TerminateProcess(GetCurrentProcess(), code as u32) }.ok();
+            // Only reached if the call failed: a process that must not go on still may not hang.
+            std::process::abort()
+        }
+    }
+
+    /// Per-invocation no-progress check for a re-arm loop under a frozen clock. Create one at wait
+    /// entry and call [`round`](Self::round) once at the top of every round: two consecutive
+    /// rounds with no [`advance_by_elapsed_if_frozen`] call between them mean the loop dropped its
+    /// advance and would spin forever.
+    ///
+    /// While the thread is panicking (a Drop path) a second panic would abort the process without
+    /// a word, so the violation is written to the real stderr, past libtest's capture, and the
+    /// process exits at once with [`VIOLATION_EXIT_CODE`]: loud, and never a spin.
+    pub(crate) struct RoundCheck {
+        site: &'static str,
+        last: Option<u64>,
+    }
+
+    impl RoundCheck {
+        pub(crate) fn new(site: &'static str) -> Self {
+            Self { site, last: None }
+        }
+
+        pub(crate) fn round(&mut self) {
+            let generation = ADVANCES.with(Cell::get);
+            let stalled = self.last == Some(generation) && is_frozen();
+            self.last = Some(generation);
+            if !stalled {
+                return;
+            }
+            let message = format!(
+                "{}: a round followed a round with no `advance_by_elapsed_if_frozen` call under a \
+                 frozen clock: no progress (the loop dropped its advance)",
+                self.site
+            );
+            if std::thread::panicking() {
+                use std::io::Write as _;
+                // A failed write changes nothing: the exit below is the failure.
+                writeln!(std::io::stderr(), "{message}").ok();
+                exit_now(VIOLATION_EXIT_CODE);
+            }
+            panic!("{message}");
+        }
     }
 
     /// The mock "now": the frozen instant if [`FrozenClockGuard::install`] is active on this
@@ -460,12 +577,17 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
 /// deadline already past still polls once. `None`/`Some(None)` is unbounded. A round's `Err` ends
 /// the loop.
 ///
-/// Owns the frozen-clock advance: a round must not advance it itself.
+/// Owns the frozen-clock advance: a round must not advance it itself. Under a frozen clock a
+/// round that follows one with no advance panics ([`test_clock::RoundCheck`]).
 pub(crate) fn rearm_until<T, E>(
     deadline: Option<Option<Instant>>,
     mut round: impl FnMut(Option<Duration>) -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
+    #[cfg(test)]
+    let mut check = test_clock::RoundCheck::new("rearm_until");
     loop {
+        #[cfg(test)]
+        check.round();
         let remaining_now = remaining(deadline);
         #[cfg(test)]
         let round_start = Instant::now();

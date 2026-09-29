@@ -160,6 +160,80 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
     );
 }
 
+/// `wait_drained`'s bounded arm with its frozen-clock advance dropped fails at the second round
+/// instead of re-arming forever.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait_drained` -> same panic, without
+/// the seam. Mutant: drop `wait_drained`'s `check.round()` -> the leaf drains after the second
+/// block is announced, `wait_drained` returns, and the test fails on "did not panic" instead of
+/// the loop spinning forever.
+#[cfg(target_os = "linux")]
+#[test]
+#[should_panic(expected = "no progress")]
+fn wait_drained_panics_when_its_advance_is_dropped() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf, WaitObserver};
+    use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
+    use std::time::Duration;
+
+    /// Joins the drainer before the leaf's directory goes, panic or not.
+    struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
+    impl Drop for JoinOnDrop {
+        fn drop(&mut self) {
+            if let Some(drainer) = self.0.take() {
+                drainer.join().expect("the drainer thread");
+            }
+        }
+    }
+
+    let fake = FakeLeaf::new("cosca-wait-drained-advance-dropped", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    // Ends a loop whose check is gone: the leaf drains once the second block is announced. The
+    // announcement is sent from the waiting thread, so no timing is involved; if the wait
+    // panics first, the observer guard drops the sender and the drainer returns.
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let events = fake.events.clone();
+    let _drainer = JoinOnDrop(Some(std::thread::spawn(move || {
+        for _ in 0..2 {
+            if block_rx.recv().is_err() {
+                return;
+            }
+        }
+        FakeLeaf::set_populated(&events, false);
+    })));
+
+    let (_clock, at) = FrozenClockGuard::install();
+    let _skip = SkipAdvanceGuard::install();
+    WaitObserver::run_with_block_sender(block_tx, || {
+        leaf.wait_drained(Some(Some(at + Duration::from_millis(5)))).ok()
+    });
+}
+
+/// Under a frozen clock a bounded `wait_drained` on a leaf that never drains ends: each real
+/// park advances the clock.
+///
+/// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait_drained` -> the second round
+/// panics with "no progress" instead of re-arming forever.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_drained_terminates_under_a_frozen_clock() {
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+    use crate::containment::TreeDrain;
+    use crate::wait::test_clock::FrozenClockGuard;
+    use std::time::Duration;
+
+    let fake = FakeLeaf::new("cosca-wait-drained-frozen-clock", true);
+    let leaf = entered_leaf_at(fake.leaf.clone());
+    leaf.disarm();
+
+    let (_clock, at) = FrozenClockGuard::install();
+    let verdict = leaf
+        .wait_drained(Some(Some(at + Duration::from_millis(5))))
+        .expect("wait_drained");
+    assert_eq!(verdict, TreeDrain::MembersRemain);
+}
+
 // CgroupLeaf::wait_drained real-mechanism test -----
 // Linux + cgroup-v2 only, and only when CI provisions a delegated leaf (COSCA_TEST_CGROUP=1) —
 // the same gating convention `tests/spawn_io.rs`'s `linux_cgroup_v2_*` tests already use: a true
