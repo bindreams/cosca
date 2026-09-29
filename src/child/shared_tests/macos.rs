@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, Blocker};
 use crate::child::shared::SharedChild;
 use crate::identity::{quiet_fault, ReadPurpose, Resolved};
-use crate::wait::backend::test_hooks;
+use crate::wait::backend::test_hooks::{self, ForcedOnce};
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
@@ -220,15 +220,33 @@ fn run_case(path: &str, case: &str) {
 /// sibling blocked on its stdin, so the kernel reaps the root itself and a blocking `waitid`
 /// would sleep until the sibling is gone. The root's stdin closes from inside the holder's first
 /// blocking `kevent` round, so the waiter is known to be asleep first.
-fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::process::ChildStdin) {
+fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::process::ChildStdin, ForcedOnce) {
     crate::test_child::set_sigchld_ignored(true);
     let (sibling, sibling_stdin) = spawn_std_blocker();
     let (root, root_stdin) = spawn_std_blocker();
     let id = super::fixtures::identity_of(&root);
     let shared = SharedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut root_stdin = Some(root_stdin);
-    test_hooks::on_kevent_round(0, move || drop(root_stdin.take()));
-    (shared, sibling, sibling_stdin)
+    let end = test_hooks::on_kevent_round(0, move || drop(root_stdin.take()));
+    (shared, sibling, sibling_stdin, end)
+}
+
+/// The holder's wait on macOS is the kqueue wait, never a blocking `waitid`. Structural, and
+/// under the default disposition: the exit is confirmed first (a zombie is there), so a
+/// `waitid` would return at once and only the kevent request tells the two apart. This is what
+/// the `SIG_IGN` cases below prove by hanging.
+///
+/// Mutant: the holder's platform wait is a blocking `waitid(WNOWAIT)`.
+#[test]
+fn the_holder_waits_on_the_kqueue_not_in_waitid() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let _hooks = test_hooks::HookGuard::install(|_, _| {});
+    b.shared.wait().expect("wait");
+    assert!(
+        !test_hooks::await_requested_timeouts().is_empty(),
+        "the holder never asked the kqueue"
+    );
 }
 
 /// A `wait` on a child the kernel reaped returns `ECHILD` while a sibling lives.
@@ -243,7 +261,7 @@ fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
             "",
         );
     }
-    let (shared, _sibling, _stdin) = ignoring_sigchld_with_a_sibling();
+    let (shared, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
     let err = shared.wait().expect_err("the kernel reaped the root");
     assert!(is_echild(&err), "{err}");
 }
@@ -259,7 +277,7 @@ fn a_wait_timeout_far_past_the_bound_returns_echild() {
             "",
         );
     }
-    let (shared, _sibling, _stdin) = ignoring_sigchld_with_a_sibling();
+    let (shared, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
     let err = shared.wait_deadline(far()).expect_err("the kernel reaped the root");
     assert!(is_echild(&err), "{err}");
 }
