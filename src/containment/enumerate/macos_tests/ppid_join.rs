@@ -16,7 +16,7 @@ fn join_edges_filters_non_positive_pids() {
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, denied, sample) = join_edges(&[0, -1, me]);
+    let (out, denied, sample) = join_edges(&[0, -1, me]).expect("edge buffer");
     let parent_after = std::os::unix::process::parent_id();
     assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
     assert!(
@@ -38,7 +38,7 @@ fn join_edges_filters_non_positive_pids() {
 #[test]
 fn join_edges_does_not_count_gone_pids_as_denied() {
     let unresolvable = vec![libc::c_int::MAX; 8];
-    let (out, denied, sample) = join_edges(&unresolvable);
+    let (out, denied, sample) = join_edges(&unresolvable).expect("edge buffer");
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
     assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
     assert!(
@@ -87,7 +87,7 @@ fn push_denied_sample_caps_at_the_limit() {
 fn parents_contains_this_process_edge() {
     let me = std::process::id();
     let parent_before = std::os::unix::process::parent_id();
-    let parents = process_parents();
+    let parents = process_parents().expect("the process snapshot");
     let parent_after = std::os::unix::process::parent_id();
     assert!(
         parents.contains(&(me, parent_before)) || parents.contains(&(me, parent_after)),
@@ -137,4 +137,19 @@ fn ppid_of_reports_gone_for_an_unallocatable_pid() {
         Resolved::Gone,
         "a pid beyond PID_MAX can never resolve to a ppid, and is not a denial"
     );
+}
+
+/// A failed `proc_listallpids` is `Unassessable` naming the call, not an empty snapshot a tree
+/// walk would read as "no descendants". Mutant: "`process_parents` reads `all_pids()`" (a failure
+/// becomes an empty list).
+#[test]
+fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
+    super::super::force_blind_snapshot_for_next_call(true);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("proc_listallpids"), "{detail}");
+            assert!(source.is_some());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
 }

@@ -1,28 +1,21 @@
 //! Linux `(pid, ppid)` snapshot: list the numeric entries of the checked `/proc`
 //! (`identity::linux::proc_view`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
 
+use crate::error::Error;
 use crate::identity::stat_parse::parse_ppid;
 use crate::identity::RawPid;
 
-/// The snapshot is empty, with a `warn` naming why, when `/proc` cannot be trusted: an outer pid
+/// [`Error::Unassessable`], naming why, when `/proc` cannot be trusted or listed: an outer pid
 /// namespace's `/proc` lists pids that mean nothing to the caller, and the tree walk signals by
-/// pid.
-pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
+/// pid. Never an empty snapshot standing in for that: a walk over one finds no descendants.
+pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     let mut out = Vec::new();
-    let dir = match crate::identity::proc_view().into_dir() {
-        Ok(dir) => dir,
-        Err(why) => {
-            log::warn!("enumerate::process_parents: {why}; the process snapshot is empty");
-            return out;
-        }
-    };
-    let pids = match dir.pids() {
-        Ok(pids) => pids,
-        Err(e) => {
-            log::warn!("enumerate::process_parents: /proc could not be listed ({e}); the process snapshot is empty");
-            return out;
-        }
-    };
+    let dir = crate::identity::proc_view()
+        .into_dir()
+        .map_err(|why| unassessable(&why.reason, why.source))?;
+    let pids = dir
+        .pids()
+        .map_err(|e| unassessable("/proc could not be listed", Some(e)))?;
     for pid in pids {
         // The process may exit between the listing and the read; that's just absence. A read the
         // checked directory refuses (it would cross a mount) is omitted too, and says so.
@@ -40,7 +33,16 @@ pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
             out.push((pid, ppid));
         }
     }
-    out
+    Ok(out)
+}
+
+fn unassessable(why: &str, source: Option<std::io::Error>) -> Error {
+    let mut detail = format!("the process snapshot could not be taken: {why}");
+    if let Some(source) = &source {
+        detail.push_str(&format!(": {source}"));
+    }
+    log::warn!("enumerate::process_parents: {detail}");
+    Error::Unassessable { detail, source }
 }
 
 #[cfg(test)]
