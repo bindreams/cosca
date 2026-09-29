@@ -62,7 +62,18 @@ impl RawChild {
     fn can_terminate(&self) -> bool {
         // SAFETY: our live owned handle pins the process object, so `self.pid` still names
         // THIS process; OpenProcess tolerates failure (returns Err).
+        #[cfg(test)]
+        if fault::probe_forced_unterminable() {
+            return false;
+        }
         super::can_terminate(self.pid)
+    }
+
+    /// Block on the exit that a denied or accepted `TerminateProcess` has set in motion.
+    fn reap(&self) -> io::Result<ExitStatus> {
+        #[cfg(test)]
+        fault::before_blocking_wait();
+        self.wait()
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -129,7 +140,7 @@ impl RawChild {
                     // (a) Our own CreateProcessW child, or a runas child we DO have terminate
                     // rights on: the denial means exit is already underway. BLOCK on that real
                     // event (never a timer) to confirm it.
-                    self.wait()?;
+                    self.reap()?;
                     Ok(())
                 }
             }
@@ -145,7 +156,7 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
             Ok(()) => {
-                _ = self.wait();
+                _ = self.reap();
             }
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
@@ -154,7 +165,7 @@ impl RawChild {
                         self.pid
                     );
                 } else {
-                    _ = self.wait();
+                    _ = self.reap();
                 }
             }
             Err(e) => log::warn!("terminating child {} on drop failed: {e:?}", self.pid),
@@ -263,6 +274,82 @@ pub(crate) fn win32_io_error(e: windows::core::Error) -> io::Error {
         io::Error::from_raw_os_error((code & 0xFFFF) as i32)
     } else {
         io::Error::from_raw_os_error(code as i32)
+    }
+}
+
+/// Seam for [`RawChild::kill`] and [`RawChild::teardown_on_drop`].
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct State {
+        armed: bool,
+        on_wait: Option<Box<dyn FnMut()>>,
+        waits: u32,
+        unterminable: bool,
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    /// Run `on_wait` before every blocking reap on this thread and count them. Lets a test end a
+    /// never-exiting fixture a second way, so a no-op terminate fails on exit code, not by hanging.
+    ///
+    /// The guard resets the state on drop. Arming over a live guard is a test bug.
+    pub(crate) fn observe_waits(on_wait: impl FnMut() + 'static) -> Observer {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            debug_assert!(!s.armed, "the wait observer is already armed");
+            *s = State {
+                armed: true,
+                on_wait: Some(Box::new(on_wait)),
+                ..State::default()
+            };
+        });
+        Observer
+    }
+
+    pub(crate) fn before_blocking_wait() {
+        let hook = STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            if !s.armed {
+                return None;
+            }
+            s.waits += 1;
+            s.on_wait.take()
+        });
+        if let Some(mut hook) = hook {
+            hook();
+            STATE.with(|s| s.borrow_mut().on_wait = Some(hook));
+        }
+    }
+
+    pub(crate) fn probe_forced_unterminable() -> bool {
+        STATE.with(|s| s.borrow().unterminable)
+    }
+
+    #[must_use]
+    pub(crate) struct Observer;
+
+    impl Observer {
+        /// Blocking reaps started since arming.
+        pub(crate) fn waits(&self) -> u32 {
+            STATE.with(|s| s.borrow().waits)
+        }
+
+        /// Make `can_terminate` answer `false`, as for a higher-integrity child.
+        pub(crate) fn force_unterminable(&self) {
+            STATE.with(|s| s.borrow_mut().unterminable = true);
+        }
+    }
+
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            let state = STATE.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            drop(state);
+        }
     }
 }
 

@@ -1,7 +1,12 @@
 use std::os::windows::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
-use windows::Win32::System::Threading::{CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
+use windows::Win32::System::Threading::{
+    OpenProcess, TerminateProcess, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
+};
 
 use super::{create_process, win32_io_error, RawChild};
 
@@ -29,7 +34,16 @@ impl Drop for KillOnDrop {
 /// A `CREATE_SUSPENDED` process: its thread never runs, so it never exits on its own. Held in
 /// `KillOnDrop` so a panic mid-test still kills and reaps it.
 fn spawn_suspended() -> KillOnDrop {
-    let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect(); // never actually runs
+    spawn_suspended_as(RawChild::new)
+}
+
+/// [`spawn_suspended`] as a non-elevated runas child, so `RawChild`'s runas arms run.
+fn spawn_suspended_runas() -> KillOnDrop {
+    spawn_suspended_as(RawChild::new_runas)
+}
+
+fn spawn_suspended_as(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> KillOnDrop {
+    let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect();
     let mut si = STARTUPINFOEXW::default();
     let (proc, pid) = create_process(
         None,
@@ -40,43 +54,144 @@ fn spawn_suspended() -> KillOnDrop {
         EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
     )
     .expect("spawn suspended");
-    KillOnDrop(RawChild::new(proc, pid))
+    KillOnDrop(wrap(proc, pid))
 }
 
-fn spawn_long_lived_runas() -> RawChild {
-    // A real, NON-elevated child wrapped with the runas flag. `ping -n 5 127.0.0.1` runs
-    // ~4s — long-lived enough that kill/teardown must actually terminate it.
-    let mut cmdline: Vec<u16> = "ping -n 5 127.0.0.1\0".encode_utf16().collect();
-    // A zeroed STARTUPINFOEXW (null lpAttributeList is fine); `create_process` fills cb.
-    // `EXTENDED_STARTUPINFO_PRESENT` satisfies create_process's contract (it sizes the
-    // struct as extended, so CreateProcessW must be told to treat it as such).
-    let mut si = STARTUPINFOEXW::default();
-    let (proc, pid) =
-        create_process(None, &mut cmdline, &mut si, None, &None, EXTENDED_STARTUPINFO_PRESENT.0).expect("spawn");
-    RawChild::new_runas(proc, pid)
+/// A runas `RawChild` over a second handle to `owner`'s process that lacks `PROCESS_TERMINATE`,
+/// so its `TerminateProcess` is denied. `owner` stays the only handle that can end it.
+fn runas_without_terminate_right(owner: &KillOnDrop) -> RawChild {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    // SAFETY: plain OpenProcess on the live pid `owner` pins.
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            owner.id(),
+        )
+    }
+    .expect("open without PROCESS_TERMINATE");
+    // SAFETY: `h` is a fresh owned handle from OpenProcess.
+    RawChild::new_runas(unsafe { OwnedHandle::from_raw_handle(h.0) }, owner.id())
 }
 
+/// End `handle` with exit code 0, which only a process no earlier `TerminateProcess` has claimed
+/// takes: a real kill (exit 1) has already marked the thread terminated, so a later
+/// `TerminateProcess` cannot change the exit code. That later call returns success or
+/// `ERROR_ACCESS_DENIED` depending on timing; any other error is a test bug.
+fn end_with_code_zero(handle: HANDLE) {
+    // SAFETY: the caller's live process handle.
+    match unsafe { TerminateProcess(handle, 0) } {
+        Ok(()) => {}
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {}
+        Err(e) => panic!("TerminateProcess(handle, 0) failed: {e:?}"),
+    }
+}
+
+/// Arm the wait observer to end `owner`'s child with exit code 0 before every blocking reap.
+fn end_on_wait(owner: &KillOnDrop) -> super::fault::Observer {
+    let handle = owner.handle();
+    super::fault::observe_waits(move || end_with_code_zero(handle))
+}
+
+/// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
 #[test]
 fn runas_kill_of_a_killable_child_returns_and_reaps() {
-    let child = spawn_long_lived_runas();
+    let child = spawn_suspended_runas();
+    // Keeps a no-op `kill` from hanging its denied-arm wait; see `end_with_code_zero`.
+    let _observer = end_on_wait(&child);
     child
         .kill()
         .expect("kill of our own (non-elevated) runas-flagged child must succeed");
-    // kill() returned (no hang). `TerminateProcess` is asynchronous — it initiates termination
-    // and returns before the process object signals — so confirm the real exit via a blocking
-    // wait on that event (never a racing try_wait poll, never a timer).
+    // Keeps a no-op `kill` that reported `Ok` from hanging the wait below.
+    end_with_code_zero(child.handle());
+    // `TerminateProcess` is asynchronous — it initiates termination and returns before the
+    // process object signals — so confirm the real exit via a blocking wait on that event
+    // (never a racing try_wait poll, never a timer).
     let status = child.wait().expect("wait after kill");
-    assert!(!status.success(), "a TerminateProcess(1) exit is non-zero: {status:?}");
+    assert_eq!(status.code(), Some(1), "a TerminateProcess(1) exit is 1: {status:?}");
 }
 
+/// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
+/// `ERROR_ACCESS_DENIED`; the wait after an accepted terminate dropped.
 #[test]
 fn runas_teardown_on_drop_returns_promptly() {
-    let child = spawn_long_lived_runas();
-    child.teardown_on_drop(); // must not hang even though the runas arm is taken
-    assert!(
-        child.try_wait().expect("try_wait").is_some(),
-        "teardown must reap a killable runas child"
+    let child = spawn_suspended_runas();
+    // Keeps a no-op terminate from hanging teardown's wait; see `end_with_code_zero`.
+    let observer = end_on_wait(&child);
+    child.teardown_on_drop();
+    assert_eq!(observer.waits(), 1, "teardown must block on the exit it started");
+    let status = child.wait().expect("wait after teardown");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "teardown must end it with TerminateProcess(1): {status:?}"
     );
+}
+
+/// The runas `ERROR_ACCESS_DENIED` arm with a child we CAN terminate (`can_terminate` is true):
+/// the denial means exit is underway, so teardown reaps.
+///
+/// Mutant: drop `&& !self.can_terminate()`, so a terminable runas child is left running.
+#[test]
+fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
+    let owner = spawn_suspended();
+    let denied = runas_without_terminate_right(&owner);
+    let observer = end_on_wait(&owner);
+    denied.teardown_on_drop();
+    assert_eq!(observer.waits(), 1, "a terminable runas child's denial must be reaped");
+    let status = denied.wait().expect("wait after teardown");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "only the observer's terminate ended it: {status:?}"
+    );
+}
+
+/// As above, for `kill`.
+///
+/// Mutant: drop `&& !self.can_terminate()` in `kill`, so it returns `ERROR_ACCESS_DENIED`.
+#[test]
+fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
+    let owner = spawn_suspended();
+    let denied = runas_without_terminate_right(&owner);
+    let observer = end_on_wait(&owner);
+    denied
+        .kill()
+        .expect("a denial on a terminable runas child means exit is underway");
+    assert_eq!(observer.waits(), 1, "kill must reap that exit");
+}
+
+/// The runas `ERROR_ACCESS_DENIED` arm with a child we cannot terminate: never block.
+///
+/// Mutant: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`.
+#[test]
+fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
+    let owner = spawn_suspended();
+    let denied = runas_without_terminate_right(&owner);
+    let observer = end_on_wait(&owner);
+    observer.force_unterminable();
+    denied.teardown_on_drop();
+    assert_eq!(observer.waits(), 0, "teardown blocked on a child it cannot terminate");
+    assert!(
+        denied.try_wait().expect("try_wait").is_none(),
+        "nothing ended the child"
+    );
+}
+
+/// As above, for `kill`: surfaces the denial.
+///
+/// Mutant: reap in the `runas && !can_terminate()` arm of `kill`.
+#[test]
+fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
+    let owner = spawn_suspended();
+    let denied = runas_without_terminate_right(&owner);
+    let observer = end_on_wait(&owner);
+    observer.force_unterminable();
+    let err = denied
+        .kill()
+        .expect_err("an unterminable runas child must not report success");
+    assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{err:?}");
+    assert_eq!(observer.waits(), 0, "kill blocked on a child it cannot terminate");
 }
 
 /// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
