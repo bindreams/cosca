@@ -23,7 +23,6 @@ serde = ["dep:serde"]
 
 [dependencies]
 thiserror = "2"
-shared_child = { version = "1", features = ["timeout"] }
 log = "0.4"
 # Zeroize the password held for Auth::Stdin so it never lingers in freed memory.
 zeroize = "1"
