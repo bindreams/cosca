@@ -26,7 +26,10 @@ fn blocker() -> Command {
 /// the assertion: dropping it clears the seam.
 fn teardown_blocker() -> (Command, TeardownBlocker) {
     let mut cmd = Command::new();
+    #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    #[cfg(windows)]
+    cmd.args([crate::test_child::windows_more()]);
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
     let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
@@ -34,17 +37,9 @@ fn teardown_blocker() -> (Command, TeardownBlocker) {
     let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
     cmd.stdin(crate::stdio::Stdio::from_file(reader))
         .expect("set stdin pipe");
-    // `findstr` echoes the matching line the release writes.
+    // `more` echoes its input.
     cmd.stdout(crate::stdio::Stdio::null()).expect("null stdout");
-    let release = fault::set_between_kill_and_wait(move || {
-        // `findstr` exits 0 on a match, so only a kill can make it exit 1; a broken pipe (the
-        // child already dead) is what a real kill leaves.
-        #[cfg(windows)]
-        {
-            _ = std::io::Write::write_all(&mut &writer, b"x\r\n");
-        }
-        drop(writer);
-    });
+    let release = fault::set_between_kill_and_wait(move || drop(writer));
     let reaps = fault::record_teardown_reaps();
     (
         cmd,
@@ -60,7 +55,7 @@ struct TeardownBlocker {
 }
 impl TeardownBlocker {
     /// Every child the teardown reaped was ended by its kill: `SIGKILL` on Unix, on Windows the
-    /// exit code 1 of `TerminateProcess`, not the status a self-exit gives.
+    /// exit code 1 of `TerminateProcess` (`more` exits 0 by itself).
     fn assert_killed(&self) {
         let reaps = self.reaps.recorded();
         assert!(!reaps.is_empty(), "the teardown must have reaped the child");
@@ -144,7 +139,10 @@ fn attach_failure_reaps_the_spawned_child() {
 #[test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
     let mut cmd = Command::new();
+    #[cfg(unix)]
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    #[cfg(windows)]
+    cmd.args([crate::test_child::windows_more()]);
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]
     let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
@@ -153,9 +151,6 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
     cmd.stdin(crate::stdio::Stdio::from_file(reader))
         .expect("set stdin pipe");
     cmd.stdout(crate::stdio::Stdio::null()).expect("null stdout");
-    // `findstr` exits 0 only on a match.
-    #[cfg(windows)]
-    std::io::Write::write_all(&mut &writer, b"x\r\n").expect("write a matching line");
     drop(writer);
     let reaps = fault::record_teardown_reaps();
     fault::set_force_identity_vanished(true);
