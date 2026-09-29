@@ -328,80 +328,42 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 /// call site immediately force-signals `cancel` so the real wait that follows returns at once
 /// instead of genuinely spending the grace — a caught bug fails fast, not slow.
 ///
-/// `thread_local!`, NOT a process-global slot — a global (even one gated by `is_armed`) is
-/// still visible from every thread, so under plain `cargo test`'s shared-process, many-threads
-/// model (which cosca must pass) a concurrent, unrelated test's `block_until_exit_or_cancel`
-/// call on ANOTHER thread would see `is_armed() == true` while this test's guard is installed,
-/// find ITS OWN target unsignalled, and get force-cancelled too — cross-test interference.
-///
-/// `block_until_exit_or_cancel` runs inside `tokio::task::spawn_blocking`'s closure, on a
-/// blocking-pool thread distinct from the one that called `grace_wait` (the "arming" thread), so
-/// a thread-local written there is not, by itself, visible on the blocking-pool thread.
-/// `blocking_watch` (`src/tokio/wait.rs`) bridges the two threads: it reads [`current`] on the
-/// arming thread before `spawn_blocking`, then re-[`install`]s the cloned sender on the
-/// blocking-pool thread for that call's scope.
+/// A [`crate::relayed_probe`], not a process-global slot: a global (even one gated by
+/// `is_armed`) is visible from every thread, so under plain `cargo test`'s shared process a
+/// concurrent, unrelated test's `block_until_exit_or_cancel` on ANOTHER thread would see
+/// `is_armed() == true`, find ITS OWN target unsignalled, and get force-cancelled too.
+/// `blocking_watch` (`src/tokio/wait.rs`) relays it to the blocking-pool thread the wait runs on.
 #[cfg(test)]
 pub(crate) mod armed_probe {
-    use std::cell::RefCell;
+    use crate::relayed_probe::{self, Probe};
     use std::sync::mpsc::Sender;
 
-    thread_local! {
-        static ARMED_TX: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
+    pub(crate) struct Armed;
+    impl Probe for Armed {
+        type Event = ();
     }
 
-    /// Installs `tx` as the CURRENT thread's observer for the guard's lifetime, restoring
-    /// whatever was there before (always `None` in every real use — this repo never nests two
-    /// installs on one thread) on drop, even on unwind, so a panicking test or a reused
-    /// blocking-pool thread never carries a stale observer forward.
+    pub(crate) type Guard = relayed_probe::Guard<Armed>;
+
     // Consumers are the tokio TreeWalk fast-path test
     // (`windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped`) and
     // `grace_wait_resolves_immediately_on_an_identity_mismatch`, both `tokio`-only, so this is
     // dead code in a `--no-default-features` (no `tokio`) build — same shape as
     // `block_until_exit_or_cancel`'s own `allow(dead_code)` just above.
-    //
-    // `!Send`, via the `PhantomData<*const ()>` marker: the whole point is that dropping it
-    // clears the thread-local slot IT WAS INSTALLED ON. A `Guard` sent to another thread and
-    // dropped there would restore `self.0` into THAT thread's cell instead — corrupting an
-    // unrelated thread's (possibly a live test's) observer state.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
-    pub(crate) struct Guard(Option<Sender<()>>, std::marker::PhantomData<*const ()>);
-
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn install(tx: Sender<()>) -> Guard {
-        let prev = ARMED_TX.with(|cell| cell.replace(Some(tx)));
-        debug_assert!(prev.is_none(), "armed_probe::install nested on the same thread");
-        Guard(prev, std::marker::PhantomData)
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ARMED_TX.with(|cell| *cell.borrow_mut() = self.0.take());
-        }
-    }
-
-    /// The CURRENT thread's installed observer, if any — read on the arming thread, before
-    /// `spawn_blocking`, so `blocking_watch` can `move` it into that closure. Cloned, not
-    /// taken: the arming thread's own installation must survive for its guard's whole
-    /// lifetime, which may span more than one `blocking_watch` call (e.g. `wait_exit`'s retry
-    /// loop).
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
-    pub(crate) fn current() -> Option<Sender<()>> {
-        ARMED_TX.with(|cell| cell.borrow().clone())
+        relayed_probe::install(tx)
     }
 
     /// Whether the CURRENT thread has an observer installed — gates the call site's poll and
     /// forced cancel so they run only for the one test that opted in, never for any other
     /// caller of `block_until_exit_or_cancel` in the same binary or on another thread.
     pub(crate) fn is_armed() -> bool {
-        ARMED_TX.with(|cell| cell.borrow().is_some())
+        relayed_probe::is_installed::<Armed>()
     }
 
     pub(crate) fn notify_armed_unsignalled() {
-        ARMED_TX.with(|cell| {
-            if let Some(tx) = cell.borrow().as_ref() {
-                _ = tx.send(());
-            }
-        });
+        relayed_probe::notify::<Armed>(());
     }
 }
 
