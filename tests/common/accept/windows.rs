@@ -57,7 +57,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             // No such process: gone, which is the same disposition as on Linux and macOS.
             Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
                 close_all(&processes);
-                return WatchEvent::Died(pid);
+                panic!("OpenProcess({pid}) mutant: {e}");
             }
             Err(e) => {
                 close_all(&processes);
