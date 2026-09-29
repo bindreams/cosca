@@ -38,8 +38,11 @@ a silent skip, never a false pass on every unprivileged machine. CI provisions r
 these tests (see `.github/workflows/ci.yaml`'s "Run root-precondition tests" step) on Linux and
 macOS.
 
-These tests spawn real children under real, different unprivileged uids and re-exec as root to do
-it — never run them against this machine's own `sudo`. Run them in a throwaway container instead.
+These tests run as root, spawn real children under real, different unprivileged uids, and
+re-exec themselves as one of those uids (`READER_UID`) to make the call under test — never run
+them against this machine's own `sudo`. An ordinary (unprivileged) `cargo nextest run` must set
+`COSCA_TEST_ROOT=0`: the switch defaults ON, so the test would otherwise fail at its unmet consent
+instead of being skipped. Run them in a throwaway container instead.
 Two steps, because `--network none` (below) cannot itself fetch anything: first a networked step
 populates a named `CARGO_HOME` volume with cosca's own dependencies and `cargo-nextest` itself,
 then the actual test run is fully offline and network-isolated:
