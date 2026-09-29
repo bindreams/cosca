@@ -125,8 +125,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
 
-    # The TRACER test group attaches a tracer to the tests' own children. A CI runner is the
-    # sandbox principle 10 requires, so every step consents. Windows has no tracer tests.
+    # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
+    # sandbox, so every step consents. Windows has no tracer tests.
     env:
       COSCA_TEST_TRACER: "1"
       COSCA_TEST_TRACER_CONSENT: "1"
