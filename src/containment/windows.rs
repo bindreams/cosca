@@ -267,7 +267,7 @@ pub(crate) fn clear_std_handle_inheritance() {
             if let Ok(h) = GetStdHandle(std_handle) {
                 if !h.is_invalid() {
                     // Clear the INHERIT flag; dwflags=0 means "clear all bits in mask".
-                    let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+                    _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
                 }
             }
         }
@@ -568,12 +568,12 @@ pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::Raw
             std::ptr::addr_of!(info).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) {
-            let _ = CloseHandle(job);
+            _ = CloseHandle(job);
             return Err(io::Error::from(e));
         }
 
         if let Err(e) = AssignProcessToJobObject(job, raw_handle) {
-            let _ = CloseHandle(job);
+            _ = CloseHandle(job);
             return Err(io::Error::from(e));
         }
 
@@ -717,7 +717,7 @@ impl JobHandle {
         let result = wait_drained_raw(dup, deadline, cancel);
         // SAFETY: `dup` is ours alone and no longer in use.
         unsafe {
-            let _ = CloseHandle(dup);
+            _ = CloseHandle(dup);
         }
         result
     }
@@ -841,7 +841,7 @@ pub(crate) fn wait_drained_raw(
                         // Openable but not in this job — the pid was recycled between the
                         // enumeration and the open. Filtering it out is the point.
                         Ok(()) => unsafe {
-                            let _ = CloseHandle(h);
+                            _ = CloseHandle(h);
                         },
                         // The query itself failed, so membership is unknown. Recorded like any
                         // other actionable failure rather than silently dropped: if it holds
@@ -850,7 +850,7 @@ pub(crate) fn wait_drained_raw(
                             denied = Some(io::Error::from(e));
                             // SAFETY: opened just above and not stored anywhere.
                             unsafe {
-                                let _ = CloseHandle(h);
+                                _ = CloseHandle(h);
                             }
                         }
                     }
@@ -925,7 +925,7 @@ pub(crate) fn wait_drained_raw(
             // SAFETY: each handle was opened above; closing after the wait releases it
             // regardless of which handle (if any) was signaled.
             unsafe {
-                let _ = CloseHandle(*h);
+                _ = CloseHandle(*h);
             }
         }
 
@@ -1001,7 +1001,7 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                 Err(e) if e.code() == end_of_walk => break,
                 Err(e) => {
                     // A snapshot-API fault, not normal end-of-iteration.
-                    let _ = CloseHandle(snap);
+                    _ = CloseHandle(snap);
                     return Err(io::Error::from(e));
                 }
             }
@@ -1014,14 +1014,14 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                         } else {
                             resumed += 1;
                         }
-                        let _ = CloseHandle(thread);
+                        _ = CloseHandle(thread);
                     }
                     Err(e) => last_err = Some(io::Error::from(e)),
                 }
             }
             step = Thread32Next(snap, &mut entry);
         }
-        let _ = CloseHandle(snap);
+        _ = CloseHandle(snap);
     }
 
     // That must hold even when SOME threads resumed successfully before another one failed, not
@@ -1110,7 +1110,7 @@ pub(crate) fn job_contains_pid(attached: &crate::containment::Attached, pid: u32
     });
     // SAFETY: `process_handle` was opened above and must be closed.
     unsafe {
-        let _ = CloseHandle(process_handle);
+        _ = CloseHandle(process_handle);
     }
     matches!(queried, Some(Ok(()))) && in_job.as_bool()
 }

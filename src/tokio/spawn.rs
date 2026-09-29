@@ -444,7 +444,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             "the elevated child was terminated".to_string()
         }
         Err(e) => {
-            let _ = child.try_wait();
+            _ = child.try_wait();
             format!("the elevated child could not be terminated ({e})")
         }
     };

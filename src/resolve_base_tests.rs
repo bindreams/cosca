@@ -225,7 +225,7 @@ fn a_leading_separator_is_never_a_drive_prefix() {
 #[test]
 #[should_panic(expected = "needs a base")]
 fn a_located_name_without_a_base_is_a_contract_violation() {
-    let _ = resolve(ResolveInput {
+    _ = resolve(ResolveInput {
         program: Path::new("sub/tool"),
         cwd: None,
         system_dirs: &no_system_dirs,
@@ -403,7 +403,7 @@ fn only_a_denied_or_absent_execute_check_is_a_no() {
 #[test]
 #[should_panic(expected = "must be fully qualified")]
 fn a_relative_windows_base_is_a_contract_violation() {
-    let _ = resolve(ResolveInput {
+    _ = resolve(ResolveInput {
         program: Path::new(r"sub\tool.exe"),
         cwd: Some(Path::new("rel")),
         system_dirs: &no_system_dirs,
@@ -419,7 +419,7 @@ fn a_relative_windows_base_is_a_contract_violation() {
 #[test]
 #[should_panic(expected = "loadable_only is a Windows rule")]
 fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
-    let _ = resolve(ResolveInput {
+    _ = resolve(ResolveInput {
         program: Path::new("tool"),
         cwd: None,
         system_dirs: &no_system_dirs,
@@ -464,7 +464,7 @@ fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
         seen.borrow_mut().push(p.to_path_buf());
         Ok(p.to_path_buf())
     };
-    let _ = resolve(ResolveInput {
+    _ = resolve(ResolveInput {
         program: Path::new(r"..\..\..\t.exe"),
         cwd: Some(Path::new(r"\\?\UNC\srv\shr\d")),
         system_dirs: &no_system_dirs,

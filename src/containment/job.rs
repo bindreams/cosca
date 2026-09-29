@@ -124,7 +124,7 @@ impl Job {
         // SAFETY: `dup` is a handle this function alone created and holds; nothing else
         // references it.
         unsafe {
-            let _ = CloseHandle(dup);
+            _ = CloseHandle(dup);
         }
         result
     }

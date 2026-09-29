@@ -385,7 +385,7 @@ fn a_verbatim_current_dir_finds_a_dot_relative_name() {
 fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     use std::os::windows::ffi::OsStringExt;
     let p = OsString::from_wide(&"C:\\a\0b".encode_utf16().collect::<Vec<u16>>());
-    let _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
+    _ = complete_on(Path::new(&p), || unreachable!(), no_drive);
 }
 
 /// What `GetFullPathNameW` makes of a verbatim path, as measured on both CI architectures: it

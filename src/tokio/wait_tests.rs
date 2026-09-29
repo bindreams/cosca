@@ -81,8 +81,8 @@ fn kill_and_reap(child: &mut std::process::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        _ = child.kill();
+        _ = child.wait();
     }
 }
 
@@ -752,7 +752,7 @@ async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
 async fn arm_at_debug_asserts_a_deadline_inside_the_timer_margin() {
     let violating = crate::wait::instant_near_ceiling(super::tokio_now());
     let mut fut = std::pin::pin!(super::arm_at(violating, std::future::pending::<()>()));
-    let _ = poll_once(fut.as_mut());
+    _ = poll_once(fut.as_mut());
 }
 
 /// Release counterpart of the debug-assert test: the wait resolves with the future's own output,

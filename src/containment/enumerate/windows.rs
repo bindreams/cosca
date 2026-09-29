@@ -37,7 +37,7 @@ pub(crate) fn process_parents() -> Vec<(RawPid, RawPid)> {
             }
             step = Process32NextW(snap, &mut entry);
         }
-        let _ = CloseHandle(snap);
+        _ = CloseHandle(snap);
     }
 
     out

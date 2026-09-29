@@ -57,8 +57,8 @@ async fn cleanup(child: &mut crate::tokio::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = child.kill_tree();
-        let _ = child.wait().await;
+        _ = child.kill_tree();
+        _ = child.wait().await;
     }
 }
 
@@ -447,7 +447,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     );
     // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
     // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    let _ = child.kill_tree();
+    _ = child.kill_tree();
 }
 
 // The lone graceful ops must not fire a pid-addressed console event once the backend has reaped:

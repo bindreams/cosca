@@ -739,7 +739,7 @@ impl Drop for Child {
                 let probe = reaper::test_probe::take();
                 #[cfg(test)]
                 if let Some(p) = probe.as_ref() {
-                    let _ = p.entered.send(std::thread::current().id());
+                    _ = p.entered.send(std::thread::current().id());
                 }
                 let pid = self.id.pid();
                 let mut os = std::mem::take(&mut self.os);
@@ -770,7 +770,7 @@ impl Drop for Child {
         let probe = reaper::test_probe::take();
         #[cfg(test)]
         if let Some(p) = probe.as_ref() {
-            let _ = p.entered.send(std::thread::current().id());
+            _ = p.entered.send(std::thread::current().id());
         }
         // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
         // only the root); a no-op for an uncontained child.
@@ -785,7 +785,7 @@ impl Drop for Child {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
         }
-        let _ = tree;
+        _ = tree;
 
         let pid = self.id.pid();
         // The WHOLE resource group moves, so a field added to `OsResources` is carried here

@@ -150,7 +150,7 @@ fn a_pidfd_open_failure_still_reaps_the_child() {
 
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     let unwound = std::panic::catch_unwind(|| {
-        let _ = fork_running(|| {
+        _ = fork_running(|| {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -190,7 +190,7 @@ fn a_probe_pidfd_open_failure_does_not_skip_the_cleanup() {
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_fork_running_probe_pidfd_failure(true);
     let unwound = std::panic::catch_unwind(|| {
-        let _ = fork_running(|| {
+        _ = fork_running(|| {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -252,7 +252,7 @@ fn defuse_disarms_the_guard() {
     let child = rustix::process::Pid::from_raw(guard.pid() as i32).expect("a positive pid");
     let probe = rustix::process::pidfd_open(child, rustix::process::PidfdFlags::empty()).expect("open a probe pidfd");
 
-    let _ = guard.defuse();
+    _ = guard.defuse();
     drop(ack_write); // our own copy: only the child's, if it's alive, keeps the pipe open
 
     gate_write.write_all(b"g").expect("release the child");
@@ -262,8 +262,8 @@ fn defuse_disarms_the_guard() {
 
     // Through the probe pidfd, before the assertion below: harmless if the child is already
     // dead (the very regression this test would then be about to report).
-    let _ = rustix::process::pidfd_send_signal(probe.as_fd(), rustix::process::Signal::KILL);
-    let _ = rustix::process::waitid(
+    _ = rustix::process::pidfd_send_signal(probe.as_fd(), rustix::process::Signal::KILL);
+    _ = rustix::process::waitid(
         rustix::process::WaitId::PidFd(probe.as_fd()),
         rustix::process::WaitIdOptions::EXITED,
     );
@@ -345,8 +345,8 @@ fn set_nonblocking(fd: std::os::fd::RawFd) {
 /// Two checks:
 ///
 /// - The child reports, over a pipe, its inherited copy of the thread-local flag
-///   `spawn_lock_tracked` set on the forking thread. A parent-side check after the fork returns
-///   can't tell "held across the fork" from "dropped before it, re-acquired after".
+///   `spawn_lock_held_by_this_thread` reads on the forking thread. A parent-side check after the
+///   fork returns can't tell "held across the fork" from "dropped before it, re-acquired after".
 /// - The post-fork hook, on the forking thread, reports the same flag; it catches a lock released
 ///   right after the fork, before `pidfd_open` and the hook. The test thread asserts it, so a
 ///   failure names its cause instead of panicking on the fork thread.
@@ -368,7 +368,7 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
         // Set on THIS thread: the seams are thread-locals and `fork_running` runs here.
         let _report_guard = crate::containment::cgroup::fault::set_fork_running_lock_held_report_fd(report_write_fd);
         let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move || {
-            let _ = tx_hook.send(crate::child::spawn::spawn_lock_held_by_this_thread());
+            _ = tx_hook.send(crate::child::spawn::spawn_lock_held_by_this_thread());
         });
         // The child reports, runs this empty body, and `_exit`s on its own; the test waits for
         // that exit instead of killing it, which could land before the report.
@@ -451,7 +451,7 @@ fn fork_running_waits_for_a_held_spawn_lock() {
         std::thread::spawn(move || {
             let lock = crate::child::spawn::spawn_lock();
             tx_held.send(()).expect("the test thread is waiting for the holder");
-            let _ = rx_release.recv();
+            _ = rx_release.recv();
             released.store(true, Ordering::SeqCst);
             drop(lock);
         })
@@ -464,10 +464,10 @@ fn fork_running_waits_for_a_held_spawn_lock() {
         let tx_contended = tx_probe.clone();
         std::thread::spawn(move || {
             let _contended_guard = crate::containment::cgroup::fault::set_fork_running_lock_contended(move || {
-                let _ = tx_contended.send(LockProbe::Contended);
+                _ = tx_contended.send(LockProbe::Contended);
             });
             let _hook_guard = crate::containment::cgroup::fault::set_after_fork_still_locked(move || {
-                let _ = tx_probe.send(LockProbe::Forked {
+                _ = tx_probe.send(LockProbe::Forked {
                     holder_released: released.load(Ordering::SeqCst),
                 });
             });
@@ -509,9 +509,9 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
     let fork_thread = std::thread::spawn(move || {
         crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
         let _cleanup_guard = crate::containment::cgroup::fault::set_fork_running_cleanup(move || {
-            let _ = tx.send(crate::child::spawn::spawn_lock_held_by_this_thread());
+            _ = tx.send(crate::child::spawn::spawn_lock_held_by_this_thread());
         });
-        let _ = fork_running(|| {
+        _ = fork_running(|| {
             // SAFETY: `pause` is async-signal-safe.
             unsafe { libc::pause() };
         });
@@ -527,13 +527,13 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
 }
 
 /// `fork_running` takes `spawn_lock` itself, and the mutex is not reentrant: a caller that already
-/// holds it must get a named panic, not a hang (which nextest would only bound minutes later).
+/// holds it must get a named panic, not a hang.
 #[cfg(target_os = "linux")]
 #[test]
 fn fork_running_under_an_outer_spawn_lock_panics_naming_the_reentry() {
     let outer = crate::child::spawn::spawn_lock();
     let unwound = std::panic::catch_unwind(|| {
-        let _ = fork_running(|| {});
+        _ = fork_running(|| {});
     });
     drop(outer);
     let payload = unwound.expect_err("fork_running must refuse to run under an outer spawn_lock");

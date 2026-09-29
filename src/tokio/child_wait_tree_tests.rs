@@ -46,7 +46,7 @@ async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    let _ = child.wait().await;
+    _ = child.wait().await;
 }
 
 #[tokio::test]
@@ -63,8 +63,8 @@ async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    let _ = child.kill_tree();
-    let _ = child.wait().await;
+    _ = child.kill_tree();
+    _ = child.wait().await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_members_remain_on_a_live_tree` — see there for
@@ -83,8 +83,8 @@ async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
         let err = result.expect_err("a non-drainable mechanism must refuse wait_tree_timeout");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
     }
-    let _ = child.kill_tree();
-    let _ = child.wait().await;
+    _ = child.kill_tree();
+    _ = child.wait().await;
 }
 
 /// Async twin of `wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained`
@@ -115,7 +115,7 @@ async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree
             "got {err:?}"
         );
     }
-    let _ = child.wait().await;
+    _ = child.wait().await;
 }
 
 /// See the sync twin's identical test for the full rationale, including why this cannot be a
@@ -148,5 +148,5 @@ async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
             .expect_err("TreeWalk, honored as requested, has no kernel drain edge");
         assert!(matches!(err2, crate::error::Error::Unsupported { .. }), "got {err2:?}");
     }
-    let _ = treewalk_child.wait().await;
+    _ = treewalk_child.wait().await;
 }

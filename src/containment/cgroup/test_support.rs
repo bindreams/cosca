@@ -12,6 +12,38 @@
 pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
     let guard =
         crate::child::spawn::spawn_lock_tracked(crate::containment::cgroup::fault::run_fork_running_lock_contended);
+    fork_running_held(Held::Owned(guard), body)
+}
+
+/// [`fork_running`] under a `spawn_lock` the caller already holds: forks without re-acquiring
+/// it (the mutex is not reentrant) and leaves it held on return. For a caller whose own fds must
+/// stay unpinned by other forks for longer than this fork.
+#[cfg(target_os = "linux")]
+pub(crate) fn fork_running_locked(guard: &crate::child::spawn::SpawnLockGuard, body: impl FnOnce()) -> KillOnDrop {
+    debug_assert!(
+        crate::child::spawn::spawn_lock_held_by_this_thread(),
+        "fork_running_locked: the guard must be this thread's spawn_lock"
+    );
+    fork_running_held(Held::Borrowed(guard), body)
+}
+
+/// The `spawn_lock` a fork runs under: taken by [`fork_running`], or the caller's.
+#[cfg(target_os = "linux")]
+enum Held<'a> {
+    Owned(crate::child::spawn::SpawnLockGuard),
+    Borrowed(&'a crate::child::spawn::SpawnLockGuard),
+}
+
+#[cfg(target_os = "linux")]
+impl Held<'_> {
+    /// Unlock if this fork took the lock itself; a caller's guard stays held.
+    fn release(self) {
+        drop(self);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fork_running_held(held: Held<'_>, body: impl FnOnce()) -> KillOnDrop {
     // Taken before the fork: the child uses this captured value, not the thread-local.
     let report_fd = crate::containment::cgroup::fault::take_fork_running_lock_held_report_fd();
     // SAFETY: the child runs only `body`, async-signal-safe by the caller's contract, then
@@ -38,7 +70,7 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
             // Never dropped here: `MutexGuard::drop`'s unlock (an atomic swap, a `FUTEX_WAKE`
             // when contended) is not async-signal-safe, and this process's own copy of the lock
             // state dies with it regardless — only the parent's release is real.
-            std::mem::forget(guard);
+            std::mem::forget(held);
             body();
             // SAFETY: async-signal-safe.
             unsafe { libc::_exit(0) }
@@ -62,11 +94,11 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                     // Run only once `kod` exists, and only then release the lock: a seam that
                     // panics still unwinds through `kod`'s `Drop`, which kills and reaps the child.
                     crate::containment::cgroup::fault::run_after_fork_still_locked();
-                    drop(guard);
+                    held.release();
                     kod
                 }
                 Err(e) => {
-                    drop(guard);
+                    held.release();
                     crate::containment::cgroup::fault::run_fork_running_cleanup();
                     // The probe pidfd lets the test verify the reap without racing pid reuse. Its
                     // failure is reported but must not skip the kill/reap.
@@ -79,7 +111,7 @@ pub(crate) fn fork_running(body: impl FnOnce()) -> KillOnDrop {
                         Ok(probe) => crate::containment::cgroup::fault::record_fork_running_pidfd_failure_probe(probe),
                         Err(probe_err) => {
                             use std::io::Write;
-                            let _ = writeln!(std::io::stderr(), "fork_running: probe pidfd_open: {probe_err}");
+                            _ = writeln!(std::io::stderr(), "fork_running: probe pidfd_open: {probe_err}");
                         }
                     }
                     // Bare pid is safe: the child is still unreaped, so the pid can't be recycled.
@@ -164,7 +196,7 @@ impl Drop for KillOnDrop {
             rustix::process::pidfd_send_signal(pidfd.as_fd(), rustix::process::Signal::KILL)
         };
         if killed.is_err() {
-            let _ = writeln!(std::io::stderr(), "KillOnDrop: pidfd_send_signal: {killed:?}");
+            _ = writeln!(std::io::stderr(), "KillOnDrop: pidfd_send_signal: {killed:?}");
             if !panicking {
                 debug_assert!(killed.is_ok(), "pidfd_send_signal: {killed:?}");
             }
@@ -185,7 +217,7 @@ impl Drop for KillOnDrop {
         };
         if reaped.is_err() {
             if panicking {
-                let _ = writeln!(std::io::stderr(), "KillOnDrop: waitid: {reaped:?}");
+                _ = writeln!(std::io::stderr(), "KillOnDrop: waitid: {reaped:?}");
             } else {
                 debug_assert!(reaped.is_ok(), "waitid: {reaped:?}");
             }

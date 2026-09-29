@@ -23,7 +23,7 @@ fn spawn_parked_worker() -> (ProcessId, std::sync::mpsc::Sender<()>, std::thread
         // SAFETY: SYS_gettid takes no arguments and always succeeds.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
         tid_tx.send(tid).expect("send tid to the test thread");
-        let _ = stop_rx.recv();
+        _ = stop_rx.recv();
     });
     let tid = tid_rx.recv().expect("recv tid from the worker thread");
     let id = ProcessId::of(tid as u32)
@@ -98,7 +98,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error_with_forced_enoent() {
         other => panic!("a forced ENOENT on a live non-leader tid must be NotThreadGroupLeader, got {other:?}"),
     }
 
-    let _ = stop_tx.send(());
+    _ = stop_tx.send(());
     worker.join().expect("join the worker thread");
 }
 
@@ -119,7 +119,7 @@ fn block_until_exit_on_a_dead_non_leader_tid_is_exited_with_forced_enoent() {
         "a Present but Dead non-leader tid must report exited (Ok(true)), not {result:?}"
     );
 
-    let _ = stop_tx.send(());
+    _ = stop_tx.send(());
     worker.join().expect("join the worker thread");
 }
 
@@ -151,7 +151,7 @@ fn block_until_exit_is_unassessable_when_the_einval_arms_liveness_is_unknown() {
         "the Unassessable verdict must be logged once, at warn"
     );
 
-    let _ = stop_tx.send(());
+    _ = stop_tx.send(());
     worker.join().expect("join the worker thread");
 }
 
@@ -287,4 +287,50 @@ fn child_step_exit_codes_round_trip_and_are_distinct() {
             assert_ne!(a.exit_code(), b.exit_code(), "{a:?} vs {b:?}");
         }
     }
+}
+
+/// While the fixture's `block_w` is open, no other `fork_running` can fork: a fork now would let
+/// the child inherit `block_w` and hold `M` back from EOF. The forking thread reports over one
+/// channel, in order: first that it found `spawn_lock` held (`Contended`, sent before it blocks),
+/// then that it forked (`Forked`). It cannot fork while this thread holds the lock, so the first
+/// event is `Contended` and the channel is empty until the fixture releases; a fixture that left
+/// the lock free would make the first event `Forked` instead of hanging.
+#[test]
+fn a_concurrent_fork_running_waits_until_the_fixture_releases_block_w() {
+    use crate::containment::cgroup::fault::{set_after_fork_still_locked, set_fork_running_lock_contended};
+    use crate::containment::cgroup::test_support::{fork_running, reap};
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Contended,
+        Forked,
+    }
+
+    let (l_id, fixture) = build_reaped_pgid_leader();
+    let _ = l_id;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx_contended, tx_forked) = (tx.clone(), tx);
+    let forker = std::thread::spawn(move || {
+        let _contended = set_fork_running_lock_contended(move || tx_contended.send(Event::Contended).unwrap());
+        let _forked = set_after_fork_still_locked(move || tx_forked.send(Event::Forked).unwrap());
+        fork_running(|| {}).defuse()
+    });
+
+    assert_eq!(
+        rx.recv().expect("the forking thread reports"),
+        Event::Contended,
+        "fork_running must find spawn_lock held by the fixture, not fork past it"
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "no fork may happen while the fixture's block_w is open"
+    );
+
+    fixture.release_and_confirm_m_exited();
+    let child = forker
+        .join()
+        .expect("the forking thread finishes once the lock is free");
+    assert_eq!(rx.recv().expect("the forking thread reports its fork"), Event::Forked);
+    reap(child);
 }

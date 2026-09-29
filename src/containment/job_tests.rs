@@ -70,8 +70,8 @@ fn disarm_clears_kill_on_job_close() {
 
     // Cleanup: disarm() means dropping `job` will NOT kill this real process.
     drop(job);
-    let _ = child.kill();
-    let _ = child.wait();
+    _ = child.kill();
+    _ = child.wait();
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn wait_tree_after_kill_tree_is_unassessable() {
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
 
     job.kill_tree().expect("kill_tree");
-    let _ = child.wait();
+    _ = child.wait();
 
     let err = job
         .wait_tree()
@@ -146,7 +146,7 @@ fn job_debug_differs_before_and_after_kill_tree() {
         live, killed,
         "Debug must reflect the handle being consumed by kill_tree, not print the same thing regardless"
     );
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// `Job` is shared across threads by callers, which is exactly what makes its `&self` methods
@@ -180,7 +180,7 @@ fn disarm_and_kill_tree_from_two_threads_complete() {
         job.kill_tree().expect("kill_tree");
         t.join().expect("the disarming thread must not panic");
 
-        let _ = child.wait();
+        _ = child.wait();
     }
 }
 
@@ -205,7 +205,7 @@ fn disarm_after_kill_tree_does_nothing() {
         "disarm on a consumed job must leave it consumed, not resurrect or mutate it"
     );
 
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// A zero timeout on a live tree reports `MembersRemain` rather than blocking or guessing.
@@ -226,5 +226,5 @@ fn wait_tree_timeout_zero_reports_members_remain() {
     );
 
     job.kill_tree().expect("kill_tree");
-    let _ = child.wait();
+    _ = child.wait();
 }

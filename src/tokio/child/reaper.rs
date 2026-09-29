@@ -217,7 +217,7 @@ impl LazyPool {
             drop(guard);
         }
         for handle in abandoned {
-            let _ = handle.join();
+            _ = handle.join();
         }
         for e in failures {
             log::error!("starting a reaper thread failed: {e}");
@@ -240,7 +240,7 @@ fn work(rx: crossbeam_channel::Receiver<ReapJob>) {
         // pool permanently, since nothing replenishes one. The assert still reaches the default
         // panic hook, so it stays as loud as any other.
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_teardown(job))).is_err() {
-            let _ = std::panic::catch_unwind(|| {
+            _ = std::panic::catch_unwind(|| {
                 log::error!("a reaper teardown unwound despite its no-unwind contract");
                 debug_assert!(false, "run_teardown unwound despite its no-unwind contract");
             });
@@ -283,7 +283,7 @@ fn release(job: ReapJob) {
     drop(job.os);
     #[cfg(test)]
     if let Some(p) = probe {
-        let _ = p.outcome.send(test_probe::ReapOutcome::Released);
+        _ = p.outcome.send(test_probe::ReapOutcome::Released);
     }
 }
 
@@ -314,7 +314,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
     let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if let Some(p) = probe.as_ref() {
-            let _ = p.started.send(std::thread::current().id());
+            _ = p.started.send(std::thread::current().id());
         }
         // Executing elsewhere ⇒ a test may hold the teardown until it has observed the
         // not-yet-reaped state. On the dropping thread the teardown was inlined, so skipping the
@@ -322,7 +322,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
         #[cfg(test)]
         if std::thread::current().id() != origin {
             if let Some(p) = probe.as_ref() {
-                let _ = p.gate.recv(); // a dropped sender is also a release
+                _ = p.gate.recv(); // a dropped sender is also a release
             }
         }
         #[cfg(test)]
@@ -350,7 +350,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
         drop(os); // one drop, ordered by `OsResources`' own declaration
         #[cfg(test)]
         if let Some(p) = probe {
-            let _ = p.outcome.send(if waited.is_err() {
+            _ = p.outcome.send(if waited.is_err() {
                 test_probe::ReapOutcome::Panicked
             } else {
                 test_probe::ReapOutcome::Reaped(std::thread::current().id())
@@ -360,7 +360,7 @@ pub(crate) fn run_teardown(job: ReapJob) {
     if released.is_err() {
         // Wrapped for the same reason the other log calls are: an untrusted `Log` impl must not
         // be the thing that finally unwinds this function.
-        let _ = std::panic::catch_unwind(|| {
+        _ = std::panic::catch_unwind(|| {
             log::error!("releasing child {pid}'s resources panicked; its wait had already completed");
         });
     }

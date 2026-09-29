@@ -542,7 +542,7 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
             child.commit_kill_on_drop();
         }
         child.kill().expect("end the stand-in root");
-        let _ = child.wait().await;
+        _ = child.wait().await;
         drop(child);
 
         let expected: &[u8] = if commit { b"" } else { b"1" };

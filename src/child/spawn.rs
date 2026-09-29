@@ -99,11 +99,11 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     let root_note = match child.kill() {
         Ok(()) => {
-            let _ = child.wait();
+            _ = child.wait();
             "the elevated child was terminated".to_string()
         }
         Err(e) => {
-            let _ = child.try_wait();
+            _ = child.try_wait();
             format!("the elevated child could not be terminated ({e})")
         }
     };
@@ -380,19 +380,22 @@ pub(crate) fn spawn_lock() -> SpawnLockGuard {
 
 static SPAWN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Holds [`spawn_lock`]. In test builds it also records that this thread holds the (non-reentrant)
-/// mutex, so a nested acquire can fail with a named panic instead of deadlocking.
+/// Holds [`spawn_lock`]. Under `debug_assertions` (and in test builds) it also records that this
+/// thread holds the non-reentrant mutex, so a nested acquire fails with a named panic instead of
+/// deadlocking.
+#[must_use = "if unused the spawn lock is released immediately; bind the guard for the whole window"]
 pub(crate) struct SpawnLockGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 thread_local! {
     /// Whether THIS thread holds `SPAWN_MUTEX`; set and cleared only by [`SpawnLockGuard`].
-    #[cfg(test)]
+    /// `const`-initialized with no destructor, so reading it in a forked child is safe.
+    #[cfg(any(test, debug_assertions))]
     static SPAWN_LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for SpawnLockGuard {
     fn drop(&mut self) {
         SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(false));
@@ -400,14 +403,11 @@ impl Drop for SpawnLockGuard {
 }
 
 /// Takes `SPAWN_MUTEX`. `on_contended` runs first if it is already held, before this blocks.
-/// In test builds, a thread that already holds it panics rather than deadlocking on itself.
 fn acquire_spawn_lock(on_contended: impl FnOnce()) -> SpawnLockGuard {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     assert!(
         !spawn_lock_held_by_this_thread(),
-        "spawn_lock re-entered: this thread already holds it and the mutex is not reentrant. \
-         An outer `spawn_lock()` around a call that takes it itself (`fork_running`, a cosca \
-         spawn) deadlocks; drop the outer one"
+        "spawn_lock re-entered: the mutex is not reentrant; drop the outer spawn_lock() (fork_running and cosca spawns take it themselves)"
     );
     let guard = match SPAWN_MUTEX.try_lock() {
         Ok(guard) => guard,
@@ -417,7 +417,7 @@ fn acquire_spawn_lock(on_contended: impl FnOnce()) -> SpawnLockGuard {
             SPAWN_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.set(true));
     SpawnLockGuard { _guard: guard }
 }
@@ -430,7 +430,7 @@ pub(crate) fn spawn_lock_tracked(on_contended: impl FnOnce()) -> SpawnLockGuard 
 }
 
 /// Whether THIS thread currently holds `spawn_lock`'s mutex.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
@@ -976,7 +976,7 @@ fn reap_in_background(mut child: std::process::Child) {
             }
             #[cfg(test)]
             if let Some(notify) = notify {
-                let _ = notify.send(reaped);
+                _ = notify.send(reaped);
             }
         });
     if let Err(e) = spawned {
@@ -1218,6 +1218,10 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(test)]
+#[path = "spawn/spawn_lock_tests.rs"]
+mod spawn_lock_tests;
 
 #[cfg(all(test, unix))]
 #[path = "spawn/exact_posix_tests.rs"]

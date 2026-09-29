@@ -315,7 +315,7 @@ pub(crate) fn set_wait_polling_notifier(notify: std::sync::mpsc::Sender<()>) {
 }
 pub(crate) fn notify_wait_polling() {
     if let Some(notify) = WAIT_POLLING.with(|w| w.borrow_mut().take()) {
-        let _ = notify.send(());
+        _ = notify.send(());
     }
 }
 
@@ -598,7 +598,7 @@ pub(crate) fn set_pump_batch_notifier(name: &str, notify: std::sync::mpsc::Sende
 pub(crate) fn notify_pump_batch(name: &std::ffi::OsStr, notified: bool) {
     for (n, seam) in PUMP_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if let (true, PumpSeam::Batches(notify)) = (n.as_os_str() == name, seam) {
-            let _ = notify.send(notified);
+            _ = notify.send(notified);
         }
     }
 }

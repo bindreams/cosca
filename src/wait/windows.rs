@@ -398,7 +398,7 @@ pub(crate) mod armed_probe {
     pub(crate) fn notify_armed_unsignalled() {
         ARMED_TX.with(|cell| {
             if let Some(tx) = cell.borrow().as_ref() {
-                let _ = tx.send(());
+                _ = tx.send(());
             }
         });
     }

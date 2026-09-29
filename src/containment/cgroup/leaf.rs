@@ -421,7 +421,7 @@ impl CgroupLeaf {
             };
             // The child leads its group; the unreaped child holds the group's id.
             if !denied {
-                let _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
+                _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
             }
             match killed {
                 Ok(()) => {
@@ -702,7 +702,7 @@ impl CgroupLeaf {
         };
         for line in content.lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
-                let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+                _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
             }
         }
         Ok(())
@@ -1116,7 +1116,7 @@ fn end_child(received: &Received) -> ChildFate {
     };
     // The group it leads: an unreaped leader pins the group's id, so this names its group alone.
     if !denied {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     if let Err(e) = killed {
         log::warn!("cgroup v2: could not kill an abandoned spawn's child ({e}); it is reaped once it exits");
@@ -1189,7 +1189,7 @@ fn reap_in_background(child: ChildId) {
                 {
                     #[cfg(test)]
                     if let Some(notify) = &notify {
-                        let _ = notify.send(());
+                        _ = notify.send(());
                     }
                 }
             }

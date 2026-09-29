@@ -359,7 +359,7 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
     let _keep_alive = prepared.read;
 
     drop(child.stdin.take()); // EOF releases the child (cleanup, not an assertion)
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// A real spawn through the real installer: the child must be a holder, and the SUPERVISOR
@@ -394,7 +394,7 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
     let _keep_alive = prepared.read;
 
     drop(child.stdin.take());
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// A holder whose descriptor survives exec is NOT an imminent membership loss, so no warning
@@ -444,7 +444,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
     let _keep_alive = prepared.read;
 
     drop(child.stdin.take());
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// The complement: a holder whose descriptor is CLOEXEC WILL lose membership at its next exec,
@@ -538,7 +538,7 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let _keep_alive = prepared.read;
 
     drop(stdin);
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// Each real failure arm of `install` degrades to "no marker" and says so, with the message
@@ -741,7 +741,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     );
 
     drop(stdin);
-    let _ = child.wait();
+    _ = child.wait();
 }
 
 /// A root whose identity could not be read because the OS refused (`root_denied` — set only
@@ -957,8 +957,8 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 
     // T is reachable by the marker channel too (this same pass 2 call's own holder-kill loop),
     // so it should already be gone or going; reap it rather than leave it running either way.
-    let _ = t_child.kill();
-    let _ = t_child.wait();
+    _ = t_child.kill();
+    _ = t_child.wait();
 }
 
 /// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes

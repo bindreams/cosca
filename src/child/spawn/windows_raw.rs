@@ -570,7 +570,7 @@ impl AttributeList {
         let mut size: usize = 0;
         // Sizing call: returns ERROR_INSUFFICIENT_BUFFER and writes the required byte count.
         // SAFETY: the null-list form is the documented way to query the buffer size.
-        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+        _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
         let mut buf: Vec<u8> = vec![0u8; size];
         let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
         // SAFETY: `buf` is `size` bytes, matching the queried requirement; count = 1 (one attribute).

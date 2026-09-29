@@ -143,7 +143,7 @@ fn signal_group(pgid: i32, signal: Signal) -> Result<(), Error> {
         // Preserved exactly as before this fix: the pgid == pid direct-to-leader fallback
         // for the sudo-wrapper case (sibling #54 territory — do not remove or reshape).
         Err(nix::errno::Errno::EPERM) => {
-            let _ = signal_direct(pgid, signal);
+            _ = signal_direct(pgid, signal);
         }
         Err(e) => return Err(Error::Io(io::Error::from(e))),
     }
