@@ -21,6 +21,8 @@ env:
   NEXTEST_VERSION: "0.9.137"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`.
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
+  # System-affecting groups are off workflow-wide; the root lane opts back in.
+  COSCA_TEST_NAMESPACES: "0"
 
 jobs:
   lint:
@@ -273,7 +275,9 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
-            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))"
+            # Namespace tests: root here, on a throwaway runner, so consent is given.
+            export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
+            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default

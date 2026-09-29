@@ -1,5 +1,8 @@
 //! Test-only child processes shared across the crate's unit tests.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod namespaces;
+
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or

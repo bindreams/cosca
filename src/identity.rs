@@ -173,6 +173,38 @@ impl ProcessId {
 #[cfg(windows)]
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
+#[cfg(target_os = "linux")]
+pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView};
+
+/// The [`proc_view`] and fdinfo forcing seams.
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_view::fault as proc_view_fault;
+
+#[cfg(target_os = "linux")]
+impl ProcessId {
+    /// [`exists`](Self::exists), reading through the `/proc` at `proc_dir` instead of
+    /// re-resolving `/proc` by path. Only meaningful when that `/proc` is known to describe
+    /// this pid's namespace.
+    pub(crate) fn exists_in(&self, proc_dir: &ProcDir) -> Existence {
+        match backend::start_token_in(proc_dir, self.pid) {
+            Resolved::Found(t) if t == self.start => Existence::Present,
+            Resolved::Found(_) | Resolved::Gone => Existence::Gone,
+            Resolved::Unknown => Existence::Unknown,
+        }
+    }
+
+    /// [`is_alive`](Self::is_alive), reading through the `/proc` at `proc_dir`; see
+    /// [`exists_in`](Self::exists_in).
+    pub(crate) fn is_alive_in(&self, proc_dir: &ProcDir) -> Liveness {
+        backend::is_running_in(proc_dir, self.pid, self.start)
+    }
+
+    /// Whether `kill(pid, 0)` answers `ESRCH`; independent of `/proc`.
+    pub(crate) fn signal_says_no_such_process(&self) -> bool {
+        backend::signal_says_no_such_process(self.pid)
+    }
+}
+
 /// The `kinfo_proc` ABI is defined once, here, behind the size tripwires in
 /// `macos/kinfo.rs`. Containment's process-group listing reads it too.
 #[cfg(target_os = "macos")]
