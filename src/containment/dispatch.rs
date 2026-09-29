@@ -671,7 +671,7 @@ pub(crate) fn prepare(
     })
 }
 
-/// Phase 2 (after spawn, before SharedChild::new): attach the mechanism and bundle it with the
+/// Phase 2 (after spawn, before `SharedChild::adopt`): attach the mechanism and bundle it with the
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
 /// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
 /// cooperative-signal mechanism is read off it first.
@@ -771,9 +771,9 @@ fn attach_tree(
                 // survives setsid/reparenting/exec that the mode-specific mechanism does not.
                 #[cfg(target_os = "macos")]
                 if let Some(marker) = prepared.marker {
-                    // `Gone` is routine, not an anomaly: `SharedChild::new`'s internal
-                    // `try_wait` can reap a fast-exiting child inside `spawn()` itself (#61) —
-                    // `debug!`, no `incomplete`. The marker and group channels below don't need
+                    // `Gone` is routine, not an anomaly: a fast-exiting child that something else
+                    // in the process reaps (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` reaper)
+                    // can be gone before this read (#61) — `debug!`, no `incomplete`. The marker and group channels below don't need
                     // `root`, so a reparented-away live descendant stays reachable through them.
                     // `Unknown` means the OS refused to answer — a real gap — so it is `warn!`
                     // and carries `root_denied` into `Marker`, the only way `sweep_pass` can

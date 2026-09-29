@@ -11,20 +11,20 @@ impl Child {
     /// Block up to `timeout` for the root process to exit. `Ok(Some(status))` =
     /// exited; `Ok(None)` = still running at expiry (not an error); `Err` = a wait
     /// failure. `Duration::ZERO` acts like [`try_wait`](Child::try_wait). Event-driven
-    /// (no poll loop) and concurrent-safe with `kill` (shared_child pins the pid via
-    /// `waitid(WNOWAIT)`). Reaps **only the root**: a contained tree's descendants have
+    /// (no poll loop) and concurrent-safe with `kill` (the handle pins the child: a
+    /// pidfd on Linux, the process handle on Windows, an unreaped zombie on macOS). Reaps **only the root**: a contained tree's descendants have
     /// no waitable handle. A `timeout` so large it would overflow `Instant` is treated as
     /// unbounded (blocks until exit) rather than panicking.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
-        // The sync lone path's watch goes through shared_child's wait_deadline, not
+        // The sync lone path's watch goes through `SharedChild::wait_deadline`, not
         // block_until_exit, so it needs its own head of the shared watch fault seam.
         #[cfg(test)]
         if crate::wait::fault::take_force_watch_error() {
             return Err(crate::wait::fault::forced_watch_error());
         }
-        // shared_child's wait_timeout computes `Instant::now() + timeout` internally, which
-        // panics on overflow (e.g. Duration::MAX). Convert to a deadline with a saturating
-        // checked_add: on overflow the timeout is effectively infinite, so block until exit.
+        // `Instant + Duration` panics on overflow (e.g. Duration::MAX). Convert to a deadline
+        // with a saturating checked_add: on overflow the timeout is effectively infinite, so
+        // block until exit.
         match crate::wait::now().checked_add(timeout) {
             Some(deadline) => self.wait_deadline(deadline),
             None => self.wait().map(Some),
@@ -34,8 +34,8 @@ impl Child {
     /// Like [`wait_timeout`](Child::wait_timeout) but against an absolute `deadline`
     /// (at or before now behaves like [`try_wait`](Child::try_wait)).
     ///
-    /// Never returns `None` before the real clock reaches `deadline`: the backend's `None` is
-    /// rechecked, since `shared_child`'s Windows `wait_deadline` can report it early.
+    /// Never returns `None` before the clock reaches `deadline`: `SharedChild` decides expiry
+    /// from the clock after every wake, never from a primitive's own "timed out".
     pub fn wait_deadline(&self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.proc.wait_deadline(deadline).map_err(Error::Io)
     }
