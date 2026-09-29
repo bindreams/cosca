@@ -1,0 +1,1 @@
+{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["pidfd_open","pidfd_send_signal"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]}
