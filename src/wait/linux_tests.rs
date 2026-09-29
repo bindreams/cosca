@@ -41,7 +41,6 @@ fn spawn_parked_worker() -> (ProcessId, std::sync::mpsc::Sender<()>, std::thread
 /// < 6.16, `ESRCH` on >= 6.16 (the arm is then not reached; see the forced twin).
 #[test]
 fn block_until_exit_reports_exited_for_a_reaped_pgid_leader() {
-    let _guard = crate::child::spawn::spawn_lock();
     let (l_id, fixture) = build_reaped_pgid_leader();
     assert_eq!(
         l_id.exists(),
@@ -63,7 +62,6 @@ fn block_until_exit_reports_exited_for_a_reaped_pgid_leader() {
 /// any kernel.
 #[test]
 fn block_until_exit_reports_exited_for_a_reaped_pgid_leader_with_forced_einval() {
-    let _guard = crate::child::spawn::spawn_lock();
     let (l_id, fixture) = build_reaped_pgid_leader();
     assert_eq!(
         l_id.exists(),
@@ -193,7 +191,6 @@ fn block_until_exit_is_unassessable_when_the_post_open_exists_is_unknown() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
     crate::log_capture::install();
-    let _guard = crate::child::spawn::spawn_lock();
     let (gate_r, gate_w) = std::io::pipe().expect("pipe");
     let gate_r_fd = gate_r.as_raw_fd();
     let child = fork_running(|| block_on(gate_r_fd));
@@ -222,7 +219,6 @@ fn block_until_exit_is_unassessable_when_the_post_open_exists_is_unknown() {
 /// real assertion failure takes.
 #[test]
 fn a_panic_before_release_still_tears_down_l_and_m() {
-    let _guard = crate::child::spawn::spawn_lock();
     let probe: std::cell::RefCell<Option<rustix::fd::OwnedFd>> = std::cell::RefCell::new(None);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (_l_id, fixture) = build_reaped_pgid_leader();
@@ -253,7 +249,6 @@ fn a_panic_before_release_still_tears_down_l_and_m() {
 /// afterwards `L` is reaped, so `waitpid(L)` answers `ECHILD`.
 #[test]
 fn a_panic_mid_handshake_before_release_reaps_l() {
-    let _guard = crate::child::spawn::spawn_lock();
     let forced = force_panic_after_fixture();
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_reaped_pgid_leader));
     assert!(unwound.is_err(), "the forced panic must actually unwind");
@@ -274,7 +269,6 @@ fn a_panic_mid_handshake_before_release_reaps_l() {
 /// short read.
 #[test]
 fn a_failed_close_range_in_l_is_reported_as_that_step() {
-    let _guard = crate::child::spawn::spawn_lock();
     let forced = force_l_close_range_failure();
     let result = try_build_reaped_pgid_leader();
     drop(forced);

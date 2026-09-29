@@ -322,7 +322,7 @@ pub(super) fn build_reaped_pgid_leader() -> (ProcessId, ReapedLeaderFixture) {
 /// thread-group-leader task attached: the shape `pidfd_open` answers `EINVAL` (< Linux 6.16) or
 /// `ESRCH` (>= 6.16) to. Returns `L`'s identity and the fixture that tears down `L`/`M`.
 ///
-/// Callers hold `spawn_lock()`.
+/// Callers must NOT hold `spawn_lock()`: `fork_running` takes it, and it is not reentrant.
 pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderFixture), FixtureError> {
     // `rendezvous`: test<->L handshake, so L's identity is read while L is alive. `m_ready`: M
     // reports its pid; M holds the write end until `_exit`, so EOF proves M exited. `block`: M

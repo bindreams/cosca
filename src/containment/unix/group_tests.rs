@@ -353,7 +353,6 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
     crate::log_capture::install();
-    let _guard = crate::child::spawn::spawn_lock();
     let (gate_r, gate_w) = std::io::pipe().expect("pipe");
     let gate_r_fd = std::os::fd::AsRawFd::as_raw_fd(&gate_r);
     let child = fork_running(|| block_on(gate_r_fd));
