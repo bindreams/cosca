@@ -447,7 +447,7 @@ fn check_or_signal(pid: RawPid, id: crate::identity::ProcessId, signal: Option<S
 /// (`classify_member`) let it through to the attempt.
 #[cfg(target_os = "linux")]
 fn check_or_signal_linux_sigkill(pid: RawPid, id: crate::identity::ProcessId) -> Reached {
-    match crate::wait::backend::open_verified(id, "process-group teardown verification") {
+    match crate::wait::backend::open_verified(id, "process-group teardown", "process-group teardown verification") {
         Ok(None) => Reached::Yes, // already gone
         Ok(Some(pidfd)) => match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
             Ok(()) => Reached::Yes,
