@@ -80,3 +80,15 @@ fn a_wait_timeout_before_the_deadline_is_not_trusted() {
     assert!(status.is_some(), "an early WAIT_TIMEOUT was trusted: {arms:?}");
     assert!(arms.len() >= 2, "expected a re-arm, got {arms:?}");
 }
+
+/// THROWAWAY: the detector forty times over.
+#[test]
+fn forty_runs_of_the_early_timeout_detector() {
+    let mut red = 0;
+    for _ in 0..40 {
+        if std::panic::catch_unwind(a_wait_timeout_before_the_deadline_is_not_trusted).is_err() {
+            red += 1;
+        }
+    }
+    assert_eq!(red, 40, "RED {red}/40 (expected 40)");
+}

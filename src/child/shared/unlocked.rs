@@ -206,7 +206,7 @@ impl SharedChild {
 
         let handle = HANDLE(self.handle.as_raw_handle());
         // SAFETY: `handle` is our owned process handle, alive for the whole call.
-        let waited = crate::wait::wait_until(deadline.map(Some), |ms| unsafe { WaitForSingleObject(handle, ms) });
+        let waited = unsafe { WaitForSingleObject(handle, crate::wait::win32_timeout_ms(crate::wait::remaining(deadline.map(Some)))) };
         if waited == WAIT_OBJECT_0 {
             return Ok(Unlocked::ExitSeen);
         }
