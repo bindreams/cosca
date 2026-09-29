@@ -52,7 +52,7 @@ impl ProcHandle {
                 std_wait_deadline(s, armed)
             }),
             #[cfg(windows)]
-            ProcHandle::Raw(r) => r.wait_deadline(deadline),
+            ProcHandle::Raw(r) => crate::wait::rearm_until(Some(Some(deadline)), |_| r.wait_deadline(deadline)),
         }
     }
 
