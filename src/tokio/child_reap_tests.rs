@@ -155,3 +155,65 @@ async fn wait_and_reap_warns_and_returns_when_waitid_fails() {
     );
     child.wait().await.expect("reap the real child");
 }
+
+// A `waitid` that failed reaped nothing, so it records nothing: a fabricated exit-0 record would
+// make `TeardownBlocker::assert_killed` blame the kill for a failed wait.
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_and_reap_records_no_reap_when_waitid_fails() {
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let mut child = spawn_a_tokio_child_that_exits();
+    // Not `i32::MAX`: the warn-test above counts that pid's log line.
+    let not_our_child = i32::MAX as u32 - 1;
+
+    super::wait_and_reap(&mut child, not_our_child, true);
+
+    assert_eq!(reaps.recorded(), vec![], "a failed waitid must record no reap");
+    child.wait().await.expect("reap the real child");
+}
+
+/// What `waitid(WEXITED | WNOWAIT)` reports for `pid`, decoded by `exit_status_of`.
+#[cfg(unix)]
+fn waitid_status(pid: u32) -> std::process::ExitStatus {
+    // SAFETY: an all-zero `siginfo_t` is a valid value; the kernel fills it in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a well-formed blocking `waitid` on this process's own un-reaped child.
+    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    super::exit_status_of(&info)
+}
+
+/// `exit_status_of` decodes a real child's `siginfo_t` to the status std reports for it.
+#[cfg(unix)]
+#[test]
+fn exit_status_of_matches_std_for_exited_and_killed_children() {
+    for script in ["exit 3", "kill -KILL $$"] {
+        let child = {
+            let _guard = crate::child::spawn::spawn_lock();
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("spawn")
+        };
+        let mut child = child;
+        let decoded = waitid_status(child.id());
+        let real = child.wait().expect("wait");
+        assert_eq!(decoded, real, "`sh -c '{script}'`");
+    }
+}
+
+/// A dumped child is not portably producible (a core file is a host side effect), so the
+/// decoding is checked on the `si_code`/`si_status` pair itself: the low bits hold the signal and
+/// bit 7 the core flag, as in std's wait status.
+#[cfg(unix)]
+#[test]
+fn exit_status_from_parts_encodes_a_dumped_child() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let dumped = super::exit_status_from_parts(libc::CLD_DUMPED, libc::SIGSEGV);
+    assert_eq!(dumped.signal(), Some(libc::SIGSEGV));
+    assert!(dumped.core_dumped(), "{dumped:?}");
+    let killed = super::exit_status_from_parts(libc::CLD_KILLED, libc::SIGKILL);
+    assert_eq!(killed.signal(), Some(libc::SIGKILL));
+    assert!(!killed.core_dumped(), "{killed:?}");
+    assert_eq!(super::exit_status_from_parts(libc::CLD_EXITED, 3).code(), Some(3));
+}
