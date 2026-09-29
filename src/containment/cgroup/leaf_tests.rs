@@ -3429,3 +3429,26 @@ fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
     let b = suffix(crate::containment::cgroup::leaf_name().expect("a name"));
     assert_ne!(a, b);
 }
+
+/// A hook whose fire point was never reached must not outlive its guard: it would fire in an
+/// unrelated later `fail_closed`/`end_child` on this thread and release the wrong fixture.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unfired_before_exit_wait_hook_is_cleared_when_its_guard_drops() {
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = fired.clone();
+    drop(crate::containment::cgroup::fault::set_before_exit_wait(move || {
+        seen.set(true)
+    }));
+    crate::containment::cgroup::fault::run_before_exit_wait();
+    assert!(!fired.get(), "a dropped guard must take its hook with it");
+    assert_eq!(std::rc::Rc::strong_count(&fired), 1, "the hook itself must be dropped");
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+#[should_panic(expected = "already armed")]
+fn arming_over_a_live_before_exit_wait_hook_is_refused() {
+    let _first = crate::containment::cgroup::fault::set_before_exit_wait(|| {});
+    let _second = crate::containment::cgroup::fault::set_before_exit_wait(|| {});
+}
