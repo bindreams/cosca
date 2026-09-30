@@ -29,6 +29,44 @@ use std::io::Write as _;
 mod machine;
 mod sys;
 
+/// Why [`attach_settled`] did not return a settled stop.
+#[derive(Debug)]
+pub(crate) enum AttachError {
+    /// A request failed with this errno.
+    Errno(i32),
+    /// The tracee exited before it stopped, so no stop is coming: the `waitid` `si_code`
+    /// (`CLD_EXITED` 1, `CLD_KILLED` 2, `CLD_DUMPED` 3) and `si_status`.
+    Exited { code: i32, status: i32 },
+}
+
+/// Attach this process to its own child `pid` and return once the stop has settled, so the caller
+/// can act on it ([`sys::stop`] says why the settling matters). Unlike [`start`]'s helper, the
+/// caller is the tracee's parent and the tracer.
+///
+/// The stop raises no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks under
+/// a capped backoff: a deterministic condition, not a bet on time. It ends when the stop settles
+/// or the tracee is gone; an exited tracee never stops, so without that exit this would spin.
+pub(crate) fn attach_settled(pid: u32) -> Result<(), AttachError> {
+    sys::attach(pid).map_err(AttachError::Errno)?;
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match sys::stop(pid).map_err(AttachError::Errno)? {
+            sys::Stop::Stopped(_) => return Ok(()),
+            sys::Stop::Running | sys::Stop::Settling => {
+                let exited = sys::peek(pid, libc::WEXITED | libc::WNOHANG).map_err(AttachError::Errno)?;
+                if exited.si_pid != 0 {
+                    return Err(AttachError::Exited {
+                        code: exited.si_code,
+                        status: exited.si_status,
+                    });
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
 /// What the helper does once the traced tracee exits.
@@ -446,6 +484,25 @@ pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
     cmd.stdout(crate::Stdio::null()).expect("stdout null");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
     cmd.spawn().expect("spawn the tracee fixture")
+}
+
+/// [`uh_tracee_fixture`] as a `std` child with a piped stdin, spawned under `spawn_lock`. Unlike
+/// `cat`, it retries an `EINTR` from its `read`: a `cat` blocked in `read` when a tracer attaches
+/// prints `Interrupted system call` and exits 1, before or after the stop.
+pub(crate) fn spawn_std_tracee() -> std::process::Child {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "cosca_unit_tests",
+        "--test-threads=1",
+        "--exact",
+        crate::test_child::fixture_path!(uh_tracee_fixture),
+    ])
+    .env("COSCA_UH_ROLE", "tracee")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee fixture")
 }
 
 /// The tracee: reads stdin until EOF or one byte, then exits 0. A no-op unless
