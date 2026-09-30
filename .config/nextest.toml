@@ -16,9 +16,6 @@ fail-fast = false
 # A correct test's pipes close promptly, so any period catches a real leak; this one is far above
 # the noise of a loaded runner.
 leak-timeout = { period = "5s", result = "fail" }
-# nextest has no way to surface a skuld `requires` precondition's OWN reason text (only `cargo
-# test` prints that) — this at least names which test was skipped, instead of only a bare count.
-final-status-level = "skip"
 
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
