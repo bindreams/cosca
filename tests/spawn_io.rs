@@ -1636,7 +1636,7 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
         // Whatever happens below, the tree must be killed before the scope joins the watcher, or a
         // failing assertion would leave the watcher (and so the scope) waiting on a live tree.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let worker = common::cgroup::accept_or_signalled(&listener, &drained);
+            let worker = common::accept_or_signalled(&listener, &drained);
             let mut worker = std::io::BufReader::new(worker);
             let mut hello = String::new();
             worker.read_line(&mut hello).expect("read the worker's hello");
@@ -1681,10 +1681,11 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
 /// forever. The contained `sh` exits at once and leaves no descendant.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects() {
+    if !common::require_group("CGROUP") {
+        return;
+    }
     stderr_log::install();
-    common::cgroup::require_lane();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let mut cmd = Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "exit 0"]);
@@ -1697,7 +1698,7 @@ fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anythi
             rustix::io::write(&drained, &1u64.to_ne_bytes()).expect("signal the drain");
         });
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            common::cgroup::accept_or_signalled(&listener, &drained)
+            common::accept_or_signalled(&listener, &drained)
         }))
     });
     let message = common::panic_message(result.expect_err("a drained leaf with no connection must panic"));
