@@ -542,12 +542,11 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     let child = cmd.spawn().expect("spawn");
     // The fixture exits at once and its group-signal-immune descendant is the one that connects,
     // so the fixture's own pid cannot be watched: the job draining is the death of every possible
-    // connector. A watcher thread signals `drained` when `wait_tree` returns.
-    let drained = crate::wait::backend::new_cancel_event().expect("create the drain event");
+    // connector. A watcher thread records `wait_tree`'s result into `drained` when it returns.
+    let drained = crate::test_child::DrainSignal::new();
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            _ = child.wait_tree();
-            crate::wait::backend::signal_cancel(&drained);
+            drained.record(child.wait_tree());
         });
         // Whatever happens below, the tree must be killed before the scope joins the watcher, or a
         // failing assertion would leave the scope waiting on a live tree.
@@ -590,11 +589,10 @@ fn windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_conne
         .args(crate::test_child::fixture_argv("test_child::__no_such_test__"));
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
-    let drained = crate::wait::backend::new_cancel_event().expect("create the drain event");
+    let drained = crate::test_child::DrainSignal::new();
     let result = std::thread::scope(|scope| {
         scope.spawn(|| {
-            _ = child.wait_tree();
-            crate::wait::backend::signal_cancel(&drained);
+            drained.record(child.wait_tree());
         });
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::test_child::accept_or_signalled(&listener, &drained)
@@ -607,7 +605,7 @@ fn windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_conne
         .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
         .expect("string panic payload");
     assert!(
-        message.contains("drained before anything connected"),
+        message.starts_with("the tree drained (") && message.ends_with(") before anything connected"),
         "got: {message:?}"
     );
     _ = child.wait();

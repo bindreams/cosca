@@ -569,18 +569,10 @@ fn main() {
             // pgid addresses both.
             let addr = args[2].clone();
             let setuid_helper = args[3].clone();
-            #[allow(
-                clippy::zombie_processes,
-                reason = "grandchild must outlive us; containment kills/refuses us"
-            )]
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
-            )]
-            let _gc = std::process::Command::new(setuid_helper)
-                .args(["setuid-control-block", &addr, "P"])
-                .spawn()
-                .unwrap();
+            let _gc = spawn_reported_grandchild(
+                std::path::Path::new(&setuid_helper),
+                &["setuid-control-block", &addr, "P"],
+            );
             // Become a control-block ourselves (no test-owned stdin → no EOF confound).
             let mut sock = crate::ack::connect_control(&addr).unwrap();
             sock.write_all(b"R\n").unwrap();
@@ -674,14 +666,9 @@ fn main() {
         "orphan-relay" => {
             let addr = args[2].clone();
             let exe = std::env::current_exe().unwrap();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
-            )]
-            let _ = std::process::Command::new(&exe)
-                .args(["control-echo-pid", &addr, "G"])
-                .spawn()
-                .unwrap();
+            // The relay is the orphan's parent until it exits: it holds the orphan unreaped while
+            // the harness captures its identity (the report), then exits to orphan it.
+            let _gc = spawn_reported_grandchild(&exe, &["control-echo-pid", &addr, "G"]);
             std::process::exit(0);
         }
         #[cfg(unix)]

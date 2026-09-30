@@ -302,14 +302,6 @@ pub(crate) mod ack;
 /// when [`ack::ACK_ENV`] is set in its environment, so it cannot exit between `connect()` and the
 /// accept. An exit before the accept is therefore a failure, decided without consulting the
 /// accept queue.
-///
-/// Callers today are gated `windows` (`src/child/graceful_tests.rs`) or live under `src/tokio/`
-/// (`feature = "tokio"`, itself required for that whole module to exist) — under neither (e.g. a
-/// `--no-default-features` build on a non-Windows target), nothing calls this at all.
-#[cfg_attr(
-    not(any(windows, feature = "tokio")),
-    allow(dead_code, reason = "called only by the Windows and tokio tests")
-)]
 pub(crate) fn accept_or_die(
     listener: &std::net::TcpListener,
     target: crate::identity::ProcessId,
@@ -337,17 +329,47 @@ enum WatchEvent {
     Died,
 }
 
+/// How a tree's drain wait ended, handed from the watcher thread to [`accept_or_signalled`]: a
+/// wait that FAILED must not be reported as the tree having drained.
+#[cfg(windows)]
+pub(crate) struct DrainSignal {
+    event: std::os::windows::io::OwnedHandle,
+    outcome: std::sync::Mutex<Option<Result<String, String>>>,
+}
+
+#[cfg(windows)]
+impl DrainSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            event: crate::wait::backend::new_cancel_event().expect("create the drain event"),
+            outcome: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Records the result of `wait_tree` and wakes the acceptor. The outcome is stored before
+    /// the event is signalled, so an acceptor woken by the event always finds it.
+    pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
+        let outcome = result.map(|drain| format!("{drain:?}")).map_err(|e| e.to_string());
+        *self.outcome.lock().expect("the drain outcome lock") = Some(outcome);
+        crate::wait::backend::signal_cancel(&self.event);
+    }
+
+    fn fail(&self) -> ! {
+        match self.outcome.lock().expect("the drain outcome lock").take() {
+            Some(Ok(drain)) => panic!("the tree drained ({drain}) before anything connected"),
+            Some(Err(e)) => panic!("wait_tree failed while waiting for a connection: {e}"),
+            None => unreachable!("the drain event is signalled only after the outcome is stored"),
+        }
+    }
+}
+
 /// Windows: accepts a connection and acks it, or fails loudly once `drained` is signalled. For a
 /// target that is EXPECTED to exit at once while a descendant it left in the job is the one that
 /// connects (`fixture_survives_group_signal`), so its own pid cannot be watched: the tree
-/// draining is the death of every possible connector. The caller signals `drained` (a
-/// `new_cancel_event`) from a watcher thread when `wait_tree` returns; the watcher never touches
+/// draining is the death of every possible connector. The caller records `wait_tree`'s result into `drained` from a watcher thread when it returns; the watcher never touches
 /// the listener. The connector waits for the ack, so a drain with nothing accepted is a failure.
 #[cfg(windows)]
-pub(crate) fn accept_or_signalled(
-    listener: &std::net::TcpListener,
-    drained: &std::os::windows::io::OwnedHandle,
-) -> std::net::TcpStream {
+pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &DrainSignal) -> std::net::TcpStream {
     use std::os::windows::io::{AsRawHandle, AsRawSocket};
 
     use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
@@ -372,7 +394,10 @@ pub(crate) fn accept_or_signalled(
         std::io::Error::last_os_error()
     );
     // The drain is listed first: the lowest signalled index wins.
-    let handles = [HANDLE(drained.as_raw_handle()), HANDLE(accept_event.as_raw_handle())];
+    let handles = [
+        HANDLE(drained.event.as_raw_handle()),
+        HANDLE(accept_event.as_raw_handle()),
+    ];
     // SAFETY: both handles are live and owned for the call's duration.
     let woken = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
     let wait_error = std::io::Error::last_os_error();
@@ -393,7 +418,7 @@ pub(crate) fn accept_or_signalled(
         "WaitForMultipleObjects while waiting for a control connection: {wait_error}"
     );
     if woken == WAIT_OBJECT_0 {
-        panic!("the tree drained before anything connected");
+        drained.fail();
     }
     let mut stream = listener.accept().expect("accept a control connection").0;
     ack::send_ack(&mut stream)
@@ -487,19 +512,26 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
     let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [placeholder; 2];
     loop {
-        let n = kq
-            .kevent(&[], &mut events, None)
-            .expect("kevent while waiting for a control connection");
+        // macOS returns EINTR from `kevent` even under SA_RESTART, e.g. for the SIGCHLD handler
+        // tokio installs when any test in this process spawns a child.
+        let n = match kq.kevent(&[], &mut events, None) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("kevent while waiting for a control connection: {e}"),
+        };
         for ev in &events[..n] {
             debug_assert!(
                 !ev.flags().contains(EvFlags::EV_ERROR),
                 "an armed kevent reported EV_ERROR: {ev:?}"
             );
-            match ev.filter() {
-                Ok(EventFilter::EVFILT_READ) => return WatchEvent::Connection,
-                Ok(EventFilter::EVFILT_PROC) => return WatchEvent::Died,
-                _ => {}
-            }
+        }
+        // An exit among the events returned together wins over a ready listener, as on Linux and
+        // Windows.
+        if events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_PROC)) {
+            return WatchEvent::Died;
+        }
+        if events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ)) {
+            return WatchEvent::Connection;
         }
     }
 }

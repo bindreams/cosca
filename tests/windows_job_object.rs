@@ -95,7 +95,7 @@ struct Suspended {
 impl Suspended {
     /// Spawn `exe` with `args` (argv[1..]), suspended. The command line is built with
     /// `cosca::quote::windows::join_wide` rather than hand-rolled quoting.
-    fn spawn(exe: &str, args: &[&str]) -> Suspended {
+    fn spawn(exe: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Suspended {
         let wide_args: Vec<Vec<u16>> = std::iter::once(exe)
             .chain(args.iter().copied())
             .map(|a| a.encode_utf16().collect())
@@ -109,9 +109,17 @@ impl Suspended {
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
-        // Our environment plus the accept-handshake opt-in, as a UTF-16 block.
+        // Our environment plus the accept-handshake opt-in and `extra_env`, as a UTF-16 block.
+        // Windows requires the names sorted case-insensitively, and a name is one entry however
+        // it is cased, so the block is built from a case-insensitive map like `std`'s own.
+        let mut vars: std::collections::BTreeMap<String, (std::ffi::OsString, std::ffi::OsString)> =
+            std::collections::BTreeMap::new();
+        let overrides = [(common::ACK_ENV, "1")].into_iter().chain(extra_env.iter().copied());
+        for (key, value) in std::env::vars_os().chain(overrides.map(|(k, v)| (k.into(), v.into()))) {
+            vars.insert(key.to_string_lossy().to_uppercase(), (key, value));
+        }
         let mut env: Vec<u16> = Vec::new();
-        for (key, value) in std::env::vars_os().chain([(common::ACK_ENV.into(), "1".into())]) {
+        for (key, value) in vars.values() {
             use std::os::windows::ffi::OsStrExt;
             env.extend(key.encode_wide());
             env.push(u16::from(b'='));
@@ -203,16 +211,24 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
 
-    let mut root = Suspended::spawn(env!("CARGO_BIN_EXE_cosca_testbin"), &["spawn-grandchild-echo", &addr]);
+    let (report, report_addr) = common::bind_report();
+    let mut root = Suspended::spawn(
+        env!("CARGO_BIN_EXE_cosca_testbin"),
+        &["spawn-grandchild-echo", &addr],
+        &[(common::GC_PID_ADDR_ENV, &report_addr)],
+    );
     // Step 1 (spawn suspended) already happened above. Step 2: assign, while still frozen.
     let job = cosca::Job::assign(root.borrow_process()).expect("Job::assign");
     // Step 3: only now resume.
     root.resume();
+    let watched = common::report_grandchild_of(&report, &mut root);
 
     let mut root_member = None;
     let mut grand_member = None;
     for _ in 0..2 {
-        let s = common::accept_or_die(&listener, &mut root);
+        // The root is watched throughout and the grandchild until it has connected.
+        let watch_grand = grand_member.is_none().then_some(watched);
+        let s = common::accept_or_die_also(&listener, &mut root, watch_grand);
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)

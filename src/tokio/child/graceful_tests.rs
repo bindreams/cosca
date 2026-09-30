@@ -474,7 +474,10 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
     let mut sock = tokio::select! {
         biased;
         accepted = listener.accept() => accepted.expect("accept the readiness connection").0,
-        _ = child.wait_tree() => panic!("the tree drained before anything connected"),
+        drained = child.wait_tree() => match drained {
+            Ok(drain) => panic!("the tree drained ({drain:?}) before anything connected"),
+            Err(e) => panic!("wait_tree failed while waiting for a connection: {e}"),
+        },
     };
     sock.write_all(&[crate::test_child::ack::ACK_BYTE])
         .await

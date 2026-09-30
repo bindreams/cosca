@@ -250,6 +250,8 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     cmd.stderr(cosca::Stdio::null()).expect("null stderr");
     cmd.contain();
     cmd.env(common::ACK_ENV, "1");
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn contained root");
 
     // The pgid-based mechanism specifically — NOT cgroup v2 (whose `cgroup.kill` bypasses the
@@ -271,8 +273,12 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let mut priv_pid = None;
     let mut priv_sock = None;
     let mut lines = Vec::new();
-    let streams = common::accept_tree(&listener, &mut child, 2, |s| {
-        lines.push(read_handshake_line(s));
+    let streams = common::accept_tree(&listener, &report, &mut child, |s| {
+        let line = read_handshake_line(s);
+        // The root's handshake line is `R`; the privileged helper's starts with its tag `P`.
+        let is_grandchild = !line.starts_with('R');
+        lines.push(line);
+        is_grandchild
     });
     for (line, stream) in lines.into_iter().zip(streams) {
         match classify(&line, stream) {

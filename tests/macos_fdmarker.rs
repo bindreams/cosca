@@ -71,15 +71,19 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
         .env(common::ACK_ENV, "1")
         .contain_with(mode);
     common::silence(&mut cmd);
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn the orphan tree");
 
     let mut lines = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
             .expect("read tag+pid");
+        let is_grandchild = line.starts_with('G');
         lines.push(line);
+        is_grandchild
     });
     let mut root = None;
     let mut grand = None;
@@ -205,12 +209,17 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
         .env(common::ACK_ENV, "1")
         .contain_with(mode);
     common::silence_async(&mut cmd);
+    let (report, report_addr) = common::bind_async_listener();
+    cmd.env(common::GC_PID_ADDR_ENV, report_addr);
     let mut child = cmd.spawn().expect("spawn the orphan tree (tokio)");
+    let watched = common::report_grandchild_async(&report, &mut child).await;
 
     let mut root = None;
     let mut grand = None;
     for _ in 0..2 {
-        let s = common::accept_or_die_async(&listener, &mut child).await;
+        // The root is watched throughout and the orphan until it has connected.
+        let watch_grand = grand.is_none().then_some(watched);
+        let s = common::accept_or_die_async_also(&listener, &mut child, watch_grand).await;
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
@@ -270,17 +279,21 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     for slot in 64..=90 {
         cmd.fd(slot, cosca::Stdio::null()).expect("map a real child fd");
     }
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd
         .spawn()
         .expect("spawn the orphan tree with a wide reserved-fd range");
 
     let mut lines = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
             .expect("read tag+pid");
+        let is_grandchild = line.starts_with('G');
         lines.push(line);
+        is_grandchild
     });
     let mut root = None;
     let mut grand = None;
