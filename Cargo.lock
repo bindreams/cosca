@@ -170,6 +170,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,12 +681,13 @@ dependencies = [
 
 [[package]]
 name = "skuld"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2f78c86bddbd5e8c95528fae6150ddfc719d15c226ccae754c87c245aec90db"
+checksum = "13443ab130646d782c290593fabbbc99e93e7575bc8c410cbe8d7dfa8f2fa34a"
 dependencies = [
  "boolean_expression",
  "clap",
+ "dunce",
  "inventory",
  "libc",
  "libtest-mimic",
@@ -699,9 +706,9 @@ dependencies = [
 
 [[package]]
 name = "skuld-macros"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "153f89b484b0921bcd5a02faa01da45454edc9245b7e4293a4a257fa4594d46a"
+checksum = "b00834d51dfd8ff004a0e32e42626f0cc37eaeec3407c4102dadc65e85b0105f"
 dependencies = [
  "proc-macro2",
  "quote",
