@@ -5,9 +5,7 @@
 //! fire while the kernel is still tearing the process down, before it is marked a zombie —
 //! the state `is_alive` reads.
 
-// `harness = false`: skuld is the only harness, and `#[macro_use]` makes its `#[test]` shadow the
-// built-in in every module of this binary, `common` and nested ones included. A `#[test]` that
-// libtest would run cannot compile to nothing.
+// Shadows the built-in #[test] in every module of this binary so a stray one registers with skuld (harness = false).
 #[allow(
     unused_imports,
     reason = "a stray #[test] must register with skuld, not silently never run"
