@@ -5,6 +5,14 @@
 //! fire while the kernel is still tearing the process down, before it is marked a zombie —
 //! the state `is_alive` reads.
 
+// Shadows the built-in #[test] in every module of this binary so a stray one registers with skuld (harness = false).
+#[allow(
+    unused_imports,
+    reason = "a stray #[test] must register with skuld, not silently never run"
+)]
+#[macro_use]
+extern crate skuld;
+
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -12,7 +20,7 @@ use std::time::Duration;
 mod common;
 use common::spawn_blocker;
 
-#[test]
+#[skuld::test]
 fn foreign_wait_returns_when_the_process_exits() {
     let (child, mut sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid())
@@ -30,7 +38,7 @@ fn foreign_wait_returns_when_the_process_exits() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn foreign_wait_timeout_times_out_on_a_live_process() {
     // The blocker is structurally wedged on its never-written socket, so it cannot
     // exit; wait_timeout returns Ok(false) regardless of the (short) duration.
@@ -45,7 +53,7 @@ fn foreign_wait_timeout_times_out_on_a_live_process() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn foreign_wait_timeout_observes_an_exit() {
     let (child, mut sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -54,7 +62,7 @@ fn foreign_wait_timeout_observes_an_exit() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn foreign_wait_timeout_zero_returns_immediately_on_a_live_process() {
     // ZERO is the poll-once edge in each backend; a wedged child must yield Ok(false).
     let (child, _sock) = spawn_blocker();
@@ -64,7 +72,7 @@ fn foreign_wait_timeout_zero_returns_immediately_on_a_live_process() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn foreign_wait_timeout_huge_duration_does_not_panic() {
     // Duration::MAX overflows Instant + Duration; the saturating deadline must make
     // it unbounded, not panic. Trigger the exit first so the wait completes.
@@ -75,7 +83,7 @@ fn foreign_wait_timeout_huge_duration_does_not_panic() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn current_and_from_id_round_trip() {
     let me = cosca::Process::current();
     assert_eq!(me.is_alive(), cosca::identity::Liveness::Alive);
@@ -86,7 +94,7 @@ fn current_and_from_id_round_trip() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     // from_pid resolves a live foreign child to its true identity; after the child is
     // killed+reaped, that resolved Process reports !is_alive (the zombie-EXCLUSIVE liveness
@@ -111,7 +119,7 @@ fn from_pid_resolves_a_live_foreign_child_then_reports_it_dead() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn parent_and_children_resolve_the_spawned_tree() {
     let (child, mut sock) = spawn_blocker();
     let me = cosca::Process::current();
@@ -141,7 +149,7 @@ fn parent_and_children_resolve_the_spawned_tree() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn children_recursive_distinguishes_direct_from_descendant() {
     // spawn-grandchild: the child connects (tag "R") and spawns a control-block grandchild
     // (tag "G"). `spawn_grandchild` accepts BOTH, death-watched, which proves the 2-level tree
@@ -188,7 +196,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     grandkid.wait().expect("wait for the orphaned grandchild");
 }
 
-#[test]
+#[skuld::test]
 fn foreign_kill_terminates_the_process() {
     let (child, mut sock) = spawn_blocker();
     let p = cosca::Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -211,7 +219,7 @@ fn foreign_kill_terminates_the_process() {
 // XNU's launchd protection is unverified, and being wrong panics the machine — so as
 // root on non-Linux we refuse to signal pid 1 at all.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn foreign_kill_surfaces_permission_denied() {
     let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
     assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must be alive");
@@ -238,7 +246,7 @@ fn foreign_kill_surfaces_permission_denied() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn is_alive_is_false_for_a_real_zombie() {
     // Spawn a RAW std child (std does NOT reap on drop), take it foreign, drive it to a
     // zombie, then — before reaping — assert is_alive()==Dead while the identity still
@@ -316,7 +324,7 @@ impl common::Target for AlreadyDead {
 }
 
 /// A target that dies before connecting makes `accept_or_die` panic naming it, not hang.
-#[test]
+#[skuld::test]
 fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -333,7 +341,7 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
 /// An exit AFTER the watch is armed. The target is alive when `accept_or_die` starts; the armed
 /// hook, which runs once the watches are in place, closes its stdin so it exits. This reaches the
 /// OS exit notification itself (pidfd, kqueue `NOTE_EXIT`, process handle).
-#[test]
+#[skuld::test]
 fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     use std::net::TcpListener;
     use std::process::Stdio;
@@ -362,7 +370,7 @@ fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
 
 /// A target that `has_exited` is dead, and its pid (here one that cannot exist) is never opened:
 /// a reaped pid could name a stranger.
-#[test]
+#[skuld::test]
 fn accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -374,7 +382,7 @@ fn accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
 
 /// A std child reaped by its own `wait` is reported exited by `Target::has_exited`, so it takes the
 /// same path as above with a real pid.
-#[test]
+#[skuld::test]
 fn a_reaped_std_child_is_reported_exited() {
     use common::Target as _;
     let mut child =
@@ -385,7 +393,7 @@ fn a_reaped_std_child_is_reported_exited() {
 
 /// A target that connects and exits without waiting for the ack is dead whether or not its
 /// connection reached the accept queue: the exit alone decides.
-#[test]
+#[skuld::test]
 fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -402,7 +410,7 @@ fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_d
 }
 
 /// The ack is written on the accepted connection; the opted-in target sends its tag only after it.
-#[test]
+#[skuld::test]
 fn accept_or_die_acks_the_connection_it_accepts() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -424,7 +432,7 @@ fn accept_or_die_acks_the_connection_it_accepts() {
 /// A descendant that is gone (reaped, so its identity no longer resolves) is reported dead, not
 /// panicked over: Linux `pidfd_open` ESRCH, macOS `EV_ADD` ESRCH, Windows `OpenProcess` failing
 /// with `ERROR_INVALID_PARAMETER`. The target is alive throughout.
-#[test]
+#[skuld::test]
 fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
     use std::net::TcpListener;
     use std::process::Stdio;
@@ -459,7 +467,7 @@ fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
 /// A pid now running a DIFFERENT process (a live one, with the identity forged to differ in its
 /// start token, which is what a reissued pid looks like) is reported as the descendant being gone,
 /// never watched.
-#[test]
+#[skuld::test]
 fn accept_or_die_also_does_not_watch_a_reissued_pid() {
     use std::net::TcpListener;
     use std::process::Stdio;
@@ -492,7 +500,7 @@ fn accept_or_die_also_does_not_watch_a_reissued_pid() {
 
 /// `wait_handles` reports the OS error of a failed wait, captured before anything can overwrite it.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn wait_handles_reports_the_os_error_of_a_failed_wait() {
     use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
     let err = common::wait_handles(&[HANDLE(std::ptr::null_mut())]).expect_err("a null handle cannot be waited on");
@@ -502,7 +510,7 @@ fn wait_handles_reports_the_os_error_of_a_failed_wait() {
 // Tree helpers =====
 
 /// The helpers themselves (`spawn_control`, `spawn_tree`), end to end, fail rather than hang.
-#[test]
+#[skuld::test]
 fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(|| common::spawn_control("--not-a-real-mode", &[], false));
     assert!(
@@ -511,7 +519,7 @@ fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() 
     );
 }
 
-#[test]
+#[skuld::test]
 fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(|| common::spawn_tree("--not-a-real-mode", false));
     assert!(
@@ -522,7 +530,7 @@ fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
 
 /// Only the GRANDCHILD dies before connecting; the panic must name it (the pid the root
 /// reported), not the live root.
-#[test]
+#[skuld::test]
 fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-dies", false));
     let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
@@ -531,7 +539,7 @@ fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_l
 
 /// The root reports a live grandchild and exits without ever connecting to the main address, so
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
-#[test]
+#[skuld::test]
 fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
     // Contained so unwinding kills the orphaned grandchild (it would otherwise outlive the test
     // holding its stdio). The kill is only sent on drop, so wait for the grandchild's exit by
@@ -562,7 +570,7 @@ fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
 
 /// The root connects to the report address and exits without reporting: the failure names that,
 /// not a parse error on an empty line.
-#[test]
+#[skuld::test]
 fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-eof", false));
     assert!(
@@ -593,14 +601,14 @@ fn reap(mut child: std::process::Child) {
 
 /// `strict` turns a missing opt-in into a death before connecting, which is how the mode tests
 /// see that a mode forgot to opt its child in.
-#[test]
+#[skuld::test]
 fn accept_or_die_seam_strict_kills_a_target_that_was_not_opted_in() {
     let (mut child, listener) = seamed_control_block("strict", false);
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
     assert_died_before_connecting(&message, child.id());
 }
 
-#[test]
+#[skuld::test]
 fn accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
     let (mut child, listener) = seamed_control_block("strict", true);
     let mut sock = common::accept_or_die(&listener, &mut child);
@@ -612,7 +620,7 @@ fn accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
 }
 
 /// `die-now` is the state the `die` seam leaves a mode in for its children.
-#[test]
+#[skuld::test]
 fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
     let (mut child, listener) = seamed_control_block("die-now", true);
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
@@ -621,8 +629,12 @@ fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
 
 /// Pid 1 has no parent, and that is `Ok(None)`: a real absence, not an unanswerable question.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn pid_one_has_no_parent() {
     let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
     assert!(init.parent().expect("pid 1's parent is answerable").is_none());
+}
+
+fn main() {
+    skuld::run_all();
 }
