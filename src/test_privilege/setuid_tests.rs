@@ -146,8 +146,6 @@ mod linux {
         assert_eq!((h.byte(), proc_ids(pid)), (Some(b'D'), (c, c, 0)));
         h.send(b'r');
         assert_eq!((h.byte(), proc_ids(pid)), (Some(b'R'), (0, 0, 0)));
-        h.send(b'n');
-        assert_eq!(h.byte(), Some(b'N'));
         h.send(b'd');
         assert_eq!(h.byte(), Some(b'D'));
         // Without CAP_SETUID this fails, so nothing may be acknowledged.
@@ -156,6 +154,18 @@ mod linux {
         let (code, stderr) = h.finish();
         assert_eq!(code, Some(3));
         assert!(stderr.contains("setresuid"), "{stderr}");
+    }
+
+    /// Its own helper: the new user namespace maps neither uid 0 nor the caller, so no `setresuid`
+    /// follows.
+    #[test]
+    fn setuid_testbin_unshare_acks_after_the_namespace_exists() {
+        let Some(helper) = setuid_helper() else { return };
+        let mut h = Helper::start(&helper, "root");
+        assert_eq!(h.byte(), Some(b'+'));
+        h.send(b'n');
+        assert_eq!(h.byte(), Some(b'N'));
+        assert_eq!(h.finish(), (Some(0), String::new()));
     }
 
     #[test]
