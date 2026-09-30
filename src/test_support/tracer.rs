@@ -468,6 +468,12 @@ pub(crate) const SIGTERM_EXIT: i32 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tracee {
     Plain,
+    /// Leads a process group of its own, which only it can orphan: the tracee for `SIGTSTP` and
+    /// `SIGTTIN`, which XNU discards in an orphaned group. Its parent's group can be orphaned
+    /// under a shell without job control, and under plain `cargo test` the other tests' orphaned
+    /// grandchildren each decrement that group's `pg_jobc` when they exit (xnu `kern_exit.c`,
+    /// `fixjobc`), so it can reach 0.
+    OwnGroup,
     /// Exits with [`SIGTERM_EXIT`] on `SIGTERM`.
     CatchSigterm,
     /// Holds a thread it created with `pthread_create_suspended_np` and never starts.
@@ -545,6 +551,9 @@ fn uh_tracee_fixture() {
     let kind = std::env::var("COSCA_UH_KIND").expect("COSCA_UH_KIND is set by spawn_tracee");
     match kind.as_str() {
         "Plain" => {}
+        "OwnGroup" => {
+            nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).expect("setpgid");
+        }
         "CatchSigterm" => {
             extern "C" fn exit_on_sigterm(_: libc::c_int) {
                 // SAFETY: `_exit` is async-signal-safe.
