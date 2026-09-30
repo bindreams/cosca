@@ -8,7 +8,7 @@ jobs:
         arch:
           - {runner: macos-15, target: x86_64-apple-darwin, tag: amd64}
           - {runner: macos-latest, target: aarch64-apple-darwin, tag: arm64}
-        variant: [fix, fix-widened, m1-attachexc, m2-attachexc-no-exit-check]
+        variant: [m2-attachexc-no-exit-check]
         include:
           - {variant: fix, n: 8, stress: 50}
           - {variant: fix-widened, n: 4, stress: 10}
@@ -41,7 +41,7 @@ jobs:
           if v.startswith("m"):
               edit('src/test_support/tracer/sys.rs',"const ATTACH: libc::c_int = libc::PT_ATTACH;","const ATTACH: libc::c_int = libc::PT_ATTACHEXC;")
           if v.startswith("m2"):
-              edit('src/test_support/tracer.rs',"if exited.si_pid != 0 &&","if false && exited.si_pid != 0 &&")
+              edit('src/test_support/tracer.rs',"if exited.si_pid != 0","if false && exited.si_pid != 0")
           if v != "fix":
               a='        step("attach and settle");'
               edit('src/child/shared_tests/tracer.rs',a,'        std::thread::sleep(Duration::from_millis(300));\n'+a)
