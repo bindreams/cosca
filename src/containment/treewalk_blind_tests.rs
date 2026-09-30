@@ -115,3 +115,17 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
         release(child);
     }
 }
+
+/// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
+/// its own. Mutant: "walk without an anchor".
+#[test]
+fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
+    let me = ProcessId::current();
+    let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));
+    for (name, walk) in walks() {
+        let (child, _) = live_member();
+        let result = walk(stale);
+        assert!(result.is_ok(), "{name}: {result:?}");
+        release(child);
+    }
+}
