@@ -469,3 +469,311 @@ fn fixture_reports_job_breakaway_probe() {
         );
     }
 }
+
+// ===== initial-thread resume ownership =====
+
+/// A suspended process this test made itself, holding its main thread. It sits in a
+/// kill-on-close job, so the OS kills it however the test process exits; `Drop` kills it sooner.
+struct SuspendedHelper {
+    process: windows::Win32::Foundation::HANDLE,
+    thread: windows::Win32::Foundation::HANDLE,
+    tid: u32,
+    pid: u32,
+    _job: super::JobHandle,
+}
+
+impl SuspendedHelper {
+    fn new() -> Self {
+        use windows::core::PWSTR;
+        use windows::Win32::System::Threading::{
+            CreateProcessW, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        let mut cmdline: Vec<u16> = "cmd /C more".encode_utf16().chain(std::iter::once(0)).collect();
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer that outlives the call.
+        unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                None,
+                None,
+                &si,
+                &mut pi,
+            )
+        }
+        .expect("CreateProcessW for the suspended helper");
+        let job = super::assign_to_kill_on_close_job(pi.hProcess.0).expect("assign the helper to a job");
+        Self {
+            process: pi.hProcess,
+            thread: pi.hThread,
+            tid: pi.dwThreadId,
+            pid: pi.dwProcessId,
+            _job: job,
+        }
+    }
+}
+
+impl Drop for SuspendedHelper {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::TerminateProcess;
+        // SAFETY: both handles are live and owned by this helper.
+        unsafe {
+            _ = TerminateProcess(self.process, 1);
+            _ = CloseHandle(self.thread);
+            _ = CloseHandle(self.process);
+        }
+    }
+}
+
+/// Spawn a contained blocker. Whatever is injected or forced on this thread applies to it.
+fn spawn_contained_blocker() -> Result<crate::Child, crate::error::Error> {
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    cmd.contain();
+    cmd.spawn()
+}
+
+/// Spawn with an extra snapshot entry for `tid`, owned by `owner` (`None`: the child).
+/// Returns the spawn result and what the walk did with the entry.
+fn spawn_with_injected_tid(
+    tid: u32,
+    owner: Option<u32>,
+) -> (
+    Result<crate::Child, crate::error::Error>,
+    Option<Option<crate::containment::windows::Visit>>,
+) {
+    let injected = crate::containment::windows::fault::inject_snapshot_tid(tid, owner);
+    let spawned = spawn_contained_blocker();
+    let visit = crate::containment::windows::fault::take_injected_visit();
+    drop(injected);
+    (spawned, visit)
+}
+
+fn finish_child(spawned: Result<crate::Child, crate::error::Error>) {
+    let mut child = spawned.expect("a stale snapshot entry must not fail the spawn");
+    assert_eq!(
+        child.containment(),
+        crate::Containment::JobObject,
+        "the walk under test only runs for a Job Object spawn"
+    );
+    drop(child.stdin().expect("piped stdin"));
+    child.wait().expect("wait for the contained child");
+}
+
+/// A thread id the snapshot lists under the child (owner = the child's pid) but that belongs to
+/// another process (a reused id) must not be resumed, and must not fail the spawn. The helper's
+/// main thread has suspend count 1; suspending it again returns the previous count, so 1 proves
+/// nothing resumed it and 0 proves something did.
+#[test]
+fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
+    use crate::containment::windows::Visit;
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let helper = SuspendedHelper::new();
+    let (spawned, visit) = spawn_with_injected_tid(helper.tid, None);
+    assert!(
+        spawned.is_ok(),
+        "a snapshot entry for another process's thread must not fail the spawn: {:?}",
+        spawned.as_ref().err()
+    );
+    assert_eq!(
+        visit,
+        Some(Some(Visit::Foreign { owner: helper.pid })),
+        "the injected entry must be walked and identified as the helper's"
+    );
+
+    // SAFETY: `helper.thread` is a live thread handle with suspend rights.
+    let previous = unsafe { SuspendThread(helper.thread) };
+    assert_eq!(
+        previous, 1,
+        "the helper's thread is another process's: the spawn must not have resumed it"
+    );
+    // SAFETY: as above; restore the count this test added.
+    unsafe { ResumeThread(helper.thread) };
+
+    finish_child(spawned);
+}
+
+/// The owner filter drops a snapshot entry listed under another pid before any thread is opened.
+#[test]
+fn windows_resume_initial_threads_drops_an_entry_owned_by_another_pid() {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let helper = SuspendedHelper::new();
+    let (spawned, visit) = spawn_with_injected_tid(helper.tid, Some(helper.pid));
+    assert_eq!(visit, Some(None), "an entry owned by another pid must be filtered out");
+    // SAFETY: `helper.thread` is a live thread handle with suspend rights.
+    let previous = unsafe { SuspendThread(helper.thread) };
+    assert_eq!(previous, 1, "a filtered entry must not be touched");
+    // SAFETY: as above.
+    unsafe { ResumeThread(helper.thread) };
+    finish_child(spawned);
+}
+
+/// A listed thread that exited and whose id was not reused makes `OpenThread` fail with
+/// `ERROR_INVALID_PARAMETER`, and must not fail the spawn. The kernel masks an id's low two bits
+/// before the lookup, so id 1 resolves to CID 0, which is never allocated to any thread or
+/// process: the lookup always fails, whatever ids are live or reused.
+#[test]
+fn windows_resume_initial_threads_skips_a_thread_id_that_no_longer_exists() {
+    use crate::containment::windows::Visit;
+
+    let (spawned, visit) = spawn_with_injected_tid(1, None);
+    assert!(
+        spawned.is_ok(),
+        "a snapshot entry for a nonexistent thread must not fail the spawn: {:?}",
+        spawned.as_ref().err()
+    );
+    assert_eq!(
+        visit,
+        Some(Some(Visit::Gone)),
+        "the entry must be walked and found gone"
+    );
+    finish_child(spawned);
+}
+
+/// `ERROR_ACCESS_DENIED` on the query-only open marks the id as someone else's: the child's own
+/// threads are openable by its creator. Forced onto the child's first thread, that leaves nothing
+/// resumed, and the spawn fails with the stale-walk error rather than an open failure.
+#[test]
+fn windows_resume_initial_threads_treats_a_denied_query_open_as_stale() {
+    use crate::containment::windows::fault::{force_next, Step};
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    let _forced = force_next(Step::QueryOpen, ERROR_ACCESS_DENIED);
+    let spawned = spawn_contained_blocker();
+    assert!(spawned.is_err(), "no thread was resumed, so the spawn must fail");
+    let text = format!("{:?}", spawned.err());
+    assert!(
+        text.contains("was stale") && text.contains("access denied"),
+        "a denied query open must be reported as a stale skip: {text}"
+    );
+}
+
+/// Spawn with `step` forced to fail on the child's first thread; the spawn must fail with an
+/// error naming `call`, the thread and the pid.
+fn assert_forced_failure_fails_the_spawn(step: crate::containment::windows::fault::Step, code: u32, call: &str) {
+    let _forced = crate::containment::windows::fault::force_next(step, code);
+    let spawned = spawn_contained_blocker();
+    assert!(
+        spawned.is_err(),
+        "a failure on the child's own thread must fail the spawn"
+    );
+    let text = format!("{:?}", spawned.err());
+    assert!(
+        text.contains(&format!("{call} failed for thread")) && text.contains("of pid"),
+        "the error must name the call, thread and pid ({call}): {text}"
+    );
+    assert!(!text.contains("was stale"), "a failure is not a stale skip: {text}");
+}
+
+#[test]
+fn windows_resume_initial_threads_fails_the_spawn_when_the_query_open_fails() {
+    use crate::containment::windows::fault::Step;
+    const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+    assert_forced_failure_fails_the_spawn(Step::QueryOpen, ERROR_NOT_ENOUGH_MEMORY, "OpenThread(query)");
+}
+
+/// A denied suspend/resume open of a thread that IS the child's is a failure, not a skip.
+#[test]
+fn windows_resume_initial_threads_fails_the_spawn_when_the_resume_open_is_denied() {
+    use crate::containment::windows::fault::Step;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    assert_forced_failure_fails_the_spawn(Step::ResumeOpen, ERROR_ACCESS_DENIED, "OpenThread(suspend/resume)");
+}
+
+#[test]
+fn windows_resume_initial_threads_fails_the_spawn_when_the_owner_is_unreadable() {
+    use crate::containment::windows::fault::Step;
+    const ERROR_INVALID_HANDLE: u32 = 6;
+    assert_forced_failure_fails_the_spawn(Step::Owner, ERROR_INVALID_HANDLE, "GetProcessIdOfThread");
+}
+
+#[test]
+fn windows_resume_initial_threads_fails_the_spawn_when_resume_thread_fails() {
+    use crate::containment::windows::fault::Step;
+    const ERROR_INVALID_HANDLE: u32 = 6;
+    assert_forced_failure_fails_the_spawn(Step::Resume, ERROR_INVALID_HANDLE, "ResumeThread");
+}
+
+/// The walk keeps the FIRST failure: it is the root cause, and later ones only follow from it.
+#[test]
+fn walk_verdict_returns_the_first_failure() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk::default();
+    walk.fail("ResumeThread", 1, 9, "first cause");
+    walk.fail("ResumeThread", 2, 9, "second cause");
+    let text = walk_verdict(9, walk).expect_err("a failure").to_string();
+    assert!(text.contains("thread 1") && text.contains("first cause"), "{text}");
+    assert!(
+        !text.contains("second cause"),
+        "the later failure replaced the first: {text}"
+    );
+}
+
+/// When every listed thread was stale the walk fails, and the error names the last skip.
+#[test]
+fn walk_verdict_with_only_skips_names_the_last_skip() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk::default();
+    walk.skip("thread 7 no longer exists".to_owned());
+    let text = walk_verdict(4321, walk).expect_err("nothing was resumed").to_string();
+    assert!(
+        text.contains("4321") && text.contains("thread 7 no longer exists"),
+        "{text}"
+    );
+    let text = walk_verdict(4321, Walk::default())
+        .expect_err("nothing listed")
+        .to_string();
+    assert!(text.contains("listed no threads"), "{text}");
+}
+
+#[test]
+fn walk_verdict_accepts_a_walk_that_resumed_a_thread() {
+    use super::{walk_verdict, Walk};
+    let mut walk = Walk {
+        resumed: 1,
+        ..Walk::default()
+    };
+    walk.skip("thread 7 no longer exists".to_owned());
+    walk_verdict(4321, walk).expect("a resumed thread with stale siblings is a success");
+}
+
+/// `GetProcessId` answers 0 for a handle that is not a process.
+#[test]
+fn process_pid_of_rejects_a_handle_that_names_no_process() {
+    let result = super::process_pid_of(windows::Win32::Foundation::HANDLE::default());
+    assert!(result.is_err(), "a null handle names no process: {result:?}");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("GetProcessId"),
+        "error must name the call: {err}"
+    );
+}
+
+/// A handle that names no process breaks the caller's contract. Debug builds assert it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "live process handle")]
+fn resume_initial_threads_asserts_its_handle_contract_in_debug() {
+    _ = super::resume_initial_threads(std::ptr::null_mut());
+}
+
+/// Release builds return the error instead. Runs in the release lane.
+#[cfg(not(debug_assertions))]
+#[test]
+fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
+    let err = super::resume_initial_threads(std::ptr::null_mut()).expect_err("a null handle names no process");
+    assert!(err.to_string().contains("GetProcessId"), "{err}");
+}

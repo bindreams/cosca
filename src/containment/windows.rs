@@ -26,9 +26,9 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    THREAD_SUSPEND_RESUME,
+    GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
+    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
@@ -546,6 +546,78 @@ pub(crate) mod fault {
     pub(crate) fn armed() -> bool {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.get())
     }
+
+    /// The Win32 call `resume_if_owned` makes at each step, for [`force_next`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        QueryOpen,
+        Owner,
+        ResumeOpen,
+        Resume,
+    }
+
+    thread_local! {
+        static INJECTED: Cell<Option<(u32, Option<u32>)>> = const { Cell::new(None) };
+        static INJECTED_VISIT: Cell<Option<Option<super::Visit>>> = const { Cell::new(None) };
+        static FORCED: Cell<Option<(Step, u32)>> = const { Cell::new(None) };
+    }
+    /// Make `resume_initial_threads` on THIS thread walk one extra snapshot entry for thread
+    /// `tid`, owned by `owner` (`None`: the CHILD's pid, which is what a stale id looks like).
+    /// Reset on drop, which also clears the recorded visit and any forced failure.
+    pub(crate) fn inject_snapshot_tid(tid: u32, owner: Option<u32>) -> Injected {
+        INJECTED.with(|f| {
+            debug_assert!(f.get().is_none(), "a snapshot tid is already injected");
+            f.set(Some((tid, owner)));
+        });
+        INJECTED_VISIT.with(|f| f.set(None));
+        Injected(())
+    }
+    /// The injected entry's `(tid, owner)`.
+    pub(crate) fn injected_entry() -> Option<(u32, Option<u32>)> {
+        INJECTED.with(|f| f.get())
+    }
+    /// Record what the walk did with the injected entry (`None`: the owner filter dropped it).
+    pub(crate) fn record_injected_visit(visit: Option<super::Visit>) {
+        INJECTED_VISIT.with(|f| f.set(Some(visit)));
+    }
+    /// What the walk did with the injected entry. The outer `None` means it was never walked.
+    pub(crate) fn take_injected_visit() -> Option<Option<super::Visit>> {
+        INJECTED_VISIT.with(|f| f.take())
+    }
+    /// Make the NEXT `step` call on THIS thread fail with Win32 error `code`. Reset on drop of the
+    /// guard. Neither an owner of 0 nor a failed `ResumeThread` can be produced on a live system.
+    pub(crate) fn force_next(step: Step, code: u32) -> Forced {
+        FORCED.with(|f| {
+            debug_assert!(f.get().is_none(), "a failure is already forced");
+            f.set(Some((step, code)));
+        });
+        Forced(())
+    }
+    /// Consume a forced failure for `step`, if one is armed for it.
+    pub(crate) fn take_forced(step: Step) -> Option<u32> {
+        FORCED.with(|f| match f.get() {
+            Some((armed, code)) if armed == step => {
+                f.set(None);
+                Some(code)
+            }
+            _ => None,
+        })
+    }
+    #[must_use = "dropping this immediately removes the injected entry"]
+    pub(crate) struct Injected(());
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            INJECTED.with(|f| f.set(None));
+            INJECTED_VISIT.with(|f| f.set(None));
+        }
+    }
+    #[must_use = "dropping this immediately disarms the forced failure"]
+    pub(crate) struct Forced(());
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.set(None));
+        }
+    }
 }
 
 /// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
@@ -961,6 +1033,231 @@ pub(crate) fn wait_drained_raw(
     }
 }
 
+/// What `resume_if_owned` did with one thread id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visit {
+    Resumed,
+    /// The opened thread belongs to `owner`, not to the child: the id was reused.
+    Foreign {
+        owner: u32,
+    },
+    /// No thread has this id any more (`ERROR_INVALID_PARAMETER`).
+    Gone,
+    /// The query-only open was denied. The child's own threads are openable by its creator, so
+    /// the id belongs to someone else.
+    Denied,
+    /// A call failed on a thread that is the child's; recorded in `last_err`.
+    Failed,
+}
+
+/// The state of one walk over the snapshot.
+#[derive(Default)]
+struct Walk {
+    resumed: u32,
+    /// The FIRST failure: it is the root cause, and later ones are logged as they happen.
+    last_err: Option<io::Error>,
+    /// Reason for the latest stale skip, for the none-resumed error.
+    last_skip: Option<String>,
+}
+
+impl Walk {
+    fn skip(&mut self, reason: String) {
+        log::debug!("resume_initial_threads: {reason}; skipped");
+        self.last_skip = Some(reason);
+    }
+
+    fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
+        let msg = format!("{call} failed for thread {tid} of pid {process_pid}: {cause}");
+        log::warn!("resume_initial_threads: {msg}");
+        self.last_err.get_or_insert_with(|| io::Error::other(msg));
+        Visit::Failed
+    }
+}
+
+/// A thread handle, closed on drop.
+struct ThreadHandle(HANDLE);
+
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned and closed exactly once.
+        unsafe { _ = CloseHandle(self.0) };
+    }
+}
+
+/// Fail with the Win32 error a test armed for `step`, if any.
+#[cfg(test)]
+fn forced(step: fault::Step) -> windows::core::Result<()> {
+    match fault::take_forced(step) {
+        Some(code) => Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+            code,
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn open_query(tid: u32) -> windows::core::Result<ThreadHandle> {
+    #[cfg(test)]
+    forced(fault::Step::QueryOpen)?;
+    // SAFETY: plain Win32 call; the handle is owned by the returned guard.
+    unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
+}
+
+fn open_for_resume(tid: u32) -> windows::core::Result<ThreadHandle> {
+    #[cfg(test)]
+    forced(fault::Step::ResumeOpen)?;
+    // SAFETY: plain Win32 call; the handle is owned by the returned guard.
+    unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
+}
+
+fn owner_of(thread: &ThreadHandle) -> windows::core::Result<u32> {
+    #[cfg(test)]
+    forced(fault::Step::Owner)?;
+    // SAFETY: `thread` is a live handle with THREAD_QUERY_LIMITED_INFORMATION.
+    match unsafe { GetProcessIdOfThread(thread.0) } {
+        0 => Err(windows::core::Error::from_thread()),
+        pid => Ok(pid),
+    }
+}
+
+fn resume_thread(thread: &ThreadHandle) -> windows::core::Result<()> {
+    #[cfg(test)]
+    forced(fault::Step::Resume)?;
+    // ResumeThread returns the previous suspend count, or u32::MAX on failure.
+    // SAFETY: `thread` is a live handle with THREAD_SUSPEND_RESUME.
+    match unsafe { ResumeThread(thread.0) } {
+        u32::MAX => Err(windows::core::Error::from_thread()),
+        _ => Ok(()),
+    }
+}
+
+/// Walk one snapshot entry; `None` if the snapshot lists it under another pid. Ownership is then
+/// re-checked on the opened handle by [`resume_if_owned`].
+fn visit_thread_entry(
+    entry: &windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
+    process_pid: u32,
+    walk: &mut Walk,
+) -> Option<Visit> {
+    (entry.th32OwnerProcessID == process_pid).then(|| resume_if_owned(entry.th32ThreadID, process_pid, walk))
+}
+
+/// Resume thread `tid` only if it provably belongs to `process_pid`.
+///
+/// The Toolhelp snapshot is stale by the time the thread is opened: an id can be released and
+/// reused by another process, or released and not reused. So:
+/// 1. Open with query-only rights and KEEP the handle: it pins the thread, so the id cannot be
+///    reused while it is held. Read the owner through it. A thread's owner never changes.
+/// 2. Only for the child's own thread, open with suspend/resume rights (the pin guarantees it
+///    is the same thread), re-check the owner on that handle, and resume.
+///
+/// A stale id (reused, gone, or not openable by the child's creator) means the child's own thread
+/// with that id has exited, so nothing is left to resume: skipped, not an error. A failed call on
+/// the child's own thread is recorded in `last_err`.
+fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    let gone = windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0);
+    let denied = windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0);
+
+    let query = match open_query(tid) {
+        Ok(h) => h,
+        Err(e) if e.code() == gone => {
+            walk.skip(format!("thread {tid} no longer exists"));
+            return Visit::Gone;
+        }
+        Err(e) if e.code() == denied => {
+            walk.skip(format!(
+                "thread {tid} cannot be opened for query (access denied), so it is not the child's"
+            ));
+            return Visit::Denied;
+        }
+        Err(e) => return walk.fail("OpenThread(query)", tid, process_pid, e),
+    };
+
+    match owner_of(&query) {
+        Ok(owner) if owner == process_pid => {}
+        Ok(owner) => {
+            walk.skip(format!("thread {tid} now belongs to pid {owner}"));
+            return Visit::Foreign { owner };
+        }
+        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+    }
+
+    let resume = match open_for_resume(tid) {
+        Ok(h) => h,
+        Err(e) => return walk.fail("OpenThread(suspend/resume)", tid, process_pid, e),
+    };
+    match owner_of(&resume) {
+        Ok(again) if again == process_pid => {}
+        Ok(again) => {
+            return walk.fail(
+                "OpenThread(suspend/resume)",
+                tid,
+                process_pid,
+                format_args!("opened a thread of pid {again}, not the thread just checked"),
+            )
+        }
+        Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
+    }
+
+    match resume_thread(&resume) {
+        Ok(()) => {
+            walk.resumed += 1;
+            Visit::Resumed
+        }
+        Err(e) => walk.fail("ResumeThread", tid, process_pid, e),
+    }
+}
+
+/// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
+///
+/// `GetProcessId` answers 0 on failure, and a walk filtered to owner 0 would match the System
+/// Idle process instead of the child.
+fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
+    // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
+    let pid = unsafe { GetProcessId(raw_handle) };
+    if pid == 0 {
+        let cause = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "GetProcessId failed on the child's handle: {cause}"
+        )));
+    }
+    Ok(pid)
+}
+
+/// The error for a walk that resumed nothing, naming why every listed thread was skipped.
+fn none_resumed_error(process_pid: u32, last_skip: Option<&str>) -> io::Error {
+    match last_skip {
+        Some(reason) => io::Error::other(format!(
+            "no suspended threads resumed: every thread the snapshot listed for pid {process_pid} was stale (last: {reason})"
+        )),
+        None => io::Error::other(format!(
+            "no suspended threads resumed: the snapshot listed no threads for pid {process_pid}"
+        )),
+    }
+}
+
+/// The outcome of a finished walk. A failed resume is an error even when siblings resumed: a
+/// thread left suspended is exactly the "frozen process" `resume_initial_threads` exists to rule
+/// out, however many of its siblings got moving first.
+fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
+    let Walk {
+        resumed,
+        last_err,
+        last_skip,
+    } = walk;
+    if let Some(e) = last_err {
+        log::warn!(
+            "resume_initial_threads: failed to resume one or more of this child's initial threads \
+             ({resumed} resumed successfully before the failure): {e}"
+        );
+        return Err(e);
+    }
+    if resumed == 0 {
+        return Err(none_resumed_error(process_pid, last_skip.as_deref()));
+    }
+    Ok(())
+}
+
 /// Resume every suspended thread of the process at `proc_handle` after job assignment.
 ///
 /// Why resume REGARDLESS of job-assign result: the kill-group race invariant
@@ -981,13 +1278,17 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
 
     // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
     let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
-    let mut resumed = 0u32;
-    let mut last_err: Option<io::Error> = None;
+    let mut walk = Walk::default();
 
-    // SAFETY: snapshot/iterate/open/resume with owned handles, all closed before return.
+    let process_pid = process_pid_of(raw_handle);
+    debug_assert!(
+        process_pid.is_ok(),
+        "the caller must pass a live process handle: {process_pid:?}"
+    );
+    let process_pid = process_pid?;
+
+    // SAFETY: snapshot/iterate with an owned handle, closed before return.
     unsafe {
-        let process_pid = GetProcessId(raw_handle);
-
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
         let mut entry = THREADENTRY32 {
             dwSize: size_of::<THREADENTRY32>() as u32,
@@ -1005,39 +1306,24 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                     return Err(io::Error::from(e));
                 }
             }
-            if entry.th32OwnerProcessID == process_pid {
-                match OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
-                    Ok(thread) => {
-                        // ResumeThread returns the previous suspend count, or u32::MAX on failure.
-                        if ResumeThread(thread) == u32::MAX {
-                            last_err = Some(io::Error::last_os_error());
-                        } else {
-                            resumed += 1;
-                        }
-                        _ = CloseHandle(thread);
-                    }
-                    Err(e) => last_err = Some(io::Error::from(e)),
-                }
-            }
+            visit_thread_entry(&entry, process_pid, &mut walk);
             step = Thread32Next(snap, &mut entry);
         }
         _ = CloseHandle(snap);
     }
 
-    // That must hold even when SOME threads resumed successfully before another one failed, not
-    // only when every one did: a thread left suspended is exactly the "frozen process" this
-    // function exists to rule out, regardless of how many of its siblings got moving first.
-    if let Some(e) = last_err {
-        log::warn!(
-            "resume_initial_threads: failed to resume one or more of this child's initial threads \
-             ({resumed} resumed successfully before the failure): {e}"
-        );
-        return Err(e);
+    // Test-only: the injected entry goes through the same owner filter as a real one.
+    #[cfg(test)]
+    if let Some((tid, owner)) = fault::injected_entry() {
+        let entry = THREADENTRY32 {
+            th32OwnerProcessID: owner.unwrap_or(process_pid),
+            th32ThreadID: tid,
+            ..Default::default()
+        };
+        fault::record_injected_visit(visit_thread_entry(&entry, process_pid, &mut walk));
     }
-    if resumed == 0 {
-        return Err(io::Error::other("no suspended threads resumed"));
-    }
-    Ok(())
+
+    walk_verdict(process_pid, walk)
 }
 
 /// Assign the process at `proc_handle` to a `KILL_ON_JOB_CLOSE` job and resume its
