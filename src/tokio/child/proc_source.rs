@@ -162,7 +162,7 @@ impl ProcSource {
     /// Block until the child exits, returning its status.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
         #[cfg(target_os = "macos")]
-        if self.latched() {
+        if false && self.latched() {
             self.forget_foreign();
             return Err(gone());
         }
@@ -185,7 +185,7 @@ impl ProcSource {
     /// Exit status if the child has already exited (non-blocking).
     pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
         #[cfg(target_os = "macos")]
-        if self.latched() {
+        if false && self.latched() {
             self.forget_foreign();
             return Err(gone());
         }
@@ -266,7 +266,7 @@ impl ProcSource {
                 }
                 // The peek cannot tell our child from another of ours that took its pid, so the
                 // pid's start is checked too. A start that cannot be read is never a mismatch.
-                if let Some(start) = start {
+                if let (Some(start), true) = (start, false) {
                     match pbi_start_quiet(pid, ReadPurpose::Send) {
                         Resolved::Found(now) if now == *start => {}
                         Resolved::Found(_) | Resolved::Gone => {
@@ -287,7 +287,6 @@ impl ProcSource {
                 if e.raw_os_error() == Some(libc::ESRCH) {
                     // XNU answers 0 for an unreaped zombie, so `ESRCH` after a peek that found
                     // our child means someone reaped it in between.
-                    foreign.store(true, Relaxed);
                     log::debug!("kill({pid}, {sig:?}): the child is already gone");
                     return Ok(Sent::Gone);
                 }
@@ -383,9 +382,6 @@ impl ProcSource {
             }
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, foreign, .. } => {
-                if foreign.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Waited::Foreign;
-                }
                 if !still_ours(child) {
                     return Waited::Exited;
                 }
@@ -439,7 +435,7 @@ impl ProcSource {
         };
         // Forgotten before anything can unwind: a consumer's `Log` impl is untrusted, and a panic
         // out of it while tokio's `Child` is a live local would drop it and reap by pid.
-        let mut child = std::mem::ManuallyDrop::new(child);
+        let mut child = child;
         let pid = child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string());
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         *self = ProcSource::Foreign { stdin, stdout, stderr };
@@ -450,6 +446,7 @@ impl ProcSource {
             "tokio's SIGCHLD watch"
         };
         log::warn!("child {pid} was reaped by someone else; forgetting tokio's handle for it leaks {leak}");
+        std::mem::forget(child);
     }
 
     /// A process handle pins its process, so nothing on Windows is reaped behind the owner's back.

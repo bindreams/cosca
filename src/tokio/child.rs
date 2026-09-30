@@ -166,9 +166,7 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn wait_and_reap_blocking(&mut self) {
         let pid = self.id.pid();
-        if self.proc_mut().wait_and_reap(pid) == Waited::Foreign {
-            self.proc_mut().forget_foreign();
-        }
+        let _ = self.proc_mut().wait_and_reap(pid);
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -452,8 +450,6 @@ impl Child {
             Ok(Sent::Delivered) => Ok(()),
             Ok(Sent::Gone) => {
                 // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
-                #[cfg(unix)]
-                self.proc_mut().forget_if_foreign();
                 Ok(())
             }
         }
