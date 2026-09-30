@@ -10,9 +10,6 @@ jobs:
           - {runner: macos-latest, target: aarch64-apple-darwin, tag: arm64}
         variant: [m2-attachexc-no-exit-check]
         include:
-          - {variant: fix, n: 8, stress: 50}
-          - {variant: fix-widened, n: 4, stress: 10}
-          - {variant: m1-attachexc, n: 1, stress: 3}
           - {variant: m2-attachexc-no-exit-check, n: 1, stress: 3}
     name: ${{ matrix.arch.tag }}-${{ matrix.variant }}
     runs-on: ${{ matrix.arch.runner }}
