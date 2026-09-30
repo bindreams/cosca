@@ -53,7 +53,8 @@ fn label(report: Report) -> String {
 
 /// Reads reports, matching each against `pattern` as it arrives, until `pattern` is used up.
 /// `<report>*` matches any number of that report in a row: only a backoff whose rounds the
-/// kernel counts (`EBUSY` until a stop lands) is starred. Panics at the first mismatch.
+/// kernel counts (`EBUSY` until a stop lands) is starred, or a report that appears only if the
+/// helper's own check runs before the test's next byte. Panics at the first mismatch.
 fn expect(th: &mut TracerHelper<'_>, pattern: &[&str]) {
     debug_assert!(
         pattern.last().is_some_and(|last| !last.ends_with('*')),
@@ -462,10 +463,19 @@ fn names_ready(thread: &libc::proc_threadinfo) -> bool {
     std::ffi::CStr::from_bytes_until_nul(&name).is_ok_and(|name| name == super::UNSTARTED_READY)
 }
 
+/// Every thread of `pid`. No thread of this group's tracees exits while the test reads them.
+fn read_threads(pid: u32) -> Vec<libc::proc_threadinfo> {
+    sys::threads(pid)
+        .expect("list the tracee's threads")
+        .into_iter()
+        .map(|thread| thread.expect("no tracee thread exits while the test reads them"))
+        .collect()
+}
+
 /// Re-checks `pid`'s threads under a backoff until `done` holds for them.
 fn await_threads(pid: u32, done: impl Fn(&[libc::proc_threadinfo]) -> bool) {
     let mut backoff = std::time::Duration::from_millis(1);
-    while !done(&sys::threads(pid).expect("list the tracee's threads")) {
+    while !done(&read_threads(pid)) {
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
     }
@@ -496,6 +506,14 @@ fn a_stop_with_a_never_started_thread_settles() {
                 .iter()
                 .all(|thread| never_ran(thread) || parked.contains(&thread.pth_run_state))
     });
+    let threads = read_threads(pid);
+    assert!(
+        threads.iter().any(|thread| never_ran(thread)
+            && thread.pth_run_state == libc::TH_STATE_UNINTERRUPTIBLE
+            && thread.pth_flags & libc::TH_FLAGS_SWAPPED != 0),
+        "no never-started thread reads as uninterruptible with no kernel stack: the premise of \
+         the exemption under test"
+    );
     th.signal();
     expect(
         &mut th,

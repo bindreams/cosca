@@ -146,7 +146,8 @@ pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
     match threads_parked(pid) {
         Ok(true) => Ok(Stop::Stopped(info.si_status)),
         Ok(false) => Ok(Stop::Settling),
-        // Exiting, and so no longer stopped: its NOTE_EXIT follows.
+        // The process is gone from `proc_pidinfo` (a vanished thread reads as unsettled instead):
+        // exiting, and so no longer stopped. Its NOTE_EXIT follows.
         Err(libc::ESRCH) => Ok(Stop::Running),
         Err(e) => Err(e),
     }
@@ -172,15 +173,17 @@ fn threads_parked(pid: u32) -> Result<bool, i32> {
     Ok(all_parked(&threads(pid)?))
 }
 
-/// Whether every one of `threads` is [`parked`].
-fn all_parked(threads: &[libc::proc_threadinfo]) -> bool {
+/// Whether every one of `threads` is [`parked`]. A thread that exited between the listing and its
+/// read (`None`) leaves the verdict unsettled, so the caller peeks again under its backoff.
+fn all_parked(threads: &[Option<libc::proc_threadinfo>]) -> bool {
     threads
         .iter()
-        .all(|thread| parked(thread.pth_run_state, thread.pth_flags))
+        .all(|thread| thread.is_some_and(|thread| parked(thread.pth_run_state, thread.pth_flags)))
 }
 
-/// Every thread of `pid`, or the errno.
-pub(super) fn threads(pid: u32) -> Result<Vec<libc::proc_threadinfo>, i32> {
+/// Every thread of `pid`, `None` for one that exited between the listing and its read, or the
+/// errno.
+pub(super) fn threads(pid: u32) -> Result<Vec<Option<libc::proc_threadinfo>>, i32> {
     // SAFETY: `proc_taskinfo` is plain data; all-zero is a valid value.
     let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
     pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task)?;
@@ -198,10 +201,18 @@ pub(super) fn threads(pid: u32) -> Result<Vec<libc::proc_threadinfo>, i32> {
         .map(|&handle| {
             // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
             let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
-            pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
-            Ok(thread[0])
+            vanished_as_none(pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread).map(|_| thread[0]))
         })
         .collect()
+}
+
+/// One listed thread's read: `ESRCH` means that thread exited after the listing, not the process.
+fn vanished_as_none<T>(read: Result<T, i32>) -> Result<Option<T>, i32> {
+    match read {
+        Ok(thread) => Ok(Some(thread)),
+        Err(libc::ESRCH) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether a thread in `run_state` with `flags` (`pth_run_state`, `pth_flags`) waits
@@ -217,11 +228,15 @@ pub(super) fn threads(pid: u32) -> Result<Vec<libc::proc_threadinfo>, i32> {
 /// `thread_invoke`), while every wait in the stop's window keeps its stack
 /// (`thread_block(THREAD_CONTINUE_NULL)`). So a stackless uninterruptible thread counts as
 /// parked; without that, such a stop would never settle.
+///
+/// Panics on a run state that is no `TH_STATE_*`: `retrieve_thread_basic_info` sets one under
+/// `thread_lock` for every thread.
 fn parked(run_state: i32, flags: i32) -> bool {
     match run_state {
         libc::TH_STATE_RUNNING => false,
         libc::TH_STATE_UNINTERRUPTIBLE => flags & libc::TH_FLAGS_SWAPPED != 0,
-        _ => true,
+        libc::TH_STATE_WAITING | libc::TH_STATE_STOPPED | libc::TH_STATE_HALTED => true,
+        other => panic!("pth_run_state {other} is no TH_STATE_*"),
     }
 }
 
