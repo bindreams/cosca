@@ -12,7 +12,7 @@
 //! there, so a wrong path fails an assertion instead of hanging.
 //!
 //! **Settling.** The helper acts on a stop only once it has settled, every tracee thread neither
-//! running nor in an uninterruptible wait: see [`sys::stop`].
+//! running nor in an uninterruptible wait, unless it has never started: see [`sys::stop`].
 //!
 //! **Signals.** The tracee's stops are passed on as a debugger does. XNU discards a stop signal
 //! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`

@@ -11,19 +11,19 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 
-use super::{sys, Cause, Mode, Report, TracerHelper, Until};
+use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
 
 /// The tracee and its stdin, or `None` with the `TRACER` group turned off.
 fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
-    tracee_with(false)
+    tracee_with(Tracee::Plain)
 }
 
-/// [`tracee`], catching `SIGTERM` if `catch_sigterm` (see [`super::spawn_tracee`]).
-fn tracee_with(catch_sigterm: bool) -> Option<(crate::Child, std::io::PipeWriter)> {
+/// [`tracee`] of `kind` (see [`super::spawn_tracee`]).
+fn tracee_with(kind: Tracee) -> Option<(crate::Child, std::io::PipeWriter)> {
     if !crate::test_support::require_group("TRACER") {
         return None;
     }
-    let mut child = super::spawn_tracee(catch_sigterm);
+    let mut child = super::spawn_tracee(kind);
     let stdin = child.stdin().expect("the tracee's stdin is piped");
     Some((child, stdin))
 }
@@ -451,6 +451,63 @@ fn s1h_a_lone_sigchld_reads_as_the_timeout() {
     assert_sigkilled(tracee);
 }
 
+/// Whether `thread` has never run: no CPU time at all.
+fn never_ran(thread: &libc::proc_threadinfo) -> bool {
+    thread.pth_user_time == 0 && thread.pth_system_time == 0
+}
+
+/// Whether `thread` is the one a [`Tracee::UnstartedThread`] tracee names once ready.
+fn names_ready(thread: &libc::proc_threadinfo) -> bool {
+    let name = thread.pth_name.map(|c| c as u8);
+    std::ffi::CStr::from_bytes_until_nul(&name).is_ok_and(|name| name == super::UNSTARTED_READY)
+}
+
+/// Re-checks `pid`'s threads under a backoff until `done` holds for them.
+fn await_threads(pid: u32, done: impl Fn(&[libc::proc_threadinfo]) -> bool) {
+    let mut backoff = std::time::Duration::from_millis(1);
+    while !done(&sys::threads(pid).expect("list the tracee's threads")) {
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A tracee holding a thread it created but never started, which XNU reports as
+/// `TH_STATE_UNINTERRUPTIBLE` with no kernel stack (measured on CI, with a thread caught inside
+/// `pthread_create` by a stop too). The test waits until the tracee is ready, and after the
+/// attach until its stop has settled around that thread (`SSTOP`, and every thread that ever
+/// ran in an interruptible wait or suspended), then ends the hold, so S2's first peek comes
+/// after it.
+/// Mutant: no exemption for an uninterruptible thread without a kernel stack, so S2 backs off
+/// instead of releasing the tracee.
+#[test]
+fn a_stop_with_a_never_started_thread_settles() {
+    let Some((mut tracee, stdin)) = tracee_with(Tracee::UnstartedThread) else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    await_threads(pid, |threads| threads.iter().any(names_ready));
+    let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
+    expect(&mut th, &["S0", "S1", "S1h"]);
+    let parked = [libc::TH_STATE_WAITING, libc::TH_STATE_STOPPED];
+    await_threads(pid, |threads| {
+        sys::pbi_status(pid) == Ok(libc::SSTOP)
+            && threads.iter().any(never_ran)
+            && threads
+                .iter()
+                .all(|thread| never_ran(thread) || parked.contains(&thread.pth_run_state))
+    });
+    th.signal();
+    expect(
+        &mut th,
+        &["S1hs*", "blocking S1h eof*", "S2", "attached", "S3", "blocking S3 eof"],
+    );
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    assert_handed_back(pid);
+    drop(th);
+    assert_exited_cleanly(tracee);
+}
+
 // S2 ===========================================================================================
 
 /// Holds the tracee, then releases it into S2 under `force` (which must hold `S1:hold`).
@@ -505,7 +562,7 @@ fn s2_backs_off_before_the_release(force: &str) {
 /// `SIGTERM`. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
 #[test]
 fn s2_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee_with(true) else {
+    let Some((mut tracee, stdin)) = tracee_with(Tracee::CatchSigterm) else {
         return;
     };
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM");
