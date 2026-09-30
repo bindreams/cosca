@@ -144,9 +144,10 @@ pub enum Error {
     ///
     /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
     /// program can run. It first calls `pidfd_open` on its own process: a refusal is this
-    /// variant with `op` `spawn`, and no child was forked. The child is then held before `exec`
-    /// until the parent has opened its pidfd; if that fails the child never runs the program and
-    /// the failure is this variant (a refusal) or [`Error::Io`] (a transient failure).
+    /// variant with `op` `spawn`, and no child was forked. The child then opens a pidfd on itself
+    /// before `exec` and sends it to the parent; if its `pidfd_open` fails the child never runs
+    /// the program and the failure is this variant (a refusal) or [`Error::Io`] (a transient
+    /// failure).
     ///
     /// A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
     /// for a non-leader thread) is not an error: the operation reports it as exited.

@@ -339,7 +339,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
         #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-        let held = handshake.run(|| std_cmd.spawn(), |c| Some(c.id()))?;
+        let held = handshake.run(|| std_cmd.spawn())?;
         (prepared, held.child, held.pidfd)
     };
     #[cfg(windows)]
@@ -375,12 +375,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         use std::os::windows::io::AsRawHandle;
         child.as_raw_handle()
     };
-    // Linux tears down through the pidfd the handshake opened: nothing there kills or reaps by pid.
+    // Linux tears down through the pidfd the child sent: nothing there kills or reaps by pid.
     #[cfg(target_os = "linux")]
-    let child = PidfdChild {
+    let child = HeldStdChild {
+        through: PidfdChild::new(Some(child.id()), pidfd),
         child,
-        pidfd,
-        reaped: None,
     };
     let attachment = match attach_or_fault(
         child.id(),
@@ -414,7 +413,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     // The pidfd is already held, so adopting cannot fail.
     #[cfg(target_os = "linux")]
-    let shared = SharedChild::adopt_opened(child.child, id, child.pidfd);
+    let shared = SharedChild::adopt_opened(child.child, id, child.through.pidfd);
     #[cfg(not(target_os = "linux"))]
     let shared = match SharedChild::adopt(child, id) {
         Ok(shared) => shared,
@@ -1030,22 +1029,27 @@ pub(crate) fn attach_or_fault(
 /// A spawned child that an error path abandons before adoption, killed and reaped by
 /// [`teardown_unadopted`].
 trait Unadopted: Send + 'static {
-    fn id(&self) -> u32;
+    /// Its pid, for logs; `None` where the spawn that failed never handed the child back.
+    fn pid(&self) -> Option<u32>;
     /// `Ok` for a child that has already exited.
     fn kill(&mut self) -> std::io::Result<()>;
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     /// Blocks until the child exits, and reaps it.
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
-    /// Nothing is left to kill or reap: the child was gone when its pidfd was to be opened.
-    fn already_gone(&self) -> bool {
-        false
+}
+
+/// `pid {pid}`, or what stands for an unknown one.
+fn named(pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => format!("pid {pid}"),
+        None => "the spawned child (pid unknown)".to_string(),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 impl Unadopted for std::process::Child {
-    fn id(&self) -> u32 {
-        std::process::Child::id(self)
+    fn pid(&self) -> Option<u32> {
+        Some(std::process::Child::id(self))
     }
     fn kill(&mut self) -> std::io::Result<()> {
         std::process::Child::kill(self)
@@ -1058,38 +1062,40 @@ impl Unadopted for std::process::Child {
     }
 }
 
-/// A Linux child and the pidfd opened while it was held before `exec`. Kills and reaps through
-/// the pidfd, never by pid. `pidfd` is `None` only for a child already gone at the handshake.
+/// A Linux child, by the pidfd it sent while it was held before `exec`. Kills and reaps through
+/// the pidfd, never by pid.
 #[cfg(target_os = "linux")]
 struct PidfdChild {
-    child: std::process::Child,
-    pidfd: Option<std::os::fd::OwnedFd>,
+    pid: Option<u32>,
+    pidfd: std::os::fd::OwnedFd,
     /// Kept once reaped, as std keeps it: a later `try_wait` or `wait` answers it, not `ECHILD`.
     reaped: Option<std::process::ExitStatus>,
 }
 
 #[cfg(target_os = "linux")]
 impl PidfdChild {
-    fn target(&self) -> std::io::Result<crate::wait::exit_only::Target<'_>> {
-        use std::os::fd::AsFd;
-        match &self.pidfd {
-            Some(pidfd) => Ok(crate::wait::exit_only::Target::PidFd(pidfd.as_fd())),
-            None => Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
+    fn new(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) -> PidfdChild {
+        PidfdChild {
+            pid,
+            pidfd,
+            reaped: None,
         }
+    }
+
+    fn target(&self) -> crate::wait::exit_only::Target<'_> {
+        use std::os::fd::AsFd;
+        crate::wait::exit_only::Target::PidFd(self.pidfd.as_fd())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Unadopted for PidfdChild {
-    fn id(&self) -> u32 {
-        self.child.id()
+    fn pid(&self) -> Option<u32> {
+        self.pid
     }
     fn kill(&mut self) -> std::io::Result<()> {
-        let Some(pidfd) = &self.pidfd else {
-            return Ok(());
-        };
         // A zombie takes the signal too, so an exited child is `Ok`; `ESRCH` is reaped elsewhere.
-        match rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL) {
+        match rustix::process::pidfd_send_signal(&self.pidfd, rustix::process::Signal::KILL) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -1099,7 +1105,7 @@ impl Unadopted for PidfdChild {
         if self.reaped.is_some() {
             return Ok(self.reaped);
         }
-        match try_reap(&self.target()?)? {
+        match try_reap(&self.target())? {
             Reap::Reaped(Reaped::Status(status)) => {
                 self.reaped = Some(status);
                 Ok(Some(status))
@@ -1117,7 +1123,7 @@ impl Unadopted for PidfdChild {
         if let Some(status) = self.reaped {
             return Ok(status);
         }
-        match reap_blocking(&self.target()?)? {
+        match reap_blocking(&self.target())? {
             Ok(Reaped::Status(status)) => {
                 self.reaped = Some(status);
                 Ok(status)
@@ -1129,9 +1135,63 @@ impl Unadopted for PidfdChild {
             Err(_) => Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
         }
     }
-    fn already_gone(&self) -> bool {
-        self.pidfd.is_none()
+}
+
+/// A sync spawn's Linux child before adoption: std's handle, and the pidfd it is torn down through.
+#[cfg(target_os = "linux")]
+struct HeldStdChild {
+    child: std::process::Child,
+    through: PidfdChild,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldStdChild {
+    fn id(&self) -> u32 {
+        self.child.id()
     }
+}
+
+#[cfg(target_os = "linux")]
+impl Unadopted for HeldStdChild {
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.through.kill()
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.through.try_wait()
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.through.wait()
+    }
+}
+
+/// Kill and reap, through `pidfd`, the child of a spawn that failed after its fork, unless it is
+/// already collected: std reaps the child of a spawn it fails; tokio can fail a spawn after std's
+/// succeeded, and drops the child neither killed nor reaped.
+#[cfg(target_os = "linux")]
+pub(super) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
+    use crate::wait::exit_only::{peek, Peek};
+
+    let child = PidfdChild::new(pid, pidfd);
+    match peek(&child.target()) {
+        Ok(Peek::Foreign(_)) => {
+            log::debug!("{}: already collected when its spawn failed", named(pid));
+            return;
+        }
+        Ok(Peek::Exit(_) | Peek::Running) => {}
+        // `waitid` on a pidfd of this process's own child answers or says `ECHILD`.
+        Err(e) => {
+            log::warn!(
+                "{}: its spawn failed, and its pidfd could not be waited on ({e}); it is left as it is",
+                named(pid)
+            );
+            debug_assert!(false, "waitid on a spawned child's pidfd failed: {e}");
+            return;
+        }
+    }
+    teardown_unadopted(child);
 }
 
 /// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
@@ -1143,15 +1203,12 @@ impl Unadopted for PidfdChild {
 /// which reaps it whenever it does, so it never lingers as a zombie. EPERM is the one kill failure
 /// that is not asserted, because it is reachable without any bug.
 fn teardown_unadopted(mut child: impl Unadopted) {
-    if child.already_gone() {
-        return;
-    }
     // warn before any assert: `debug_assert` is compiled out in release, and a swallowed failure
     // would otherwise leave no trace at all there.
     if let Err(kill) = kill_unadopted(&mut child) {
         log::warn!(
-            "spawn teardown failed to kill pid {}: {kill}; reaping it in the background once it exits",
-            child.id()
+            "spawn teardown failed to kill {}: {kill}; reaping it in the background once it exits",
+            named(child.pid())
         );
         if !matches!(child.try_wait(), Ok(Some(_))) {
             reap_in_background(child);
@@ -1165,9 +1222,17 @@ fn teardown_unadopted(mut child: impl Unadopted) {
     }
     #[cfg(test)]
     fault::run_between_kill_and_wait();
-    if let Err(reap) = reap_unadopted(&mut child) {
-        log::warn!("spawn teardown failed to reap pid {}: {reap}", child.id());
-        debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
+    match reap_unadopted(&mut child) {
+        Ok(_) => {}
+        // Reaped by someone else: a handled case, not a contract violation.
+        #[cfg(unix)]
+        Err(reap) if reap.raw_os_error() == Some(libc::ECHILD) => {
+            log::debug!("spawn teardown: {} was reaped by someone else", named(child.pid()));
+        }
+        Err(reap) => {
+            log::warn!("spawn teardown failed to reap {}: {reap}", named(child.pid()));
+            debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
+        }
     }
 }
 
@@ -1176,21 +1241,24 @@ fn teardown_unadopted(mut child: impl Unadopted) {
 fn reap_in_background(mut child: impl Unadopted) {
     #[cfg(test)]
     let notify = fault::take_background_reap_notifier();
-    let pid = child.id();
-    let spawned = std::thread::Builder::new()
-        .name(format!("cosca-reap-{pid}"))
-        .spawn(move || {
-            let reaped = child.wait().map(drop);
-            if let Err(e) = &reaped {
-                log::warn!("background reap of pid {pid} failed: {e}");
-            }
-            #[cfg(test)]
-            if let Some(notify) = notify {
-                _ = notify.send(reaped);
-            }
-        });
+    let name = child
+        .pid()
+        .map_or_else(|| "cosca-reap".to_string(), |pid| format!("cosca-reap-{pid}"));
+    let pid = named(child.pid());
+    let reaper_pid = pid.clone();
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        let pid = reaper_pid;
+        let reaped = child.wait().map(drop);
+        if let Err(e) = &reaped {
+            log::warn!("background reap of {pid} failed: {e}");
+        }
+        #[cfg(test)]
+        if let Some(notify) = notify {
+            _ = notify.send(reaped);
+        }
+    });
     if let Err(e) = spawned {
-        log::warn!("could not start a thread to reap pid {pid}, which stays unreaped: {e}");
+        log::warn!("could not start a thread to reap {pid}, which stays unreaped: {e}");
     }
 }
 
@@ -1240,7 +1308,8 @@ fn reap_unadopted(child: &mut impl Unadopted) -> std::io::Result<std::process::E
     let forced = fault::take_force_reap_failure();
     let status = child.wait()?;
     #[cfg(test)]
-    fault::record_teardown_reap(child.id(), status);
+    // An unknown pid records as 0.
+    fault::record_teardown_reap(child.pid().unwrap_or(0), status);
     #[cfg(test)]
     if let Some(marker) = forced {
         return Err(std::io::Error::other(marker));

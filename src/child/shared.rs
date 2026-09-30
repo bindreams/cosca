@@ -221,19 +221,14 @@ impl SharedChild {
         })
     }
 
-    /// [`adopt`](Self::adopt) for a Linux child whose pidfd the spawn handshake already opened,
-    /// while the child was held before `exec`. Infallible: nothing is left to open. `pidfd` is
-    /// `None` only when the child was already gone at the handshake.
+    /// [`adopt`](Self::adopt) for a Linux child that sent its pidfd to the spawn handshake while
+    /// it was held before `exec`. Infallible: nothing is left to open.
     #[cfg(target_os = "linux")]
-    pub(crate) fn adopt_opened(
-        child: std::process::Child,
-        id: ProcessId,
-        pidfd: Option<std::os::fd::OwnedFd>,
-    ) -> SharedChild {
+    pub(crate) fn adopt_opened(child: std::process::Child, id: ProcessId, pidfd: std::os::fd::OwnedFd) -> SharedChild {
         debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
         SharedChild {
             id,
-            pidfd,
+            pidfd: Some(pidfd),
             inner: Mutex::new(Inner {
                 child,
                 state: State::N,

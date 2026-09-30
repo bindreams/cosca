@@ -338,7 +338,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // also spans the pidfd handshake's channel, from its creation to its helper's join.
         let _guard = crate::child::spawn::spawn_lock();
 
-        // Linux: the child is held before `exec` until the parent has opened its pidfd; the
+        // Linux: the child is held before `exec` until the parent holds the pidfd it sent; the
         // pidfd itself is dropped here, as tokio's child has no place for it. Its hook was
         // registered first of all, so `fd_map`'s, which may `dup2` a mapping onto the channel's
         // descriptor number, runs after it is done.
@@ -374,7 +374,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-                let held = handshake.run(|| tcmd.spawn(), |c| c.id());
+                let held = handshake.run(|| tcmd.spawn());
                 held.map(|held| held.child)
             };
             #[cfg(not(target_os = "linux"))]
@@ -494,6 +494,34 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),
     })
+}
+
+/// tokio reaps its child by pid, on drop or from its orphan queue; the handshake leaves that reap to
+/// it, and only makes it happen while the number is still the child's.
+#[cfg(target_os = "linux")]
+impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
+    fn pid(&self) -> Option<u32> {
+        self.id()
+    }
+
+    /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
+    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) {
+        crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
+        match self.try_wait() {
+            Ok(Some(_)) => {}
+            // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
+            Ok(None) => log::debug!("pid {:?}: held by a tracer; left to tokio's reaper", self.id()),
+            Err(e) => log::debug!("pid {:?}: already reaped by someone else ({e})", self.id()),
+        }
+    }
+
+    /// tokio reaps it, on drop or from its orphan queue.
+    fn abandon_unreported(self) {
+        log::debug!(
+            "pid {:?} died before it sent its pidfd; left to tokio's reaper",
+            self.id()
+        );
+    }
 }
 
 #[cfg(windows)]

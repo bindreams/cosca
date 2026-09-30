@@ -7,7 +7,7 @@ use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
 
-use crate::child::spawn::pidfd_handshake::fault;
+use crate::child::spawn::pidfd_handshake::fault::{self, ChildFault};
 use crate::error::Error;
 use crate::stdio::Stdio;
 use crate::tokio::Command;
@@ -47,9 +47,9 @@ async fn a_refused_probe_fails_unsupported_and_forks_nothing() {
     }
 }
 
-/// Mutants: the hook does not wait for the verdict; the parent says "go" on failure.
+/// Mutants: the child execs despite its failed `pidfd_open`; the parent ignores its errno report.
 #[tokio::test]
-async fn emfile_after_the_fork_fails_io_and_the_program_never_runs() {
+async fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
     fault::reset_leaked_pid();
@@ -74,4 +74,28 @@ async fn a_normal_spawn_runs_the_program() {
     assert_eq!(fault::spawns(), 1);
     assert!(child.wait().await.expect("wait").success());
     assert!(program_ran(cmd, reader));
+}
+
+/// A child that sent its pidfd and died before it could be told to go never ran the program: the
+/// spawn fails, and tokio reaps the child once the pidfd shows it exited.
+///
+/// Mutant: `Gone` is a successful spawn.
+#[tokio::test]
+async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
+    let (mut cmd, reader) = marker_command();
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns(|_| {});
+    let err = cmd.spawn().err();
+    drop(held);
+    drop(armed);
+
+    let err = err.expect("a child that never ran the program must fail the spawn");
+    assert!(
+        err.to_string().ends_with("died before exec: the program never ran"),
+        "{err}"
+    );
+    crate::child::spawn::pidfd_handshake::pidfd_handshake_tests::assert_no_child_of_this_thread(
+        "tokio reaped the child",
+    );
+    assert!(!program_ran(cmd, reader));
 }

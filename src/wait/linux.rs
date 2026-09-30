@@ -115,7 +115,7 @@ fn pidfd_open_unsupported(op: PidfdOp, errno_name: &str) -> Error {
 }
 
 /// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.
-fn spawn_open_error(errno: rustix::io::Errno) -> Error {
+pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
     match refusal_name(errno) {
         Some(name) => pidfd_open_unsupported(PidfdOp::Spawn, name),
         None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
@@ -136,22 +136,11 @@ pub(crate) fn probe_pidfd_support() -> Result<(), Error> {
         .map_err(spawn_open_error)
 }
 
-/// The next scripted `pidfd_open` outcome on THIS thread, for a caller that opens on another
-/// thread. See [`fault::force_pidfd_open_script`].
+/// The next scripted `pidfd_open` outcome on THIS thread, for a `pidfd_open` made elsewhere: the
+/// spawn handshake's is made by the child. See [`fault::force_pidfd_open_script`].
 #[cfg(test)]
 pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
     fault::take_forced_pidfd_open_errno()
-}
-
-/// `pidfd_open` for `raw`, unless `scripted` is an errno; pairs with [`take_scripted_pidfd_open`].
-pub(crate) fn pidfd_open_or(
-    raw: Pid,
-    scripted: Option<rustix::io::Errno>,
-) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    match scripted {
-        Some(errno) => Err(errno),
-        None => pidfd_open(raw, PidfdFlags::empty()),
-    }
 }
 
 /// Open a pidfd for `pid`, a child this process spawned, and confirm it names that child.
@@ -173,17 +162,6 @@ pub(crate) fn pidfd_open_or(
 ///   even if its start time matched.
 #[cfg(test)]
 pub(crate) fn open_own_child(pid: u32, id: Option<ProcessId>) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    open_own_child_via(pid, id, pidfd_open_checked)
-}
-
-/// [`open_own_child`], opening the pidfd with `open`. The spawn handshake opens on a helper
-/// thread, where the thread-local test seam behind `pidfd_open_checked` cannot reach, so it
-/// passes the outcome it took on the spawning thread.
-pub(crate) fn open_own_child_via(
-    pid: u32,
-    id: Option<ProcessId>,
-    open: impl FnOnce(Pid) -> Result<rustix::fd::OwnedFd, rustix::io::Errno>,
-) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
     debug_assert!(
@@ -191,7 +169,7 @@ pub(crate) fn open_own_child_via(
         "pid {pid} exceeds i32::MAX; pidfd cast would truncate"
     );
     let raw = Pid::from_raw(pid as i32).expect("a spawned child's pid is never 0");
-    let pidfd = match open(raw) {
+    let pidfd = match pidfd_open_checked(raw) {
         Ok(pidfd) => pidfd,
         Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => return Ok(None),
         Err(e) => return Err(spawn_open_error(e)),
