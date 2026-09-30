@@ -373,7 +373,9 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
     Ok((edges, denied, sample))
 }
 
-/// [`Error::Unassessable`] naming the `proc_listallpids` failure when no pid list can be taken.
+/// [`Error::Unassessable`] naming the `proc_listallpids` failure when no pid list can be taken,
+/// or the count and a sample of the pids denied a ppid read: each leaves its subtree out of the
+/// edges, and a walk over them would skip it. [`snapshot`] applies its own policy to the same denial.
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     let raw = try_all_pids().map_err(|e| {
         let detail = format!("the process snapshot could not be taken: proc_listallpids failed ({e})");
@@ -391,7 +393,15 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
             source: Some(e),
         }
     })?;
-    log_denied(denied, raw.len(), &sample);
+    if denied > 0 {
+        let detail = format!(
+            "the process snapshot could not be taken: {denied} of {} pids denied a ppid read, so their \
+             subtrees are missing from it; sample: {sample:?}",
+            raw.len()
+        );
+        log::warn!("enumerate::process_parents: {detail}");
+        return Err(Error::Unassessable { detail, source: None });
+    }
     Ok(edges)
 }
 

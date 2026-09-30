@@ -43,12 +43,17 @@ fn signal_probe(pid: RawPid) -> SignalProbe {
 /// else `Unknown` unless `kill(pid, 0)` says the pid is gone: an outer namespace's `/proc/<pid>`
 /// names another process, so what it says is no answer about `pid`.
 fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
-    match proc_view::proc_view() {
-        ProcView::Same(dir) => read_stat_in(&dir, pid),
-        ProcView::Diverged => resolve_unreadable(pid, proc_view::DIVERGED_REASON),
-        ProcView::Unassessable(why) => {
-            resolve_unreadable(pid, format_args!("the /proc view could not be established: {why}"))
-        }
+    read_stat_explained(pid).0
+}
+
+/// [`read_stat`], and the unusable view that made it `Unknown`, when one did.
+fn read_stat_explained(pid: RawPid) -> (Resolved<Vec<u8>>, Option<proc_view::ViewUnreadable>) {
+    match proc_view::proc_view().into_dir() {
+        Ok(dir) => (read_stat_in(&dir, pid), None),
+        Err(why) => (
+            resolve_unreadable(pid, format_args!("the /proc view could not be established: {why}")),
+            Some(why),
+        ),
     }
 }
 
@@ -94,6 +99,12 @@ pub(super) fn signal_says_no_such_process(pid: RawPid) -> bool {
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
     start_token_from(pid, read_stat(pid))
+}
+
+/// [`start_token`], and the unusable `/proc` view behind an `Unknown`, when that is why.
+pub(super) fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, Option<proc_view::ViewUnreadable>) {
+    let (stat, cause) = read_stat_explained(pid);
+    (start_token_from(pid, stat), cause)
 }
 
 /// [`start_token`], read through the `/proc` at `proc_dir`.
@@ -169,15 +180,16 @@ fn read_self_stat() -> std::io::Result<Vec<u8>> {
 /// Without `openat2` it is [`Error::Unsupported`] naming that; otherwise
 /// [`Error::Unassessable`] carrying the view's reason.
 pub(crate) fn unknown_identity_error(subject: &str) -> Option<Error> {
-    let why = match proc_view::proc_view() {
-        ProcView::Same(_) => return None,
-        ProcView::Diverged => return Some(unassessable_view(subject, proc_view::DIVERGED_REASON, None)),
-        ProcView::Unassessable(why) => why,
-    };
-    Some(
-        why.unsupported(format!("identifying {subject}"))
-            .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source)),
-    )
+    proc_view::proc_view()
+        .into_dir()
+        .err()
+        .map(|why| view_error(subject, why))
+}
+
+/// The error for a by-pid identity read of `subject` that `why` (an unusable view) made `Unknown`.
+pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error {
+    why.unsupported(format!("identifying {subject}"))
+        .unwrap_or_else(|| unassessable_view(subject, &why.reason, why.source))
 }
 
 fn unassessable_view(subject: &str, reason: &str, source: Option<std::io::Error>) -> Error {

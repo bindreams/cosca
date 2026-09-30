@@ -449,6 +449,11 @@ impl Child {
     /// (errors `Unsupported` otherwise — use [`kill`](Child::kill) for a lone process).
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
+    /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
+    /// process table could not be read or trusted, so the descendants could not be found: NOTHING
+    /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
+    /// kills the root and logs that descendants may be orphaned.)
+    ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
@@ -489,6 +494,11 @@ impl Child {
             self.id.pid()
         );
         let group_result = self.os.attached.hard_kill();
+        // A TreeWalk that could not walk killed nothing, and the root's death would strand the
+        // descendants beyond a retry: return the error with the tree intact.
+        if self.os.attached.hard_kill_refused_to_walk(&group_result) {
+            return group_result;
+        }
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
         // covers that, so its failure is contract-relevant.
@@ -798,6 +808,10 @@ impl Drop for Child {
         if let Err(e) = &tree {
             // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            if self.os.attached.hard_kill_refused_to_walk(&tree) {
+                // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+                log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+            }
         }
         _ = tree;
 
