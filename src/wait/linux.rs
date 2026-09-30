@@ -9,7 +9,6 @@
 //! the checked `/proc` view cannot be built, and `open_verified` is `Unsupported` naming `openat2`.
 
 use std::os::fd::AsFd;
-
 use std::time::Instant;
 
 use rustix::event::{poll, PollFd, PollFlags};

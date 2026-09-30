@@ -12,9 +12,8 @@
 //!
 //! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
 //!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
-//!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not enforce this yet: it
-//!   returns `Io` for the errnos only a filter produces (`EPERM`, `EACCES`, `ENODEV`) and does not
-//!   require a pidfd at spawn ([#341](https://github.com/bindreams/cosca/issues/341)).
+//!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not require a pidfd
+//!   at spawn yet ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
 //!   leaf reaps that way; an owned child's waits and reaps still go by pid
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
