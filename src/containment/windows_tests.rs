@@ -477,6 +477,7 @@ struct SuspendedHelper {
     process: windows::Win32::Foundation::HANDLE,
     thread: windows::Win32::Foundation::HANDLE,
     tid: u32,
+    pid: u32,
 }
 
 impl SuspendedHelper {
@@ -511,6 +512,7 @@ impl SuspendedHelper {
             process: pi.hProcess,
             thread: pi.hThread,
             tid: pi.dwThreadId,
+            pid: pi.dwProcessId,
         }
     }
 }
@@ -528,30 +530,59 @@ impl Drop for SuspendedHelper {
     }
 }
 
-/// A thread id the snapshot lists under the child (owner = the child's pid) but that belongs to
-/// another process (a reused id) must not be resumed, and must not fail the spawn. The helper's main thread has suspend count 1; suspending it again
-/// returns the previous count, so 1 proves nothing resumed it and 0 proves something did.
-#[test]
-fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
-    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
-
-    let helper = SuspendedHelper::new();
-    let injected = crate::containment::windows::fault::inject_snapshot_tid(helper.tid);
+/// Spawn a contained blocker with `tid` injected into the snapshot walk as an entry of the
+/// child. Returns the spawn result and what the walk did with the entry.
+fn spawn_with_injected_tid(
+    tid: u32,
+) -> (
+    Result<crate::Child, crate::error::Error>,
+    Option<Option<crate::containment::windows::Visit>>,
+) {
+    let injected = crate::containment::windows::fault::inject_snapshot_tid(tid);
     let mut cmd = crate::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::null()).expect("set stdout");
     cmd.contain();
     let spawned = cmd.spawn();
+    let visit = crate::containment::windows::fault::take_injected_visit();
     drop(injected);
-    // A stale entry is skipped, never an error: it must not fail the spawn.
+    (spawned, visit)
+}
+
+fn finish_child(spawned: Result<crate::Child, crate::error::Error>) {
+    let mut child = spawned.expect("a stale snapshot entry must not fail the spawn");
+    assert_eq!(
+        child.containment(),
+        crate::Containment::JobObject,
+        "the walk under test only runs for a Job Object spawn"
+    );
+    drop(child.stdin().expect("piped stdin"));
+    child.wait().expect("wait for the contained child");
+}
+
+/// A thread id the snapshot lists under the child (owner = the child's pid) but that belongs to
+/// another process (a reused id) must not be resumed, and must not fail the spawn. The helper's
+/// main thread has suspend count 1; suspending it again returns the previous count, so 1 proves
+/// nothing resumed it and 0 proves something did. The recorded visit proves the entry was walked
+/// and identified as the helper's, rather than never reached.
+#[test]
+fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
+    use crate::containment::windows::Visit;
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let helper = SuspendedHelper::new();
+    let (spawned, visit) = spawn_with_injected_tid(helper.tid);
     assert!(
         spawned.is_ok(),
         "a snapshot entry for another process's thread must not fail the spawn: {:?}",
         spawned.as_ref().err()
     );
-    let mut child = spawned.expect("checked above");
-    let stdin = child.stdin().expect("piped stdin");
+    assert_eq!(
+        visit,
+        Some(Some(Visit::Foreign { owner: helper.pid })),
+        "the injected entry must be walked and identified as the helper's"
+    );
 
     // SAFETY: `helper.thread` is a live thread handle with suspend rights.
     let previous = unsafe { SuspendThread(helper.thread) };
@@ -562,6 +593,51 @@ fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
     // SAFETY: as above; restore the count this test added.
     unsafe { ResumeThread(helper.thread) };
 
-    drop(stdin);
-    child.wait().expect("wait for the contained child");
+    finish_child(spawned);
+}
+
+/// A listed thread that exited and whose id was not reused makes `OpenThread` fail with
+/// `ERROR_INVALID_PARAMETER`. That is as stale as a reused id and must not fail the spawn. Id 1
+/// is not a multiple of 4, so no thread ever has it: the outcome cannot depend on id reuse.
+#[test]
+fn windows_resume_initial_threads_skips_a_thread_id_that_no_longer_exists() {
+    use crate::containment::windows::Visit;
+
+    let (spawned, visit) = spawn_with_injected_tid(1);
+    assert!(
+        spawned.is_ok(),
+        "a snapshot entry for a nonexistent thread must not fail the spawn: {:?}",
+        spawned.as_ref().err()
+    );
+    assert_eq!(
+        visit,
+        Some(Some(Visit::Gone)),
+        "the entry must be walked and found gone"
+    );
+    finish_child(spawned);
+}
+
+/// `GetProcessId` answers 0 for a handle that is not a process; that must be an error naming the
+/// call, not a walk that matches the System Idle process.
+#[test]
+fn process_pid_of_rejects_a_handle_that_names_no_process() {
+    let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default())
+        .expect_err("a null handle names no process");
+    assert!(
+        err.to_string().contains("GetProcessId"),
+        "error must name the call: {err}"
+    );
+}
+
+/// When every listed thread was stale the spawn fails, and the error says why.
+#[test]
+fn none_resumed_error_names_the_last_skip_reason() {
+    let err = super::none_resumed_error(4321, Some("thread 8 no longer exists"));
+    let text = err.to_string();
+    assert!(
+        text.contains("4321") && text.contains("thread 8 no longer exists"),
+        "{text}"
+    );
+    let text = super::none_resumed_error(4321, None).to_string();
+    assert!(text.contains("listed no threads"), "{text}");
 }

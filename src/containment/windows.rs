@@ -549,25 +549,36 @@ pub(crate) mod fault {
 
     thread_local! {
         static INJECTED_SNAPSHOT_TID: Cell<Option<u32>> = const { Cell::new(None) };
+        static INJECTED_VISIT: Cell<Option<Option<super::Visit>>> = const { Cell::new(None) };
     }
     /// Make `resume_initial_threads` on THIS thread walk one extra snapshot entry: thread `tid`
-    /// with the CHILD's pid as its owner, which is what a reused thread id looks like. Reset on
-    /// drop.
+    /// with the CHILD's pid as its owner, which is what a stale thread id looks like. Reset on
+    /// drop, which also clears the recorded visit.
     pub(crate) fn inject_snapshot_tid(tid: u32) -> InjectedSnapshotTid {
         INJECTED_SNAPSHOT_TID.with(|f| {
             debug_assert!(f.get().is_none(), "a snapshot tid is already injected");
             f.set(Some(tid));
         });
+        INJECTED_VISIT.with(|f| f.set(None));
         InjectedSnapshotTid(())
     }
     pub(crate) fn injected_snapshot_tid() -> Option<u32> {
         INJECTED_SNAPSHOT_TID.with(|f| f.get())
+    }
+    /// Record what the walk did with the injected entry (`None`: the owner filter dropped it).
+    pub(crate) fn record_injected_visit(visit: Option<super::Visit>) {
+        INJECTED_VISIT.with(|f| f.set(Some(visit)));
+    }
+    /// What the walk did with the injected entry. The outer `None` means it was never walked.
+    pub(crate) fn take_injected_visit() -> Option<Option<super::Visit>> {
+        INJECTED_VISIT.with(|f| f.take())
     }
     #[must_use = "dropping this immediately removes the injected tid"]
     pub(crate) struct InjectedSnapshotTid(());
     impl Drop for InjectedSnapshotTid {
         fn drop(&mut self) {
             INJECTED_SNAPSHOT_TID.with(|f| f.set(None));
+            INJECTED_VISIT.with(|f| f.set(None));
         }
     }
 }
@@ -985,51 +996,117 @@ pub(crate) fn wait_drained_raw(
     }
 }
 
+/// What `resume_if_owned` did with one thread id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visit {
+    Resumed,
+    /// The opened thread belongs to `owner`, not to the child: the id was reused.
+    Foreign {
+        owner: u32,
+    },
+    /// No thread has this id any more (`ERROR_INVALID_PARAMETER`).
+    Gone,
+    /// The thread could not be opened, queried or resumed; recorded in `last_err`.
+    Failed,
+}
+
+/// The state of one walk over the snapshot.
+#[derive(Default)]
+struct Walk {
+    resumed: u32,
+    last_err: Option<io::Error>,
+    /// Why the most recent listed thread of the child was skipped as stale.
+    last_skip: Option<String>,
+}
+
 /// Visit one snapshot entry: skip it unless the snapshot lists it under `process_pid`, then
-/// resume it only if the opened handle agrees ([`resume_if_owned`]).
+/// resume it only if the opened handle agrees ([`resume_if_owned`]). `None`: not the child's.
 fn visit_thread_entry(
     entry: &windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
     process_pid: u32,
-    resumed: &mut u32,
-    last_err: &mut Option<io::Error>,
-) {
-    if entry.th32OwnerProcessID == process_pid {
-        resume_if_owned(entry.th32ThreadID, process_pid, resumed, last_err);
-    }
+    walk: &mut Walk,
+) -> Option<Visit> {
+    (entry.th32OwnerProcessID == process_pid).then(|| resume_if_owned(entry.th32ThreadID, process_pid, walk))
 }
 
 /// Resume thread `tid` only if the opened handle shows it belongs to `process_pid`.
 ///
-/// The Toolhelp snapshot is stale by the time `OpenThread` runs: a thread id can be released and
-/// reused by another process in between. The handle pins the thread object, and a thread's owning
-/// process never changes, so the owner read through it is the owner of the thread that
-/// `ResumeThread` then acts on. A foreign thread is skipped, not an error: this child's own thread
-/// with that id has exited.
-fn resume_if_owned(tid: u32, process_pid: u32, resumed: &mut u32, last_err: &mut Option<io::Error>) {
+/// The Toolhelp snapshot is stale by the time `OpenThread` runs. A thread id can be released and
+/// reused by another process in between, or released and not reused. The handle pins the thread
+/// object, and a thread's owning process never changes, so the owner read through it is the
+/// owner of the thread that `ResumeThread` then acts on.
+///
+/// Both stale cases are skipped, not errors: the child's own thread with that id has exited, so
+/// there is nothing of the child's left to resume. Any other failure is recorded in `last_err`.
+fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
+    use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+    let gone = windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0);
     // SAFETY: plain Win32 calls; the opened handle is closed on every path.
     unsafe {
         match OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, tid) {
             Ok(thread) => {
                 let owner = GetProcessIdOfThread(thread);
-                if owner == 0 {
-                    *last_err = Some(io::Error::last_os_error());
+                let visit = if owner == 0 {
+                    walk.last_err = Some(io::Error::last_os_error());
+                    Visit::Failed
                 } else if owner == process_pid {
                     // ResumeThread returns the previous suspend count, or u32::MAX on failure.
                     if ResumeThread(thread) == u32::MAX {
-                        *last_err = Some(io::Error::last_os_error());
+                        walk.last_err = Some(io::Error::last_os_error());
+                        Visit::Failed
                     } else {
-                        *resumed += 1;
+                        walk.resumed += 1;
+                        Visit::Resumed
                     }
                 } else {
-                    // Not an error: the snapshot entry was stale, and a stale entry never fails a spawn.
-                    log::debug!(
-                        "resume_initial_threads: thread {tid} belongs to pid {owner}, not pid {process_pid}; skipped"
-                    );
-                }
+                    let reason = format!("thread {tid} now belongs to pid {owner}");
+                    log::debug!("resume_initial_threads: {reason}, not pid {process_pid}; skipped");
+                    walk.last_skip = Some(reason);
+                    Visit::Foreign { owner }
+                };
                 _ = CloseHandle(thread);
+                visit
             }
-            Err(e) => *last_err = Some(io::Error::from(e)),
+            Err(e) if e.code() == gone => {
+                let reason = format!("thread {tid} no longer exists");
+                log::debug!("resume_initial_threads: {reason}; skipped");
+                walk.last_skip = Some(reason);
+                Visit::Gone
+            }
+            Err(e) => {
+                walk.last_err = Some(io::Error::from(e));
+                Visit::Failed
+            }
         }
+    }
+}
+
+/// The pid of the process at `raw_handle`, or an error naming `GetProcessId`.
+///
+/// `GetProcessId` answers 0 on failure, and a walk filtered to owner 0 would match the System
+/// Idle process instead of the child.
+fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
+    // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
+    let pid = unsafe { GetProcessId(raw_handle) };
+    if pid == 0 {
+        let cause = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "GetProcessId failed on the child's handle: {cause}"
+        )));
+    }
+    Ok(pid)
+}
+
+/// The error for a walk that resumed nothing, naming why every listed thread was skipped.
+fn none_resumed_error(process_pid: u32, last_skip: Option<&str>) -> io::Error {
+    match last_skip {
+        Some(reason) => io::Error::other(format!(
+            "no suspended threads resumed: every thread the snapshot listed for pid {process_pid} was stale (last: {reason})"
+        )),
+        None => io::Error::other(format!(
+            "no suspended threads resumed: the snapshot listed no threads for pid {process_pid}"
+        )),
     }
 }
 
@@ -1053,11 +1130,14 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
 
     // Thread32First/Next signal end-of-enumeration with ERROR_NO_MORE_FILES.
     let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
-    let mut resumed = 0u32;
-    let mut last_err: Option<io::Error> = None;
+    let mut walk = Walk::default();
 
-    // SAFETY: `raw_handle` is the caller's live process handle.
-    let process_pid = unsafe { GetProcessId(raw_handle) };
+    let process_pid = process_pid_of(raw_handle);
+    debug_assert!(
+        process_pid.is_ok(),
+        "the caller must pass a live process handle: {process_pid:?}"
+    );
+    let process_pid = process_pid?;
 
     // SAFETY: snapshot/iterate with an owned handle, closed before return.
     unsafe {
@@ -1078,13 +1158,13 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                     return Err(io::Error::from(e));
                 }
             }
-            visit_thread_entry(&entry, process_pid, &mut resumed, &mut last_err);
+            visit_thread_entry(&entry, process_pid, &mut walk);
             step = Thread32Next(snap, &mut entry);
         }
         _ = CloseHandle(snap);
     }
 
-    // A reused thread id looks like a listed one: an entry naming the child as owner. A test
+    // A stale thread id looks like a listed one: an entry naming the child as owner. A test
     // injects one, so it goes through the same owner filter as a real entry.
     #[cfg(test)]
     if let Some(tid) = fault::injected_snapshot_tid() {
@@ -1093,12 +1173,17 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
             th32ThreadID: tid,
             ..Default::default()
         };
-        visit_thread_entry(&entry, process_pid, &mut resumed, &mut last_err);
+        fault::record_injected_visit(visit_thread_entry(&entry, process_pid, &mut walk));
     }
 
     // That must hold even when SOME threads resumed successfully before another one failed, not
     // only when every one did: a thread left suspended is exactly the "frozen process" this
     // function exists to rule out, regardless of how many of its siblings got moving first.
+    let Walk {
+        resumed,
+        last_err,
+        last_skip,
+    } = walk;
     if let Some(e) = last_err {
         log::warn!(
             "resume_initial_threads: failed to resume one or more of this child's initial threads \
@@ -1107,7 +1192,7 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
         return Err(e);
     }
     if resumed == 0 {
-        return Err(io::Error::other("no suspended threads resumed"));
+        return Err(none_resumed_error(process_pid, last_skip.as_deref()));
     }
     Ok(())
 }
