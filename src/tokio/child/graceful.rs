@@ -51,7 +51,8 @@ impl Child {
     /// that case out: absence from its console list is equally the answer for a healthy child.
     /// Each such call also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error means nothing was sent and nothing was killed.**
+    /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
+    /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
@@ -237,6 +238,9 @@ impl Child {
     /// has already exited by this refusal's own precondition, the watch resolves at once, and
     /// the sweep follows immediately. Descendants get no window there, whatever `grace` says
     /// (bindreams/cosca#125).
+    ///
+    /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
+    /// watch failure, so the sweep still runs.
     ///
     /// # Runtime
     ///

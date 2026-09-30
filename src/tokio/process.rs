@@ -71,8 +71,8 @@ impl Process {
     }
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (on
-    /// Linux, see the crate root's "Platform requirements"). Dropping the future cancels the watch on every
+    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure (on Linux a
+    /// refused `pidfd_open` is `Unsupported`, see [`Error::Unsupported`](crate::error::Error::Unsupported)). Dropping the future cancels the watch on every
     /// platform (the Windows watcher is released via its cancel event).
     ///
     /// # Runtime
@@ -87,19 +87,20 @@ impl Process {
     /// Wait up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
     /// still alive at expiry. `Duration::ZERO` polls once. Non-reaping; cancellation and
     /// runtime requirements as on [`wait`](Process::wait) (Unix additionally needs the time
-    /// driver).
+    /// driver). Errors as for [`wait`](Process::wait).
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
         crate::tokio::wait::grace_wait(self.inner.id(), timeout).await
     }
 
     /// Hard-kill the process by identity (see [`Process::kill`](crate::Process::kill) for
-    /// the per-OS race-freedom contract).
+    /// the per-OS race-freedom contract). On Linux a refused `pidfd_open` is `Unsupported` (see
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
     pub fn kill(&self) -> Result<(), Error> {
         self.inner.kill()
     }
 
     /// Send `SIGTERM` (signal-only, identity-bound). Unix only; Windows returns
-    /// `Unsupported`.
+    /// `Unsupported`, as does Linux when `pidfd_open` is refused (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     pub fn terminate(&self) -> Result<(), Error> {
         self.inner.terminate()
     }

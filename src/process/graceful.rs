@@ -10,7 +10,8 @@ use crate::error::Error;
 impl Process {
     /// Send `SIGTERM` to the foreign process — a cooperative request to exit. Signal-only.
     /// Identity-bound (Linux `pidfd_send_signal`; macOS reverify-then-`kill`). Already-dead ⇒
-    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`.
+    /// `Ok`; a real failure (`EPERM`) ⇒ `Err`. On Linux a refused `pidfd_open` is `Unsupported`
+    /// (see [`Error::Unsupported`]).
     ///
     /// **Windows: `Unsupported`, for two concrete absences.** A `Process` holds only a pid,
     /// nothing that pins it, and `GenerateConsoleCtrlEvent` takes a raw pid with no
@@ -30,7 +31,9 @@ impl Process {
     /// Unix only; Windows returns `Unsupported`. `grace` is relative; `ZERO` signals, polls
     /// once, then escalates.
     ///
-    /// A watch failure surfaces only after the kill runs; a kill error wins over it.
+    /// A watch failure surfaces only after the kill runs; a kill error wins over it. On Linux a
+    /// refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]), naming the step it hit: terminate,
+    /// the grace wait, or the kill.
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<(), Error> {
         crate::wait::terminate(self.id)?;
         // A watch failure must not strand the process between the soft signal and the
@@ -93,7 +96,8 @@ impl Process {
     ///
     /// A grace-watch failure does not strand the tree between the soft signal and the sweep:
     /// the hard sweep still runs (an unobservable grace escalates immediately), and the watch
-    /// error is surfaced afterward; a sweep failure would win over it.
+    /// error is surfaced afterward; a sweep failure would win over it. On Linux that error
+    /// includes a refused `pidfd_open` (see [`Error::Unsupported`]).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
 

@@ -406,6 +406,30 @@ async fn wait_exit_resolves_for_exited_unreaped_child() {
     child.wait().expect("reap");
 }
 
+/// The async watch reports a refused `pidfd_open` as `process wait`. The child is killed first so
+/// an unconsumed forced errno resolves the watch `Ok` and fails the assertion instead of hanging.
+///
+/// Mutants: `exit_watch` names another `PidfdOp`; the forced errno is not consumed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn wait_exit_names_process_wait_when_pidfd_open_is_refused() {
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    child.kill().expect("kill");
+    let forced = crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::ACCESS);
+    let result = wait_exit(id).await;
+    drop(forced);
+    child.wait().expect("reap");
+    match result {
+        Err(e @ crate::error::Error::Unsupported { .. }) => assert_eq!(
+            e.to_string(),
+            "process wait is not supported on linux: cosca requires pidfd_open (Linux \u{2265} 5.3), \
+             refused here: pidfd_open answered EACCES"
+        ),
+        other => panic!("a refused pidfd_open must be Unsupported, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn wait_exit_resolves_when_child_dies_mid_wait() {
     // Arm on a LIVE child; our own kill is the real exit event. Race-tolerant either side.

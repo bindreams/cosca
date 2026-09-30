@@ -77,9 +77,8 @@ impl Process {
     }
 
     /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). `Err` only on a wait failure (on Linux, see the
-    /// crate root's "Platform requirements").
-    /// Non-reaping.
+    /// parent gets one). Non-reaping. `Err` only on a wait failure; on Linux a refused
+    /// `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn wait(&self) -> Result<(), Error> {
         let exited = crate::wait::block_until_exit(self.id, None)?;
         debug_assert!(exited);
@@ -87,7 +86,7 @@ impl Process {
     }
 
     /// Block up to `timeout` for the process to exit. `Ok(true)` = exited; `Ok(false)` =
-    /// still alive at expiry. `Duration::ZERO` polls once.
+    /// still alive at expiry. `Duration::ZERO` polls once. Errors as for [`wait`](Self::wait).
     pub fn wait_timeout(&self, timeout: Duration) -> Result<bool, Error> {
         crate::wait::block_until_exit(self.id, Some(timeout))
     }
@@ -174,7 +173,8 @@ impl Process {
     /// **Race-freedom is OS-dependent:** Linux uses an identity-bound `pidfd_send_signal`
     /// (atomic, zero pid-reuse race) and Windows pins the kernel object via its handle; macOS
     /// has no pidfd, so it re-verifies identity immediately before `kill(2)` with a small
-    /// irreducible residual window — best-effort there, like the existing tree teardown.
+    /// irreducible residual window — best-effort there, like the existing tree teardown. On
+    /// Linux a refused `pidfd_open` is `Unsupported` (see [`Error::Unsupported`]).
     pub fn kill(&self) -> Result<(), Error> {
         crate::wait::kill(self.id)
     }
