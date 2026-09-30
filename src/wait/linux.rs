@@ -1,10 +1,11 @@
 //! Linux death-watch + kill via pidfd. `pidfd_open` returns a fd that
 //! becomes readable (POLLIN) when the task becomes a zombie (exits); polling never reaps.
-//! `pidfd_send_signal` is identity-bound (no pid-reuse race). A refused `pidfd_open` is
-//! [`Error::Unsupported`], a transient one [`Error::Io`] prefixed `pidfd_open:`; the errno
-//! classification is documented once, on [`Error::Unsupported`].
-//! The `/proc` checks behind `open_verified` use `openat2` (kernel >= 5.6); on 5.3 to 5.5 a live
-//! target is `Unassessable`.
+//! `pidfd_send_signal` is identity-bound (no pid-reuse race).
+//!
+//! The kernel floor and the per-syscall versions are in the crate root's "Platform requirements".
+//! A refused `pidfd_open` is [`Error::Unsupported`], a transient one [`Error::Io`] prefixed
+//! `pidfd_open:`; the errno classification is documented once, on [`Error::Unsupported`]. Without
+//! `openat2` the checked `/proc` view cannot be built, and a live target is `Unassessable`.
 
 use std::os::fd::AsFd;
 use std::time::Instant;
