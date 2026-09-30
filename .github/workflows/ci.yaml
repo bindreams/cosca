@@ -19,8 +19,11 @@ env:
   COSCA_TEST_ROOT: "0"
   # One place for values several jobs share. `.config/nextest.toml` requires the same nextest.
   NEXTEST_VERSION: "0.9.137"
-  # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`.
-  PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
+  # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
+  # gated on `COSCA_TEST_UID_SWITCH`.
+  PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"
+  # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
+  COSCA_TEST_UID_SWITCH: "0"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
   # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
@@ -504,12 +507,14 @@ jobs:
         include:
           - lane: root
             docker_flags: ""
+            uid_switch: "1"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x2"
             expect_capeff_lacks: "0x4"
             expect_capamb: "0x0"
           - lane: root, unshare -r
+            uid_switch: "0" # `unshare -r` maps no uid 65534
             docker_flags: "--cap-add SYS_ADMIN" # `unshare -r` needs it
             prefix: "unshare -r "
             expect_uid: "0"
@@ -519,6 +524,7 @@ jobs:
             expect_userns: "1"
           - lane: root, DAC_READ_SEARCH
             docker_flags: "--cap-add DAC_READ_SEARCH"
+            uid_switch: "1"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x6"
@@ -526,6 +532,7 @@ jobs:
             expect_capamb: "0x0"
           - lane: root, foreign TMPDIR
             docker_flags: ""
+            uid_switch: "1"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x2"
@@ -533,6 +540,7 @@ jobs:
             expect_capamb: "0x0"
             foreign_tmpdir: "true"
           - lane: uid 1000, CAP_DAC_OVERRIDE ambient
+            uid_switch: "0" # not root, so it cannot `setuid`
             docker_flags: ""
             prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
             expect_uid: "1000"
@@ -567,6 +575,8 @@ jobs:
             -e COSCA_TEST_ROOT=1 \
             -e COSCA_TEST_ROOT_CONSENT=1 \
             -e PRIVILEGE_TESTS \
+            -e COSCA_TEST_UID_SWITCH="${{ matrix.uid_switch }}" \
+            -e COSCA_TEST_UID_SWITCH_CONSENT=1 \
             -e FOREIGN_TMPDIR="${{ matrix.foreign_tmpdir }}" \
             -e PREFIX="${{ matrix.prefix }}" \
             -e EXPECT_UID="${{ matrix.expect_uid }}" \
@@ -655,6 +665,8 @@ jobs:
         env:
           COSCA_TEST_ROOT: "1"
           COSCA_TEST_ROOT_CONSENT: "1"
+          COSCA_TEST_UID_SWITCH: "1"
+          COSCA_TEST_UID_SWITCH_CONSENT: "1"
         run: |
           set -euxo pipefail
           exec sudo -E bash -euxc '

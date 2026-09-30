@@ -27,6 +27,11 @@ pub use accept::*;
 mod locked;
 pub use locked::*;
 
+#[cfg(unix)]
+mod uid_switch;
+#[cfg(unix)]
+pub use uid_switch::*;
+
 mod report;
 pub use report::*;
 
@@ -42,8 +47,14 @@ pub mod test_stdio;
 #[path = "../../src/test_privilege/setuid.rs"]
 pub mod setuid;
 
+/// The `cosca_testbin` path. Prefers nextest's run-time `NEXTEST_BIN_EXE_cosca_testbin`: the
+/// build-time path is absent when an archive runs elsewhere.
 pub fn testbin() -> &'static str {
-    env!("CARGO_BIN_EXE_cosca_testbin")
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| match std::env::var_os("NEXTEST_BIN_EXE_cosca_testbin") {
+        Some(path) => path.into_string().expect("NEXTEST_BIN_EXE_cosca_testbin is not UTF-8"),
+        None => env!("CARGO_BIN_EXE_cosca_testbin").to_owned(),
+    })
 }
 
 /// Blocks reading stdin; ends only by a kill or stdin EOF. `cat` on Unix; `more.com` on Windows

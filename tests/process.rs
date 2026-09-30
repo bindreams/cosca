@@ -212,36 +212,19 @@ fn foreign_kill_terminates_the_process() {
     p.kill().expect("second kill on a dead process must be Ok");
 }
 
-// pid 1 (init/launchd) is world-resolvable AND non-root-unkillable on Linux and macOS:
-// procfs / sysctl KERN_PROC both resolve it, and a non-root kill(1) returns EPERM, which
-// Process::kill must SURFACE as Err (not swallow into Ok). The ROOT branch stays
-// Linux-only: Linux provably discards unhandled SIGKILL to pid 1 (SIGNAL_UNKILLABLE);
-// XNU's launchd protection is unverified, and being wrong panics the machine — so as
-// root on non-Linux we refuse to signal pid 1 at all.
+// pid 1 is root-owned, resolvable on Linux (procfs) and macOS (sysctl), and a non-root `SIGKILL`
+// to it is refused with `EPERM`, which `Process::kill` must surface as `Err`, not swallow into
+// `Ok`. The precondition keeps this off root, where the signal could land.
 #[cfg(unix)]
-#[skuld::test]
-fn foreign_kill_surfaces_permission_denied() {
+#[skuld::test(requires = [common::unprivileged_with_root_init])]
+fn foreign_kill_of_a_root_process_surfaces_permission_denied() {
     let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
     assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must be alive");
-    // SAFETY: geteuid() takes no arguments and is always safe.
-    let root = unsafe { libc::geteuid() } == 0;
-    #[cfg(not(target_os = "linux"))]
-    if root {
-        // Fail LOUD, never silently pass unverified (the repo's no-silent-skip rule):
-        panic!(
-            "inconclusive: refusing to SIGKILL pid 1 as root on this platform \
-             (unverified kernel semantics) — run this test unprivileged"
-        );
-    }
     let r = init.kill();
-    if !root {
-        assert!(
-            matches!(r, Err(cosca::error::Error::Io(_))),
-            "non-root kill of init must surface EPERM as Err, got {r:?}"
-        );
-    } else {
-        assert!(r.is_ok(), "as root, SIGKILL to init is kernel-ignored => Ok, got {r:?}");
-    }
+    assert!(
+        matches!(&r, Err(cosca::error::Error::Io(e)) if e.raw_os_error() == Some(libc::EPERM)),
+        "a non-root kill of init must surface EPERM as Err, got {r:?}"
+    );
     assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must survive");
 }
 
