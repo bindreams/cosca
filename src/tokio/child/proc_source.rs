@@ -155,18 +155,10 @@ impl ProcSource {
             }
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child } => {
-                use crate::wait::exit_only::{self, Peek, Target};
                 let Some(pid) = child.id() else {
                     log::debug!("the child is already reaped; nothing to signal");
                     return Ok(());
                 };
-                match exit_only::peek(&Target::pid(pid, None)).map_err(Error::Io)? {
-                    Peek::Foreign(_) => {
-                        log::debug!("child {pid} was reaped by someone else; nothing to signal");
-                        return Ok(());
-                    }
-                    Peek::Running | Peek::Exit(_) => {}
-                }
                 #[cfg(test)]
                 crate::send_log::record(pid, sig, Via::Pid);
                 // SAFETY: the peek found `pid` to be our own unreaped child.
