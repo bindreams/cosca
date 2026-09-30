@@ -41,8 +41,8 @@ pub fn run(args: &[String]) {
     let mut cmd = [0u8; 1];
     let mut stdin = std::io::stdin();
     while stdin.read(&mut cmd).expect("read a command") == 1 {
-        let ack = command(cmd[0], caller);
-        out.write_all(&[ack]).and_then(|()| out.flush()).expect("write an ack");
+        out.write_all(&[cmd[0].to_ascii_uppercase()]).and_then(|()| out.flush()).expect("write an ack");
+        command(cmd[0], caller);
     }
 }
 
