@@ -528,10 +528,23 @@ fn d0_role_m4_tracer() {
         return;
     }
     let target: i32 = std::env::var("D0_M4_TARGET").expect("target").parse().expect("pid");
-    // SAFETY: plain ptrace request.
-    let r = unsafe { libc::ptrace(libc::PT_ATTACH, target, std::ptr::null_mut(), 0) };
-    let errno = if r != 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
-    println!("ATTACH ret={r} errno={} tracer_pid={}", errname(errno), std::process::id());
+    const PT_ATTACHEXC: c_int = 14;
+    // SAFETY: plain ptrace requests.
+    let mut r = unsafe { libc::ptrace(libc::PT_ATTACH, target, std::ptr::null_mut(), 0) };
+    let mut errno = if r != 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+    let mut which = "PT_ATTACH";
+    if r != 0 {
+        println!("D0-tracer PT_ATTACH ret={r} errno={}", errname(errno));
+        r = unsafe { libc::ptrace(PT_ATTACHEXC, target, std::ptr::null_mut(), 0) };
+        errno = if r != 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        which = "PT_ATTACHEXC";
+    }
+    println!(
+        "ATTACH via={which} ret={r} errno={} tracer_pid={} tracer_uid={}",
+        errname(errno),
+        std::process::id(),
+        unsafe { libc::getuid() }
+    );
     std::io::stdout().flush().expect("flush");
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
@@ -541,38 +554,57 @@ fn d0_role_m4_tracer() {
     }
 }
 
-fn traced_case(tag: &str, target: u32) {
+fn traced_case(tag: &str, target: u32, sudo: bool) {
     let me = std::process::id();
     show17("parent", me);
     show13(&format!("{tag}.before"), target);
     show17(&format!("{tag}.before"), target);
     show_kinfo(&format!("{tag}.before"), target);
 
-    let mut t = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", "macos::d0_role_m4_tracer", "--nocapture"])
-        .env("D0_ROLE", "m4")
-        .env("D0_M4_TARGET", target.to_string())
+    let exe = std::env::current_exe().expect("exe");
+    let args = ["--exact", "macos::d0_role_m4_tracer", "--nocapture"];
+    let mut cmd = if sudo {
+        let mut c = Command::new("sudo");
+        c.args(["-n", "env", "D0_ROLE=m4", &format!("D0_M4_TARGET={target}")]).arg(&exe).args(args);
+        c
+    } else {
+        let mut c = Command::new(&exe);
+        c.args(args).env("D0_ROLE", "m4").env("D0_M4_TARGET", target.to_string());
+        c
+    };
+    let mut t = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn tracer");
-    let tracer_pid = t.id();
     let stdin = t.stdin.take().unwrap();
     let mut out = std::io::BufReader::new(t.stdout.take().unwrap());
     let mut line = String::new();
-    let attach = loop {
+    let mut attach = None;
+    loop {
         line.clear();
-        assert!(std::io::BufRead::read_line(&mut out, &mut line).expect("read") > 0, "tracer exited early");
-        if line.starts_with("ATTACH ") {
-            break line.trim().to_string();
+        if std::io::BufRead::read_line(&mut out, &mut line).expect("read") == 0 {
+            break;
         }
+        if line.starts_with("D0-tracer ") {
+            d0!("M4", "{tag}.{}", line.trim());
+        }
+        if line.starts_with("ATTACH ") {
+            attach = Some(line.trim().to_string());
+            break;
+        }
+    }
+    let Some(attach) = attach else {
+        d0!("M4", "{tag}.tracer_never_reported sudo={sudo}");
+        let _ = t.wait();
+        return;
     };
-    d0!("M4", "{tag}.tracer_pid={tracer_pid} {attach}");
+    d0!("M4", "{tag}.sudo={sudo} {attach}");
     show13(&format!("{tag}.after_attach"), target);
     show17(&format!("{tag}.after_attach"), target);
     show_kinfo(&format!("{tag}.after_attach"), target);
-    d0!("M4", "{tag}.original_parent_is_pid={me} (the probe); tracer is pid={tracer_pid}");
+    d0!("M4", "{tag}.original_parent_is_pid={me} (the probe)");
     drop(stdin);
     let _ = t.wait();
 }
@@ -608,8 +640,10 @@ fn d0_m4_short_bsd_info() {
 
     // Traced: a non-platform target (this test binary) and a platform one (`/bin/sleep`).
     let rc = RoleChild::spawn();
-    traced_case("traced_probe_binary", rc.pid());
+    traced_case("traced_probe_binary", rc.pid(), false);
+    traced_case("traced_probe_binary_root_tracer", rc.pid(), true);
     drop(rc);
     let s = sleeper();
-    traced_case("traced_bin_sleep", s.0.id());
+    traced_case("traced_bin_sleep", s.0.id(), false);
+    traced_case("traced_bin_sleep_root_tracer", s.0.id(), true);
 }
