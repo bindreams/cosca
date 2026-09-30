@@ -27,6 +27,11 @@ pub use accept::*;
 mod locked;
 pub use locked::*;
 
+#[cfg(unix)]
+mod uid_switch;
+#[cfg(unix)]
+pub use uid_switch::*;
+
 mod report;
 pub use report::*;
 
@@ -42,8 +47,8 @@ pub mod test_stdio;
 #[path = "../../src/test_privilege/setuid.rs"]
 pub mod setuid;
 
-/// The `cosca_testbin` path. Under nextest, `NEXTEST_BIN_EXE_cosca_testbin` names the binary where
-/// this run actually finds it; the build-time path does not exist where an archive is run elsewhere.
+/// The `cosca_testbin` path. Prefers nextest's run-time `NEXTEST_BIN_EXE_cosca_testbin`: the
+/// build-time path is absent when an archive runs elsewhere.
 pub fn testbin() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| match std::env::var_os("NEXTEST_BIN_EXE_cosca_testbin") {
@@ -687,8 +692,3 @@ impl Drop for RestoreRlimitNofile {
         );
     }
 }
-
-#[cfg(unix)]
-mod uid_switch;
-#[cfg(unix)]
-pub use uid_switch::*;

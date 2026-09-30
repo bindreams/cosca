@@ -5,19 +5,33 @@
 #[path = "common/mod.rs"]
 mod common;
 
-/// Set on this binary's own re-exec of itself, routing `fn main` (bottom of this file) to
-/// [`foreign_kill_helper_main`] instead of the skuld harness — checked before skuld ever parses
-/// argv, so the re-exec'd process never itself becomes a skuld test run.
+/// Set on the re-exec'd reader to `<parent pid>:<target pid>`; `main` then runs
+/// [`foreign_kill_helper_main`] instead of skuld. See [`helper_role`].
 #[cfg(unix)]
 const ENV_TARGET_PID: &str = "COSCA_FOREIGN_KILL_TARGET_PID";
 
-/// Runs only when `COSCA_TEST_UID_SWITCH` is not `0` and `COSCA_TEST_UID_SWITCH_CONSENT=1`;
-/// `common::assert_root_capable` then fails the test if the process cannot actually switch uids.
-///
-/// The target and the caller under test both run as child processes of this (root) one, never as
-/// this process, so root can always name and clean up the target. The target crosses to the reader
-/// as a bare pid: this process holds its unreaped `Child`, so the kernel cannot recycle the pid
-/// before the reader reports back.
+/// The target pid if this process is the re-exec'd reader, `None` if it is an ordinary run. A value
+/// whose parent pid is not this process's parent was inherited (a shell export, an outer harness,
+/// a descendant) and is an error, never proof of the reader role.
+#[cfg(unix)]
+fn helper_role(inherited: Option<&str>, parent_pid: u32) -> Result<Option<u32>, String> {
+    let Some(v) = inherited else { return Ok(None) };
+    let target = v
+        .split_once(':')
+        .filter(|(parent, _)| *parent == parent_pid.to_string())
+        .and_then(|(_, target)| target.parse().ok());
+    match target {
+        Some(pid) => Ok(Some(pid)),
+        None => Err(format!(
+            "{ENV_TARGET_PID}={v:?} is set in this process's environment but is not \
+             \"{parent_pid}:<target pid>\" (its parent is {parent_pid}), so it was inherited, not set \
+             by the caller; unset it"
+        )),
+    }
+}
+
+/// The target crosses to the reader as a bare pid: this process holds the unreaped `Child`, so the
+/// pid cannot be recycled before the reader reports.
 #[cfg(unix)]
 #[skuld::test]
 fn foreign_kill_surfaces_permission_denied() {
@@ -35,9 +49,8 @@ fn foreign_kill_surfaces_permission_denied() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
 
-    // execve as another uid needs o+x on every ancestor directory, and $HOME (Linux) or the
-    // per-user $TMPDIR (macOS) commonly lacks it. Copy both binaries into a 0755 dir directly
-    // under /tmp, which both platforms keep traversable.
+    // execve as another uid needs o+x on every ancestor; $HOME (Linux) and macOS's per-user $TMPDIR
+    // lack it, /tmp keeps it.
     let scratch = tempfile::Builder::new()
         .tempdir_in("/tmp")
         .expect("scratch directory for world-executable copies");
@@ -45,15 +58,12 @@ fn foreign_kill_surfaces_permission_denied() {
         .expect("chmod the scratch directory world-traversable");
     let target_bin = common::world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
 
-    // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
-    // such concept), so this one spawn uses `std::process::Command` directly, under the spawn
-    // lock like every raw fork in this suite (see `common::output_locked`). `control-echo-pid`,
-    // not `control-block`: the survival check below needs a target that stays responsive, not
-    // merely present, to prove the denied kill didn't land.
+    // `cosca::Command` has no uid()/gid(), so this uses `std::process::Command`. `control-echo-pid`,
+    // not `control-block`: the survival check needs a target that stays responsive.
     let target = common::spawn_locked(
         std::process::Command::new(&target_bin)
             .args(["control-echo-pid", &addr, "R"])
-            .env(common::ACK_ENV, "1") // `accept_or_die` acks; the target reads it before sending its tag
+            .env(common::ACK_ENV, "1") // the target waits for `accept_or_die`'s ack
             .uid(common::TARGET_UID)
             .gid(common::TARGET_UID),
     )
@@ -69,25 +79,21 @@ fn foreign_kill_surfaces_permission_denied() {
         "the target's self-reported pid must match what we spawned"
     );
 
-    // The actual caller under test: re-exec THIS SAME test binary (another world-executable
-    // copy — see above) as READER_UID. Its result crosses back as an exit code ONLY (never
-    // parsed text) — see `foreign_kill_helper_main`'s doc for the exact mapping.
+    // The caller under test: this binary re-exec'd as READER_UID; it reports by exit code.
     let exe = std::env::current_exe().expect("this test binary's own path");
     let reader_bin = common::world_executable_copy(&exe, scratch.path());
     let status = common::status_locked(
         std::process::Command::new(&reader_bin)
             .uid(common::READER_UID)
             .gid(common::READER_UID)
-            .env(ENV_TARGET_PID, target_pid.to_string()),
+            .env(ENV_TARGET_PID, format!("{}:{target_pid}", std::process::id())),
     )
     .expect("re-exec this binary as the unprivileged reader");
 
     assert_eq!(
         status.code(),
         Some(0),
-        "the unprivileged reader did not confirm EPERM (see its stderr, above, for which check \
-         failed) — got exit code {:?}",
-        status.code()
+        "the reader did not confirm EPERM (its stderr names the failed check)"
     );
 
     // The target was alive and answering while the reader was refused, so the EPERM came from a
@@ -95,28 +101,41 @@ fn foreign_kill_surfaces_permission_denied() {
     common::assert_echoes(&mut sock, "the target");
 }
 
-/// [`foreign_kill_surfaces_permission_denied`]'s re-exec'd helper mode — dispatched from `fn
-/// main` (bottom of this file) via `ENV_TARGET_PID`, before skuld ever sees argv. Reports its
-/// verdict PURELY via the process exit code:
-/// - `0`: `Process::kill` on the target surfaced `EPERM` as `Err` — the expected outcome.
-/// - `10`: `kill` unexpectedly returned `Ok(())`.
+#[cfg(unix)]
+#[skuld::test]
+fn helper_role_is_none_without_the_variable() {
+    assert_eq!(helper_role(None, 42), Ok(None));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn helper_role_accepts_the_parents_pid_and_returns_the_target() {
+    assert_eq!(helper_role(Some("42:7"), 42), Ok(Some(7)));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn helper_role_rejects_an_inherited_value_naming_the_variable() {
+    for inherited in ["7", "41:7", "42:", "42:x", ":7", "42:7:8"] {
+        let err = helper_role(Some(inherited), 42).unwrap_err();
+        assert!(
+            err.contains(ENV_TARGET_PID) && err.contains("inherited"),
+            "{inherited:?}: {err}"
+        );
+    }
+}
+
+/// The re-exec'd reader. Exit code:
+/// - `0`: `Process::kill` on the target surfaced `EPERM` as `Err`, as expected.
+/// - `10`: `kill` returned `Ok(())`.
 /// - `11`: `kill` returned an `Err` other than `Io(EPERM)`.
-/// - `12`: the target pid is `Gone` (no such process — a test bug, not an OS refusal).
+/// - `12`: the target pid is `Gone` (a test bug, not an OS refusal).
 /// - `13`: the target pid's identity is `Unknown` (the OS refused the query).
 #[cfg(unix)]
-fn foreign_kill_helper_main() -> i32 {
-    // The caller's `Command::uid()/gid()` already runs setuid/setgid in its pre-exec child; a
-    // failed drop would have made THAT spawn() return Err, which the caller `.expect()`s. So by
-    // the time this process exists at all, the drop must have already succeeded.
+fn foreign_kill_helper_main(pid: u32) -> i32 {
+    // A failed uid/gid drop fails the caller's spawn(), so euid is never 0 here.
     // SAFETY: geteuid() takes no arguments and has no preconditions.
-    debug_assert_ne!(
-        unsafe { libc::geteuid() },
-        0,
-        "reached foreign_kill_helper_main still euid 0 — the caller's own Command::uid()/gid() \
-         should have failed spawn() first if the drop to READER_UID failed"
-    );
-    let pid_str = std::env::var(ENV_TARGET_PID).expect("ENV_TARGET_PID set by the caller");
-    let pid: cosca::identity::RawPid = pid_str.parse().expect("ENV_TARGET_PID is a valid pid");
+    debug_assert_ne!(unsafe { libc::geteuid() }, 0, "the reader is still euid 0");
     let target = match cosca::Process::from_pid(pid) {
         cosca::identity::Resolved::Found(p) => p,
         cosca::identity::Resolved::Gone => {
@@ -142,10 +161,17 @@ fn foreign_kill_helper_main() -> i32 {
 }
 
 fn main() {
-    // Helper re-exec must bypass skuld (see ENV_TARGET_PID).
     #[cfg(unix)]
-    if std::env::var_os(ENV_TARGET_PID).is_some() {
-        std::process::exit(foreign_kill_helper_main());
+    {
+        let inherited = std::env::var_os(ENV_TARGET_PID).map(|v| v.to_string_lossy().into_owned());
+        match helper_role(inherited.as_deref(), std::os::unix::process::parent_id()) {
+            Ok(Some(pid)) => std::process::exit(foreign_kill_helper_main(pid)),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
     }
     skuld::run_all();
 }

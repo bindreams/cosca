@@ -212,6 +212,22 @@ fn foreign_kill_terminates_the_process() {
     p.kill().expect("second kill on a dead process must be Ok");
 }
 
+// pid 1 is root-owned, resolvable on Linux (procfs) and macOS (sysctl), and a non-root `SIGKILL`
+// to it is refused with `EPERM`, which `Process::kill` must surface as `Err`, not swallow into
+// `Ok`. The precondition keeps this off root, where the signal could land.
+#[cfg(unix)]
+#[skuld::test(requires = [common::unprivileged_with_root_init])]
+fn foreign_kill_of_a_root_process_surfaces_permission_denied() {
+    let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
+    assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must be alive");
+    let r = init.kill();
+    assert!(
+        matches!(&r, Err(cosca::error::Error::Io(e)) if e.raw_os_error() == Some(libc::EPERM)),
+        "a non-root kill of init must surface EPERM as Err, got {r:?}"
+    );
+    assert_eq!(init.is_alive(), cosca::identity::Liveness::Alive, "init must survive");
+}
+
 #[cfg(unix)]
 #[skuld::test]
 fn is_alive_is_false_for_a_real_zombie() {

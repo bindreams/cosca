@@ -22,8 +22,7 @@ env:
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
   # gated on `COSCA_TEST_UID_SWITCH`.
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"
-  # Real uid switching needs real root that can `setuid`: only the lanes that are, and the macOS
-  # root lane, turn it on (with consent).
+  # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
   COSCA_TEST_UID_SWITCH: "0"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
