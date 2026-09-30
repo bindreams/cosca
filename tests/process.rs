@@ -119,9 +119,23 @@ fn parent_and_children_resolve_the_spawned_tree() {
         .found()
         .expect("child resolves");
 
-    assert_eq!(kid.parent().expect("child has a parent").id(), me.id());
-    assert!(me.children(cosca::Recursive::No).iter().any(|p| p.id() == kid.id()));
-    assert!(me.children(cosca::Recursive::Yes).iter().any(|p| p.id() == kid.id()));
+    assert_eq!(
+        kid.parent()
+            .expect("the parent is queryable")
+            .expect("child has a parent")
+            .id(),
+        me.id()
+    );
+    assert!(me
+        .children(cosca::Recursive::No)
+        .expect("children are enumerable")
+        .iter()
+        .any(|p| p.id() == kid.id()));
+    assert!(me
+        .children(cosca::Recursive::Yes)
+        .expect("children are enumerable")
+        .iter()
+        .any(|p| p.id() == kid.id()));
 
     sock.write_all(b"x").expect("release child");
     let _ = child.wait();
@@ -140,7 +154,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
         .found()
         .expect("child resolves");
     // The grandchild is kid's only direct child — use it to learn the grandchild's identity.
-    let grandkids = kid.children(cosca::Recursive::No);
+    let grandkids = kid.children(cosca::Recursive::No).expect("children are enumerable");
     assert_eq!(
         grandkids.len(),
         1,
@@ -148,7 +162,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     );
     let grandkid = grandkids[0];
 
-    let direct = me.children(cosca::Recursive::No);
+    let direct = me.children(cosca::Recursive::No).expect("children are enumerable");
     assert!(
         direct.iter().any(|p| p.id() == kid.id()),
         "Recursive::No must include the direct child"
@@ -157,7 +171,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
         !direct.iter().any(|p| p.id() == grandkid.id()),
         "Recursive::No must EXCLUDE the grandchild"
     );
-    let all = me.children(cosca::Recursive::Yes);
+    let all = me.children(cosca::Recursive::Yes).expect("children are enumerable");
     assert!(
         all.iter().any(|p| p.id() == kid.id()),
         "Recursive::Yes must include the child"
@@ -603,4 +617,12 @@ fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
     let (mut child, listener) = seamed_control_block("die-now", true);
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
     assert_died_before_connecting(&message, child.id());
+}
+
+/// Pid 1 has no parent, and that is `Ok(None)`: a real absence, not an unanswerable question.
+#[cfg(target_os = "linux")]
+#[test]
+fn pid_one_has_no_parent() {
+    let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
+    assert!(init.parent().expect("pid 1's parent is answerable").is_none());
 }

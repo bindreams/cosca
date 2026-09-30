@@ -142,29 +142,78 @@ fn every_walk_without_openat2_is_unsupported_naming_it() {
     }
 }
 
-/// `parent` and `children` have no error channel: their `warn` names the requirement, both where
-/// the anchor read is what fails (this pid's `exists()` answers `Unknown`) and where the table
-/// read does. Mutant: "drop the cause from the anchor's warning".
+/// `parent` and `children` error, never answer "none", where the answer cannot be established:
+/// `Unsupported` naming `openat2`, whether the anchor read (this pid's `exists()` answers
+/// `Unknown`) or the table read is what fails. Mutants: "map the error to `Ok(None)` /
+/// `Ok(vec![])`" at the anchor, or at the table read.
 #[test]
-fn parent_and_children_without_openat2_warn_naming_it() {
+fn parent_and_children_without_openat2_are_unsupported_naming_it() {
     use crate::identity::proc_view_fault::force_openat2_errno;
     use crate::Recursive;
-    crate::log_capture::install();
     let me = crate::Process::from_id(ProcessId::current());
-    for errno in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
-        let mark = crate::log_capture::mark();
+    for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let forced = force_openat2_errno(errno);
-        assert!(me.parent().is_none());
-        assert!(me.children(Recursive::Yes).is_empty());
+        let results = [
+            ("parent", me.parent().map(|_| ())),
+            ("children(No)", me.children(Recursive::No).map(|_| ())),
+            ("children(Yes)", me.children(Recursive::Yes).map(|_| ())),
+        ];
         drop(forced);
-        for marker in ["Process::parent", "Process::children"] {
-            let records = crate::log_capture::records_since_on_current_thread(mark, marker);
+        for (name, result) in results {
+            match result {
+                Err(Error::Unsupported { detail, .. }) => assert!(
+                    detail.contains(&format!("refused here: openat2 answered {code}")),
+                    "{name} {errno}: {detail}"
+                ),
+                other => panic!("{name} {errno}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// An untrusted `/proc` view is `Unassessable`, not "no parent" / "no children". The view is
+/// forced once, so the anchor read may take it; either read failing must surface. Mutant: "map
+/// the error to `Ok(None)` / `Ok(vec![])`".
+#[test]
+fn parent_and_children_over_an_untrusted_view_are_unassessable() {
+    use crate::Recursive;
+    let me = crate::Process::from_id(ProcessId::current());
+    for (view, _) in views() {
+        let forced = force_proc_view_once(view);
+        let result = me.parent().map(|_| ());
+        drop(forced);
+        assert!(matches!(result, Err(Error::Unassessable { .. })), "parent: {result:?}");
+        for recursive in [Recursive::No, Recursive::Yes] {
+            let forced = force_proc_view_once(view);
+            let result = me.children(recursive).map(|_| ());
+            drop(forced);
             assert!(
-                records
-                    .iter()
-                    .any(|(level, m)| *level == log::Level::Warn && m.contains("refused here: openat2 answered")),
-                "{marker} {errno}: {records:?}"
+                matches!(result, Err(Error::Unassessable { .. })),
+                "children({recursive:?}): {result:?}"
             );
+        }
+    }
+}
+
+/// The table read alone failing, the anchor having passed, still errors and names the view.
+/// Mutant: "`process_parents()?` becomes `unwrap_or_default()`" in `parent` / `children`, which
+/// the tests above cannot see because their anchor read fails first.
+#[test]
+fn parent_and_children_error_when_only_the_table_read_fails() {
+    use crate::identity::proc_view_fault::force_proc_view_after;
+    use crate::Recursive;
+    let me = crate::Process::from_id(ProcessId::current());
+    for (view, cause) in views() {
+        // The anchor's `exists()` reads the view once; the table read is the next.
+        let forced = force_proc_view_after(1, view);
+        let result = me.parent().map(|_| ());
+        drop(forced);
+        assert_unassessable_naming(result, cause);
+        for recursive in [Recursive::No, Recursive::Yes] {
+            let forced = force_proc_view_after(1, view);
+            let result = me.children(recursive).map(|_| ());
+            drop(forced);
+            assert_unassessable_naming(result, cause);
         }
     }
 }
