@@ -4,13 +4,15 @@
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 #[cfg(target_os = "macos")]
 use super::install_preserved;
 use super::{install, FdMapping};
+use crate::test_own_process::{own_process, test_path};
+use crate::test_stdio::RestoreStdio;
 
 /// A throwaway file holding `content`, rewound to its start so a child reading it from the
 /// beginning sees exactly `content`.
@@ -365,51 +367,6 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 
 // A parent_fd below fd 3 must not be clobbered by std's own stdio dup2 =====
 
-/// Dup fd 2 aside and close the original, so the CURRENT test process's fd 2 is free for the
-/// test to reuse — restoring it on drop even if the test panics. Safe because this workspace's
-/// test runner (`cargo nextest`) puts every test function in its own OS process, so this cannot
-/// affect any other test.
-struct RestoreFd2 {
-    saved: OwnedFd,
-}
-
-impl RestoreFd2 {
-    fn take() -> RestoreFd2 {
-        // SAFETY: F_DUPFD_CLOEXEC(2, 3) duplicates fd 2 to a fresh number >= 3, checked below.
-        let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
-        assert!(saved >= 0, "dup fd 2 aside before closing it");
-        // SAFETY: `saved` was just returned by a successful F_DUPFD_CLOEXEC.
-        let saved = unsafe { OwnedFd::from_raw_fd(saved) };
-        assert_eq!(unsafe { libc::close(2) }, 0, "close the test process' fd 2");
-        RestoreFd2 { saved }
-    }
-}
-
-impl Drop for RestoreFd2 {
-    fn drop(&mut self) {
-        // SAFETY: dup2 back onto 2; `self.saved` stays valid (and is closed normally by its own
-        // Drop) regardless of this call's outcome.
-        //
-        // Retries EINTR the same way `fd_map::dup2_onto` does, so a signal landing mid-restore
-        // cannot leave fd 2 unrestored, and asserts the final result: a restore failure here would
-        // silently leave this test process' own fd 2 in the wrong state for every test that runs
-        // after it.
-        let ret = loop {
-            let ret = unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
-            if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                break ret;
-            }
-        };
-        assert_eq!(
-            ret,
-            2,
-            "dup2({}, 2) while restoring fd 2 failed: {}",
-            self.saved.as_raw_fd(),
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 /// A mapping whose parent-side source starts out sitting at fd 2 — because the current process
 /// just closed its own fd 2 and the source is the next thing opened — must not be silently
 /// repointed to whatever std's OWN `.stderr()` setup later `dup2`s onto fd 2 in the child. Std
@@ -420,8 +377,13 @@ impl Drop for RestoreFd2 {
 /// through fd 3 instead of the mapping's real source.
 #[test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
-    let _restore = RestoreFd2::take();
-    // The next fd opened lands at 2 (just closed above by `RestoreFd2::take`) — this IS the
+    let Some(done) = own_process(test_path!(
+        a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it
+    )) else {
+        return;
+    };
+    let _restore = RestoreStdio::close(&done, &[2]);
+    // The next fd opened lands at 2 (just closed above by `RestoreStdio::close`) — this IS the
     // mapping's source, at the exact number the bug needs to reproduce.
     let owned: OwnedFd = file_with("fd3-token").into();
     assert_eq!(
@@ -467,8 +429,13 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 /// purposes across the fork, corrupting whichever one loses.
 #[test]
 fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
-    let _restore = RestoreFd2::take();
-    // The next fd opened lands at 2 (just closed above by `RestoreFd2::take`).
+    let Some(done) = own_process(test_path!(
+        a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops
+    )) else {
+        return;
+    };
+    let _restore = RestoreStdio::close(&done, &[2]);
+    // The next fd opened lands at 2 (just closed above by `RestoreStdio::close`).
     let owned: OwnedFd = file_with("kept-open").into();
     assert_eq!(
         owned.as_raw_fd(),

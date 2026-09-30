@@ -108,6 +108,14 @@ mod test_child;
 #[cfg(all(test, unix))]
 mod test_privilege;
 
+#[cfg(all(test, unix))]
+mod test_own_process;
+#[cfg(all(test, unix))]
+mod test_own_process_tests;
+#[cfg(all(test, unix))]
+mod test_stdio;
+#[cfg(all(test, unix))]
+mod test_stdio_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod test_support;
 
