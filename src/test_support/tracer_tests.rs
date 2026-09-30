@@ -1,4 +1,5 @@
-//! The feasibility facts, and one test per row of the helper's transition table (`machine.rs`).
+//! The feasibility facts, the contract's preconditions, and one test per row of the helper's
+//! transition table (`machine.rs`).
 //! Each test asserts every report up to each point where the helper waits, so a broken row
 //! fails an assertion there rather than passing through another row's identical final report,
 //! and names the mutant that fails it.
