@@ -273,3 +273,31 @@ pub(super) fn unwatch_signal_pipe(kq: &Kqueue) {
 fn read_knote(flags: EvFlags) -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_READ, flags, FilterFlag::empty(), 0, 0)
 }
+
+/// DIAG (throwaway).
+pub(super) fn diag(pid: u32) -> String {
+    let stopped = peek(pid, libc::WSTOPPED | libc::WNOHANG).map(|i| (i.si_pid, i.si_code, i.si_status));
+    let exited = peek(pid, libc::WEXITED | libc::WNOHANG).map(|i| (i.si_pid, i.si_code, i.si_status));
+    let mut out = format!("stop_peek={stopped:?} exit_peek={exited:?} pbi_status={:?}", pbi_status(pid));
+    let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
+    match pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task) {
+        Err(e) => out += &format!(" taskinfo_err={e}"),
+        Ok(_) => {
+            out += &format!(" threadnum={}", task[0].pti_threadnum);
+            let mut handles = vec![0u64; (task[0].pti_threadnum.max(1) as usize) * 2 + 4];
+            match pidinfo(pid, PROC_PIDLISTTHREADS, 0, &mut handles) {
+                Err(e) => out += &format!(" list_err={e}"),
+                Ok(n) => {
+                    for &h in &handles[..n / 8] {
+                        let mut t: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
+                        match pidinfo(pid, libc::PROC_PIDTHREADINFO, h, &mut t) {
+                            Ok(_) => out += &format!(" [run_state={} flags={} cpu={}]", t[0].pth_run_state, t[0].pth_flags, t[0].pth_cpu_usage),
+                            Err(e) => out += &format!(" [thread_err={e}]"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}

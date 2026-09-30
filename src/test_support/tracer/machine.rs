@@ -565,6 +565,7 @@ impl Machine<'_> {
             Err(e) => return self.fail(e, "S4"),
         }
         let mut backoff = FIRST_BACKOFF;
+        let mut rounds = 0u32;
         loop {
             let result = match forced.take() {
                 Some(forced) => forced,
@@ -577,6 +578,10 @@ impl Machine<'_> {
                 Ok(()) => return self.detached(),
                 Err(libc::ESRCH) => return self.exiting(),
                 Err(libc::EBUSY) => {
+                    rounds += 1;
+                    if rounds == 60 {
+                        self.enter(&format!("S4b DIAG {}", sys::diag(self.pid)))?;
+                    }
                     self.enter("S4b")?;
                     if self.wait(kq, "S4b", Some(backoff))?.note_exit {
                         return to(State::S5);
