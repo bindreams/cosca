@@ -72,10 +72,9 @@ pub(crate) enum Report {
     /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal it
     /// does not ignore is re-sent after the detach, unless a later `SIGCONT` cancelled it, and an
     /// ignored one is dropped (see [`machine`]).
-    /// Measured on CI: on macOS 15 the tracee runs, or is job-stopped by the re-sent signal; on
-    /// macOS 26 it may instead stay stopped by the detach's `SIGSTOP`, against which XNU discards
-    /// the re-sent one. So the test ends it with `SIGKILL` through its handle, which ends it
-    /// either way.
+    /// With nothing to re-send, the detach is from S4's `SIGSTOP`: measured on CI, macOS 15 then
+    /// runs the tracee, while macOS 26 leaves it stopped by that `SIGSTOP`. So a test ends it with
+    /// `SIGKILL` through its handle, which ends it either way.
     Detached,
     /// The protocol failed in `state`.
     Error { cause: Cause, state: String },
