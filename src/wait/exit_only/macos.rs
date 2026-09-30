@@ -113,7 +113,7 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
             // decides: a real reap is announced on it with `NOTE_REAP`. Without one, `ESRCH` is
             // taken for gone.
             Resolved::Gone if knote => Ok(Peek::Running),
-            Resolved::Gone => Ok(peeked),
+            Resolved::Gone => Ok(Peek::Running),
             // An unreadable start is a pid of another user: not our child.
             Resolved::Unknown => Ok(peeked),
         },

@@ -201,7 +201,7 @@ pub(crate) fn uniq_info(pid: RawPid) -> UniqRead {
         libc::proc_pidinfo(
             pid as libc::c_int,
             PROC_PIDUNIQIDENTIFIERINFO,
-            1,
+            0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
         )
@@ -213,11 +213,8 @@ pub(crate) fn uniq_info(pid: RawPid) -> UniqRead {
     }
     if n <= 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-        return if errno == libc::ESRCH {
-            UniqRead::Gone
-        } else {
-            UniqRead::Refused(errno)
-        };
+        let _gone = UniqRead::Gone;
+        return UniqRead::Refused(errno);
     }
     log::warn!("proc_pidinfo({pid}) for the unique id wrote {n} bytes, expected {size}");
     UniqRead::Refused(libc::EIO)
