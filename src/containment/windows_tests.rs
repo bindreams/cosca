@@ -528,8 +528,8 @@ impl Drop for SuspendedHelper {
     }
 }
 
-/// A thread id the snapshot lists under the child but that belongs to another process (a reused
-/// id) must not be resumed. The helper's main thread has suspend count 1; suspending it again
+/// A thread id the snapshot lists under the child (owner = the child's pid) but that belongs to
+/// another process (a reused id) must not be resumed, and must not fail the spawn. The helper's main thread has suspend count 1; suspending it again
 /// returns the previous count, so 1 proves nothing resumed it and 0 proves something did.
 #[test]
 fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
@@ -537,8 +537,21 @@ fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
 
     let helper = SuspendedHelper::new();
     let injected = crate::containment::windows::fault::inject_snapshot_tid(helper.tid);
-    let (child, stdin) = crate::test_child::held_contained_blocker(crate::Stdio::null());
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout");
+    cmd.contain();
+    let spawned = cmd.spawn();
     drop(injected);
+    // A stale entry is skipped, never an error: it must not fail the spawn.
+    assert!(
+        spawned.is_ok(),
+        "a snapshot entry for another process's thread must not fail the spawn: {:?}",
+        spawned.as_ref().err()
+    );
+    let mut child = spawned.expect("checked above");
+    let stdin = child.stdin().expect("piped stdin");
 
     // SAFETY: `helper.thread` is a live thread handle with suspend rights.
     let previous = unsafe { SuspendThread(helper.thread) };

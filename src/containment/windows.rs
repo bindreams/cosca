@@ -550,8 +550,9 @@ pub(crate) mod fault {
     thread_local! {
         static INJECTED_SNAPSHOT_TID: Cell<Option<u32>> = const { Cell::new(None) };
     }
-    /// Make `resume_initial_threads` on THIS thread treat `tid` as if the Toolhelp snapshot had
-    /// listed it under the child, which is what a reused thread id looks like. Reset on drop.
+    /// Make `resume_initial_threads` on THIS thread walk one extra snapshot entry: thread `tid`
+    /// with the CHILD's pid as its owner, which is what a reused thread id looks like. Reset on
+    /// drop.
     pub(crate) fn inject_snapshot_tid(tid: u32) -> InjectedSnapshotTid {
         INJECTED_SNAPSHOT_TID.with(|f| {
             debug_assert!(f.get().is_none(), "a snapshot tid is already injected");
@@ -984,6 +985,19 @@ pub(crate) fn wait_drained_raw(
     }
 }
 
+/// Visit one snapshot entry: skip it unless the snapshot lists it under `process_pid`, then
+/// resume it only if the opened handle agrees ([`resume_if_owned`]).
+fn visit_thread_entry(
+    entry: &windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
+    process_pid: u32,
+    resumed: &mut u32,
+    last_err: &mut Option<io::Error>,
+) {
+    if entry.th32OwnerProcessID == process_pid {
+        resume_if_owned(entry.th32ThreadID, process_pid, resumed, last_err);
+    }
+}
+
 /// Resume thread `tid` only if the opened handle shows it belongs to `process_pid`.
 ///
 /// The Toolhelp snapshot is stale by the time `OpenThread` runs: a thread id can be released and
@@ -1006,6 +1020,11 @@ fn resume_if_owned(tid: u32, process_pid: u32, resumed: &mut u32, last_err: &mut
                     } else {
                         *resumed += 1;
                     }
+                } else {
+                    // Not an error: the snapshot entry was stale, and a stale entry never fails a spawn.
+                    log::debug!(
+                        "resume_initial_threads: thread {tid} belongs to pid {owner}, not pid {process_pid}; skipped"
+                    );
                 }
                 _ = CloseHandle(thread);
             }
@@ -1059,18 +1078,22 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                     return Err(io::Error::from(e));
                 }
             }
-            if entry.th32OwnerProcessID == process_pid {
-                resume_if_owned(entry.th32ThreadID, process_pid, &mut resumed, &mut last_err);
-            }
+            visit_thread_entry(&entry, process_pid, &mut resumed, &mut last_err);
             step = Thread32Next(snap, &mut entry);
         }
         _ = CloseHandle(snap);
     }
 
-    // A reused thread id is indistinguishable from a listed one, so a test names one directly.
+    // A reused thread id looks like a listed one: an entry naming the child as owner. A test
+    // injects one, so it goes through the same owner filter as a real entry.
     #[cfg(test)]
     if let Some(tid) = fault::injected_snapshot_tid() {
-        resume_if_owned(tid, process_pid, &mut resumed, &mut last_err);
+        let entry = THREADENTRY32 {
+            th32OwnerProcessID: process_pid,
+            th32ThreadID: tid,
+            ..Default::default()
+        };
+        visit_thread_entry(&entry, process_pid, &mut resumed, &mut last_err);
     }
 
     // That must hold even when SOME threads resumed successfully before another one failed, not
