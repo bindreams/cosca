@@ -1105,6 +1105,9 @@ async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
+    // The async `Child` was dropped by the unwind before `panic_message_of` returned; the drop only
+    // sends the kill.
+    common::wait_for_last_async_root();
     let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
     assert_died_before_connecting(&message, grandchild);
 }
@@ -1113,6 +1116,7 @@ async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_whil
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
+    common::wait_for_last_async_root();
     let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
     assert_died_before_connecting(&message, grandchild);
 }
@@ -1121,9 +1125,31 @@ async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting
 /// root.
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
-    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |_| {})).await;
-    let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
+    // Contained so unwinding kills the orphaned grandchild. The `Child` is dropped by the unwind
+    // before `panic_message_of` returns, but the drop only sends the kill: wait for the exit by
+    // identity.
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |cmd| {
+        cmd.contain();
+    }))
+    .await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
+    let id = common::last_reported_grandchild_id()
+        .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
+    assert_eq!(
+        common::last_reported_grandchild_contained(),
+        Some(true),
+        "the grandchild must be inside the root's containment when identified, or the drop does not kill it"
+    );
+    assert_eq!(
+        common::last_reported_grandchild_liveness(),
+        Some(cosca::identity::Liveness::Alive),
+        "the grandchild must be alive when identified, so its exit is the containment kill's"
+    );
+    cosca::Process::from_id(id)
+        .wait()
+        .expect("wait for the orphaned grandchild");
+    common::wait_for_last_async_root();
+    let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(
         !message.contains(&format!("(pid {grandchild})")),
         "the live grandchild must not be the one blamed: {message:?}"
@@ -1134,6 +1160,7 @@ async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_conne
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-eof", |_| {})).await;
+    common::wait_for_last_async_root();
     assert!(
         message.contains("died before it reported the grandchild pid"),
         "got: {message:?}"

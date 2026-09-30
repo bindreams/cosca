@@ -409,7 +409,15 @@ impl Child {
     /// against the held handle, not "any job"). `pub` so integration tests can call it.
     #[cfg(windows)]
     pub fn test_job_handle_contains_self(&self) -> bool {
-        crate::containment::windows::job_contains_pid(&self.os.attached, self.id.pid())
+        self.test_job_handle_contains(self.id.pid())
+    }
+
+    /// Test-only: [`test_job_handle_contains_self`](Self::test_job_handle_contains_self) for any
+    /// `pid`, e.g. a descendant. `false` if the child is not job-contained or `pid` cannot be
+    /// opened.
+    #[cfg(windows)]
+    pub fn test_job_handle_contains(&self, pid: u32) -> bool {
+        crate::containment::windows::job_contains_pid(&self.os.attached, pid)
     }
 
     /// Block until the child exits, returning its status. For a bounded wait, fix a deadline
