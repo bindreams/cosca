@@ -54,7 +54,8 @@ pub enum ElevationErrorKind {
     /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
     ///
     /// Not this: a child that had already exited (`Ok`; Linux answers `EPERM` for a root-owned
-    /// zombie).
+    /// zombie), and, on Linux, a signal a seccomp or LSM filter refused although the kernel's own
+    /// rule permits it ([`Error::Unsupported`], naming the syscall).
     #[error("could not terminate an elevated child: permission denied")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to

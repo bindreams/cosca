@@ -130,7 +130,7 @@ impl ProcDir {
     }
 
     /// The target of the symlink at `path` under this `/proc`, without following it.
-    fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
+    pub(crate) fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
         let link = self.open_beneath(path, OFlags::PATH | OFlags::NOFOLLOW)?;
         Ok(rustix::fs::readlinkat(&link, "", Vec::new())?.into_bytes())
     }

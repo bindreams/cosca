@@ -15,8 +15,10 @@
 //!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not require a pidfd
 //!   at spawn yet ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `pidfd_send_signal` needs 5.1, and `Child::terminate` uses it. `Child::kill` uses `kill(2)`.
-//!   An `EPERM` from either for an already-exited child is `Ok`; one for a live child of a more
-//!   privileged user is an ordinary permission error.
+//!   An `EPERM` from either that the kernel's own permission rule would not produce (the sender's
+//!   uid matches the target's real or saved uid, or it holds `CAP_KILL`) came from a seccomp or LSM
+//!   filter, and is `Unsupported` naming the syscall. An `EPERM` for an already-exited child is
+//!   `Ok`; one for a live child of a more privileged user is an ordinary permission error.
 //! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
 //!   leaf reaps that way; an owned child's waits and reaps still go by pid
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
