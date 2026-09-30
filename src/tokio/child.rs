@@ -799,10 +799,6 @@ impl Child {
 /// own. One exception: a leaf this handle already killed through
 /// [`kill_tree`](Child::kill_tree) is released like an armed one.
 ///
-/// Once [`wait`](Child::wait) has reaped the root, a tree contained by a process group or a macOS
-/// fd marker's group is not signalled: the root's number, and so the group's, may already belong
-/// to an unrelated process group (principle 4).
-///
 /// Then it releases what the handle owns:
 ///
 /// - **The root.** tokio's own `Child` is dropped normally. It tries one reap, and a root that has
@@ -818,7 +814,9 @@ impl Child {
 ///   `KILL_ON_JOB_CLOSE` cleared, and nothing kills it. Other mechanisms drop in place.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop).
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
+/// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
+/// number.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -840,15 +838,35 @@ impl Drop for Child {
         // `os`, so a panic in the signals unwinds through the resources while still inside it.
         let _bounded = crate::bounded::Section::enter();
         let mut os = std::mem::take(&mut self.os);
+        // Read before the `kill_on_drop` branch: a disarmed drop signals nothing, but releasing
+        // tokio's `Child` still `try_wait`s the root's number, so it needs the same evidence.
+        #[cfg(unix)]
+        let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
+        #[cfg(unix)]
+        let view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
         if self.kill_on_drop {
+            #[cfg(unix)]
+            signal_on_drop(self.id, view, &mut os);
+            #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
+        }
+        // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
+        // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
+        #[cfg(unix)]
+        if view.root_reaped && !own_reap {
+            forget_reaped_elsewhere(&mut os, self.id.pid());
         }
         os.release_without_waiting();
     }
 }
 
 /// The signals of a kill-on-drop drop: the tree, then the root.
-fn signal_on_drop(id: ProcessId, tree_killed: &crate::containment::TreeKilled, os: &mut OsResources) {
+fn signal_on_drop(
+    id: ProcessId,
+    #[cfg(unix)] view: crate::containment::DropView,
+    #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
+    os: &mut OsResources,
+) {
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
@@ -860,12 +878,8 @@ fn signal_on_drop(id: ProcessId, tree_killed: &crate::containment::TreeKilled, o
     //
     // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
     // this handle's own state, or the number no longer reading as this root (tokio's state cannot
-    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after this
-    // read, and tokio's orphan queue reaping by number afterwards.
-    #[cfg(unix)]
-    let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
-    #[cfg(unix)]
-    let view = crate::containment::DropView::read(id, own_reap, tree_killed);
+    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
+    // was read, and tokio's orphan queue reaping by number afterwards.
     #[cfg(unix)]
     let tree = os.attached.hard_kill_for_drop(view);
     #[cfg(not(unix))]
@@ -881,14 +895,9 @@ fn signal_on_drop(id: ProcessId, tree_killed: &crate::containment::TreeKilled, o
             log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
         }
     }
-    // Already reaped: no signal to issue. A reap outside this handle (tokio's state cannot see
-    // it) leaves the number possibly naming another child, so tokio's `Child` must not run its
-    // own drop, which reaps by pid.
+    // Already reaped: no signal to issue.
     #[cfg(unix)]
     if view.root_reaped {
-        if !own_reap {
-            forget_reaped_elsewhere(os, pid);
-        }
         return;
     }
     #[cfg(not(unix))]

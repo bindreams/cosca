@@ -52,6 +52,10 @@ mod linux {
     pub(super) enum Ended {
         Exited(i32),
         Signalled(i32),
+        /// Already reaped while its stdin was still open. Nothing but the drop's `SIGKILL` can
+        /// have ended it then, and tokio's own `Child` drop reaped it: the drop's `try_wait` ran
+        /// after the kill had already taken effect.
+        KilledAndReapedByTokio,
     }
 
     /// The root's exit, read through a pidfd opened while the caller still holds the unreaped
@@ -86,10 +90,15 @@ mod linux {
 
         /// Close the root's stdin, so a root nothing signalled exits on its own, wait for its
         /// exit, and say how it ended. A root a drop killed died of `SIGKILL` before its stdin
-        /// closed; one nothing killed exits `0`. Waiting on the root is waiting on an external
-        /// event that always comes, since its stdin is closed: no bound is needed.
+        /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root the kill
+        /// already ended, which leaves no status to read: that is [`Ended::KilledAndReapedByTokio`].
+        /// The read is exact, since nothing else reaps before this thread yields to a runtime.
         pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
+            let reaped_while_open = self.reaped();
             drop(stdin);
+            if reaped_while_open {
+                return Ended::KilledAndReapedByTokio;
+            }
             loop {
                 let status = rustix::process::waitid(
                     rustix::process::WaitId::PidFd(self.0.as_fd()),
@@ -245,7 +254,14 @@ async fn a_kill_on_drop_drop_kills_the_root() {
     let (child, stdin) = blocker();
     let root = linux::Pidfd::of(&child);
     drop(child);
-    assert_eq!(root.ended_after_closing(stdin), linux::Ended::Signalled(libc::SIGKILL));
+    let ended = root.ended_after_closing(stdin);
+    assert!(
+        matches!(
+            ended,
+            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::KilledAndReapedByTokio
+        ),
+        "the drop must kill the root, got {ended:?}"
+    );
 }
 
 /// The drop runs inside a bounded section, which is what turns a wait added to it into a debug
@@ -372,8 +388,8 @@ async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
 /// reads it through its own pidfd.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_signalled_root_is_handed_off_not_waited_on() {
-    if !alone(fixture_path!(a_signalled_root_is_handed_off_not_waited_on)) {
+async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
+    if !alone(fixture_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on)) {
         return;
     }
     let name = "cosca-async-drop-handoff";

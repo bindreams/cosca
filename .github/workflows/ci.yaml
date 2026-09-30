@@ -389,8 +389,8 @@ jobs:
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
             run_forwarding "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
-            # Plain `cargo test` shares one process across tests, unlike nextest: the ignored cgroup
-            # `own_process` tests run under that model here. Root cargo keeps the runner toolchain
+            # Plain `cargo test` shares one process across tests, unlike nextest: the cgroup-lane
+            # tests run under that model here (`--include-ignored` adds only the `dir_tests` unshare test). Root cargo keeps the runner toolchain
             # via `sudo -E`; the target dir is handed back so later steps can write to it.
             export PATH="$4"
             run_forwarding "$2" test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} -- --include-ignored cgroup || status=1

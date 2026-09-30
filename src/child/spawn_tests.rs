@@ -712,6 +712,60 @@ fn a_failed_password_write_kills_the_contained_tree() {
     );
 }
 
+/// Sync twin of the async `a_failed_password_write_removes_the_leaf_once_the_tree_drains`: after
+/// the failed write the handle's blocking `Drop` waits for the killed tree to drain and removes
+/// the leaf, warning of nothing. The members of the fake leaf exit when the wait is about to
+/// block, not before.
+///
+/// Mutant: the leaf's `Drop` does not wait for the drain (`block_until_drained` returns at once).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
+    use crate::containment::cgroup::fault as leaf_fault;
+    use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
+
+    crate::log_capture::install();
+    let name = "cosca-password-drains-leaf";
+    let fake = FakeLeaf::new(name, true);
+    let (path, events) = (fake.leaf.clone(), fake.events.clone());
+    leaf_fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&path, &events));
+    let (blocking, wait_reached) = std::sync::mpsc::channel();
+    leaf_fault::set_drain_blocking_notifier(blocking);
+    let members = fake.events.clone();
+    let exiting = std::thread::spawn(move || {
+        // A closed channel means the wait never blocked: nothing to release.
+        if wait_reached.recv().is_ok() {
+            FakeLeaf::set_populated(&members, false);
+        }
+    });
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(entered_leaf_at(fake.leaf.clone())),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+
+    let mark = crate::log_capture::mark();
+    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    teardown.assert_killed();
+    leaf_fault::take_drain_blocking_notifier();
+    exiting.join().expect("the exiting thread");
+    leaf_fault::take_rmdir_hook();
+
+    assert!(matches!(err, Error::Elevation { .. }), "got {err:?}");
+    assert!(
+        !fake.leaf.exists(),
+        "the drained leaf must be removed by the handle's drop"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, name),
+        Vec::<log::Level>::new(),
+        "a leaf that was removed must not be warned about"
+    );
+}
+
 /// A tree-teardown failure during a failed password write is logged at `warn`, naming the leaf
 /// and the OS reason, like other teardown-mechanism failures (e.g. `warn_leaf_left_behind`).
 #[cfg(target_os = "linux")]

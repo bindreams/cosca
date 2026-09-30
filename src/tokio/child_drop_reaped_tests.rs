@@ -187,6 +187,51 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     assert_eq!(drop_warns_since(mark).len(), 1);
 }
 
+/// A spawned `sleep` whose root something else (the application's own `waitpid`) has reaped,
+/// while the handle still reads it as running.
+fn foreign_reaped(mut cmd: Command) -> crate::tokio::Child {
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    child.kill().expect("kill the root");
+    crate::test_child::wait_until_zombie(pid);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own zombie child. This plays the application that reaps it.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    child
+}
+
+/// A disarmed drop signals nothing, but tokio's own `Child` drop still `try_wait`s the root's
+/// number, so a foreign reap must forget it there too. Mutant: the foreign-reap check runs only
+/// under `kill_on_drop`.
+#[tokio::test]
+async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::log_capture::install();
+    let root = drop_fault::record();
+    let backend_drops = crate::tokio::child::fault::count_backend_drops();
+    let mut child = foreign_reaped(session(&["sleep", "300"]));
+    child.detach();
+    drop(child);
+    assert_eq!(
+        (root.kills(), root.forgets(), backend_drops.get()),
+        (0, 1, 0),
+        "a detached drop must not run tokio's `Child` drop, which reaps by the reused number"
+    );
+}
+
+/// The same through the command's opt-out. Mutant: as above.
+#[tokio::test]
+async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::log_capture::install();
+    let root = drop_fault::record();
+    let backend_drops = crate::tokio::child::fault::count_backend_drops();
+    let mut cmd = session(&["sleep", "300"]);
+    cmd.kill_on_drop(false);
+    let child = foreign_reaped(cmd);
+    drop(child);
+    assert_eq!((root.kills(), root.forgets(), backend_drops.get()), (0, 1, 0));
+}
+
 /// The skip is quiet once this handle has already hard-killed the tree. Mutant: the tree-killed
 /// flag is ignored.
 #[tokio::test]
@@ -338,6 +383,15 @@ async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     assert_eq!(records[0].0, log::Level::Warn);
 }
 
+// The integration tests' cgroup helpers, compiled from their real source.
+#[cfg(target_os = "linux")]
+#[path = "../../tests/common/cgroup.rs"]
+#[allow(
+    dead_code,
+    reason = "this file needs `drain_and_remove_leaf` alone; the integration binaries use the rest"
+)]
+mod cgroup_common;
+
 /// A cgroup names its tree without the root's number, so the reaped root does not stop the drop's
 /// kill. The cgroup lane's counterpart of the sync test of the same name; `COSCA_TEST_CGROUP`
 /// is `0` everywhere else. Mutant: the skip applied to every mechanism, which logs the warn here.
@@ -358,6 +412,11 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
     cmd.stderr(crate::Stdio::pipe_out()).expect("stderr pipe");
     let mut child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), Containment::CgroupV2);
+    // The drop is under test, so it stays the killer; the leaf is the test's to remove afterwards.
+    let leaf = match &child.os.attached {
+        crate::containment::Attached::Cgroup(leaf) => leaf.path().to_path_buf(),
+        other => panic!("a cgroup child holds its leaf, got {other:?}"),
+    };
     let mut started = [0u8; 8];
     child
         .stdout()
@@ -378,6 +437,9 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
         .read_to_end(&mut rest)
         .await
         .expect("the cgroup kill ended the cat, closing stderr, with stdin still held");
+    // Stderr's EOF only proves the member is exiting. The drop may have left the leaf undrained:
+    // wait for the kernel's drain event, then remove it.
+    cgroup_common::drain_and_remove_leaf(&leaf);
 }
 
 /// Exactly one record of the drop's skip since `mark`, at `debug`.

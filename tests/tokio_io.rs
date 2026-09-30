@@ -370,6 +370,33 @@ async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
     common::assert_echoes(&mut grand, "the grandchild of a reaped process-group root");
 }
 
+/// `kill_tree()` before `wait()` is how a process-group tree is ended when the root will be waited
+/// on: the group kill happens while the live root still pins its number. The grandchild gives EOF
+/// (or a reset) once killed, so the read proves the teardown with no wait on a signal's delivery.
+#[cfg(unix)]
+#[tokio::test]
+async fn async_kill_tree_before_wait_tears_down_the_tree() {
+    use std::io::Read as _;
+    let common::AsyncEchoTree {
+        mut child,
+        root: _root,
+        mut grand,
+        ..
+    } = common::spawn_echo_tree_async_configured("spawn-grandchild-echo", |cmd| {
+        cmd.contain_with(cosca::ContainMode::Session);
+    })
+    .await;
+    child.kill_tree().expect("kill_tree");
+    child.wait().await.expect("wait reaps the killed root");
+    drop(child);
+    let mut buf = [0u8; 1];
+    match grand.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("grandchild not torn down by kill_tree before wait: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
@@ -619,9 +646,9 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
-// There is no zombie check for a dropped root: tokio's orphan queue reaps it, best-effort, once a
-// runtime next sees `SIGCHLD`, and cosca offers no edge to sequence one after
-// (`docs/principles.md`, principle 3).
+// The zombie check for a dropped root is `a_dropped_root_left_to_tokio_is_reaped` in the library's
+// tests: tokio's orphan queue reaps it, best-effort, once a runtime next sees `SIGCHLD`, and cosca
+// offers no edge to sequence one after (`docs/principles.md`, principle 3).
 
 // Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 
