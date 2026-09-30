@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Run the privilege tests inside a root-lane container (see `resolve_root_lanes` in ci.yaml).
 # Environment: PREFIX (words that change identity, may be empty), PRIVILEGE_TESTS (nextest
-# filterset), UID_SWITCH ("true": also run UID_SWITCH_TESTS, which need real root that can setuid),
-# FOREIGN_TMPDIR, and the EXPECT_* variables root-lane-check.sh reads.
+# filterset), FOREIGN_TMPDIR, and the EXPECT_* variables root-lane-check.sh reads.
 set -euxo pipefail
 
 if [[ "${FOREIGN_TMPDIR:-}" == "true" ]]; then
@@ -10,11 +9,6 @@ if [[ "${FOREIGN_TMPDIR:-}" == "true" ]]; then
     chown 1000:1000 /tmp/foreign
     chmod 0700 /tmp/foreign
     export TMPDIR=/tmp/foreign
-fi
-
-filter="${PRIVILEGE_TESTS:?}"
-if [[ "${UID_SWITCH:-}" == "true" ]]; then
-    filter="$filter | ${UID_SWITCH_TESTS:?}"
 fi
 
 # `PREFIX` must word-split into separate argv entries.
@@ -26,4 +20,4 @@ ${PREFIX:-} cargo-nextest nextest run \
     --archive-file /artifacts/root-lane.tar.zst \
     --workspace-remap /repo \
     --profile ci \
-    -E "$filter"
+    -E "${PRIVILEGE_TESTS:?}"

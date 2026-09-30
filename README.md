@@ -29,19 +29,21 @@ agent can't run that step locally either — it only runs in CI.
 
 ### Tests that need root
 
-A few tests (e.g. `foreign_kill_surfaces_permission_denied` in `tests/process_root.rs`) belong to
-the `ROOT` group: an on/off switch, `COSCA_TEST_ROOT` (default on, `=0` disables the group —
-reported as `ignored`, never a failure), plus separate CONSENT, `COSCA_TEST_ROOT_CONSENT` (default
-off, `=1` consents — an unmet consent FAILS the test, since the switch being on is not the same as
-meaning to run it). "Switch on" alone never assumes the environment happens to run as root — never
-a silent skip, never a false pass on every unprivileged machine. CI provisions root for exactly
-these tests: the root lanes in `.github/workflows/ci.yaml` (`UID_SWITCH_TESTS`) on Linux and macOS.
+Two test groups run only as root (principles 9 and 10 in `docs/principles.md`):
 
-These tests run as root, spawn real children under real, different unprivileged uids, and
-re-exec themselves as one of those uids (`READER_UID`) to make the call under test — never run
-them against this machine's own `sudo`. An ordinary (unprivileged) `cargo nextest run` must set
-`COSCA_TEST_ROOT=0`: the switch defaults ON, so the test would otherwise fail at its unmet consent
-instead of being skipped. Run them in a throwaway container instead.
+- `ROOT` (`COSCA_TEST_ROOT`): the library tests that need a DAC bypass.
+- `UID_SWITCH` (`COSCA_TEST_UID_SWITCH`): `foreign_kill_surfaces_permission_denied` in
+  `tests/process_root.rs`. It runs as real root, spawns children under two other real uids and
+  re-execs itself as one of them, so it also fails unless the process can `setuid` to both (not
+  under `unshare -r`, not as uid 1000).
+
+For each group, `=0` turns it off: its tests return early and report as passed. Otherwise
+`COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
+(unprivileged) run sets both switches to `0`. CI does this workflow-wide; the root lanes in
+`.github/workflows/ci.yaml` turn `ROOT` on, and turn `UID_SWITCH` on only in the lanes that are real
+root (Linux root, `DAC_READ_SEARCH`, foreign `TMPDIR`, and macOS).
+
+Never run these against this machine's own `sudo`; use a throwaway container.
 Two steps, because `--network none` (below) cannot itself fetch anything: first a networked step
 populates a named `CARGO_HOME` volume with cosca's own dependencies and `cargo-nextest` itself,
 then the actual test run is fully offline and network-isolated:
@@ -61,8 +63,8 @@ docker run --rm \
     rust:1 \
     bash -c 'cargo fetch --locked && cargo install cargo-nextest --locked --quiet'
 
-# 2. Offline and network-isolated: the actual root-precondition run. COSCA_TEST_ROOT_CONSENT=1
-#    consents to the ROOT group's real uid-switching; COSCA_TEST_ROOT=0 would instead skip it.
+# 2. Offline and network-isolated: the two groups' tests (`PRIVILEGE_TESTS` in ci.yaml). Each
+#    _CONSENT=1 consents to that group inside the sandbox; `=0` on the group would skip it.
 docker run --rm --network none \
     -v "$PWD":/repo:ro \
     -v cosca-root-test-cargo-home:/usr/local/cargo:ro \
@@ -70,9 +72,10 @@ docker run --rm --network none \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_NET_OFFLINE=true \
     -e COSCA_TEST_ROOT_CONSENT=1 \
+    -e COSCA_TEST_UID_SWITCH_CONSENT=1 \
     -w /repo \
     rust:1 \
-    cargo nextest run --offline -E "binary(process_root)"
+    cargo nextest run --offline -E "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"
 )
 docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 ```
@@ -80,13 +83,13 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 - The whole block is wrapped in `( set -e; … )` — a subshell, not the calling shell — so pasting
   it into an interactive terminal cannot change that shell's own error-handling behavior.
 - The container's default user is already root, so no `sudo` (and none of its `secure_path`/PATH
-  surprises) is needed inside it; `COSCA_TEST_ROOT_CONSENT=1` is the only thing that unlocks the
-  test's real uid-switching, and it stays inside the container's own environment. The repo is
+  surprises) is needed inside it; the two `_CONSENT=1` variables are what unlock the tests' real
+  privilege, and they stay inside the container's own environment. The repo is
   bind-mounted read-only, and both the build and the fetched dependencies go to throwaway named
   volumes — nothing under `target/` (or `~/.cargo`) on the host is ever touched, so there is no
   unprivileged/privileged ownership conflict to clean up afterward.
 - Don't lift the inner `cargo nextest run` out of the container and run it with `sudo` on the
-  host: `COSCA_TEST_ROOT_CONSENT=1` is real, standing consent to switch uids and spawn/kill
+  host: the consent variables are real, standing consent to switch uids and spawn/kill
   processes, and this project's own rule is that system-affecting tests run in a container or VM,
   never against this machine's own services.
 

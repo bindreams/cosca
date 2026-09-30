@@ -1,14 +1,9 @@
-//! `foreign_kill_surfaces_permission_denied`: a genuinely foreign, unprivileged caller's `kill`
-//! on a genuinely foreign, unprivileged target must surface `EPERM` as `Err`, never swallow it
-//! into `Ok`. Split out of `tests/process.rs` (which keeps the ordinary, non-root foreign-process
-//! tests): the uid-switching/re-exec machinery and the `ROOT` label/precondition CI keys its root
-//! step on are a separate concern, and living in their own binary lets a future root test reuse
-//! `tests/common/`'s pieces without dragging this one in. Unix-only, like the test itself.
+//! `foreign_kill_surfaces_permission_denied`: a foreign, unprivileged caller's `kill` on a foreign,
+//! unprivileged target surfaces `EPERM` as `Err`, never `Ok`. It is the `UID_SWITCH` group
+//! (`COSCA_TEST_UID_SWITCH`, principles 9 and 10): it runs as root and switches to real uids.
 
 #[path = "common/mod.rs"]
 mod common;
-#[cfg(unix)]
-use common::consent_root;
 
 /// Set on this binary's own re-exec of itself, routing `fn main` (bottom of this file) to
 /// [`foreign_kill_helper_main`] instead of the skuld harness — checked before skuld ever parses
@@ -16,29 +11,25 @@ use common::consent_root;
 #[cfg(unix)]
 const ENV_TARGET_PID: &str = "COSCA_FOREIGN_KILL_TARGET_PID";
 
-/// See the module doc. Runs only once its `ROOT` group's switch AND consent both hold
-/// (`common::preconditions::root`, `#[fixture(consent_root)]`, label `ROOT`) — this test changes
-/// real system state (two uid switches), so it needs explicit consent, not just the switch being
-/// on. `common::assert_root_capable()` then asserts the ACTUAL requirement (root, and on Linux
-/// the ability to setuid/setgid to both `TARGET_UID` and `READER_UID`): a missing capability at
-/// that point FAILS the test — switch-on-plus-consent is a promise the environment can do this,
-/// and a broken promise is a failure, not "unavailable".
+/// Runs only when `COSCA_TEST_UID_SWITCH` is not `0` and `COSCA_TEST_UID_SWITCH_CONSENT=1`;
+/// `common::assert_root_capable` then fails the test if the process cannot actually switch uids.
 ///
-/// Both the target and the actual caller under test run as ordinary child PROCESSES of this
-/// (root) one — never as this process itself — so root can always name and clean up the target
-/// regardless of what the assertions below do.
-///
-/// The target crosses to the reader as a bare pid: this process holds its unreaped
-/// `std::process::Child`, so the kernel cannot recycle the pid before the reader reports back.
+/// The target and the caller under test both run as child processes of this (root) one, never as
+/// this process, so root can always name and clean up the target. The target crosses to the reader
+/// as a bare pid: this process holds its unreaped `Child`, so the kernel cannot recycle the pid
+/// before the reader reports back.
 #[cfg(unix)]
-#[skuld::test(requires = [common::preconditions::root], labels = [common::ROOT])]
-fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &()) {
+#[skuld::test]
+fn foreign_kill_surfaces_permission_denied() {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
     use common::KillOnDrop;
 
+    if !common::require_group("UID_SWITCH") {
+        return;
+    }
     common::assert_root_capable();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -52,10 +43,7 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
         .expect("scratch directory for world-executable copies");
     std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
         .expect("chmod the scratch directory world-traversable");
-    // `env!("CARGO_BIN_EXE_…")` is the build-time path, which does not exist where a nextest
-    // archive runs (a root lane's container); nextest sets its own variable to the extracted one.
-    let testbin = std::env::var_os("NEXTEST_BIN_EXE_cosca_testbin").unwrap_or_else(|| common::testbin().into());
-    let target_bin = common::world_executable_copy(std::path::Path::new(&testbin), scratch.path());
+    let target_bin = common::world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
 
     // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
     // such concept), so this one spawn uses `std::process::Command` directly, under the spawn
@@ -102,11 +90,8 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
         status.code()
     );
 
-    // Restores the "must not kill" half of the contract: a kill that both delivers the signal
-    // AND returns Err(EPERM) would otherwise still pass the assertion above. A bare
-    // `try_wait() == None` would be a timing race (a SIGKILL can be in flight, not yet reaped) —
-    // a ping/pong round trip on the target's own control socket instead PROVES it is still alive
-    // AND responsive, not merely "not yet observed dead".
+    // The target was alive and answering while the reader was refused, so the EPERM came from a
+    // live foreign process. A bare `try_wait() == None` would only show it not yet reaped.
     common::assert_echoes(&mut sock, "the target");
 }
 

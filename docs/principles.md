@@ -227,7 +227,9 @@ copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the
 Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there. Its
 members are the tests whose names start with `setuid_` and the `group_teardown_setuid` binary, the
 same name-prefix convention as `namespaces_`; a new member takes the gate and that prefix. So does
-`COSCA_TEST_CGROUP` (the tests that need a delegated cgroup, whose names contain `cgroup` so the
+`COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids, today
+`process_root`): CI turns it off workflow-wide and opts in only in the root lanes that can
+`setuid` to those uids. So does `COSCA_TEST_CGROUP` (the tests that need a delegated cgroup, whose names contain `cgroup` so the
 cgroup lane selects them): CI turns it off workflow-wide and the cgroup step opts in. Some
 system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
 
