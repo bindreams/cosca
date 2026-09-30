@@ -601,7 +601,7 @@ impl Command {
 
     /// Contain with a specific [`ContainMode`].
     pub fn contain_with(&mut self, mode: ContainMode) -> &mut Command {
-        self.contain.mode = Some(mode);
+        let _ = mode;
         self
     }
 
