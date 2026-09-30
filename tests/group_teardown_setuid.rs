@@ -266,6 +266,10 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-setuid", &addr, &helper]);
+    // The setuid helper outlives this test (it exits on EOF after `drop(priv_sock)`, and cannot be
+    // killed or reaped from here), so it must not hold nextest's stdout/stderr.
+    cmd.stdout(cosca::Stdio::null()).expect("null stdout");
+    cmd.stderr(cosca::Stdio::null()).expect("null stderr");
     cmd.contain();
     let child = cmd.spawn().expect("spawn contained root");
 
