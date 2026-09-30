@@ -541,7 +541,7 @@ impl Drop for Child {
         // unrelated group. Only this handle reaps the root, so a root still unreaped here stays a
         // zombie — pinning its group — until `teardown_on_drop` below.
         #[cfg(unix)]
-        let tree = self.attached.hard_kill_for_drop(self.root_is_reaped());
+        let tree = self.attached.hard_kill_for_drop(self.root_is_reaped() && !crate::mutant("a"));
         #[cfg(not(unix))]
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {

@@ -1,0 +1,41 @@
+name: Mutants
+on:
+  pull_request:
+jobs:
+  mutants:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Build tests
+        run: cargo nextest run --locked --lib --no-run --target ${{ matrix.target }}
+      - name: Mutants
+        shell: bash
+        run: |
+          rc=0
+          for m in none a b c d e; do
+            echo "::group::mutant $m"
+            start=$SECONDS
+            if COSCA_MUT=$m cargo nextest run --locked --lib --target ${{ matrix.target }} --profile ci --no-fail-fast -E 'test(drop_reaped_tests)' > "mut-$m.log" 2>&1; then res=GREEN; else res=RED; fi
+            cat "mut-$m.log"
+            echo "::endgroup::"
+            echo "RESULT mutant=$m $res time=$((SECONDS-start))s"
+            grep -E "^\s+(FAIL|SIGABRT|TIMEOUT)" "mut-$m.log" | sort -u || true
+            if [ "$m" = none ] && [ "$res" = RED ]; then rc=1; fi
+            if [ "$m" != none ] && [ "$res" = GREEN ]; then rc=1; fi
+          done
+          exit $rc

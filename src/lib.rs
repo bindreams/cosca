@@ -155,3 +155,19 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
     c.commandline(line);
     c
 }
+
+pub(crate) fn mutant(m: &str) -> bool {
+    std::env::var("COSCA_MUT").as_deref() == Ok(m)
+}
+
+macro_rules! mutant_warn {
+    ($fmt:literal $(, $a:expr)*) => {
+        if crate::mutant("b") {
+        } else if crate::mutant("c") {
+            log::warn!("Child::drop: the root is already reaped, so this drop does not kill its process group (pgid ?); use kill_tree() before wait()");
+        } else {
+            log::warn!($fmt $(, $a)*)
+        }
+    };
+}
+pub(crate) use mutant_warn;

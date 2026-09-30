@@ -314,7 +314,13 @@ impl Attached {
         };
         #[cfg(target_os = "macos")]
         if let Attached::FdMarker(m) = self {
-            log::warn!(
+            if crate::mutant("d") {
+                return Ok(());
+            }
+            if crate::mutant("e") {
+                return self.hard_kill();
+            }
+            crate::mutant_warn!(
                 "Child::drop: the root is already reaped, so this drop does not kill its process group \
                  (pgid {pgid}), whose number may now name an unrelated group. Descendants that outlived \
                  the waited-on root and no longer hold the fd marker are not torn down by this drop; \
@@ -323,7 +329,7 @@ impl Attached {
             );
             return m.hard_kill_without_group_signal();
         }
-        log::warn!(
+        crate::mutant_warn!(
             "Child::drop: the root is already reaped, so this drop does not kill its process group \
              (pgid {pgid}), whose number may now name an unrelated group. Descendants that outlived \
              the waited-on root are not torn down by this drop; call kill_tree() before wait() to end \
