@@ -23,6 +23,37 @@
 //! carries `com.apple.security.cs.debugger`. So the helper runs from a copy of this binary
 //! ad-hoc signed with `cs.debugger`, made per helper in a temporary directory, which lets it
 //! attach to any child of the test.
+//!
+//! **Contract: it behaves like a debugger, for the signals cosca's tests send.** A tracer owns
+//! the tracee's signal delivery: XNU hands it every signal as a stop, except a `SIGKILL` sent
+//! while the tracee is stopped, which lands on its next release. A `SIGKILL` the tracer does see
+//! lands on release whatever the tracer passes on (xnu `kern_sig.c`, `psignal_internal` and
+//! `issignal`). So the helper promises only what a debugger does, for the sequences its tests
+//! drive:
+//!
+//! - It attaches, holds the tracee stopped under `S1:hold`, and continues it.
+//! - It continues each stop and passes its signal on ([`machine`]'s **Signals**): `SIGTERM`,
+//!   `SIGCONT` and `SIGKILL` at once; the first default-action `SIGTSTP` or `SIGTTIN` after the
+//!   detach, unless a later `SIGCONT` drops it. The detached tracee is then stopped by that
+//!   signal, or by the detach's own `SIGSTOP` (sometimes on macOS 26; see [`Report::Detached`]).
+//! - It ends by detaching, by reaping the exited tracee (which hands the zombie back), or by
+//!   exiting while tracing, where XNU kills the tracee.
+//!
+//! It does not promise, as no debugger does, to deliver a signal as an untraced process would
+//! get it. Outside the contract, and not bugs:
+//!
+//! - a caught or ignored stop signal, which is kept and re-sent after the detach like a default
+//!   one: a handler runs late, or never if the tracee exits while traced;
+//! - a signal sent while another is pending or being passed on, or during the attach or
+//!   detach: the helper's `SIGSTOP` clears a pending `SIGCONT`, and a `SIGCONT` cancels the
+//!   `SIGSTOP` S2 or S4 waits for, so the helper waits on;
+//! - a blocked or thread-directed signal;
+//! - `SIGTSTP`, `SIGTTIN` or `SIGTTOU` in an orphaned process group, which XNU discards for a
+//!   traced process.
+//!
+//! A test asserts the preconditions of each signal the contract passes on before it attaches
+//! (`tracer_tests::assert_receives`), so a broken one fails instead of hanging. `SIGKILL` and
+//! `SIGSTOP` have none.
 
 use std::io::Write as _;
 
@@ -441,19 +472,74 @@ pub(crate) const SIGTERM_EXIT: i32 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tracee {
     Plain,
+    /// Leads a process group of its own: the tracee for `SIGTSTP` and `SIGTTIN`, which XNU
+    /// discards in an orphaned group. Its `pg_jobc` changes only when the tracee, the test or the
+    /// tracer exits or changes group (xnu `kern_proc.c`, `fixjobc`). Its parent's group can be
+    /// orphaned under a shell without job control, and under plain `cargo test` the other tests'
+    /// orphaned grandchildren each decrement that group's `pg_jobc` when they exit
+    /// (`kern_exit.c`), so it can reach 0.
+    OwnGroup,
     /// Exits with [`SIGTERM_EXIT`] on `SIGTERM`.
     CatchSigterm,
-    /// Holds a thread it created with `pthread_create_suspended_np` and never starts, then writes
-    /// [`UNSTARTED_READY`] to its piped stdout.
+    /// Holds a thread it created with `pthread_create_suspended_np` and never starts.
     UnstartedThread,
+    /// [`Tracee::OwnGroup`] that ignores `SIGTSTP`: breaks one precondition of the helper's
+    /// contract, for the tests that check the preconditions are asserted.
+    IgnoreSigtstp,
+    /// [`Tracee::OwnGroup`] that blocks `SIGTSTP` on every thread: as [`Tracee::IgnoreSigtstp`].
+    /// It blocks it on its first thread, then re-executes itself, so the new image's threads all
+    /// inherit the mask.
+    BlockSigtstp,
+    /// Leads a session of its own, so its process group is orphaned: as
+    /// [`Tracee::IgnoreSigtstp`].
+    OwnSession,
 }
 
-/// The line that signals a [`Tracee::UnstartedThread`] is ready.
-pub(crate) const UNSTARTED_READY: &str = "uh-unstarted-ready";
+/// The start of the line [`uh_tracee_fixture`] writes once it is set up, followed by what it
+/// reads of itself then: `blocked=<n> pgrp=<n> caught=<n> ignored=<n>`.
+const TRACEE_READY: &str = "uh-tracee-ready";
 
-/// Spawns [`uh_tracee_fixture`] of `kind`, uncontained, with a piped stdin: closing it ends the
-/// tracee.
-pub(crate) fn spawn_tracee(kind: Tracee) -> crate::Child {
+/// What a tracee fixture reported of itself once it was set up. Each mask has bit `signal - 1`
+/// for each signal.
+#[derive(Debug)]
+pub(crate) struct Ready {
+    /// The signals its threads block. Every thread inherits the mask the first thread had, and
+    /// the fixture sets no other.
+    pub(crate) blocked: u32,
+    /// Its process group.
+    pub(crate) pgrp: libc::pid_t,
+    /// The signals it has a handler for.
+    pub(crate) caught: u32,
+    /// The signals it has set to `SIG_IGN`.
+    pub(crate) ignored: u32,
+}
+
+impl Ready {
+    fn parse(fields: &str) -> Option<Ready> {
+        let mut values = [None; 4];
+        for field in fields.split_whitespace() {
+            let (key, value) = field.split_once('=')?;
+            let at = ["blocked", "pgrp", "caught", "ignored"]
+                .iter()
+                .position(|k| *k == key)?;
+            values[at] = Some(value.parse::<i64>().ok()?);
+        }
+        let [Some(blocked), Some(pgrp), Some(caught), Some(ignored)] = values else {
+            return None;
+        };
+        Some(Ready {
+            blocked: u32::try_from(blocked).ok()?,
+            pgrp: libc::pid_t::try_from(pgrp).ok()?,
+            caught: u32::try_from(caught).ok()?,
+            ignored: u32::try_from(ignored).ok()?,
+        })
+    }
+}
+
+/// Spawns [`uh_tracee_fixture`] of `kind`, uncontained, with a piped stdin (closing it ends the
+/// tracee), and waits until it is set up. Its handlers and signal mask are then final: the test
+/// may read them and attach.
+pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
@@ -463,67 +549,139 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> crate::Child {
             "--exact",
             crate::test_child::fixture_path!(uh_tracee_fixture),
         ])
-        .env("COSCA_UH_ROLE", "tracee");
-    match kind {
-        Tracee::Plain => {}
-        Tracee::CatchSigterm => {
-            cmd.env("COSCA_UH_CATCH", "SIGTERM");
-        }
-        Tracee::UnstartedThread => {
-            cmd.env("COSCA_UH_UNSTARTED", "1");
-        }
-    }
+        .env("COSCA_UH_ROLE", "tracee")
+        .env("COSCA_UH_KIND", format!("{kind:?}"));
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    let stdout = match kind {
-        Tracee::UnstartedThread => crate::Stdio::pipe(),
-        Tracee::Plain | Tracee::CatchSigterm => crate::Stdio::null(),
-    };
-    cmd.stdout(stdout).expect("stdout");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
-    cmd.spawn().expect("spawn the tracee fixture")
+    let mut tracee = cmd.spawn().expect("spawn the tracee fixture");
+    let ready = await_ready(&mut tracee);
+    (tracee, ready)
 }
 
-/// The tracee: reads stdin until EOF or one byte, then exits 0. A no-op unless
+/// Reads the tracee's stdout up to its [`TRACEE_READY`] line. Panics at EOF: the tracee exited
+/// first. The tracee writes nothing to the pipe after that line, so it is dropped here.
+fn await_ready(tracee: &mut crate::Child) -> Ready {
+    use std::io::BufRead as _;
+    let mut stdout = std::io::BufReader::new(tracee.stdout().expect("the tracee's stdout is piped"));
+    loop {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).expect("read the tracee's stdout");
+        assert!(n > 0, "the tracee exited before it was ready");
+        if let Some(fields) = line.trim().strip_prefix(TRACEE_READY) {
+            return Ready::parse(fields).unwrap_or_else(|| panic!("malformed tracee ready line: {line:?}"));
+        }
+    }
+}
+
+/// The tracee: sets itself up as `COSCA_UH_KIND` says ([`Tracee`]), writes [`TRACEE_READY`] to
+/// stdout and points stdout at `/dev/null` (libtest fails a run whose report it cannot write, and
+/// the test drops the pipe), then reads stdin until EOF or one byte, then exits 0. A no-op unless
 /// `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
 #[test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
     }
-    if std::env::var("COSCA_UH_CATCH").as_deref() == Ok("SIGTERM") {
-        extern "C" fn exit_on_sigterm(_: libc::c_int) {
-            // SAFETY: `_exit` is async-signal-safe.
-            unsafe { libc::_exit(SIGTERM_EXIT) }
-        }
-        // SAFETY: the handler calls only `_exit`; this process runs no other test.
-        let previous = unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
-        assert_ne!(previous, libc::SIG_ERR, "install the SIGTERM handler");
+    extern "C" fn exit_on_sigterm(_: libc::c_int) {
+        // SAFETY: `_exit` is async-signal-safe.
+        unsafe { libc::_exit(SIGTERM_EXIT) }
     }
-    if std::env::var("COSCA_UH_UNSTARTED").as_deref() == Ok("1") {
-        unsafe extern "C" {
-            fn pthread_create_suspended_np(
-                thread: *mut libc::pthread_t,
-                attr: *const libc::pthread_attr_t,
-                start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
-                arg: *mut libc::c_void,
-            ) -> libc::c_int;
+    let own_group = || {
+        nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).expect("setpgid");
+    };
+    let kind = std::env::var("COSCA_UH_KIND").expect("COSCA_UH_KIND is set by spawn_tracee");
+    match kind.as_str() {
+        "Plain" => {}
+        "OwnGroup" => own_group(),
+        "CatchSigterm" => {
+            // SAFETY: the handler calls only `_exit`; this process runs no other test.
+            let previous = unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
+            assert_ne!(previous, libc::SIG_ERR, "install the SIGTERM handler");
         }
-        extern "C" fn never_runs(_: *mut libc::c_void) -> *mut libc::c_void {
-            std::ptr::null_mut()
+        "UnstartedThread" => {
+            unsafe extern "C" {
+                fn pthread_create_suspended_np(
+                    thread: *mut libc::pthread_t,
+                    attr: *const libc::pthread_attr_t,
+                    start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+                    arg: *mut libc::c_void,
+                ) -> libc::c_int;
+            }
+            extern "C" fn never_runs(_: *mut libc::c_void) -> *mut libc::c_void {
+                std::ptr::null_mut()
+            }
+            let mut thread: libc::pthread_t = 0;
+            // SAFETY: valid out-pointer, default attributes, and a start routine that touches
+            // nothing.
+            let rc =
+                unsafe { pthread_create_suspended_np(&mut thread, std::ptr::null(), never_runs, std::ptr::null_mut()) };
+            assert_eq!(rc, 0, "pthread_create_suspended_np");
         }
-        let mut thread: libc::pthread_t = 0;
-        // SAFETY: valid out-pointer, default attributes, and a start routine that touches nothing.
-        let rc =
-            unsafe { pthread_create_suspended_np(&mut thread, std::ptr::null(), never_runs, std::ptr::null_mut()) };
-        assert_eq!(rc, 0, "pthread_create_suspended_np");
-        // Raw `stdout()`, not `println!`, which libtest captures.
-        let line = format!("\n{UNSTARTED_READY}\n");
-        let mut out = std::io::stdout().lock();
-        out.write_all(line.as_bytes())
-            .and_then(|()| out.flush())
-            .expect("report readiness");
+        "IgnoreSigtstp" => {
+            own_group();
+            // SAFETY: `SIG_IGN` runs no code; this process runs no other test.
+            let previous = unsafe { libc::signal(libc::SIGTSTP, libc::SIG_IGN) };
+            assert_ne!(previous, libc::SIG_ERR, "ignore SIGTSTP");
+        }
+        "BlockSigtstp" => {
+            let mut set = nix::sys::signal::SigSet::empty();
+            set.add(nix::sys::signal::Signal::SIGTSTP);
+            set.thread_block().expect("block SIGTSTP");
+            reexec_as("BlockedSigtstp");
+        }
+        "BlockedSigtstp" => own_group(),
+        "OwnSession" => {
+            nix::unistd::setsid().expect("setsid");
+        }
+        other => panic!("unknown COSCA_UH_KIND {other:?}"),
     }
+    let blocked = nix::sys::signal::SigSet::thread_get_mask().expect("read the signal mask");
+    let blocked: libc::sigset_t = *blocked.as_ref();
+    // SAFETY: `getpgrp` has no preconditions.
+    let pgrp = unsafe { libc::getpgrp() };
+    let (mut caught, mut ignored) = (0u32, 0u32);
+    for signal in (1..32).filter(|&s| s != libc::SIGKILL && s != libc::SIGSTOP) {
+        // SAFETY: a null `act` only reads the action into `old`, a valid out-pointer.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::sigaction(signal, std::ptr::null(), &mut old) };
+        assert_eq!(rc, 0, "read the action of signal {signal}");
+        match old.sa_sigaction {
+            libc::SIG_DFL => {}
+            libc::SIG_IGN => ignored |= 1 << (signal - 1),
+            _ => caught |= 1 << (signal - 1),
+        }
+    }
+    // Raw `stdout()`, not `println!`, which libtest captures.
+    let line = format!("\n{TRACEE_READY} blocked={blocked} pgrp={pgrp} caught={caught} ignored={ignored}\n");
+    let mut out = std::io::stdout().lock();
+    out.write_all(line.as_bytes())
+        .and_then(|()| out.flush())
+        .expect("report readiness");
+    let null = std::fs::File::options()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    nix::unistd::dup2_stdout(&null).expect("point stdout at /dev/null");
+    drop(out);
     let _ = sys::read_byte(0);
+}
+
+/// Replaces the fixture's image with a fresh one of `kind`, keeping its pid, argv, environment
+/// and the calling thread's signal mask, which becomes the new image's first thread's. Raw
+/// `execve`: `std`'s `exec` resets the mask.
+fn reexec_as(kind: &str) -> ! {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = |bytes: &[u8]| std::ffi::CString::new(bytes).expect("no NUL in argv or the environment");
+    let exe = c(std::env::current_exe().expect("current_exe").as_os_str().as_bytes());
+    let argv: Vec<_> = std::env::args_os().map(|arg| c(arg.as_bytes())).collect();
+    let env: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| key != "COSCA_UH_KIND")
+        .map(|(key, value)| c(&[key.as_bytes(), b"=", value.as_bytes()].concat()))
+        .chain([c(format!("COSCA_UH_KIND={kind}").as_bytes())])
+        .collect();
+    let e = nix::unistd::execve(&exe, &argv, &env).unwrap_err();
+    panic!("re-execute the tracee fixture: {e}")
 }
 
 /// The helper's entry point. A no-op unless `COSCA_UH_ROLE=helper`.

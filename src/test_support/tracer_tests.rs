@@ -1,4 +1,5 @@
-//! The feasibility facts, and one test per row of the helper's transition table (`machine.rs`).
+//! The feasibility facts, the contract's preconditions, and one test per row of the helper's
+//! transition table (`machine.rs`).
 //! Each test asserts every report up to each point where the helper waits, so a broken row
 //! fails an assertion there rather than passing through another row's identical final report,
 //! and names the mutant that fails it.
@@ -20,12 +21,79 @@ fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
 
 /// [`tracee`] of `kind` (see [`super::spawn_tracee`]).
 fn tracee_with(kind: Tracee) -> Option<(crate::Child, std::io::PipeWriter)> {
+    tracee_receiving(kind, &[])
+}
+
+/// [`tracee`] of `kind`, which the test sends each of `signals` while it is traced: asserts that
+/// it receives them as the helper's contract needs ([`assert_receives`]).
+fn tracee_receiving(kind: Tracee, signals: &[i32]) -> Option<(crate::Child, std::io::PipeWriter)> {
     if !crate::test_support::require_group("TRACER") {
         return None;
     }
-    let mut child = super::spawn_tracee(kind);
+    let (mut child, ready) = super::spawn_tracee(kind);
+    for &signal in signals {
+        let caught = kind == Tracee::CatchSigterm && signal == libc::SIGTERM;
+        assert_receives(child.id().pid(), &ready, signal, caught);
+    }
     let stdin = child.stdin().expect("the tracee's stdin is piped");
     Some((child, stdin))
+}
+
+/// `signal`'s bit in a signal mask.
+fn bit(signal: i32) -> u32 {
+    debug_assert!((1..32).contains(&signal), "signal {signal} is outside the mask");
+    1 << (signal - 1)
+}
+
+/// Asserts the preconditions of the helper's contract (see [`super`]) for `signal`, sent to the
+/// set-up, untraced tracee `pid`, from what it reported of itself (`ready`): its threads do not
+/// block it, it has a handler exactly when `caught`, and it does not ignore it (stricter than
+/// needed for `SIGCONT`, which continues the process even when ignored). A `SIGTSTP`, `SIGTTIN`
+/// or `SIGTTOU` must also not be sent into an orphaned process group: XNU discards those three
+/// there for a traced process whatever its disposition (xnu `kern_sig.c`, `psignal_internal`,
+/// `pg_jobc == 0`), so the helper would wait for a stop that never comes. For them the tracee
+/// must lead its own group ([`Tracee::OwnGroup`]), whose `pg_jobc` only the tracee, the test or
+/// the tracer can change after this check.
+///
+/// `SIGKILL` and `SIGSTOP` need none of this: they cannot be blocked, caught or ignored, and are
+/// not job-control stops.
+fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
+    assert_eq!(
+        ready.blocked & bit(signal),
+        0,
+        "precondition: the tracee blocks signal {signal}"
+    );
+    assert_eq!(
+        ready.ignored & bit(signal),
+        0,
+        "precondition: the tracee ignores signal {signal}"
+    );
+    assert_eq!(
+        ready.caught & bit(signal) != 0,
+        caught,
+        "precondition: whether the tracee catches signal {signal}"
+    );
+    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
+        assert_job_control_reaches(pid, ready, signal);
+    }
+}
+
+/// The group half of [`assert_receives`] for the job-control stop `signal`.
+fn assert_job_control_reaches(pid: u32, ready: &super::Ready, signal: i32) {
+    assert_eq!(
+        ready.pgrp, pid as libc::pid_t,
+        "precondition: the tracee does not lead its own process group. Spawn it as Tracee::OwnGroup"
+    );
+    let jobc = match crate::identity::kinfo::kinfo(pid as _) {
+        crate::identity::Resolved::Found(info) => info.e_jobc(),
+        crate::identity::Resolved::Gone => panic!("precondition: the tracee {pid} is gone"),
+        crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),
+    };
+    assert_ne!(
+        jobc, 0,
+        "precondition: the tracee's process group is orphaned (pg_jobc {jobc}), so XNU discards \
+         signal {signal} sent to it while traced. Spawn it as Tracee::OwnGroup"
+    );
 }
 
 /// A report as the helper wrote it.
@@ -225,6 +293,141 @@ fn feasibility_facts() {
         "the detached tracee after SIGSTOP"
     );
     end_stopped(tracee);
+}
+
+// Preconditions ================================================================================
+
+/// Runs [`assert_receives`] for `signal` and `caught` on a set-up tracee of `kind`, which it then
+/// ends by EOF: `Err` with the panic message if a precondition fails. Nothing is traced.
+fn check_receives(kind: Tracee, signal: i32, caught: bool) -> Result<(), String> {
+    let (mut tracee, ready) = super::spawn_tracee(kind);
+    let stdin = tracee.stdin().expect("the tracee's stdin is piped");
+    let pid = tracee.id().pid();
+    let checked = std::panic::catch_unwind(|| assert_receives(pid, &ready, signal, caught));
+    drop(stdin);
+    assert_exited_cleanly(tracee);
+    checked.map_err(|payload| match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload
+            .downcast::<&str>()
+            .map(|message| message.to_string())
+            .expect("a string panic payload"),
+    })
+}
+
+/// Every signal the tests send meets the preconditions on the tracee they send it to. Mutants: the
+/// orphaned-group check reads a field that is 0 here; `Tracee::OwnGroup` stays in its parent's
+/// group.
+#[test]
+fn the_tracees_meet_the_preconditions() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGCONT] {
+        assert_eq!(
+            check_receives(Tracee::OwnGroup, signal, false),
+            Ok(()),
+            "signal {signal}"
+        );
+    }
+    assert_eq!(check_receives(Tracee::Plain, libc::SIGTERM, false), Ok(()));
+    assert_eq!(check_receives(Tracee::CatchSigterm, libc::SIGTERM, true), Ok(()));
+}
+
+/// Mutant: the signal mask is not checked.
+#[test]
+fn a_blocked_signal_fails_the_precondition() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::BlockSigtstp, libc::SIGTSTP, false).expect_err("no failure");
+    assert!(message.contains("blocks signal 18"), "{message}");
+}
+
+/// The block is the process's, not one thread's: an untraced `SIGTSTP` stays pending, and the
+/// tracee exits on EOF. Mutant: `BlockSigtstp` blocks it on the reading thread only, and the
+/// main thread takes the stop.
+#[test]
+fn a_blocked_tracee_blocks_the_signal_on_every_thread() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let (mut tracee, ready) = super::spawn_tracee(Tracee::BlockSigtstp);
+    let stdin = tracee.stdin().expect("the tracee's stdin is piped");
+    let pid = tracee.id().pid();
+    // So XNU would not discard the stop the mutant takes.
+    assert_job_control_reaches(pid, &ready, libc::SIGTSTP);
+    let message = panic_of(|| assert_receives(pid, &ready, libc::SIGTSTP, false));
+    assert!(message.contains("blocks signal 18"), "{message}");
+    send(pid, libc::SIGTSTP);
+    drop(stdin);
+    let info = await_change(pid);
+    if info.si_code == libc::CLD_STOPPED {
+        end_stopped(tracee);
+        panic!("the tracee was stopped by signal {}", info.si_status);
+    }
+    assert_exited_cleanly(tracee);
+}
+
+/// Mutant: `tracee_receiving` does not assert the preconditions.
+#[test]
+fn a_tracee_a_test_sends_a_job_control_stop_must_lead_its_own_group() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = panic_of(|| drop(tracee_receiving(Tracee::Plain, &[libc::SIGTSTP])));
+    assert!(message.contains("does not lead its own process group"), "{message}");
+}
+
+/// Mutant: `SIG_IGN` is not checked.
+#[test]
+fn an_ignored_signal_fails_the_precondition() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::IgnoreSigtstp, libc::SIGTSTP, false).expect_err("no failure");
+    assert!(message.contains("ignores signal 18"), "{message}");
+}
+
+/// Mutant: the handler is not checked.
+#[test]
+fn a_missing_handler_fails_the_precondition() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::Plain, libc::SIGTERM, true).expect_err("no failure");
+    assert!(message.contains("catches signal 15"), "{message}");
+}
+
+/// Mutant: the own-group check is skipped.
+#[test]
+fn a_shared_group_fails_the_precondition_for_a_job_control_stop() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::Plain, libc::SIGTSTP, false).expect_err("no failure");
+    assert!(message.contains("does not lead its own process group"), "{message}");
+}
+
+/// A session leader leads its own group too, so only the orphaned-group check fails. Mutant: that
+/// check is skipped.
+#[test]
+fn an_orphaned_group_fails_the_precondition_for_a_job_control_stop() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::OwnSession, libc::SIGTSTP, false).expect_err("no failure");
+    assert!(message.contains("process group is orphaned"), "{message}");
+}
+
+/// XNU discards only the job-control stops in an orphaned group. Mutant: the orphaned-group check
+/// applies to every signal.
+#[test]
+fn an_orphaned_group_does_not_matter_for_other_signals() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    assert_eq!(check_receives(Tracee::OwnSession, libc::SIGTERM, false), Ok(()));
 }
 
 // Client ======================================================================================
@@ -467,22 +670,6 @@ fn read_threads(pid: u32) -> Vec<libc::proc_threadinfo> {
         .collect()
 }
 
-/// Reads the tracee's stdout up to its [`super::UNSTARTED_READY`] line, and returns the pipe to
-/// be held open while the tracee lives: libtest fails a run whose report it cannot write. Panics
-/// at EOF: the tracee exited first.
-fn await_ready(tracee: &mut crate::Child) -> impl Sized {
-    use std::io::BufRead as _;
-    let mut stdout = std::io::BufReader::new(tracee.stdout().expect("the tracee's stdout is piped"));
-    loop {
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).expect("read the tracee's stdout");
-        assert!(n > 0, "the tracee exited before it was ready");
-        if line.trim() == super::UNSTARTED_READY {
-            return stdout;
-        }
-    }
-}
-
 /// Re-checks, under a backoff, until the held tracee is `SSTOP` and every thread of it that has
 /// run is in an interruptible wait or suspended. The hold keeps the stop, and a stopping thread
 /// parks once off its kernel locks, so only the tracee's end stops that from coming: it fails
@@ -522,7 +709,6 @@ fn a_stop_with_a_never_started_thread_settles() {
         return;
     };
     let pid = tracee.id().pid();
-    let _stdout = await_ready(&mut tracee);
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h"]);
     await_settled(pid);
@@ -599,7 +785,7 @@ fn s2_backs_off_before_the_release(force: &str) {
 /// `SIGTERM`. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
 #[test]
 fn s2_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee_with(Tracee::CatchSigterm) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::CatchSigterm, &[libc::SIGTERM]) else {
         return;
     };
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM");
@@ -621,7 +807,9 @@ fn s2_passes_a_stopping_signal_through() {
 /// the kept signal is not re-sent.
 #[test]
 fn s2_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S2stop:SIGTSTP").attach(&mut tracee);
     expect(&mut th, &HELD);
@@ -1238,7 +1426,9 @@ fn released_with_pending<'a>(tracee: &'a mut crate::Child, force: &str, signal: 
 /// Mutant: S3 passes on signal 0.
 #[test]
 fn s3_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold", libc::SIGTERM);
     expect(&mut th, &["blocking S3 eof", "S3s", "blocking S3 eof"]);
@@ -1253,7 +1443,9 @@ fn s3_passes_a_stopping_signal_through() {
 /// Mutants: S3 passes a stop signal on; the kept signal is not re-sent after the detach.
 #[test]
 fn s3_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1270,7 +1462,9 @@ fn s3_keeps_a_stop_signal_until_after_the_detach() {
 /// Mutant: a later stop signal replaces the kept one.
 #[test]
 fn s3_keeps_only_the_first_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGTTIN]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1289,7 +1483,9 @@ fn s3_keeps_only_the_first_stop_signal() {
 /// Mutant: a `SIGCONT` passed on leaves the kept stop signal.
 #[test]
 fn s3_a_sigcont_drops_a_kept_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGCONT]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1316,7 +1512,9 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
 /// Mutants: S4 passes a stop signal on; S4 detaches from any stop.
 #[test]
 fn s4_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     // S3's injected byte takes it to S4 before the SIGTSTP stop is handled there, and S4 sends no
     // SIGSTOP until the test does, after S4k: SIGSTOP (17) would otherwise beat SIGTSTP (18).
@@ -1333,7 +1531,9 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
 /// Mutant: S4 ignores a failed re-send.
 #[test]
 fn s4_a_failed_resend_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S4r:EPERM").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1417,7 +1617,9 @@ fn s3_a_failed_pass_through_fails() {
 /// detaches from whatever stop holds the tracee.
 #[test]
 fn s4_passes_a_stopping_signal_through_before_detaching() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]) else {
+        return;
+    };
     let pid = tracee.id().pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL", libc::SIGTERM);
     expect(

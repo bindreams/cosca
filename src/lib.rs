@@ -28,6 +28,24 @@
 //! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
 //! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
 //! described under [`Command::kill_on_drop`].
+//!
+//! # A child under a debugger
+//!
+//! A debugger that traces a [`Child`] owns its signal delivery: a graceful signal, such as the
+//! one [`Child::terminate_tree`] sends, reaches the child only if the debugger passes it on. It
+//! cannot cancel the `SIGKILL` of [`Child::kill`], but it can delay the death:
+//!
+//! - On Linux only if it traces exits (`PTRACE_O_TRACEEXIT`): it then holds the dying child at an
+//!   exit stop until it continues it ([ptrace(2)], BUGS). Otherwise the child dies at once.
+//! - On macOS a running child stops for the debugger on `SIGKILL` too, and a stopped child just
+//!   holds it. Either way the child dies once the debugger resumes it, detaches or exits.
+//!
+//! [`Child::wait`] returns the child's exit once the debugger lets go of it: when it detaches, when
+//! it collects the exit, which hands the child back, or when it exits itself. The debugger's exit
+//! kills the child on macOS; on Linux it detaches it, or kills it if the debugger asked to
+//! (`PTRACE_O_EXITKILL`).
+//!
+//! [ptrace(2)]: https://man7.org/linux/man-pages/man2/ptrace.2.html
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a

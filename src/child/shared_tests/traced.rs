@@ -18,7 +18,7 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back() {
     if !crate::test_support::require_group("TRACER") {
         return;
     }
-    let mut tracee = tracer::spawn_tracee(tracer::Tracee::Plain);
+    let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let pid = tracee.id().pid();
     let unique = match uniq_info(pid, ReadPurpose::Adopt) {
@@ -48,7 +48,7 @@ fn held() -> Option<(crate::Child, std::io::PipeWriter)> {
     if !crate::test_support::require_group("TRACER") {
         return None;
     }
-    let mut tracee = tracer::spawn_tracee(tracer::Tracee::Plain);
+    let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     Some((tracee, stdin))
 }

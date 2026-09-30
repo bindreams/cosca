@@ -1,7 +1,8 @@
 //! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
 //! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
 //! definition for these structs, so this is a minimal faithful local one. Only
-//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read; everything else is layout.
+//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
+//! everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 
@@ -35,6 +36,21 @@ impl kinfo_proc {
             .try_into()
             .expect("kp_eproc is 352 bytes; E_PPID_OFFSET + LEN fits with room to spare (see the tripwire below)");
         libc::pid_t::from_ne_bytes(bytes)
+    }
+}
+
+/// Read only by the tracer helper's tests (`test_support::tracer`), for their preconditions.
+#[cfg(test)]
+impl kinfo_proc {
+    /// Byte offset of `eproc.e_jobc` within `kp_eproc`: after `e_ppid` and `e_pgid`
+    /// (`offsetof` probe against Apple's `sys/sysctl.h`, arm64 and x86_64).
+    const E_JOBC_OFFSET: usize = 272;
+
+    /// `eproc.e_jobc`: the group's `pg_jobc`, its members whose parent is in another group of the
+    /// same session. 0 means the group is orphaned.
+    pub(crate) fn e_jobc(&self) -> i16 {
+        let at = kinfo_proc::E_JOBC_OFFSET;
+        i16::from_ne_bytes(self.kp_eproc[at..at + 2].try_into().expect("2 bytes"))
     }
 }
 
@@ -127,7 +143,7 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention (see `wait/linux.rs`, `wait/macos.rs`).
-pub(super) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
+pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     read_record(pid, libc::KERN_PROC_PID)
 }
 
