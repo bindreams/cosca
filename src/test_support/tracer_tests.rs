@@ -1638,19 +1638,23 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
     end_stopped(tracee);
 }
 
-/// Mutant: S4 ignores a failed re-send.
+/// The detach carries the first signal to re-send, the kept `SIGTTIN`, so the `kill(2)` that
+/// fails is the held `SIGTSTP`'s. Mutants: S4 ignores a failed re-send; the detach carries
+/// nothing and every signal goes by `kill(2)`.
 #[test]
 fn s4_a_failed_resend_fails() {
-    let Some((mut tracee, stdin, _stdout)) = tracee() else {
+    let Some((mut tracee, stdin, _stdout)) = setup_tracee("SIGTSTP", "") else {
         return;
     };
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S4r:EPERM").attach(&mut tracee);
     expect(&mut th, &TO_S3);
-    send(pid, libc::SIGTSTP);
+    send(pid, libc::SIGTTIN);
     expect(&mut th, &["S3k", "blocking S3 eof"]);
+    send(pid, libc::SIGTSTP);
+    expect(&mut th, &["S3h", "blocking S3 eof"]);
     th.signal();
-    expect(&mut th, &["S4", "S4b*", &err(libc::EPERM, "S4"), DONE]);
+    expect(&mut th, &["S4", "S4b*", "S4r", &err(libc::EPERM, "S4"), DONE]);
     drop(th);
     end_detached(tracee, stdin);
 }
