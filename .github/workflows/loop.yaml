@@ -20,16 +20,23 @@ jobs:
         with:
           tool: cargo-nextest@0.9.137
       - name: Build
-        run: cargo nextest run --lib --no-run --locked
+        run: cargo test --lib --locked --no-run --message-format=json > build.json
       - name: Loop
         run: |
           set +e
           sw_vers
-          sysctl -n hw.ncpu
-          (yes >/dev/null &) ; (yes >/dev/null &) ; (yes >/dev/null &)
-          fails=0
-          for i in $(seq 1 200); do
-            cargo nextest run --lib --locked -E 'test(/tracer_tests::/)' >run.log 2>&1 || { fails=$((fails+1)); echo "--- run $i FAILED"; grep -E "DIAG|panicked|TIMEOUT|left:|right:|assertion|FAIL " run.log | head -12; }
-          done
-          echo "RESULT ${{ matrix.runner }}: $fails failing iterations of 200"
-          pkill yes
+          bin=$(python3 -c "import json;print([j['executable'] for j in map(json.loads,open('build.json')) if j.get('executable') and j.get('target',{}).get('name')=='cosca' and j['profile']['test']][0])")
+          echo "bin=$bin"
+          export COSCA_TEST_ROOT=0 COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
+          name=test_support::tracer::tracer_tests::s4_passes_a_stopping_signal_through_before_detaching
+          worker() {
+            w=$1; fails=0
+            for i in $(seq 1 2500); do
+              perl -e 'alarm 25; exec @ARGV' "$bin" --exact "$name" --test-threads=1 >w$w.log 2>&1
+              code=$?
+              if [ $code -ne 0 ]; then fails=$((fails+1)); echo "--- worker $w run $i exit $code"; grep -E "DIAG|panicked|left:|right:|assertion" w$w.log | cut -c1-600 | head -8; fi
+            done
+            echo "WORKER $w: $fails failures of 2500"
+          }
+          for w in 1 2 3 4; do worker $w & done
+          wait
