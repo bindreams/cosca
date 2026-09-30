@@ -217,7 +217,7 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
             );
             Held::Gone
         }
-        Err(ParentErr::Refused(errno)) => Held::Refused(errno),
+        Err(ParentErr::Refused(_)) => Held::Parent(0),
     }
 }
 

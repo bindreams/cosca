@@ -176,7 +176,7 @@ impl SharedChild {
         };
         #[cfg(target_os = "macos")]
         let identity = match crate::signal::Identity::read(id.pid()) {
-            crate::signal::Identity::Unreadable(errno) => {
+            crate::signal::Identity::Unreadable(errno) if errno < 0 => {
                 return Err((
                     Error::Unassessable {
                         detail: format!(
@@ -314,9 +314,7 @@ impl SharedChild {
         #[cfg(target_os = "macos")]
         {
             // Gone at adoption: reaped elsewhere, so nothing is consumed by a bare pid.
-            self.identity
-                .unique()
-                .map(|unique| Target::pid(self.id.pid(), Some(unique)))
+            Some(Target::pid(self.id.pid(), self.identity.unique()))
         }
         #[cfg(windows)]
         {
