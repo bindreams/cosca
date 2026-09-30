@@ -43,7 +43,7 @@ fn signal_probe(pid: RawPid) -> SignalProbe {
 fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
     match proc_view::proc_view() {
         ProcView::Same(dir) => read_stat_in(&dir, pid),
-        ProcView::Diverged => resolve_unreadable(pid, "this process's /proc is an outer pid namespace's"),
+        ProcView::Diverged => resolve_unreadable(pid, proc_view::DIVERGED_REASON),
         ProcView::Unassessable(why) => {
             resolve_unreadable(pid, format_args!("the /proc view could not be established: {why}"))
         }
@@ -165,13 +165,7 @@ fn read_self_stat() -> std::io::Result<Vec<u8>> {
 pub(crate) fn unknown_identity_error(subject: &str) -> Option<Error> {
     let why = match proc_view::proc_view() {
         ProcView::Same(_) => return None,
-        ProcView::Diverged => {
-            return Some(unassessable_view(
-                subject,
-                "this process's /proc is an outer pid namespace's",
-                None,
-            ))
-        }
+        ProcView::Diverged => return Some(unassessable_view(subject, proc_view::DIVERGED_REASON, None)),
         ProcView::Unassessable(why) => why,
     };
     Some(

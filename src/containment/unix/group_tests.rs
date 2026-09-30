@@ -431,3 +431,130 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     worker.join().unwrap();
     drop(gate_w);
 }
+
+// Checked /proc view (Linux) =====
+
+/// An outer namespace's `/proc` lists another namespace's processes: their pgids mean nothing
+/// here, so the listing is an error naming the view, never an answer about `pgid`. Mutant:
+/// "scan `/proc` by path whatever the view".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_when_the_proc_view_is_diverged() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+    let _forced = force_proc_view_once(ForcedView::Diverged);
+    let err = members(i32::MAX).expect_err("a diverged view lists nothing");
+    assert!(err.to_string().contains("outer pid namespace"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
+    use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
+    let _forced = force_proc_view_once(ForcedView::Unassessable);
+    let err = members(i32::MAX).expect_err("an unassessable view lists nothing");
+    assert!(err.to_string().contains("forced by a test"), "{err}");
+}
+
+/// Without `openat2` no `/proc` view can be established, and the listing says that is why:
+/// `Unsupported`, naming the requirement, as a spawn does. Mutant: "surface every unreadable view
+/// as `io::Error::other`".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_without_openat2_is_unsupported_naming_the_requirement() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
+        let forced = force_openat2_errno(errno);
+        let err = members(i32::MAX).expect_err("no openat2, no listing");
+        drop(forced);
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "containment::unix::group::members: cosca requires openat2 (Linux \u{2265} 5.6), refused here: \
+                 openat2 answered {name}, so pgid {} cannot be listed",
+                i32::MAX
+            ),
+            "{errno}"
+        );
+    }
+}
+
+/// Any other `openat2` failure is not the requirement: it keeps its kind and does not claim
+/// `openat2` is missing. Mutant: "flag every `/proc` open failure as missing `openat2`".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_with_another_openat2_failure_is_not_unsupported() {
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    let forced = force_openat2_errno(rustix::io::Errno::NOENT);
+    let err = members(i32::MAX).expect_err("an unopenable /proc lists nothing");
+    drop(forced);
+    assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert!(!err.to_string().contains("cosca requires openat2"), "{err}");
+}
+
+// Per-pid stat read failures (Linux) =====
+
+/// The failures that mean "this pid says nothing about the group": it exited mid-scan (ENOENT,
+/// ESRCH) or `hidepid` hides it (EACCES, and EPERM while the checked directory still answers).
+/// The pgid matches nothing, so the honest answer is an empty listing. Mutant: "propagate every
+/// read error".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
+    for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
+        let _forced = super::fault::force_stat_read(errno, None);
+        let listed = members(i32::MAX).unwrap_or_else(|e| panic!("errno {errno} is an exclusion: {e}"));
+        assert!(listed.is_empty(), "errno {errno}: {listed:?}");
+    }
+}
+
+/// Every other failure says nothing about the pid, so it cannot clear the group: the listing is an
+/// error naming the pid and the errno. Mutant: "exclude every read error" (the group reads as
+/// `Cleared` while alive; EMFILE from a full fd table hits every pid at once).
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
+    for errno in [
+        libc::EXDEV,
+        libc::ELOOP,
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::ENOSYS,
+    ] {
+        let _forced = super::fault::force_stat_read(errno, None);
+        let err = members(i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let text = err.to_string();
+        assert!(
+            text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
+            "{errno}: {text}"
+        );
+        if matches!(errno, libc::EXDEV | libc::ELOOP) {
+            assert!(text.contains("beyond a mount"), "{errno}: {text}");
+        }
+        let pid = text.split("/stat").next().unwrap().rsplit(' ').next().unwrap();
+        assert!(
+            pid.parse::<u32>().is_ok(),
+            "{errno}: the error must name the pid before `/stat`: {text}"
+        );
+    }
+}
+
+/// EPERM is `hidepid`'s answer, and also a seccomp filter's for `openat2` installed mid-scan. Only
+/// the checked directory answering afterwards tells them apart: if it refuses too, this is a
+/// refusal, not a hidden pid. Mutant: "exclude EPERM without the re-check".
+#[cfg(target_os = "linux")]
+#[test]
+fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
+    for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
+        let _forced = super::fault::force_stat_read(libc::EPERM, Some(recheck));
+        let err = members(i32::MAX).expect_err("a refusing directory lists nothing");
+        let text = err.to_string();
+        assert!(text.contains("self/stat"), "{recheck}: {text}");
+        assert!(
+            text.contains(&std::io::Error::from_raw_os_error(recheck).to_string()),
+            "{recheck}: {text}"
+        );
+    }
+}

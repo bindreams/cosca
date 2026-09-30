@@ -175,6 +175,15 @@ fn verify(pgid: i32, signal: Signal) -> Result<(), Error> {
             }
             Err(Error::Containment { detail })
         }
+        // A listing that can never work here (no `openat2`) is the platform's `Unsupported`, as
+        // from a wait or a spawn, not an unassessable group.
+        group::GroupState::Unlistable {
+            source: Some(source), ..
+        } if source.kind() == io::ErrorKind::Unsupported => Err(Error::Unsupported {
+            op: format!("listing process group {pgid}"),
+            platform: std::env::consts::OS,
+            detail: source.to_string(),
+        }),
         group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable { detail, source }),
     }
 }
