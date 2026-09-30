@@ -32,17 +32,18 @@ fn fixture_status_mounted_over() {
         return;
     }
     ns::enter_private_mount_ns();
-    let scratch = tempfile::tempdir().expect("tempdir");
-    let status = scratch.path().join("status");
-    std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
-    ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
-
-    // A live foreign process: killed through `kill`, which goes through `open_verified`.
+    // A live foreign process: killed through `kill`, which goes through `open_verified`. Its
+    // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
     let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
         .expect("spawn cat");
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let status = scratch.path().join("status");
+    std::fs::write(&status, "Name:\tcosca\nState:\tR (running)\n").expect("write the fake status");
+    ns::bind_over(&status, &PathBuf::from(format!("/proc/{}/status", std::process::id())));
+
     super::kill(id).expect("a live foreign kill must not depend on the /proc view");
     let status = child.wait().expect("reap the killed child");
     assert!(!status.success(), "the child must have been killed, got {status:?}");

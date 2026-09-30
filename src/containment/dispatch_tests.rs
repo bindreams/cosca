@@ -417,6 +417,21 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
     assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
 }
 
+/// Where `openat2` is unavailable the root's identity cannot be read, and the error says why.
+/// Mutant: "`resolve_root_id` reports every `Unknown` as a bare `Unassessable`".
+#[cfg(target_os = "linux")]
+#[test]
+fn resolve_root_id_names_a_missing_openat2() {
+    let _forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOSYS);
+    let Err(crate::error::Error::Unsupported { detail, .. }) = super::resolve_root_id(std::process::id()) else {
+        panic!("a host without openat2 must not resolve a root identity");
+    };
+    assert!(
+        detail.starts_with("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered ENOSYS"),
+        "{detail}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn wait_drained_is_unsupported_without_a_marker() {

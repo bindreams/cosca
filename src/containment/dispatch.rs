@@ -377,10 +377,13 @@ fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
         crate::identity::Resolved::Gone => Err(Error::Containment {
             detail: "tree-walk root vanished before its identity could be read".into(),
         }),
-        crate::identity::Resolved::Unknown => Err(Error::Unassessable {
+        crate::identity::Resolved::Unknown => Err(crate::identity::unknown_identity_error(&format!(
+            "tree-walk root pid {pid}"
+        ))
+        .unwrap_or_else(|| Error::Unassessable {
             detail: format!("tree-walk root pid {pid} identity could not be read"),
             source: None,
-        }),
+        })),
     }
 }
 

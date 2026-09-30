@@ -907,10 +907,12 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
 /// second as the first. Mirrors `containment::dispatch::resolve_root_id`.
 pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>) -> Error {
     match outcome {
-        crate::identity::Resolved::Unknown => Error::Unassessable {
-            detail: "the OS refused to report the spawned child's identity".into(),
-            source: None,
-        },
+        // An unavailable Linux `/proc` view is named; any other refusal is the OS's.
+        crate::identity::Resolved::Unknown => crate::identity::unknown_identity_error("the spawned child")
+            .unwrap_or_else(|| Error::Unassessable {
+                detail: "the OS refused to report the spawned child's identity".into(),
+                source: None,
+            }),
         _ => Error::Io(std::io::Error::other(
             "spawned child vanished before its identity could be read",
         )),
@@ -1443,3 +1445,7 @@ mod spawn_lock_tests;
 #[cfg(all(test, unix))]
 #[path = "spawn/exact_posix_tests.rs"]
 mod exact_posix_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_error_tests.rs"]
+mod identity_error_tests;

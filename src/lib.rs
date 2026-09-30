@@ -19,9 +19,10 @@
 //!   leaf reaps that way; an owned child's waits and reaps still go by pid
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
-//!   checked `/proc` view uses it to read a process's identity. A refusal is `Unsupported`; `main`
-//!   surfaces it as [`Error::Unassessable`](error::Error::Unassessable)
-//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
+//!   checked `/proc` view uses it to read a process's identity. A refusal is
+//!   [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`, from a spawn or from a
+//!   by-pid identity read, wait or kill. [`ProcessId::current`](identity::ProcessId::current)
+//!   needs only a readable `/proc/self/stat`.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel

@@ -112,20 +112,21 @@ impl ProcessId {
     }
 
     /// This process's own identity. Windows reads the current-process pseudo-handle, which
-    /// performs no access check at all; Unix reads the caller's own entry by pid, which no
-    /// `hidepid` mount or sandbox policy hides from the task itself. Either way it is
-    /// resolvable even for a process whose own DACL would deny a foreign by-pid open.
+    /// performs no access check at all; macOS reads the caller's own entry by pid, and Linux
+    /// `/proc/self/stat` (no `openat2`, no `/proc` view needed), which no `hidepid` mount or
+    /// sandbox policy hides from the task itself. Either way it is resolvable even for a
+    /// process whose own DACL would deny a foreign by-pid open.
     ///
     /// # Panics
-    /// If the process cannot read its own start token: on Linux, if `/proc` is not mounted
-    /// or its own `stat` record has no parseable `starttime` (both hard requirements of that
+    /// If the process cannot read its own start token: on Linux, if `/proc/self/stat` cannot
+    /// be read or has no parseable `starttime` (both hard requirements of that
     /// backend); on Windows and macOS, if a self-directed `GetProcessTimes` / `proc_pidinfo`
     /// fails, which has no documented cause. Infallible by design — every caller, including
     /// `Process::current()`, relies on it.
     pub fn current() -> ProcessId {
         let start = backend::current_token()
             .found()
-            .expect("a process must be able to read its own start token (Linux: /proc must be mounted)");
+            .expect("a process must be able to read its own start token (Linux: /proc/self/stat must be readable)");
         ProcessId {
             pid: std::process::id(),
             start,
@@ -175,6 +176,21 @@ pub(crate) use backend::{close as windows_close, open_classified as windows_open
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
+
+/// The error for a by-pid read of `subject` that answered [`Resolved::Unknown`] because the
+/// checked `/proc` view is unavailable, or `None` when the view is fine (or off Linux, which has
+/// none). The cause is carried up: [`Error::Unsupported`] naming the `openat2` requirement, or
+/// [`Error::Unassessable`] with the view's reason.
+#[cfg(target_os = "linux")]
+pub(crate) fn unknown_identity_error(subject: &str) -> Option<crate::error::Error> {
+    backend::unknown_identity_error(subject)
+}
+
+/// [`unknown_identity_error`] off Linux, where identity reads have no `/proc` view.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Error> {
+    None
+}
 
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
