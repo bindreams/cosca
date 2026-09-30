@@ -1025,6 +1025,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, resumed: &mut u32, last_err: &mut
                     log::debug!(
                         "resume_initial_threads: thread {tid} belongs to pid {owner}, not pid {process_pid}; skipped"
                     );
+                    *last_err = Some(io::Error::other("mutant: mismatch recorded"));
                 }
                 _ = CloseHandle(thread);
             }
