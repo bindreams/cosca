@@ -66,7 +66,7 @@ fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
         caught,
         "precondition: whether the tracee catches signal {signal}"
     );
-    if true {
+    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
         assert!(
             info.e_jobc() > 0,
             "precondition: the tracee's process group is orphaned, so XNU discards signal {signal} \
@@ -1691,4 +1691,54 @@ fn done_ignores_a_signal_byte_and_holds() {
     assert_not_handed_back(pid);
     drop(th);
     assert_exited_cleanly(tracee);
+}
+
+// THROWAWAY diagnostic: where the tracee's process group stands under each runner.
+fn diag_ps(label: &str) {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pid,ppid,pgid,sess,jobc,stat,comm"])
+        .output()
+        .expect("ps");
+    eprintln!("DIAG {label} test pid={} ---\n{}", std::process::id(), String::from_utf8_lossy(&out.stdout));
+}
+
+fn diag_jobc(label: &str, pid: u32) {
+    match crate::identity::kinfo::kinfo(pid as _) {
+        crate::identity::Resolved::Found(info) => eprintln!(
+            "DIAG {label} pid={pid} pgid={} sid={} jobc={}",
+            unsafe { libc::getpgid(pid as _) },
+            unsafe { libc::getsid(pid as _) },
+            info.e_jobc()
+        ),
+        _ => eprintln!("DIAG {label} pid={pid} unresolved"),
+    }
+}
+
+#[test]
+fn diag_jobc_under_the_runner() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let me = std::process::id();
+    diag_jobc("test", me);
+    diag_jobc("test-parent", unsafe { libc::getppid() } as u32);
+    let (mut tracee, _ready) = super::spawn_tracee(Tracee::Plain);
+    let stdin = tracee.stdin().expect("stdin");
+    let pid = tracee.id().pid();
+    diag_jobc("tracee-spawned", pid);
+    diag_ps("spawned");
+    let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
+    expect(&mut th, &TO_S3);
+    diag_jobc("tracee-traced", pid);
+    diag_ps("traced");
+    send(pid, libc::SIGTSTP);
+    eprintln!("DIAG sent SIGTSTP; waiting for S3k (a hang here means XNU discarded it)");
+    expect(&mut th, &["S3k", "blocking S3 eof"]);
+    eprintln!("DIAG got S3k");
+    th.signal();
+    expect(&mut th, &["S4", "S4b*", "S4r", "detached", DONE]);
+    drop(th);
+    drop(stdin);
+    assert_job_stopped(pid, libc::SIGTSTP);
+    end_stopped(tracee);
 }

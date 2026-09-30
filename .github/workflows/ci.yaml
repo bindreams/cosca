@@ -37,6 +37,16 @@ jobs:
           tool: cargo-nextest@0.9.137
       - name: Build tests
         run: cargo nextest run --locked --no-run --lib --target ${{ matrix.target }} --profile ci
-      - name: Run tracer tests
-        timeout-minutes: 8
-        run: exec cargo nextest run --locked --lib --no-fail-fast --target ${{ matrix.target }} --profile ci -E 'test(/^test_support::tracer::/)'
+      - name: Diag under nextest
+        timeout-minutes: 3
+        run: cargo nextest run --locked --lib --target ${{ matrix.target }} --no-capture -E 'test(/diag_jobc/)'
+      - name: Build plain cargo test
+        run: cargo test --locked --no-run --lib --target ${{ matrix.target }}
+      - name: Diag under plain cargo test
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -uxo pipefail
+          source .github/scripts/forward-signals.sh
+          ps -o pid,ppid,pgid,sess,jobc,stat,comm -p $$ -p $PPID
+          run_forwarding cargo test --locked --lib --target ${{ matrix.target }} -- diag_jobc --nocapture
