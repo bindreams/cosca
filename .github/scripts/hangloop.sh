@@ -3,7 +3,7 @@
 set -uo pipefail
 N="${1:?}"; FEATURES="${2:-}"; FILTER="${3:-}"; LIM="${4:-300}"
 mkdir -p logs
-args=(nextest run --locked --profile ci --no-fail-fast)
+args=(nextest run --locked --profile ci --no-fail-fast ${STRESS:+--stress-count $STRESS})
 [ -n "$FEATURES" ] && args+=(--features "$FEATURES")
 [ -n "$FILTER" ] && args+=(-E "$FILTER")
 cargo nextest run --locked --no-run ${FEATURES:+--features "$FEATURES"} >logs/build.log 2>&1 || { cat logs/build.log; exit 1; }
