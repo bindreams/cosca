@@ -23,6 +23,42 @@ pub(crate) fn root_tests_enabled() -> bool {
     true
 }
 
+/// The setuid-root copy of `cosca_testbin` that the `COSCA_TEST_SETUID` group runs, or `None` if the
+/// group is switched off with `COSCA_TEST_SETUID=0`. On unless switched off: an enabled group
+/// fails, rather than skips, when `COSCA_TEST_SETUID_HELPER` names no file or the caller could
+/// signal a root process anyway (uid 0, or `CAP_KILL`), since then the scenario would not exist.
+/// The helper is provisioned by whoever runs the group (CI's "Set up setuid-root helper" step):
+/// owned by root, mode `u+s`, on a filesystem that is not `nosuid`. Its `setuid-stdin-block` mode
+/// reports a failed provisioning itself, and the tests wait for its `ready`.
+#[cfg(target_os = "linux")]
+pub(crate) fn setuid_helper() -> Option<std::path::PathBuf> {
+    if std::env::var("COSCA_TEST_SETUID").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let helper = std::env::var_os("COSCA_TEST_SETUID_HELPER").unwrap_or_else(|| {
+        panic!(
+            "the setuid tests need COSCA_TEST_SETUID_HELPER, a root-owned u+s copy of cosca_testbin: \
+             provision one, or set COSCA_TEST_SETUID=0 to opt out"
+        )
+    });
+    let helper = std::path::PathBuf::from(helper);
+    assert!(
+        helper.is_file(),
+        "COSCA_TEST_SETUID_HELPER={helper:?} is not an existing file"
+    );
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let cap_kill = rustix::thread::capabilities(None)
+        .expect("read this thread's capabilities")
+        .effective
+        .contains(rustix::thread::CapabilitySet::KILL);
+    assert!(
+        euid != 0 && !cap_kill,
+        "the setuid tests need an unprivileged caller (uid {euid}, CAP_KILL {cap_kill}): root may signal the helper"
+    );
+    Some(helper)
+}
+
 /// Whether this thread can bypass DAC: an effective DAC capability on Linux, so a non-root caller
 /// holding one (ambient, say) qualifies and a root caller without one does not; uid 0 elsewhere.
 fn holds_dac_bypass() -> bool {

@@ -23,6 +23,9 @@ env:
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
+  # The unit tests on a real setuid-root child need the helper only the "Set up setuid-root helper"
+  # step provisions, so every other step opts out; the step that runs them opts back in.
+  COSCA_TEST_SETUID: "0"
 
 jobs:
   lint:
@@ -337,6 +340,17 @@ jobs:
       - name: Run setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
         run: cargo nextest run --locked --target ${{ matrix.target }} --test group_teardown_setuid --run-ignored only --profile ci
+
+      # The unit tests that signal a REAL setuid-root child (`setuid_tests` in `child::graceful` and
+      # `tokio::child::graceful`): the kernel refuses the signal for privilege, and a root-owned
+      # zombie is refused too. They run as the unprivileged runner user against the helper the step
+      # above provisioned; `COSCA_TEST_SETUID=1` turns the group back on, and an unusable helper
+      # fails them.
+      - name: Run setuid-root child unit tests (Linux)
+        if: matrix.os == 'linux'
+        env:
+          COSCA_TEST_SETUID: "1"
+        run: cargo nextest run --locked --all-features --lib --target ${{ matrix.target }} -E 'test(/setuid_tests/)' --profile ci
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
