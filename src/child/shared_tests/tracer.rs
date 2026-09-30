@@ -142,10 +142,25 @@ mod macos {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                eprintln!(
-                    "WATCHDOG: {name} still running after {BOUND:?}; last step: {}",
-                    step_name()
-                );
+                use std::io::Write;
+                let mut e = std::io::stderr().lock();
+                _ = writeln!(e, "WATCHDOG: {name} still running after {BOUND:?}; last step: {}", step_name());
+                _ = writeln!(e, "TRACEE pid {}", TRACEE.load(std::sync::atomic::Ordering::SeqCst));
+                drop(e);
+                let me = std::process::id().to_string();
+                let tr = TRACEE.load(std::sync::atomic::Ordering::SeqCst).to_string();
+                for args in [vec!["-axo", "pid,ppid,pgid,stat,wchan,command"]] {
+                    if let Ok(o) = std::process::Command::new("ps").args(args).output() {
+                        _ = std::io::stderr().write_all(&o.stdout);
+                    }
+                }
+                for p in [&tr, &me] {
+                    if let Ok(o) = std::process::Command::new("sample").args([p, "1"]).output() {
+                        _ = writeln!(std::io::stderr(), "SAMPLE {p}:");
+                        _ = std::io::stderr().write_all(&o.stdout);
+                        _ = std::io::stderr().write_all(&o.stderr);
+                    }
+                }
                 std::process::abort();
             }
         });
@@ -154,8 +169,11 @@ mod macos {
 
     static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
 
+    static TRACEE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     pub(super) fn step(name: &'static str) {
-        eprintln!("step: {name}");
+        use std::io::Write;
+        _ = writeln!(std::io::stderr(), "step: {name}");
         *STEP.lock().unwrap_or_else(|e| e.into_inner()) = name;
     }
 
@@ -170,6 +188,7 @@ mod macos {
     fn attach_and_confirm_stop(blocker: &Blocker) {
         step("attach");
         let pid = blocker.shared.id();
+        TRACEE.store(pid, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: a plain ptrace request on this test's own child.
         let r = unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid as libc::pid_t, std::ptr::null_mut(), 0) };
         assert_eq!(r, 0, "PT_ATTACHEXC: {}", std::io::Error::last_os_error());
