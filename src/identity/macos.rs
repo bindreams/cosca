@@ -162,7 +162,12 @@ fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) 
         match read() {
             PpidRead::Found(ppid) => return Resolved::Found(ppid),
             PpidRead::Gone => return Resolved::Gone,
-            PpidRead::Refused => return Resolved::Unknown,
+            PpidRead::Refused if attempt > 0 => return Resolved::Unknown,
+            PpidRead::Refused => {
+                pause(attempt);
+                attempt += 1;
+            }
+            PpidRead::Forking if attempt > 1000 => return Resolved::Unknown,
             PpidRead::Forking => {
                 pause(attempt);
                 attempt = attempt.saturating_add(1);
@@ -181,7 +186,13 @@ fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) 
 /// deadline; the pid exiting meanwhile ends it as `Gone`. `Gone` is only returned when the
 /// fallback itself positively confirms the pid no longer exists.
 pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
-    resolve_ppid(|| read_ppid_once(pid), fork_pause)
+    resolve_ppid(
+        || match read_ppid_once(pid) {
+            PpidRead::Forking => PpidRead::Refused,
+            other => other,
+        },
+        fork_pause,
+    )
 }
 
 /// The pause before re-reading a pid whose `fork()` is still filling in its parent: yield first,
