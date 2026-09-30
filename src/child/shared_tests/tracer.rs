@@ -81,7 +81,7 @@ mod macos {
     use std::time::Duration;
 
     use super::super::fixtures::Blocker;
-    use crate::identity::{quiet_fault, ReadPurpose, Resolved};
+    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     use crate::test_support::tracer::{attach_settled, AttachError};
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
@@ -270,11 +270,10 @@ mod macos {
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 
-    /// A failed start read in the second reap neither panics nor leaves the state `N`: the first
-    /// reap's status is kept, and one `warn` names the pid.
+    /// A refused identity read in the second reap neither panics nor leaves the state `N`: the
+    /// first reap's status is kept, and one `warn` names the pid.
     ///
-    /// Mutant: the quiet reader implemented over `read_record`/`bsd_info`, whose
-    /// `contract_violation` panics on the injected result.
+    /// Mutant: a second reap that panics on a refused identity read.
     #[test]
     fn a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n() {
         if !crate::test_support::require_group("TRACER") {
@@ -292,7 +291,7 @@ mod macos {
         attach_and_confirm_stop(&b);
         let marker = format!("second reap of pid {}", b.shared.id());
         let mark = crate::log_capture::mark();
-        let _forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::SecondPeek, Resolved::Unknown);
+        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, UniqRead::Refused(libc::EPERM));
         kill_stopped(&b);
         assert_killed(b.shared.wait().expect("wait"));
         assert!(format!("{:?}", b.shared).contains("E("), "{:?}", b.shared);
