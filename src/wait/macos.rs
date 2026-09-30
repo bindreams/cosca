@@ -41,6 +41,10 @@ pub(crate) fn kevent_timeout(d: Duration) -> libc::timespec {
         tv_nsec: d.subsec_nanos() as libc::c_long,
     };
     assert_kevent_timespec(&ts);
+    debug_assert!(
+        d.is_zero() || ts.tv_sec > 0 || ts.tv_nsec > 0,
+        "a remaining time of {d:?} became a zero kevent timeout: a poll, which spins until the clock catches up"
+    );
     ts
 }
 

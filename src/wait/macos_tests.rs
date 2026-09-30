@@ -209,6 +209,27 @@ fn kevent_timeout_caps_at_the_limit_and_keeps_the_rest() {
     }
 }
 
+/// A positive remaining time never becomes a zero timeout: `kevent` with `{0, 0}` is a poll, so
+/// the wait loop would spin on it until the real clock caught up (forever under a frozen one).
+///
+/// Mutant: drop `subsec_nanos` -> every sub-second remaining time arms a poll.
+#[test]
+fn a_positive_remaining_time_never_arms_a_poll() {
+    use std::time::Duration;
+
+    for d in [
+        Duration::from_nanos(1),
+        Duration::from_micros(1),
+        Duration::from_millis(300),
+        Duration::new(0, 999_999_999),
+        Duration::new(1, 1),
+        Duration::new(1, 500_000_000),
+    ] {
+        let ts = super::kevent_timeout(d);
+        assert!(ts.tv_sec > 0 || ts.tv_nsec > 0, "{d:?} armed a poll: {ts:?}");
+    }
+}
+
 /// `Ok(0)` with time left is classified: a full-cap timeout is the intended re-arm, anything
 /// else is an anomaly. Judged against the cap in force, including a lowered one.
 #[test]
