@@ -179,10 +179,10 @@ impl ProcSource {
                     }
                     Peek::Running | Peek::Exit(_) => {}
                 }
-                #[cfg(test)]
-                crate::send_log::record(pid, sig, Via::Pid);
                 // SAFETY: the peek found `pid` to be our own unreaped child.
                 if unsafe { libc::kill(pid as libc::pid_t, sig.as_libc()) } == 0 {
+                    #[cfg(test)]
+                    crate::send_log::record(pid, sig, Via::Pid);
                     return Ok(Sent::Delivered);
                 }
                 let e = std::io::Error::last_os_error();
