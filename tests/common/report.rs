@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 
-use cosca::identity::{ProcessId, Resolved};
+use cosca::identity::{Liveness, ProcessId, Resolved};
 
 use super::accept::{
     accept_or_die, ack_now, died_before_connecting, died_before_reporting, wait_readable, Target, WatchEvent,
@@ -25,6 +25,9 @@ pub const GC_PID_ADDR_ENV: &str = "COSCA_TEST_GC_PID_ADDR";
 thread_local! {
     static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };
     static LAST_REPORTED_ID: Cell<Option<ProcessId>> = const { Cell::new(None) };
+    static LAST_REPORTED_LIVENESS: Cell<Option<Liveness>> = const { Cell::new(None) };
+    #[cfg(feature = "tokio")]
+    static LAST_ASYNC_ROOT: Cell<Option<ProcessId>> = const { Cell::new(None) };
 }
 
 /// The pid of the grandchild most recently reported to this thread, if any. Lets a test that
@@ -33,20 +36,42 @@ pub fn last_reported_grandchild() -> Option<u32> {
     LAST_REPORTED.with(Cell::get)
 }
 
-/// The identity of the grandchild most recently reported to this thread and resolved. Lets a
-/// test that expects a helper to panic wait for that (orphaned) grandchild to be gone, safely
-/// against pid reuse.
+/// The identity of the most recently reported grandchild, set only once it resolved; unlike the
+/// pid, safe to wait on. `None` means identification did not complete (the helper panicked
+/// earlier), so check the helper's panic message before treating `None` as a harness bug.
 pub fn last_reported_grandchild_id() -> Option<ProcessId> {
     LAST_REPORTED_ID.with(Cell::get)
+}
+
+/// Blocks until the root of the async tree most recently spawned on this thread has exited. An
+/// async `Child`'s drop only sends the kill, so a test whose helper panicked calls this before
+/// returning: the root inherited the test's stdio and must be gone by then. Waits by identity.
+#[cfg(feature = "tokio")]
+pub fn wait_for_last_async_root() {
+    let id = LAST_ASYNC_ROOT
+        .with(Cell::get)
+        .expect("an async tree helper recorded its root before panicking");
+    cosca::Process::from_id(id)
+        .wait()
+        .expect("wait for the async tree's root");
 }
 
 fn record(pid: u32) {
     LAST_REPORTED.with(|c| c.set(Some(pid)));
     LAST_REPORTED_ID.with(|c| c.set(None));
+    LAST_REPORTED_LIVENESS.with(|c| c.set(None));
 }
 
 fn record_id(id: ProcessId) {
     LAST_REPORTED_ID.with(|c| c.set(Some(id)));
+    LAST_REPORTED_LIVENESS.with(|c| c.set(Some(id.is_alive())));
+}
+
+/// The liveness of the most recently reported grandchild at the moment it was identified, before
+/// any unwind. A test that unwinds and then waits asserts `Some(Alive)` here, so the exit it waits
+/// for cannot have preceded the teardown it is testing.
+pub fn last_reported_grandchild_liveness() -> Option<Liveness> {
+    LAST_REPORTED_LIVENESS.with(Cell::get)
 }
 
 fn parse_pid(line: &str) -> u32 {
@@ -105,6 +130,7 @@ fn release(stream: TcpStream) {
 pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &mut cosca::tokio::Child) -> ProcessId {
     use ::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    LAST_ASYNC_ROOT.with(|c| c.set(Some(root.id())));
     let root_pid = root.id().pid();
     let std_stream = super::accept::accept_or_die_async(report, root).await;
     std_stream

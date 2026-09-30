@@ -414,10 +414,9 @@ pub async fn spawn_tree_async(
     let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     // Load the testbin as argv[0] via the std path (mode/addr at args[1..], so it behaves
-    // identically): these trees are usually contained; the four uncontained callers
-    // (three death-watch panic tests and the `kill_on_drop(false)` test in `tokio_io.rs`) are
-    // backend-agnostic, so argv[0] keeps this helper on one code path across OSes. `configure`
-    // applies the containment/nesting/kill_on_drop.
+    // identically): the trees that stay uncontained are backend-agnostic, so
+    // argv[0] keeps this helper on one code path across OSes. `configure` applies the
+    // containment/nesting/kill_on_drop.
     cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
     configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();

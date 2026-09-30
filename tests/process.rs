@@ -171,6 +171,7 @@ fn children_recursive_distinguishes_direct_from_descendant() {
     child.kill().expect("kill child");
     let _ = child.wait();
     drop(socks);
+    grandkid.wait().expect("wait for the orphaned grandchild");
 }
 
 #[test]
@@ -518,17 +519,22 @@ fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_l
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
 #[test]
 fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
-    // Contained: the root exits at once, orphaning a live grandchild that holds the test's stdio.
-    // Unwinding drops the `Child`, and the containment KILLS that grandchild; without it nextest
-    // reports the test as `LEAK` (Windows). The drop only sends the kill, so the test waits for
-    // the grandchild's exit (by identity, so a reissued pid is never waited on) before it ends.
+    // Contained so unwinding kills the orphaned grandchild (it would otherwise outlive the test
+    // holding its stdio). The kill is only sent on drop, so wait for the grandchild's exit by
+    // identity (never a reissued pid).
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
-    let id = common::last_reported_grandchild_id().expect("the root's grandchild was identified");
+    assert!(message.contains("died before it connected"), "got: {message:?}");
+    let id = common::last_reported_grandchild_id()
+        .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
+    assert_eq!(
+        common::last_reported_grandchild_liveness(),
+        Some(cosca::identity::Liveness::Alive),
+        "the grandchild must be alive when identified, so its exit is the containment kill's"
+    );
     cosca::Process::from_id(id)
         .wait()
         .expect("wait for the orphaned grandchild");
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
-    assert!(message.contains("died before it connected"), "got: {message:?}");
     assert!(
         !message.contains(&format!("(pid {grandchild})")),
         "the live grandchild must not be the one blamed: {message:?}"
