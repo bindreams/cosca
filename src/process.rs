@@ -102,9 +102,9 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, or the
-    ///   process table cannot be read or trusted (on Linux, a `/proc` that is not this pid
-    ///   namespace's).
+    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, `self` is
+    ///   live but missing from the process table, or the table cannot be read or trusted (on Linux,
+    ///   a `/proc` that is not this pid namespace's).
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<Process>, Error> {
         // Snapshot first, then the anchor: a `self` that still holds its pid after the snapshot
@@ -126,7 +126,10 @@ impl Process {
             (Resolved::Found(p), _) => p,
             (Resolved::Gone, _) => return Ok(None),
             (Resolved::Unknown, cause) => {
-                return Err(crate::containment::treewalk::unqueryable(&format!("ppid {ppid}"), cause));
+                return Err(crate::containment::treewalk::unqueryable(
+                    &format!("ppid {ppid}"),
+                    cause,
+                ));
             }
         };
         // Identity guard: a genuine parent predates this child, so the child's start token
