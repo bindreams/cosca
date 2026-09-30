@@ -15,11 +15,7 @@
 //! Linux only. The original bug was reproduced (and is reproduced here) via `/proc`-based group
 //! membership and `kill(2)`'s real permission check (`kill_ok_by_cred`, `kernel/signal.c`),
 //! which requires the target's REAL uid — not merely its effective/saved uid — to differ from
-//! the caller's. macOS is deliberately excluded, not silently skipped there: SIP and the
-//! hardened-runtime/notarization requirements on modern macOS make a locally-built setuid-root
-//! binary unreliable to provision in CI (SIP can strip privileges from unsigned/ad-hoc-signed
-//! binaries depending on where they live and how they were built), and there is no equivalent to
-//! Linux's straightforward "chown root, chmod u+s, exec" contract to build an honest CI lane on.
+//! the caller's. The scenario rests on `/proc` and Linux `kill` semantics.
 //! Windows has no setuid concept at all. `containment::unix::group::members` itself is only
 //! implemented for Linux and macOS (see that module), so this gap does not exist on Windows
 //! regardless.
@@ -35,26 +31,11 @@
 //! step exercises this path.
 //!
 //! # Gating
-//! This test is `#[ignore]`d by default, so an ordinary `cargo nextest run` — locally, or in every
-//! CI step that doesn't explicitly ask for it — counts it in the final `... skipped` tally, never
-//! runs it to `... ok`. A vacuous pass that merely returned early (the shape this file used at
-//! first) is indistinguishable in the log from a real one, which is exactly the failure this rule
-//! exists to prevent: a test name reading "ok" must mean the scenario it describes was actually
-//! exercised. Only the one CI step that has provisioned the helper runs it, via `cargo nextest run
-//! --test group_teardown_setuid --run-ignored only` (see
-//! `.github/workflows/ci.yaml`, the "Run setuid-root process-group teardown test" step, which
-//! follows "Set up setuid-root helper").
-//!
-//! `COSCA_TEST_SETUID_HELPER` must hold the absolute path to a pre-provisioned COPY of
-//! `cosca_testbin` that CI has `chown root:root` + `chmod u+s`'d (see the "Set up setuid-root
-//! helper" step). Once a caller has explicitly opted in to running this ignored test, there is no
-//! honest silent case left: the variable being unset there is a misconfiguration, not an
-//! environment the test doesn't apply to, so it panics rather than no-op-returning. And with the
-//! variable set, the test must fail LOUDLY if the helper does not actually achieve real uid 0 —
-//! never silently pass. That check is performed by the spawned helper itself
-//! (`setuid-control-block` in `testbin/main.rs`) and reported back over the same control socket
-//! used for the readiness handshake, so a nosuid mount or a wrong owner/mode surfaces as a loud
-//! panic here, not a false green.
+//! The `COSCA_TEST_SETUID` group, through `common::setuid` (its docs give the rule and what
+//! `COSCA_TEST_SETUID_HELPER` must be). The spawned helper (`setuid-control-block` in
+//! `testbin/main.rs`) runs the shared provisioning check of `setuid-stdin-block` and reports a
+//! failure over the control socket used for the readiness handshake, so a nosuid mount or a wrong
+//! owner/mode surfaces as a loud panic here, not a false green.
 
 // The whole file is Linux-only in purpose (see the module docs above) — gated here, once, rather
 // than on every item, so the file compiles to nothing (no unused-code warnings) elsewhere.
@@ -65,23 +46,10 @@ use std::net::{TcpListener, TcpStream};
 
 #[path = "common/mod.rs"]
 mod common;
+use common::setuid;
 
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
-}
-
-/// Panics if unset: by the time this runs, the caller has already explicitly opted in (the test
-/// is `#[ignore]`d, so it only executes given `--ignored`/`--include-ignored` or an exact-name
-/// filter combined with one of those). An unset variable at that point is a misconfigured CI lane
-/// or a developer who ran the wrong command, not a platform this test legitimately doesn't apply
-/// to — see the module docs' "Gating" section.
-fn gated() -> String {
-    std::env::var("COSCA_TEST_SETUID_HELPER").unwrap_or_else(|_| {
-        panic!(
-            "this test was explicitly requested (it is #[ignore]d) but COSCA_TEST_SETUID_HELPER \
-             is not set — see the module docs' \"Gating\" section for what it must point at"
-        )
-    })
 }
 
 /// `kill(pid, 0)` performs only the existence/permission check, sending nothing. `Ok(())` means
@@ -150,7 +118,6 @@ fn rerun_unprivileged() {
             .args([
                 "--exact",
                 test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
-                "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -223,14 +190,13 @@ fn accept_one(listener: &TcpListener) -> Handshake {
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
 ///
-/// `#[ignore]`d by default so an ordinary `cargo nextest run` counts it as `skipped`, not a
-/// vacuous `ok` — see the module docs' "Gating" section for why, and for the one CI step that
-/// runs it with `--run-ignored only` after provisioning `COSCA_TEST_SETUID_HELPER`.
+/// Gated by `COSCA_TEST_SETUID` (see the module docs' "Gating" section). Started as root it only
+/// takes the gate, then re-executes itself as an unprivileged user, whose run takes the helper.
 #[test]
-#[ignore = "requires COSCA_TEST_SETUID_HELPER (a real setuid-root helper); run with `cargo nextest \
-            run --test group_teardown_setuid --run-ignored only` — see this file's module docs"]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
-    let helper = gated();
+    if setuid::setuid_gate(|k| std::env::var(k).ok()) == setuid::Gate::Disabled {
+        return;
+    }
     let role = rerun_role(
         std::env::var(RERUN_ENV).ok().as_deref(),
         std::os::unix::process::parent_id(),
@@ -248,6 +214,8 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
         );
         return rerun_unprivileged();
     }
+    let helper = setuid::setuid_helper().expect("the gate ran above and did not disable the group");
+    let helper = helper.to_str().expect("a UTF-8 helper path");
     if role == Role::Rerun {
         use std::io::Write as _;
         let mut out = std::io::stdout();
@@ -255,17 +223,13 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
             .and_then(|()| out.flush())
             .expect("announce the re-run");
     }
-    assert!(
-        std::path::Path::new(&helper).is_file(),
-        "COSCA_TEST_SETUID_HELPER={helper:?} does not point at an existing file"
-    );
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
 
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin())
-        .args(["cosca_testbin", "spawn-grandchild-setuid", &addr, &helper]);
+        .args(["cosca_testbin", "spawn-grandchild-setuid", &addr, helper]);
     cmd.contain();
     let child = cmd.spawn().expect("spawn contained root");
 

@@ -2,6 +2,21 @@
 //! control), so a fixture that needs an `EACCES` precondition can rely on it for every caller,
 //! root included.
 
+pub(crate) mod setuid;
+
+#[cfg(test)]
+#[path = "test_privilege/setuid_gate_tests.rs"]
+mod setuid_gate_tests;
+#[cfg(test)]
+#[path = "test_privilege/setuid_helper_tests.rs"]
+mod setuid_helper_tests;
+#[cfg(test)]
+#[path = "test_privilege/setuid_lane_check_tests.rs"]
+mod setuid_lane_check_tests;
+#[cfg(test)]
+#[path = "test_privilege/setuid_protocol_tests.rs"]
+mod setuid_protocol_tests;
+
 /// Whether the tests that only mean something with a DAC bypass run: the `COSCA_TEST_ROOT` group of
 /// `docs/principles.md`'s "Tests fail loudly and never silently skip" and "System-affecting tests
 /// run in a sandbox" sections. On unless `COSCA_TEST_ROOT=0`. An enabled group fails, rather than

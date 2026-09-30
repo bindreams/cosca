@@ -23,6 +23,8 @@ env:
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
+  # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
+  COSCA_TEST_SETUID: "0"
 
 jobs:
   lint:
@@ -332,17 +334,13 @@ jobs:
             exit "$status"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)" "$PATH"
 
-      # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
-      # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo nextest run`
-      # anywhere, including the steps above, counts it as `skipped`, never runs it to a vacuous
-      # `ok`. This is the one step that opts in, via `--run-ignored only`, after provisioning a
-      # COPY of cosca_testbin that is genuinely setuid-root (owned by root, mode u+s) so the spawned
-      # helper process can call setuid(0) itself and become truly unsignalable by this job's
-      # ordinary unprivileged user — proving #61's fix against a REAL mixed process group
-      # (one signalable member, one genuinely not), not a synthetic one. Only preparing the
-      # helper copy needs root; the test itself runs as the normal unprivileged runner user,
-      # no sudo. Once opted in, an unset/unusable helper FAILS LOUDLY (wrong owner/mode, or a
-      # nosuid mount) — never a silent skip.
+      # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
+      # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become
+      # truly unsignalable by this job's ordinary unprivileged user, giving a REAL mixed process
+      # group. Only preparing the helper copy needs root; the tests run as the normal runner user,
+      # no sudo. The lane check fails the lane unless the helper really reaches uid 0 and may
+      # create a user namespace. The group is the tests named `setuid_*` and the
+      # `group_teardown_setuid` binary (see principle 10).
       - name: Set up setuid-root helper (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -357,18 +355,28 @@ jobs:
           sudo chmod 4755 "$HELPER"
           echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
 
-      - name: Run setuid-root process-group teardown test (Linux)
+      - name: Check the setuid lane (Linux)
         if: matrix.os == 'linux'
-        run: cargo nextest run --locked --target ${{ matrix.target }} --test group_teardown_setuid --run-ignored only --profile ci
+        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
+
+      - name: Run setuid tests (Linux)
+        if: matrix.os == 'linux'
+        env:
+          COSCA_TEST_SETUID: "1"
+          COSCA_TEST_SETUID_CONSENT: "1"
+        run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci -E 'test(/setuid_/) | binary(group_teardown_setuid)'
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
       # helper must all be reachable by that uid: every directory above the checkout is made
-      # traversable and `target` readable. `sudo -E` keeps COSCA_TEST_SETUID_HELPER. The binary is
-      # run directly because nextest archives extract into a root-only tempdir; libtest exits 0
-      # when a filter matches nothing, so the log must show the test passing.
+      # traversable and `target` readable. `sudo -E` keeps COSCA_TEST_SETUID_HELPER and the group's
+      # variables. The binary is run directly because nextest archives extract into a root-only
+      # tempdir; libtest exits 0 when a filter matches nothing, so the log must show the test passing.
       - name: Run setuid-root process-group teardown test as root (Linux)
         if: matrix.os == 'linux'
+        env:
+          COSCA_TEST_SETUID: "1"
+          COSCA_TEST_SETUID_CONSENT: "1"
         run: |
           set -euxo pipefail
           BIN=$(cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid --no-run --message-format=json \
@@ -378,7 +386,7 @@ jobs:
           chmod -R a+rX "$PWD/target"
           d="$PWD"
           while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
-          sudo -E "$BIN" --ignored --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
+          sudo -E "$BIN" --exact kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
           cat "$RUNNER_TEMP/setuid-root.log"
           grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"
 
@@ -490,6 +498,28 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Set up setuid-root helper (macOS)
+        run: |
+          set -euxo pipefail
+          BIN=$(cargo build --locked --bin cosca_testbin --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -x "$BIN"
+          HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
+          cp "$BIN" "$HELPER"
+          sudo chown root:wheel "$HELPER"
+          sudo chmod 4755 "$HELPER"
+          echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
+
+      - name: Check the setuid lane (macOS)
+        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
+
+      - name: Run setuid tests (macOS)
+        env:
+          COSCA_TEST_SETUID: "1"
+          COSCA_TEST_SETUID_CONSENT: "1"
+        run: cargo nextest run --locked --features tokio --profile ci -E 'test(/setuid_/)'
 
       - name: Archive the privilege tests
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane-macos.tar.zst"
