@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use shared_child::SharedChild;
+use super::shared::SharedChild;
 
 #[cfg(windows)]
 use super::spawn::windows_raw::RawChild;
@@ -16,7 +16,7 @@ use super::spawn::windows_raw::RawChild;
 /// The process backend behind an owned [`Child`](super::Child).
 #[derive(Debug)]
 pub(crate) enum ProcHandle {
-    /// std-spawned child, adopted into `shared_child` for concurrent wait/kill. The flag is
+    /// std-spawned child, adopted into a [`SharedChild`] for concurrent wait/kill. The flag is
     /// [`ProcHandle::has_reaped`]'s.
     Std(SharedChild, AtomicBool),
     /// Raw `CreateProcessW` child owning the process handle directly.
@@ -25,11 +25,9 @@ pub(crate) enum ProcHandle {
 }
 
 impl ProcHandle {
-    /// Adopt a std-spawned child. `SharedChild::new` reaps a root that has already exited; the flag
-    /// reads that back from a `try_wait`.
+    /// Adopt a std-spawned child. Adoption never reaps, so nothing is reaped yet.
     pub(crate) fn std(shared: SharedChild) -> ProcHandle {
-        let reaped = matches!(shared.try_wait(), Ok(Some(_)));
-        ProcHandle::Std(shared, AtomicBool::new(reaped))
+        ProcHandle::Std(shared, AtomicBool::new(false))
     }
 
     /// Whether this handle itself has reaped the root: adoption, [`wait`](Self::wait),
@@ -72,17 +70,8 @@ impl ProcHandle {
     /// Block until the child exits or `deadline` passes (`Ok(None)` at expiry).
     pub(crate) fn wait_deadline(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         match self {
-            // The Raw arm rechecks inside `wait_until`, which advances the frozen clock itself.
-            ProcHandle::Std(s, reaped) => Self::note(
-                reaped,
-                crate::wait::rearm_until(Some(Some(deadline)), |remaining| {
-                    let armed = remaining
-                        .and_then(|r| Instant::now().checked_add(r))
-                        .unwrap_or(deadline);
-                    std_wait_deadline(s, armed)
-                }),
-                Option::is_some,
-            ),
+            // `SharedChild` decides expiry itself, from `crate::wait::now()`, never early.
+            ProcHandle::Std(s, reaped) => Self::note(reaped, s.wait_deadline(deadline), Option::is_some),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.wait_deadline(deadline),
         }
@@ -124,7 +113,9 @@ impl ProcHandle {
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
                     StdTeardown::ReapBlocking => {
-                        _ = s.wait();
+                        if let Err(e) = s.wait() {
+                            log_teardown_wait_failure(s.id(), &e);
+                        }
                     }
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
                     // child is still running (an elevated child we cannot signal), warn.
@@ -147,6 +138,20 @@ impl ProcHandle {
     }
 }
 
+/// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected
+/// and quiet; anything else leaves a zombie or an unread exit, and is a `warn`.
+fn log_teardown_wait_failure(pid: u32, e: &io::Error) {
+    #[cfg(unix)]
+    let gone = e.raw_os_error() == Some(libc::ECHILD);
+    #[cfg(windows)]
+    let gone = false;
+    if gone {
+        log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
+    } else {
+        log::warn!("teardown of child {pid}: the reap after the kill failed: {e}");
+    }
+}
+
 /// The teardown action for a `Std` child, decided purely from the observed kill result.
 /// Extracted so the "any `Err` → NEVER a blocking wait" invariant is unit-testable without
 /// a real EPERM (root-only) child.
@@ -163,21 +168,6 @@ fn std_teardown_action(kill_result: &io::Result<()>) -> StdTeardown {
         Ok(()) => StdTeardown::ReapBlocking,
         Err(_) => StdTeardown::ReapNonBlocking,
     }
-}
-
-/// One `shared_child` `wait_deadline` call, which can report `None` before `armed` on Windows
-/// (see `crate::wait::win32_timeout_ms`); the test seam scripts that.
-fn std_wait_deadline(s: &SharedChild, armed: Instant) -> io::Result<Option<ExitStatus>> {
-    #[cfg(test)]
-    match crate::wait::std_wait_seam::next(armed) {
-        Some(crate::wait::std_wait_seam::Step::EarlyNone) => return Ok(None),
-        Some(crate::wait::std_wait_seam::Step::Fail) => return Err(io::Error::other("scripted backend failure")),
-        Some(crate::wait::std_wait_seam::Step::Bounded(d)) => {
-            return s.wait_deadline(armed.min(Instant::now() + d));
-        }
-        None => {}
-    }
-    s.wait_deadline(armed)
 }
 
 #[cfg(test)]

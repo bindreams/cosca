@@ -44,10 +44,10 @@ pub type RawPid = u32;
 /// A raw, per-process kernel start value. Opaque: its only meaning is identity
 /// (exact equality). Interpreted into a wall-clock time only by `created_at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct StartToken(u64);
+pub(crate) struct StartToken(u64);
 
 impl StartToken {
-    fn from_raw(v: u64) -> StartToken {
+    pub(crate) fn from_raw(v: u64) -> StartToken {
         StartToken(v)
     }
 
@@ -290,6 +290,16 @@ pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
 pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
     backend::fault::force_unknown(pid)
 }
+
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::UniqInfo;
+/// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
+#[cfg(target_os = "macos")]
+pub(crate) use backend::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
+
+/// The identity-read forcing seams.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::{ppid_fault, uniq_fault, ReadErr};
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see

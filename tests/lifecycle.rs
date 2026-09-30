@@ -86,8 +86,8 @@ fn wait_deadline_past_returns_some_after_exit() {
 
 #[test]
 fn concurrent_wait_timeout_and_kill_is_safe() {
-    // shared_child makes this race-free (waitid WNOWAIT pins the pid). The kill
-    // guarantees death, so wait_timeout observes Some — deterministic, no
+    // `SharedChild` makes this race-free (the pidfd, handle or unreaped zombie pins the child).
+    // The kill guarantees death, so wait_timeout observes Some — deterministic, no
     // is_alive/sleep. The 30s is only a backstop against a hang.
     let (child, _sock) = spawn_control("control-block", &["R"], false);
     std::thread::scope(|s| {

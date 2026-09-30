@@ -544,6 +544,45 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
     child.wait_with_output().expect("wait for fixture child")
 }
 
+/// [`run_fixture_output`] for a fixture that must pass, with the case it should run in
+/// `case_env`: for a fixture that changes process-wide state (a signal disposition, say) and so
+/// runs one case per re-exec. Panics with the fixture's output unless it passes and wrote its gate
+/// line. Build `fixture` with [`fixture_path!`].
+#[cfg(unix)]
+pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, case: &str) {
+    let mut cmd = fixture_command(fixture);
+    cmd.env(marker_env, std::process::id().to_string()).env(case_env, case);
+    cmd.env_remove("RUST_TEST_NOCAPTURE");
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
+    let output = child.wait_with_output().expect("wait for fixture child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
+        "fixture {fixture} case {case:?} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains(FIXTURE_GATE_PASSED_LINE),
+        "fixture {fixture} case {case:?} never wrote {FIXTURE_GATE_PASSED_LINE:?}:\n{stderr}",
+    );
+}
+
+/// Set `SIGCHLD`'s disposition, process-wide: `SIG_IGN` if `ignore`, else `SIG_DFL`. Only a
+/// fixture re-exec (see [`run_fixture_case`]) may call it: it changes every thread of the process.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_sigchld_ignored(ignore: bool) {
+    let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+    // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` installs no handler code.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, handler) };
+    assert_ne!(
+        previous,
+        libc::SIG_ERR,
+        "signal(SIGCHLD): {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// The directory [`run_fixture_with_cwd`]'s caller prepared, read from `marker_env`; `None` when it
 /// is unset or (on unix) [`parent_pid_matches`] says this is not a deliberate re-exec. Either way
 /// the fixture is also picked up by ordinary suite runs, where it must no-op.

@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use crate::error::Error;
 use crate::identity::ProcessId;
 
+pub(crate) mod exit_only;
+
 #[cfg_attr(target_os = "linux", path = "wait/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "wait/macos.rs")]
 #[cfg_attr(windows, path = "wait/windows.rs")]
@@ -37,92 +39,6 @@ pub(crate) mod fault {
     }
     pub(crate) fn forced_watch_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced grace-watch failure (test seam)"))
-    }
-}
-
-/// Test-only seam on the std backend's `wait_deadline` call (`ProcHandle::Std`), standing in for
-/// `shared_child`'s early Windows `WAIT_TIMEOUT`. The scripted steps replace the first backend
-/// calls; once the script is spent the real backend runs. Every call made while a guard is live
-/// is recorded, so a test can assert what each round was armed with.
-#[cfg(test)]
-pub(crate) mod std_wait_seam {
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-    use std::time::{Duration, Instant};
-
-    /// One scripted backend call.
-    pub(crate) enum Step {
-        /// Return `None` at once without waiting.
-        EarlyNone,
-        /// Really wait, but only up to `Duration`, then return the backend's `None`.
-        Bounded(Duration),
-        /// Fail with a backend error.
-        Fail,
-    }
-
-    /// A backend call as observed: what it was armed with, and the real clock at entry.
-    #[derive(Clone, Copy, Debug)]
-    pub(crate) struct Round {
-        pub(crate) armed: Instant,
-        pub(crate) entered: Instant,
-    }
-
-    thread_local! {
-        static ACTIVE: Cell<bool> = const { Cell::new(false) };
-        static SCRIPT: RefCell<VecDeque<Step>> = const { RefCell::new(VecDeque::new()) };
-        static ON_SCRIPT_END: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-        static ROUNDS: RefCell<Vec<Round>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Script the next backend calls and record every call until the guard drops. `on_script_end`
-    /// runs when the last step is consumed, so a test can end the wait through a real event.
-    #[must_use]
-    pub(crate) fn arm(steps: impl IntoIterator<Item = Step>, on_script_end: impl FnOnce() + 'static) -> Guard {
-        ACTIVE.with(|a| {
-            debug_assert!(!a.get(), "std_wait_seam is not nestable");
-            a.set(true);
-        });
-        SCRIPT.with(|s| *s.borrow_mut() = steps.into_iter().collect());
-        ON_SCRIPT_END.with(|h| *h.borrow_mut() = Some(Box::new(on_script_end)));
-        ROUNDS.with(|r| r.borrow_mut().clear());
-        Guard(())
-    }
-
-    pub(crate) struct Guard(());
-
-    impl Guard {
-        /// Every backend call made since [`arm`].
-        pub(crate) fn rounds(&self) -> Vec<Round> {
-            ROUNDS.with(|r| r.borrow().clone())
-        }
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ACTIVE.with(|a| a.set(false));
-            SCRIPT.with(|s| s.borrow_mut().clear());
-            ON_SCRIPT_END.with(|h| *h.borrow_mut() = None);
-        }
-    }
-
-    /// Record a backend call armed with `armed` and take its scripted step, if any.
-    pub(crate) fn next(armed: Instant) -> Option<Step> {
-        if !ACTIVE.with(Cell::get) {
-            return None;
-        }
-        ROUNDS.with(|r| {
-            r.borrow_mut().push(Round {
-                armed,
-                entered: Instant::now(),
-            })
-        });
-        let step = SCRIPT.with(|s| s.borrow_mut().pop_front());
-        if step.is_some() && SCRIPT.with(|s| s.borrow().is_empty()) {
-            if let Some(hook) = ON_SCRIPT_END.with(|h| h.borrow_mut().take()) {
-                hook();
-            }
-        }
-        step
     }
 }
 
@@ -583,6 +499,13 @@ pub(crate) fn win32_timeout_ms(remaining: Option<Duration>) -> u32 {
 ///
 /// Owns the frozen-clock advance: a round must not advance it itself. Under a frozen clock a
 /// round that follows one with no advance panics ([`test_clock::RoundCheck`]).
+#[cfg_attr(
+    not(any(test, target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "called only by the Windows `wait_until` and the Linux holder's poll; macOS blocks on kqueue"
+    )
+)]
 pub(crate) fn rearm_until<T, E>(
     deadline: Option<Option<Instant>>,
     mut round: impl FnMut(Option<Duration>) -> Result<Option<T>, E>,
@@ -626,6 +549,19 @@ pub(crate) fn wait_until(
     }
 }
 
+/// The longest a single timed block may be armed for: `0xFFFF_FFFE` ms. std's Windows
+/// `Condvar::wait_timeout` turns anything above `u32::MAX` ms into `INFINITE` (`dur2timeout`),
+/// and `u32::MAX` ms is `INFINITE` itself, so an unclamped huge remaining would block forever.
+/// Applied to every timed `Condvar::wait_timeout` and `WaitForSingleObject`; the caller loops
+/// until its deadline.
+pub(crate) const MAX_BLOCK: Duration = Duration::from_millis(0xFFFF_FFFE);
+
+/// `remaining`, clamped to [`MAX_BLOCK`]. After every wake, `now() >= deadline` decides expiry,
+/// never the primitive's own "timed out".
+pub(crate) fn clamp_block(remaining: Duration) -> Duration {
+    remaining.min(MAX_BLOCK)
+}
+
 /// The clamp [`win32_timeout_ms`] applies to a finite `remaining` (production:
 /// `WIN32_INFINITE - 1`); [`wait_clamp_seam`] lowers it so tests reach the re-arm path quickly.
 #[cfg_attr(
@@ -641,6 +577,32 @@ fn win32_wait_clamp() -> u32 {
         return v;
     }
     WIN32_INFINITE - 1
+}
+
+/// Test-only, thread-local record of the timeout each non-kqueue timed block was armed with on
+/// this thread (`None` = unbounded): a `poll` or `Condvar::wait_timeout` round. A test proves a
+/// deadline wait armed nothing longer than the time remaining, and blocked at all, from the log.
+#[cfg(test)]
+pub(crate) mod block_probe {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    thread_local! {
+        static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(armed: Option<Duration>) {
+        ARMED.with(|a| a.borrow_mut().push(armed));
+    }
+
+    /// Every timeout armed on this thread since the last call, in order.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux poll tests read it")
+    )]
+    pub(crate) fn take() -> Vec<Option<Duration>> {
+        ARMED.with(|a| std::mem::take(&mut *a.borrow_mut()))
+    }
 }
 
 // Test seams =====
