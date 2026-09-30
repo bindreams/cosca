@@ -83,6 +83,10 @@ impl ProcSource {
 
     /// Signal a hard kill (does not reap). Already-exited ⇒ `Ok`.
     pub(crate) fn start_kill(&mut self) -> Result<(), Error> {
+        #[cfg(test)]
+        if crate::wait::fault::kill_denied() {
+            return Err(Error::Io(crate::wait::fault::denied_error()));
+        }
         match self {
             ProcSource::Tokio(c) => c.start_kill().map_err(Error::Io),
             #[cfg(windows)]

@@ -97,6 +97,37 @@ fn graceful_shutdown_escalation_refused_by_a_filter_is_unsupported_naming_kill()
     cleanup(child, stdin);
 }
 
+// A refused pidfd_open is a refused pidfd_open, whoever the child is =====
+
+// `terminate` reaches `pidfd_open` first. Its `EPERM` is not the signal's, so it is never
+// `Unkillable`, even on a wrapper-elevated child.
+#[test]
+fn a_refused_pidfd_open_is_unsupported_naming_pidfd_open_not_unkillable() {
+    use crate::wait::backend::fault::force_pidfd_open_errno_once;
+    for (errno, name) in [
+        (rustix::io::Errno::PERM, "EPERM"),
+        (rustix::io::Errno::ACCESS, "EACCES"),
+        (rustix::io::Errno::NODEV, "ENODEV"),
+    ] {
+        let (mut child, stdin) = blocker();
+        child.set_elevation(wrapped());
+        let forced = force_pidfd_open_errno_once(errno);
+        let err = child.terminate().expect_err("pidfd_open is refused");
+        drop(forced);
+        match &err {
+            Error::Unsupported { platform, detail, .. } => {
+                assert_eq!(*platform, "linux");
+                assert!(
+                    detail.contains(&format!("refused here: pidfd_open answered {name}")),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected Unsupported for {name}, got {other:?}"),
+        }
+        cleanup(child, stdin);
+    }
+}
+
 // An exited child is Ok whatever refuses the signal =====
 
 // A filter refuses both signal syscalls, yet an unreaped zombie is `Ok`: the kernel would have

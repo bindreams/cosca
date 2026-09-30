@@ -339,18 +339,37 @@ pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
     }
 }
 
-/// Map a raw kill/terminate `io::Error` on an ELEVATED wrapper child to the typed
-/// `Unkillable` error. EPERM (POSIX) and ACCESS_DENIED (Windows) both surface as
-/// `io::ErrorKind::PermissionDenied`; anything else, or a non-elevated child, stays `Io`.
+/// Whether a child's `report` says a wrapper (`sudo`, `pkexec`, ...) or UAC elevated it, so a plain
+/// parent may be unable to signal it. `AlreadyElevated` is an ordinary child of an already-root
+/// parent, and `MacosOsascript` tracks `osascript`, which runs as the caller: both are killable.
+pub(crate) fn is_elevated_wrapper(report: Option<&ElevationReport>) -> bool {
+    matches!(
+        report.map(|r| &r.via),
+        Some(ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac)
+    )
+}
+
+/// [`map_elevated_kill_error`] for a signal outcome already wrapped as [`crate::error::Error`]:
+/// only `Io` is remapped; every other variant passes through.
+pub(crate) fn map_elevated_signal_error(err: crate::error::Error, elevated_wrapper: bool) -> crate::error::Error {
+    match err {
+        crate::error::Error::Io(e) => map_elevated_kill_error(e, elevated_wrapper),
+        other => other,
+    }
+}
+
+/// Map the error of a signal call on an ELEVATED wrapper child to the typed `Unkillable` error.
+/// Only a [privilege refusal](crate::refusal::refused) of the signal call itself qualifies: the OS
+/// answered `EPERM` / `ACCESS_DENIED` and the target's state was established. Anything else, or a
+/// non-elevated child, stays `Io`. The detail says whether the child is still running.
 pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: bool) -> crate::error::Error {
     use crate::error::{ElevationErrorKind, Error};
-    if elevated_wrapper && err.kind() == std::io::ErrorKind::PermissionDenied {
-        Error::Elevation {
+    match crate::refusal::refusal_state(&err) {
+        Some(state) if elevated_wrapper => Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
-            detail: format!("could not signal the elevated child: {err}"),
-        }
-    } else {
-        Error::Io(err)
+            detail: format!("could not signal the elevated child ({state}): {err}"),
+        },
+        _ => Error::Io(err),
     }
 }
 

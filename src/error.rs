@@ -51,7 +51,8 @@ pub enum ElevationErrorKind {
     #[error("no controlling terminal for interactive elevation")]
     NoTty,
     /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
-    /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
+    /// ACCESS_DENIED on Windows): the OS's own permission rule refuses the signal. `detail` says
+    /// whether the child is still running, or that whether it has exited could not be determined.
     ///
     /// Not this: a child that had already exited (`Ok`; Linux answers `EPERM` for a root-owned
     /// zombie), and, on Linux, a signal a seccomp or LSM filter refused although the kernel's own

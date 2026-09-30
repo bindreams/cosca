@@ -144,14 +144,6 @@ impl Child {
     pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
         self.elevation.clone()
     }
-    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
-    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
-    fn is_elevated_wrapper(&self) -> bool {
-        matches!(
-            self.elevation.as_ref().map(|r| &r.via),
-            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
-        )
-    }
     /// Blocking reap used by the POSIX spawn-error cleanup path (a sync context — no reactor
     /// `await` available).
     ///
@@ -429,13 +421,18 @@ impl Child {
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
     ///
-    /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
-    /// `Ok`, and on Linux one by a seccomp or LSM filter is
+    /// On a wrapper-elevated child the OS may refuse the signal (`EPERM` / `ACCESS_DENIED`); when
+    /// the child is still running that is
+    /// [`Error::Elevation`](crate::error::Error::Elevation) with
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), as for
+    /// [`terminate`](Child::terminate) and the escalation of
+    /// [`graceful_shutdown`](Child::graceful_shutdown). A refusal for a child that has already
+    /// exited is `Ok`, and on Linux one by a seccomp or LSM filter is
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming `kill`.
     pub fn kill(&mut self) -> Result<(), Error> {
         // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok`, a filter's is
         // `Unsupported`, and a privilege refusal of an elevated wrapper child becomes `Unkillable`.
-        let elevated_wrapper = self.is_elevated_wrapper();
+        let elevated_wrapper = crate::elevation::is_elevated_wrapper(self.elevation.as_ref());
         match self.proc_mut().start_kill() {
             Err(Error::Io(e)) => crate::refusal::resolve_kill_error(e, self.id(), elevated_wrapper),
             other => other,
