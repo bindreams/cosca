@@ -1294,7 +1294,7 @@ impl Marker {
         //
         // Not when the root's number is off limits (`by_root_number` false): the gap is in the
         // channel that names the root, which this pass then does not run.
-        if by_root_number && self.root_denied {
+        if self.root_denied {
             *incomplete = true;
         }
 

@@ -371,7 +371,7 @@ impl Attached {
                 // read at attach: a root that had already exited has none.
                 let actions: Vec<String> = [
                     m.pgid().map(|pgid| format!("kill its process group (pgid {pgid})")),
-                    m.has_root()
+                    true
                         .then(|| format!("walk the process table from the root's pid (root pid {root_pid})")),
                 ]
                 .into_iter()
@@ -379,6 +379,8 @@ impl Attached {
                 .collect();
                 (!actions.is_empty()).then(|| actions.join(" or "))
             }
+            #[cfg(target_os = "linux")]
+            Attached::Cgroup(_) => Some("kill its cgroup".to_string()),
             Attached::TreeWalk(_) => Some(format!(
                 "walk the process table from the root's pid (root pid {root_pid})"
             )),
