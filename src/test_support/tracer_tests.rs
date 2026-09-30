@@ -186,16 +186,34 @@ fn assert_exited_cleanly(tracee: crate::Child) {
     assert!(status.success(), "expected the tracee's own clean exit, got {status:?}");
 }
 
-/// The tracee was killed with `SIGKILL`: by XNU when its tracer exited while tracing it, or by
-/// this test.
+/// The tracee was killed with `SIGKILL` by this test.
 fn assert_sigkilled(tracee: crate::Child) {
+    assert_killed_by(tracee, &[libc::SIGKILL]);
+}
+
+/// The tracee was killed because the helper exited while tracing it. XNU sends it `SIGKILL`
+/// (xnu `kern_exit.c`, `proc_exit`), but first finds its process group orphaned (`fixjobc`, before
+/// the `SIGKILL`) and sends a stopped member `SIGHUP` and `SIGCONT` (`kern_proc.c`, `orphanpg`):
+/// the group's count had been raised for the test as the tracee's parent, and the reparenting to
+/// the helper does not adjust it, so the helper's exit takes it to 0. Either signal can end it.
+fn assert_killed_with_the_helper(tracee: crate::Child) {
+    assert_killed_by(tracee, &[libc::SIGKILL, libc::SIGHUP]);
+}
+
+fn assert_killed_by(tracee: crate::Child, signals: &[i32]) {
     let info = await_change(tracee.id().pid());
     if info.si_code == libc::CLD_STOPPED {
         tracee.kill().expect("kill the stopped tracee");
-        panic!("expected SIGKILL, but the tracee is stopped by {}", info.si_status);
+        panic!(
+            "expected a kill by {signals:?}, but the tracee is stopped by {}",
+            info.si_status
+        );
     }
     let status = tracee.wait().expect("wait for the tracee");
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "expected SIGKILL, got {status:?}");
+    assert!(
+        status.signal().is_some_and(|signal| signals.contains(&signal)),
+        "expected a kill by {signals:?}, got {status:?}"
+    );
 }
 
 /// The tracee was ended by `SIGTERM`, a signal the helper passed on.
@@ -489,7 +507,7 @@ fn s1h_eof_exits_and_xnu_kills_the_tracee() {
     assert_eq!(th.session.next_report(), None);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// The injected `NOTE_EXIT` arrives while the tracee is really held, so S5's result is injected
@@ -503,7 +521,7 @@ fn s1h_note_exit_goes_to_reap() {
     expect(&mut th, &["S0", "S1", "S1h", "S5", "reaped", DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Runs S1h's peeks under `force`, the last of which fails the run.
@@ -515,7 +533,7 @@ fn s1h_peeks_until_the_error(force: &str) {
     expect(&mut th, &["S0", "S1", "S1h", &err(libc::EINVAL, "S1h"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S1h retries a failed peek.
@@ -549,7 +567,7 @@ fn s1h_a_lone_sigchld_reads_as_the_timeout() {
     assert_eq!(th.session.next_report(), None);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 // S2 ===========================================================================================
@@ -660,7 +678,7 @@ fn s2_fails(force: &str) {
     expect(&mut th, &["S0", "S1", "S2", &err(libc::EINVAL, "S2"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S2 treats a failed stop peek as "not stopped yet".
@@ -696,7 +714,7 @@ fn s2b_event_fails(event: &str) {
     expect(&mut th, &["S0", "S1", "S2", "S2b", &err(event, "S2b"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S2b retries on `NOTE_EXIT`.
@@ -854,7 +872,7 @@ fn s5_a_stop_is_not_a_reap() {
     expect(&mut th, &[&err(libc::EINVAL, "S5"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 // S3 hold, S3x =================================================================================
@@ -984,7 +1002,7 @@ fn s3_hold_a_zombie_wait_that_finds_no_exit_fails() {
     expect(&mut th, &[&err(libc::EINVAL, "S3"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S3 `hold` takes a signal byte to S3x.
@@ -1212,7 +1230,7 @@ fn s4_fails(force: &str, errno: i32) {
     expect(&mut th, &["S4", &err(errno, "S4"), DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S4 takes `EPERM` for an exiting tracee.
@@ -1729,7 +1747,7 @@ fn s3_fails(force: &str) {
     );
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S3 ignores a failed stop peek.
@@ -1794,7 +1812,7 @@ fn a_failed_report_write_exits() {
     th.session.finish();
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// `gone:attached`: the helper goes to done still tracing. Mutant: `report_then` ignores a
@@ -1808,7 +1826,7 @@ fn a_failed_attached_write_ends_the_run() {
     expect(&mut th, &["S2", DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: the pass-through's trace ignores a failed write.
@@ -1821,7 +1839,7 @@ fn a_failed_pass_through_trace_write_ends_the_run() {
     expect(&mut th, &["S2", DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: S3's pass-through ignores a failed trace write.
@@ -1835,7 +1853,7 @@ fn a_failed_s3_pass_through_trace_write_ends_the_run() {
     expect(&mut th, &["S0", "S1", "S2", "S2b*", "attached", "S3", DONE]);
     drop(th);
     drop(stdin);
-    assert_sigkilled(tracee);
+    assert_killed_with_the_helper(tracee);
 }
 
 /// Mutant: a failed `exited` write is ignored.

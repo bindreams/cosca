@@ -467,6 +467,8 @@ pub(crate) fn spawn_tracee(catch: &str, ignore: &str) -> crate::Child {
 /// (xnu `kern_sig.c`, `psignal_internal`, `pg_jobc == 0`), which is the group a test run inherits
 /// under a shell without job control, such as one over ssh. Its parent, the test, stays in
 /// another group of the same session, so the new group is not orphaned (`kern_proc.c`, `fixjobc`).
+/// A helper that exits while still tracing it orphans the group, so XNU then also sends the
+/// tracee `SIGHUP` (`orphanpg`).
 #[test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
