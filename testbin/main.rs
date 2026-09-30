@@ -647,6 +647,44 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
         }
+        #[cfg(target_os = "linux")]
+        "setuid-stdin-block" => {
+            // Only ever exec'd from the pre-provisioned setuid-root copy named by
+            // `COSCA_TEST_SETUID_HELPER` (see `src/child/setuid_tests.rs`). Takes the credentials
+            // `args[2]` names, prints `ready` on stdout, and blocks until stdin reaches EOF, then
+            // exits 0:
+            //
+            // - `root`: real, effective and saved uid 0, so its caller genuinely cannot signal it.
+            // - `euid-only`: as exec'd, real uid the caller's, effective and saved 0. The kernel
+            //   lets the caller signal it (its real uid matches).
+            // - `suid-only`: real and effective 0, saved uid the caller's. Signalable too (its
+            //   saved uid matches).
+            //
+            // A provisioning failure exits 3 with the reason on stderr and no `ready`, so the
+            // harness cannot mistake an ordinary, killable process for the root one.
+            let mode = args.get(2).map(String::as_str).unwrap_or("root");
+            // Safety: geteuid()/getuid()/setuid()/setresuid() have no preconditions; failure is
+            // reported below.
+            let ok = unsafe {
+                let caller = libc::getuid();
+                libc::geteuid() == 0
+                    && match mode {
+                        "root" => libc::setuid(0) == 0 && libc::getuid() == 0,
+                        "euid-only" => caller != 0,
+                        "suid-only" => caller != 0 && libc::setresuid(0, 0, caller) == 0,
+                        _ => false,
+                    }
+            };
+            if !ok {
+                eprintln!(
+                    "setuid-stdin-block {mode}: not the requested credentials after exec (wrong owner/mode on the helper, a nosuid mount, or a root caller)"
+                );
+                exit(3);
+            }
+            println!("ready");
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+        }
         #[cfg(unix)]
         "spawn-grandchild-escapee" => {
             // Like spawn-grandchild, but FIRST escape any process group / session

@@ -470,3 +470,7 @@ mod graceful_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "refusal_tests.rs"]
 mod refusal_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "setuid_tests.rs"]
+mod setuid_tests;
