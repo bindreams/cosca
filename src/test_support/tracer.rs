@@ -478,10 +478,10 @@ pub(crate) enum Tracee {
     CatchSigterm,
     /// Holds a thread it created with `pthread_create_suspended_np` and never starts.
     UnstartedThread,
-    /// Ignores `SIGTSTP`: breaks a precondition of the helper's contract, for the tests that
-    /// check the preconditions are asserted.
+    /// [`Tracee::OwnGroup`] that ignores `SIGTSTP`: breaks one precondition of the helper's
+    /// contract, for the tests that check the preconditions are asserted.
     IgnoreSigtstp,
-    /// Blocks `SIGTSTP`: as [`Tracee::IgnoreSigtstp`].
+    /// [`Tracee::OwnGroup`] that blocks `SIGTSTP`: as [`Tracee::IgnoreSigtstp`].
     BlockSigtstp,
     /// Leads a session of its own, so its process group is orphaned: as
     /// [`Tracee::IgnoreSigtstp`].
@@ -548,12 +548,13 @@ fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
     }
+    let own_group = || {
+        nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).expect("setpgid");
+    };
     let kind = std::env::var("COSCA_UH_KIND").expect("COSCA_UH_KIND is set by spawn_tracee");
     match kind.as_str() {
         "Plain" => {}
-        "OwnGroup" => {
-            nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).expect("setpgid");
-        }
+        "OwnGroup" => own_group(),
         "CatchSigterm" => {
             extern "C" fn exit_on_sigterm(_: libc::c_int) {
                 // SAFETY: `_exit` is async-signal-safe.
@@ -583,11 +584,13 @@ fn uh_tracee_fixture() {
             assert_eq!(rc, 0, "pthread_create_suspended_np");
         }
         "IgnoreSigtstp" => {
+            own_group();
             // SAFETY: `SIG_IGN` runs no code; this process runs no other test.
             let previous = unsafe { libc::signal(libc::SIGTSTP, libc::SIG_IGN) };
             assert_ne!(previous, libc::SIG_ERR, "ignore SIGTSTP");
         }
         "BlockSigtstp" => {
+            own_group();
             let mut set = nix::sys::signal::SigSet::empty();
             set.add(nix::sys::signal::Signal::SIGTSTP);
             set.thread_block().expect("block SIGTSTP");
