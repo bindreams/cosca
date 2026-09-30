@@ -157,6 +157,8 @@ fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
         rt.block_on(async {
             let mut cmd = cosca::tokio::Command::new();
             cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
+            // The child may already be running when the spawn panics; keep it off nextest's pipes.
+            common::silence_async(&mut cmd);
             let _ = cmd.spawn();
         })
     }))

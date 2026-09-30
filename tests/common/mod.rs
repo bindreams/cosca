@@ -242,6 +242,21 @@ pub fn read_report_line(sock: &TcpStream) -> String {
     line
 }
 
+/// Point a tree root's stdout/stderr at null. Its descendants inherit them, and a descendant that
+/// exits only after the test returns (a released grandchild, a detached tree) would otherwise
+/// hold nextest's pipes open past the test's end, which `leak-timeout` reports as a leak.
+pub fn silence(cmd: &mut cosca::Command) {
+    cmd.stdout(cosca::Stdio::null()).expect("null stdout");
+    cmd.stderr(cosca::Stdio::null()).expect("null stderr");
+}
+
+/// [`silence`] for the tokio builder.
+#[cfg(feature = "tokio")]
+pub fn silence_async(cmd: &mut cosca::tokio::Command) {
+    cmd.stdout(cosca::Stdio::null()).expect("null stdout");
+    cmd.stderr(cosca::Stdio::null()).expect("null stderr");
+}
+
 /// Spawn `mode <addr> [extra...]` as a control child that connects, writes a 1-byte tag,
 /// then blocks; returns the owned `Child` and the accepted socket (the tag read proves it
 /// is alive). `contain` applies `.contain()`. This is the canonical form; `tests/lifecycle.rs`
@@ -253,6 +268,7 @@ pub fn spawn_control(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin()).args(&argv).env(ACK_ENV, "1");
+    silence(&mut cmd);
     if contain {
         cmd.contain();
     }
@@ -274,6 +290,7 @@ pub fn spawn_gui_control(contain: bool) -> (cosca::Child, TcpStream) {
     let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
     let mut cmd = cosca::Command::new();
     cmd.executable(exe).args([exe, addr.as_str()]).env(ACK_ENV, "1");
+    silence(&mut cmd);
     if contain {
         cmd.contain();
     }
@@ -299,6 +316,7 @@ pub async fn spawn_gui_control_async(contain: bool) -> (cosca::tokio::Child, Tcp
     let exe = env!("CARGO_BIN_EXE_cosca_testbin_gui");
     let mut cmd = cosca::tokio::Command::new();
     cmd.args([exe, addr.as_str()]).env(ACK_ENV, "1");
+    silence_async(&mut cmd);
     if contain {
         cmd.contain();
     }
@@ -337,6 +355,7 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
     cmd.executable(testbin())
         .args(["cosca_testbin", mode, addr.as_str()])
         .env(ACK_ENV, "1");
+    silence(&mut cmd);
     if contain {
         cmd.contain();
     }
@@ -396,6 +415,7 @@ pub async fn spawn_control_async(mode: &str, extra: &[&str], contain: bool) -> (
     argv.extend(extra.iter().map(|s| s.to_string()));
     let mut cmd = cosca::tokio::Command::new();
     cmd.env(ACK_ENV, "1");
+    silence_async(&mut cmd);
     if contain {
         // Load the testbin as argv[0] via the std path (mode/addr stay at args[1..], so it behaves
         // identically) — keeps this shared helper on one code path across OSes. The async raw
@@ -433,6 +453,7 @@ pub async fn spawn_tree_async(
     // argv[0] keeps this helper on one code path across OSes. `configure` applies the
     // containment/nesting/kill_on_drop.
     cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
+    silence_async(&mut cmd);
     configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);
@@ -494,6 +515,7 @@ pub async fn spawn_echo_tree_async_configured(
     let (listener, addr) = bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
     cmd.args([testbin(), mode, addr.as_str()]).env(ACK_ENV, "1");
+    silence_async(&mut cmd);
     configure(&mut cmd);
     let (report, report_addr) = bind_async_listener();
     cmd.env(GC_PID_ADDR_ENV, report_addr);

@@ -8,10 +8,14 @@ nextest-version = { required = "0.9.137" }
 # same shape of regression. The helper's own tests fail on a broken helper without waiting; this
 # bound only stops a regression they did not anticipate from stalling the job.
 filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
-slow-timeout = { period = "10s", terminate-after = 1 }
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [profile.ci]
 fail-fast = false
+# Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.
+# A correct test's pipes close promptly, so any period catches a real leak; this one is far above
+# the noise of a loaded runner.
+leak-timeout = { period = "5s", result = "fail" }
 
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
@@ -79,13 +83,13 @@ test-group = 'windows-elevation-routes'
 # Under `profile.default` so `profile.ci` and local runs both inherit it — same reasoning as
 # `test_support_tests` below.
 filter = 'binary(cosca) & test(=tokio::child::graceful::graceful_tests::windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped)'
-slow-timeout = { period = "30s", terminate-after = 2 }
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # Bounds a hang (blocking reap of a `pause()` child) if the guard stops killing, so it fails
 # instead. Under `profile.default` so `profile.ci` and local runs both inherit it.
 filter = 'test(test_support_tests)'
-slow-timeout = { period = "20s", terminate-after = 1 }
+slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # `cgroup_wait_drained_tracks_two_real_members_through_exit`'s unbounded park is made
@@ -95,7 +99,7 @@ slow-timeout = { period = "20s", terminate-after = 1 }
 # `profile.default` so `profile.ci` and local runs both inherit it, same as `test_support_tests`
 # above.
 filter = 'test(cgroup_wait_drained_tracks_two_real_members_through_exit)'
-slow-timeout = { period = "15s", terminate-after = 1 }
+slow-timeout = { period = "15s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A backstop, not the proof: `async_wait_never_drains_past_the_low_water_clamp` asserts in-process
@@ -106,14 +110,14 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # hang into a bounded per-test failure instead of the darwin job's 15-minute CI timeout. Under
 # `default` so a local run is bounded the same way.
 filter = 'test(async_wait_never_drains_past_the_low_water_clamp)'
-slow-timeout = { period = "20s", terminate-after = 3 }
+slow-timeout = { period = "20s", terminate-after = 3, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A hang backstop for the tracer tests, which block on the helper's reports. The tests assert
 # each report as it arrives, so a broken transition fails an assertion; this bound is the last
 # resort.
 filter = 'test(/^test_support::tracer::/)'
-slow-timeout = { period = "10s", terminate-after = 3 }
+slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
@@ -124,4 +128,4 @@ slow-timeout = { period = "10s", terminate-after = 3 }
 # under load, so 60s x 5 leaves ample headroom. Earlier overrides in this file win for the tests
 # they name.
 filter = 'binary(cosca)'
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "1s" }
