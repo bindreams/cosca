@@ -186,13 +186,10 @@ fn a_forbidding_job_yields_a_typed_containment_error_via_the_raw_backend() {
 #[test]
 fn accept_or_die_panics_loudly_when_the_target_dies_first() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let mut child = {
-        let _guard = cosca::test_spawn_lock();
-        std::process::Command::new(testbin())
-            .args(["--not-a-real-mode"]) // testbin exits immediately on an unknown mode
-            .spawn()
-            .expect("spawn a child that exits immediately")
-    };
+    let mut child = common::spawn_locked(
+        std::process::Command::new(testbin()).args(["--not-a-real-mode"]), // testbin exits immediately on an unknown mode
+    )
+    .expect("spawn a child that exits immediately");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         common::accept_or_die(&listener, &mut child)
     }));
