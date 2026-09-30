@@ -116,25 +116,33 @@ pub(super) fn pbi_status(pid: u32) -> Result<u32, i32> {
 pub(super) enum Stop {
     /// Not stopped: running, or exiting.
     Running,
-    /// Stopped by the signal, but a thread still runs: the stop has not settled.
+    /// Stopped by the signal, but a thread still runs or waits uninterruptibly: the stop has not
+    /// settled.
     Settling,
-    /// Stopped by the signal, every thread blocked.
+    /// Stopped by the signal, every thread parked (see [`stop`]).
     Stopped(i32),
 }
 
 /// Whether the tracee is stopped, and by which signal, without consuming the stop.
 ///
-/// A traced stop sets `SSTOP` and posts `SIGCHLD` to the tracer before its thread waits for the
-/// tracer's release, and a `PT_CONTINUE` or `PT_DETACH` in between wakes nothing: the tracee then
-/// never runs again (xnu `kern_sig.c`, `issignal`, `assert_wait` on `sigwait`; seen on CI as a
-/// tracee that neither exits nor stops again). So a stop counts only once no thread of the
-/// tracee is in the running state.
+/// A traced stop sets `SSTOP` and `sigwait`, posts `SIGCHLD` to the tracer, and only then waits
+/// on `sigwait` for the tracer's release (xnu `kern_sig.c`, `issignal_locked`). A `PT_CONTINUE`
+/// or `PT_DETACH` in between finds no waiter, sets `SRUN` and resumes the task, and the thread
+/// then sleeps on `sigwait` for good: `ptrace` refuses every later request with `EBUSY` (not
+/// `SSTOP`), and a signal to a traced process only `thread_abort_safely`s, which does not wake
+/// that interruptible wait (`mach_process.c`, `ptrace`; `kern_sig.c`, `psignal_internal`;
+/// `thread_act.c`). Seen on CI as a tracee that neither exits nor stops again.
+///
+/// In that window the thread runs, or blocks uninterruptibly on a kernel lock (`proc_list_lock`,
+/// the tracer's proc lock, `proc_klist_lock`, the tracer's signal lock), and every such wait is
+/// `THREAD_UNINT`. Its `sigwait` wait is `THREAD_INTERRUPTIBLE`. So a stop counts only once every
+/// thread of the tracee is neither running nor uninterruptible: [`parked`].
 pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
     let info = peek(pid, libc::WSTOPPED | libc::WNOHANG)?;
     if info.si_pid == 0 {
         return Ok(Stop::Running);
     }
-    match threads_blocked(pid) {
+    match threads_parked(pid) {
         Ok(true) => Ok(Stop::Stopped(info.si_status)),
         Ok(false) => Ok(Stop::Settling),
         // Exiting, and so no longer stopped: its NOTE_EXIT follows.
@@ -158,8 +166,8 @@ fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<
     }
 }
 
-/// `Ok(true)` if no thread of `pid` is in the running state.
-fn threads_blocked(pid: u32) -> Result<bool, i32> {
+/// `Ok(true)` if every thread of `pid` is [`parked`].
+fn threads_parked(pid: u32) -> Result<bool, i32> {
     // SAFETY: `proc_taskinfo` is plain data; all-zero is a valid value.
     let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
     pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task)?;
@@ -176,11 +184,19 @@ fn threads_blocked(pid: u32) -> Result<bool, i32> {
         // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
         let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
         pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
-        if thread[0].pth_run_state == libc::TH_STATE_RUNNING {
+        if !parked(thread[0].pth_run_state) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Whether a thread in `run_state` (`pth_run_state`) waits interruptibly or is suspended. XNU
+/// reports a thread that is running or runnable as `TH_STATE_RUNNING`, and one in a
+/// `THREAD_UNINT` wait as `TH_STATE_UNINTERRUPTIBLE` (`thread.c`,
+/// `retrieve_thread_basic_info`).
+fn parked(run_state: i32) -> bool {
+    !matches!(run_state, libc::TH_STATE_RUNNING | libc::TH_STATE_UNINTERRUPTIBLE)
 }
 
 /// `Ok` while `pid` is this process's unreaped child: a `waitid` peek that neither blocks nor
@@ -273,3 +289,7 @@ pub(super) fn unwatch_signal_pipe(kq: &Kqueue) {
 fn read_knote(flags: EvFlags) -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_READ, flags, FilterFlag::empty(), 0, 0)
 }
+
+#[cfg(test)]
+#[path = "sys_tests.rs"]
+mod sys_tests;
