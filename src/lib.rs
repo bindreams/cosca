@@ -93,6 +93,11 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(all(test, unix))]
+mod send_log;
+#[cfg(unix)]
+mod signal;
+
 #[cfg(test)]
 mod log_capture;
 

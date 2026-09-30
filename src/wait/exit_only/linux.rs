@@ -69,10 +69,21 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 }
 
 pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
+    #[cfg(test)]
+    if super::seams::take_forced_visible_none() {
+        return no_record();
+    }
     match waitid_record(pidfd(target), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
         Ok(Some(record)) if is_exit_record(record.si_code) => Ok(Peek::Exit(reaped_from_record(record))),
-        Ok(_) => Ok(Peek::Running),
+        Ok(Some(_)) => Ok(Peek::Running),
+        Ok(None) => no_record(),
         Err(Errno::CHILD) => Ok(Peek::Foreign(Foreign::Gone)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// A blocking `waitid` cannot legitimately find nothing: without `NOHANG` it waits.
+fn no_record() -> io::Result<Peek> {
+    debug_assert!(false, "a blocking waitid(P_PIDFD, WEXITED) returned no record");
+    Err(io::Error::other("a blocking waitid on the pidfd returned no record"))
 }

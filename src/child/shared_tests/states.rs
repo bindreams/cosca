@@ -190,19 +190,37 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
 
 // S7: wait_deadline behind a holder =====
 
-/// S7: a deadline waiter behind a parked holder returns `None` once its deadline has passed,
-/// while the holder is still parked.
+/// S7: a deadline waiter behind a parked holder blocks on the `Condvar` for the time remaining,
+/// then returns `None` once its deadline has passed, while the holder is still parked. The clock
+/// is frozen, so the armed timeout is exactly the time remaining.
 ///
-/// Mutant: the `Condvar::wait` without a timeout, which hangs.
+/// Mutant: the `Condvar::wait` without a timeout, which hangs; a waiter that returns `None` by
+/// peeking, without blocking; a wait armed with anything but the time remaining.
 #[test]
 fn a_deadline_waiter_behind_a_parked_holder_returns_none_at_its_deadline() {
     let b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
-    let deadline = Instant::now() + Duration::from_millis(50);
-    let (waiter, _blocked) = spawn_waiter(&b.shared, true, move |s| s.wait_deadline(deadline));
-    let got = waiter.join().expect("waiter").expect("a running child is not an error");
-    assert_eq!(got, None);
-    assert!(crate::wait::now() >= deadline, "returned before the deadline");
+    let remaining = Duration::from_millis(50);
+    let (waiter, _blocked) = spawn_waiter(&b.shared, true, move |s| {
+        let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+        crate::wait::block_probe::take();
+        let got = s.wait_deadline(at + remaining);
+        let expired = crate::wait::now() >= at + remaining;
+        let holder_still_parked = matches!(s.lock().state, State::W { .. });
+        (got, expired, holder_still_parked, crate::wait::block_probe::take())
+    });
+    let (got, expired, holder_still_parked, armed) = waiter.join().expect("waiter");
+    assert_eq!(got.expect("a running child is not an error"), None);
+    assert!(expired, "returned before the deadline");
+    assert!(
+        holder_still_parked,
+        "the holder must still be parked when the waiter returns"
+    );
+    assert_eq!(
+        armed.first(),
+        Some(&Some(remaining)),
+        "the waiter must block on the Condvar for the time remaining: {armed:?}"
+    );
     // Let the holder go, and end the child through the fixture's drop.
     drop(holder);
 }

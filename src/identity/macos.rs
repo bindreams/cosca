@@ -79,6 +79,10 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
+    /// The identity check just before a signal.
+    Kill,
+    /// The check after a by-pid `ECHILD`, that the pid still names our child.
+    Echild,
 }
 
 /// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees

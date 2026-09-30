@@ -85,7 +85,9 @@ impl ProcHandle {
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
                     StdTeardown::ReapBlocking => {
-                        _ = s.wait();
+                        if let Err(e) = s.wait() {
+                            log_teardown_wait_failure(s.id(), &e);
+                        }
                     }
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
                     // child is still running (an elevated child we cannot signal), warn.
@@ -105,6 +107,20 @@ impl ProcHandle {
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.teardown_on_drop(),
         }
+    }
+}
+
+/// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected
+/// and quiet; anything else leaves a zombie or an unread exit, and is a `warn`.
+fn log_teardown_wait_failure(pid: u32, e: &io::Error) {
+    #[cfg(unix)]
+    let gone = e.raw_os_error() == Some(libc::ECHILD);
+    #[cfg(windows)]
+    let gone = false;
+    if gone {
+        log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
+    } else {
+        log::warn!("teardown of child {pid}: the reap after the kill failed: {e}");
     }
 }
 

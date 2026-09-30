@@ -8,7 +8,8 @@
 //!   tracer's hand-back re-sends `NOTE_EXIT` and returns before `proc_knote(child, NOTE_REAP)`,
 //!   `kern_exit.c:2721-2773` against `:2787`), and every caller reaps only after this returns,
 //!   so a `NOTE_REAP` during the wait means something else reaped the child. It never peeks
-//!   again by a pid that may since name another child. An `ECHILD` from a peek is `Gone` too.
+//!   again by a pid that may since name another child. An `ECHILD` from a peek is `Gone` too, unless
+//!   `start` says the pid still names the child: a tracer holds it, and the wait goes on.
 //! - Once `NOTE_EXIT` has come, or the registration's receipt says `ESRCH` (the child is already
 //!   past `P_REF_DEAD`), it re-peeks with a backoff until the peek finds the zombie: XNU is
 //!   finishing the exit on its own, and the backoff re-checks that real condition. 1 ms doubling
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
 use super::add_with_receipt;
+use crate::identity::StartToken;
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
 /// The wait's verdict.
@@ -100,9 +102,9 @@ fn into_io(e: crate::error::Error) -> io::Error {
     }
 }
 
-/// One non-consuming look, by number and with no start check.
-fn peek(pid: u32) -> io::Result<Peek> {
-    exit_only::peek(&Target::pid(pid, None))
+/// One non-consuming look, by number and checked against `start` when there is one.
+fn peek(pid: u32, start: Option<StartToken>) -> io::Result<Peek> {
+    exit_only::peek(&Target::pid(pid, start))
 }
 
 /// The peek's verdict as a wait verdict, or `None` when the child is still running.
@@ -209,7 +211,12 @@ fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::
 }
 
 /// Wait until `pid`'s exit is reapable, on `kq`; see the module docs.
-pub(crate) fn await_reapable_on(kq: &Kqueue, pid: u32, deadline: Option<Instant>) -> io::Result<Waited> {
+pub(crate) fn await_reapable_on(
+    kq: &Kqueue,
+    pid: u32,
+    start: Option<StartToken>,
+    deadline: Option<Instant>,
+) -> io::Result<Waited> {
     let deadline = deadline.map(Some);
     let mut backoff = register(kq, pid)?;
     let mut interval = BACKOFF_START;
@@ -237,11 +244,11 @@ pub(crate) fn await_reapable_on(kq: &Kqueue, pid: u32, deadline: Option<Instant>
         if drain_for_reap(kq, &mut events)? {
             return Ok(Waited::Gone);
         }
-        if let Some(verdict) = settle(peek(pid)?) {
+        if let Some(verdict) = settle(peek(pid, start)?) {
             return Ok(verdict);
         }
         if expired(deadline) {
-            return final_peek(pid);
+            return final_peek(pid, start);
         }
         // Block: on the kqueue alone until `NOTE_EXIT`, then per backoff interval.
         #[cfg(test)]
@@ -269,7 +276,7 @@ pub(crate) fn await_reapable_on(kq: &Kqueue, pid: u32, deadline: Option<Instant>
             if drain_for_reap(kq, &mut events)? {
                 return Ok(Waited::Gone);
             }
-            return final_peek(pid);
+            return final_peek(pid, start);
         }
     }
 }
@@ -279,14 +286,14 @@ fn expired(deadline: Option<Option<Instant>>) -> bool {
 }
 
 /// The one non-blocking look at expiry.
-fn final_peek(pid: u32) -> io::Result<Waited> {
+fn final_peek(pid: u32, start: Option<StartToken>) -> io::Result<Waited> {
     #[cfg(test)]
     exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
-    Ok(settle(peek(pid)?).unwrap_or(Waited::DeadlinePassed))
+    Ok(settle(peek(pid, start)?).unwrap_or(Waited::DeadlinePassed))
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.
-pub(crate) fn await_reapable(pid: u32, deadline: Option<Instant>) -> io::Result<Waited> {
+pub(crate) fn await_reapable(pid: u32, start: Option<StartToken>, deadline: Option<Instant>) -> io::Result<Waited> {
     let kq = Kqueue::new().map_err(io::Error::from)?;
-    await_reapable_on(&kq, pid, deadline)
+    await_reapable_on(&kq, pid, start, deadline)
 }

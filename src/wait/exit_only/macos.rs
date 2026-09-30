@@ -78,19 +78,30 @@ fn check_start(pid: u32, start: StartToken, purpose: ReadPurpose) -> StartCheck 
 pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
     let (pid, start) = pid_and_start(target);
     let peeked = peek_raw(pid)?;
-    // The start is read only when the peek says `Exit`, just before the consume: a `Running`
-    // or `ECHILD` reads none, so a reusing process of another user never provokes the same-user
-    // `EPERM` (`proc_info.c:2197-2212`).
-    let (Peek::Exit(_), Some(start)) = (peeked, start) else {
-        return Ok(peeked);
-    };
-    match check_start(pid, start, ReadPurpose::Peek) {
-        StartCheck::Matches => Ok(peeked),
-        StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-        StartCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
-        // Unreadable start: the caller gets the start-less peek's answer. `Unassessable` is a
-        // later unit's; a start that cannot be read is never taken as a mismatch.
-        StartCheck::Unreadable => Ok(peeked),
+    let Some(start) = start else { return Ok(peeked) };
+    match peeked {
+        // The start is read only when the peek says `Exit`, just before the consume: a `Running`
+        // reads none, so a reusing process of another user never provokes the same-user `EPERM`
+        // (`proc_info.c:2197-2212`).
+        Peek::Exit(_) => match check_start(pid, start, ReadPurpose::Peek) {
+            StartCheck::Matches => Ok(peeked),
+            StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            StartCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
+            // Unreadable start: the caller gets the start-less peek's answer. `Unassessable` is
+            // a later unit's; a start that cannot be read is never taken as a mismatch.
+            StartCheck::Unreadable => Ok(peeked),
+        },
+        // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
+        // answers `ECHILD` (`src/test_support/tracer.rs`). Only a pid that no longer names the
+        // child is a reap; one that does is still ours, and the tracer's hand-back re-sends
+        // `NOTE_EXIT`.
+        Peek::Foreign(Foreign::Gone) => match check_start(pid, start, ReadPurpose::Echild) {
+            StartCheck::Matches => Ok(Peek::Running),
+            StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            // An unreadable start is a pid of another user: not our child.
+            StartCheck::Gone | StartCheck::Unreadable => Ok(peeked),
+        },
+        Peek::Running | Peek::Foreign(Foreign::Other) => Ok(peeked),
     }
 }
 
@@ -163,17 +174,20 @@ pub(crate) fn second_reap(pid: u32, start: Option<StartToken>) {
             return;
         }
     }
-    if let Some(start) = start {
-        match check_start(pid, start, ReadPurpose::SecondPeek) {
-            StartCheck::Matches => {}
-            StartCheck::Other | StartCheck::Gone => {
-                log::debug!("second reap of pid {pid}: the pid names another process now");
-                return;
-            }
-            StartCheck::Unreadable => {
-                log::warn!("second reap of pid {pid}: its start could not be read; a zombie may be left");
-                return;
-            }
+    // A consume by a bare pid could take a reusing process's exit record.
+    let Some(start) = start else {
+        log::warn!("second reap of pid {pid}: no start to check it against; a zombie may be left");
+        return;
+    };
+    match check_start(pid, start, ReadPurpose::SecondPeek) {
+        StartCheck::Matches => {}
+        StartCheck::Other | StartCheck::Gone => {
+            log::debug!("second reap of pid {pid}: the pid names another process now");
+            return;
+        }
+        StartCheck::Unreadable => {
+            log::warn!("second reap of pid {pid}: its start could not be read; a zombie may be left");
+            return;
         }
     }
     match consume(pid) {

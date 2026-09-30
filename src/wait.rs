@@ -594,10 +594,6 @@ pub(crate) mod block_probe {
     }
 
     /// Every timeout armed on this thread since the last call, in order.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux poll tests read it")
-    )]
     pub(crate) fn take() -> Vec<Option<Duration>> {
         ARMED.with(|a| std::mem::take(&mut *a.borrow_mut()))
     }

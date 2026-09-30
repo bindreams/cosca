@@ -129,8 +129,8 @@ fn confirm_exit_of(child: &std::process::Child) {
     assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
 }
 
-/// Adopt a child under the force `arm` installs, and expect the gone path: every method answers
-/// `ECHILD`. The child has already exited (and is not yet reaped) when it is adopted, so a force
+/// Adopt a child under the force `arm` installs, and expect the gone path: every wait answers
+/// `ECHILD`, and `kill` succeeds without sending. The child has already exited (and is not yet reaped) when it is adopted, so a force
 /// that is not applied leaves a handle whose methods answer at once with a status, and the
 /// assertions fail instead of blocking on a live child.
 #[cfg(target_os = "linux")]
@@ -147,7 +147,12 @@ pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
     assert!(is_echild(&shared.wait().expect_err("wait")));
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
     assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
-    assert!(is_echild(&shared.kill().expect_err("kill")));
+    let log = crate::send_log::Capture::start();
+    shared
+        .kill()
+        .expect("a child that was gone at adoption is already dead: success");
+    assert_eq!(log.entries(), [], "nothing is sent without a pidfd");
+    drop(log);
     // The force was synthetic: the child is still this test's own, unreaped.
     let mut status = 0;
     // SAFETY: `status` is a valid out-pointer.
