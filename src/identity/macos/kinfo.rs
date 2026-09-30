@@ -49,7 +49,7 @@ impl kinfo_proc {
     /// `eproc.e_jobc`: the group's `pg_jobc`, its members whose parent is in another group of the
     /// same session. 0 means the group is orphaned.
     pub(crate) fn e_jobc(&self) -> i16 {
-        let at = kinfo_proc::E_JOBC_OFFSET;
+        let at = if std::env::var("COSCA_MUT").as_deref() == Ok("M6") { 274 } else { kinfo_proc::E_JOBC_OFFSET };
         i16::from_ne_bytes(self.kp_eproc[at..at + 2].try_into().expect("2 bytes"))
     }
 }

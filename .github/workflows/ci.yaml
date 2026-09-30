@@ -37,16 +37,29 @@ jobs:
           tool: cargo-nextest@0.9.137
       - name: Build tests
         run: cargo nextest run --locked --no-run --lib --target ${{ matrix.target }} --profile ci
-      - name: Diag under nextest
-        timeout-minutes: 3
-        run: cargo nextest run --locked --lib --target ${{ matrix.target }} --no-capture -E 'test(/diag_jobc/)'
-      - name: Build plain cargo test
-        run: cargo test --locked --no-run --lib --target ${{ matrix.target }}
-      - name: Diag under plain cargo test
-        timeout-minutes: 3
+      - name: Unmutated tracer tests
+        timeout-minutes: 8
+        run: cargo nextest run --locked --lib --no-fail-fast --target ${{ matrix.target }} --profile ci -E 'test(/^test_support::tracer::/)'
+      - name: Mutants (each must fail its named test)
+        timeout-minutes: 8
         shell: bash
         run: |
-          set -uxo pipefail
-          source .github/scripts/forward-signals.sh
-          ps -o pid,ppid,pgid,sess,jobc,stat,comm -p $$ -p $PPID
-          run_forwarding cargo test --locked --lib --target ${{ matrix.target }} -- diag_jobc --nocapture
+          set -uo pipefail
+          status=0
+          for m in M1 M2 M3 M4 M5 M6 M7 M8; do
+            case $m in
+              M1) t=a_blocked_signal_fails_the_precondition ;;
+              M2) t=an_ignored_signal_fails_the_precondition ;;
+              M3) t=a_missing_handler_fails_the_precondition ;;
+              M4) t=an_orphaned_group_fails_the_precondition_for_a_job_control_stop ;;
+              M5) t=an_orphaned_group_does_not_matter_for_other_signals ;;
+              M6 | M7) t=the_tracees_meet_the_preconditions ;;
+              M8) t=a_shared_group_fails_the_precondition_for_a_job_control_stop ;;
+            esac
+            if COSCA_MUT=$m cargo nextest run --locked --lib --no-fail-fast --target ${{ matrix.target }} --profile ci -E "test(=test_support::tracer::tracer_tests::$t)" > "mut-$m.log" 2>&1; then
+              echo "MUTANT $m SURVIVED ($t passed)"; status=1
+            else
+              echo "MUTANT $m KILLED by $t:"; grep -E "Summary|panicked at|assertion|no failure" "mut-$m.log" | head -4
+            fi
+          done
+          exit "$status"

@@ -44,11 +44,12 @@ fn tracee_receiving(kind: Tracee, signals: &[i32]) -> Option<(crate::Child, std:
 /// when `caught` and does not ignore it, and a `SIGTSTP`, `SIGTTIN` or `SIGTTOU` is not sent into
 /// an orphaned process group. XNU discards those three there for a traced process whatever its
 /// disposition (xnu `kern_sig.c`, `psignal_internal`, `pg_jobc == 0`), so the helper would wait
-/// for a stop that never comes.
+/// for a stop that never comes. For those three the tracee must also lead its own group, so that
+/// no other process's exit can orphan it after this check ([`Tracee::OwnGroup`]).
 fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
     use crate::identity::kinfo::{kinfo, signal_bit};
     assert_eq!(
-        ready.blocked & signal_bit(signal),
+        if std::env::var("COSCA_MUT").as_deref() == Ok("M1") { 0 } else { ready.blocked & signal_bit(signal) },
         0,
         "precondition: the tracee blocks signal {signal}"
     );
@@ -58,19 +59,26 @@ fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
         crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),
     };
     assert!(
-        !info.kp_proc.sig_ignored(signal),
+        std::env::var("COSCA_MUT").as_deref() == Ok("M2") || !info.kp_proc.sig_ignored(signal),
         "precondition: the tracee ignores signal {signal}"
     );
     assert_eq!(
-        info.kp_proc.sig_caught(signal),
+        if std::env::var("COSCA_MUT").as_deref() == Ok("M3") { caught } else { info.kp_proc.sig_caught(signal) },
         caught,
         "precondition: whether the tracee catches signal {signal}"
     );
-    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
-        assert!(
-            info.e_jobc() > 0,
-            "precondition: the tracee's process group is orphaned, so XNU discards signal {signal} \
-             sent to it while traced. Run the tests under nextest, or under a shell with job control"
+    if std::env::var("COSCA_MUT").as_deref() == Ok("M5") || matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
+        // SAFETY: `getpgid` has no memory preconditions; `pid` is this test's unreaped child.
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(
+            pgid, if std::env::var("COSCA_MUT").as_deref() == Ok("M8") { pgid } else { pid as libc::pid_t },
+            "precondition: the tracee does not lead its own process group. Spawn it as Tracee::OwnGroup"
+        );
+        let jobc = info.e_jobc();
+        assert_ne!(
+            jobc, if std::env::var("COSCA_MUT").as_deref() == Ok("M4") { -12345 } else { 0 },
+            "precondition: the tracee's process group is orphaned (pg_jobc {jobc}), so XNU discards \
+             signal {signal} sent to it while traced. Spawn it as Tracee::OwnGroup"
         );
     }
 }
@@ -294,16 +302,22 @@ fn check_receives(kind: Tracee, signal: i32, caught: bool) -> Result<(), String>
     })
 }
 
-/// Every signal the tests send a plain tracee meets the preconditions. Mutant: the orphaned-group
-/// check reads a field that is 0 here.
+/// Every signal the tests send meets the preconditions on the tracee they send it to. Mutants: the
+/// orphaned-group check reads a field that is 0 here; `Tracee::OwnGroup` stays in its parent's
+/// group.
 #[test]
-fn a_plain_tracee_meets_the_preconditions() {
+fn the_tracees_meet_the_preconditions() {
     if !crate::test_support::require_group("TRACER") {
         return;
     }
-    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGCONT, libc::SIGTERM] {
-        assert_eq!(check_receives(Tracee::Plain, signal, false), Ok(()), "signal {signal}");
+    for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGCONT] {
+        assert_eq!(
+            check_receives(Tracee::OwnGroup, signal, false),
+            Ok(()),
+            "signal {signal}"
+        );
     }
+    assert_eq!(check_receives(Tracee::Plain, libc::SIGTERM, false), Ok(()));
     assert_eq!(check_receives(Tracee::CatchSigterm, libc::SIGTERM, true), Ok(()));
 }
 
@@ -337,7 +351,18 @@ fn a_missing_handler_fails_the_precondition() {
     assert!(message.contains("catches signal 15"), "{message}");
 }
 
-/// Mutant: the orphaned-group check is skipped.
+/// Mutant: the own-group check is skipped.
+#[test]
+fn a_shared_group_fails_the_precondition_for_a_job_control_stop() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = check_receives(Tracee::Plain, libc::SIGTSTP, false).expect_err("no failure");
+    assert!(message.contains("does not lead its own process group"), "{message}");
+}
+
+/// A session leader leads its own group too, so only the orphaned-group check fails. Mutant: that
+/// check is skipped.
 #[test]
 fn an_orphaned_group_fails_the_precondition_for_a_job_control_stop() {
     if !crate::test_support::require_group("TRACER") {
@@ -734,7 +759,7 @@ fn s2_passes_a_stopping_signal_through() {
 /// the kept signal is not re-sent.
 #[test]
 fn s2_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1370,7 +1395,7 @@ fn s3_passes_a_stopping_signal_through() {
 /// Mutants: S3 passes a stop signal on; the kept signal is not re-sent after the detach.
 #[test]
 fn s3_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1389,7 +1414,7 @@ fn s3_keeps_a_stop_signal_until_after_the_detach() {
 /// Mutant: a later stop signal replaces the kept one.
 #[test]
 fn s3_keeps_only_the_first_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP, libc::SIGTTIN]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGTTIN]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1410,7 +1435,7 @@ fn s3_keeps_only_the_first_stop_signal() {
 /// Mutant: a `SIGCONT` passed on leaves the kept stop signal.
 #[test]
 fn s3_a_sigcont_drops_a_kept_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP, libc::SIGCONT]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGCONT]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1439,7 +1464,7 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
 /// Mutants: S4 passes a stop signal on; S4 detaches from any stop.
 #[test]
 fn s4_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1458,7 +1483,7 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
 /// Mutant: S4 ignores a failed re-send.
 #[test]
 fn s4_a_failed_resend_fails() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTSTP]) else {
+    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
         return;
     };
     let pid = tracee.id().pid();
@@ -1691,54 +1716,4 @@ fn done_ignores_a_signal_byte_and_holds() {
     assert_not_handed_back(pid);
     drop(th);
     assert_exited_cleanly(tracee);
-}
-
-// THROWAWAY diagnostic: where the tracee's process group stands under each runner.
-fn diag_ps(label: &str) {
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "pid,ppid,pgid,sess,jobc,stat,comm"])
-        .output()
-        .expect("ps");
-    eprintln!("DIAG {label} test pid={} ---\n{}", std::process::id(), String::from_utf8_lossy(&out.stdout));
-}
-
-fn diag_jobc(label: &str, pid: u32) {
-    match crate::identity::kinfo::kinfo(pid as _) {
-        crate::identity::Resolved::Found(info) => eprintln!(
-            "DIAG {label} pid={pid} pgid={} sid={} jobc={}",
-            unsafe { libc::getpgid(pid as _) },
-            unsafe { libc::getsid(pid as _) },
-            info.e_jobc()
-        ),
-        _ => eprintln!("DIAG {label} pid={pid} unresolved"),
-    }
-}
-
-#[test]
-fn diag_jobc_under_the_runner() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
-    let me = std::process::id();
-    diag_jobc("test", me);
-    diag_jobc("test-parent", unsafe { libc::getppid() } as u32);
-    let (mut tracee, _ready) = super::spawn_tracee(Tracee::Plain);
-    let stdin = tracee.stdin().expect("stdin");
-    let pid = tracee.id().pid();
-    diag_jobc("tracee-spawned", pid);
-    diag_ps("spawned");
-    let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
-    expect(&mut th, &TO_S3);
-    diag_jobc("tracee-traced", pid);
-    diag_ps("traced");
-    send(pid, libc::SIGTSTP);
-    eprintln!("DIAG sent SIGTSTP; waiting for S3k (a hang here means XNU discarded it)");
-    expect(&mut th, &["S3k", "blocking S3 eof"]);
-    eprintln!("DIAG got S3k");
-    th.signal();
-    expect(&mut th, &["S4", "S4b*", "S4r", "detached", DONE]);
-    drop(th);
-    drop(stdin);
-    assert_job_stopped(pid, libc::SIGTSTP);
-    end_stopped(tracee);
 }
