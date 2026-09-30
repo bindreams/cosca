@@ -200,3 +200,27 @@ fn an_unparsable_stat_is_unassessable_naming_the_pid() {
     }
     assert_eq!(super::ppid_of_stat(4242, b"4242 (x) S 7 1 1").expect("parses"), 7);
 }
+
+/// The kernel prints a parseable `stat` for every pid, so an unparsable one reaching the snapshot
+/// is a contract violation: asserted in debug. Mutant: "remove the assertion".
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the kernel printed an unparseable stat")]
+fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
+    let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
+    let _ = process_parents();
+}
+
+/// Without the assertion (release), the scan still refuses to drop the pid. Mutant: "an unparsable
+/// `stat` drops the pid".
+#[cfg(not(debug_assertions))]
+#[test]
+fn an_unparsable_stat_in_the_scan_is_unassessable_in_release() {
+    let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains("/stat has no parseable"), "{detail}")
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
