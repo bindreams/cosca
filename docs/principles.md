@@ -55,8 +55,9 @@ runtime parks ([tokio runtime/process.rs]), and until
 then the root stays a zombie.
 
 On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
-included), cosca instead takes the child's stdio out, forgets tokio's `Child`, and logs what the forget leaks as principle 7 says: on Linux the pidfd and its
-reactor registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
+included), cosca instead takes the child's stdio out, forgets tokio's `Child`, and logs what the
+forget leaks as principle 7 says: on Linux the pidfd and its reactor registration
+([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
 [#174] and open with the owner.
 
 tokio discards a PID that is already reaped: the queue drops it on `ECHILD` ([tokio orphan.rs]).

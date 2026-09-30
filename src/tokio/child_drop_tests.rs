@@ -52,16 +52,20 @@ mod linux {
     pub(super) enum Ended {
         Exited(i32),
         Signalled(i32),
-        /// Already reaped while its stdin was still open. Nothing but the drop's `SIGKILL` can
-        /// have ended it then, and tokio's own `Child` drop reaped it: the drop's `try_wait` ran
-        /// after the kill had already taken effect.
-        KilledAndReapedByTokio,
+        /// Reaped before its stdin closed, by tokio's own `Child` drop (its `try_wait` ran after
+        /// something had already ended the root), so no status is left to read. It proves only
+        /// that the root died with its stdin open. For a root that ignores every catchable signal
+        /// ([`ignoring_blocker`](super::ignoring_blocker)) that leaves an uncatchable signal, a
+        /// crash or a foreign kill: never a wrong signal from the drop.
+        ReapedWhileStdinOpen,
     }
 
     /// The root's exit, read through a pidfd opened while the caller still holds the unreaped
     /// child, so it names that process exactly. It never consumes the exit: the root's number
     /// belongs to tokio's reaper once the child is dropped, and a `#[tokio::test]` runtime that
-    /// this thread never yields to has not run it.
+    /// this thread never yields to has not run it. That holds only in a process running this one
+    /// test (tokio's orphan queue is process-global, and any runtime that parks drains it), so
+    /// [`ended_after_closing`](Self::ended_after_closing) requires `alone()`.
     pub(super) struct Pidfd(OwnedFd);
 
     impl Pidfd {
@@ -92,12 +96,18 @@ mod linux {
         /// exit, and say how it ended. A root a drop killed died of `SIGKILL` before its stdin
         /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root the kill
         /// already ended, which leaves no status to read: that is [`Ended::KilledAndReapedByTokio`].
-        /// The read is exact, since nothing else reaps before this thread yields to a runtime.
+        /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
+        /// a runtime.
         pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
+            debug_assert!(
+                std::env::var_os("COSCA_TEST_ALONE").is_some(),
+                "`ended_after_closing` is exact only in a process running this test alone (`alone()`): \
+                 tokio's orphan queue is process-global"
+            );
             let reaped_while_open = self.reaped();
             drop(stdin);
             if reaped_while_open {
-                return Ended::KilledAndReapedByTokio;
+                return Ended::ReapedWhileStdinOpen;
             }
             loop {
                 let status = rustix::process::waitid(
@@ -244,23 +254,50 @@ async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
     );
 }
 
-/// The drop kills the root itself: it dies of `SIGKILL` before its stdin closes.
+/// A root that ignores every catchable signal, blocked on its stdin, and its stdin's write end. It
+/// says `r` once the `trap` is in place, and the caller reads that before dropping the child:
+/// otherwise the drop races the `trap`, and a `SIGTERM` would still kill the root. Only an
+/// uncatchable signal can end it early.
+#[cfg(target_os = "linux")]
+async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::ChildStdout) {
+    use ::tokio::io::AsyncReadExt as _;
+
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args([
+        "sh",
+        "-c",
+        "trap '' HUP INT QUIT PIPE ALRM TERM USR1 USR2; echo r; exec cat >/dev/null",
+    ]);
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).await.expect("the root's `r` handshake");
+    assert_eq!(&ready, b"r\n");
+    (child, stdin, stdout)
+}
+
+/// The drop kills the root itself, and with `SIGKILL`: the root ignores every catchable signal, so
+/// a drop that sent any other would leave it running until its stdin closes (`Exited(0)`). Mutants:
+/// the drop skips the kill, or sends `SIGTERM`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_kill_on_drop_drop_kills_the_root() {
     if !alone(fixture_path!(a_kill_on_drop_drop_kills_the_root)) {
         return;
     }
-    let (child, stdin) = blocker();
+    let (child, stdin, _stdout) = ignoring_blocker().await;
     let root = linux::Pidfd::of(&child);
     drop(child);
     let ended = root.ended_after_closing(stdin);
     assert!(
         matches!(
             ended,
-            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::KilledAndReapedByTokio
+            linux::Ended::Signalled(libc::SIGKILL) | linux::Ended::ReapedWhileStdinOpen
         ),
-        "the drop must kill the root, got {ended:?}"
+        "the drop must kill the root with SIGKILL, got {ended:?}"
     );
 }
 
