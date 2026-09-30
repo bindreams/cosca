@@ -16,7 +16,7 @@ fn join_edges_filters_non_positive_pids() {
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, denied, sample) = join_edges(&[0, -1, me]);
+    let (out, denied, sample) = join_edges(&[0, -1, me]).expect("edge buffer");
     let parent_after = std::os::unix::process::parent_id();
     assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
     assert!(
@@ -38,7 +38,7 @@ fn join_edges_filters_non_positive_pids() {
 #[test]
 fn join_edges_does_not_count_gone_pids_as_denied() {
     let unresolvable = vec![libc::c_int::MAX; 8];
-    let (out, denied, sample) = join_edges(&unresolvable);
+    let (out, denied, sample) = join_edges(&unresolvable).expect("edge buffer");
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
     assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
     assert!(
@@ -87,7 +87,7 @@ fn push_denied_sample_caps_at_the_limit() {
 fn parents_contains_this_process_edge() {
     let me = std::process::id();
     let parent_before = std::os::unix::process::parent_id();
-    let parents = process_parents();
+    let parents = process_parents().expect("the process snapshot");
     let parent_after = std::os::unix::process::parent_id();
     assert!(
         parents.contains(&(me, parent_before)) || parents.contains(&(me, parent_after)),
@@ -137,4 +137,100 @@ fn ppid_of_reports_gone_for_an_unallocatable_pid() {
         Resolved::Gone,
         "a pid beyond PID_MAX can never resolve to a ppid, and is not a denial"
     );
+}
+
+/// A failed `proc_listallpids` is `Unassessable` naming the call, not an empty snapshot a tree
+/// walk would read as "no descendants". Mutant: "`process_parents` reads `all_pids()`" (a failure
+/// becomes an empty list).
+#[test]
+fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
+    super::super::force_blind_snapshot_for_next_call(true);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("proc_listallpids"), "{detail}");
+            assert!(source.is_some());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
+
+/// A pid denied its ppid read leaves its subtree out of the edges, and a walk over them would skip
+/// it: `process_parents` is `Unassessable` naming the denied count and a sample. Mutant: "`denied >
+/// 0` still returns `Ok`".
+#[test]
+fn a_denied_ppid_read_is_unassessable_naming_the_count_and_a_sample() {
+    let me = std::process::id() as libc::c_int;
+    let _forced = super::super::fault::force_denied(&[me]);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("1 of "), "{detail}");
+            assert!(detail.contains(&format!("sample: [{me}]")), "{detail}");
+            assert!(source.is_none());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
+
+/// `snapshot` keeps its own policy for the same denial: the fd-marker sweep folds the count into
+/// its `incomplete` accounting, so it gets the edges it could read and the count. Mutant:
+/// "`snapshot` fails like `process_parents`".
+#[test]
+fn snapshot_reports_a_denied_ppid_read_as_a_count_not_an_error() {
+    let me = std::process::id() as libc::c_int;
+    let _forced = super::super::fault::force_denied(&[me]);
+    let (pids, edges, denied) = super::super::snapshot();
+    assert_eq!(denied, 1);
+    assert!(pids.contains(&(me as u32)));
+    assert!(!edges.iter().any(|&(pid, _)| pid == me as u32));
+}
+
+/// A failed edge allocation is `Unassessable`, not an empty tree. Mutant: "`join_edges`' failure is
+/// an empty snapshot".
+#[test]
+fn a_failed_edge_allocation_is_unassessable_not_an_empty_snapshot() {
+    let _forced = super::super::fault::force_join_alloc_failure();
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("edge buffer"), "{detail}");
+            assert!(source.is_some());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
+
+/// `snapshot`'s blind-pass arm: a failed join is an empty table and a zero count, which the
+/// fd-marker sweep reads as an incomplete pass. Mutant: "a failed join returns the pid list".
+#[test]
+fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
+    let _forced = super::super::fault::force_join_alloc_failure();
+    assert_eq!(super::super::snapshot(), (Vec::new(), Vec::new(), 0));
+}
+
+/// `fork()` in progress is transient: it resolves inside the read, so it is neither a denial nor
+/// an error. Mutant: "transient counted as denied".
+#[test]
+fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
+    use crate::identity::{macos_fault, PpidRead};
+    let me = std::process::id() as libc::c_int;
+    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(1)]);
+    let (edges, denied, _) = join_edges(&[me]).expect("edge buffer");
+    assert_eq!(denied, 0);
+    assert_eq!(edges, [(me as u32, 1)]);
+    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 3);
+}
+
+/// A persistent refusal is a denial, read once. Mutant: "a persistent refusal is retried" (a second
+/// read reaches the real one, which resolves it).
+#[test]
+fn a_persistent_refusal_is_a_denial_after_one_read() {
+    use crate::identity::{macos_fault, PpidRead};
+    let me = std::process::id() as libc::c_int;
+    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Refused]);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains(&format!("sample: [{me}]")), "{detail}")
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 1);
 }

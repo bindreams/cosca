@@ -190,11 +190,16 @@ impl Attached {
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(),
-            Attached::TreeWalk(root) => {
-                crate::containment::treewalk::hard_kill(*root);
-                Ok(())
-            }
+            Attached::TreeWalk(root) => crate::containment::treewalk::hard_kill(*root),
         }
+    }
+
+    /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk` refusal to walk: the
+    /// snapshot could not be taken, so NOTHING was killed, the root included. Killing the root
+    /// anyway would reparent the descendants out of the ppid walk, so a retry could no longer
+    /// find them. Every other mechanism's error is a kill that was attempted.
+    pub(crate) fn hard_kill_refused_to_walk(&self, result: &Result<(), crate::error::Error>) -> bool {
+        matches!(self, Attached::TreeWalk(_)) && result.is_err()
     }
 
     /// Send the graceful termination signal to the group (signal-only).

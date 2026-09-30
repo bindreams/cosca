@@ -90,9 +90,14 @@ impl ViewUnreadable {
     /// The `openat2` requirement text, when `openat2` being refused is why the view could not be
     /// established. For callers whose error type is not [`Error`].
     pub(crate) fn openat2_requirement(&self) -> Option<String> {
-        self.openat2_refused
-            .map(|errno| format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}"))
+        self.openat2_refused.map(openat2_refused_message)
     }
+}
+
+/// The requirement text for an `openat2` refused with the errno named `errno`. The one place the
+/// wording lives: tests build their expectation with it.
+pub(crate) fn openat2_refused_message(errno: &str) -> String {
+    format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}")
 }
 
 impl std::fmt::Display for ViewUnreadable {
@@ -174,6 +179,10 @@ impl ProcDir {
 
     /// The pids listed under this `/proc`: its decimal-named entries.
     pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
+        #[cfg(test)]
+        if let Some(errno) = fault::forced_pids_errno() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
         collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
     }
@@ -423,6 +432,11 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCE_PROC_VIEW: Cell<Option<ForcedView>> = const { Cell::new(None) };
+        static FORCE_PROC_VIEW_SKIP: Cell<u32> = const { Cell::new(0) };
+        static PROC_VIEW_CALLS: Cell<u32> = const { Cell::new(0) };
+        static PROC_VIEW_FIRED_AT: Cell<Option<u32>> = const { Cell::new(None) };
+        static FORCE_PIDS_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        static FORCE_IDENTITY_STAT: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
         static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
@@ -437,6 +451,11 @@ pub(crate) mod fault {
     impl Drop for Forced {
         fn drop(&mut self) {
             FORCE_PROC_VIEW.with(|f| f.set(None));
+            FORCE_PROC_VIEW_SKIP.with(|f| f.set(0));
+            PROC_VIEW_CALLS.with(|f| f.set(0));
+            PROC_VIEW_FIRED_AT.with(|f| f.set(None));
+            FORCE_PIDS_ERRNO.with(|f| f.set(None));
+            FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().clear());
             FORCE_FDINFO.with(|f| f.set(None));
             FORCE_STATUS.with(|f| f.take());
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
@@ -454,6 +473,29 @@ pub(crate) mod fault {
 
     pub(crate) fn forced_openat2_errno() -> Option<rustix::io::Errno> {
         FORCE_OPENAT2_ERRNO.with(|f| f.get())
+    }
+
+    /// Make EVERY [`ProcDir::pids`](super::ProcDir::pids) on THIS thread fail with `errno` until
+    /// the guard drops.
+    pub(crate) fn force_pids_errno(errno: i32) -> Forced {
+        FORCE_PIDS_ERRNO.with(|f| f.set(Some(errno)));
+        Forced(())
+    }
+
+    pub(crate) fn forced_pids_errno() -> Option<i32> {
+        FORCE_PIDS_ERRNO.with(|f| f.get())
+    }
+
+    /// Make every by-pid identity read of `pid`'s `stat` on THIS thread fail with `errno` (a
+    /// `hidepid` or access refusal that `kill(pid, 0)` does not call a gone pid), until the guard
+    /// drops. Reads by the checked-directory table scan are unaffected.
+    pub(crate) fn force_identity_stat_errno(pid: u32, errno: i32) -> Forced {
+        FORCE_IDENTITY_STAT.with(|f| f.borrow_mut().push((pid, errno)));
+        Forced(())
+    }
+
+    pub(crate) fn forced_identity_stat_errno(pid: u32) -> Option<i32> {
+        FORCE_IDENTITY_STAT.with(|f| f.borrow().iter().find(|&&(p, _)| p == pid).map(|&(_, e)| e))
     }
 
     /// Make the NEXT read of this process's own `stat` on THIS thread return `bytes`.
@@ -479,8 +521,17 @@ pub(crate) mod fault {
 
     /// Force the NEXT [`proc_view`](super::proc_view) on THIS thread.
     pub(crate) fn force_proc_view_once(view: ForcedView) -> Forced {
+        PROC_VIEW_CALLS.with(|f| f.set(0));
+        PROC_VIEW_FIRED_AT.with(|f| f.set(None));
         FORCE_PROC_VIEW.with(|f| f.set(Some(view)));
         Forced(())
+    }
+
+    /// Force the [`proc_view`](super::proc_view) on THIS thread that follows `skip` real ones,
+    /// so a caller whose first read must pass (an anchor) fails only at a later one.
+    pub(crate) fn force_proc_view_after(skip: u32, view: ForcedView) -> Forced {
+        FORCE_PROC_VIEW_SKIP.with(|f| f.set(skip));
+        force_proc_view_once(view)
     }
 
     /// Force the NEXT [`pidfd_pid_in_view`](super::pidfd_pid_in_view) on THIS thread to answer
@@ -490,8 +541,31 @@ pub(crate) mod fault {
         Forced(())
     }
 
+    /// Where the forced view fired: how many [`proc_view`](super::proc_view) calls on THIS thread
+    /// preceded it since it was armed. `None` while it has not fired.
+    pub(crate) fn proc_view_fired_at() -> Option<u32> {
+        PROC_VIEW_FIRED_AT.with(|f| f.get())
+    }
+
     pub(crate) fn take_forced_proc_view() -> Option<ForcedView> {
-        FORCE_PROC_VIEW.with(|f| f.take())
+        let index = PROC_VIEW_CALLS.with(|f| {
+            let n = f.get();
+            f.set(n + 1);
+            n
+        });
+        let skipped = FORCE_PROC_VIEW_SKIP.with(|f| {
+            let n = f.get();
+            f.set(n.saturating_sub(1));
+            n > 0
+        });
+        if skipped {
+            return None;
+        }
+        let forced = FORCE_PROC_VIEW.with(|f| f.take());
+        if forced.is_some() {
+            PROC_VIEW_FIRED_AT.with(|f| f.set(Some(index)));
+        }
+        forced
     }
 
     pub(crate) fn take_forced_fdinfo() -> Option<Result<super::PidfdTarget, i32>> {

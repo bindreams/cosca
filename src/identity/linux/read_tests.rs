@@ -121,8 +121,10 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
     let err = unknown_identity_error("the spawned child").expect("no openat2 is an error");
     assert_eq!(
         err.to_string(),
-        "identifying the spawned child is not supported on linux: cosca requires openat2 (Linux \u{2265} 5.6), \
-         refused here: openat2 answered ENOSYS"
+        format!(
+            "identifying the spawned child is not supported on linux: {}",
+            crate::identity::openat2_refused_message("ENOSYS")
+        )
     );
 }
 

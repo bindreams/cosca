@@ -156,7 +156,7 @@ impl RestrictedChild {
             .expect("the owned handle always yields an identity");
         loop {
             assert!(self.is_running(), "the fixture shell exited before spawning its child");
-            let parents = crate::containment::enumerate::process_parents();
+            let parents = crate::containment::enumerate::process_parents().expect("the process snapshot");
             if let Some(kid) = crate::containment::treewalk::children_of(me, &parents).first() {
                 return kid.pid();
             }

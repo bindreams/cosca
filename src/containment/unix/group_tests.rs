@@ -470,8 +470,8 @@ fn members_without_openat2_is_unsupported_naming_the_requirement() {
         assert_eq!(
             err.to_string(),
             format!(
-                "containment::unix::group::members: cosca requires openat2 (Linux \u{2265} 5.6), refused here: \
-                 openat2 answered {name}, so pgid {} cannot be listed",
+                "containment::unix::group::members: {}, so pgid {} cannot be listed",
+                crate::identity::openat2_refused_message(name),
                 i32::MAX
             ),
             "{errno}"

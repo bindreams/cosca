@@ -427,7 +427,7 @@ fn resolve_root_id_names_a_missing_openat2() {
         panic!("a host without openat2 must not resolve a root identity");
     };
     assert!(
-        detail.starts_with("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered ENOSYS"),
+        detail.starts_with(&crate::identity::openat2_refused_message("ENOSYS")),
         "{detail}"
     );
 }

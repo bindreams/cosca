@@ -83,7 +83,13 @@ impl ProcessId {
     /// process; [`Resolved::Unknown`] means it refused the question (typically an
     /// unprivileged caller querying a service) — the process may well be running.
     pub fn of(pid: RawPid) -> Resolved<ProcessId> {
-        backend::start_token(pid).map(|start| ProcessId { pid, start })
+        Self::of_explained(pid).0
+    }
+
+    /// [`of`](Self::of), and why it was [`Resolved::Unknown`] when the read itself knows.
+    pub(crate) fn of_explained(pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+        let (read, cause) = start_token_explained(pid);
+        (read.map(|start| ProcessId { pid, start }), cause)
     }
 
     /// Build a `ProcessId` from an already-known `(pid, raw start token)` pair, without a
@@ -140,11 +146,18 @@ impl ProcessId {
     /// [`Existence::Unknown`] when the OS refuses the query — never `Gone`. For "is it still
     /// running?", use [`ProcessId::is_alive`].
     pub fn exists(&self) -> Existence {
-        match backend::start_token(self.pid) {
+        self.exists_explained().0
+    }
+
+    /// [`exists`](Self::exists), and why it was [`Existence::Unknown`] when the read itself knows.
+    pub(crate) fn exists_explained(&self) -> (Existence, UnknownCause) {
+        let (read, cause) = start_token_explained(self.pid);
+        let existence = match read {
             Resolved::Found(t) if t == self.start => Existence::Present,
             Resolved::Found(_) | Resolved::Gone => Existence::Gone,
             Resolved::Unknown => Existence::Unknown,
-        }
+        };
+        (existence, cause)
     }
 
     /// Whether the process is currently *running* (has not exited). Answers out of the OS's own
@@ -175,7 +188,46 @@ impl ProcessId {
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
 #[cfg(target_os = "linux")]
+pub(crate) use backend::pid_stat;
+
+#[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
+
+/// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
+/// `/proc` view it went through. Carried out of the failing read, so the error describes that read
+/// and not a second look at a view that may have recovered.
+#[derive(Debug, Default)]
+pub(crate) struct UnknownCause {
+    #[cfg(target_os = "linux")]
+    view: Option<ViewUnreadable>,
+}
+
+impl UnknownCause {
+    /// The error for `subject`'s `Unknown` read when the view is why (see
+    /// [`unknown_identity_error`]), else `None`.
+    pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
+        #[cfg(target_os = "linux")]
+        {
+            self.view.map(|why| backend::view_error(subject, why))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, subject);
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
+    let (read, view) = backend::start_token_explained(pid);
+    (read, UnknownCause { view })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, UnknownCause) {
+    (backend::start_token(pid), UnknownCause::default())
+}
 
 /// The error for a by-pid read of `subject` that answered [`Resolved::Unknown`] because the
 /// checked `/proc` view is unavailable, or `None` when the view is fine (or off Linux, which has
@@ -194,7 +246,7 @@ pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Err
 
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::fault as proc_view_fault;
+pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
@@ -226,12 +278,29 @@ impl ProcessId {
 #[cfg(target_os = "macos")]
 pub(crate) use backend::kinfo;
 
+/// Make every by-pid identity read of `pid` on THIS thread answer `Unknown` until the guard drops:
+/// an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on macOS) for a live pid.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
+    proc_view_fault::force_identity_stat_errno(pid, libc::EACCES)
+}
+
+/// [`force_unknown_identity`] on macOS.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
+    backend::fault::force_unknown(pid)
+}
+
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see
 /// `identity::macos::ppid_of`'s doc for why it lives here instead of a second copy of either
 /// the guard or `kinfo_proc`'s layout.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::ppid_of as macos_ppid_of;
+
+/// The macOS parent-pid read's test seams and its attempt type.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use backend::{fault as macos_fault, PpidRead};
 
 /// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
 /// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).

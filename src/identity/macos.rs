@@ -70,6 +70,10 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
+    #[cfg(test)]
+    if fault::is_unknown(pid) {
+        return Resolved::Unknown;
+    }
     if let Some(info) = bsd_info(pid) {
         return Resolved::Found(token_of_bsd(&info));
     }
@@ -98,11 +102,10 @@ pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
 /// than clears the finding, since a targeted fork-storm and ordinary host churn during a
 /// parallel test run are different windows onto the same kernel-internal, userspace-
 /// invisible race, the same class already documented for `proc_listallpids`'s walk cap.
-/// Never trusted as a real ppid, and never retried: excluded by the pid it names (a fixed,
-/// data-driven rule), not chased with a timing guess. The record itself is otherwise valid
-/// (correctly sized, no sysctl/libproc error) - this is not `contract_violation`'s "layout
-/// drifted or the kernel misbehaved" case, only a narrow timing window - so an excluded `0`
-/// is a DESIGNED `None`, `debug`-logged like every other per-pid probe.
+/// Never trusted as a real ppid: [`ppid_of`] re-reads it until the fork finishes. The record
+/// itself is otherwise valid (correctly sized, no sysctl/libproc error) - this is not
+/// `contract_violation`'s "layout drifted or the kernel misbehaved" case, only a narrow timing
+/// window - so an excluded `0` is a DESIGNED `None`, `debug`-logged like every other per-pid probe.
 fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
     if raw == 0 && pid != 1 {
         log::debug!(
@@ -115,31 +118,79 @@ fn trusted_ppid(pid: RawPid, raw: RawPid) -> Option<RawPid> {
     }
 }
 
-/// `pid`'s parent pid: `proc_pidinfo` (the same primary read [`bsd_info`] makes) first, the
-/// sysctl fallback on a miss - the shape [`start_token`] already uses for its own libproc
-/// miss, reused whole by `containment::enumerate::macos` instead of that module keeping a
-/// second `proc_pidinfo` call. An untrusted `0` from the primary ([`trusted_ppid`]) falls
-/// through to the fallback exactly like any other miss, rather than being returned as a
-/// bogus `Found(0)` parent.
-///
-/// `Unknown` covers: a genuinely unresolvable pid (gone, or an EPERM/EACCES sysctl refusal),
-/// or BOTH reads producing an untrusted `0` (the fork-window race hitting the same pid on
-/// both syscalls - see [`trusted_ppid`]). `Gone` is only returned when the fallback itself
-/// positively confirms the pid no longer exists.
-pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
+/// One attempt at `pid`'s parent pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PpidRead {
+    Found(RawPid),
+    /// Both reads reported an untrusted `e_ppid == 0` ([`trusted_ppid`]): `fork()` has not
+    /// finished. Transient.
+    Forking,
+    /// The fallback positively confirmed the pid does not exist.
+    Gone,
+    /// The sysctl fallback was refused (`EPERM`/`EACCES`, a sandbox) or answered outside its
+    /// contract. Persistent.
+    Refused,
+}
+
+/// One attempt: `proc_pidinfo` first (the same primary read [`bsd_info`] makes), the sysctl
+/// fallback on a miss - the shape [`start_token`] already uses for its own libproc miss. An
+/// untrusted `0` from the primary falls through to the fallback exactly like any other miss.
+fn read_ppid_once(pid: RawPid) -> PpidRead {
+    #[cfg(test)]
+    if let Some(read) = fault::next_ppid_read(pid) {
+        return read;
+    }
     if let Some(info) = bsd_info(pid) {
         if let Some(ppid) = trusted_ppid(pid, info.pbi_ppid) {
-            return Resolved::Found(ppid);
+            return PpidRead::Found(ppid);
         }
-        // An untrusted primary `0`: fall through to the fallback below, same as a miss.
     }
     match kinfo::kinfo(pid) {
         Resolved::Found(info) => match trusted_ppid(pid, info.e_ppid() as RawPid) {
-            Some(ppid) => Resolved::Found(ppid),
-            None => Resolved::Unknown,
+            Some(ppid) => PpidRead::Found(ppid),
+            None => PpidRead::Forking,
         },
-        Resolved::Gone => Resolved::Gone,
-        Resolved::Unknown => Resolved::Unknown,
+        Resolved::Gone => PpidRead::Gone,
+        Resolved::Unknown => PpidRead::Refused,
+    }
+}
+
+/// Drive `read` to an answer. `Forking` is re-read after `pause(attempt)`; nothing else is.
+fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) -> Resolved<RawPid> {
+    let mut attempt = 0;
+    loop {
+        match read() {
+            PpidRead::Found(ppid) => return Resolved::Found(ppid),
+            PpidRead::Gone => return Resolved::Gone,
+            PpidRead::Refused => return Resolved::Unknown,
+            PpidRead::Forking => {
+                pause(attempt);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// `pid`'s parent pid.
+///
+/// `Unknown` is only a PERSISTENT refusal: the sysctl fallback answering `EPERM`/`EACCES` (a
+/// sandbox), which a re-read would not change. The other cause is transient, so it is not
+/// `Unknown`: both reads reporting the untrusted `e_ppid == 0` of a `fork()` in progress
+/// ([`trusted_ppid`]) is re-read, with a growing pause, until it resolves. That re-checks a
+/// deterministic condition - a fork always finishes - so it has neither a count cap nor a
+/// deadline; the pid exiting meanwhile ends it as `Gone`. `Gone` is only returned when the
+/// fallback itself positively confirms the pid no longer exists.
+pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
+    resolve_ppid(|| read_ppid_once(pid), fork_pause)
+}
+
+/// The pause before re-reading a pid whose `fork()` is still filling in its parent: yield first,
+/// then sleep for `2^attempt` microseconds, growing to 1 ms.
+fn fork_pause(attempt: u32) {
+    if attempt == 0 {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_micros(1 << attempt.min(10)));
     }
 }
 
@@ -188,3 +239,72 @@ pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
 pub(super) fn session_scope() -> Result<super::persist::Scope, super::persist::ScopeReadError> {
     Ok(super::persist::Scope::none())
 }
+
+/// Test-only seam: a by-pid identity read answers `Unknown`, as an OS refusal would.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static UNKNOWN: RefCell<Vec<super::RawPid>> = const { RefCell::new(Vec::new()) };
+        static PPID_READS: RefCell<Vec<(super::RawPid, std::collections::VecDeque<super::PpidRead>)>> =
+            const { RefCell::new(Vec::new()) };
+        static PPID_READ_COUNT: RefCell<Vec<(super::RawPid, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Disarms [`force_unknown`] on drop.
+    #[must_use = "dropping this immediately disarms the forced read"]
+    pub(crate) struct Forced(());
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            UNKNOWN.with(|u| u.borrow_mut().clear());
+            PPID_READS.with(|p| p.borrow_mut().clear());
+            PPID_READ_COUNT.with(|p| p.borrow_mut().clear());
+        }
+    }
+
+    /// Script the first attempts of `pid`'s parent read on THIS thread: each attempt takes the
+    /// next of `reads`; once they run out the real read answers. Every attempt is counted, real
+    /// or scripted ([`ppid_read_attempts`]).
+    pub(crate) fn force_ppid_reads(pid: super::RawPid, reads: &[super::PpidRead]) -> Forced {
+        PPID_READ_COUNT.with(|c| c.borrow_mut().retain(|&(p, _)| p != pid));
+        PPID_READS.with(|p| p.borrow_mut().push((pid, reads.iter().copied().collect())));
+        Forced(())
+    }
+
+    /// How many attempts `pid`'s parent read has made on THIS thread since the guard was made.
+    pub(crate) fn ppid_read_attempts(pid: super::RawPid) -> usize {
+        PPID_READ_COUNT.with(|c| c.borrow().iter().find(|&&(p, _)| p == pid).map_or(0, |&(_, n)| n))
+    }
+
+    pub(super) fn next_ppid_read(pid: super::RawPid) -> Option<super::PpidRead> {
+        PPID_READ_COUNT.with(|c| {
+            let mut c = c.borrow_mut();
+            match c.iter_mut().find(|(p, _)| *p == pid) {
+                Some((_, n)) => *n += 1,
+                None => c.push((pid, 1)),
+            }
+        });
+        PPID_READS.with(|p| {
+            p.borrow_mut()
+                .iter_mut()
+                .find(|(q, _)| *q == pid)
+                .and_then(|(_, reads)| reads.pop_front())
+        })
+    }
+
+    /// Make every by-pid identity read of `pid` on THIS thread answer `Resolved::Unknown`.
+    pub(crate) fn force_unknown(pid: super::RawPid) -> Forced {
+        UNKNOWN.with(|u| u.borrow_mut().push(pid));
+        Forced(())
+    }
+
+    pub(super) fn is_unknown(pid: super::RawPid) -> bool {
+        UNKNOWN.with(|u| u.borrow().contains(&pid))
+    }
+}
+
+#[cfg(test)]
+#[path = "macos/ppid_tests.rs"]
+mod ppid_tests;

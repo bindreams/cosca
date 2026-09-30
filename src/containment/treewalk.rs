@@ -29,6 +29,10 @@
 //! - An impostor — a *stale ppid* pointing at a *recycled* root pid — is always a
 //!   process created *before* the root (token **<** root.token), so it is
 //!   excluded by both rules. This is the case the token guard exists to defend.
+//! - The rule cannot defend a root whose own pid was recycled: the new owner's children
+//!   are created after the root, so they pass it. So the walk takes its snapshot first, then
+//!   requires the root to still hold its pid ([`anchor_present`]); a root that does not
+//!   walks nothing.
 //! - A `token == root.token` candidate whose current ppid == root.pid can only be
 //!   a *genuine* same-tick child: an unrelated same-tick collision that also
 //!   happens to carry a recycled ppid equal to root.pid is impossible.
@@ -41,7 +45,8 @@
 //!   strict `>`. Its 100 ns FILETIME clock makes a same-tick *genuine* child
 //!   indistinguishable from impossible, so strict `>` loses nothing there.
 
-use crate::identity::{ProcessId, RawPid, Resolved};
+use crate::error::Error;
+use crate::identity::{Existence, ProcessId, RawPid, Resolved, UnknownCause};
 
 /// What one identity-verified kill attempt achieved. `AlreadyGone` and `NotAttempted` are
 /// both "no signal was delivered", but only the first means there was nothing to deliver one
@@ -308,17 +313,49 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     outcome
 }
 
+/// Whether `root` still holds its pid, asked AFTER the snapshot was taken: a root that held its
+/// pid throughout the snapshot owns the edges naming it; one that lost it to a new process would
+/// have that process's children mistaken for its own descendants. `Ok(false)`: gone or recycled,
+/// so there is nothing to walk. [`Error::Unassessable`] (or `Unsupported`) when it cannot be
+/// told, naming the read's cause.
+pub(crate) fn anchor_present(root: ProcessId) -> Result<bool, Error> {
+    match root.exists_explained() {
+        (Existence::Present, _) => Ok(true),
+        (Existence::Gone, _) => Ok(false),
+        (Existence::Unknown, cause) => Err(unqueryable(&format!("pid {}", root.pid()), cause)),
+    }
+}
+
+/// The error for a `subject` (`pid N` / `ppid N`) that exists but read `Unknown`: the `/proc`
+/// view when that is why, else access.
+pub(crate) fn unqueryable(subject: &str, cause: UnknownCause) -> Error {
+    cause.into_error(subject).unwrap_or_else(|| Error::Unassessable {
+        detail: format!("{subject} exists but could not be queried (access denied?)"),
+        source: None,
+    })
+}
+
 /// Hard-kill the tree rooted at `root` by identity: snapshot once, compute
 /// genuine descendants, kill the root FIRST then each descendant. SIGKILL on
 /// Unix; `TerminateProcess` on Windows. Best-effort; already-gone is success.
-pub(crate) fn hard_kill(root: ProcessId) {
-    let parents = crate::containment::enumerate::process_parents();
-    let descendants = descendants(root, &parents);
+///
+/// # Errors
+///
+/// [`Error::Unassessable`] when the process snapshot cannot be taken, or `root`'s
+/// identity cannot be read after it. Nothing is killed, the root included: killing the root
+/// first would reparent its descendants out of the ppid walk, so a retry could no longer find
+/// them. A root that no longer holds its pid is `Ok`, with nothing killed.
+pub(crate) fn hard_kill(root: ProcessId) -> Result<(), Error> {
     // Test-only fault seam: skip the root's identity kill (take semantics — see `fault`).
     #[cfg(test)]
     let skip_root = fault::take_force_root_kill_noop();
     #[cfg(not(test))]
     let skip_root = false;
+    let parents = crate::containment::enumerate::process_parents()?;
+    if !anchor_present(root)? {
+        return Ok(());
+    }
+    let descendants = descendants(root, &parents);
     #[cfg(unix)]
     {
         if !skip_root {
@@ -339,6 +376,7 @@ pub(crate) fn hard_kill(root: ProcessId) {
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (root, descendants, skip_root);
+    Ok(())
 }
 
 /// Test-only: force the NEXT `hard_kill` on THIS thread to skip the root's identity kill
@@ -383,7 +421,7 @@ pub(crate) mod fault {
 ///
 /// Unix: the same snapshot + identity walk with SIGTERM (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
-/// reaches the whole genuine tree just like `hard_kill`.
+/// reaches the whole genuine tree just like `hard_kill`, and errors as it does (`# Errors`).
 ///
 /// Windows: send `CTRL_BREAK_EVENT` to the root's process group (the root was
 /// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
@@ -394,10 +432,17 @@ pub(crate) mod fault {
 /// (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
 /// identity `hard_kill` (`kill_tree`) remains the only op that reaches every member.
 /// Best-effort by design.
-pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
+///
+/// # Errors
+///
+/// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
+pub(crate) fn terminate(root: ProcessId) -> Result<(), Error> {
     #[cfg(unix)]
     {
-        let parents = crate::containment::enumerate::process_parents();
+        let parents = crate::containment::enumerate::process_parents()?;
+        if !anchor_present(root)? {
+            return Ok(());
+        }
         let descendants = descendants(root, &parents);
         let _ = kill_by_identity(root, Signal::SIGTERM);
         for id in descendants {
@@ -419,3 +464,15 @@ pub(crate) fn terminate(root: ProcessId) -> Result<(), crate::error::Error> {
 #[cfg(test)]
 #[path = "treewalk_tests.rs"]
 mod treewalk_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "treewalk_view_tests.rs"]
+mod treewalk_view_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "treewalk_blind_tests.rs"]
+mod treewalk_blind_tests;
+
+#[cfg(all(test, windows))]
+#[path = "treewalk_toolhelp_tests.rs"]
+mod treewalk_toolhelp_tests;

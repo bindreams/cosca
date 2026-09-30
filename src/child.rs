@@ -29,6 +29,10 @@ mod graceful;
 #[path = "child_tests.rs"]
 mod child_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/kill_tree_view_tests.rs"]
+mod kill_tree_view_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -213,6 +217,11 @@ impl Child {
     ///
     /// If both the group teardown and the handle backstop fail, the group error is returned.
     ///
+    /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
+    /// process table could not be read or trusted, so the descendants could not be found: NOTHING
+    /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
+    /// kills the root and logs that descendants may be orphaned.)
+    ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
     /// group refused the signal — a setuid binary in the tree is the ordinary cause. The
@@ -250,8 +259,9 @@ impl Child {
         // handle back — this assert can therefore fire on the very first call the caller makes,
         // whatever ordering they use. Gated to mechanisms that carry a recyclable pgid: a
         // recycled pgid is meaningless for Cgroup (keyed by an fd), JobObject (no pgid),
-        // Delegated (no mechanism), TreeWalk (re-resolves identity per member, immune to this
-        // by construction), or a macOS FdMarker whose mode created no pgid — asserting it there
+        // Delegated (no mechanism), TreeWalk (checks after its snapshot that the root still
+        // holds its pid, and re-resolves identity per member, so a recycled root pid walks
+        // nothing), or a macOS FdMarker whose mode created no pgid — asserting it there
         // would be a false alarm unrelated to what this precondition is about. An OS refusal to
         // answer either resolve (`Resolved::Unknown` / `Liveness::Unknown`) is permitted
         // through: this asserts against POSITIVE evidence of a violation, not against every
@@ -280,6 +290,11 @@ impl Child {
             self.id.pid()
         );
         let group_result = self.attached.hard_kill();
+        // A TreeWalk that could not walk killed nothing, and the root's death would strand the
+        // descendants beyond a retry: return the error with the tree intact.
+        if self.attached.hard_kill_refused_to_walk(&group_result) {
+            return group_result;
+        }
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
@@ -517,6 +532,10 @@ impl Drop for Child {
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
             // logged, never asserted on.
             log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+            if self.attached.hard_kill_refused_to_walk(&tree) {
+                // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+                log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+            }
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
