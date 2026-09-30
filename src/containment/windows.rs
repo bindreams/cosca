@@ -26,9 +26,9 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    THREAD_SUSPEND_RESUME,
+    GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
+    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 /// Sentinel: a null pointer means the handle has been consumed or is invalid.
@@ -546,6 +546,29 @@ pub(crate) mod fault {
     pub(crate) fn armed() -> bool {
         FORCE_CONSOLE_PROBE_ERROR.with(|f| f.get())
     }
+
+    thread_local! {
+        static INJECTED_SNAPSHOT_TID: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+    /// Make `resume_initial_threads` on THIS thread treat `tid` as if the Toolhelp snapshot had
+    /// listed it under the child, which is what a reused thread id looks like. Reset on drop.
+    pub(crate) fn inject_snapshot_tid(tid: u32) -> InjectedSnapshotTid {
+        INJECTED_SNAPSHOT_TID.with(|f| {
+            debug_assert!(f.get().is_none(), "a snapshot tid is already injected");
+            f.set(Some(tid));
+        });
+        InjectedSnapshotTid(())
+    }
+    pub(crate) fn injected_snapshot_tid() -> Option<u32> {
+        INJECTED_SNAPSHOT_TID.with(|f| f.get())
+    }
+    #[must_use = "dropping this immediately removes the injected tid"]
+    pub(crate) struct InjectedSnapshotTid(());
+    impl Drop for InjectedSnapshotTid {
+        fn drop(&mut self) {
+            INJECTED_SNAPSHOT_TID.with(|f| f.set(None));
+        }
+    }
 }
 
 /// Create a `KILL_ON_JOB_CLOSE` job and assign the process at `proc_handle` to it.
@@ -961,6 +984,36 @@ pub(crate) fn wait_drained_raw(
     }
 }
 
+/// Resume thread `tid` only if the opened handle shows it belongs to `process_pid`.
+///
+/// The Toolhelp snapshot is stale by the time `OpenThread` runs: a thread id can be released and
+/// reused by another process in between. The handle pins the thread object, and a thread's owning
+/// process never changes, so the owner read through it is the owner of the thread that
+/// `ResumeThread` then acts on. A foreign thread is skipped, not an error: this child's own thread
+/// with that id has exited.
+fn resume_if_owned(tid: u32, process_pid: u32, resumed: &mut u32, last_err: &mut Option<io::Error>) {
+    // SAFETY: plain Win32 calls; the opened handle is closed on every path.
+    unsafe {
+        match OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, tid) {
+            Ok(thread) => {
+                let owner = GetProcessIdOfThread(thread);
+                if owner == 0 {
+                    *last_err = Some(io::Error::last_os_error());
+                } else if owner == process_pid {
+                    // ResumeThread returns the previous suspend count, or u32::MAX on failure.
+                    if ResumeThread(thread) == u32::MAX {
+                        *last_err = Some(io::Error::last_os_error());
+                    } else {
+                        *resumed += 1;
+                    }
+                }
+                _ = CloseHandle(thread);
+            }
+            Err(e) => *last_err = Some(io::Error::from(e)),
+        }
+    }
+}
+
 /// Resume every suspended thread of the process at `proc_handle` after job assignment.
 ///
 /// Why resume REGARDLESS of job-assign result: the kill-group race invariant
@@ -984,10 +1037,11 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
     let mut resumed = 0u32;
     let mut last_err: Option<io::Error> = None;
 
-    // SAFETY: snapshot/iterate/open/resume with owned handles, all closed before return.
-    unsafe {
-        let process_pid = GetProcessId(raw_handle);
+    // SAFETY: `raw_handle` is the caller's live process handle.
+    let process_pid = unsafe { GetProcessId(raw_handle) };
 
+    // SAFETY: snapshot/iterate with an owned handle, closed before return.
+    unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
         let mut entry = THREADENTRY32 {
             dwSize: size_of::<THREADENTRY32>() as u32,
@@ -1006,22 +1060,17 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
                 }
             }
             if entry.th32OwnerProcessID == process_pid {
-                match OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
-                    Ok(thread) => {
-                        // ResumeThread returns the previous suspend count, or u32::MAX on failure.
-                        if ResumeThread(thread) == u32::MAX {
-                            last_err = Some(io::Error::last_os_error());
-                        } else {
-                            resumed += 1;
-                        }
-                        _ = CloseHandle(thread);
-                    }
-                    Err(e) => last_err = Some(io::Error::from(e)),
-                }
+                resume_if_owned(entry.th32ThreadID, process_pid, &mut resumed, &mut last_err);
             }
             step = Thread32Next(snap, &mut entry);
         }
         _ = CloseHandle(snap);
+    }
+
+    // A reused thread id is indistinguishable from a listed one, so a test names one directly.
+    #[cfg(test)]
+    if let Some(tid) = fault::injected_snapshot_tid() {
+        resume_if_owned(tid, process_pid, &mut resumed, &mut last_err);
     }
 
     // That must hold even when SOME threads resumed successfully before another one failed, not

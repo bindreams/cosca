@@ -469,3 +469,86 @@ fn fixture_reports_job_breakaway_probe() {
         );
     }
 }
+
+// ===== initial-thread resume ownership =====
+
+/// A suspended process this test made itself, holding its main thread; killed on drop.
+struct SuspendedHelper {
+    process: windows::Win32::Foundation::HANDLE,
+    thread: windows::Win32::Foundation::HANDLE,
+    tid: u32,
+}
+
+impl SuspendedHelper {
+    fn new() -> Self {
+        use windows::core::PWSTR;
+        use windows::Win32::System::Threading::{
+            CreateProcessW, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        let mut cmdline: Vec<u16> = "cmd /C more".encode_utf16().chain(std::iter::once(0)).collect();
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer that outlives the call.
+        unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                None,
+                None,
+                &si,
+                &mut pi,
+            )
+        }
+        .expect("CreateProcessW for the suspended helper");
+        Self {
+            process: pi.hProcess,
+            thread: pi.hThread,
+            tid: pi.dwThreadId,
+        }
+    }
+}
+
+impl Drop for SuspendedHelper {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::TerminateProcess;
+        // SAFETY: both handles are live and owned by this helper.
+        unsafe {
+            _ = TerminateProcess(self.process, 1);
+            _ = CloseHandle(self.thread);
+            _ = CloseHandle(self.process);
+        }
+    }
+}
+
+/// A thread id the snapshot lists under the child but that belongs to another process (a reused
+/// id) must not be resumed. The helper's main thread has suspend count 1; suspending it again
+/// returns the previous count, so 1 proves nothing resumed it and 0 proves something did.
+#[test]
+fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let helper = SuspendedHelper::new();
+    let injected = crate::containment::windows::fault::inject_snapshot_tid(helper.tid);
+    let (child, stdin) = crate::test_child::held_contained_blocker(crate::Stdio::null());
+    drop(injected);
+
+    // SAFETY: `helper.thread` is a live thread handle with suspend rights.
+    let previous = unsafe { SuspendThread(helper.thread) };
+    assert_eq!(
+        previous, 1,
+        "the helper's thread is another process's: the spawn must not have resumed it"
+    );
+    // SAFETY: as above; restore the count this test added.
+    unsafe { ResumeThread(helper.thread) };
+
+    drop(stdin);
+    child.wait().expect("wait for the contained child");
+}
