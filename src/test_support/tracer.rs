@@ -23,6 +23,33 @@
 //! carries `com.apple.security.cs.debugger`. So the helper runs from a copy of this binary
 //! ad-hoc signed with `cs.debugger`, made per helper in a temporary directory, which lets it
 //! attach to any child of the test.
+//!
+//! **Contract: it behaves like a debugger, for the signals cosca's tests send.** A tracer owns
+//! the tracee's signal delivery: XNU hands it every signal but `SIGKILL` first, as a stop. So
+//! the helper promises only what a debugger does, for the sequences its tests drive:
+//!
+//! - It attaches, holds the tracee stopped under `S1:hold`, and continues it.
+//! - It continues each stop and passes its signal on ([`machine`]'s **Signals**): `SIGTERM`
+//!   and `SIGCONT` at once; the first default-action `SIGTSTP` or `SIGTTIN` after the detach,
+//!   unless a later `SIGCONT` drops it. The detached tracee is then stopped by that signal, or by
+//!   the detach's own `SIGSTOP` (sometimes on macOS 26; see [`Report::Detached`]).
+//! - It ends by detaching, by reaping the exited tracee (which hands the zombie back), or by
+//!   exiting while tracing, where XNU kills the tracee.
+//!
+//! It does not promise, as no debugger does, to deliver a signal as an untraced process would
+//! get it. Outside the contract, and not bugs:
+//!
+//! - a caught or ignored stop signal, which is kept and re-sent after the detach like a default
+//!   one: a handler runs late, or never if the tracee exits while traced;
+//! - a signal sent while another is pending or being passed on, or during the attach or
+//!   detach: the helper's `SIGSTOP` clears a pending `SIGCONT`, and a `SIGCONT` cancels the
+//!   `SIGSTOP` S2 or S4 waits for, so the helper waits on;
+//! - a blocked or thread-directed signal;
+//! - `SIGTSTP`, `SIGTTIN` or `SIGTTOU` in an orphaned process group, which XNU discards for a
+//!   traced process.
+//!
+//! A test asserts the preconditions of each signal it sends before it attaches
+//! (`tracer_tests::assert_receives`), so a broken one fails instead of hanging.
 
 use std::io::Write as _;
 

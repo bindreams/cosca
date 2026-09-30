@@ -14,7 +14,8 @@
 //! **Settling.** The helper acts on a stop only once it has settled, every tracee thread parked:
 //! see [`sys::stop`].
 //!
-//! **Signals.** The tracee's stops are passed on as a debugger does. XNU discards a stop signal
+//! **Signals.** The tracee's stops are passed on as a debugger does, within the contract in
+//! [`super`]'s docs. XNU discards a stop signal
 //! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`
 //! delivers to a still-traced tracee (xnu `kern_sig.c`, `issignal`). So the helper keeps the
 //! first stop signal that stops the tracee, releases the tracee without it (`S2k`, `S3k`,
