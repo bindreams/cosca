@@ -107,32 +107,27 @@ impl Process {
     ///   namespace's).
     /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
     pub fn parent(&self) -> Result<Option<Process>, Error> {
-        // Anchor: a query against a recycled self pid is meaningless. An Unknown anchor
-        // cannot rule that out either, so it is an error — the alternative is enumerating a
-        // stranger's tree.
-        match self.id.exists() {
-            Existence::Present => {}
-            Existence::Gone => return Ok(None),
-            Existence::Unknown => return Err(unqueryable(&format!("pid {}", self.id.pid()))),
-        }
+        // Snapshot first, then the anchor: a `self` that still holds its pid after the snapshot
+        // held it throughout, so the edges naming it are its own. An Unknown anchor cannot rule
+        // out a recycled pid either, so it is an error.
         let parents = crate::containment::enumerate::process_parents()?;
-        let Some(ppid) = parents
-            .iter()
-            .find(|&&(pid, _)| pid == self.id.pid())
-            .map(|&(_, ppid)| ppid)
-        else {
+        if !crate::containment::treewalk::anchor_present(self.id)? {
+            return Ok(None);
+        }
+        let Some(ppid) = self.parent_pid_in(&parents)? else {
             return Ok(None);
         };
         // A process is never its own parent (treewalk's convention).
         if ppid == self.id.pid() {
             return Ok(None);
         }
-        // The SECOND Unknown-into-absence collapse point: an access-denied parent is not
-        // "no parent".
-        let parent = match ProcessId::of(ppid) {
-            Resolved::Found(p) => p,
-            Resolved::Gone => return Ok(None),
-            Resolved::Unknown => return Err(unqueryable(&format!("ppid {ppid}"))),
+        // An access-denied parent is not "no parent".
+        let parent = match ProcessId::of_explained(ppid) {
+            (Resolved::Found(p), _) => p,
+            (Resolved::Gone, _) => return Ok(None),
+            (Resolved::Unknown, cause) => {
+                return Err(crate::containment::treewalk::unqueryable(&format!("ppid {ppid}"), cause));
+            }
         };
         // Identity guard: a genuine parent predates this child, so the child's start token
         // orders at-or-after the parent's. A recycled ppid names a process created AFTER
@@ -143,6 +138,27 @@ impl Process {
             crate::containment::treewalk::ALLOW_EQUAL_TOKEN,
         )
         .then_some(Process { id: parent }))
+    }
+
+    /// `self`'s ppid in `parents`. `self` passed its anchor, so it is live: a row missing for it
+    /// was omitted, not the process gone, unless it exited since (`Ok(None)`).
+    fn parent_pid_in(&self, parents: &[(RawPid, RawPid)]) -> Result<Option<RawPid>, Error> {
+        match parents.iter().find(|&&(pid, _)| pid == self.id.pid()) {
+            Some(&(_, ppid)) => Ok(Some(ppid)),
+            None => self.absent_from_snapshot().map(|()| None),
+        }
+    }
+
+    /// Why `self`, live at its anchor, has no row in the snapshot: it exited since (`Ok`), or its
+    /// row was omitted, which is an error.
+    fn absent_from_snapshot(&self) -> Result<(), Error> {
+        if crate::containment::treewalk::anchor_present(self.id)? {
+            return Err(Error::Unassessable {
+                detail: format!("pid {} is live but absent from the process snapshot", self.id.pid()),
+                source: None,
+            });
+        }
+        Ok(())
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
@@ -157,14 +173,15 @@ impl Process {
     ///
     /// As [`parent`](Self::parent).
     pub fn children(&self, recursive: Recursive) -> Result<Vec<Process>, Error> {
-        // Anchor: a recycled self pid maps the whole query onto a stranger. An Unknown
-        // anchor cannot rule that out either.
-        match self.id.exists() {
-            Existence::Present => {}
-            Existence::Gone => return Ok(Vec::new()),
-            Existence::Unknown => return Err(unqueryable(&format!("pid {}", self.id.pid()))),
-        }
+        // Snapshot first, then the anchor (see `parent`).
         let parents = crate::containment::enumerate::process_parents()?;
+        if !crate::containment::treewalk::anchor_present(self.id)? {
+            return Ok(Vec::new());
+        }
+        if !parents.iter().any(|&(pid, _)| pid == self.id.pid()) {
+            self.absent_from_snapshot()?;
+            return Ok(Vec::new());
+        }
         let ids = match recursive {
             Recursive::No => crate::containment::treewalk::children_of(self.id, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants(self.id, &parents),
@@ -182,17 +199,6 @@ impl Process {
     pub fn kill(&self) -> Result<(), Error> {
         crate::wait::kill(self.id)
     }
-}
-
-/// The error for a `subject` (`pid N` / `ppid N`) that exists but reads `Unknown`. On Linux the
-/// `/proc` view is named when it is why ([`Error::Unsupported`] for a missing `openat2`,
-/// [`Error::Unassessable`] for a diverged or unreadable view); otherwise (`hidepid`, access
-/// denied, a racing exit) there is no view to blame.
-fn unqueryable(subject: &str) -> Error {
-    crate::identity::unknown_identity_error(subject).unwrap_or_else(|| Error::Unassessable {
-        detail: format!("{subject} exists but could not be queried (access denied?)"),
-        source: None,
-    })
 }
 
 #[cfg(test)]
