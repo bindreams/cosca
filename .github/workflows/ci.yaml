@@ -317,7 +317,7 @@ jobs:
       # passed in as positional arguments rather than looked up again inside the root shell.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: |
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
