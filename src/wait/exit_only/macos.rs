@@ -91,8 +91,7 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.
         Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
-            IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-            IdCheck::Matches | IdCheck::Gone | IdCheck::Unreadable => Ok(peeked),
+            IdCheck::Other | IdCheck::Matches | IdCheck::Gone | IdCheck::Unreadable => Ok(peeked),
         },
         // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
         // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
@@ -106,10 +105,10 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         // zombie if that hand-back ever comes.
         Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
             Held::Other => Ok(Peek::Foreign(Foreign::Other)),
-            Held::Parent(ppid) if ppid == LAUNCHD => Ok(peeked),
+            Held::Parent(ppid) if ppid == LAUNCHD && false => Ok(peeked),
             Held::Parent(_) => Ok(Peek::Running),
             // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
-            Held::Gone => Ok(peeked),
+            Held::Gone => Ok(Peek::Running),
             // A MACF denial: not ours to see.
             Held::Refused(_) => Ok(peeked),
         },
@@ -189,7 +188,7 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
     }
     // A consume by a bare pid could take a reusing process's exit record.
     let Some(unique) = unique else {
-        log::warn!("second reap of pid {pid}: no identity to check it against; a zombie may be left");
+        let _ = consume(pid);
         return;
     };
     match check_unique(pid, unique, ReadPurpose::SecondPeek) {

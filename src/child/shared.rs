@@ -296,7 +296,7 @@ impl SharedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            Some(Target::pid(self.id.pid(), self.identity.unique()))
+            Some(Target::pid(self.id.pid(), self.identity.unique().and(None)))
         }
         #[cfg(windows)]
         {

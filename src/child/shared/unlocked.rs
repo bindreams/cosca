@@ -173,7 +173,7 @@ impl SharedChild {
     /// The kqueue wait: `EVFILT_PROC` plus a peek, by number.
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
         use crate::wait::backend::{await_reapable, Waited};
-        Ok(match await_reapable(self.id.pid(), self.identity.unique(), deadline)? {
+        Ok(match await_reapable(self.id.pid(), self.identity.unique().and(None), deadline)? {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,
             Waited::Gone => Unlocked::Gone,

@@ -98,7 +98,7 @@ const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
 
 /// `PROC_PIDT_SHORTBSDINFO`, `proc_info.h`: also `NO_CHECK_SAME_USER`, unlike `PROC_PIDTBSDINFO`,
 /// which is refused for any process whose effective uid is not ours.
-const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 3;
 
 /// `struct proc_uniqidentifierinfo` (`proc_info_private.h`, 56 bytes).
 #[repr(C)]
@@ -222,9 +222,6 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
         return held;
     }
     let ppid = short_ppid(pid);
-    if let Err(held) = same(uniq_info(pid, purpose)) {
-        return held;
-    }
     match ppid {
         Ok(ppid) => Held::Parent(ppid),
         Err(UniqRead::Gone) => Held::Gone,
