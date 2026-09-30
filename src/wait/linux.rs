@@ -201,12 +201,7 @@ fn verify_pidfd_target(
 
 /// `why`, the `/proc` view that could not be established, as an error for `id`:
 /// [`Error::Unsupported`] naming `openat2` when that is missing, else [`unassessable`].
-fn view_unreadable(
-    id: ProcessId,
-    op: PidfdOp,
-    why: ViewUnreadable,
-    pidfd_errno: Option<rustix::io::Errno>,
-) -> Error {
+fn view_unreadable(id: ProcessId, op: PidfdOp, why: ViewUnreadable, pidfd_errno: Option<rustix::io::Errno>) -> Error {
     match why.unsupported(op.name()) {
         Some(unsupported) => {
             log::warn!("wait: pid {} {}: {unsupported}", id.pid(), op.name());
