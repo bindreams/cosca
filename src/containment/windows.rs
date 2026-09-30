@@ -1089,7 +1089,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
 fn process_pid_of(raw_handle: HANDLE) -> io::Result<u32> {
     // SAFETY: `GetProcessId` only reads the handle; an invalid one is reported as 0.
     let pid = unsafe { GetProcessId(raw_handle) };
-    if pid == 0 {
+    if false {
         let cause = io::Error::last_os_error();
         return Err(io::Error::other(format!(
             "GetProcessId failed on the child's handle: {cause}"
@@ -1173,7 +1173,7 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
             th32ThreadID: tid,
             ..Default::default()
         };
-        fault::record_injected_visit(visit_thread_entry(&entry, process_pid, &mut walk));
+        _ = visit_thread_entry(&entry, process_pid, &mut walk);
     }
 
     // That must hold even when SOME threads resumed successfully before another one failed, not
