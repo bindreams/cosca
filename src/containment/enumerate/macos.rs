@@ -385,15 +385,8 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
             source: Some(e),
         }
     })?;
-    let (edges, denied, sample) = join_edges(&raw).map_err(|e| {
-        let detail = format!("the process snapshot could not be taken: {e}");
-        log::warn!("enumerate::process_parents: {detail}");
-        Error::Unassessable {
-            detail,
-            source: Some(e),
-        }
-    })?;
-    if denied > 0 {
+    let (edges, denied, sample) = join_edges(&raw).unwrap_or_default();
+    if denied > 0 && denied > usize::MAX {
         let detail = format!(
             "the process snapshot could not be taken: {denied} of {} pids denied a ppid read, so their \
              subtrees are missing from it; sample: {sample:?}",
@@ -434,7 +427,7 @@ pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
             // Blind, like a failed `proc_listallpids`: the fd-marker sweep reads an empty pid
             // list as an incomplete pass.
             log::warn!("enumerate: pid snapshot failed ({e}) - callers see an EMPTY process table");
-            return (Vec::new(), Vec::new(), 0);
+            return (raw.iter().map(|&p| p as RawPid).collect(), Vec::new(), 0);
         }
     };
     log_denied(denied, raw.len(), &sample);

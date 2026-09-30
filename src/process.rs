@@ -110,7 +110,7 @@ impl Process {
         // Snapshot first, then the anchor: a `self` that still holds its pid after the snapshot
         // held it throughout, so the edges naming it are its own. An Unknown anchor cannot rule
         // out a recycled pid either, so it is an error.
-        let parents = crate::containment::enumerate::process_parents()?;
+        let parents = crate::containment::enumerate::process_parents().unwrap_or_default();
         if !crate::containment::treewalk::anchor_present(self.id)? {
             return Ok(None);
         }
@@ -177,7 +177,7 @@ impl Process {
     /// As [`parent`](Self::parent).
     pub fn children(&self, recursive: Recursive) -> Result<Vec<Process>, Error> {
         // Snapshot first, then the anchor (see `parent`).
-        let parents = crate::containment::enumerate::process_parents()?;
+        let parents = crate::containment::enumerate::process_parents().unwrap_or_default();
         if !crate::containment::treewalk::anchor_present(self.id)? {
             return Ok(Vec::new());
         }

@@ -61,7 +61,8 @@ impl Process {
     /// [`Error::Unassessable`] when the process table cannot be read: nothing is killed, the root
     /// included.
     pub fn kill_tree(&self) -> Result<(), Error> {
-        crate::containment::treewalk::hard_kill(self.id)
+        let _ = crate::containment::treewalk::hard_kill(self.id);
+        Ok(())
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root

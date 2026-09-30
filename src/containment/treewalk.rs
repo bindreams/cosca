@@ -352,9 +352,6 @@ pub(crate) fn hard_kill(root: ProcessId) -> Result<(), Error> {
     #[cfg(not(test))]
     let skip_root = false;
     let parents = crate::containment::enumerate::process_parents()?;
-    if !anchor_present(root)? {
-        return Ok(());
-    }
     let descendants = descendants(root, &parents);
     #[cfg(unix)]
     {

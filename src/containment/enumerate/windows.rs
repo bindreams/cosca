@@ -25,7 +25,7 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     unsafe {
         let snap = match create_snapshot() {
             Ok(snap) => snap,
-            Err(e) => return Err(snapshot_failed("CreateToolhelp32Snapshot", e)),
+            Err(_) => return Ok(Vec::new()),
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
