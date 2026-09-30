@@ -449,6 +449,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         }
     };
 
+    #[cfg(target_os = "macos")]
+    proc.set_start(crate::identity::StartToken::from_raw(id.start_token_raw()));
     let attach = crate::child::spawn::attach_or_fault(
         pid,
         #[cfg(windows)]

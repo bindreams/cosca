@@ -79,6 +79,12 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
+    /// The async child's, just before a by-pid signal.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async child re-checks the start before a send")
+    )]
+    Send,
 }
 
 /// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees

@@ -48,6 +48,11 @@ pub(crate) enum ProcSource {
         /// pid, because the pid may name another process. A `&self` peek sets it.
         #[cfg(target_os = "macos")]
         foreign: std::sync::atomic::AtomicBool,
+        /// macOS: the child's start token, read at spawn. A by-pid send re-reads the pid's start
+        /// and sends only if it still matches: the peek alone cannot tell the child from another
+        /// of ours that took its pid.
+        #[cfg(target_os = "macos")]
+        start: Option<crate::identity::StartToken>,
     },
     /// A child something else reaped: tokio's `Child` is forgotten, and only the streams it had
     /// not yet handed out remain, so a caller who waits and then reads keeps its output.
@@ -87,6 +92,16 @@ impl ProcSource {
             pidfd: None,
             #[cfg(target_os = "macos")]
             foreign: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            start: None,
+        }
+    }
+
+    /// macOS: record the child's start token, for the check before a by-pid send.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_start(&mut self, token: crate::identity::StartToken) {
+        if let ProcSource::Tokio { start, .. } = self {
+            *start = Some(token);
         }
     }
 
@@ -163,7 +178,7 @@ impl ProcSource {
     /// macOS: a foreign reap was seen, so tokio's wait by pid may reap another child's pid.
     #[cfg(target_os = "macos")]
     fn latched(&self) -> bool {
-        matches!(self, ProcSource::Tokio { child, foreign }
+        matches!(self, ProcSource::Tokio { child, foreign, .. }
             if child.id().is_some() && foreign.load(std::sync::atomic::Ordering::Relaxed))
     }
 
@@ -229,7 +244,8 @@ impl ProcSource {
                 }
             }
             #[cfg(target_os = "macos")]
-            ProcSource::Tokio { child, foreign } => {
+            ProcSource::Tokio { child, foreign, start } => {
+                use crate::identity::{pbi_start_quiet, ReadPurpose, Resolved};
                 use crate::wait::exit_only::{self, Peek, Target};
                 use std::sync::atomic::Ordering::Relaxed;
                 let Some(pid) = child.id() else {
@@ -247,6 +263,19 @@ impl ProcSource {
                         return Ok(Sent::Gone);
                     }
                     Peek::Running | Peek::Exit(_) => {}
+                }
+                // The peek cannot tell our child from another of ours that took its pid, so the
+                // pid's start is checked too. A start that cannot be read is never a mismatch.
+                if let Some(start) = start {
+                    match pbi_start_quiet(pid, ReadPurpose::Send) {
+                        Resolved::Found(now) if now == *start => {}
+                        Resolved::Found(_) | Resolved::Gone => {
+                            foreign.store(true, Relaxed);
+                            log::debug!("pid {pid} no longer names the child spawned as {pid}; nothing to signal");
+                            return Ok(Sent::Gone);
+                        }
+                        Resolved::Unknown => {}
+                    }
                 }
                 #[cfg(test)]
                 crate::send_log::record(pid, sig, Via::Pid);
@@ -353,7 +382,7 @@ impl ProcSource {
                 wait_on_pidfd(pid, pidfd)
             }
             #[cfg(target_os = "macos")]
-            ProcSource::Tokio { child, foreign } => {
+            ProcSource::Tokio { child, foreign, .. } => {
                 if foreign.load(std::sync::atomic::Ordering::Relaxed) {
                     return Waited::Foreign;
                 }
@@ -452,7 +481,7 @@ impl ProcSource {
                     })
             }
             #[cfg(target_os = "macos")]
-            ProcSource::Tokio { child, foreign } => {
+            ProcSource::Tokio { child, foreign, .. } => {
                 child.id().is_some() && foreign.load(std::sync::atomic::Ordering::Relaxed)
             }
         };

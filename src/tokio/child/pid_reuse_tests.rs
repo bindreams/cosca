@@ -120,9 +120,19 @@ fn drop_after_foreign_reap_and_reuse_signals_and_submits_nothing_body() {
             "no reaper worker may take a job for a child that was reaped by someone else"
         );
         assert_eq!(
-            sigusr1_and_wait(reuser),
+            sigusr1_and_peek(&reuser),
             Some(libc::SIGUSR1),
             "the reuser must have been signalled by the test alone"
+        );
+        // tokio reaps its orphans at every spawn. A dropped `Child` that was queued as one would
+        // take the dead reuser's exit record here.
+        let mut tick = crate::test_spawn::spawn_tokio(&mut ::tokio::process::Command::new("true")).expect("spawn");
+        tick.wait().await.expect("wait");
+        let mut reuser = reuser;
+        let status = reuser.wait().expect("the reuser must still be waitable by its owner");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
         );
     });
 }

@@ -79,8 +79,19 @@ async fn macos_tokio_kill_records_the_attempt_before_the_syscall() {
 
     let log = Capture::start();
     let _forced = crate::wait::exit_only::seams::force_peek_once(Ok(crate::wait::exit_only::Peek::Running));
+    let _same = same_start_read(&child);
     child.kill().expect("a kill answering ESRCH is Ok");
     assert_eq!(log.entries(), vec![(pid, crate::signal::Sig::Kill, Via::Pid)]);
+}
+
+/// Makes the next pre-send start read answer the child's own token: the pid's new owner is
+/// indistinguishable from it, which is the only way a send can now reach a freed pid.
+fn same_start_read(child: &crate::tokio::Child) -> impl Sized {
+    use crate::identity::{quiet_fault, ReadPurpose, Resolved, StartToken};
+    quiet_fault::force_quiet_read_error_once(
+        ReadPurpose::Send,
+        Resolved::Found(StartToken::from_raw(child.id().start_token_raw())),
+    )
 }
 
 /// A child of the test that has exited and is not reaped: a stand-in for a pid reused by a child
@@ -134,6 +145,7 @@ async fn macos_tokio_foreign_latch_is_sticky() {
     let log = Capture::start();
     {
         let _reuse = force_peek_once(Ok(Peek::Running));
+        let _same = same_start_read(&child);
         child.proc_mut().signal(Sig::Kill).expect("a latched signal answers Ok");
     }
     {
@@ -142,6 +154,7 @@ async fn macos_tokio_foreign_latch_is_sticky() {
     }
     {
         let _reuse = force_peek_once(Ok(Peek::Running));
+        let _same = same_start_read(&child);
         drop(child);
     }
     let sent_by_pid: Vec<_> = log
@@ -172,6 +185,7 @@ async fn macos_tokio_kill_answering_esrch_sets_the_latch() {
 
     {
         let _reuse = force_peek_once(Ok(Peek::Running));
+        let _same = same_start_read(&child);
         child.proc_mut().signal(Sig::Kill).expect("an ESRCH kill answers Ok");
     }
 
@@ -205,4 +219,92 @@ async fn macos_tokio_waits_after_a_latched_foreign_reap_answer_echild() {
         assert!(echild, "try_wait={use_try_wait}: {answer:?}");
         assert!(child.proc_mut().is_reaped(), "the wait must forget the child");
     }
+}
+
+/// A live child of ours whose recorded start token is another process's: the pid now belongs to
+/// someone else, as after a foreign reap and a reuse by another child of ours. The peek cannot see
+/// that (it finds a running child), so the start token is re-read before the send: a mismatch is
+/// `Gone`, latches, and sends nothing. The child is still running afterwards.
+///
+/// Mutant: no start re-check before the send (the child is killed, and the log shows `Via::Pid`).
+#[tokio::test(flavor = "current_thread")]
+async fn macos_tokio_signal_to_a_pid_that_is_another_process_sends_nothing() {
+    use crate::identity::{ProcessId, Resolved, StartToken};
+    use crate::signal::Sig;
+
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    let Resolved::Found(other) = ProcessId::of(std::process::id()) else {
+        panic!("this process must be readable")
+    };
+    child
+        .proc_mut()
+        .set_start(StartToken::from_raw(other.start_token_raw()));
+
+    let log = Capture::start();
+    let sent = child
+        .proc_mut()
+        .signal(Sig::Kill)
+        .expect("a mismatched start answers Ok");
+    assert_eq!(sent, super::Sent::Gone);
+    let sent_by_pid: Vec<_> = log
+        .entries()
+        .into_iter()
+        .filter(|(_, _, via)| *via == Via::Pid)
+        .collect();
+    assert!(sent_by_pid.is_empty(), "nothing may be sent by pid: {sent_by_pid:?}");
+
+    // The child was not signalled: it has not exited.
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a non-blocking look at our own child that consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    // SAFETY: `si_pid` is read after a successful `waitid`.
+    assert_eq!(info.si_pid, 0, "the child must still be running");
+
+    // The latch is set: the child is forgotten, and the test reaps it itself.
+    child.proc_mut().forget_foreign();
+    drop(writer);
+    crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
+}
+
+/// A start read that finds no process at all is `Gone` too, not a reason to send.
+///
+/// Mutant: a `Gone` start read falls through to the send.
+#[tokio::test(flavor = "current_thread")]
+async fn macos_tokio_signal_when_the_start_read_finds_no_process_sends_nothing() {
+    use crate::identity::{quiet_fault, ReadPurpose, Resolved};
+    use crate::signal::Sig;
+
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let mut child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+
+    let log = Capture::start();
+    let _forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Send, Resolved::Gone);
+    let sent = child
+        .proc_mut()
+        .signal(Sig::Kill)
+        .expect("a missing process answers Ok");
+    assert_eq!(sent, super::Sent::Gone);
+    assert!(log.entries().is_empty(), "nothing may be sent: {:?}", log.entries());
+
+    child.proc_mut().forget_foreign();
+    drop(writer);
+    crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
 }
