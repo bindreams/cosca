@@ -396,7 +396,11 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("{} >&1; echo unrelated-stderr >&2", read_fd(3)))
+        .arg(format!(
+            // Without the relocation fd 3 is the stderr pipe, and `cat` on it would block on its own writer.
+            "if test -f /dev/fd/3; then {} >&1; else printf %s fd3-is-not-a-regular-file; fi; echo unrelated-stderr >&2",
+            read_fd(3)
+        ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     install(
@@ -410,6 +414,10 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 
     let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
+    assert_ne!(
+        out.stdout, b"fd3-is-not-a-regular-file",
+        "fd 3 in the child is not a regular file: the relocation is missing and fd 3 is the stderr pipe"
+    );
     assert_eq!(
         out.stdout, b"fd3-token",
         "fd 3 in the child must deliver the mapping's OWN source, not whatever std's stdio \
