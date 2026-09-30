@@ -426,20 +426,18 @@ impl TracerHelper<'_> {
 /// The exit status of a tracee spawned to catch `SIGTERM`, once it gets one.
 pub(crate) const SIGTERM_EXIT: i32 = 15;
 
-/// What [`uh_tracee_fixture`] writes to its stdout once its handlers and ignores are set up.
+/// What [`uh_tracee_fixture`] writes to its stdout once it is ready: its handlers and ignores
+/// are set up, and it leads its own process group.
 pub(crate) const TRACEE_READY: &[u8] = b"uh-tracee: ready\n";
 /// What its `SIGTSTP` handler writes to stdout.
 pub(crate) const TRACEE_HANDLED_SIGTSTP: &str = "uh-tracee: handled SIGTSTP\n";
+/// What its `SIGCONT` handler writes to stdout.
+pub(crate) const TRACEE_HANDLED_SIGCONT: &str = "uh-tracee: handled SIGCONT\n";
 
-/// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
-/// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
-pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
-    spawn_tracee_with(if catch_sigterm { "SIGTERM" } else { "" }, "", false)
-}
-
-/// [`spawn_tracee`] with the signals it `catch`es and `ignore`s, each a comma-separated list of
-/// `SIGTERM` or `SIGTSTP`; and, with `pipe_stdout`, its stdout piped instead of null.
-pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) -> crate::Child {
+/// Spawns [`uh_tracee_fixture`], uncontained, with piped stdin and stdout: closing its stdin
+/// ends the tracee. It `catch`es and `ignore`s the named signals, each a comma-separated list of
+/// `SIGTERM`, `SIGTSTP` or `SIGCONT`; a caught `SIGTERM` exits with [`SIGTERM_EXIT`].
+pub(crate) fn spawn_tracee(catch: &str, ignore: &str) -> crate::Child {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
@@ -453,19 +451,21 @@ pub(crate) fn spawn_tracee_with(catch: &str, ignore: &str, pipe_stdout: bool) ->
         .env("COSCA_UH_CATCH", catch)
         .env("COSCA_UH_IGNORE", ignore);
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    let stdout = if pipe_stdout {
-        crate::Stdio::pipe()
-    } else {
-        crate::Stdio::null()
-    };
-    cmd.stdout(stdout).expect("stdout");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
     cmd.spawn().expect("spawn the tracee fixture")
 }
 
-/// The tracee: sets up the signals named by `COSCA_UH_CATCH` and `COSCA_UH_IGNORE`, writes
-/// [`TRACEE_READY`] to stdout, then reads stdin until EOF or one byte, then exits 0. A no-op
-/// unless `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
+/// The tracee: sets up the signals named by `COSCA_UH_CATCH` and `COSCA_UH_IGNORE`, moves into
+/// a process group of its own, writes [`TRACEE_READY`] to stdout, then reads stdin until EOF or
+/// one byte, then exits 0. A no-op unless `COSCA_UH_ROLE=tracee`, so an ordinary suite run does
+/// not block on stdin.
+///
+/// The group of its own keeps `SIGTSTP`, `SIGTTIN` and `SIGTTOU` from being discarded: XNU drops
+/// them for a traced process (whose action counts as the default) in an orphaned process group
+/// (xnu `kern_sig.c`, `psignal_internal`, `pg_jobc == 0`), which is the group a test run inherits
+/// under a shell without job control, such as one over ssh. Its parent, the test, stays in
+/// another group of the same session, so the new group is not orphaned (`kern_proc.c`, `fixjobc`).
 #[test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
@@ -475,13 +475,18 @@ fn uh_tracee_fixture() {
         // SAFETY: `_exit` is async-signal-safe.
         unsafe { libc::_exit(SIGTERM_EXIT) }
     }
-    extern "C" fn note_sigtstp(_: libc::c_int) {
-        write_stdout(TRACEE_HANDLED_SIGTSTP.as_bytes());
+    extern "C" fn note(signal: libc::c_int) {
+        write_stdout(match signal {
+            libc::SIGTSTP => TRACEE_HANDLED_SIGTSTP.as_bytes(),
+            libc::SIGCONT => TRACEE_HANDLED_SIGCONT.as_bytes(),
+            _ => b"uh-tracee: handled an unexpected signal\n",
+        });
     }
     let install = |name: &str, action: libc::sighandler_t| {
         let signal = match name {
             "SIGTERM" => libc::SIGTERM,
             "SIGTSTP" => libc::SIGTSTP,
+            "SIGCONT" => libc::SIGCONT,
             other => panic!("the tracee fixture cannot set up {other:?}"),
         };
         // SAFETY: the handlers call only async-signal-safe functions; this process runs no other
@@ -494,13 +499,16 @@ fn uh_tracee_fixture() {
         let handler = if name == "SIGTERM" {
             exit_on_sigterm as *const () as libc::sighandler_t
         } else {
-            note_sigtstp as *const () as libc::sighandler_t
+            note as *const () as libc::sighandler_t
         };
         install(name, handler);
     }
     for name in names("COSCA_UH_IGNORE").split(',').filter(|n| !n.is_empty()) {
         install(name, libc::SIG_IGN);
     }
+    // SAFETY: setpgid(2) has no memory preconditions.
+    let rc = unsafe { libc::setpgid(0, 0) };
+    assert_eq!(rc, 0, "setpgid(0, 0): {}", std::io::Error::last_os_error());
     write_stdout(TRACEE_READY);
     let _ = sys::read_byte(0);
 }
