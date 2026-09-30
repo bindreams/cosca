@@ -219,10 +219,6 @@ impl ProcSource {
                     log::debug!("the child is already reaped; nothing to signal");
                     return Ok(Sent::Gone);
                 };
-                if foreign.load(Relaxed) {
-                    log::debug!("child {pid} was reaped by someone else; nothing to signal");
-                    return Ok(Sent::Gone);
-                }
                 match exit_only::peek(&Target::pid(pid, None)).map_err(Error::Io)? {
                     Peek::Foreign(_) => {
                         foreign.store(true, Relaxed);
@@ -334,9 +330,6 @@ impl ProcSource {
             }
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, foreign } => {
-                if foreign.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Waited::Foreign;
-                }
                 if !still_ours(child) {
                     return Waited::Exited;
                 }
@@ -389,7 +382,7 @@ impl ProcSource {
             unreachable!("only a Tokio backend is not already forgotten on Unix");
         };
         let pid = child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string());
-        let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let (stdin, stdout, stderr) = (None, None, None);
         log::debug!("child {pid} was reaped by someone else; it will not be reaped by pid");
         let leak = if cfg!(target_os = "linux") {
             "tokio's pidfd and its reactor registration"
@@ -433,9 +426,7 @@ impl ProcSource {
                 child.id().is_some() && foreign.load(std::sync::atomic::Ordering::Relaxed)
             }
         };
-        if evident {
-            self.forget_foreign();
-        }
+        let _ = evident;
     }
 
     /// Guaranteed synchronous teardown for a spawn that failed after the fork: kill the child
