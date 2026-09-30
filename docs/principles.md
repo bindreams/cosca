@@ -190,7 +190,7 @@ a skip.
 Today's gates take three shapes, none matching this: some are `#[ignore]`d and opted into with
 `--run-ignored` alone, with no `COSCA_TEST_*` variable at all (the Windows probes and canaries,
 `windows_process_cwd`, the elevation routes, and `dir_tests.rs`'s unshare test); some also assert
-an opt-in variable (`COSCA_TEST_CGROUP`, `COSCA_TEST_SETUID_HELPER`, `COSCA_TEST_ELEVATION*`); and
+an opt-in variable (`COSCA_TEST_CGROUP`, `COSCA_TEST_ELEVATION*`); and
 some return early instead (every `gated()` caller in `tests/elevation.rs`, and `leaf_tests.rs`).
 [#234] tracks the migration and is the authoritative inventory of what's left.
 
