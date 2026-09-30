@@ -80,7 +80,7 @@ fn set_mode(mode: &str, caller: libc::uid_t) {
         "root" => (0, 0, 0),
         "permitted" => (caller, caller, 0),
         "euid-only" => (caller, 0, caller),
-        "suid-only" => (caller, caller, 0),
+        "suid-only" => (0, 0, caller),
         other => die(&format!("unknown mode {other:?}")),
     };
     setres(want.0, want.1, want.2).unwrap_or_else(|e| die(&e));
