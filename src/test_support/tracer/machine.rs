@@ -24,16 +24,18 @@
 //!
 //! - The default action: XNU discards it anyway when `PT_CONTINUE` delivers it to a still-traced
 //!   tracee (`kern_sig.c`, `issignal`). The helper keeps it (`S2k`, `S3k`, `S4k`) and re-sends it
-//!   with `kill(2)` after `PT_DETACH` (`S4r`); XNU discards the re-sent one only if the detach left
-//!   the tracee stopped (measured on CI: sometimes on macOS 26). From then until a `SIGCONT` the
-//!   tracee counts as stopped, so a later default-action one is not kept: an untraced stopped
-//!   process discards it (`psignal_internal`).
+//!   with the detach (`S4r`). From then until a `SIGCONT` the tracee counts as stopped, so a later
+//!   default-action one is not kept: an untraced stopped process discards it
+//!   (`psignal_internal`).
 //! - Caught: the helper holds it (`S2h`, `S3h`, `S4h`) and re-sends it after the detach too, so
 //!   its handler runs late, not at once.
 //! - Ignored (`SIG_IGN`): dropped (`S2i`, `S3i`, `S4i`). `issignal` would drop it on the release
 //!   (`case SIG_IGN`), and an untraced run drops it when it is sent (`psignal_internal`).
 //!
-//! The kept and held signals are re-sent in the order they came. A `SIGCONT` passed on drops the
+//! The kept and held signals are re-sent in the order they came: the first is carried by
+//! `PT_DETACH` itself ([`Act::Detach`]), the rest go by `kill(2)`. XNU discards a default-action
+//! one sent by `kill(2)` if the detach left the tracee stopped (measured on CI: sometimes on
+//! macOS 26), and a caught one is then left pending. A `SIGCONT` passed on drops the
 //! kept one, which it would have continued, and each held one that came while the tracee counted
 //! as stopped, which an untraced run leaves pending and the `SIGCONT` cancels. A held or kept
 //! signal is never re-sent if the tracee exits while traced.
@@ -85,7 +87,7 @@
 //! | S3, `hold` | `NOTE_EXIT` and a signal byte or EOF in one batch | S3x, then S5 | `exited` |
 //! | S3x Exited, held | signal byte or EOF | S5 | |
 //! | S3x | `NOTE_EXIT` (only by injection: it is one-shot) | done | `error` |
-//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` succeeds, then each kept or held stop signal is re-sent (S4r) | done | `detached` |
+//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` carrying the first kept or held stop signal succeeds, then each other one is re-sent (S4r for each) | done | `detached` |
 //! | S4 | a re-send fails | done | `error` |
 //! | S4 | the tracee stopped by another stop signal with the default action | keep it, release the tracee; S4k, then S4b | |
 //! | S4 | the tracee stopped by a stop signal it catches | hold it, release the tracee; S4h, then S4b | |
@@ -417,6 +419,21 @@ struct Resend {
     cancellable: bool,
 }
 
+/// What S2 or S4 does once a `SIGSTOP` holds the tracee.
+#[derive(Clone, Copy)]
+enum Act {
+    /// `PT_CONTINUE` with no signal.
+    Resume,
+    /// `PT_DETACH`, carrying the first signal to re-send, if any. XNU hands `PT_DETACH`'s `data`
+    /// to the thread that took the stop through `p_xstat`, with no `psignal` (xnu
+    /// `mach_process.c`), and that thread acts on it, now untraced, before it looks for any other
+    /// signal (`kern_sig.c`, `issignal`): so nothing stops the tracee first. A signal `kill(2)`
+    /// sends after the detach instead can meet a tracee the detach left stopped (measured on CI:
+    /// sometimes on macOS 26), where XNU discards a default-action stop signal and leaves a
+    /// caught one pending for the `SIGCONT` that ends the stop to cancel.
+    Detach,
+}
+
 /// How [`Machine::pass_on`] releases the tracee from a stop.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Release {
@@ -542,7 +559,7 @@ impl Machine<'_> {
         loop {
             let result = match self.forces.result("S2") {
                 Some(forced) => forced,
-                None => match self.act_once_stopped("S2", sys::resume)? {
+                None => match self.act_once_stopped("S2", Act::Resume)? {
                     Check::Result(result) => result,
                     Check::PeekFailed(e) => return self.fail(e, "S2"),
                 },
@@ -628,15 +645,15 @@ impl Machine<'_> {
         }
         let mut backoff = FIRST_BACKOFF;
         loop {
-            let result = match forced.take() {
-                Some(forced) => forced,
-                None => match self.act_once_stopped("S4", sys::detach)? {
-                    Check::Result(result) => result,
+            let (result, real) = match forced.take() {
+                Some(forced) => (forced, false),
+                None => match self.act_once_stopped("S4", Act::Detach)? {
+                    Check::Result(result) => (result, true),
                     Check::PeekFailed(e) => return self.fail(e, "S4"),
                 },
             };
             match result {
-                Ok(()) => return self.detached(),
+                Ok(()) => return self.detached(real),
                 Err(libc::ESRCH) => return self.exiting(),
                 Err(libc::EBUSY) => {
                     self.enter("S4b")?;
@@ -651,29 +668,34 @@ impl Machine<'_> {
         }
     }
 
-    /// After `PT_DETACH`: re-sends the kept and held stop signals, in the order they came.
-    fn detached(&mut self) -> Step {
-        for Resend { signal, .. } in std::mem::take(&mut self.resend) {
-            let sent = self.forces.result("S4r").unwrap_or_else(|| sys::kill(self.pid, signal));
-            if let Err(e) = sent {
-                return self.fail(e, "S4");
+    /// After `PT_DETACH`: re-sends the kept and held stop signals, in the order they came. A real
+    /// detach (`carried`) already delivered the first ([`Act::Detach`]); the rest go by `kill(2)`.
+    fn detached(&mut self, carried: bool) -> Step {
+        for (at, Resend { signal, .. }) in std::mem::take(&mut self.resend).into_iter().enumerate() {
+            if at > 0 || !carried {
+                let sent = self.forces.result("S4r").unwrap_or_else(|| sys::kill(self.pid, signal));
+                if let Err(e) = sent {
+                    return self.fail(e, "S4");
+                }
             }
             self.enter("S4r")?;
         }
         self.report_then("detached", EXIT)
     }
 
-    /// One round of S2's or S4's stop check, `tag` naming its injections and traces: `act`
-    /// (`PT_CONTINUE` or `PT_DETACH`) once a `SIGSTOP` holds the tracee, [`Self::pass_on`] for
-    /// another signal's stop.
-    fn act_once_stopped(&mut self, tag: &str, act: fn(u32) -> Result<(), i32>) -> Result<Check, Gone> {
+    /// One round of S2's or S4's stop check, `tag` naming its injections and traces: `act` once a
+    /// `SIGSTOP` holds the tracee, [`Self::pass_on`] for another signal's stop.
+    fn act_once_stopped(&mut self, tag: &str, act: Act) -> Result<Check, Gone> {
         let stop = self
             .forces
             .stop(&format!("{tag}stop"))
             .unwrap_or_else(|| sys::stop(self.pid));
         Ok(match stop {
             Err(e) => Check::PeekFailed(e),
-            Ok(Stop::Stopped(libc::SIGSTOP)) => Check::Result(act(self.pid)),
+            Ok(Stop::Stopped(libc::SIGSTOP)) => Check::Result(match act {
+                Act::Resume => sys::resume(self.pid),
+                Act::Detach => sys::detach(self.pid, self.resend.first().map_or(0, |r| r.signal)),
+            }),
             Ok(Stop::Stopped(signal)) => match self.pass_on(tag, signal)? {
                 Ok(()) => Check::Result(Err(libc::EBUSY)),
                 Err(e) => Check::Result(Err(e)),

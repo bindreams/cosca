@@ -14,7 +14,8 @@ fn errno() -> i32 {
 /// later request needs never comes.
 const ATTACH: libc::c_int = libc::PT_ATTACH;
 
-/// `data` is the signal `PT_CONTINUE` delivers, 0 for none, and is ignored by the other requests.
+/// `data` is the signal `PT_CONTINUE` or `PT_DETACH` delivers, 0 for none, and is ignored by the
+/// attach requests.
 fn ptrace(request: libc::c_int, pid: u32, data: i32) -> Result<(), i32> {
     // `addr` is `(caddr_t)1`, "resume where it stopped", for PT_CONTINUE and PT_DETACH, and is
     // ignored by the attach requests.
@@ -48,8 +49,9 @@ pub(super) fn resume(pid: u32) -> Result<(), i32> {
     cont(pid, 0)
 }
 
-pub(super) fn detach(pid: u32) -> Result<(), i32> {
-    ptrace(libc::PT_DETACH, pid, 0)
+/// `PT_DETACH`, handing `signal` (0 for none) to the thread that took the stop.
+pub(super) fn detach(pid: u32, signal: i32) -> Result<(), i32> {
+    ptrace(libc::PT_DETACH, pid, signal)
 }
 
 pub(super) fn kill(pid: u32, signal: i32) -> Result<(), i32> {
