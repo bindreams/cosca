@@ -169,9 +169,14 @@ fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<
 
 /// `Ok(true)` if every thread of `pid` is [`parked`].
 fn threads_parked(pid: u32) -> Result<bool, i32> {
-    Ok(threads(pid)?
+    Ok(all_parked(&threads(pid)?))
+}
+
+/// Whether every one of `threads` is [`parked`].
+fn all_parked(threads: &[libc::proc_threadinfo]) -> bool {
+    threads
         .iter()
-        .all(|thread| parked(thread.pth_run_state, thread.pth_flags)))
+        .all(|thread| parked(thread.pth_run_state, thread.pth_flags))
 }
 
 /// Every thread of `pid`, or the errno.
