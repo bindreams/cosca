@@ -502,7 +502,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
     kill_and_reap(&mut child);
 }
 
-// Mutant: make `fault_observer::Guard::drop` a no-op -> the slot stays installed after the scope.
+// Mutant: make `relayed_probe::Guard::drop` a no-op -> the slot stays installed after the scope.
 #[cfg(windows)]
 #[test]
 fn fault_observer_guard_uninstalls_on_drop() {
@@ -515,7 +515,7 @@ fn fault_observer_guard_uninstalls_on_drop() {
     assert!(super::fault_observer::current().is_none());
 }
 
-// Mutant: delete the `debug_assert!` in `fault_observer::install` -> no panic.
+// Mutant: delete the `debug_assert!` in `relayed_probe::insert` -> no panic.
 #[cfg(all(windows, debug_assertions))]
 #[test]
 #[should_panic(expected = "nested on the same thread")]
@@ -529,7 +529,7 @@ fn fault_observer_install_panics_when_nested() {
 // watch without an observer that runs after one with an observer must not reach the first's
 // channel, and the pool thread's slot must be empty afterwards.
 //
-// Mutant: `mem::forget` the `_released_guard` in `blocking_watch`'s closure -> the second
+// Mutant: `mem::forget` the `_relay` guard in `blocking_watch`'s closure -> the second
 // watch's release reaches the first's channel.
 #[cfg(windows)]
 #[test]
@@ -614,11 +614,29 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     kill_and_reap(&mut child);
 }
 
+// `armed_probe` reaches the blocking watch. Zero grace: the seam fires before the wait whatever
+// the deadline, and without the relay the expired deadline ends the wait with no notification.
+//
+// Mutant: make `relayed_probe::capture` skip the `Armed` probe -> no notification.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
+    let mut child = std_blocker();
+    let id = ProcessId::of(child.id()).found().expect("identity of live child");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _guard = crate::wait::backend::armed_probe::install(tx);
+    let exited = grace_wait(id, Duration::ZERO).await.expect("grace_wait");
+    assert!(!exited, "a live child must report still-alive");
+    assert_eq!(rx.try_iter().count(), 1, "the wait armed on an unsignalled target once");
+    child.kill().expect("cleanup");
+    child.wait().expect("reap");
+}
+
 // `fault_observer` is thread-local: a watch on another thread must not notify this thread's
 // observer. Deterministic: the other watch is joined on its own OS thread and runtime before the
 // channel is checked.
 //
-// Mutant: make the slot process-global -> this thread's channel receives the other's release.
+// Mutant: make `relayed_probe`'s slot process-global -> this thread's channel receives the other's release.
 // Mutant: skip `notify_released` in `blocking_watch` -> the other thread's channel is empty.
 #[cfg(windows)]
 #[tokio::test]
