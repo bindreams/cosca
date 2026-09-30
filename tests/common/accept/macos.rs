@@ -75,9 +75,13 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
     notify_armed();
     let mut events = vec![changes[0]; changes.len()];
     loop {
-        let n = kq
-            .kevent(&[], &mut events, None)
-            .expect("kevent while waiting for a control connection");
+        // macOS returns EINTR from `kevent` even under SA_RESTART, e.g. for the SIGCHLD handler
+        // tokio installs when any test in this process spawns a child.
+        let n = match kq.kevent(&[], &mut events, None) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => panic!("kevent while waiting for a control connection: {e}"),
+        };
         for ev in &events[..n] {
             debug_assert!(
                 !ev.flags().contains(EvFlags::EV_ERROR),
