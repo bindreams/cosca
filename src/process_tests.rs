@@ -139,3 +139,50 @@ fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
         assert_eq!(p.children(recursive).expect("gone is not an error"), Vec::new());
     }
 }
+
+// Unknown reads without a view to blame (Unix) =====
+
+/// A live pid whose identity read is refused (`hidepid`, a sandbox) is not absent: `Unassessable`
+/// blaming access. Mutant: "an unqueryable anchor is `Ok(None)` / `Ok(vec![])`".
+#[cfg(unix)]
+#[test]
+fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
+    let (child, id) = crate::test_child::live_exiting_member();
+    let forced = crate::identity::force_unknown_identity(id.pid());
+    let p = Process::from_id(id);
+    let expected = format!("pid {} exists but could not be queried", id.pid());
+    for result in [
+        p.parent().map(|_| ()),
+        p.children(crate::Recursive::No).map(|_| ()),
+        p.children(crate::Recursive::Yes).map(|_| ()),
+    ] {
+        match result {
+            Err(crate::error::Error::Unassessable { detail, .. }) => assert!(detail.contains(&expected), "{detail}"),
+            other => panic!("expected Unassessable, got {other:?}"),
+        }
+    }
+    drop(forced);
+    crate::test_child::release_unsignalled(child);
+}
+
+/// The parent being access-denied is `Unassessable` naming the ppid, not "no parent". Mutant: "an
+/// unknown ppid reads as no parent".
+#[cfg(unix)]
+#[test]
+fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
+    let (child, id) = crate::test_child::live_exiting_member();
+    let me = std::process::id();
+    let forced = crate::identity::force_unknown_identity(me);
+    let result = Process::from_id(id).parent();
+    drop(forced);
+    match result {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(
+                detail.contains(&format!("ppid {me} exists but could not be queried")),
+                "{detail}"
+            )
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+    crate::test_child::release_unsignalled(child);
+}

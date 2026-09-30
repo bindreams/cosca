@@ -54,6 +54,10 @@ fn read_stat(pid: RawPid) -> Resolved<Vec<u8>> {
 
 /// [`read_stat`] via `openat` on `proc_dir`, not a `/proc` path lookup.
 fn read_stat_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(errno) = proc_view::fault::forced_identity_stat_errno(pid) {
+        return resolve_unreadable(pid, std::io::Error::from_raw_os_error(errno));
+    }
     read_stat_with(pid, || proc_dir.read(&format!("{pid}/stat")))
 }
 

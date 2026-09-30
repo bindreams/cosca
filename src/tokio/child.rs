@@ -677,6 +677,10 @@ mod child_reap_tests;
 #[path = "child_wait_tree_tests.rs"]
 mod child_wait_tree_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child_kill_tree_view_tests.rs"]
+mod child_kill_tree_view_tests;
+
 #[cfg(all(test, windows))]
 impl Child {
     /// Test-only: install the per-instance raw-wait observer on this child (see the raw backend's

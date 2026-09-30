@@ -45,6 +45,13 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     Ok(out)
 }
 
+/// Field 4 of `pid`'s `stat`. The kernel prints a parseable record for every pid, so a failure to
+/// parse is [`Error::Unassessable`] naming the pid, never an absence.
+#[allow(dead_code)]
+fn ppid_of_stat(pid: RawPid, stat: &[u8]) -> Result<RawPid, Error> {
+    parse_ppid(stat).ok_or_else(|| unassessable(&format!("{pid}/stat has no parseable ppid field"), None))
+}
+
 fn unassessable(why: &str, source: Option<std::io::Error>) -> Error {
     let mut detail = format!("the process snapshot could not be taken: {why}");
     if let Some(source) = &source {

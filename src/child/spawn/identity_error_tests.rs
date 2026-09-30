@@ -18,11 +18,7 @@ fn a_spawn_where_openat2_is_unavailable_is_unsupported_naming_it() {
         match err.expect("a spawn without openat2 must fail") {
             Error::Unsupported { detail, platform, .. } => {
                 assert_eq!(platform, "linux");
-                assert_eq!(
-                    detail,
-                    format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {name}"),
-                    "{errno}"
-                );
+                assert_eq!(detail, crate::identity::openat2_refused_message(name), "{errno}");
             }
             other => panic!("{errno}: expected Unsupported, got {other:?}"),
         }

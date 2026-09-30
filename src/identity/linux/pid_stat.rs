@@ -49,10 +49,7 @@ impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Unreadable { pid, kind, source } = self;
         match kind {
-            Kind::BeyondMount => write!(
-                f,
-                "{pid}/stat lies beyond a mount in /proc and was not read: {source}"
-            ),
+            Kind::BeyondMount => write!(f, "{pid}/stat lies beyond a mount in /proc and was not read: {source}"),
             Kind::DirectoryRefuses(refusal) => write!(
                 f,
                 "{pid}/stat answered {source} and the checked /proc then refused self/stat: {refusal}"

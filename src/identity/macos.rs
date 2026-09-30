@@ -70,6 +70,10 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
+    #[cfg(test)]
+    if fault::is_unknown(pid) {
+        return Resolved::Unknown;
+    }
     if let Some(info) = bsd_info(pid) {
         return Resolved::Found(token_of_bsd(&info));
     }
@@ -187,4 +191,34 @@ pub(super) fn created_at(start: StartToken) -> Option<SystemTime> {
 /// recorded once at creation, so it survives a reboot unchanged and needs no scope.
 pub(super) fn session_scope() -> Result<super::persist::Scope, super::persist::ScopeReadError> {
     Ok(super::persist::Scope::none())
+}
+
+/// Test-only seam: a by-pid identity read answers `Unknown`, as an OS refusal would.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static UNKNOWN: RefCell<Vec<super::RawPid>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Disarms [`force_unknown`] on drop.
+    #[must_use = "dropping this immediately disarms the forced read"]
+    pub(crate) struct Forced(());
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            UNKNOWN.with(|u| u.borrow_mut().clear());
+        }
+    }
+
+    /// Make every by-pid identity read of `pid` on THIS thread answer `Resolved::Unknown`.
+    pub(crate) fn force_unknown(pid: super::RawPid) -> Forced {
+        UNKNOWN.with(|u| u.borrow_mut().push(pid));
+        Forced(())
+    }
+
+    pub(super) fn is_unknown(pid: super::RawPid) -> bool {
+        UNKNOWN.with(|u| u.borrow().contains(&pid))
+    }
 }
