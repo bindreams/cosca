@@ -808,7 +808,7 @@ impl Drop for Child {
         // stays a zombie, pinning its group, until the reaper collects it.
         #[cfg(unix)]
         let tree = {
-            let root_reaped = self.os.proc_mut().is_reaped();
+            let root_reaped = false;
             self.os.attached.hard_kill_for_drop(root_reaped)
         };
         #[cfg(not(unix))]
