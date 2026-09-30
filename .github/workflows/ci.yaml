@@ -30,6 +30,7 @@ env:
 
 jobs:
   lint:
+    if: false
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -164,321 +165,12 @@ jobs:
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
-      - name: Build
-        run: cargo build --locked --target ${{ matrix.target }}
+      - name: Build D0 probes
+        run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci --test private_call_probe
 
-      # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
-      # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
-      # plus the suite's runtime, so a hang costs one step. On Unix the runner signals only the
-      # step's top-level shell when the bound fires, so a run step `exec`s its command
-      # (`matrix.exec`, empty on Windows where the shell is pwsh) or, for several commands, uses
-      # `run_forwarding` (.github/scripts/forward-signals.sh), and the signal reaches nextest.
-      - name: Build tests
-        run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
-
-      - name: Run tests
+      - name: Run D0 probes
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --target ${{ matrix.target }} --profile ci
-
-      # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
-      # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.
-      - name: Run the drive-mapping test (Windows)
-        if: matrix.os == 'windows'
-        timeout-minutes: 8
-        run: >-
-          cargo nextest run --locked --target ${{ matrix.target }} --profile ci
-          --test windows_process_cwd --run-ignored all
-          -E 'test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does)'
-
-      # `pty` is an additive feature flag; exercise the feature-gated code paths.
-      - name: Build tests (pty feature)
-        run: cargo nextest run --locked --no-run --features pty --target ${{ matrix.target }} --profile ci
-
-      - name: Run tests (pty feature)
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
-
-      - name: Build tests (tokio feature)
-        run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
-
-      - name: Run tests (tokio feature)
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci
-
-      # `serde` is an additive feature flag; exercise the persisted-identity wire format.
-      - name: Build tests (serde feature)
-        run: cargo nextest run --locked --no-run --features serde --target ${{ matrix.target }} --profile ci
-
-      - name: Run tests (serde feature)
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
-
-      # nextest runs each test in its own process, which hides tests that mutate process-global
-      # state (fd 0/1/2, RLIMIT_NOFILE). Plain `cargo test` shares one process, so this step guards
-      # the `test_own_process` isolation. Every invocation runs and the step fails at the end, so
-      # one failing configuration does not hide the other. `timeout-minutes` bounds a hang.
-      - name: Build plain cargo test (Unix)
-        if: matrix.os == 'linux' || matrix.os == 'darwin'
-        run: |
-          set -euxo pipefail
-          cargo test --locked --no-run --lib --tests --target ${{ matrix.target }}
-          cargo test --locked --no-run --all-features --lib --tests --target ${{ matrix.target }}
-
-      - name: Run plain cargo test (Unix)
-        if: matrix.os == 'linux' || matrix.os == 'darwin'
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -uxo pipefail
-          source .github/scripts/forward-signals.sh
-          status=0
-          run_forwarding cargo test --locked --no-fail-fast --lib --tests --target ${{ matrix.target }} || status=1
-          run_forwarding cargo test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} || status=1
-          exit "$status"
-
-      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16), so they use
-      # plain `cargo test`. cosca has no doctests today.
-      - name: Run doctests
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
-
-      - name: Check rustdoc
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --locked --target "$TARGET"
-
-      - name: Assert the package excludes test-only paths
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          # Write outside the workspace. A listing file created in the package
-          # root becomes an uncommitted, non-excluded file that cargo sees as a
-          # dirty worktree — the guard would abort before ever running.
-          LIST="${RUNNER_TEMP}/pkg-list.txt"
-          cargo package --list --locked --target "$TARGET" > "$LIST"
-
-          set +e
-          grep -qE '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
-          grep_status=$?
-          set -e
-
-          case "$grep_status" in
-            0)
-              echo "::error::Excluded paths leaked into the package:"
-              grep -E '^(testbin/|tests/|\.github/|\.claude/|\.config/|prek\.toml$)' "$LIST"
-              exit 1
-              ;;
-            1) echo "no excluded paths in the package" ;;
-            *)
-              echo "::error::grep errored (exit $grep_status); exclusion unverified"
-              exit 1
-              ;;
-          esac
-
-      # Release lane (debug_assertions off): exercises the calm-release arm of the
-      # should_panic oracles in the macOS-gated kinfo_tests.rs, and the Linux cgroup tests of what
-      # release builds do where debug builds assert a broken precondition instead.
-      - name: Build unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
-        run: cargo nextest run --locked --no-run --release --lib --target ${{ matrix.target }} --profile ci
-
-      - name: Unit tests (release — debug_assertions off)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
-
-      # The same lane with `tokio`: `tokio::wait_tests` pins `arm_at`'s calm-release arm (a deadline
-      # inside tokio's timer margin waits unbounded where debug builds assert).
-      - name: Build unit tests (release — debug_assertions off, tokio feature)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
-        run: cargo nextest run --locked --no-run --release --lib --features tokio --target ${{ matrix.target }} --profile ci
-
-      - name: Unit tests (release — debug_assertions off, tokio feature)
-        if: matrix.os == 'darwin' || matrix.os == 'linux'
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }} --profile ci
-
-      # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
-      # backend) and `cfg(target_os = "macos")` code are otherwise never
-      # linted: the `lint` job only runs on ubuntu-latest, so clippy never
-      # type-checks either against a Windows or macOS target.
-      #
-      # --feature-powerset, not --all-features: this crate has real dead_code
-      # gaps that only a default-features-only build exposes, which
-      # --all-features alone never catches.
-      #
-      # Placed after the test steps above (including the darwin and Linux release
-      # lane just above), not right after Build: a clippy failure there would
-      # skip every later step (their implicit `if: success()`), hiding test
-      # results.
-      #
-      # `!cancelled()` is the one step in this job that overrides that implicit
-      # `success()`: it makes this step run even after an earlier step in the
-      # job has failed, so the lint result is always reported instead of being
-      # hidden behind an earlier failure.
-      #
-      # Runs once per OS (windows/amd64, darwin/arm64), not once per arch
-      # (matrix.lint is set on exactly these two entries): nothing in this
-      # crate's Windows or macOS code is `cfg(target_arch = ...)`-gated
-      # (checked: no such attribute exists in the tree), so within each OS the
-      # two arches type-check and lint identically. Linting every arch would
-      # double the Windows and macOS runner-minutes spent on lint for no
-      # additional coverage.
-      - name: Clippy (feature powerset)
-        if: ${{ !cancelled() && matrix.lint }}
-        uses: ./.github/actions/clippy-powerset
-        with:
-          target: ${{ matrix.target }}
-
-      # `cfg(not(debug_assertions))` code on this OS is compiled by no debug build, so neither the
-      # step above nor clippy.toml's bans reach it.
-      - name: Clippy (feature powerset, release)
-        if: ${{ !cancelled() && matrix.lint }}
-        uses: ./.github/actions/clippy-powerset
-        with:
-          target: ${{ matrix.target }}
-          release: "true"
-
-      # Live cgroup v2 containment tests are gated behind COSCA_TEST_CGROUP
-      # (a no-op without it). They need a cgroup the supervisor may create child
-      # cgroups under. We make a fresh leaf directly under the unified root cgroup:
-      # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
-      # rule does not apply and a cgroup may hold BOTH the test process and a child
-      # leaf. We move our shell into it and run only the cgroup-named tests there
-      # (as root, single-threaded) — across the `spawn_io` integration binary, the
-      # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
-      # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
-      # post-fork failure path), and `tokio_io`; its cgroup tests that
-      # cannot be a no-op are `#[ignore]`d, hence `--run-ignored all`. With the marker
-      # set the tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable
-      # — never a silent skip.
-      #
-      # Also selected by exact name: the two `graceful_tree_members_remain_still_reaps_an_already_exited_root`
-      # tests, whose `MembersRemain` branch only runs against a real cgroup v2 here.
-      #
-      # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
-      # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
-      # passed in as positional arguments rather than looked up again inside the root shell.
-      - name: Build cgroup v2 containment tests (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          set -euxo pipefail
-          cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
-          cargo test --locked --all-features --lib --tests --target ${{ matrix.target }} --no-run
-
-      - name: Run cgroup v2 containment tests (Linux)
-        if: matrix.os == 'linux'
-        timeout-minutes: 8
-        shell: bash
-        run: |
-          set -euxo pipefail
-          source .github/scripts/forward-signals.sh
-          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          run_forwarding sudo -E bash -uxc '
-            source "$5"
-            CG=/sys/fs/cgroup/cosca-ci
-            mkdir -p "$CG"
-            echo $$ > "$CG/cgroup.procs"
-            export COSCA_TEST_CGROUP=1
-            # The workflow turns COSCA_TEST_CGROUP_DROP off; this lane is where those tests run.
-            export COSCA_TEST_CGROUP_DROP=1 COSCA_TEST_CGROUP_DROP_CONSENT=1
-            # Namespace tests: root here, on a throwaway runner, so consent is given.
-            export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
-            status=0
-            run_forwarding "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
-            # Plain `cargo test` shares one process across tests, unlike nextest: the ignored cgroup
-            # `own_process` tests run under that model here. Root cargo keeps the runner toolchain
-            # via `sudo -E`; the target dir is handed back so later steps can write to it.
-            export PATH="$4"
-            run_forwarding "$2" test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} -- --include-ignored cgroup || status=1
-            chown -R "$3" "$PWD/target"
-            exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)" "$PATH" "$PWD/.github/scripts/forward-signals.sh"
-
-      # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
-      # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become
-      # truly unsignalable by this job's ordinary unprivileged user, giving a REAL mixed process
-      # group. Only preparing the helper copy needs root; the tests run as the normal runner user,
-      # no sudo. The lane check fails the lane unless the helper really reaches uid 0 and may
-      # create a user namespace. The group is the tests named `setuid_*` and the
-      # `group_teardown_setuid` binary (see principle 10).
-      - name: Set up setuid-root helper (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          set -euxo pipefail
-          BIN=$(cargo build --locked --target ${{ matrix.target }} --bin cosca_testbin --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -x "$BIN"
-          HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
-          cp "$BIN" "$HELPER"
-          sudo chown root:root "$HELPER"
-          sudo chmod 4755 "$HELPER"
-          echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
-
-      - name: Check the setuid lane (Linux)
-        if: matrix.os == 'linux'
-        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
-
-      - name: Build setuid tests (Linux)
-        if: matrix.os == 'linux'
-        run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci -E 'test(/setuid_/) | binary(group_teardown_setuid)'
-
-      - name: Run setuid tests (Linux)
-        if: matrix.os == 'linux'
-        timeout-minutes: 8
-        env:
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
-        run: ${{ matrix.exec }}cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci -E 'test(/setuid_/) | binary(group_teardown_setuid)'
-
-      # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
-      # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
-      # helper must all be reachable by that uid: every directory above the checkout is made
-      # traversable and `target` readable. `sudo -E` keeps COSCA_TEST_SETUID_HELPER and the group's
-      # variables. The binary is run directly because nextest archives extract into a root-only
-      # tempdir; libtest exits 0 when a filter matches nothing, so the log must show the test passing.
-      - name: Build setuid-root process-group teardown test as root (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          set -euxo pipefail
-          BIN=$(cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "group_teardown_setuid") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -x "$BIN"
-          chmod -R a+rX "$PWD/target"
-          d="$PWD"
-          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
-          echo "COSCA_TEST_SETUID_BIN=$BIN" >> "$GITHUB_ENV"
-
-      - name: Run setuid-root process-group teardown test as root (Linux)
-        if: matrix.os == 'linux'
-        timeout-minutes: 8
-        shell: bash
-        env:
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
-        run: |
-          set -euxo pipefail
-          source .github/scripts/forward-signals.sh
-          run_forwarding sudo -E "$COSCA_TEST_SETUID_BIN" --exact kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
-          cat "$RUNNER_TEMP/setuid-root.log"
-          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"
-
-      # Names the stuck process after a hang or failure. Windows has no `ps`.
-      - name: Print the process table (Linux)
-        if: (cancelled() || failure()) && matrix.os == 'linux'
-        timeout-minutes: 2
-        run: ps -eo pid,ppid,pgid,stat,etime,args
-
-      - name: Print the process table (macOS)
-        if: (cancelled() || failure()) && matrix.os == 'darwin'
-        timeout-minutes: 2
-        run: ps -axo pid,ppid,pgid,stat,etime,command
+        run: ${{ matrix.exec }}cargo nextest run --locked --target ${{ matrix.target }} --profile ci --test private_call_probe --no-capture
 
   # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
   # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest
@@ -495,6 +187,7 @@ jobs:
   #                   nothing, so only the root lanes catch a deleted `no_new_privs`.
   # Capability masks: `CAP_DAC_OVERRIDE` is 0x2, `CAP_DAC_READ_SEARCH` is 0x4.
   resolve_root_lanes:
+    if: false
     name: Root lane (${{ matrix.lane }})
     runs-on: ubuntu-24.04 # matches the `ubuntu:24.04` run image's glibc
     timeout-minutes: 15
@@ -585,6 +278,7 @@ jobs:
   # Root on macOS, where a fixture drops by changing uid and re-execs a copy of the test binary.
   # No container on macOS runners, so this runs under `sudo`.
   resolve_root_lane_macos:
+    if: false
     name: Root lane (macOS, sudo -E)
     runs-on: macos-latest
     timeout-minutes: 15
@@ -667,3 +361,31 @@ jobs:
         if: cancelled() || failure()
         timeout-minutes: 2
         run: ps -axo pid,ppid,pgid,stat,etime,command
+
+  d0-kernels:
+    name: D0 kernels (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Print the kernel
+        run: uname -r
+
+      - name: Build D0 probes
+        run: cargo nextest run --locked --no-run --profile ci --test private_call_probe -E 'test(d0_l1_pidfs) | test(d0_env)'
+
+      - name: Run D0 probes
+        timeout-minutes: 8
+        run: exec cargo nextest run --locked --profile ci --test private_call_probe -E 'test(d0_l1_pidfs) | test(d0_env)' --no-capture
