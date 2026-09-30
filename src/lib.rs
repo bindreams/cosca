@@ -28,6 +28,16 @@
 //! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
 //! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
 //! described under [`Command::kill_on_drop`].
+//!
+//! # A child under a debugger
+//!
+//! On Linux and macOS a debugger that traces a [`Child`] owns its signal delivery: the kernel
+//! hands the debugger every signal but `SIGKILL` first, and the debugger decides whether the
+//! child gets it. So [`Child::kill`] always ends a traced child, while a graceful signal, such as
+//! the one [`Child::terminate_tree`] sends, is the debugger's to deliver. [`Child::wait`] returns
+//! once the debugger lets go: after it detaches and the child exits, or after the child dies and
+//! the debugger collects the exit, which hands it back. cosca doesn't do this on macOS yet: while
+//! another process traces the child, `wait` fails with `ECHILD`.
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
