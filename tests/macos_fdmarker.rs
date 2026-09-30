@@ -65,12 +65,12 @@ impl Member {
 fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let child = cosca::Command::new()
-        .executable(testbin())
+    let mut cmd = cosca::Command::new();
+    cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
-        .contain_with(mode)
-        .spawn()
-        .expect("spawn the orphan tree");
+        .contain_with(mode);
+    common::silence(&mut cmd);
+    let child = cmd.spawn().expect("spawn the orphan tree");
 
     let mut root = None;
     let mut grand = None;
@@ -200,6 +200,7 @@ fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Child, Me
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-orphan-escapee", &addr])
         .contain_with(mode);
+    common::silence_async(&mut cmd);
     let child = cmd.spawn().expect("spawn the orphan tree (tokio)");
 
     let mut root = None;

@@ -745,6 +745,9 @@ fn detach_leaves_the_child_running() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
     cmd.stdin(Stdio::pipe()).unwrap();
+    // The orphan exits after this test returns; it must not hold nextest's stdout/stderr.
+    cmd.stdout(Stdio::null()).unwrap();
+    cmd.stderr(Stdio::null()).unwrap();
     let mut child = cmd.spawn().expect("spawn");
     let id = child.id();
     // Take the stdin writer BEFORE detaching, so we can end the orphan cleanly
@@ -853,6 +856,7 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     let mut cmd = Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-echo", &addr]);
+    common::silence(&mut cmd);
     cmd.contain();
     cmd.kill_on_drop(kill_on_drop);
     // As in `spawn_contained_tree`: every caller asserts an achieved mechanism that can

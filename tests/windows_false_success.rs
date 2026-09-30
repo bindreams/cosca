@@ -45,6 +45,7 @@ fn spawn_configured(mode: &str, configure: impl Fn(&mut cosca::Command)) -> (cos
     let mut cmd = cosca::Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", mode, addr.as_str(), "R"]);
+    common::silence(&mut cmd);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn control child");
     let (mut sock, _) = listener.accept().expect("accept");
@@ -64,6 +65,7 @@ fn spawn_configured_async(
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(testbin())
         .args(["cosca_testbin", mode, addr.as_str(), "R"]);
+    common::silence_async(&mut cmd);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn async control child");
     let (mut sock, _) = listener.accept().expect("accept");
