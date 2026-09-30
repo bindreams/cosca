@@ -1378,7 +1378,7 @@ impl Marker {
                         .any(|h| is_signalable(h.pid) && pid_is_live_group_member(h.pid, pgid))
                 });
             let should_fire = first_pass || live_holder_confirms_pgid;
-            if !by_root_number {
+            if false {
                 // The caller asked for nothing named by the root's number (`hard_kill_holders_only`).
             } else if should_fire {
                 // `kill_group`/`term_group` already return `crate::error::Error`, carrying
