@@ -77,10 +77,12 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::io::Write as _;
     use std::time::Duration;
 
     use super::super::fixtures::Blocker;
     use crate::identity::{quiet_fault, ReadPurpose, Resolved};
+    use crate::test_support::tracer::{attach_settled, AttachError};
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
 
@@ -142,7 +144,9 @@ mod macos {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                eprintln!(
+                // Not `eprintln!`: libtest captures that, and the abort would lose it.
+                _ = writeln!(
+                    std::io::stderr(),
                     "WATCHDOG: {name} still running after {BOUND:?}; last step: {}",
                     step_name()
                 );
@@ -155,7 +159,7 @@ mod macos {
     static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
 
     pub(super) fn step(name: &'static str) {
-        eprintln!("step: {name}");
+        _ = writeln!(std::io::stderr(), "step: {name}");
         *STEP.lock().unwrap_or_else(|e| e.into_inner()) = name;
     }
 
@@ -163,52 +167,46 @@ mod macos {
         *STEP.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Attach to `blocker`'s child with `PT_ATTACHEXC` and wait, without consuming it, until its
-    /// stop is visible. `waitid` cannot block here: under `PT_ATTACHEXC` the stop raises a Mach
-    /// exception with no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks
-    /// with a capped backoff.
+    /// Attach to `blocker`'s child and wait, without consuming it, until its stop has settled: a
+    /// request before the tracee's threads have parked wakes nothing ([`attach_settled`]).
+    ///
+    /// The child is `cat`, which a stop can kill: a `cat` already blocked in `read` gets `EINTR`
+    /// when it resumes, prints `Interrupted system call` and exits 1. So no fixture resumes it.
+    /// They end it with [`kill_stopped`], whose `SIGKILL` cannot lose to that exit.
     fn attach_and_confirm_stop(blocker: &Blocker) {
-        step("attach");
-        let pid = blocker.shared.id();
-        // SAFETY: a plain ptrace request on this test's own child.
-        let r = unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid as libc::pid_t, std::ptr::null_mut(), 0) };
-        assert_eq!(r, 0, "PT_ATTACHEXC: {}", std::io::Error::last_os_error());
-        step("confirm the stop");
-        let mut interval = Duration::from_millis(1);
-        loop {
-            // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let r = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            assert_eq!(r, 0, "waitid: {}", std::io::Error::last_os_error());
-            if info.si_pid != 0 {
-                return;
-            }
-            std::thread::sleep(interval);
-            interval = (interval * 2).min(Duration::from_millis(50));
+        step("attach and settle");
+        match attach_settled(blocker.shared.id()) {
+            Ok(()) => {}
+            Err(AttachError::Errno(e)) => panic!("attach: {}", std::io::Error::from_raw_os_error(e)),
+            Err(AttachError::Exited) => panic!("the tracee exited before it stopped"),
         }
     }
 
-    fn continue_tracee(blocker: &Blocker) {
-        // SAFETY: as above; `1` resumes from where the tracee stopped.
-        let r = unsafe {
+    /// End a child stopped by [`attach_and_confirm_stop`]: `PT_KILL` sets `SRUN`, then `SIGKILL`
+    /// through the handle wakes a thread asleep in `read()` (`PT_KILL`'s own `SIGKILL` is only
+    /// posted to an `SSTOP` tracee, `kern_sig.c:2274`).
+    fn kill_stopped(blocker: &Blocker) {
+        // SAFETY: a plain ptrace request on this test's own child.
+        unsafe {
             libc::ptrace(
-                libc::PT_CONTINUE,
+                libc::PT_KILL,
                 blocker.shared.id() as libc::pid_t,
-                std::ptr::dangling_mut::<libc::c_char>(),
+                std::ptr::null_mut(),
                 0,
             )
         };
-        assert_eq!(r, 0, "PT_CONTINUE: {}", std::io::Error::last_os_error());
+        blocker.shared.kill().expect("kill");
     }
 
-    /// `try_wait` on a child stopped under this process's own `PT_ATTACHEXC` returns `None` and
+    fn assert_killed(status: std::process::ExitStatus) {
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL),
+            "{status:?}"
+        );
+    }
+
+    /// `try_wait` on a child stopped under this process's own `PT_ATTACH` returns `None` and
     /// leaves the state `N`.
     ///
     /// Mutant: a `waitpid(WNOHANG)` reap returns the stop as a status and writes `E`.
@@ -229,16 +227,8 @@ mod macos {
         step("try_wait");
         assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
         assert!(format!("{:?}", b.shared).contains("N"));
-        // Clean-up: PT_KILL sets SRUN, then SIGKILL through the handle wakes the thread asleep in
-        // `read()` (PT_KILL's own SIGKILL is only posted to an SSTOP tracee, `kern_sig.c:2274`).
-        // SAFETY: as above.
-        unsafe { libc::ptrace(libc::PT_KILL, b.shared.id() as libc::pid_t, std::ptr::null_mut(), 0) };
-        b.shared.kill().expect("kill");
-        let status = b.shared.wait().expect("wait");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(libc::SIGKILL)
-        );
+        kill_stopped(&b);
+        assert_killed(b.shared.wait().expect("wait"));
     }
 
     /// A child this process traces is reaped fully: XNU needs two reaps, because the first only
@@ -258,15 +248,11 @@ mod macos {
         }
         let _dog = watchdog("reaped fully");
         step("spawn");
-        let mut b = Blocker::spawn();
+        let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
-        // A stopped child never reads its stdin's EOF.
-        step("continue");
-        continue_tracee(&b);
-        b.end_child();
+        kill_stopped(&b);
         step("wait");
-        let status = b.shared.wait().expect("wait");
-        assert!(status.success(), "{status:?}");
+        assert_killed(b.shared.wait().expect("wait"));
         // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
@@ -299,15 +285,13 @@ mod macos {
         crate::log_capture::install();
         let _dog = watchdog("failed start read");
         step("spawn");
-        let mut b = Blocker::spawn();
+        let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
-        continue_tracee(&b);
-        b.end_child();
         let marker = format!("second reap of pid {}", b.shared.id());
         let mark = crate::log_capture::mark();
         let _forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::SecondPeek, Resolved::Unknown);
-        let status = b.shared.wait().expect("wait");
-        assert!(status.success(), "{status:?}");
+        kill_stopped(&b);
+        assert_killed(b.shared.wait().expect("wait"));
         assert!(format!("{:?}", b.shared).contains("E("), "{:?}", b.shared);
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);
     }
