@@ -134,10 +134,7 @@ pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
 }
 
 /// [`stop`]'s answer from its `waitid` peek and, if that found a stop, the tracee's `threads`.
-fn verdict(
-    peeked: &libc::siginfo_t,
-    threads: impl FnOnce() -> Result<Vec<Option<libc::proc_threadinfo>>, i32>,
-) -> Result<Stop, i32> {
+fn verdict(peeked: &libc::siginfo_t, threads: impl FnOnce() -> Result<Vec<Thread>, i32>) -> Result<Stop, i32> {
     if peeked.si_pid == 0 {
         return Ok(Stop::Running);
     }
@@ -170,15 +167,18 @@ fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<
 
 /// Whether every one of `threads` is [`parked`]. A thread that exited between the listing and its
 /// read (`None`) leaves the verdict unsettled, so the caller peeks again under its backoff.
-fn all_parked(threads: &[Option<libc::proc_threadinfo>]) -> bool {
+fn all_parked(threads: &[Thread]) -> bool {
     threads
         .iter()
-        .all(|thread| thread.is_some_and(|thread| parked(thread.pth_run_state, thread.pth_flags)))
+        .all(|(_, info)| info.is_some_and(|info| parked(info.pth_run_state, info.pth_flags)))
 }
 
-/// Every thread of `pid`, `None` for one that exited between the listing and its read, or the
-/// errno. Listed by unique thread id: a listing by TSD base names every raw Mach thread 0.
-pub(super) fn threads(pid: u32) -> Result<Vec<Option<libc::proc_threadinfo>>, i32> {
+/// A thread's unique id and info, `None` if it exited between the listing and its read.
+pub(super) type Thread = (u64, Option<libc::proc_threadinfo>);
+
+/// Every thread of `pid`, or the errno. Listed by unique thread id: a listing by TSD base names
+/// every raw Mach thread 0.
+pub(super) fn threads(pid: u32) -> Result<Vec<Thread>, i32> {
     threads_with(
         || thread_ids(pid),
         |id| {
@@ -194,12 +194,12 @@ pub(super) fn threads(pid: u32) -> Result<Vec<Option<libc::proc_threadinfo>>, i3
 fn threads_with<T>(
     list: impl FnOnce() -> Result<Vec<u64>, i32>,
     read: impl Fn(u64) -> Result<T, i32>,
-) -> Result<Vec<Option<T>>, i32> {
+) -> Result<Vec<(u64, Option<T>)>, i32> {
     list()?
         .into_iter()
         .map(|id| match read(id) {
-            Ok(thread) => Ok(Some(thread)),
-            Err(libc::ESRCH) => Ok(None),
+            Ok(thread) => Ok((id, Some(thread))),
+            Err(libc::ESRCH) => Ok((id, None)),
             Err(e) => Err(e),
         })
         .collect()

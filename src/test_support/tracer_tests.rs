@@ -463,7 +463,7 @@ fn read_threads(pid: u32) -> Vec<libc::proc_threadinfo> {
     sys::threads(pid)
         .expect("list the tracee's threads")
         .into_iter()
-        .map(|thread| thread.expect("no tracee thread exits while the test reads them"))
+        .map(|(_, info)| info.expect("no tracee thread exits while the test reads them"))
         .collect()
 }
 
