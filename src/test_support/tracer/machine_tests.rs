@@ -5,8 +5,8 @@ use std::time::Duration;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
 /// A timeout beyond XNU's `kevent` limit still delivers a pending exit instead of panicking. The
-/// child is `cat` on a pipe, so it cannot exit before `NOTE_EXIT` is armed: XNU refuses to arm it
-/// on an exited process (`ESRCH`).
+/// child blocks on a pipe until `NOTE_EXIT` is armed, since XNU refuses to arm it on an exited
+/// process (`ESRCH`).
 ///
 /// Mutant: build the timespec inline, unclamped -> `kevent failed: EINVAL`.
 #[test]
