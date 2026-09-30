@@ -426,9 +426,23 @@ impl TracerHelper<'_> {
 /// The exit status of a tracee spawned to catch `SIGTERM`, once it gets one.
 pub(crate) const SIGTERM_EXIT: i32 = 15;
 
-/// Spawns [`uh_tracee_fixture`], uncontained, with a piped stdin: closing it ends the tracee.
-/// With `catch_sigterm` the tracee exits with [`SIGTERM_EXIT`] on `SIGTERM`.
-pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
+/// What [`uh_tracee_fixture`] does besides reading stdin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tracee {
+    Plain,
+    /// Exits with [`SIGTERM_EXIT`] on `SIGTERM`.
+    CatchSigterm,
+    /// Holds a thread it created with `pthread_create_suspended_np` and never starts, then writes
+    /// [`UNSTARTED_READY`] to its piped stdout.
+    UnstartedThread,
+}
+
+/// The line that signals a [`Tracee::UnstartedThread`] is ready.
+pub(crate) const UNSTARTED_READY: &str = "uh-unstarted-ready";
+
+/// Spawns [`uh_tracee_fixture`] of `kind`, uncontained, with a piped stdin: closing it ends the
+/// tracee.
+pub(crate) fn spawn_tracee(kind: Tracee) -> crate::Child {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
@@ -439,11 +453,21 @@ pub(crate) fn spawn_tracee(catch_sigterm: bool) -> crate::Child {
             crate::test_child::fixture_path!(uh_tracee_fixture),
         ])
         .env("COSCA_UH_ROLE", "tracee");
-    if catch_sigterm {
-        cmd.env("COSCA_UH_CATCH", "SIGTERM");
+    match kind {
+        Tracee::Plain => {}
+        Tracee::CatchSigterm => {
+            cmd.env("COSCA_UH_CATCH", "SIGTERM");
+        }
+        Tracee::UnstartedThread => {
+            cmd.env("COSCA_UH_UNSTARTED", "1");
+        }
     }
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("stdout null");
+    let stdout = match kind {
+        Tracee::UnstartedThread => crate::Stdio::pipe(),
+        Tracee::Plain | Tracee::CatchSigterm => crate::Stdio::null(),
+    };
+    cmd.stdout(stdout).expect("stdout");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
     cmd.spawn().expect("spawn the tracee fixture")
 }
@@ -463,6 +487,30 @@ fn uh_tracee_fixture() {
         // SAFETY: the handler calls only `_exit`; this process runs no other test.
         let previous = unsafe { libc::signal(libc::SIGTERM, exit_on_sigterm as *const () as libc::sighandler_t) };
         assert_ne!(previous, libc::SIG_ERR, "install the SIGTERM handler");
+    }
+    if std::env::var("COSCA_UH_UNSTARTED").as_deref() == Ok("1") {
+        unsafe extern "C" {
+            fn pthread_create_suspended_np(
+                thread: *mut libc::pthread_t,
+                attr: *const libc::pthread_attr_t,
+                start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+                arg: *mut libc::c_void,
+            ) -> libc::c_int;
+        }
+        extern "C" fn never_runs(_: *mut libc::c_void) -> *mut libc::c_void {
+            std::ptr::null_mut()
+        }
+        let mut thread: libc::pthread_t = 0;
+        // SAFETY: valid out-pointer, default attributes, and a start routine that touches nothing.
+        let rc =
+            unsafe { pthread_create_suspended_np(&mut thread, std::ptr::null(), never_runs, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "pthread_create_suspended_np");
+        // Raw `stdout()`, not `println!`, which libtest captures.
+        let line = format!("\n{UNSTARTED_READY}\n");
+        let mut out = std::io::stdout().lock();
+        out.write_all(line.as_bytes())
+            .and_then(|()| out.flush())
+            .expect("report readiness");
     }
     let _ = sys::read_byte(0);
 }

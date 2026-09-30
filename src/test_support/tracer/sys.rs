@@ -116,35 +116,42 @@ pub(super) fn pbi_status(pid: u32) -> Result<u32, i32> {
 pub(super) enum Stop {
     /// Not stopped: running, or exiting.
     Running,
-    /// Stopped by the signal, but a thread still runs: the stop has not settled.
+    /// Stopped by the signal, but not every thread is parked yet: the stop has not settled.
     Settling,
-    /// Stopped by the signal, every thread blocked.
+    /// Stopped by the signal, every thread parked (see [`stop`]).
     Stopped(i32),
 }
 
 /// Whether the tracee is stopped, and by which signal, without consuming the stop.
 ///
-/// A traced stop sets `SSTOP` and posts `SIGCHLD` to the tracer before its thread waits for the
-/// tracer's release, and a `PT_CONTINUE` or `PT_DETACH` in between wakes nothing: the tracee then
-/// never runs again (xnu `kern_sig.c`, `issignal`, `assert_wait` on `sigwait`; seen on CI as a
-/// tracee that neither exits nor stops again). So a stop counts only once no thread of the
-/// tracee is in the running state.
+/// A traced stop sets `SSTOP` and `sigwait`, posts `SIGCHLD`, and only then waits on `sigwait`
+/// (xnu `kern_sig.c`, `issignal_locked`). A `PT_CONTINUE`/`PT_DETACH` in that window finds no
+/// waiter and is lost: the thread then sleeps for good and `ptrace` answers `EBUSY`. In the
+/// window a thread runs or waits `THREAD_UNINT`; the `sigwait` wait is interruptible. So a stop
+/// counts only once every thread is [`parked`].
 pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
-    let info = peek(pid, libc::WSTOPPED | libc::WNOHANG)?;
-    if info.si_pid == 0 {
+    verdict(&peek(pid, libc::WSTOPPED | libc::WNOHANG)?, || threads(pid))
+}
+
+/// [`stop`]'s answer from its `waitid` peek and, if that found a stop, the tracee's `threads`.
+fn verdict(peeked: &libc::siginfo_t, threads: impl FnOnce() -> Result<Vec<Thread>, i32>) -> Result<Stop, i32> {
+    if peeked.si_pid == 0 {
         return Ok(Stop::Running);
     }
-    match threads_blocked(pid) {
-        Ok(true) => Ok(Stop::Stopped(info.si_status)),
-        Ok(false) => Ok(Stop::Settling),
+    match threads() {
+        Ok(threads) if all_parked(&threads) => Ok(Stop::Stopped(peeked.si_status)),
+        Ok(_) => Ok(Stop::Settling),
         // Exiting, and so no longer stopped: its NOTE_EXIT follows.
         Err(libc::ESRCH) => Ok(Stop::Running),
         Err(e) => Err(e),
     }
 }
 
-/// `<sys/proc_info.h>`: lists a process's thread handles. Not in `libc`.
-const PROC_PIDLISTTHREADS: libc::c_int = 6;
+/// `<sys/proc_info_private.h>`: lists a process's unique thread ids. Not in `libc`.
+const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
+
+/// `<sys/proc_info.h>`: one thread's info by unique thread id. Not in `libc`.
+const PROC_PIDTHREADID64INFO: libc::c_int = 15;
 
 /// `proc_pidinfo` into `buf`, `Ok` with the bytes written.
 fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<usize, i32> {
@@ -158,29 +165,81 @@ fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<
     }
 }
 
-/// `Ok(true)` if no thread of `pid` is in the running state.
-fn threads_blocked(pid: u32) -> Result<bool, i32> {
+/// Whether every one of `threads` is [`parked`]. A thread that exited between the listing and its
+/// read (`None`) leaves the verdict unsettled, so the caller peeks again under its backoff.
+fn all_parked(threads: &[Thread]) -> bool {
+    threads
+        .iter()
+        .all(|(_, info)| info.is_some_and(|info| parked(info.pth_run_state, info.pth_flags)))
+}
+
+/// A thread's unique id and info, `None` if it exited between the listing and its read.
+pub(super) type Thread = (u64, Option<libc::proc_threadinfo>);
+
+/// Every thread of `pid`, or the errno. Listed by unique thread id: a listing by TSD base names
+/// every raw Mach thread 0.
+pub(super) fn threads(pid: u32) -> Result<Vec<Thread>, i32> {
+    threads_with(
+        || thread_ids(pid),
+        |id| {
+            // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
+            let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
+            pidinfo(pid, PROC_PIDTHREADID64INFO, id, &mut thread).map(|_| thread[0])
+        },
+    )
+}
+
+/// `list`'s threads, each read with `read`. A read's `ESRCH` means that thread exited after the
+/// listing, not the process: `None`.
+fn threads_with<T>(
+    list: impl FnOnce() -> Result<Vec<u64>, i32>,
+    read: impl Fn(u64) -> Result<T, i32>,
+) -> Result<Vec<(u64, Option<T>)>, i32> {
+    list()?
+        .into_iter()
+        .map(|id| match read(id) {
+            Ok(thread) => Ok((id, Some(thread))),
+            Err(libc::ESRCH) => Ok((id, None)),
+            Err(e) => Err(e),
+        })
+        .collect()
+}
+
+/// The unique ids of `pid`'s threads.
+fn thread_ids(pid: u32) -> Result<Vec<u64>, i32> {
     // SAFETY: `proc_taskinfo` is plain data; all-zero is a valid value.
     let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
     pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task)?;
-    let mut handles = vec![0u64; task[0].pti_threadnum.max(1) as usize];
-    let listed = loop {
-        let n = pidinfo(pid, PROC_PIDLISTTHREADS, 0, &mut handles)? / std::mem::size_of::<u64>();
+    let mut ids = vec![0u64; task[0].pti_threadnum.max(1) as usize];
+    loop {
+        let n = pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, &mut ids)? / std::mem::size_of::<u64>();
         // A full buffer may have cut the list short.
-        if n < handles.len() {
-            break n;
+        if n < ids.len() {
+            ids.truncate(n);
+            return Ok(ids);
         }
-        handles.resize(handles.len() * 2, 0);
-    };
-    for &handle in &handles[..listed] {
-        // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
-        let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
-        pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
-        if thread[0].pth_run_state == libc::TH_STATE_RUNNING {
-            return Ok(false);
-        }
+        ids.resize(ids.len() * 2, 0);
     }
-    Ok(true)
+}
+
+/// Whether a thread is waiting interruptibly, suspended, or never started. XNU reports a running
+/// or runnable thread as `TH_STATE_RUNNING`, and one in a `THREAD_UNINT` wait as
+/// `TH_STATE_UNINTERRUPTIBLE`.
+///
+/// A never-started thread also reads `TH_STATE_UNINTERRUPTIBLE` and stays so while the stop
+/// holds the task, but has no kernel stack (`TH_FLAGS_SWAPPED`); every wait in the stop's window
+/// keeps its stack. So a stackless uninterruptible thread counts as parked, else such a stop
+/// never settles.
+///
+/// Panics on a run state that is no `TH_STATE_*`: `retrieve_thread_basic_info` sets one under
+/// `thread_lock` for every thread.
+fn parked(run_state: i32, flags: i32) -> bool {
+    match run_state {
+        libc::TH_STATE_RUNNING => false,
+        libc::TH_STATE_UNINTERRUPTIBLE => flags & libc::TH_FLAGS_SWAPPED != 0,
+        libc::TH_STATE_WAITING | libc::TH_STATE_STOPPED | libc::TH_STATE_HALTED => true,
+        other => panic!("pth_run_state {other} is no TH_STATE_*"),
+    }
 }
 
 /// `Ok` while `pid` is this process's unreaped child: a `waitid` peek that neither blocks nor
@@ -273,3 +332,7 @@ pub(super) fn unwatch_signal_pipe(kq: &Kqueue) {
 fn read_knote(flags: EvFlags) -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_READ, flags, FilterFlag::empty(), 0, 0)
 }
+
+#[cfg(test)]
+#[path = "sys_tests.rs"]
+mod sys_tests;

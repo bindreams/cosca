@@ -11,19 +11,19 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 
-use super::{sys, Cause, Mode, Report, TracerHelper, Until};
+use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
 
 /// The tracee and its stdin, or `None` with the `TRACER` group turned off.
 fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
-    tracee_with(false)
+    tracee_with(Tracee::Plain)
 }
 
-/// [`tracee`], catching `SIGTERM` if `catch_sigterm` (see [`super::spawn_tracee`]).
-fn tracee_with(catch_sigterm: bool) -> Option<(crate::Child, std::io::PipeWriter)> {
+/// [`tracee`] of `kind` (see [`super::spawn_tracee`]).
+fn tracee_with(kind: Tracee) -> Option<(crate::Child, std::io::PipeWriter)> {
     if !crate::test_support::require_group("TRACER") {
         return None;
     }
-    let mut child = super::spawn_tracee(catch_sigterm);
+    let mut child = super::spawn_tracee(kind);
     let stdin = child.stdin().expect("the tracee's stdin is piped");
     Some((child, stdin))
 }
@@ -53,7 +53,9 @@ fn label(report: Report) -> String {
 
 /// Reads reports, matching each against `pattern` as it arrives, until `pattern` is used up.
 /// `<report>*` matches any number of that report in a row: only a backoff whose rounds the
-/// kernel counts (`EBUSY` until a stop lands) is starred. Panics at the first mismatch.
+/// kernel counts (`EBUSY` until a stop lands) is starred (also a report whose presence depends on
+/// whether the helper's settle check runs before the test's next byte, e.g. `S1hs*`). Panics at
+/// the first mismatch.
 fn expect(th: &mut TracerHelper<'_>, pattern: &[&str]) {
     debug_assert!(
         pattern.last().is_some_and(|last| !last.ends_with('*')),
@@ -451,6 +453,98 @@ fn s1h_a_lone_sigchld_reads_as_the_timeout() {
     assert_sigkilled(tracee);
 }
 
+/// Whether `thread` has never run: no CPU time at all.
+fn never_ran(thread: &libc::proc_threadinfo) -> bool {
+    thread.pth_user_time == 0 && thread.pth_system_time == 0
+}
+
+/// Every thread of `pid`. No thread of this group's tracees exits while the test reads them.
+fn read_threads(pid: u32) -> Vec<libc::proc_threadinfo> {
+    sys::threads(pid)
+        .expect("list the tracee's threads")
+        .into_iter()
+        .map(|(_, info)| info.expect("no tracee thread exits while the test reads them"))
+        .collect()
+}
+
+/// Reads the tracee's stdout up to its [`super::UNSTARTED_READY`] line, and returns the pipe to
+/// be held open while the tracee lives: libtest fails a run whose report it cannot write. Panics
+/// at EOF: the tracee exited first.
+fn await_ready(tracee: &mut crate::Child) -> impl Sized {
+    use std::io::BufRead as _;
+    let mut stdout = std::io::BufReader::new(tracee.stdout().expect("the tracee's stdout is piped"));
+    loop {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).expect("read the tracee's stdout");
+        assert!(n > 0, "the tracee exited before it was ready");
+        if line.trim() == super::UNSTARTED_READY {
+            return stdout;
+        }
+    }
+}
+
+/// Re-checks, under a backoff, until the held tracee is `SSTOP` and every thread of it that has
+/// run is in an interruptible wait or suspended. The hold keeps the stop, and a stopping thread
+/// parks once off its kernel locks, so only the tracee's end stops that from coming: it fails
+/// then.
+fn await_settled(pid: u32) {
+    let parked = [libc::TH_STATE_WAITING, libc::TH_STATE_STOPPED];
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match sys::pbi_status(pid) {
+            Ok(libc::SSTOP) => {
+                let threads = read_threads(pid);
+                if threads
+                    .iter()
+                    .all(|thread| never_ran(thread) || parked.contains(&thread.pth_run_state))
+                {
+                    return;
+                }
+            }
+            Ok(libc::SZOMB) => panic!("the held tracee exited"),
+            Ok(_) => {}
+            Err(e) => panic!("the held tracee is gone: errno {e}"),
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A tracee holding a never-started thread, which XNU reports as `TH_STATE_UNINTERRUPTIBLE` with
+/// no kernel stack. The hold ends only after the stop has settled around that thread, so S2's
+/// first peek sees the exemption's case.
+///
+/// Mutant: no exemption for an uninterruptible thread without a kernel stack, so S2 backs off
+/// instead of releasing the tracee.
+#[test]
+fn a_stop_with_a_never_started_thread_settles() {
+    let Some((mut tracee, stdin)) = tracee_with(Tracee::UnstartedThread) else {
+        return;
+    };
+    let pid = tracee.id().pid();
+    let _stdout = await_ready(&mut tracee);
+    let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
+    expect(&mut th, &["S0", "S1", "S1h"]);
+    await_settled(pid);
+    assert!(
+        read_threads(pid).iter().any(|thread| never_ran(thread)
+            && thread.pth_run_state == libc::TH_STATE_UNINTERRUPTIBLE
+            && thread.pth_flags & libc::TH_FLAGS_SWAPPED != 0),
+        "no never-started thread reads as uninterruptible with no kernel stack: the premise of \
+         the exemption under test"
+    );
+    th.signal();
+    expect(
+        &mut th,
+        &["S1hs*", "blocking S1h eof*", "S2", "attached", "S3", "blocking S3 eof"],
+    );
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    assert_handed_back(pid);
+    drop(th);
+    assert_exited_cleanly(tracee);
+}
+
 // S2 ===========================================================================================
 
 /// Holds the tracee, then releases it into S2 under `force` (which must hold `S1:hold`).
@@ -505,7 +599,7 @@ fn s2_backs_off_before_the_release(force: &str) {
 /// `SIGTERM`. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
 #[test]
 fn s2_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee_with(true) else {
+    let Some((mut tracee, stdin)) = tracee_with(Tracee::CatchSigterm) else {
         return;
     };
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM");
