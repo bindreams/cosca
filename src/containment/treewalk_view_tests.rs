@@ -118,7 +118,9 @@ fn parent_and_children_without_openat2_are_unsupported_naming_it() {
 
 // The snapshot precedes the anchor =====
 
-fn queries() -> [(&'static str, fn(&crate::Process) -> Result<(), Error>); 3] {
+type Query = fn(&crate::Process) -> Result<(), Error>;
+
+fn queries() -> [(&'static str, Query); 3] {
     [
         ("parent", |p| p.parent().map(|_| ())),
         ("children(No)", |p| p.children(Recursive::No).map(|_| ())),
