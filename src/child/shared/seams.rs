@@ -51,11 +51,14 @@ pub(crate) fn park_gate() -> (ParkGate, Receiver<()>, Sender<()>) {
     )
 }
 
+/// A hook run just before a `Condvar` block, given the block's timeout (`None`: none).
+type BlockHook = Box<dyn FnOnce(Option<std::time::Duration>)>;
+
 thread_local! {
     static PARK: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
     static FORCED_WAIT: Cell<Option<ForcedWait>> = const { Cell::new(None) };
     static PANIC_AFTER_RELOCK: Cell<bool> = const { Cell::new(false) };
-    static ON_CONDVAR_BLOCK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static ON_CONDVAR_BLOCK: RefCell<Option<BlockHook>> = const { RefCell::new(None) };
     #[cfg(windows)]
     static FORCE_DUPLICATE_HANDLE_ERROR: Cell<bool> = const { Cell::new(false) };
 }
@@ -114,13 +117,19 @@ pub(super) fn panic_after_relock_if_armed() {
 /// `Condvar` before it releases anything: the wait releases the lock atomically, so the release
 /// cannot overtake it.
 pub(crate) fn on_condvar_block(hook: impl FnOnce() + 'static) -> Forced {
+    on_condvar_block_with(move |_| hook())
+}
+
+/// [`on_condvar_block`], with the time the block is about to be armed for: `None` is a block
+/// with no timeout.
+pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<std::time::Duration>) + 'static) -> Forced {
     ON_CONDVAR_BLOCK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
     Forced(|| ON_CONDVAR_BLOCK.with(|h| *h.borrow_mut() = None))
 }
 
-pub(super) fn before_condvar_block() {
+pub(super) fn before_condvar_block(remaining: Option<std::time::Duration>) {
     if let Some(hook) = ON_CONDVAR_BLOCK.with(|h| h.borrow_mut().take()) {
-        hook();
+        hook(remaining);
     }
 }
 

@@ -141,12 +141,11 @@ filter = 'binary(tokio_io) & test(=async_kill_tree_before_wait_tears_down_the_tr
 slow-timeout = { period = "10s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
-# Every `SharedChild` test that `recv()`s or `join()`s waits on our own code: a mutant that strands
-# a waiter (a state write without `notify_all`, a holder that leaves `W`) hangs instead of failing.
-# The bound turns that hang into a bounded failure, and never synchronises anything: with the
-# correct code every one of these returns at once. Under `profile.default`, so `profile.ci` and
-# local runs both inherit it. The macOS wait's tests (`wait::backend::macos_tests::await_reapable`)
-# block on a real kqueue in the same way.
+# A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),
+# not by timing out. This bound only stops a regression those checks did not anticipate, in a test
+# that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
+# (`wait::backend::macos_tests::await_reapable`) block on a real kqueue in the same way. Under
+# `profile.default` so `profile.ci` and local runs inherit it.
 filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_tests::await_reapable/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 

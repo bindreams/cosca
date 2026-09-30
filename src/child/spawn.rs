@@ -397,8 +397,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 }
 
 /// The spawned `child` could not be adopted: on Linux its pidfd could not be opened (a refusal,
-/// or `EMFILE`, `ENFILE`, `ENOMEM`), on Windows its process handle could not be duplicated.
-/// Tears it down and answers `error`.
+/// or `EMFILE`, `ENFILE`, `ENOMEM`), on Windows its process handle could not be duplicated, on
+/// macOS its unique id could not be read (a refusal that is not `ESRCH`, so the child was an
+/// unreaped child at the read: the same footing as a failed `resolve_identity`). Tears it down
+/// and answers `error`.
 ///
 /// **OPEN OWNER QUESTION.** On Linux std has already forked, so a child exists with no pidfd, and
 /// killing and reaping it by pid is the race the owner rejected. The coordinator's recommendation,

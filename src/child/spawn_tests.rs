@@ -1030,3 +1030,28 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
     teardown.assert_killed();
 }
+
+/// macOS: an identity read that is refused at adoption fails the spawn as `Unassessable`, naming
+/// the errno, and the child is torn down.
+///
+/// Mutant: `Unassessable` mapped to `Io`; an arm that drops the returned child without tearing it
+/// down; a spawn that succeeds with no identity.
+#[cfg(target_os = "macos")]
+#[test]
+fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
+    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    let (mut cmd, teardown) = teardown_blocker();
+    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let err = cmd.spawn().err();
+    drop(forced);
+
+    match err.expect("a refused identity read must fail the spawn") {
+        Error::Unassessable { detail, source } => {
+            assert!(detail.contains("identity could not be read"), "{detail}");
+            assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EPERM));
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
+    teardown.assert_killed();
+}

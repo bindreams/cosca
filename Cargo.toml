@@ -115,7 +115,8 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+# 0.2.187 added `proc_bsdshortinfo` and `PROC_PIDT_SHORTBSDINFO`; 0.2.189 is what is locked.
+libc = "0.2.189"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

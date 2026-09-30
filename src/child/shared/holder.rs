@@ -1,11 +1,7 @@
 //! The holder's guard: whoever writes `W { token }` arms exactly one, in the same critical
 //! section, and every exit of the holder goes through it.
 
-use std::sync::MutexGuard;
-#[cfg(target_os = "linux")]
-use std::sync::PoisonError;
-
-use super::{Inner, SharedChild, State};
+use super::{Guard, SharedChild, State};
 
 /// Arms the holder. Its `Drop`, which runs only if [`finish`](HolderGuard::finish) never did,
 /// restores `N` and wakes the waiters, **only if the state is still its own `W`**: another
@@ -18,18 +14,18 @@ use super::{Inner, SharedChild, State};
 pub(super) struct HolderGuard<'a> {
     sc: &'a SharedChild,
     token: u64,
-    lock: Option<MutexGuard<'a, Inner>>,
+    lock: Option<Guard<'a>>,
     done: bool,
 }
 
 impl<'a> HolderGuard<'a> {
     /// Write `W { token }` with a fresh token and arm the guard with `lock`, in one critical
     /// section.
-    pub(super) fn arm(sc: &'a SharedChild, mut lock: MutexGuard<'a, Inner>) -> Self {
+    pub(super) fn arm(sc: &'a SharedChild, mut lock: Guard<'a>) -> Self {
         let token = lock.next_token;
         lock.next_token += 1;
-        lock.state = State::W { token };
-        sc.condvar.notify_all();
+        lock.set(State::W { token });
+        sc.notify(&mut lock);
         HolderGuard {
             sc,
             token,
@@ -69,28 +65,23 @@ impl<'a> HolderGuard<'a> {
     pub(super) fn sleep(&mut self, dur: std::time::Duration) {
         let lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
         #[cfg(test)]
-        super::seams::before_condvar_block();
-        let (lock, _) = self
-            .sc
-            .condvar
-            .wait_timeout(lock, dur)
-            .unwrap_or_else(PoisonError::into_inner);
-        self.lock = Some(lock);
+        super::seams::before_condvar_block(Some(dur));
+        self.lock = Some(self.sc.cv_wait_timeout(lock, dur));
         self.assert_own();
     }
 
     /// Write `state`, wake the waiters, and hand back the lock with no guard left, in one
     /// critical section. Consuming the guard makes it impossible for a normal return to restore
     /// `N` under a newer holder.
-    pub(super) fn finish(mut self, state: State) -> MutexGuard<'a, Inner> {
+    pub(super) fn finish(mut self, state: State) -> Guard<'a> {
         let mut lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
         debug_assert!(
             matches!(lock.state, State::W { token } if token == self.token),
             "the holder finished over the state {:?}, not its own W",
             lock.state
         );
-        lock.state = state;
-        self.sc.condvar.notify_all();
+        lock.set(state);
+        self.sc.notify(&mut lock);
         self.done = true;
         lock
     }
@@ -103,8 +94,8 @@ impl Drop for HolderGuard<'_> {
         }
         let mut lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
         if matches!(lock.state, State::W { token } if token == self.token) {
-            lock.state = State::N;
-            self.sc.condvar.notify_all();
+            lock.set(State::N);
+            self.sc.notify(&mut lock);
         }
     }
 }

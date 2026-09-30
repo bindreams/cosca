@@ -54,6 +54,8 @@ thread_local! {
     static FORCED_PEEK: RefCell<Option<io::Result<Peek>>> = const { RefCell::new(None) };
     static FORCED_REAP: Cell<Option<ForcedReap>> = const { Cell::new(None) };
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
+    #[cfg(target_os = "linux")]
+    static FORCED_VISIBLE_NONE: Cell<bool> = const { Cell::new(false) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
     static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
     static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
@@ -98,6 +100,19 @@ pub(crate) fn force_consuming_record_once(si_code: i32) -> Forced {
 
 pub(crate) fn take_forced_si_code() -> Option<i32> {
     FORCED_SI_CODE.with(Cell::take)
+}
+
+/// The next blocking `waitid` in `wait_visible_exit` on this thread finds no record, which the
+/// kernel never answers.
+#[cfg(target_os = "linux")]
+pub(crate) fn force_visible_none_once() -> Forced {
+    FORCED_VISIBLE_NONE.with(|f| f.set(true));
+    Forced(|| FORCED_VISIBLE_NONE.with(|f| f.set(false)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn take_forced_visible_none() -> bool {
+    FORCED_VISIBLE_NONE.with(Cell::take)
 }
 
 /// Record that the holder is about to take `step`, and run the hook registered for it, if any.
