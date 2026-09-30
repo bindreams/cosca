@@ -136,6 +136,8 @@ pub(crate) mod std_wait_seam {
 /// process, macOS surfaces the permission failure as `Err` whereas Windows cannot open the
 /// handle and reports `Ok(true)` (matching [`ProcessId::is_alive`]'s open-failure convention).
 pub(crate) fn block_until_exit(id: ProcessId, timeout: Option<Duration>) -> Result<bool, Error> {
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("waiting for a process to exit");
     #[cfg(test)]
     if fault::take_force_watch_error() {
         return Err(fault::forced_watch_error());

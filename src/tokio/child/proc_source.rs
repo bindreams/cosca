@@ -26,6 +26,15 @@ pub(crate) enum ProcSource {
     Raw(crate::tokio::spawn::windows_raw::RawAsyncChild),
 }
 
+/// Counts the backend's drop, which drops tokio's `Child` with it, for the tests that pin the
+/// hand-off to tokio's orphan queue (`fault::count_backend_drops`).
+#[cfg(test)]
+impl Drop for ProcSource {
+    fn drop(&mut self) {
+        super::fault::note_backend_drop();
+    }
+}
+
 impl ProcSource {
     /// Take tokio's own stdin stream (the Raw backend serves its piped std ends via `owned_std`,
     /// so it has none here).
@@ -103,15 +112,12 @@ impl ProcSource {
     /// caller's own successful kill is what bounds the wait.
     /// **Invariant:** no `wait()` future for this child is in flight when this runs.
     ///
-    /// `done_ok` is `false` for every caller: both reach here only past an
-    /// [`is_reaped`](ProcSource::is_reaped) check or on a child that was never awaited, so an
-    /// already-reaped one is a broken precondition, not a case to return quietly from — the shape
-    /// this entry exists to remove.
+    /// The caller's child was never awaited, so an already-reaped one is a broken precondition,
+    /// asserted in debug.
+    #[cfg(unix)]
     pub(crate) fn wait_and_reap(&mut self, pid: u32) {
         match self {
-            ProcSource::Tokio(c) => super::wait_and_reap(c, pid, false),
-            #[cfg(windows)]
-            ProcSource::Raw(r) => r.wait_and_reap(),
+            ProcSource::Tokio(c) => super::wait_and_reap(c, pid),
         }
     }
 

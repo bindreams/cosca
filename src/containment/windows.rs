@@ -776,6 +776,8 @@ impl JobHandle {
         deadline: Option<Option<std::time::Instant>>,
         cancel: Option<HANDLE>,
     ) -> Result<crate::containment::TreeDrain, crate::error::Error> {
+        #[cfg(feature = "tokio")]
+        crate::bounded::assert_may_block("waiting for a job to drain");
         // Duplicate under the lock, then wait on the duplicate. The wait can block for the
         // whole deadline, and holding the lock for that long would stall `hard_kill`/`Drop`
         // (and, with an unbounded deadline, forever). The duplicate is an independent
@@ -857,6 +859,8 @@ pub(crate) fn wait_drained_raw(
     use crate::containment::TreeDrain;
     use crate::error::Error;
 
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("waiting for a job to drain");
     let budget = MAXIMUM_WAIT_OBJECTS - 1 - if cancel.is_some() { 1 } else { 0 };
     loop {
         // Cancellation is checked BEFORE any work this round, including the very first — a

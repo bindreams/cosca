@@ -42,7 +42,7 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
     sock.write_all(b"g").expect("release the fixture");
     sock.flush().expect("flush the release byte");
 
-    super::wait_and_reap(&mut child, pid, true);
+    super::wait_and_reap(&mut child, pid);
 
     // No poll loop and no retry: `try_wait` is called exactly once, immediately. It can only
     // report an exit if `wait_and_reap` already blocked until the child had one.
@@ -72,9 +72,7 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
     .expect("spawn")
 }
 
-// `done_ok` is the whole diagnostic: an already-reaped child is legal for `Drop` (the user may
-// have `wait()`ed) and a broken precondition for a caller whose child was never awaited. Both
-// arms are pinned, so neither loosening the assert nor hard-firing it survives.
+// An already-reaped child is a broken precondition: every caller's child was never awaited.
 //
 // Debug-only oracle, `kinfo_tests`' calm-release shape: `debug_assert!` is compiled out in the
 // release lane, where the same straight-line code returns instead — which the post-call assert
@@ -88,22 +86,13 @@ async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited(
     let mut child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
     child.wait().await.expect("wait");
-    super::wait_and_reap(&mut child, pid, false);
+    super::wait_and_reap(&mut child, pid);
     // Only reachable in release (debug panicked above, as expected):
     assert!(child.id().is_none(), "the child was reaped by the wait() above");
 }
 
-#[tokio::test]
-async fn wait_and_reap_accepts_an_already_reaped_child_the_caller_may_have_awaited() {
-    let mut child = spawn_a_tokio_child_that_exits();
-    let pid = child.id().expect("tokio owns an un-reaped child");
-    child.wait().await.expect("wait");
-    super::wait_and_reap(&mut child, pid, true); // `Drop`'s disposition: legal, returns quietly
-}
-
-// The value the elevated-spawn cleanup path passes. That child is killed and reaped without ever
-// being awaited, so an already-reaped one means the precondition broke — passing `done_ok = true`
-// here would swallow it silently, the same shape this entry exists to remove from that path.
+// The elevated-spawn cleanup path. That child is killed and reaped without ever being awaited, so
+// an already-reaped one means the precondition broke, and must not be swallowed silently.
 //
 // `#[cfg(unix)]` with the entry itself: the Windows elevation arm has no deferred password.
 #[cfg(unix)]
@@ -144,7 +133,7 @@ async fn wait_and_reap_warns_and_returns_when_waitid_fails() {
     assert!(child.id().is_some(), "tokio owns an un-reaped child");
     let not_our_child = i32::MAX as u32;
 
-    super::wait_and_reap(&mut child, not_our_child, true);
+    super::wait_and_reap(&mut child, not_our_child);
 
     assert_eq!(
         crate::log_capture::levels_since(mark, &format!("waitid on pid {not_our_child} failed")),
@@ -163,7 +152,7 @@ async fn wait_and_reap_records_no_reap_when_waitid_fails() {
     // Not `i32::MAX`: the warn-test above counts that pid's log line.
     let not_our_child = i32::MAX as u32 - 1;
 
-    super::wait_and_reap(&mut child, not_our_child, true);
+    super::wait_and_reap(&mut child, not_our_child);
 
     assert_eq!(reaps.recorded(), vec![], "a failed waitid must record no reap");
     child.wait().await.expect("reap the real child");

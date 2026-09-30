@@ -1,33 +1,5 @@
 //! cgroup v2 helpers for the Linux cgroup lane.
 
-/// Fail a lane test run outside the lane. It is `#[ignore]`d, so reaching this means it was
-/// requested explicitly, and an unset `COSCA_TEST_CGROUP` is a misconfigured invocation.
-pub fn require_lane() {
-    assert!(
-        std::env::var_os("COSCA_TEST_CGROUP").is_some(),
-        "this #[ignore]d test was requested explicitly, but COSCA_TEST_CGROUP is unset: run it \
-         in a delegated cgroup with COSCA_TEST_CGROUP=1"
-    );
-}
-
-/// Whether the cgroup drop group runs: `COSCA_TEST_CGROUP_DROP=0` turns it off (the caller returns
-/// early), and otherwise it needs `COSCA_TEST_CGROUP_DROP_CONSENT=1` and panics without. The cgroup
-/// lane gives consent; every other lane turns the group off. Mirrors the crate's own
-/// `test_support::require_group`, which an integration test cannot reach.
-pub fn require_drop_group() -> bool {
-    if std::env::var("COSCA_TEST_CGROUP_DROP").as_deref() == Ok("0") {
-        return false;
-    }
-    assert_eq!(
-        std::env::var("COSCA_TEST_CGROUP_DROP_CONSENT").as_deref(),
-        Ok("1"),
-        "CGROUP_DROP tests need a delegated cgroup and run only in a sandbox; set \
-         COSCA_TEST_CGROUP_DROP_CONSENT=1 there to consent, or COSCA_TEST_CGROUP_DROP=0 to turn the \
-         group off"
-    );
-    true
-}
-
 /// The cgroup v2 leaf `pid` is in, as an absolute path. Mirrors the join
 /// `containment::cgroup` makes for itself: `/proc/<pid>/cgroup`'s `0::` line is relative to
 /// this process's cgroup namespace, whose root is `/sys/fs/cgroup`.
@@ -51,7 +23,7 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
 /// first read: `cgroup.events` changing, and the leaf's removal (`IN_DELETE` on its parent). The
 /// second matters because removing a cgroup can cancel the `populated` notification the kernel
 /// postponed (see cosca's `DrainWatch`), and the handle's own `Drop` may remove the leaf
-/// concurrently: the async handle drops it on a reaper thread. `ENOENT` or `ENODEV` from any step
+/// concurrently: an async drop may remove a drained leaf. `ENOENT` or `ENODEV` from any step
 /// means it is gone, which is the goal.
 pub fn drain_and_remove_leaf(leaf: &std::path::Path) {
     wait_drained(leaf);

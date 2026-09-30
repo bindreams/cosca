@@ -430,6 +430,10 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive; a
     // real sweep now (the seam is consumed) kills it.
     child.kill_tree().expect("cleanup sweep");
+    // Drain and remove the leaf here: the drop is not under test, and would leave a `cosca-*` leaf.
+    if drainable {
+        child.wait_tree().await.expect("the swept tree drains");
+    }
 }
 
 // Async twin of `windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure` — see

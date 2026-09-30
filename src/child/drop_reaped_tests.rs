@@ -435,13 +435,13 @@ fn assert_skipped_at_debug(mark: usize) {
 }
 
 /// A cgroup names its tree without the root's number, so the reaped root does not stop the drop's
-/// kill. Needs a delegated cgroup, so it belongs to the cgroup lane: `COSCA_TEST_CGROUP_DROP` is
-/// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_DROP_CONSENT=1`.
+/// kill. Needs a delegated cgroup, so it belongs to the cgroup lane: `COSCA_TEST_CGROUP` is
+/// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_CONSENT=1`.
 /// Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
-    if !crate::test_support::require_group("CGROUP_DROP") {
+    if !crate::test_support::require_group("CGROUP") {
         return;
     }
     crate::log_capture::install();

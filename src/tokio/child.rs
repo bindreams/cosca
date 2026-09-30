@@ -8,9 +8,6 @@ mod graceful;
 mod proc_source;
 pub(crate) use proc_source::ProcSource;
 
-#[path = "child/reaper.rs"]
-pub(super) mod reaper;
-
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
@@ -35,17 +32,15 @@ pub(super) type FdPipes = BTreeMap<Fd, super::stdio::OwnedStd>;
 const PROC_TAKEN: &str = "the async child's process backend is taken only by Drop";
 
 /// Every field of a [`Child`] that owns an OS resource, **declared in the order they must be
-/// released**: the backend first, so the pid stays pinned for the whole wait and each other
-/// release is ordered after the reap.
+/// released**: the backend first, then the containment resource.
 ///
-/// This grouping is the parity contract with [`reaper::ReapJob`], which carries one of these
-/// verbatim: `Drop` hands the whole group over, so a resource-owning field added here travels to
-/// the reaper — and is released in the right order — with no other edit. Adding one directly to
-/// `Child` instead would silently keep its release on the dropping thread.
+/// [`release_without_waiting`](OsResources::release_without_waiting) is the one place `Drop`
+/// gives them up. Adding a resource-owning field here without releasing it there would silently
+/// change when it is released.
 #[derive(Debug, Default)]
 pub(crate) struct OsResources {
-    /// `Option` so `Drop` can move the backend into the reaper job; nothing else takes it.
-    /// Read it through [`proc_mut`](OsResources::proc_mut), never directly.
+    /// `Option` so the release can drop the backend before the containment resource; nothing else
+    /// takes it. Read it through [`proc_mut`](OsResources::proc_mut), never directly.
     pub(crate) proc: Option<ProcSource>,
     pub(crate) attached: Attached,
     /// Parent ends of fd >= 3 pipes, read by [`fd_read_end`](Child::fd_read_end) /
@@ -59,10 +54,24 @@ pub(crate) struct OsResources {
 }
 
 impl OsResources {
-    /// The process backend. The single `expect` site: `Drop` is the only thing that empties this,
-    /// and it is the last reader.
+    /// The process backend. The single `expect` site: only the release empties this, and it is
+    /// the last reader.
     pub(crate) fn proc_mut(&mut self) -> &mut ProcSource {
         self.proc.as_mut().expect(PROC_TAKEN)
+    }
+
+    /// Give up every resource, in declaration order, without waiting for anything.
+    ///
+    /// The backend goes first. tokio's `Child` drops normally, never through `mem::forget`: it
+    /// tries a reap once and queues a still-running child on tokio's orphan queue, tokio's state
+    /// and not cosca's (principle 3). The Windows raw backend closes its handle. The containment
+    /// resource follows through [`Attached::release_without_waiting`], bounded on every
+    /// mechanism. The pipes and merge targets close last.
+    pub(crate) fn release_without_waiting(mut self) {
+        #[cfg(test)]
+        fault::note_release();
+        drop(self.proc.take());
+        std::mem::take(&mut self.attached).release_without_waiting();
     }
 }
 
@@ -129,6 +138,18 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
         self.os.attached.hard_kill_marking(&self.tree_killed)
+    }
+
+    /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
+    /// first `rmdir`. For a path that may block, such as a failed spawn: never `Drop`, never an
+    /// `async fn`. Nothing else leaves work on the drain, so any other mechanism returns at once.
+    #[cfg(unix)]
+    pub(super) fn block_until_members_drained(&self) -> Result<(), Error> {
+        #[cfg(target_os = "linux")]
+        if matches!(self.os.attached, crate::containment::Attached::Cgroup(_)) {
+            return self.os.attached.wait_drained(None).map(drop);
+        }
+        Ok(())
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -440,6 +461,10 @@ impl Child {
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
+        #[cfg(test)]
+        if fault::take_force_kill_failure() {
+            return Err(fault::forced_kill_failure());
+        }
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
         match self.proc_mut().start_kill() {
@@ -474,6 +499,9 @@ impl Child {
     /// classified, never signaled, and the group can report cleared regardless. No fix
     /// exists within this mechanism: the pid is never learned, and `killpg`'s own return
     /// value is not trustworthy evidence either.
+    ///
+    /// **Kernel requirement.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree): the
+    /// `cgroup.kill` fork-race fix, see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
@@ -655,19 +683,12 @@ impl Child {
 
 impl Child {
     /// Leave the child (and its contained tree) running after this handle drops. The drop then
-    /// never kills the tree itself — though if [`kill_tree`](Self::kill_tree) already returned
-    /// `Ok` on this handle, its `Drop` still waits for that kill's drain before giving up the
-    /// leaf. A `kill_tree()` that returned `Err` leaves nothing to wait for.
+    /// never signals the tree or the root, except that a leaf this handle already killed through
+    /// [`kill_tree`](Self::kill_tree) has its `cgroup.kill` written once more by the release.
     ///
-    /// **That wait never blocks the dropping thread.** A disarmed handle skips the root-kill this
-    /// method's sibling paragraph on [`Drop`](#impl-Drop-for-Child) describes, but a drain this
-    /// handle's own prior `kill_tree()` started is routed through the same reaper-pool handoff:
-    /// the drop hands the leaf to a reaper thread and returns at once, exactly like the armed
-    /// path. The one exception is a root already reaped by the time `drop` runs, which releases
-    /// inline — nothing left to wait for. This is the async handle's own behaviour; the sync
-    /// [`Child`](crate::Child) has no reaper pool to hand off to and always blocks the caller's
-    /// thread for this same wait. Call [`wait_tree`](Self::wait_tree) before dropping if the
-    /// caller needs to observe the drain itself rather than merely not block on it.
+    /// Dropping never waits: a leaf this handle killed and that has not drained is left behind
+    /// with a warning, and one nothing killed is left at `debug`, since the caller asked for that.
+    /// Call [`wait_tree`](Self::wait_tree) before dropping to observe the drain.
     pub fn detach(&mut self) {
         self.kill_on_drop = false;
         self.os.attached.disarm();
@@ -765,189 +786,144 @@ impl Child {
     }
 }
 
-/// Signals the tree and the root and does NOT wait: the child is not necessarily gone when
-/// `drop` returns, and neither is it necessarily reaped. A caller that must observe the teardown
-/// calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then awaits
-/// [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree).
+/// Signals the tree and the root (unless opted out) and does NOT wait: the child is not
+/// necessarily gone when `drop` returns, and neither is it necessarily reaped. A caller that must
+/// observe the teardown calls [`kill`](Child::kill)/[`kill_tree`](Child::kill_tree) and then
+/// awaits [`wait`](Child::wait)/[`wait_tree`](Child::wait_tree). This handle's `Drop` does
+/// bounded work only: at most two `cgroup.kill` writes and two `rmdir`s of the leaf (the release
+/// re-fires the kill and retries once, when the first `rmdir` finds the leaf populated), and one
+/// sweep of the leaf's empty child cgroups. It starts no thread and keeps no state.
 ///
-/// The reap — and, for a `Cgroup`-contained tree, the leaf's own drain wait — is handed to a
-/// small fixed pool of reaper threads (currently two) that starts on the first kill-on-drop drop
-/// and persists for the process's life. A disarmed but already-killed handle (see
-/// [`detach`](Child::detach)) hands its leaf's drain wait to the same pool, for the same reason:
-/// so that wait, too, never runs on whichever thread called `drop`.
+/// With `kill_on_drop` set (the default), it hard-kills the contained tree, then kills the root.
+/// With it clear ([`detach`](Child::detach), or `kill_on_drop(false)`), it signals nothing of its
+/// own. One exception: a leaf this handle already killed through
+/// [`kill_tree`](Child::kill_tree) is released like an armed one.
 ///
-/// **Exactly two things make this handle's `Drop` block the calling thread instead:**
-/// - **The root is already reaped when `drop` runs.** Nothing is submitted — there is no reap
-///   left to move off this thread — and the resources release right here, in place. For a
-///   `Cgroup` leaf this still runs that leaf's own (synchronous) `Drop`, which blocks on the
-///   drain if this handle's kill already fired and the tree has not yet cleared; this is the
-///   same wait the cgroup leaf's own (private, internal) `Drop` documents, not one this type
-///   adds.
-/// - **The reaper pool cannot start at all** (thread exhaustion on the very first kill-on-drop
-///   drop of the process). This is loud (an `error` log) and degrades to releasing the job in
-///   hand right here rather than queuing it — which, for a `Cgroup` leaf, blocks on that same
-///   drain for the same reason as above. Each further drop while the pool stays unstarted costs
-///   at most that many failing spawn syscalls before retrying.
+/// Then it releases what the handle owns:
 ///
-/// Neither exception is specific to the disarmed-but-killed path added above: both apply equally
-/// to the ordinary kill-on-drop reap. Outside them, this handle's `Drop` never blocks.
+/// - **The root.** tokio's own `Child` is dropped normally. It tries one reap, and a root that has
+///   not exited yet goes to tokio's orphan queue, which reaps it once a runtime next sees
+///   `SIGCHLD`. That queue is tokio's, not cosca's, and it is best-effort: it drains only while
+///   some runtime runs. On Windows the process handle is closed.
+/// - **The containment resource.** A `Cgroup` leaf is removed if it has drained. A leaf that has
+///   not drained is **left behind**, and a warning names it, if this handle killed it or was
+///   armed to. Nothing waits for the drain: `cgroup.kill` is asynchronous, and a member stuck in
+///   uninterruptible I/O outlives it. Call [`wait_tree`](Child::wait_tree) first to have the leaf
+///   removed. A Job Object is terminated by the drop's tree kill and its handle closed there
+///   (`TerminateJobObject`, then `CloseHandle`); one opted out of teardown is closed with
+///   `KILL_ON_JOB_CLOSE` cleared, and nothing kills it. Other mechanisms drop in place.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop).
+/// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
+/// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
+/// number.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
-/// **A process that forks after this pool has started, and then keeps running Rust code in the
-/// child, loses the reap silently in that child.** `fork` duplicates only the calling thread, so
-/// the child inherits the pool's job queue with none of its workers; sends into it still succeed
-/// (the receiver handles exist in the copied address space), so nothing errors and nothing is
-/// logged, and every child handle dropped there queues forever, pinning its process handle,
-/// containment resource and stdio for the life of that process. It affects daemonizing and
-/// pre-fork worker models. It does **not** affect ordinary subprocess spawning — `fork`+`exec`
-/// and `posix_spawn` replace the child image immediately — nor Windows, which has no `fork`.
+/// **A process that forks and then keeps running Rust code in the child inherits tokio's orphan
+/// queue without the runtime that would drain it.** A dropped, still-running root that lands on
+/// the queue in such a child is never reaped there ([tokio#4301]). cosca keeps no pool of its
+/// own for a fork to break, so nothing else is lost. It does **not** affect ordinary subprocess
+/// spawning: `fork`+`exec` and `posix_spawn` replace the child image at once. Nor Windows, which
+/// has no `fork`.
 ///
-/// Until it is fixed, a forking consumer should either fork before its first kill-on-drop drop,
-/// or `kill` and `await` [`wait`](Child::wait) explicitly in the forked child rather than relying
-/// on `Drop`. The sync [`Child`](crate::Child) is unaffected: it reaps on the dropping thread.
+/// A forking consumer should `kill` and `await` [`wait`](Child::wait) explicitly in the forked
+/// child rather than rely on `Drop`. The sync [`Child`](crate::Child) is unaffected: it reaps on
+/// the dropping thread.
 ///
-/// That divergence from the sync `Child`, which still blocks, is otherwise deliberate.
+/// [tokio#4301]: https://github.com/tokio-rs/tokio/issues/4301
 impl Drop for Child {
     fn drop(&mut self) {
-        // The opt-out/`detach()` contract: nothing is signalled here. The leaf's own `Drop` still
-        // reports a leaf a still-running tree occupies, at `debug` — but for one this handle
-        // already killed through `kill_tree()`/`hard_kill()`, it waits for that kill's drain and
-        // retries the `rmdir` first, reporting at `warn` only if that retry still fails.
-        if !self.kill_on_drop {
-            // That wait can block: route it through the same reaper handoff the armed path below
-            // uses, so it never runs on whichever thread called `drop` (a runtime worker,
-            // routinely). Every other disarmed leaf — never killed, or a mechanism whose drop
-            // cannot block at all — has nothing to route and returns immediately below.
-            if self.os.attached.disarmed_kill_may_block_drop() {
-                #[cfg(test)]
-                let probe = reaper::test_probe::take();
-                #[cfg(test)]
-                if let Some(p) = probe.as_ref() {
-                    _ = p.entered.send(std::thread::current().id());
-                }
-                let pid = self.id.pid();
-                let mut os = std::mem::take(&mut self.os);
-                // Already reaped: `wait_and_reap`'s precondition (a wait bounded by a signal this
-                // handle knows was sent) does not hold as cheaply here — nothing left to wait for,
-                // so release inline, exactly as the armed path does just below.
-                if os.proc_mut().is_reaped() {
-                    return;
-                }
-                reaper::submit(reaper::ReapJob {
-                    os,
-                    pid,
-                    #[cfg(test)]
-                    origin: std::thread::current().id(),
-                    #[cfg(test)]
-                    probe,
-                    #[cfg(test)]
-                    force_panic: false,
-                    #[cfg(test)]
-                    force_release_panic: false,
-                    #[cfg(test)]
-                    force_glue_panic: false,
-                });
-            }
-            return;
-        }
-        #[cfg(test)]
-        let probe = reaper::test_probe::take();
-        #[cfg(test)]
-        if let Some(p) = probe.as_ref() {
-            _ = p.entered.send(std::thread::current().id());
-        }
-        // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches
-        // only the root); a no-op for an uncontained child.
-        //
-        // MUST stay on the dropping thread, before the handle is dismembered: on Windows a job
-        // object's kill is the only signal reaching a nested descendant that leads its own console
-        // group (console control events stop at that boundary). On Unix this and `terminate_tree`
-        // have the same radius. The contract either way: the tree is signalled before `drop`
-        // returns.
-        //
-        // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
-        // this handle's own state, or the number no longer reading as this root (tokio's state
-        // cannot see a foreign reap until it is polled). Accepted gaps: a foreign reap landing
-        // after this read, and tokio's orphan queue reaping by number afterwards. Read before the
-        // handle is dismembered below.
+        // Enforced in debug builds: nothing below may wait for an exit or a drain. Declared before
+        // `os`, so a panic in the signals unwinds through the resources while still inside it.
+        let _bounded = crate::bounded::Section::enter();
+        let mut os = std::mem::take(&mut self.os);
+        // Read before the `kill_on_drop` branch: a disarmed drop signals nothing, but releasing
+        // tokio's `Child` still `try_wait`s the root's number, so it needs the same evidence.
         #[cfg(unix)]
-        let own_reap = self.os.proc_mut().is_reaped();
+        let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         #[cfg(unix)]
         let view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-        #[cfg(unix)]
-        let tree = self.os.attached.hard_kill_for_drop(view);
-        #[cfg(not(unix))]
-        let tree = self.os.attached.hard_kill();
-        if let Err(e) = &tree {
-            // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
-            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
-            if self.os.attached.hard_kill_refused_to_walk(&tree) {
-                // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-                log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
-            }
+        if self.kill_on_drop {
+            #[cfg(unix)]
+            signal_on_drop(self.id, view, &mut os);
+            #[cfg(not(unix))]
+            signal_on_drop(self.id, &self.tree_killed, &mut os);
         }
-        _ = tree;
+        // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
+        // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
+        #[cfg(unix)]
+        if view.root_reaped && !own_reap {
+            forget_reaped_elsewhere(&mut os, self.id.pid());
+        }
+        os.release_without_waiting();
+    }
+}
 
-        let pid = self.id.pid();
-        // The WHOLE resource group moves, so a field added to `OsResources` is carried here
-        // without touching this function. On every early return below it drops in group order,
-        // on this thread — exactly where it dropped before the reap moved off it.
-        let mut os = std::mem::take(&mut self.os);
-        // Already reaped: no signal to issue and no exit to wait for. tokio's own state says so, or
-        // only the root's number does (a reap outside this handle): then the number may name
-        // another child, so tokio's `Child` must not run its own drop, which reaps by pid.
-        #[cfg(unix)]
-        if view.root_reaped {
-            if !own_reap {
-                forget_reaped_elsewhere(&mut os, pid);
-            }
-            return;
+/// The signals of a kill-on-drop drop: the tree, then the root.
+fn signal_on_drop(
+    id: ProcessId,
+    #[cfg(unix)] view: crate::containment::DropView,
+    #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
+    os: &mut OsResources,
+) {
+    let pid = id.pid();
+    // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
+    // the root); a no-op for an uncontained child.
+    //
+    // MUST come before the handle is dismembered: on Windows a job object's kill is the only
+    // signal reaching a nested descendant that leads its own console group (console control
+    // events stop at that boundary). On Unix this and `terminate_tree` have the same radius. The
+    // contract either way: the tree is signalled before `drop` returns.
+    //
+    // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
+    // this handle's own state, or the number no longer reading as this root (tokio's state cannot
+    // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
+    // was read, and tokio's orphan queue reaping by number afterwards.
+    #[cfg(unix)]
+    let tree = os.attached.hard_kill_for_drop(view);
+    #[cfg(not(unix))]
+    let tree = {
+        _ = tree_killed;
+        os.attached.hard_kill()
+    };
+    if let Err(e) = &tree {
+        // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
+        log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        if os.attached.hard_kill_refused_to_walk(&tree) {
+            // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+            log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
         }
-        #[cfg(not(unix))]
-        if os.proc_mut().is_reaped() {
-            return;
-        }
-        #[cfg(all(test, unix))]
-        drop_fault::note_root_kill();
-        // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
-        // higher-integrity elevated child), and asserting would panic inside a destructor.
-        //
-        // The test seam REPLACES the kill rather than masking its result — a masked kill would
-        // still have signalled the child, and the branch below is about one that was not.
-        #[cfg(test)]
-        let killed = if reaper::fault::take_force_kill_failure() {
-            Err(Error::Io(std::io::Error::other("forced kill failure (test seam)")))
-        } else {
-            os.proc_mut().start_kill()
-        };
-        #[cfg(not(test))]
-        let killed = os.proc_mut().start_kill();
-        if killed.is_err() {
-            if !matches!(os.proc_mut().try_wait(), Ok(Some(_))) {
-                log::warn!("async child {pid} could not be terminated on drop; leaving it running");
-            }
-            // An unsignalled child is never submitted: its wait is unbounded, and a worker parked
-            // on it would never come back. Its resources release with this handle instead.
-            return;
-        }
-        reaper::submit(reaper::ReapJob {
-            os,
-            pid,
-            #[cfg(test)]
-            origin: std::thread::current().id(),
-            #[cfg(test)]
-            probe,
-            #[cfg(test)]
-            force_panic: false,
-            #[cfg(test)]
-            force_release_panic: false,
-            #[cfg(test)]
-            force_glue_panic: false,
-        });
+    }
+    // Already reaped: no signal to issue.
+    #[cfg(unix)]
+    if view.root_reaped {
+        return;
+    }
+    #[cfg(not(unix))]
+    if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
+        return;
+    }
+    let Some(proc) = os.proc.as_mut() else {
+        return;
+    };
+    #[cfg(all(test, unix))]
+    drop_fault::note_root_kill();
+    // No `debug_assert` here: a failed kill is a designed outcome the branch below serves (a
+    // higher-integrity elevated child), and asserting would panic inside a destructor.
+    //
+    // The test seam REPLACES the kill rather than masking its result — a masked kill would still
+    // have signalled the child, and the branch below is about one that was not.
+    #[cfg(test)]
+    let killed = if fault::take_force_kill_failure() {
+        Err(fault::forced_kill_failure())
+    } else {
+        proc.start_kill()
+    };
+    #[cfg(not(test))]
+    let killed = proc.start_kill();
+    if killed.is_err() && !matches!(proc.try_wait(), Ok(Some(_))) {
+        log::warn!("async child {pid} could not be terminated on drop; leaving it running");
     }
 }
 
@@ -957,21 +933,23 @@ impl Drop for Child {
 /// registration, or the `SIGCHLD` watch. This is a foreign reap, so it is logged at `debug`.
 #[cfg(unix)]
 fn forget_reaped_elsewhere(os: &mut OsResources, pid: u32) {
-    if let Some(ProcSource::Tokio(mut child)) = os.proc.take() {
+    if let Some(mut proc) = os.proc.take() {
+        let ProcSource::Tokio(child) = &mut proc;
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
         log::debug!("async child {pid} was reaped outside its handle; dropping it would reap by that number, so it is forgotten");
         #[cfg(test)]
         drop_fault::note_forget();
-        std::mem::forget(child);
+        std::mem::forget(proc);
     }
 }
 
-/// Guaranteed synchronous teardown for `Drop`: kill the child, then block until it has exited.
+/// Synchronous teardown for a spawn that failed: kill the child, then block until it has exited.
 /// The kill here is what bounds the wait, so a caller that has ALREADY killed must use
 /// [`wait_and_reap`] instead — re-killing would make its reap conditional on a second kill that
 /// can be refused.
 /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
+pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32) {
+    crate::bounded::assert_may_block("reap_now");
     // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
     // whose argument is stripped in release). A no-op on an already-exited child.
     #[cfg(test)]
@@ -996,7 +974,7 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
         );
         return;
     }
-    wait_and_reap(child, pid, done_ok);
+    wait_and_reap(child, pid);
 }
 
 /// The wait-then-reap half of [`reap_now`], with **no kill of its own**: the caller's own
@@ -1006,16 +984,17 @@ pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32, done_ok: b
 /// zombie synchronously in its drop (its `try_wait` returns `Ok(Some)`, not a park-dependent
 /// orphan enqueue) — a guaranteed reap before the handle is gone. We only wait while tokio still
 /// owns the child (`id().is_some()`), which pins the pid; once tokio is `Done` (a prior `wait()`
-/// reaped it), the pid may be recycled and we must not wait on it. `done_ok` says whether an
-/// already-`Done` child is legal here: `true` for `Drop` (the user may have `wait()`ed), `false`
-/// for a caller whose child was never awaited.
+/// reaped it), the pid may be recycled and we must not wait on it. A `Done` child is a broken
+/// precondition, asserted in debug: every caller's child was never awaited.
 /// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32, done_ok: bool) {
-    // tokio `Done` ⇒ already reaped, pid possibly recycled ⇒ nothing to do (the recycled-pid wait
-    // hazard the sync side avoids by holding a handle).
+pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32) {
+    crate::bounded::assert_may_block("wait_and_reap");
+    // tokio `Done` ⇒ already reaped, pid possibly recycled ⇒ nothing to wait on (the recycled-pid
+    // wait hazard the sync side avoids by holding a handle). No caller can hold such a child: each
+    // reaches here with a child it never awaited.
     if child.id().is_none() {
         debug_assert!(
-            done_ok,
+            false,
             "wait_and_reap found an already-reaped child where one was impossible"
         );
         return;
@@ -1090,4 +1069,102 @@ fn exit_status_from_parts(si_code: libc::c_int, si_status: libc::c_int) -> std::
         _ => si_status, // CLD_KILLED: the signal number
     };
     std::process::ExitStatus::from_raw(raw)
+}
+
+/// Test seams for the drop path. Thread-local and take-once: each read consumes the flag, and the
+/// guard clears whatever is left.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    use crate::error::Error;
+
+    thread_local! {
+        static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static RELEASES: Cell<usize> = const { Cell::new(0) };
+        static BACKEND_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts the process backends ([`ProcSource`](super::ProcSource), so tokio's own `Child`
+    /// with it) dropped on THIS thread from now on. Starts at zero; zeroed again when dropped.
+    /// A backend that was forgotten, or moved to another thread, is not counted.
+    pub(crate) fn count_backend_drops() -> BackendDropCount {
+        BACKEND_DROPS.with(|d| d.set(0));
+        BackendDropCount(())
+    }
+
+    #[must_use = "the count is zeroed as soon as the guard is dropped"]
+    pub(crate) struct BackendDropCount(());
+
+    impl BackendDropCount {
+        pub(crate) fn get(&self) -> usize {
+            BACKEND_DROPS.with(Cell::get)
+        }
+    }
+
+    impl Drop for BackendDropCount {
+        fn drop(&mut self) {
+            BACKEND_DROPS.with(|d| d.set(0));
+        }
+    }
+
+    pub(super) fn note_backend_drop() {
+        BACKEND_DROPS.with(|d| d.set(d.get() + 1));
+    }
+
+    /// Counts the releases ([`OsResources::release_without_waiting`](super::OsResources)) that
+    /// run on THIS thread from now on. Starts at zero; zeroed again when dropped, so a count
+    /// cannot reach the next test on this thread.
+    pub(crate) fn count_releases() -> ReleaseCount {
+        RELEASES.with(|r| r.set(0));
+        ReleaseCount(())
+    }
+
+    #[must_use = "the count is zeroed as soon as the guard is dropped"]
+    pub(crate) struct ReleaseCount(());
+
+    impl ReleaseCount {
+        pub(crate) fn get(&self) -> usize {
+            RELEASES.with(Cell::get)
+        }
+    }
+
+    impl Drop for ReleaseCount {
+        fn drop(&mut self) {
+            RELEASES.with(|r| r.set(0));
+        }
+    }
+
+    pub(super) fn note_release() {
+        RELEASES.with(|r| r.set(r.get() + 1));
+    }
+
+    /// Makes the NEXT root kill on THIS thread report failure, from [`Child::kill`] (and so
+    /// `kill_tree`'s backstop) or from `Drop`. It REPLACES the kill rather than masking its
+    /// result, so the child really is left unsignalled. Take-once: a test that forces two kills
+    /// arms it twice.
+    ///
+    /// [`Child::kill`]: super::Child::kill
+    pub(crate) fn force_kill_failure() -> KillFailureGuard {
+        FORCE_KILL_FAILURE.with(|f| f.set(true));
+        KillFailureGuard(())
+    }
+
+    /// Clears the seam when dropped, so an unread arming cannot reach the next test on this thread.
+    #[must_use = "the seam is cleared as soon as the guard is dropped"]
+    pub(crate) struct KillFailureGuard(());
+
+    impl Drop for KillFailureGuard {
+        fn drop(&mut self) {
+            FORCE_KILL_FAILURE.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn take_force_kill_failure() -> bool {
+        FORCE_KILL_FAILURE.with(|f| f.replace(false))
+    }
+
+    pub(super) fn forced_kill_failure() -> Error {
+        Error::Io(std::io::Error::other("forced kill failure (test seam)"))
+    }
 }

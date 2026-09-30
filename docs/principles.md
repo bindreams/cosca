@@ -54,9 +54,10 @@ only avoid it or forget tokio's `Child` (below). The alternatives are a reaper c
 runtime parks ([tokio runtime/process.rs]), and until
 then the root stays a zombie.
 
-On evidence of a foreign reap at drop time, cosca instead takes the child's stdio out, forgets
-tokio's `Child`, and logs what the forget leaks as principle 7 says: on Linux the pidfd and its
-reactor registration ([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
+On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
+included), cosca instead takes the child's stdio out, forgets tokio's `Child`, and logs what the
+forget leaks as principle 7 says: on Linux the pidfd and its reactor registration
+([tokio unix/mod.rs]), otherwise the `SIGCHLD` watch. That leak is tracked in
 [#174] and open with the owner.
 
 tokio discards a PID that is already reaped: the queue drops it on `ECHILD` ([tokio orphan.rs]).
@@ -190,8 +191,10 @@ a skip.
 Today's gates take three shapes, none matching this: some are `#[ignore]`d and opted into with
 `--run-ignored` alone, with no `COSCA_TEST_*` variable at all (the Windows probes and canaries,
 `windows_process_cwd`, the elevation routes, and `dir_tests.rs`'s unshare test); some also assert
-an opt-in variable (`COSCA_TEST_CGROUP`, `COSCA_TEST_ELEVATION*`); and
-some return early instead (every `gated()` caller in `tests/elevation.rs`, and `leaf_tests.rs`).
+an opt-in variable (`COSCA_TEST_ELEVATION*`); and
+some return early instead (every `gated()` caller in `tests/elevation.rs`, and every
+`require_group` caller, in the library and in `tests/`, whose groups are `CGROUP`, `NAMESPACES` and
+`TRACER`).
 [#234] tracks the migration and is the authoritative inventory of what's left.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
@@ -224,10 +227,8 @@ copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the
 Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there. Its
 members are the tests whose names start with `setuid_` and the `group_teardown_setuid` binary, the
 same name-prefix convention as `namespaces_`; a new member takes the gate and that prefix. So does
-`COSCA_TEST_CGROUP_DROP` (the tests that a drop after a reap still kills a cgroup's tree, named
-`cgroup_*` so the cgroup lane selects them): CI turns it off workflow-wide and the cgroup step opts
-in. It is an interim group, because the legacy `COSCA_TEST_CGROUP` gate treats any value as on;
-[#234] folds it into a corrected `COSCA_TEST_CGROUP`. Some
+`COSCA_TEST_CGROUP` (the tests that need a delegated cgroup, whose names contain `cgroup` so the
+cgroup lane selects them): CI turns it off workflow-wide and the cgroup step opts in. Some
 system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
