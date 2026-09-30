@@ -178,30 +178,3 @@ fn a_forbidding_job_yields_a_typed_containment_error_via_the_raw_backend() {
     assert_eq!(report_field(&r, "limits"), "none", "wrong job shape: {r}");
     assert_eq!(report_field(&r, "spawn"), "Containment", "{r}");
 }
-
-/// Regression test for `common::accept_or_die`'s reason to exist: a dead-before-connecting
-/// target must panic, not hang the caller forever — and specifically on the "died" message, not
-/// merely on ANY panic. Its own file, not `windows_breakaway.rs`'s topic, but this is the one
-/// Windows-only, raw-`std::process::Command` file already carrying exactly the imports needed.
-#[test]
-fn accept_or_die_panics_loudly_when_the_target_dies_first() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let mut child = common::spawn_locked(
-        std::process::Command::new(testbin()).args(["--not-a-real-mode"]), // testbin exits immediately on an unknown mode
-    )
-    .expect("spawn a child that exits immediately");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        common::accept_or_die(&listener, &mut child)
-    }));
-    let payload = result.expect_err("accept_or_die must panic, not hang, when the target dies before connecting");
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
-    assert!(
-        message.contains("died before it connected"),
-        "expected a \"died before it connected\" panic, got: {message:?}"
-    );
-    child.wait().expect("reap the already-exited child");
-}

@@ -150,6 +150,13 @@ filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_t
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 [[profile.default.overrides]]
+# A hang backstop, not the proof: `linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited`
+# joins a watcher that waits for the leaf to drain. If `kill_tree` returns `Ok` without killing the
+# worker, the drain never comes and the join blocks forever; this bound turns that into a failure.
+filter = 'binary(spawn_io) & test(=linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited)'
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
+
+[[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
 # stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
 # detect that themselves; this bound only stops a hang from stalling the job. It covers the whole

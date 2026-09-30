@@ -69,7 +69,7 @@ pub use win::wait_handles;
 #[path = "accept/signalled.rs"]
 mod signalled;
 #[cfg(target_os = "linux")]
-pub use signalled::accept_or_signalled;
+pub use signalled::{accept_or_signalled, DrainSignal};
 
 /// A child process the caller owns and has not reaped.
 pub trait Target {
@@ -230,26 +230,36 @@ pub(crate) fn notify_armed() {
     }
 }
 
-/// Accepts `n` connections from a tree rooted at `target`, in arrival order (the tag, if any, is
-/// `on_accept`'s to read and demux). Every accept watches `target` through [`accept_or_die`].
+/// Accepts the two members of a tree, the root (`target`) and one grandchild, in arrival order.
+/// The root is watched throughout; `grandchild`, whose identity the caller captured while the
+/// root held it (see `report.rs`), is watched until it has connected. Either dying first fails
+/// the accept through [`accept_or_die_also`] instead of leaving it waiting on the live member.
 ///
-/// Every accepted socket is HELD (returned, never dropped) until all `n` have arrived: testbin's
+/// `on_accept` runs on each socket right after it is accepted, before the next accept, so a
+/// caller can read its tag inline. It returns `true` for the grandchild's socket, which ends the
+/// grandchild's watch (a connected grandchild is no longer expected to connect), and `false` for
+/// the root's.
+///
+/// Every accepted socket is HELD (returned, never dropped) until both have arrived: testbin's
 /// `control-*` modes exit when their socket closes, so a dropped member would make the watched
 /// root exit and be correctly reported. The same rule binds any caller doing its own accepts.
-///
-/// `on_accept` runs on each socket right after it is accepted, before the next accept, so a caller
-/// can demux by tag inline.
-pub fn accept_tree(
+pub fn accept_tree_also(
     listener: &TcpListener,
     target: &mut impl Target,
-    n: usize,
-    mut on_accept: impl FnMut(&mut TcpStream),
+    grandchild: ProcessId,
+    mut on_accept: impl FnMut(&mut TcpStream) -> bool,
 ) -> Vec<TcpStream> {
-    let mut socks: Vec<TcpStream> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut s = accept_or_die(listener, target);
-        on_accept(&mut s);
+    let mut socks: Vec<TcpStream> = Vec::with_capacity(2);
+    let mut grandchild_connected = false;
+    for _ in 0..2 {
+        let watch = (!grandchild_connected).then_some(grandchild);
+        let mut s = accept_or_die_also(listener, target, watch);
+        if on_accept(&mut s) {
+            assert!(!grandchild_connected, "two connections claimed to be the grandchild's");
+            grandchild_connected = true;
+        }
         socks.push(s);
     }
+    assert!(grandchild_connected, "neither accepted connection was the grandchild's");
     socks
 }

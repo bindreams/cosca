@@ -808,14 +808,17 @@ fn spawn_contained_tree() -> (cosca::Child, std::net::TcpStream) {
     // mechanism that can silently be a weaker one. Route the reason for that.
     #[cfg(unix)]
     stderr_log::install();
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn");
     // Accept both connections; keep the grandchild's (tag 'G'). Accepting it is
     // proof the grandchild is alive — no is_alive() race.
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
+        tag[0] == b'G'
     });
     let mut gc = None;
     for (tag, s) in tags.into_iter().zip(socks) {
@@ -866,12 +869,17 @@ fn spawn_contained_echo_tree(kill_on_drop: bool) -> EchoTree {
     // silently be a weaker one, so route the reason for that.
     #[cfg(unix)]
     stderr_log::install();
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn");
     // Accept order is not guaranteed, so demux by tag. Both connections being accepted is
     // itself proof both members are alive — no is_alive() race.
     let mut demux = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
-        demux.push(common::read_tag_and_pid(s));
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
+        let member = common::read_tag_and_pid(s);
+        let is_grandchild = member.0 == b'G';
+        demux.push(member);
+        is_grandchild
     });
     let (mut root, mut grand) = (None, None);
     for ((tag, pid), s) in demux.into_iter().zip(socks) {
@@ -1074,12 +1082,15 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain_with(cosca::ContainMode::Session);
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn session-contained tree");
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
+        tag[0] == b'G'
     });
     let mut gc = None;
     for (tag, s) in tags.into_iter().zip(socks) {
@@ -1174,12 +1185,15 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn tree-walk-contained tree");
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
+        tag[0] == b'G'
     });
     let mut gc = None;
     let mut root = None;
@@ -1274,6 +1288,8 @@ fn treewalk_kills_process_group_escapee() {
     cmd.executable(testbin())
         .args(["cosca_testbin", "spawn-grandchild-escapee", &addr]);
     cmd.contain_with(cosca::ContainMode::TreeWalk);
+    let (report, report_addr) = common::bind_report();
+    cmd.env(common::GC_PID_ADDR_ENV, &report_addr);
     let mut child = cmd.spawn().expect("spawn tree-walk escapee tree");
     let expected = if cfg!(target_os = "macos") {
         cosca::Containment::FdMarker
@@ -1283,10 +1299,11 @@ fn treewalk_kills_process_group_escapee() {
     assert_eq!(child.containment(), expected);
 
     let mut tags = Vec::new();
-    let socks = common::accept_tree(&listener, &mut child, 2, |s| {
+    let socks = common::accept_tree(&listener, &report, &mut child, |s| {
         let mut tag = [0u8; 1];
         s.read_exact(&mut tag).expect("read tag");
         tags.push(tag[0]);
+        tag[0] == b'G'
     });
     let mut gc = None;
     let mut root = None;
@@ -1627,11 +1644,10 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     // bounds the wait instead is the leaf draining: a watcher thread signals an eventfd when
     // `wait_tree` returns, and `accept_or_signalled` polls the listener and that eventfd. The
     // watcher never touches the listener.
-    let drained = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).expect("create the drain eventfd");
+    let drained = common::DrainSignal::new();
     let (leaf, mut worker) = std::thread::scope(|scope| {
         scope.spawn(|| {
-            let _ = child.wait_tree();
-            rustix::io::write(&drained, &1u64.to_ne_bytes()).expect("signal the drain");
+            drained.record(child.wait_tree());
         });
         // Whatever happens below, the tree must be killed before the scope joins the watcher, or a
         // failing assertion would leave the watcher (and so the scope) waiting on a live tree.
@@ -1691,11 +1707,13 @@ fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anythi
     cmd.executable("/bin/sh").args(["sh", "-c", "exit 0"]);
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
-    let drained = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).expect("create the drain eventfd");
+    // The other tests of this group assert the mechanism: without a cgroup the tree would be
+    // reported drained for the wrong reason, or `wait_tree` would be unsupported.
+    assert_eq!(child.containment(), cosca::Containment::CgroupV2);
+    let drained = common::DrainSignal::new();
     let result = std::thread::scope(|scope| {
         scope.spawn(|| {
-            let _ = child.wait_tree();
-            rustix::io::write(&drained, &1u64.to_ne_bytes()).expect("signal the drain");
+            drained.record(child.wait_tree());
         });
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             common::accept_or_signalled(&listener, &drained)
@@ -1703,7 +1721,7 @@ fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anythi
     });
     let message = common::panic_message(result.expect_err("a drained leaf with no connection must panic"));
     assert!(
-        message.contains("drained before anything connected"),
+        message.starts_with("the leaf drained (") && message.ends_with(") before anything connected"),
         "got: {message:?}"
     );
     let _ = child.wait();
