@@ -8,11 +8,11 @@ jobs:
         arch:
           - {runner: macos-15, target: x86_64-apple-darwin, tag: amd64}
           - {runner: macos-latest, target: aarch64-apple-darwin, tag: arm64}
-        variant: [fix, mutant]
+        variant: [exec-settled, exec-unsettled]
+        load: ["0", "2"]
         include:
-          - {variant: fix, load: "2", n: 8}
-          - {variant: mutant, load: "2", n: 4}
-    name: ${{ matrix.arch.tag }}-${{ matrix.variant }}
+          - {n: 8}
+    name: ${{ matrix.arch.tag }}-${{ matrix.variant }}-l${{ matrix.load }}
     runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 90
     env:
@@ -28,23 +28,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.137
-      - name: Mutate (skip the thread-settling check)
-        if: matrix.variant == 'mutant'
+      - name: Mutate
         run: |
           python3 - <<'PY'
           p='src/test_support/tracer/sys.rs'
           s=open(p).read()
-          a="        Ok(true) => Ok(Stop::Stopped(info.si_status)),"
-          assert a in s
-          s=s.replace("    match threads_blocked(pid) {","    if true { return Ok(Stop::Stopped(info.si_status)); }\n    match threads_blocked(pid) {")
+          s=s.replace("const ATTACH: libc::c_int = libc::PT_ATTACH;","const ATTACH: libc::c_int = libc::PT_ATTACHEXC;")
+          if "${{ matrix.variant }}" == "exec-unsettled":
+              s=s.replace("    match threads_blocked(pid) {","    if true { return Ok(Stop::Stopped(info.si_status)); }\n    match threads_blocked(pid) {")
           open(p,'w').write(s)
           PY
           git diff --stat
       - name: Loop
-        run: LOAD=${{ matrix.load }} STRESS=50 .github/scripts/hangloop.sh ${{ matrix.n }} "" 'test(/shared_tests::tracer::macos/)' 600
+        run: LOAD=$([ "${{ matrix.load }}" = 0 ] && echo "" || echo ${{ matrix.load }}) STRESS=50 .github/scripts/hangloop.sh ${{ matrix.n }} "" 'test(/shared_tests::tracer::macos/)' 600
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.arch.tag }}-${{ matrix.variant }}
+          name: logs-${{ matrix.arch.tag }}-${{ matrix.variant }}-l${{ matrix.load }}
           path: logs
