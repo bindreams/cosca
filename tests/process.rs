@@ -14,7 +14,10 @@ use common::spawn_blocker;
 
 // `harness = false` in Cargo.toml: skuld is the only harness, so a plain `#[test]` must resolve to
 // skuld's macro.
-#[allow(unused_imports, reason = "a stray #[test] must register with skuld, not silently never run")]
+#[allow(
+    unused_imports,
+    reason = "a stray #[test] must register with skuld, not silently never run"
+)]
 use skuld::test;
 
 #[skuld::test]
