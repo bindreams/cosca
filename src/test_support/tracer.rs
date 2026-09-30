@@ -377,7 +377,18 @@ impl Pending {
     /// Takes `&mut`: `Child::wait`/`try_wait` take `&self`, so only an exclusive borrow stops the
     /// test from reaping the tracee (and freeing its pid for reuse) while the helper may still
     /// act on it.
-    pub(crate) fn attach(mut self, tracee: &mut crate::Child) -> TracerHelper<'_> {
+    pub(crate) fn attach(self, tracee: &mut crate::Child) -> TracerHelper<'_> {
+        self.attach_pid(tracee)
+    }
+
+    /// [`attach`](Pending::attach) for a test whose subject is the tracee's own handle, which
+    /// waits, kills and polls it while the helper holds it. Only the handle's shared methods are
+    /// reachable, and the test must not reap the tracee through anything else.
+    pub(crate) fn attach_shared(self, tracee: &crate::Child) -> TracerHelper<'_> {
+        self.attach_pid(tracee)
+    }
+
+    fn attach_pid(mut self, tracee: &crate::Child) -> TracerHelper<'_> {
         let pid = tracee.id().pid();
         if let Err(e) = sys::peek_child(pid) {
             panic!(
@@ -399,7 +410,7 @@ impl Pending {
 /// the helper down before the borrow of the tracee ends.
 pub(crate) struct TracerHelper<'a> {
     session: Session,
-    _tracee: std::marker::PhantomData<&'a mut crate::Child>,
+    _tracee: std::marker::PhantomData<&'a crate::Child>,
 }
 
 impl TracerHelper<'_> {

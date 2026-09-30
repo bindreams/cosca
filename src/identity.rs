@@ -291,14 +291,16 @@ pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
     backend::fault::force_unknown(pid)
 }
 
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::UniqInfo;
 /// The assert-free start-time read every `exit_only` start check uses, and the purpose that
 /// names each read.
 #[cfg(target_os = "macos")]
-pub(crate) use backend::{pbi_start_quiet, ReadPurpose};
+pub(crate) use backend::{pbi_read_quiet, pbi_start_quiet, uniq_info, ReadPurpose, UniqRead};
 
 /// The `pbi_start_quiet` forcing seam.
 #[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::quiet_fault;
+pub(crate) use backend::{quiet_fault, uniq_fault};
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see

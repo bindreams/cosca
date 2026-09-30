@@ -27,7 +27,7 @@
 //!   expiry, never the primitive's own "timed out".
 //!
 //! `pidfd: None` (Linux) means the child was already reaped elsewhere when it was adopted: every
-//! method answers `ECHILD`.
+//! wait answers `ECHILD`, and `kill` is success.
 
 use std::fmt;
 use std::io;
@@ -60,8 +60,11 @@ enum State {
 }
 
 struct Inner {
-    /// Kept alive for its stdio; also the signal path on macOS and Windows.
-    #[cfg_attr(target_os = "linux", allow(dead_code, reason = "Linux signals through the pidfd"))]
+    /// Kept alive for its stdio; also the signal path on Windows.
+    #[cfg_attr(
+        unix,
+        allow(dead_code, reason = "Unix signals through the pidfd or the verified pid")
+    )]
     child: std::process::Child,
     state: State,
     /// The next holder's token: one per holder, so a stale guard cannot touch a newer holder.
@@ -76,6 +79,9 @@ pub(crate) struct SharedChild {
     /// reaped elsewhere at adoption.
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
+    /// The child's unique id, read at adoption, while the pid could name nothing else.
+    #[cfg(target_os = "macos")]
+    identity: crate::signal::Identity,
     /// A duplicate of the std `Child`'s process handle, usable unlocked.
     #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
@@ -114,6 +120,8 @@ impl SharedChild {
             id,
             #[cfg(target_os = "linux")]
             pidfd,
+            #[cfg(target_os = "macos")]
+            identity: crate::signal::Identity::read(id.pid()),
             #[cfg(windows)]
             handle,
             inner: Mutex::new(Inner {
@@ -146,6 +154,12 @@ impl SharedChild {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The child's start time, which tells it from a process that later reuses its pid.
+    #[cfg(target_os = "macos")]
+    fn start(&self) -> crate::identity::StartToken {
+        crate::identity::StartToken::from_raw(self.id.start_token_raw())
+    }
+
     /// The handle that names the child, or `None` when it was reaped elsewhere before adoption.
     fn target(&self) -> Option<Target<'_>> {
         #[cfg(target_os = "linux")]
@@ -155,7 +169,7 @@ impl SharedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            Some(Target::pid(self.id.pid(), None))
+            Some(Target::pid(self.id.pid(), Some(self.start())))
         }
         #[cfg(windows)]
         {
@@ -238,38 +252,37 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
-    /// Hard-kill the child. Already-exited (or already reaped by us) is success.
+    /// Hard-kill the child. Already-exited, reaped by us, or reaped elsewhere is success, logged
+    /// at `debug` where nothing was sent.
+    ///
+    /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
+    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
+    ///   no reap of ours can run between the state read and the call.
+    /// - **Windows:** through the process handle.
     pub(crate) fn kill(&self) -> io::Result<()> {
-        #[cfg_attr(
-            target_os = "linux",
-            allow(
-                unused_mut,
-                reason = "only the non-Linux branch calls `lock.child.kill()`, which needs `&mut`"
-            )
-        )]
-        let mut lock = self.lock();
+        let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return Ok(());
         }
+        #[cfg(test)]
+        exit_only::seams::signal_sent();
         #[cfg(target_os = "linux")]
         {
-            use rustix::process::{pidfd_send_signal, Signal};
-            let Some(pidfd) = &self.pidfd else {
-                return Err(echild());
-            };
-            #[cfg(test)]
-            exit_only::seams::signal_sent();
-            match pidfd_send_signal(pidfd, Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            use std::os::fd::AsFd;
+            crate::signal::via_pidfd(
+                self.pidfd.as_ref().map(AsFd::as_fd),
+                self.id(),
+                crate::signal::Sig::Kill,
+            )
+            .map(drop)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            #[cfg(test)]
-            exit_only::seams::signal_sent();
-            // By pid on macOS, under the lock: no reap of ours can run between the state read
-            // and the call.
+            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill).map(drop)
+        }
+        #[cfg(windows)]
+        {
+            let mut lock = lock;
             lock.child.kill()
         }
     }

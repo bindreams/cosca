@@ -173,21 +173,27 @@ impl SharedChild {
     /// The kqueue wait: `EVFILT_PROC` plus a peek, by number.
     fn platform_wait(&self, deadline: Option<Instant>) -> io::Result<Unlocked> {
         use crate::wait::backend::{await_reapable, Waited};
-        Ok(match await_reapable(self.id.pid(), deadline)? {
+        Ok(match await_reapable(self.id.pid(), Some(self.start()), deadline)? {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,
             Waited::Gone => Unlocked::Gone,
         })
     }
 
-    /// A reap that finds nothing right after `Reapable` means the pid names another process now:
-    /// something else reaped the child. An `ECHILD`, never an assert.
+    /// The exit was seen but the reap's own peek found no exit record: the child is still ours
+    /// (a foreign reap or a reused pid is `Foreign`, which never gets here), and a tracer is
+    /// holding it. Waits again, unlocked, for the hand-back.
     pub(super) fn reap_found_nothing(
         &self,
-        _holder: &mut HolderGuard<'_>,
-        _deadline: Option<Instant>,
+        holder: &mut HolderGuard<'_>,
+        deadline: Option<Instant>,
     ) -> io::Result<Unlocked> {
-        Ok(Unlocked::Gone)
+        log::debug!(
+            "pid {}: the reap found no exit record after one was seen; waiting again",
+            self.id()
+        );
+        holder.unlock();
+        self.platform_wait(deadline)
     }
 }
 

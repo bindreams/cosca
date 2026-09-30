@@ -47,7 +47,7 @@ fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
 #[test]
 fn a_start_read_gone_takes_the_echild_path() {
     let (child, stdin) = spawn_std_blocker();
-    let start = crate::identity::StartToken::from_raw(1);
+    let start = start_of(child.id());
     drop(stdin);
     let mut child = child;
     // The child's exit, seen without consuming it.
@@ -143,6 +143,24 @@ fn a_second_reap_that_meets_echild_is_skipped() {
     child.wait().expect("the zombie was never consumed");
 }
 
+/// S10r: a second reap with no start to check is skipped with a `warn`, and consumes nothing: a
+/// consume by a bare pid could take a reusing process's record.
+///
+/// Mutant: the consume runs when there is no start.
+#[test]
+fn a_second_reap_without_a_start_is_skipped_with_a_warning() {
+    crate::log_capture::install();
+    let (mut child, stdin) = spawn_std_blocker();
+    drop(stdin);
+    confirm_exit_of(&child);
+    let marker = format!("second reap of pid {}", child.id());
+    let mark = crate::log_capture::mark();
+    crate::wait::exit_only::second_reap(child.id(), None);
+    let levels = crate::log_capture::levels_since(mark, &marker);
+    assert_eq!(levels, [log::Level::Warn], "{levels:?}");
+    child.wait().expect("the zombie was never consumed");
+}
+
 /// S10r: a second consume that finds nothing is skipped quietly.
 ///
 /// Mutant: a `debug_assert!` on the by-pid consume.
@@ -154,9 +172,12 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
     confirm_exit_of(&child);
     let marker = format!("second reap of pid {}", child.id());
     let mark = crate::log_capture::mark();
+    let start = crate::identity::StartToken::from_raw(7);
+    let same = quiet_fault::force_quiet_read_error_once(ReadPurpose::SecondPeek, Resolved::Found(start));
     let none = exit_seams::force_reap_once(ForcedReap::None);
-    crate::wait::exit_only::second_reap(child.id(), None);
+    crate::wait::exit_only::second_reap(child.id(), Some(start));
     drop(none);
+    drop(same);
     let levels = crate::log_capture::levels_since(mark, &marker);
     assert!(
         !levels.contains(&log::Level::Warn),
@@ -302,4 +323,353 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     cmd.stdout(crate::Stdio::null()).expect("stdout");
     let child = cmd.spawn().expect("spawn");
     drop(child);
+}
+
+// Identity: the start token is checked on every by-pid surface =====
+
+fn start_of(pid: u32) -> crate::identity::StartToken {
+    match crate::identity::pbi_start_quiet(pid, ReadPurpose::Echild) {
+        Resolved::Found(start) => start,
+        other => panic!("the start of {pid}: {other:?}"),
+    }
+}
+
+/// The handle's target carries the child's start, so every peek and consume checks it.
+///
+/// Mutant: `Target::pid(pid, None)`.
+#[test]
+fn the_shared_childs_target_carries_its_start_token() {
+    let b = Blocker::spawn();
+    let target = b.shared.target().expect("a target");
+    let Target::Pid { pid, start, .. } = target;
+    assert_eq!(pid, b.shared.id());
+    assert_eq!(start, Some(start_of(pid)));
+}
+
+/// `try_wait` on an exited child whose pid now reads as another start answers `ECHILD` and
+/// consumes nothing.
+///
+/// Mutant: `target()` without the start: the exit is reported.
+#[test]
+fn try_wait_on_a_pid_with_another_start_is_echild_and_consumes_nothing() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let other = crate::identity::StartToken::from_raw(1);
+    let forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Peek, Resolved::Found(other));
+    let err = b.shared.try_wait().expect_err("another process holds the pid");
+    drop(forced);
+    assert!(is_echild(&err), "{err}");
+    b.shared.wait().expect("our zombie was never consumed");
+}
+
+/// The wait itself checks the start: a pid that reads as another start ends the wait as `Gone`,
+/// before any reap step.
+///
+/// Mutant: the wait's peek without the start: it reports `Reapable` and reaches the reap.
+#[test]
+fn a_wait_on_a_pid_with_another_start_never_reaches_the_reap() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    exit_seams::holder_steps();
+    let other = crate::identity::StartToken::from_raw(1);
+    let forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Peek, Resolved::Found(other));
+    let err = b.shared.wait().expect_err("another process holds the pid");
+    drop(forced);
+    assert!(is_echild(&err), "{err}");
+    assert!(
+        !exit_seams::holder_steps().contains(&HolderStep::Reap),
+        "the wait reached the reap for a pid that is not ours"
+    );
+    b.shared.wait().expect("our zombie was never consumed");
+}
+
+/// `kill` sends nothing to a pid whose unique id is no longer the child's: the child then ends on its own,
+/// by EOF on its stdin, and exits cleanly.
+///
+/// Mutant: `kill` by the bare pid, as std's `Child::kill` does: the child dies of `SIGKILL`.
+#[test]
+fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
+    let mut b = Blocker::spawn();
+    let log = crate::send_log::Capture::start();
+    let forced = crate::identity::uniq_fault::force_uniq_read_once(crate::identity::UniqRead::Found(
+        crate::identity::UniqInfo {
+            unique_id: match b.shared.identity {
+                crate::signal::Identity::Known(id) => id ^ 1,
+                other => panic!("a live child's identity: {other:?}"),
+            },
+        },
+    ));
+    b.shared.kill().expect("a pid that is not ours is gone, not an error");
+    drop(forced);
+    assert_eq!(log.entries(), []);
+    b.end_child();
+    let status = b.shared.wait().expect("wait");
+    assert!(status.success(), "the child was signalled: {status:?}");
+}
+
+/// `kill` on a live child sends `SIGKILL` by pid and records it.
+///
+/// Mutant: nothing sent.
+#[test]
+fn kill_signals_a_live_child_by_its_verified_pid() {
+    let b = Blocker::spawn();
+    let log = crate::send_log::Capture::start();
+    b.shared.kill().expect("kill");
+    assert_eq!(
+        log.entries(),
+        [(b.shared.id(), crate::signal::Sig::Kill, crate::send_log::Via::Pid)]
+    );
+    let status = b.shared.wait().expect("wait");
+    assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
+}
+
+// A pid that is not our child, yet still names it (a tracer holds it) =====
+
+/// Our own pid: `waitid` answers `ECHILD` for it, as it does for a child a tracer holds, and it
+/// still resolves to the start read for it.
+fn echild_yet_resolvable() -> (u32, crate::identity::StartToken) {
+    let pid = std::process::id();
+    (pid, start_of(pid))
+}
+
+/// The `Echild` read of a live process another process holds, as a tracer holds a child: its
+/// parent is not launchd.
+fn held_by_a_tracer(start: crate::identity::StartToken) -> quiet_fault::Forced {
+    quiet_fault::force_quiet_read_once(ReadPurpose::Echild, Resolved::Found(start), false)
+}
+
+/// The `Echild` read of a zombie whose tracer died: XNU reparented it to launchd.
+fn orphaned_to_launchd(start: crate::identity::StartToken) -> quiet_fault::Forced {
+    quiet_fault::force_quiet_read_once(ReadPurpose::Echild, Resolved::Found(start), true)
+}
+
+/// A by-pid `ECHILD` for a pid that still names the child, and that a live process holds, is not a
+/// reap.
+///
+/// Mutant: `ECHILD` mapped to `Foreign(Gone)` without the start and parent check.
+#[test]
+fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
+    let (pid, start) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(start));
+    let forced = held_by_a_tracer(start);
+    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Running);
+    drop(forced);
+    let _forced = held_by_a_tracer(start);
+    assert_eq!(
+        exit_only::try_reap(&target).expect("try_reap"),
+        exit_only::Reap::Running
+    );
+}
+
+/// A by-pid `ECHILD` for a pid that still names the child but that launchd owns: a zombie whose
+/// tracer died. Nothing hands it back, and waiting for it never ends.
+///
+/// Mutant: the parent ignored: `Running`.
+#[test]
+fn an_echild_for_a_pid_orphaned_to_launchd_is_foreign() {
+    let (pid, start) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(start));
+    let forced = orphaned_to_launchd(start);
+    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Foreign(Foreign::Gone));
+    drop(forced);
+    let _forced = orphaned_to_launchd(start);
+    assert_eq!(
+        exit_only::try_reap(&target).expect("try_reap"),
+        exit_only::Reap::Foreign(Foreign::Gone)
+    );
+}
+
+/// An `ECHILD` for a pid with another start is a reuse; an unreadable pid is not our child; a pid
+/// the start read finds nowhere is gone when no knote says otherwise.
+///
+/// Mutant: any `ECHILD` taken for `Running`.
+#[test]
+fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
+    let (pid, start) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(start));
+    let other = crate::identity::StartToken::from_raw(1);
+    for (echild_read, want) in [
+        (Resolved::Found(other), Foreign::Other),
+        (Resolved::Unknown, Foreign::Gone),
+        (Resolved::Gone, Foreign::Gone),
+    ] {
+        let forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Echild, echild_read);
+        assert_eq!(
+            exit_only::peek(&target).expect("peek"),
+            Peek::Foreign(want),
+            "{echild_read:?}"
+        );
+        drop(forced);
+    }
+}
+
+/// With a live knote and no `NOTE_REAP`, an `ECHILD` whose pid resolves nowhere is not a reap.
+///
+/// Mutant: the knote ignored: `Foreign(Gone)`.
+#[test]
+fn an_unresolvable_echild_under_a_live_knote_is_running() {
+    let (pid, start) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(start)).with_knote();
+    let _echild = quiet_fault::force_quiet_read_error_once(ReadPurpose::Echild, Resolved::Gone);
+    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Running);
+}
+
+/// A `Running` peek names a child of ours; if the pid now reads as another start, it is a reuse.
+///
+/// Mutant: `Running` never checks the start.
+#[test]
+fn a_running_peek_of_a_pid_with_another_start_is_foreign() {
+    let mut b = Blocker::spawn();
+    let other = crate::identity::StartToken::from_raw(1);
+    let forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Running, Resolved::Found(other));
+    let err = b.shared.try_wait().expect_err("another process holds the pid");
+    drop(forced);
+    assert!(is_echild(&err), "{err}");
+    // A start that cannot be read, or that matches, leaves it running.
+    for read in [Resolved::Unknown, Resolved::Found(b.shared.start())] {
+        let forced = quiet_fault::force_quiet_read_error_once(ReadPurpose::Running, read);
+        assert_eq!(b.shared.try_wait().expect("try_wait"), None, "{read:?}");
+        drop(forced);
+    }
+    b.end_child();
+    b.shared.wait().expect("wait");
+}
+
+/// With no start there is nothing to check an `ECHILD` against: it stays a reap.
+///
+/// Mutant: `ECHILD` taken for `Running` whatever the start.
+#[test]
+fn an_echild_with_no_start_stays_foreign() {
+    let (pid, _) = echild_yet_resolvable();
+    assert_eq!(
+        exit_only::peek(&Target::pid(pid, None)).expect("peek"),
+        Peek::Foreign(Foreign::Gone)
+    );
+}
+
+/// The kqueue wait does not read a held child as reaped: it is still running at its deadline.
+///
+/// Mutant: the wait's peek without the start: `Gone`.
+#[test]
+fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() {
+    use crate::wait::backend::{await_reapable, Waited};
+    let (pid, start) = echild_yet_resolvable();
+    // The first look, and the final one at expiry.
+    let _forced = (held_by_a_tracer(start), held_by_a_tracer(start));
+    // An expired deadline: no blocking.
+    let waited = await_reapable(pid, Some(start), Some(Instant::now())).expect("wait");
+    assert_eq!(waited, Waited::DeadlinePassed);
+}
+
+/// The wait's verdict for a pid that reads as another start is `Gone`.
+///
+/// Mutant: the wait ignores the start.
+#[test]
+fn the_kqueue_wait_reports_gone_for_a_pid_with_another_start() {
+    use crate::wait::backend::{await_reapable, Waited};
+    let (pid, _) = echild_yet_resolvable();
+    let other = crate::identity::StartToken::from_raw(1);
+    let waited = await_reapable(pid, Some(other), Some(Instant::now())).expect("wait");
+    assert_eq!(waited, Waited::Gone);
+}
+
+// S11m: the reap finds no exit record after `Reapable` =====
+
+/// A reap whose own peek finds no exit record right after the wait saw one is still our child (a
+/// foreign reap is `Foreign`): the holder waits again, and gets the exit.
+///
+/// Mutant: `Gone` at once: the wait answers `ECHILD`.
+#[test]
+fn a_reap_that_finds_no_exit_record_after_reapable_waits_again() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _hook = exit_seams::on_holder_step(HolderStep::Reap, {
+        let slot = std::rc::Rc::clone(&slot);
+        move || *slot.borrow_mut() = Some(exit_seams::force_peek_once(Ok(Peek::Running)))
+    });
+    let status = b.shared.wait().expect("the holder waited again and got the exit");
+    assert!(status.success(), "{status:?}");
+    assert!(
+        exit_seams::take_forced_peek().is_none(),
+        "the reap must have consumed the forced peek"
+    );
+}
+
+// A child whose identity a same-user read refuses (the `setuid` group) =====
+
+/// A setuid-root `setuid-stdin-block root` child that has become root, with its stdin.
+fn spawn_root_child() -> Option<(std::process::Child, std::process::ChildStdin)> {
+    use std::io::Read as _;
+    let helper = crate::test_privilege::setuid::setuid_helper()?;
+    let mut cmd = std::process::Command::new(helper);
+    cmd.args(["setuid-stdin-block", "root"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the setuid helper");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let mut ready = [0u8; 1];
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .expect("the helper reports ready");
+    assert_eq!(ready, *b"+");
+    Some((child, stdin))
+}
+
+/// `kill` of a child this caller may not signal reads its identity all the same, and surfaces the
+/// `EPERM` as `PermissionDenied`, not an untyped error.
+///
+/// Mutant: the identity read through the same-user `PROC_PIDTBSDINFO`: `ErrorKind::Other`.
+#[test]
+fn setuid_kill_of_a_root_child_is_permission_denied() {
+    let Some((child, stdin)) = spawn_root_child() else {
+        return;
+    };
+    let id = super::fixtures::identity_of(&child);
+    let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    assert!(
+        matches!(shared.identity, crate::signal::Identity::Known(_)),
+        "the identity of another user's process is readable: {:?}",
+        shared.identity
+    );
+    let err = shared.kill().expect_err("this caller may not signal a root process");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    drop(stdin);
+    let status = shared.wait().expect("the helper exits on EOF");
+    assert!(status.success(), "{status:?}");
+}
+
+/// The same through the public handle: `Child::kill` is `Io(PermissionDenied)`, which the elevated
+/// wrapper's mapping turns into `Unkillable`.
+///
+/// Mutant: as above.
+#[test]
+fn setuid_child_kill_is_permission_denied() {
+    let Some(helper) = crate::test_privilege::setuid::setuid_helper() else {
+        return;
+    };
+    let mut cmd = crate::Command::new();
+    // `args` is the whole argv, program name included.
+    cmd.executable(&helper)
+        .args(["cosca_testbin", "setuid-stdin-block", "root"]);
+    cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+    cmd.stderr(crate::Stdio::null()).expect("stderr null");
+    let mut child = cmd.spawn().expect("spawn the setuid helper");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut ready = [0u8; 1];
+    std::io::Read::read_exact(&mut child.stdout().expect("piped stdout"), &mut ready).expect("ready");
+    assert_eq!(ready, *b"+");
+    let err = child.kill().expect_err("this caller may not signal a root process");
+    assert!(
+        matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    drop(stdin);
+    let status = child.wait().expect("the helper exits on EOF");
+    assert!(status.success(), "{status:?}");
 }

@@ -190,21 +190,53 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
 
 // S7: wait_deadline behind a holder =====
 
-/// S7: a deadline waiter behind a parked holder returns `None` once its deadline has passed,
-/// while the holder is still parked.
+/// S7: a deadline waiter behind a parked holder blocks on the `Condvar` for the time remaining,
+/// then returns `None` once its deadline has passed, while the holder is still parked. The clock
+/// is frozen, so the armed timeout is exactly the time remaining.
 ///
-/// Mutant: the `Condvar::wait` without a timeout, which hangs.
+/// A block with no timeout is reported by the hook, and the test then lets the holder finish, so
+/// the waiter returns and the assertion fails instead of hanging.
+///
+/// Mutant: the `Condvar::wait` without a timeout; a waiter that returns `None` by peeking,
+/// without blocking; a wait armed with anything but the time remaining.
 #[test]
 fn a_deadline_waiter_behind_a_parked_holder_returns_none_at_its_deadline() {
-    let b = Blocker::spawn();
+    let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
-    let deadline = Instant::now() + Duration::from_millis(50);
-    let (waiter, _blocked) = spawn_waiter(&b.shared, true, move |s| s.wait_deadline(deadline));
-    let got = waiter.join().expect("waiter").expect("a running child is not an error");
-    assert_eq!(got, None);
-    assert!(crate::wait::now() >= deadline, "returned before the deadline");
-    // Let the holder go, and end the child through the fixture's drop.
-    drop(holder);
+    let remaining = Duration::from_millis(50);
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn({
+        let shared = Arc::clone(&b.shared);
+        move || {
+            let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+            let _hook = seams::on_condvar_block_with(move |armed| _ = armed_tx.send(armed));
+            let _forced = seams::force_unlocked_wait(ForcedWait::Panic);
+            let got = shared.wait_deadline(at + remaining);
+            let expired = crate::wait::now() >= at + remaining;
+            let holder_still_parked = matches!(shared.lock().state, State::W { .. });
+            (got, expired, holder_still_parked)
+        }
+    });
+    let armed = armed_rx.recv().expect("the waiter must block on the Condvar");
+    if armed.is_none() {
+        // A wait with no timeout would never return: end the child, so the holder reaps it and
+        // wakes the waiter, and fail below on the value.
+        b.shared.kill().expect("kill");
+        holder.release_and_join().expect("holder wait").expect("a status");
+        waiter.join().expect("waiter").0.expect("wait_deadline");
+        panic!("the waiter blocked on the Condvar with no timeout");
+    }
+    let (got, expired, holder_still_parked) = waiter.join().expect("waiter");
+    assert_eq!(armed, Some(remaining), "armed with the time remaining");
+    assert_eq!(got.expect("a running child is not an error"), None);
+    assert!(expired, "returned before the deadline");
+    assert!(
+        holder_still_parked,
+        "the holder must still be parked when the waiter returns"
+    );
+    // Let the holder go, and end the child.
+    b.end_child();
+    holder.release_and_join().expect("holder wait").expect("a status");
 }
 
 /// S7: a deadline waiter whose deadline has passed, behind a holder, returns the exit status from

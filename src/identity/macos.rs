@@ -79,17 +79,45 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
+    /// The check after a by-pid `ECHILD`, that the pid still names our child.
+    Echild,
+    /// A `Running` peek's, that the pid still names our child.
+    Running,
 }
 
+/// What a by-pid identity read saw: the start time, and whether launchd owns `pid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PbiRead {
+    pub(crate) start: StartToken,
+    /// The parent is launchd (pid 1). A child of ours that a tracer held is handed back to us, or
+    /// its zombie stays on the tracer's list; when the tracer dies first, XNU reparents the
+    /// zombie to launchd instead (measured on CI: `p_stat` `SZOMB`, `ppid` 1, `P_TRACED` clear,
+    /// `p_oppid` still ours), and nothing hands it back.
+    pub(crate) orphaned: bool,
+}
+
+/// The pid launchd runs as, the parent of every orphan.
+const LAUNCHD: RawPid = 1;
+
 /// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees
-/// zombies and never waits on `P_LINTRANSIT` (a `sysctl(KERN_PROC_PID)` read sleeps while the
-/// pid's `exec` is in transit, which a hung NFS or FUSE mount can stretch without bound). Every
+/// zombies and never waits on `P_LINTRANSIT` (xnu-12377.121.6 and xnu-10063.101.15: `proc_pidinfo`
+/// looks the process up with `proc_find`, then `proc_find_zombref`, and `proc_info.c` has no
+/// `proc_transwait`; `proc_find` waits only for the brief `P_REF_WILL_EXEC | P_REF_IN_EXEC` switch
+/// after exec's point of no return, as `kill(2)` does). A `sysctl(KERN_PROC_PID)` read sleeps
+/// while the pid's `exec` is in transit (`proc_iterate` without `PROC_NOWAITTRANS`), which spans
+/// image activation, so a hung NFS or FUSE mount can stretch it without bound. It fails with
+/// `EPERM` for another user's process. Every
 /// failure is a value, never [`contract_violation`]: `Gone` for `ESRCH`, `Unknown` for the rest,
 /// with a `warn` naming `purpose` for those.
 pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<StartToken> {
+    pbi_read_quiet(pid, purpose).map(|read| read.start)
+}
+
+/// [`pbi_start_quiet`], with whether launchd owns the process.
+pub(crate) fn pbi_read_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<PbiRead> {
     #[cfg(test)]
-    if let Some(forced) = quiet_fault::take(purpose) {
-        return forced;
+    if let Some((forced, orphaned)) = quiet_fault::take(purpose) {
+        return forced.map(|start| PbiRead { start, orphaned });
     }
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -104,7 +132,10 @@ pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<Sta
         )
     };
     if n == size {
-        return Resolved::Found(token_of_bsd(&info));
+        return Resolved::Found(PbiRead {
+            start: token_of_bsd(&info),
+            orphaned: info.pbi_ppid == LAUNCHD,
+        });
     }
     if n <= 0 {
         let e = std::io::Error::last_os_error();
@@ -116,6 +147,114 @@ pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<Sta
     }
     log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read wrote {n} bytes, expected {size}");
     Resolved::Unknown
+}
+
+/// `PROC_PIDUNIQIDENTIFIERINFO`, `proc_info_private.h`. Private, and read unprivileged: the kernel
+/// answers it for any user's process (`NO_CHECK_SAME_USER`, `proc_info.c`).
+const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+
+/// `struct proc_uniqidentifierinfo` (`proc_info_private.h`, 56 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_idversion: i32,
+    p_orig_ppidversion: i32,
+    p_reserve2: u64,
+    p_reserve3: u64,
+}
+const _: () = assert!(std::mem::size_of::<ProcUniqIdentifierInfo>() == 56);
+
+/// What `proc_pidinfo(pid, 17, ...)` says of a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UniqInfo {
+    /// The process's 64-bit id, never reused and kept across `exec`.
+    pub(crate) unique_id: u64,
+}
+
+/// The outcome of [`uniq_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UniqRead {
+    Found(UniqInfo),
+    /// `ESRCH`: no such process, or one that is exiting and not yet a zombie.
+    Gone,
+    /// Any other errno (`EPERM`, `EACCES`, ...): the identity could not be read.
+    Refused(i32),
+}
+
+/// `pid`'s unique id through `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)` with `arg = 1`, which
+/// sees zombies, on the same `proc_find` path every `kill(2)` takes: it never waits on
+/// `P_LINTRANSIT`, and it answers for another user's process where the `PROC_PIDTBSDINFO` start
+/// read is refused. `n <= 0` is classified by errno: `ESRCH` is `Gone`, the rest `Refused`.
+pub(crate) fn uniq_info(pid: RawPid) -> UniqRead {
+    #[cfg(test)]
+    if let Some(forced) = uniq_fault::take() {
+        return forced;
+    }
+    // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
+    let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcUniqIdentifierInfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer and size match.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            1,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n == size {
+        return UniqRead::Found(UniqInfo {
+            unique_id: info.p_uniqueid,
+        });
+    }
+    if n <= 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        return if errno == libc::ESRCH {
+            UniqRead::Gone
+        } else {
+            UniqRead::Refused(errno)
+        };
+    }
+    log::warn!("proc_pidinfo({pid}) for the unique id wrote {n} bytes, expected {size}");
+    UniqRead::Refused(libc::EIO)
+}
+
+/// Forces [`uniq_info`] below the syscall.
+#[cfg(test)]
+pub(crate) mod uniq_fault {
+    use std::cell::RefCell;
+
+    use super::UniqRead;
+
+    thread_local! {
+        static FORCED: RefCell<Vec<UniqRead>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
+    pub(crate) struct Forced(());
+
+    /// The next `uniq_info` on this thread answers `read`. Forces queue.
+    pub(crate) fn force_uniq_read_once(read: UniqRead) -> Forced {
+        FORCED.with(|f| f.borrow_mut().push(read));
+        Forced(())
+    }
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.borrow_mut().clear());
+        }
+    }
+
+    pub(super) fn take() -> Option<UniqRead> {
+        FORCED.with(|f| {
+            let mut forced = f.borrow_mut();
+            (!forced.is_empty()).then(|| forced.remove(0))
+        })
+    }
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
@@ -358,43 +497,50 @@ pub(crate) mod fault {
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
 
-/// Forces one [`pbi_start_quiet`] purpose to a chosen result, below the syscall.
+/// Forces [`pbi_start_quiet`] and [`kinfo_start`] reads of chosen purposes to chosen results,
+/// below the syscall.
 #[cfg(test)]
 pub(crate) mod quiet_fault {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::{ReadPurpose, Resolved, StartToken};
 
+    /// One force: its id, the purpose, the answer, and the orphaned flag.
+    type Force = (u64, ReadPurpose, Resolved<StartToken>, bool);
+
     thread_local! {
-        static FORCED: RefCell<Option<(ReadPurpose, Resolved<StartToken>)>> = const { RefCell::new(None) };
+        static FORCED: RefCell<Vec<Force>> = const { RefCell::new(Vec::new()) };
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
     }
 
     #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
+    pub(crate) struct Forced(u64);
 
-    /// The next `pbi_start_quiet` for `purpose` on this thread answers `result`. Other purposes
-    /// are untouched.
+    /// The next read for `purpose` on this thread answers `result`. Other purposes are untouched.
+    /// Forces for different purposes, or for the same one, queue.
     pub(crate) fn force_quiet_read_error_once(purpose: ReadPurpose, result: Resolved<StartToken>) -> Forced {
-        FORCED.with(|f| *f.borrow_mut() = Some((purpose, result)));
-        Forced(())
+        force_quiet_read_once(purpose, result, false)
+    }
+
+    /// [`force_quiet_read_error_once`], with the read's orphaned flag.
+    pub(crate) fn force_quiet_read_once(purpose: ReadPurpose, result: Resolved<StartToken>, orphaned: bool) -> Forced {
+        let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
+        FORCED.with(|f| f.borrow_mut().push((id, purpose, result, orphaned)));
+        Forced(id)
     }
 
     impl Drop for Forced {
         fn drop(&mut self) {
-            FORCED.with(|f| *f.borrow_mut() = None);
+            FORCED.with(|f| f.borrow_mut().retain(|(id, ..)| *id != self.0));
         }
     }
 
-    pub(super) fn take(purpose: ReadPurpose) -> Option<Resolved<StartToken>> {
+    pub(super) fn take(purpose: ReadPurpose) -> Option<(Resolved<StartToken>, bool)> {
         FORCED.with(|f| {
-            let mut slot = f.borrow_mut();
-            match *slot {
-                Some((p, r)) if p == purpose => {
-                    *slot = None;
-                    Some(r)
-                }
-                _ => None,
-            }
+            let mut forced = f.borrow_mut();
+            let at = forced.iter().position(|(_, p, ..)| *p == purpose)?;
+            let (_, _, result, orphaned) = forced.remove(at);
+            Some((result, orphaned))
         })
     }
 }

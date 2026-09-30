@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::identity::{pbi_start_quiet, ReadPurpose, Resolved, StartToken};
+use crate::identity::{pbi_read_quiet, pbi_start_quiet, ReadPurpose, Resolved, StartToken};
 
 use super::{is_exit_record, reaped_from_record, Foreign, Peek, Reap, Record, Target};
 
@@ -77,20 +77,47 @@ fn check_start(pid: u32, start: StartToken, purpose: ReadPurpose) -> StartCheck 
 
 pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
     let (pid, start) = pid_and_start(target);
+    let knote = matches!(target, Target::Pid { knote: true, .. });
     let peeked = peek_raw(pid)?;
-    // The start is read only when the peek says `Exit`, just before the consume: a `Running`
-    // or `ECHILD` reads none, so a reusing process of another user never provokes the same-user
-    // `EPERM` (`proc_info.c:2197-2212`).
-    let (Peek::Exit(_), Some(start)) = (peeked, start) else {
-        return Ok(peeked);
-    };
-    match check_start(pid, start, ReadPurpose::Peek) {
-        StartCheck::Matches => Ok(peeked),
-        StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-        StartCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
-        // Unreadable start: the caller gets the start-less peek's answer. `Unassessable` is a
-        // later unit's; a start that cannot be read is never taken as a mismatch.
-        StartCheck::Unreadable => Ok(peeked),
+    let Some(start) = start else { return Ok(peeked) };
+    match peeked {
+        // The start is read only when the peek says `Exit`, just before the consume: a reusing
+        // process of another user would provoke the same-user `EPERM` (`proc_info.c:2197-2212`).
+        Peek::Exit(_) => match check_start(pid, start, ReadPurpose::Peek) {
+            StartCheck::Matches => Ok(peeked),
+            StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            StartCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
+            // Unreadable start: the caller gets the start-less peek's answer. `Unassessable` is
+            // a later unit's; a start that cannot be read is never taken as a mismatch.
+            StartCheck::Unreadable => Ok(peeked),
+        },
+        // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
+        // of the pid by another child of ours also looks like this, so the start decides.
+        Peek::Running => match check_start(pid, start, ReadPurpose::Running) {
+            StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            StartCheck::Matches | StartCheck::Gone | StartCheck::Unreadable => Ok(peeked),
+        },
+        // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
+        // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
+        // `NOTE_EXIT`. It is a reap when the pid no longer names the child, and equally when it
+        // still does but launchd owns it: a zombie whose tracer died is reparented there, and
+        // no `waitid` of ours will ever see it.
+        Peek::Foreign(Foreign::Gone) => match pbi_read_quiet(pid, ReadPurpose::Echild) {
+            Resolved::Found(read) if read.start != start => Ok(Peek::Foreign(Foreign::Other)),
+            Resolved::Found(read) if read.orphaned => Ok(peeked),
+            Resolved::Found(_) => Ok(Peek::Running),
+            // `ESRCH` is a process that is gone, or one between `P_REF_DEAD` and the zombie: exactly
+            // when a traced child's exit wakes the wait. No read tells the two apart in that
+            // window (`proc_pidinfo` and the `kinfo` sysctl both look a process up with
+            // `proc_find`, then `proc_find_zombref`, and both fail for it), so only a live knote
+            // decides: a real reap is announced on it with `NOTE_REAP`. Without one, `ESRCH` is
+            // taken for gone.
+            Resolved::Gone if knote => Ok(Peek::Running),
+            Resolved::Gone => Ok(peeked),
+            // An unreadable start is a pid of another user: not our child.
+            Resolved::Unknown => Ok(peeked),
+        },
+        Peek::Foreign(Foreign::Other) => Ok(peeked),
     }
 }
 
@@ -124,7 +151,9 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     let first = match consume(pid) {
         Ok(Some(record)) => reaped_from_record(record),
         // A by-pid consume is never pinned: a foreign reap between the peek and here, then a
-        // reuse of the pid by a child that is still running, finds nothing.
+        // reuse of the pid by a child that is still running, finds nothing. A reuser that is our
+        // own child and already a zombie has its exit record consumed instead: the start check
+        // above is a check, not a pin.
         Ok(None) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) if is_echild(&e) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) => return Err(e),
@@ -163,17 +192,20 @@ pub(crate) fn second_reap(pid: u32, start: Option<StartToken>) {
             return;
         }
     }
-    if let Some(start) = start {
-        match check_start(pid, start, ReadPurpose::SecondPeek) {
-            StartCheck::Matches => {}
-            StartCheck::Other | StartCheck::Gone => {
-                log::debug!("second reap of pid {pid}: the pid names another process now");
-                return;
-            }
-            StartCheck::Unreadable => {
-                log::warn!("second reap of pid {pid}: its start could not be read; a zombie may be left");
-                return;
-            }
+    // A consume by a bare pid could take a reusing process's exit record.
+    let Some(start) = start else {
+        log::warn!("second reap of pid {pid}: no start to check it against; a zombie may be left");
+        return;
+    };
+    match check_start(pid, start, ReadPurpose::SecondPeek) {
+        StartCheck::Matches => {}
+        StartCheck::Other | StartCheck::Gone => {
+            log::debug!("second reap of pid {pid}: the pid names another process now");
+            return;
+        }
+        StartCheck::Unreadable => {
+            log::warn!("second reap of pid {pid}: its start could not be read; a zombie may be left");
+            return;
         }
     }
     match consume(pid) {
