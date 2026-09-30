@@ -93,6 +93,11 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(all(test, unix, feature = "tokio"))]
+mod send_log;
+#[cfg(feature = "tokio")]
+mod signal;
+
 #[cfg(test)]
 mod log_capture;
 

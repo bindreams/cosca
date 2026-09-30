@@ -19,6 +19,7 @@ use crate::child::ParentEnd;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::signal::Sig;
 use crate::stdio::Fd;
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
@@ -432,14 +433,16 @@ impl Child {
     }
 
     /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid, and a
-    /// refused Linux `pidfd_open` cannot fail it.
-    /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
-    /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
-    /// `wait().await` (or `Drop`) collects the exit status.
+    /// refused Linux `pidfd_open` cannot fail it: on Linux the signal goes through the pidfd the
+    /// spawn holds, on macOS after a peek that finds the child still ours, on Windows through the
+    /// process handle.
+    /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by
+    /// someone else (where tokio's `start_kill` answered `ESRCH`, this answers `Ok` on Linux).
+    /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc_mut().start_kill() {
+        match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }
@@ -665,6 +668,14 @@ impl Child {
 #[path = "child_drop_tests.rs"]
 mod child_drop_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/pid_reuse_tests.rs"]
+mod pid_reuse_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/macos_kill_tests.rs"]
+mod macos_kill_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
@@ -815,10 +826,10 @@ impl Drop for Child {
         let killed = if reaper::fault::take_force_kill_failure() {
             Err(Error::Io(std::io::Error::other("forced kill failure (test seam)")))
         } else {
-            os.proc_mut().start_kill()
+            os.proc_mut().signal(Sig::Kill)
         };
         #[cfg(not(test))]
-        let killed = os.proc_mut().start_kill();
+        let killed = os.proc_mut().signal(Sig::Kill);
         if killed.is_err() {
             if !matches!(os.proc_mut().try_wait(), Ok(Some(_))) {
                 log::warn!("async child {pid} could not be terminated on drop; leaving it running");

@@ -265,6 +265,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(not(unix))]
     let reserved: Vec<i32> = Vec::new();
 
+    // The pidfd the handshake opens while the child is held before `exec` (Linux); the child keeps it.
+    #[cfg(target_os = "linux")]
+    let mut held_pidfd = None;
+
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
     // fd_map's dup2 pre_exec so the latter runs LAST in the child (see the ordering
     // rationale in child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
@@ -376,7 +380,18 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
                 let held = handshake.run(|| tcmd.spawn(), |c| c.id());
-                held.map(|held| held.child)
+                held.map(|held| {
+                    // The child keeps this pidfd for good; a signal through it cannot reach a
+                    // process that later reuses the pid.
+                    debug_assert!(
+                        held.pidfd
+                            .as_ref()
+                            .is_none_or(|fd| std::os::fd::AsRawFd::as_raw_fd(fd) >= 3),
+                        "the handshake places the pidfd above stdio"
+                    );
+                    held_pidfd = held.pidfd;
+                    held.child
+                })
             };
             #[cfg(not(target_os = "linux"))]
             let spawned = {
@@ -457,7 +472,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    let mut child = Child::from_parts(ProcSource::Tokio(child), id, kill_on_drop, attachment, pipes, owned_std);
+    let proc = ProcSource::tokio(child);
+    #[cfg(target_os = "linux")]
+    let proc = match held_pidfd {
+        Some(pidfd) => proc.with_pidfd(pidfd),
+        None => proc,
+    };
+    let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
 }

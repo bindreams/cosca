@@ -84,7 +84,7 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
     let pid = proc.id().expect("a freshly spawned child has a pid");
     super::ReapJob {
         os: super::super::OsResources {
-            proc: Some(super::super::ProcSource::Tokio(proc)),
+            proc: Some(super::super::ProcSource::tokio(proc)),
             ..Default::default()
         },
         pid,

@@ -44,7 +44,7 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
 
     let child = Child {
         os: OsResources {
-            proc: Some(ProcSource::Tokio(proc)),
+            proc: Some(ProcSource::tokio(proc)),
             attached: Attached::Cgroup(leaf),
             pipes: Default::default(),
             owned_std: Default::default(),
@@ -124,7 +124,7 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
 
     let child = Child {
         os: OsResources {
-            proc: Some(ProcSource::Tokio(proc)),
+            proc: Some(ProcSource::tokio(proc)),
             attached: Attached::Cgroup(leaf),
             pipes: Default::default(),
             owned_std: Default::default(),

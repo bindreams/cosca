@@ -192,6 +192,10 @@ pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Err
     None
 }
 
+/// The start-token aliasing and read-counting seam.
+#[cfg(all(target_os = "linux", test, feature = "tokio"))]
+pub(crate) use backend::fault;
+
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::fault as proc_view_fault;

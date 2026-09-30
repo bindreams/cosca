@@ -144,3 +144,30 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 fn no_error_is_blamed_on_a_fine_view() {
     assert!(unknown_identity_error("the spawned child").is_none());
 }
+
+/// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`,
+/// and it counts every read of the pid.
+#[test]
+fn alias_token_aliases_only_a_found_stat() {
+    use super::fault::{alias_token, alias_token as alias};
+    use super::start_token_from;
+    use crate::identity::StartToken;
+
+    const PID: u32 = 4242;
+    let aliased = StartToken::from_raw(7);
+    let before = alias::reads(PID);
+    let _armed = alias_token(PID, aliased);
+
+    assert!(matches!(start_token_from(PID, Resolved::Gone), Resolved::Gone));
+    assert!(matches!(start_token_from(PID, Resolved::Unknown), Resolved::Unknown));
+    match start_token_from(PID, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+        Resolved::Found(t) => assert_eq!(t, aliased, "a found stat answers the alias"),
+        other => panic!("a found stat must resolve, got {other:?}"),
+    }
+    // Another pid is untouched.
+    match start_token_from(PID + 1, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+        Resolved::Found(t) => assert_eq!(t, StartToken::from_raw(424242)),
+        other => panic!("got {other:?}"),
+    }
+    assert_eq!(alias::reads(PID) - before, 3, "every read of the pid is counted");
+}
