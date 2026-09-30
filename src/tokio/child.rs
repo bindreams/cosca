@@ -430,10 +430,11 @@ impl Child {
     /// `wait().await` (or `Drop`) collects the exit status.
     ///
     /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
-    /// `Ok`.
+    /// `Ok`, and on Linux one by a seccomp or LSM filter is
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming `kill`.
     pub fn kill(&mut self) -> Result<(), Error> {
-        // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok`, and a privilege
-        // refusal of an elevated wrapper child becomes `Unkillable`.
+        // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok`, a filter's is
+        // `Unsupported`, and a privilege refusal of an elevated wrapper child becomes `Unkillable`.
         let elevated_wrapper = self.is_elevated_wrapper();
         match self.proc_mut().start_kill() {
             Err(Error::Io(e)) => crate::refusal::resolve_kill_error(e, self.id(), elevated_wrapper),

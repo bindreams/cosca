@@ -193,13 +193,14 @@ impl Child {
     /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
     ///
     /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
-    /// `Ok`.
+    /// `Ok`, and on Linux one by a seccomp or LSM filter is
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming `kill`.
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
         // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok` (Linux refuses a
-        // signal to a root-owned zombie), and a privilege refusal of an elevated wrapper child
-        // becomes the typed `Unkillable`.
+        // signal to a root-owned zombie), a filter's is `Unsupported`, and a privilege refusal of
+        // an elevated wrapper child becomes the typed `Unkillable`.
         match self.proc.kill() {
             Ok(()) => Ok(()),
             Err(e) => crate::refusal::resolve_kill_error(e, self.id, self.is_elevated_wrapper()),

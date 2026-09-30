@@ -1,15 +1,18 @@
 //! What a refused signal (`EPERM` on POSIX, `ACCESS_DENIED` on Windows) means, and how it is
 //! reported.
 //!
-//! The OS gives one answer for several situations: the target has exited (Linux refuses a signal
-//! to a root-owned zombie), or the target belongs to a more privileged user. Only the second is a
-//! statement about the target, and only that one may become
+//! The OS gives one answer for four situations: the target has exited (Linux refuses a signal to
+//! a root-owned zombie), the target belongs to a more privileged user, a seccomp or LSM filter
+//! refuses the syscall, or the call was never the signal's. Only the second is a statement about
+//! the target, and only that one may become
 //! [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable):
 //!
 //! - **Exited**: `Ok(())`, as for any already-exited child.
 //! - **Privilege**: a `PermissionDenied` [`refused`] error, carrying whether the target is still
-//!   running. [`map_elevated_kill_error`](crate::elevation::map_elevated_kill_error) turns these
-//!   into `Unkillable`, for an elevated wrapper child.
+//!   running. [`map_elevated_kill_error`](crate::elevation::map_elevated_kill_error) turns exactly
+//!   these into `Unkillable`, for an elevated wrapper child.
+//! - **Filter** (Linux): [`Error::Unsupported`] naming the syscall, as for any refused syscall (see
+//!   the crate root's "Platform requirements").
 
 use std::io;
 
@@ -26,6 +29,9 @@ pub(crate) enum Verdict {
     Exited,
     /// The OS's own permission rule refuses the signal.
     Privilege(TargetState),
+    /// The kernel's rule would permit the signal, so a seccomp or LSM filter refused it.
+    #[cfg(target_os = "linux")]
+    Filter(linux::SignalCall),
 }
 
 /// What is known of the target of a signal the OS refused for privilege.
@@ -86,6 +92,8 @@ pub(crate) fn resolve(verdict: Verdict, os_error: io::Error) -> Result<(), Error
     match verdict {
         Verdict::Exited => Ok(()),
         Verdict::Privilege(state) => Err(Error::Io(refused(state, os_error))),
+        #[cfg(target_os = "linux")]
+        Verdict::Filter(call) => Err(call.unsupported()),
     }
 }
 
@@ -109,7 +117,8 @@ fn classify_kill(id: ProcessId) -> Result<Verdict, Error> {
     linux::classify_kill(id)
 }
 
-/// Outside Linux the question is only whether the target has exited.
+/// Outside Linux there is no filter to tell from a privilege refusal (a sandbox profile is not
+/// modelled), so the question is only whether the target has exited.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn classify_kill(id: ProcessId) -> Result<Verdict, Error> {
     use crate::identity::Liveness;

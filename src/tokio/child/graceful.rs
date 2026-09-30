@@ -54,7 +54,9 @@ impl Child {
     /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
-    /// **Refused signal.** A signal the OS refuses for a child that has already exited is `Ok`.
+    /// **Refused signal.** A signal the OS refuses for a child that has already exited is `Ok`, and
+    /// on Linux a refusal by a seccomp or LSM filter is
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming the syscall.
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event

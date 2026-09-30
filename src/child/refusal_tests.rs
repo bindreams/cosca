@@ -1,6 +1,9 @@
-//! A signal the OS refuses, on a real Linux child: an already-exited child is `Ok` whatever
-//! refuses the signal.
+//! A signal the OS refuses, on a real Linux child: a seccomp filter's `EPERM` (the kernel's own
+//! permission rule would allow it) is `Unsupported` naming the syscall, never `Unkillable`; an
+//! already-exited child is `Ok` whatever refuses the signal.
 
+use crate::error::Error;
+use crate::refusal::linux::SignalCall;
 use crate::test_seccomp::with_denied;
 
 fn wrapped() -> Option<crate::elevation::ElevationReport> {
@@ -18,6 +21,80 @@ fn reports() -> [Option<crate::elevation::ElevationReport>; 2] {
 
 fn blocker() -> (crate::Child, std::io::PipeWriter) {
     crate::test_child::held_contained_blocker(crate::Stdio::pipe())
+}
+
+/// Ends a blocker the test still holds and reaps it. Runs OUTSIDE the filtered thread.
+fn cleanup(child: crate::Child, stdin: std::io::PipeWriter) {
+    drop(stdin);
+    child.wait().expect("reap");
+}
+
+fn assert_unsupported_naming(err: &Error, call: SignalCall) {
+    let (name, op) = match call {
+        SignalCall::Kill => ("kill", "kill a child process"),
+        SignalCall::PidfdKill => ("pidfd_send_signal", "kill a process"),
+        SignalCall::PidfdTerminate => ("pidfd_send_signal", "terminate a process"),
+    };
+    match err {
+        Error::Unsupported {
+            op: got_op,
+            platform,
+            detail,
+        } => {
+            assert_eq!(*platform, "linux");
+            assert_eq!(got_op, op);
+            assert!(
+                detail.contains(&format!("refused here: {name} answered EPERM")),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Unsupported naming {name}, got {other:?}"),
+    }
+}
+
+// A filter refusing `pidfd_send_signal` on an own-uid child =====
+
+#[test]
+fn terminate_refused_by_a_filter_is_unsupported_naming_pidfd_send_signal() {
+    for report in reports() {
+        let (err, child, stdin) = with_denied(&[libc::SYS_pidfd_send_signal], move || {
+            let (mut child, stdin) = blocker();
+            child.set_elevation(report);
+            let err = child.terminate().expect_err("the filter refuses the signal");
+            (err, child, stdin)
+        });
+        assert_unsupported_naming(&err, SignalCall::PidfdTerminate);
+        cleanup(child, stdin);
+    }
+}
+
+#[test]
+fn kill_refused_by_a_filter_is_unsupported_naming_kill() {
+    for report in reports() {
+        let (err, child, stdin) = with_denied(&[libc::SYS_kill], move || {
+            let (mut child, stdin) = blocker();
+            child.set_elevation(report);
+            let err = child.kill().expect_err("the filter refuses the signal");
+            (err, child, stdin)
+        });
+        assert_unsupported_naming(&err, SignalCall::Kill);
+        cleanup(child, stdin);
+    }
+}
+
+// The escalation kill is `kill`, so it reports the same.
+#[test]
+fn graceful_shutdown_escalation_refused_by_a_filter_is_unsupported_naming_kill() {
+    let (err, child, stdin) = with_denied(&[libc::SYS_kill], || {
+        let (mut child, stdin) = crate::test_child::term_ignoring_blocker();
+        child.set_elevation(wrapped());
+        let err = child
+            .graceful_shutdown(std::time::Duration::ZERO)
+            .expect_err("the escalation is refused");
+        (err, child, stdin)
+    });
+    assert_unsupported_naming(&err, SignalCall::Kill);
+    cleanup(child, stdin);
 }
 
 // An exited child is Ok whatever refuses the signal =====
