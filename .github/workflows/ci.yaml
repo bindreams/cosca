@@ -129,7 +129,7 @@ jobs:
             target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
     # sandbox, so every step consents. Windows has no tracer tests.
@@ -184,7 +184,7 @@ jobs:
       # one failing configuration does not hide the other. `timeout-minutes` bounds a hang.
       - name: Run plain cargo test (Unix)
         if: matrix.os == 'linux' || matrix.os == 'darwin'
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: |
           set -uxo pipefail
           status=0
