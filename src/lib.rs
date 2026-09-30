@@ -4,6 +4,30 @@
 //! spawn it into an owned [`Child`], or attach to an already-running process by
 //! pid via [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
+//!
+//! # Platform requirements
+//!
+//! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile.
+//! Each requirement comes from a different syscall:
+//!
+//! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns. A refusal is
+//!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
+//!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not enforce this yet: it
+//!   returns `Io` for the errnos only a filter produces (`EPERM`, `EACCES`, `ENODEV`) and does not
+//!   require a pidfd at spawn ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
+//!   leaf reaps that way; an owned child's waits and reaps still go by pid
+//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
+//!   checked `/proc` view uses it to read a process's identity. A refusal is `Unsupported`; `main`
+//!   surfaces it as [`Error::Unassessable`](error::Error::Unassessable)
+//!   ([#341](https://github.com/bindreams/cosca/issues/341)).
+//!
+//! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
+//! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
+//! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
+//! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
+//! described under [`Command::kill_on_drop`].
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
