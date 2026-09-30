@@ -9,6 +9,7 @@
 
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
+use std::collections::hash_map::Entry as SlotEntry;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::mpsc::Sender;
@@ -38,35 +39,57 @@ thread_local! {
     static SLOTS: RefCell<HashMap<TypeId, Box<dyn Entry>>> = RefCell::new(HashMap::new());
 }
 
-fn insert(id: TypeId, entry: Box<dyn Entry>) {
-    let prev = SLOTS.with(|slots| slots.borrow_mut().insert(id, entry));
-    debug_assert!(prev.is_none(), "probe installed nested on the same thread");
+/// Fill a vacant slot and report whether it did. An occupied slot keeps its owner's entry: a
+/// nested install is a contract violation, asserted in debug and a no-op in release.
+fn insert(id: TypeId, entry: Box<dyn Entry>) -> bool {
+    let inserted = SLOTS.with(|slots| match slots.borrow_mut().entry(id) {
+        SlotEntry::Vacant(slot) => {
+            slot.insert(entry);
+            true
+        }
+        SlotEntry::Occupied(_) => false,
+    });
+    debug_assert!(inserted, "probe installed nested on the same thread");
+    inserted
 }
 
-/// Uninstalls on drop, including during an unwind. `!Send`: it must clear the thread it was
-/// installed on.
+/// Uninstalls on drop, including during an unwind, if it installed anything. `!Send`: it must
+/// clear the thread it was installed on.
 #[must_use = "dropping this immediately uninstalls the probe; bind it for its duration"]
-pub(crate) struct Guard<P: Probe>(PhantomData<*const ()>, PhantomData<fn() -> P>);
+pub(crate) struct Guard<P: Probe> {
+    inserted: bool,
+    _not_send: PhantomData<*const ()>,
+    _probe: PhantomData<fn() -> P>,
+}
 
 impl<P: Probe> Drop for Guard<P> {
     fn drop(&mut self) {
-        SLOTS.with(|slots| slots.borrow_mut().remove(&TypeId::of::<P>()));
+        if self.inserted {
+            SLOTS.with(|slots| slots.borrow_mut().remove(&TypeId::of::<P>()));
+        }
     }
 }
 
 /// Install `tx` as this thread's `P`. Nesting on one thread is a contract violation.
 pub(crate) fn install<P: Probe>(tx: Sender<P::Event>) -> Guard<P> {
-    insert(TypeId::of::<P>(), Box::new(tx));
-    Guard(PhantomData, PhantomData)
+    let inserted = insert(TypeId::of::<P>(), Box::new(tx));
+    Guard {
+        inserted,
+        _not_send: PhantomData,
+        _probe: PhantomData,
+    }
 }
 
 /// This thread's `P`, cloned so the installation survives.
 pub(crate) fn current<P: Probe>() -> Option<Sender<P::Event>> {
     SLOTS.with(|slots| {
-        slots
-            .borrow()
-            .get(&TypeId::of::<P>())
-            .and_then(|entry| entry.as_any().downcast_ref::<Sender<P::Event>>().cloned())
+        slots.borrow().get(&TypeId::of::<P>()).map(|entry| {
+            entry
+                .as_any()
+                .downcast_ref::<Sender<P::Event>>()
+                .expect("slot keyed by P holds Sender<P::Event>")
+                .clone()
+        })
     })
 }
 
@@ -101,11 +124,12 @@ impl Relay {
     /// Install the captured probes on this thread until the guard drops.
     pub(crate) fn reinstall(self) -> RelayGuard {
         // Bound before the loop: a panicking `insert` unwinds through this guard, which then
-        // removes the entries already inserted.
+        // removes the entries already inserted, and only those.
         let mut guard = RelayGuard(Vec::with_capacity(self.0.len()), PhantomData);
         for (id, entry) in self.0 {
-            insert(id, entry);
-            guard.0.push(id);
+            if insert(id, entry) {
+                guard.0.push(id);
+            }
         }
         guard
     }

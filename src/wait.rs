@@ -448,7 +448,6 @@ pub(crate) mod read_probe {
         relayed_probe::install(tx)
     }
 
-    /// This thread's installed log, cloned so the installation survives.
     pub(crate) fn current() -> Option<Sender<Event>> {
         relayed_probe::current::<Log>()
     }

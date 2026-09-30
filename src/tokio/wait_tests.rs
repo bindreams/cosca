@@ -614,10 +614,8 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     kill_and_reap(&mut child);
 }
 
-// `armed_probe` reaches the blocking watch: a live target at the point the real wait would be
-// entered notifies once and is force-released. Zero grace keeps it deterministic: the seam fires
-// before the wait whatever the deadline, and without the relay the expired deadline ends the wait
-// at once with no notification.
+// `armed_probe` reaches the blocking watch. Zero grace: the seam fires before the wait whatever
+// the deadline, and without the relay the expired deadline ends the wait with no notification.
 //
 // Mutant: make `relayed_probe::capture` skip the `Armed` probe -> no notification.
 #[cfg(windows)]

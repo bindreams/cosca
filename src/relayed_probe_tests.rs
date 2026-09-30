@@ -106,28 +106,61 @@ fn capturing_leaves_the_arming_threads_probe_installed() {
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), [3]);
 }
 
-/// A reinstall that panics part-way must not strand the entries it already inserted.
+/// A rejected nested install leaves the outer owner's channel installed, in debug (the install
+/// panics) and in release (it is a no-op whose guard removes nothing).
+///
+/// Mutant: let `insert` overwrite an occupied slot -> the outer channel stops receiving.
+/// Mutant: let a guard that inserted nothing remove the id -> the outer channel stops receiving
+/// once the inner guard drops (release only; in debug the inner guard is never built).
+#[test]
+fn a_rejected_nested_install_leaves_the_outer_channel_receiving() {
+    let (outer_tx, outer_rx) = channel();
+    let (inner_tx, inner_rx) = channel();
+    let _outer = install::<A>(outer_tx);
+    let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(install::<A>(inner_tx))));
+    assert_eq!(nested.is_err(), cfg!(debug_assertions));
+    notify::<A>(5);
+    assert_eq!(outer_rx.try_iter().collect::<Vec<_>>(), [5]);
+    assert_eq!(inner_rx.try_iter().count(), 0);
+}
+
+/// A reinstall that hits an occupied slot must uninstall what it inserted, and only that: the
+/// prior owner's entry stays. It panics in debug; in release it skips the occupied slot.
 ///
 /// Mutant: build the `RelayGuard` after the insert loop -> `A` stays installed after the panic.
-#[cfg(debug_assertions)]
+/// Mutant: record an id before its insert succeeds -> `B`'s original entry is removed.
 #[test]
-fn a_reinstall_that_panics_midway_uninstalls_what_it_inserted() {
-    let (a_tx, _a_rx) = channel::<u8>();
-    let (b_tx, _b_rx) = channel::<&'static str>();
+fn a_reinstall_onto_an_occupied_slot_touches_only_what_it_inserted() {
+    let (a_tx, a_rx) = channel::<u8>();
+    let (b_relay_tx, b_relay_rx) = channel::<&'static str>();
+    let (b_orig_tx, b_orig_rx) = channel::<&'static str>();
     let relay = Relay(vec![
         (TypeId::of::<A>(), Box::new(a_tx) as Box<dyn Entry>),
-        (TypeId::of::<B>(), Box::new(b_tx.clone()) as Box<dyn Entry>),
+        (TypeId::of::<B>(), Box::new(b_relay_tx) as Box<dyn Entry>),
     ]);
     std::thread::scope(|s| {
         s.spawn(move || {
-            // Occupy `B`'s slot, so the second insert trips the nesting assert.
-            std::mem::forget(install::<B>(b_tx));
-            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relay.reinstall()));
-            assert!(unwound.is_err(), "the nested install must panic");
-            assert!(
-                !is_installed::<A>(),
-                "the entry inserted before the panic must be uninstalled"
-            );
+            let _b = install::<B>(b_orig_tx);
+            let reinstalled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relay.reinstall()));
+            assert_eq!(reinstalled.is_err(), cfg!(debug_assertions));
+            drop(reinstalled);
+            assert!(!is_installed::<A>(), "the inserted entry must be uninstalled");
+            notify::<B>("original");
         });
     });
+    assert_eq!(a_rx.try_iter().count(), 0);
+    assert_eq!(b_relay_rx.try_iter().count(), 0);
+    assert_eq!(b_orig_rx.try_iter().collect::<Vec<_>>(), ["original"]);
+}
+
+/// A slot whose entry is not `P`'s sender is a broken contract, not an absent probe.
+///
+/// Mutant: make `current` swallow a failed downcast -> it returns `None` instead of panicking.
+#[test]
+fn a_slot_holding_the_wrong_sender_type_panics() {
+    let (wrong_tx, _wrong_rx) = channel::<&'static str>();
+    assert!(insert(TypeId::of::<A>(), Box::new(wrong_tx)));
+    let current = std::panic::catch_unwind(current::<A>);
+    SLOTS.with(|slots| slots.borrow_mut().remove(&TypeId::of::<A>()));
+    assert!(current.is_err(), "a mistyped slot must panic, not read as absent");
 }

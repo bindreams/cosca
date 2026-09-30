@@ -190,10 +190,7 @@ pub(crate) async fn wait_exit(id: ProcessId) -> Result<(), Error> {
 /// watcher RETURNS, so a test can prove drop-release with a plain `recv()` — the
 /// no-time-sync alternative to observing teardown timing. Absent from non-test builds.
 ///
-/// A [`crate::relayed_probe`], not a process-global slot (see `armed_probe`'s doc):
-/// `notify_released` runs in `blocking_watch`, which every watch in the binary goes through, so
-/// a global slot would let another thread's watch notify this thread's observer. `blocking_watch`
-/// relays it across `spawn_blocking`.
+/// A [`crate::relayed_probe`]: `blocking_watch` relays it across `spawn_blocking`.
 #[cfg(all(test, windows))]
 pub(crate) mod fault_observer {
     use crate::relayed_probe::{self, Probe};

@@ -346,11 +346,8 @@ pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
 /// call site immediately force-signals `cancel` so the real wait that follows returns at once
 /// instead of genuinely spending the grace — a caught bug fails fast, not slow.
 ///
-/// A [`crate::relayed_probe`], not a process-global slot: a global (even one gated by
-/// `is_armed`) is visible from every thread, so under plain `cargo test`'s shared process a
-/// concurrent, unrelated test's `block_until_exit_or_cancel` on ANOTHER thread would see
-/// `is_armed() == true`, find ITS OWN target unsignalled, and get force-cancelled too.
-/// `blocking_watch` (`src/tokio/wait.rs`) relays it to the blocking-pool thread the wait runs on.
+/// A [`crate::relayed_probe`]. `blocking_watch` relays it to the blocking-pool thread; a
+/// process-global slot would force-cancel an unrelated test's wait.
 #[cfg(test)]
 pub(crate) mod armed_probe {
     use crate::relayed_probe::{self, Probe};
@@ -363,9 +360,6 @@ pub(crate) mod armed_probe {
 
     pub(crate) type Guard = relayed_probe::Guard<Armed>;
 
-    // Every consumer is a `tokio`-only test, so this is dead code in a `--no-default-features`
-    // (no `tokio`) build — same shape as `block_until_exit_or_cancel`'s own `allow(dead_code)`
-    // just above.
     #[cfg_attr(
         not(feature = "tokio"),
         allow(
