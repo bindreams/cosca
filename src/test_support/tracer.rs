@@ -432,14 +432,13 @@ pub(crate) enum Tracee {
     Plain,
     /// Exits with [`SIGTERM_EXIT`] on `SIGTERM`.
     CatchSigterm,
-    /// Holds a thread it created with `pthread_create_suspended_np` and never starts, then names
-    /// its own thread [`UNSTARTED_READY`].
+    /// Holds a thread it created with `pthread_create_suspended_np` and never starts, then writes
+    /// [`UNSTARTED_READY`] to its piped stdout.
     UnstartedThread,
 }
 
-/// The name a [`Tracee::UnstartedThread`] tracee gives its test thread once the unstarted thread
-/// exists.
-pub(crate) const UNSTARTED_READY: &std::ffi::CStr = c"uh-unstarted-ready";
+/// The line that signals a [`Tracee::UnstartedThread`] is ready.
+pub(crate) const UNSTARTED_READY: &str = "uh-unstarted-ready";
 
 /// Spawns [`uh_tracee_fixture`] of `kind`, uncontained, with a piped stdin: closing it ends the
 /// tracee.
@@ -464,7 +463,11 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> crate::Child {
         }
     }
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
-    cmd.stdout(crate::Stdio::null()).expect("stdout null");
+    let stdout = match kind {
+        Tracee::UnstartedThread => crate::Stdio::pipe(),
+        Tracee::Plain | Tracee::CatchSigterm => crate::Stdio::null(),
+    };
+    cmd.stdout(stdout).expect("stdout");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
     cmd.spawn().expect("spawn the tracee fixture")
 }
@@ -487,7 +490,6 @@ fn uh_tracee_fixture() {
     }
     if std::env::var("COSCA_UH_UNSTARTED").as_deref() == Ok("1") {
         unsafe extern "C" {
-            /// libpthread: creates the thread without starting it.
             fn pthread_create_suspended_np(
                 thread: *mut libc::pthread_t,
                 attr: *const libc::pthread_attr_t,
@@ -503,9 +505,12 @@ fn uh_tracee_fixture() {
         let rc =
             unsafe { pthread_create_suspended_np(&mut thread, std::ptr::null(), never_runs, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "pthread_create_suspended_np");
-        // SAFETY: a NUL-terminated name shorter than `MAXTHREADNAMESIZE`.
-        let rc = unsafe { libc::pthread_setname_np(UNSTARTED_READY.as_ptr()) };
-        assert_eq!(rc, 0, "pthread_setname_np");
+        // Raw `stdout()`, not `println!`, which libtest captures.
+        let line = format!("\n{UNSTARTED_READY}\n");
+        let mut out = std::io::stdout().lock();
+        out.write_all(line.as_bytes())
+            .and_then(|()| out.flush())
+            .expect("report readiness");
     }
     let _ = sys::read_byte(0);
 }
