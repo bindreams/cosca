@@ -39,48 +39,61 @@ fn tracee_receiving(kind: Tracee, signals: &[i32]) -> Option<(crate::Child, std:
     Some((child, stdin))
 }
 
+/// `signal`'s bit in a signal mask.
+fn bit(signal: i32) -> u32 {
+    debug_assert!((1..32).contains(&signal), "signal {signal} is outside the mask");
+    1 << (signal - 1)
+}
+
 /// Asserts the preconditions of the helper's contract (see [`super`]) for `signal`, sent to the
-/// set-up, untraced tracee `pid`: its reading thread does not block it, it has a handler exactly
-/// when `caught` and does not ignore it, and a `SIGTSTP`, `SIGTTIN` or `SIGTTOU` is not sent into
-/// an orphaned process group. XNU discards those three there for a traced process whatever its
-/// disposition (xnu `kern_sig.c`, `psignal_internal`, `pg_jobc == 0`), so the helper would wait
-/// for a stop that never comes. For those three the tracee must also lead its own group, so that
-/// no other process's exit can orphan it after this check ([`Tracee::OwnGroup`]).
+/// set-up, untraced tracee `pid`, from what it reported of itself (`ready`): its threads do not
+/// block it, it has a handler exactly when `caught`, and it does not ignore it (stricter than
+/// needed for `SIGCONT`, which continues the process even when ignored). A `SIGTSTP`, `SIGTTIN`
+/// or `SIGTTOU` must also not be sent into an orphaned process group: XNU discards those three
+/// there for a traced process whatever its disposition (xnu `kern_sig.c`, `psignal_internal`,
+/// `pg_jobc == 0`), so the helper would wait for a stop that never comes. For them the tracee
+/// must lead its own group ([`Tracee::OwnGroup`]), whose `pg_jobc` only the tracee, the test or
+/// the tracer can change after this check.
+///
+/// `SIGKILL` and `SIGSTOP` need none of this: they cannot be blocked, caught or ignored, and are
+/// not job-control stops.
 fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
-    use crate::identity::kinfo::{kinfo, signal_bit};
     assert_eq!(
-        ready.blocked & signal_bit(signal),
+        ready.blocked & bit(signal),
         0,
         "precondition: the tracee blocks signal {signal}"
     );
-    let info = match kinfo(pid as _) {
-        crate::identity::Resolved::Found(info) => info,
-        crate::identity::Resolved::Gone => panic!("precondition: the tracee {pid} is gone"),
-        crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),
-    };
-    assert!(
-        !info.kp_proc.sig_ignored(signal),
+    assert_eq!(
+        ready.ignored & bit(signal),
+        0,
         "precondition: the tracee ignores signal {signal}"
     );
     assert_eq!(
-        info.kp_proc.sig_caught(signal),
+        ready.caught & bit(signal) != 0,
         caught,
         "precondition: whether the tracee catches signal {signal}"
     );
     if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
-        // SAFETY: `getpgid` has no memory preconditions; `pid` is this test's unreaped child.
-        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-        assert_eq!(
-            pgid, pid as libc::pid_t,
-            "precondition: the tracee does not lead its own process group. Spawn it as Tracee::OwnGroup"
-        );
-        let jobc = info.e_jobc();
-        assert_ne!(
-            jobc, 0,
-            "precondition: the tracee's process group is orphaned (pg_jobc {jobc}), so XNU discards \
-             signal {signal} sent to it while traced. Spawn it as Tracee::OwnGroup"
-        );
+        assert_job_control_reaches(pid, ready, signal);
     }
+}
+
+/// The group half of [`assert_receives`] for the job-control stop `signal`.
+fn assert_job_control_reaches(pid: u32, ready: &super::Ready, signal: i32) {
+    assert_eq!(
+        ready.pgrp, pid as libc::pid_t,
+        "precondition: the tracee does not lead its own process group. Spawn it as Tracee::OwnGroup"
+    );
+    let jobc = match crate::identity::kinfo::kinfo(pid as _) {
+        crate::identity::Resolved::Found(info) => info.e_jobc(),
+        crate::identity::Resolved::Gone => panic!("precondition: the tracee {pid} is gone"),
+        crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),
+    };
+    assert_ne!(
+        jobc, 0,
+        "precondition: the tracee's process group is orphaned (pg_jobc {jobc}), so XNU discards \
+         signal {signal} sent to it while traced. Spawn it as Tracee::OwnGroup"
+    );
 }
 
 /// A report as the helper wrote it.
@@ -329,6 +342,41 @@ fn a_blocked_signal_fails_the_precondition() {
     }
     let message = check_receives(Tracee::BlockSigtstp, libc::SIGTSTP, false).expect_err("no failure");
     assert!(message.contains("blocks signal 18"), "{message}");
+}
+
+/// The block is the process's, not one thread's: an untraced `SIGTSTP` stays pending, and the
+/// tracee exits on EOF. Mutant: `BlockSigtstp` blocks it on the reading thread only, and the
+/// main thread takes the stop.
+#[test]
+fn a_blocked_tracee_blocks_the_signal_on_every_thread() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let (mut tracee, ready) = super::spawn_tracee(Tracee::BlockSigtstp);
+    let stdin = tracee.stdin().expect("the tracee's stdin is piped");
+    let pid = tracee.id().pid();
+    // So XNU would not discard the stop the mutant takes.
+    assert_job_control_reaches(pid, &ready, libc::SIGTSTP);
+    let message = panic_of(|| assert_receives(pid, &ready, libc::SIGTSTP, false));
+    assert!(message.contains("blocks signal 18"), "{message}");
+    send(pid, libc::SIGTSTP);
+    drop(stdin);
+    let info = await_change(pid);
+    if info.si_code == libc::CLD_STOPPED {
+        end_stopped(tracee);
+        panic!("the tracee was stopped by signal {}", info.si_status);
+    }
+    assert_exited_cleanly(tracee);
+}
+
+/// Mutant: `tracee_receiving` does not assert the preconditions.
+#[test]
+fn a_tracee_a_test_sends_a_job_control_stop_must_lead_its_own_group() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let message = panic_of(|| drop(tracee_receiving(Tracee::Plain, &[libc::SIGTSTP])));
+    assert!(message.contains("does not lead its own process group"), "{message}");
 }
 
 /// Mutant: `SIG_IGN` is not checked.

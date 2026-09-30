@@ -1,8 +1,8 @@
 //! `sysctl(KERN_PROC_PID)` / `kinfo_proc` — the BSD interface that resolves ZOMBIES and
 //! EPERM-hidden cross-user processes (libproc's `proc_pidinfo` does not). libc has no apple
 //! definition for these structs, so this is a minimal faithful local one. Only
-//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read, and in tests `p_sigignore`,
-//! `p_sigcatch` and `eproc.e_jobc`; everything else is layout.
+//! `p_un.p_starttime`, `p_stat`, and `eproc.e_ppid` are read, and in tests `eproc.e_jobc`;
+//! everything else is layout.
 //! Layout is triple-checked: the compile-time size tripwires below, the kernel-size oracle,
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 
@@ -52,27 +52,6 @@ impl kinfo_proc {
         let at = kinfo_proc::E_JOBC_OFFSET;
         i16::from_ne_bytes(self.kp_eproc[at..at + 2].try_into().expect("2 bytes"))
     }
-}
-
-/// Read only by the tracer helper's tests (`test_support::tracer`), for their preconditions.
-#[cfg(test)]
-impl extern_proc {
-    /// Whether the process has set `signal` to `SIG_IGN` (`p_sigignore`).
-    pub(crate) fn sig_ignored(&self, signal: libc::c_int) -> bool {
-        self.p_sigignore & signal_bit(signal) != 0
-    }
-
-    /// Whether the process has a handler for `signal` (`p_sigcatch`).
-    pub(crate) fn sig_caught(&self, signal: libc::c_int) -> bool {
-        self.p_sigcatch & signal_bit(signal) != 0
-    }
-}
-
-/// `signal`'s bit in a 32-bit signal mask: bit `signal - 1`.
-#[cfg(test)]
-pub(crate) fn signal_bit(signal: libc::c_int) -> u32 {
-    debug_assert!((1..=32).contains(&signal), "signal {signal} is outside the 32-bit mask");
-    1 << (signal - 1)
 }
 
 // E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
