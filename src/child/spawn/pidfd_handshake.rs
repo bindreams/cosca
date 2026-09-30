@@ -447,7 +447,7 @@ pub(crate) mod fault {
         // SAFETY: `fstat` into a zeroed buffer.
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
-            (libc::fstat(fd, &mut st) == 0).then(|| (st.st_dev as u64, st.st_ino as u64))
+            (libc::fstat(fd, &mut st) == 0).then_some((st.st_dev as u64, st.st_ino as u64))
         }
     }
 
