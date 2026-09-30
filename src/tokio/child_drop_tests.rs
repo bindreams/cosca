@@ -54,9 +54,9 @@ mod linux {
         Signalled(i32),
         /// Reaped before its stdin closed, by tokio's own `Child` drop (its `try_wait` ran after
         /// something had already ended the root), so no status is left to read. It proves only
-        /// that the root died with its stdin open. For a root that ignores every catchable signal
-        /// ([`ignoring_blocker`](super::ignoring_blocker)) that leaves an uncatchable signal, a
-        /// crash or a foreign kill: never a wrong signal from the drop.
+        /// that the root died with its stdin open. For [`ignoring_blocker`](super::ignoring_blocker),
+        /// which ignores every signal but the ones it lists there, that leaves `SIGKILL`, one of
+        /// those exceptions, a crash or a foreign kill: never another signal from the drop.
         ReapedWhileStdinOpen,
     }
 
@@ -94,8 +94,9 @@ mod linux {
 
         /// Close the root's stdin, so a root nothing signalled exits on its own, wait for its
         /// exit, and say how it ended. A root a drop killed died of `SIGKILL` before its stdin
-        /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root the kill
-        /// already ended, which leaves no status to read: that is [`Ended::KilledAndReapedByTokio`].
+        /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root that
+        /// something already ended, which leaves no status to read: that is
+        /// [`Ended::ReapedWhileStdinOpen`].
         /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
         /// a runtime.
         pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
@@ -254,10 +255,12 @@ async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
     );
 }
 
-/// A root that ignores every catchable signal, blocked on its stdin, and its stdin's write end. It
-/// says `r` once the `trap` is in place, and the caller reads that before dropping the child:
-/// otherwise the drop races the `trap`, and a `SIGTERM` would still kill the root. Only an
-/// uncatchable signal can end it early.
+/// A root that ignores signals 1-8, 10-18 and 20-64 (`trap '' $(seq 1 8) $(seq 10 18) $(seq 20
+/// 64)`), blocked on its stdin, and its stdin's write end. Not ignored: `SIGKILL` (9) and
+/// `SIGSTOP` (19), which cannot be, and 32 and 33, glibc's reserved real-time signals, which dash
+/// accepts in a `trap` without ignoring (`SIGCHLD`, 17, is ignored by default anyway). It says `r`
+/// once the `trap` is in place, and the caller reads that before dropping the child: otherwise the
+/// drop races the `trap`, and a `SIGTERM` would still kill the root.
 #[cfg(target_os = "linux")]
 async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::ChildStdout) {
     use ::tokio::io::AsyncReadExt as _;
@@ -266,7 +269,7 @@ async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::C
     cmd.args([
         "sh",
         "-c",
-        "trap '' HUP INT QUIT PIPE ALRM TERM USR1 USR2; echo r; exec cat >/dev/null",
+        "trap '' $(seq 1 8) $(seq 10 18) $(seq 20 64); echo r; exec cat >/dev/null",
     ]);
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
@@ -279,9 +282,10 @@ async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::C
     (child, stdin, stdout)
 }
 
-/// The drop kills the root itself, and with `SIGKILL`: the root ignores every catchable signal, so
-/// a drop that sent any other would leave it running until its stdin closes (`Exited(0)`). Mutants:
-/// the drop skips the kill, or sends `SIGTERM`.
+/// The drop kills the root itself, and with `SIGKILL`: the root ignores every signal but `SIGKILL`,
+/// `SIGSTOP` and 32 and 33 (see [`ignoring_blocker`]), so a drop that sent any other would leave it
+/// running until its stdin closes (`Exited(0)`). Mutants: the drop skips the kill, or sends
+/// `SIGTERM` or `SIGPROF`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_kill_on_drop_drop_kills_the_root() {
