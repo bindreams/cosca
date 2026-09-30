@@ -129,8 +129,8 @@ fn confirm_exit_of(child: &std::process::Child) {
     assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
 }
 
-/// Adopt a child under the force `arm` installs, and expect the gone path: every method answers
-/// `ECHILD`. The child has already exited (and is not yet reaped) when it is adopted, so a force
+/// Adopt a child under the force `arm` installs, and expect the gone path: every wait answers
+/// `ECHILD`, and `kill` succeeds without sending. The child has already exited (and is not yet reaped) when it is adopted, so a force
 /// that is not applied leaves a handle whose methods answer at once with a status, and the
 /// assertions fail instead of blocking on a live child.
 #[cfg(target_os = "linux")]
@@ -147,12 +147,42 @@ pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
     assert!(is_echild(&shared.wait().expect_err("wait")));
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
     assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
-    assert!(is_echild(&shared.kill().expect_err("kill")));
+    let log = crate::send_log::Capture::start();
+    shared
+        .kill()
+        .expect("a child that was gone at adoption is already dead: success");
+    assert_eq!(log.entries(), [], "nothing is sent without a pidfd");
+    drop(log);
     // The force was synthetic: the child is still this test's own, unreaped.
     let mut status = 0;
     // SAFETY: `status` is a valid out-pointer.
     let r = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
     assert_eq!(r, pid as i32, "reap the fixture: {}", io::Error::last_os_error());
+}
+
+// Hand-off checks =====
+
+/// After the holder with `token` has returned, and before any waiter is joined: the handle must
+/// not still be in that holder's `W`, and every state write must have been followed at once by a
+/// `notify_all`. On a breach the state is repaired first (`N`, and a wake), so the blocked waiters
+/// return, and then the test fails: a stranded holder fails by assertion, not by a hang.
+pub(super) fn assert_handed_off(shared: &SharedChild, token: u64) {
+    use crate::child::shared::{Logged, State};
+    let mut lock = shared.lock();
+    let stranded = matches!(lock.state, State::W { token: t } if t == token);
+    // Each write and its wake are pushed together, in one critical section.
+    let unnotified = lock
+        .log
+        .iter()
+        .enumerate()
+        .any(|(i, entry)| matches!(entry, Logged::Write(_)) && lock.log.get(i + 1) != Some(&Logged::Notify));
+    if stranded || unnotified {
+        let log = lock.log.clone();
+        lock.set(State::N);
+        shared.notify(&mut lock);
+        drop(lock);
+        panic!("the holder {token} left the handle stranded ({stranded}) or unnotified ({unnotified}): {log:?}");
+    }
 }
 
 // Threads =====
