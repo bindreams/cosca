@@ -7,6 +7,9 @@
 #[path = "shared_tests/fixtures.rs"]
 mod fixtures;
 #[cfg(target_os = "linux")]
+#[path = "shared_tests/foreign_tracer.rs"]
+mod foreign_tracer;
+#[cfg(target_os = "linux")]
 #[path = "shared_tests/linux.rs"]
 mod linux;
 #[cfg(target_os = "macos")]

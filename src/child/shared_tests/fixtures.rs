@@ -19,8 +19,16 @@ pub(super) struct Blocker {
 
 /// A blocker spawned under `spawn_lock`, not yet adopted.
 pub(super) fn spawn_std_blocker() -> (std::process::Child, ChildStdin) {
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
+    spawn_std_blocker_with(|_| {})
+}
+
+/// [`spawn_std_blocker`] after `configure` has adjusted its command.
+pub(super) fn spawn_std_blocker_with(
+    configure: impl FnOnce(&mut std::process::Command),
+) -> (std::process::Child, ChildStdin) {
+    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
+    configure(&mut cmd);
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     (child, stdin)
 }
@@ -33,7 +41,12 @@ pub(super) fn identity_of(child: &std::process::Child) -> ProcessId {
 
 impl Blocker {
     pub(super) fn spawn() -> Blocker {
-        let (child, stdin) = spawn_std_blocker();
+        Blocker::spawn_with(|_| {})
+    }
+
+    /// [`Blocker::spawn`] with `configure` run on the command first.
+    pub(super) fn spawn_with(configure: impl FnOnce(&mut std::process::Command)) -> Blocker {
+        let (child, stdin) = spawn_std_blocker_with(configure);
         let id = identity_of(&child);
         let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
         Blocker {
