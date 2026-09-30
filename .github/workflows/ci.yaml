@@ -156,12 +156,14 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }}
 
       - name: Run tests
+        timeout-minutes: 6
         run: cargo nextest run --locked --target ${{ matrix.target }} --profile ci
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
       # logon session) is `#[ignore]`d everywhere else. This step opts in to exactly that test.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
+        timeout-minutes: 6
         run: >-
           cargo nextest run --locked --target ${{ matrix.target }} --profile ci
           --test windows_process_cwd --run-ignored all
@@ -169,13 +171,16 @@ jobs:
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Run tests (pty feature)
+        timeout-minutes: 6
         run: cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        timeout-minutes: 6
         run: cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Run tests (serde feature)
+        timeout-minutes: 6
         run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
 
       # nextest runs each test in its own process, which hides tests that mutate process-global
@@ -239,12 +244,14 @@ jobs:
       # release builds do where debug builds assert a broken precondition instead.
       - name: Unit tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 6
         run: cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
 
       # The same lane with `tokio`: `tokio::wait_tests` pins `arm_at`'s calm-release arm (a deadline
       # inside tokio's timer margin waits unbounded where debug builds assert).
       - name: Unit tests (release — debug_assertions off, tokio feature)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 6
         run: cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }} --profile ci
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
@@ -310,6 +317,7 @@ jobs:
       # passed in as positional arguments rather than looked up again inside the root shell.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
+        timeout-minutes: 8
         run: |
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
@@ -359,6 +367,7 @@ jobs:
 
       - name: Run setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
+        timeout-minutes: 8
         run: cargo nextest run --locked --target ${{ matrix.target }} --test group_teardown_setuid --run-ignored only --profile ci
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
@@ -381,6 +390,18 @@ jobs:
           sudo -E "$BIN" --ignored --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
           cat "$RUNNER_TEMP/setuid-root.log"
           grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"
+
+      # A step that hangs or fails leaves its process table behind; naming the stuck process
+      # (state, parent, group, age) is what makes the next hang diagnosable. Windows has no `ps`.
+      - name: Print the process table (Linux)
+        if: (cancelled() || failure()) && matrix.os == 'linux'
+        timeout-minutes: 2
+        run: ps -eo pid,ppid,pgid,stat,etime,args
+
+      - name: Print the process table (macOS)
+        if: (cancelled() || failure()) && matrix.os == 'darwin'
+        timeout-minutes: 2
+        run: ps -axo pid,ppid,pgid,stat,etime,command
 
   # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
   # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest
@@ -452,10 +473,12 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       - name: Archive the privilege tests
+        timeout-minutes: 10
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane.tar.zst"
 
       # The container is the sandbox, so consent is given here.
       - name: Run lane
+        timeout-minutes: 5
         run: |
           set -euxo pipefail
           docker run --rm --network none ${{ matrix.docker_flags }} \
@@ -492,6 +515,7 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       - name: Archive the privilege tests
+        timeout-minutes: 10
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane-macos.tar.zst"
 
       # Two directories:
@@ -517,6 +541,7 @@ jobs:
       # `sudo -E` keeps `TMPDIR`; the runner is ephemeral and single-tenant, so consent is given
       # here. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned.
       - name: Run root lane (macOS)
+        timeout-minutes: 5
         env:
           COSCA_TEST_ROOT: "1"
           COSCA_TEST_ROOT_CONSENT: "1"
@@ -527,3 +552,8 @@ jobs:
             test "$(stat -f %u "$TMPDIR")" = 0
             exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
+
+      - name: Print the process table
+        if: cancelled() || failure()
+        timeout-minutes: 2
+        run: ps -axo pid,ppid,pgid,stat,etime,command
