@@ -1,0 +1,36 @@
+name: Hang hunt
+on: pull_request
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: amd64-tracer, runner: macos-15, target: x86_64-apple-darwin, feat: "", filter: "test(/tracer|macos_tests/)", n: 60}
+          - {name: arm64-tracer, runner: macos-latest, target: aarch64-apple-darwin, feat: "", filter: "test(/tracer|macos_tests/)", n: 60}
+          - {name: amd64-full-tokio, runner: macos-15, target: x86_64-apple-darwin, feat: "tokio", filter: "", n: 12}
+          - {name: arm64-full-tokio, runner: macos-latest, target: aarch64-apple-darwin, feat: "tokio", filter: "", n: 12}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      COSCA_TEST_TRACER: "1"
+      COSCA_TEST_TRACER_CONSENT: "1"
+      COSCA_TEST_ROOT: "0"
+      COSCA_TEST_NAMESPACES: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Loop
+        run: .github/scripts/hangloop.sh "${{ matrix.n }}" "${{ matrix.feat }}" '${{ matrix.filter }}' 420
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: logs
