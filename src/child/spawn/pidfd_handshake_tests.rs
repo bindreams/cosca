@@ -172,6 +172,10 @@ fn a_child_that_fails_before_reporting_its_pid_ends_the_spawn() {
     let (mut cmd, reader) = marker_command();
     let armed = fault::arm_child_fault(ChildFault::Fail);
     let err = cmd.spawn().err();
+    assert!(
+        !fault::child_end_leaked(),
+        "the parent must close its copy of the child's end once the spawn returns"
+    );
     drop(armed);
 
     match err.expect("a child that fails before exec fails the spawn") {
@@ -193,6 +197,10 @@ fn a_child_killed_before_reporting_its_pid_is_left_unreaped_and_named() {
     fault::reset_leaked_pid();
     let armed = fault::arm_child_fault(ChildFault::Sigkill);
     let err = cmd.spawn().err();
+    assert!(
+        !fault::child_end_leaked(),
+        "the parent must close its copy of the child's end once the spawn returns"
+    );
     drop(armed);
 
     let err = err.expect("a child killed before it reports fails the spawn");
@@ -220,6 +228,10 @@ fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let result = handshake.run(
         || Err::<(), _>(std::io::Error::other("failed before the fork")),
         |()| None,
+    );
+    assert!(
+        !fault::child_end_leaked(),
+        "the parent must close its copy of the child's end once the spawn returns"
     );
     drop(guard);
 

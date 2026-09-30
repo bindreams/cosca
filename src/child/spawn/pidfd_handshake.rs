@@ -213,7 +213,14 @@ impl Handshake {
             let spawned = spawn();
             shared.live.store(false, Ordering::Release);
             // The last copy of the child's end that can keep the helper waiting.
+            #[cfg(test)]
+            let ident = fault::identify(child_end.as_raw_fd());
+            #[cfg(test)]
+            let raw_child_end = child_end.as_raw_fd();
             drop(child_end);
+            // Answers before the join can block on a copy that was never closed.
+            #[cfg(test)]
+            fault::check_child_end_closed(raw_child_end, ident);
             let outcome = join_helper(
                 helper,
                 #[cfg(test)]
@@ -317,7 +324,9 @@ fn conclude<T>(spawned: io::Result<T>, outcome: Outcome, pid_of: impl Fn(&T) -> 
 
 /// Warns that a dead child stays unreaped: without its pidfd its number cannot be trusted.
 fn leave_unreaped(pid: Option<u32>) {
-    log::warn!("pid {pid:?} died before its pidfd was opened; it is left unreaped");
+    log::warn!(
+        "pid {pid:?} died before its pidfd was opened; it is left unreaped, as cosca never reaps a Linux child by pid"
+    );
     #[cfg(test)]
     fault::leaked_pid(pid);
 }
@@ -410,6 +419,7 @@ pub(crate) mod fault {
     }
 
     thread_local! {
+        static CHILD_END_LEAKED: Cell<bool> = const { Cell::new(false) };
         static CHILD_FAULT: Cell<ChildFault> = const { Cell::new(ChildFault::None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
         static LEAKED: Cell<Option<Option<u32>>> = const { Cell::new(None) };
@@ -430,6 +440,32 @@ pub(crate) mod fault {
         fn drop(&mut self) {
             CHILD_FAULT.with(|f| f.set(ChildFault::None));
         }
+    }
+
+    /// `(st_dev, st_ino)` of `fd`.
+    pub(super) fn identify(fd: i32) -> Option<(u64, u64)> {
+        // SAFETY: `fstat` into a zeroed buffer.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            (libc::fstat(fd, &mut st) == 0).then(|| (st.st_dev as u64, st.st_ino as u64))
+        }
+    }
+
+    /// Records whether the parent's copy of the child's end (`fd`, whose identity was `ident`) is
+    /// still open. A leaked copy is closed here, so the helper still gets its EOF and the test
+    /// fails at its assert instead of hanging.
+    pub(super) fn check_child_end_closed(fd: i32, ident: Option<(u64, u64)>) {
+        let leaked = ident.is_some() && identify(fd) == ident;
+        if leaked {
+            // SAFETY: the leaked copy is this spawn's own.
+            unsafe { libc::close(fd) };
+        }
+        CHILD_END_LEAKED.with(|c| c.set(leaked));
+    }
+
+    /// Whether the last `run` on this thread left the parent's copy of the child's end open.
+    pub(crate) fn child_end_leaked() -> bool {
+        CHILD_END_LEAKED.with(Cell::get)
     }
 
     /// Taken once by `install`.
