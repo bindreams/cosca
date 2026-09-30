@@ -5,20 +5,22 @@
 //! fire while the kernel is still tearing the process down, before it is marked a zombie —
 //! the state `is_alive` reads.
 
+// `harness = false`: skuld is the only harness, and `#[macro_use]` makes its `#[test]` shadow the
+// built-in in every module of this binary, `common` and nested ones included. A `#[test]` that
+// libtest would run cannot compile to nothing.
+#[allow(
+    unused_imports,
+    reason = "a stray #[test] must register with skuld, not silently never run"
+)]
+#[macro_use]
+extern crate skuld;
+
 use std::io::{Read, Write};
 use std::time::Duration;
 
 #[path = "common/mod.rs"]
 mod common;
 use common::spawn_blocker;
-
-// `harness = false` in Cargo.toml: skuld is the only harness, so a plain `#[test]` must resolve to
-// skuld's macro.
-#[allow(
-    unused_imports,
-    reason = "a stray #[test] must register with skuld, not silently never run"
-)]
-use skuld::test;
 
 #[skuld::test]
 fn foreign_wait_returns_when_the_process_exits() {
