@@ -621,8 +621,9 @@ fn windows_resume_initial_threads_skips_a_thread_id_that_no_longer_exists() {
 /// call, not a walk that matches the System Idle process.
 #[test]
 fn process_pid_of_rejects_a_handle_that_names_no_process() {
-    let err = super::process_pid_of(windows::Win32::Foundation::HANDLE::default())
-        .expect_err("a null handle names no process");
+    let result = super::process_pid_of(windows::Win32::Foundation::HANDLE::default());
+    assert!(result.is_err(), "a null handle names no process: {result:?}");
+    let err = result.unwrap_err();
     assert!(
         err.to_string().contains("GetProcessId"),
         "error must name the call: {err}"
