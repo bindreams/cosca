@@ -14,7 +14,9 @@ use crate::test_support::require_group;
 /// `try_wait` on a child stopped under this process's `PTRACE_SEIZE` returns `None` and leaves the
 /// stop for the tracer: the test's own consuming `waitpid` then still gets it.
 ///
-/// Mutant: a one-step consuming `waitid`, which returns `CLD_TRAPPED` and consumes it.
+/// Mutants: a one-step consuming `waitid`, which returns `CLD_TRAPPED` and consumes it; and a peek
+/// without `WNOWAIT` (`src/wait/exit_only/linux.rs`), which consumes the stop yet still returns
+/// `None`. Both fail the final `waitpid` by assertion.
 #[cfg(target_os = "linux")]
 #[test]
 fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
@@ -53,17 +55,18 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
 
     assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
 
-    // The stop is still there for the tracer.
+    // The stop is still there for the tracer. `WNOHANG`: the `WNOWAIT` peek above already saw it,
+    // so a missing stop is an assertion failure here, never a wait that blocks forever.
     let mut status = 0;
     // SAFETY: `status` is a valid out-pointer.
-    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::__WALL) };
     assert_eq!(reaped, pid);
     assert!(
         libc::WIFSTOPPED(status),
         "try_wait consumed the tracer's stop: {status:#x}"
     );
 
-    // Clean-up: SIGKILL by kill(2), never PTRACE_KILL (which before v5.19 only resumes a
+    // Clean-up: SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
     // PTRACE_EVENT_STOP); `Blocker`'s drop then waits.
     b.shared.kill().expect("kill");
 }
