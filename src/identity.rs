@@ -298,6 +298,10 @@ pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
 #[cfg(target_os = "macos")]
 pub(crate) use backend::ppid_of as macos_ppid_of;
 
+/// The macOS parent-pid read's test seams and its attempt type.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use backend::{fault as macos_fault, PpidRead};
+
 /// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
 /// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
 #[cfg(windows)]
