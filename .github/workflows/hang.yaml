@@ -1,0 +1,58 @@
+name: Hang hunt
+on: pull_request
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - {runner: macos-latest, target: aarch64-apple-darwin, tag: arm64}
+        variant: [fix]
+        include:
+          - {variant: fix, n: 3, stress: 50}
+    name: ${{ matrix.arch.tag }}-${{ matrix.variant }}
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 90
+    env:
+      COSCA_TEST_TRACER: "1"
+      COSCA_TEST_TRACER_CONSENT: "1"
+      COSCA_TEST_ROOT: "0"
+      COSCA_TEST_NAMESPACES: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.arch.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Mutate
+        run: |
+          python3 - <<'PY'
+          v="${{ matrix.variant }}"
+          t='src/child/shared_tests/tracer.rs'
+          u=open(t).read()
+          p='src/test_support/tracer.rs'
+          w=open(p).read()
+          assert ".stderr(std::process::Stdio::null());\n    crate::test_spawn::spawn" in w
+          w=w.replace(".stderr(std::process::Stdio::null());\n    crate::test_spawn::spawn",".stderr(std::process::Stdio::inherit());\n    crate::test_spawn::spawn")
+          open(p,'w').write(w)
+          if v == "m0-cat":
+              assert u.count("Blocker::spawn_traceable();") == 3
+              u=u.replace("Blocker::spawn_traceable();","Blocker::spawn();")
+          if v == "fix-widened":
+              a='        step("attach and settle");'
+              assert a in u
+              u=u.replace(a,'        std::thread::sleep(Duration::from_millis(300));\n'+a)
+          open(t,'w').write(u)
+          PY
+          git diff --stat
+      - name: Loop
+        run: STRESS=${{ matrix.stress }} bash .github/scripts/hangloop.sh ${{ matrix.n }} "" 'test(/shared_tests::tracer::macos/)' 600
+        continue-on-error: ${{ startsWith(matrix.variant, 'm') }}
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.arch.tag }}-${{ matrix.variant }}
+          path: logs
