@@ -52,7 +52,10 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
         .expect("scratch directory for world-executable copies");
     std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
         .expect("chmod the scratch directory world-traversable");
-    let target_bin = common::world_executable_copy(std::path::Path::new(common::testbin()), scratch.path());
+    // `env!("CARGO_BIN_EXE_…")` is the build-time path, which does not exist where a nextest
+    // archive runs (a root lane's container); nextest sets its own variable to the extracted one.
+    let testbin = std::env::var_os("NEXTEST_BIN_EXE_cosca_testbin").unwrap_or_else(|| common::testbin().into());
+    let target_bin = common::world_executable_copy(std::path::Path::new(&testbin), scratch.path());
 
     // The target. `cosca::Command` has no uid()/gid() (a cross-platform builder — Windows has no
     // such concept), so this one spawn uses `std::process::Command` directly, under the spawn
