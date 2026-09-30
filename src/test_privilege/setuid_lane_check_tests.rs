@@ -159,7 +159,11 @@ fn setuid_lane_check_fake_rejects_any_other_invocation() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the fake");
-        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        // A fake that rejects the invocation exits without reading stdin: a broken pipe is its answer.
+        match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => panic!("write the fake's stdin: {e}"),
+            _ => {}
+        }
         child.wait().expect("wait for the fake").code()
     }
     let real = ["setuid-stdin-block", "root"];
