@@ -5,13 +5,13 @@
 
 use std::io;
 
-use crate::identity::{pbi_start_quiet, ReadPurpose, Resolved, StartToken};
+use crate::identity::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
 
 use super::{is_exit_record, reaped_from_record, Foreign, Peek, Reap, Record, Target};
 
-fn pid_and_start(target: &Target<'_>) -> (u32, Option<StartToken>) {
+fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
     match target {
-        Target::Pid { pid, start, .. } => (*pid, *start),
+        Target::Pid { pid, unique, .. } => (*pid, *unique),
     }
 }
 
@@ -58,39 +58,62 @@ fn peek_raw(pid: u32) -> io::Result<Peek> {
     }
 }
 
-/// Whether `pid`'s start time, read for `purpose`, is `start`'s.
-enum StartCheck {
+/// Whether `pid`'s unique id, read for `purpose`, is `unique`.
+enum IdCheck {
     Matches,
     Other,
     Gone,
     Unreadable,
 }
 
-fn check_start(pid: u32, start: StartToken, purpose: ReadPurpose) -> StartCheck {
-    match pbi_start_quiet(pid, purpose) {
-        Resolved::Found(now) if now == start => StartCheck::Matches,
-        Resolved::Found(_) => StartCheck::Other,
-        Resolved::Gone => StartCheck::Gone,
-        Resolved::Unknown => StartCheck::Unreadable,
+fn check_unique(pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
+    match uniq_info(pid, purpose) {
+        UniqRead::Found(now) if now.unique_id == unique => IdCheck::Matches,
+        UniqRead::Found(_) => IdCheck::Other,
+        UniqRead::Gone => IdCheck::Gone,
+        UniqRead::Refused(_) => IdCheck::Unreadable,
     }
 }
 
 pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
-    let (pid, start) = pid_and_start(target);
+    let (pid, unique) = pid_and_unique(target);
     let peeked = peek_raw(pid)?;
-    // The start is read only when the peek says `Exit`, just before the consume: a `Running`
-    // or `ECHILD` reads none, so a reusing process of another user never provokes the same-user
-    // `EPERM` (`proc_info.c:2197-2212`).
-    let (Peek::Exit(_), Some(start)) = (peeked, start) else {
-        return Ok(peeked);
-    };
-    match check_start(pid, start, ReadPurpose::Peek) {
-        StartCheck::Matches => Ok(peeked),
-        StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-        StartCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
-        // Unreadable start: the caller gets the start-less peek's answer. `Unassessable` is a
-        // later unit's; a start that cannot be read is never taken as a mismatch.
-        StartCheck::Unreadable => Ok(peeked),
+    let Some(unique) = unique else { return Ok(peeked) };
+    match peeked {
+        Peek::Exit(_) => match check_unique(pid, unique, ReadPurpose::Peek) {
+            IdCheck::Matches => Ok(peeked),
+            IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            IdCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
+            // The read failed (a MACF denial): the caller gets the id-less peek's answer.
+            // `Unassessable` is a later unit's; an id that cannot be read is never a mismatch.
+            IdCheck::Unreadable => Ok(peeked),
+        },
+        // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
+        // of the pid by another child of ours also looks like this, so the id decides.
+        Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
+            IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            IdCheck::Matches | IdCheck::Gone | IdCheck::Unreadable => Ok(peeked),
+        },
+        // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
+        // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
+        // `NOTE_EXIT`. The pid names our child and a live process other than launchd holds it:
+        // running. A child held by launchd is a zombie (or a child mid-exit) whose tracer died:
+        // XNU reparents it to launchd and keeps `p_oppid` naming us (xnu-12377.121.6
+        // `kern_exit.c:2612-2613` and `:2748`, which sends the `SIGCHLD` to launchd). It comes
+        // back to us only if launchd waits on it: `reap_child_locked` then finds `p_oppid`, hands
+        // it back and re-sends `NOTE_EXIT` (`:2864-2912`). On CI launchd never did, in a 30 s
+        // window, so this is taken for reaped: a later `wait` or `try_wait` still reaps the
+        // zombie if that hand-back ever comes.
+        Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
+            Held::Other => Ok(Peek::Foreign(Foreign::Other)),
+            Held::Parent(ppid) if ppid == LAUNCHD => Ok(peeked),
+            Held::Parent(_) => Ok(Peek::Running),
+            // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
+            Held::Gone => Ok(peeked),
+            // A MACF denial: not ours to see.
+            Held::Refused(_) => Ok(peeked),
+        },
+        Peek::Foreign(Foreign::Other) => Ok(peeked),
     }
 }
 
@@ -107,29 +130,30 @@ fn consume(pid: u32) -> io::Result<Option<Record>> {
 }
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
-    let (pid, start) = pid_and_start(target);
+    let (pid, unique) = pid_and_unique(target);
     match peek(target)? {
         Peek::Exit(_) => {}
         Peek::Running => return Ok(Reap::Running),
         Peek::Foreign(f) => return Ok(Reap::Foreign(f)),
     }
-    // Our own zombie's start, read before the first reap: the first reap does not change it
+    // Our own zombie's unique id, read before the first reap: the first reap does not change it
     // (`proc_reparentlocked` returns early when the parent is unchanged, `kern_exit.c:3411`),
     // and the second peek checks it.
-    let second_start = start.or_else(|| match pbi_start_quiet(pid, ReadPurpose::PreReap) {
-        Resolved::Found(t) => Some(t),
-        Resolved::Gone => None,
-        Resolved::Unknown => None,
+    let second_unique = unique.or_else(|| match uniq_info(pid, ReadPurpose::PreReap) {
+        UniqRead::Found(now) => Some(now.unique_id),
+        UniqRead::Gone | UniqRead::Refused(_) => None,
     });
     let first = match consume(pid) {
         Ok(Some(record)) => reaped_from_record(record),
         // A by-pid consume is never pinned: a foreign reap between the peek and here, then a
-        // reuse of the pid by a child that is still running, finds nothing.
+        // reuse of the pid by a child that is still running, finds nothing. A reuser that is our
+        // own child and already a zombie has its exit record consumed instead: the id check above
+        // is a check, not a pin.
         Ok(None) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) if is_echild(&e) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) => return Err(e),
     };
-    second_reap(pid, second_start);
+    second_reap(pid, second_unique);
     Ok(Reap::Reaped(first))
 }
 
@@ -141,7 +165,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 ///
 /// The first status is already in hand, so nothing here panics: every outcome is a quiet skip
 /// or a `warn`.
-pub(crate) fn second_reap(pid: u32, start: Option<StartToken>) {
+pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
     #[cfg(test)]
     super::seams::step(super::seams::HolderStep::SecondPeek);
     match peek_raw(pid) {
@@ -163,17 +187,20 @@ pub(crate) fn second_reap(pid: u32, start: Option<StartToken>) {
             return;
         }
     }
-    if let Some(start) = start {
-        match check_start(pid, start, ReadPurpose::SecondPeek) {
-            StartCheck::Matches => {}
-            StartCheck::Other | StartCheck::Gone => {
-                log::debug!("second reap of pid {pid}: the pid names another process now");
-                return;
-            }
-            StartCheck::Unreadable => {
-                log::warn!("second reap of pid {pid}: its start could not be read; a zombie may be left");
-                return;
-            }
+    // A consume by a bare pid could take a reusing process's exit record.
+    let Some(unique) = unique else {
+        log::warn!("second reap of pid {pid}: no identity to check it against; a zombie may be left");
+        return;
+    };
+    match check_unique(pid, unique, ReadPurpose::SecondPeek) {
+        IdCheck::Matches => {}
+        IdCheck::Other | IdCheck::Gone => {
+            log::debug!("second reap of pid {pid}: the pid names another process now");
+            return;
+        }
+        IdCheck::Unreadable => {
+            log::warn!("second reap of pid {pid}: its identity could not be read; a zombie may be left");
+            return;
         }
     }
     match consume(pid) {

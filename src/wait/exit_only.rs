@@ -111,7 +111,8 @@ pub(crate) enum Target<'a> {
     #[cfg(target_os = "macos")]
     Pid {
         pid: u32,
-        start: Option<crate::identity::StartToken>,
+        /// The child's unique id (`proc_pidinfo` flavor 17): never reused, so it names the child.
+        unique: Option<u64>,
         _lt: std::marker::PhantomData<&'a ()>,
     },
     /// A process handle: pinned.
@@ -121,11 +122,11 @@ pub(crate) enum Target<'a> {
 
 #[cfg(target_os = "macos")]
 impl Target<'_> {
-    /// The child `pid`, checked against `start` when there is one.
-    pub(crate) fn pid(pid: u32, start: Option<crate::identity::StartToken>) -> Target<'static> {
+    /// The child `pid`, checked against `unique` when there is one.
+    pub(crate) fn pid(pid: u32, unique: Option<u64>) -> Target<'static> {
         Target::Pid {
             pid,
-            start,
+            unique,
             _lt: std::marker::PhantomData,
         }
     }

@@ -16,7 +16,7 @@
 //!
 //! - Every lock is taken poison-tolerantly (`lock().unwrap_or_else(PoisonError::into_inner)`),
 //!   `Condvar` results included. `Debug` alone uses `try_lock`.
-//! - Every state write calls `notify_all`.
+//! - Every state write calls `notify_all` ([`Inner::set`], then [`SharedChild::notify`]).
 //! - The holder is armed by a [`HolderGuard`] whose `Drop` restores `N` (and wakes the waiters)
 //!   only if the state is still its own `W`: an `Err`, a `?` or a panic can never strand the
 //!   waiters, and a normal return can never restore `N` under a new holder, because
@@ -26,13 +26,15 @@
 //!   `kevent` timeout's own cap), and after every wake `crate::wait::now() >= deadline` decides
 //!   expiry, never the primitive's own "timed out".
 //!
-//! `pidfd: None` (Linux) means the child was already reaped elsewhere when it was adopted: every
-//! method answers `ECHILD`.
+//! `pidfd: None` (Linux), and an identity read that said `ESRCH` at adoption (macOS), mean the child
+//! was already reaped elsewhere when it was adopted: every wait answers `ECHILD`, and `kill` is
+//! success.
 
 use std::fmt;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::error::Error;
@@ -60,12 +62,72 @@ enum State {
 }
 
 struct Inner {
-    /// Kept alive for its stdio; also the signal path on macOS and Windows.
-    #[cfg_attr(target_os = "linux", allow(dead_code, reason = "Linux signals through the pidfd"))]
+    /// Kept alive for its stdio; also the signal path on Windows.
+    #[cfg_attr(
+        unix,
+        allow(dead_code, reason = "Unix signals through the pidfd or the verified pid")
+    )]
     child: std::process::Child,
     state: State,
     /// The next holder's token: one per holder, so a stale guard cannot touch a newer holder.
     next_token: u64,
+    /// Every state write and every `notify_all`, in order, pushed in the critical section that
+    /// makes it: what the tests check a hand-off against.
+    #[cfg(test)]
+    log: Vec<Logged>,
+}
+
+/// One entry of [`Inner::log`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Logged {
+    Write(State),
+    Notify,
+}
+
+impl Inner {
+    /// Write `state`. The caller wakes the waiters with [`SharedChild::notify`] in the same
+    /// critical section.
+    fn set(&mut self, state: State) {
+        self.state = state;
+        #[cfg(test)]
+        self.log.push(Logged::Write(state));
+    }
+}
+
+/// The lock guard. In a test build it also records which thread holds the lock, so a thread that
+/// locks it again panics instead of deadlocking.
+#[cfg(not(test))]
+type Guard<'a> = MutexGuard<'a, Inner>;
+
+#[cfg(test)]
+struct Guard<'a> {
+    guard: Option<MutexGuard<'a, Inner>>,
+    owner: &'a Mutex<Option<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Guard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        self.guard.as_ref().expect("a live guard")
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for Guard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        self.guard.as_mut().expect("a live guard")
+    }
+}
+
+#[cfg(test)]
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
 }
 
 /// A spawned child that several threads may wait on and kill at once.
@@ -76,11 +138,18 @@ pub(crate) struct SharedChild {
     /// reaped elsewhere at adoption.
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
+    /// The child's unique id, the one identity every by-pid check on macOS uses (see
+    /// [`crate::signal::Identity`]).
+    #[cfg(target_os = "macos")]
+    identity: crate::signal::Identity,
     /// A duplicate of the std `Child`'s process handle, usable unlocked.
     #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
     inner: Mutex<Inner>,
     condvar: Condvar,
+    /// The thread that holds `inner`, for [`SharedChild::lock`]'s self-deadlock check.
+    #[cfg(test)]
+    owner: Mutex<Option<std::thread::ThreadId>>,
 }
 
 // Construction =====
@@ -105,6 +174,22 @@ impl SharedChild {
             Ok(pidfd) => pidfd,
             Err(e) => return Err((e, child)),
         };
+        #[cfg(target_os = "macos")]
+        let identity = match crate::signal::Identity::read(id.pid()) {
+            crate::signal::Identity::Unreadable(errno) => {
+                return Err((
+                    Error::Unassessable {
+                        detail: format!(
+                            "pid {}: its identity could not be read (errno {errno}); the child was not adopted",
+                            id.pid()
+                        ),
+                        source: Some(io::Error::from_raw_os_error(errno)),
+                    },
+                    child,
+                ));
+            }
+            identity => identity,
+        };
         #[cfg(windows)]
         let handle = match Self::duplicate_handle(&child) {
             Ok(handle) => handle,
@@ -114,14 +199,20 @@ impl SharedChild {
             id,
             #[cfg(target_os = "linux")]
             pidfd,
+            #[cfg(target_os = "macos")]
+            identity,
             #[cfg(windows)]
             handle,
             inner: Mutex::new(Inner {
                 child,
                 state: State::N,
                 next_token: 0,
+                #[cfg(test)]
+                log: Vec::new(),
             }),
             condvar: Condvar::new(),
+            #[cfg(test)]
+            owner: Mutex::new(None),
         })
     }
 
@@ -142,8 +233,75 @@ impl SharedChild {
         self.id.pid()
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
+    fn lock(&self) -> Guard<'_> {
+        #[cfg(test)]
+        {
+            let me = std::thread::current().id();
+            let owner = self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_ne!(
+                *owner,
+                Some(me),
+                "self-deadlock: this thread locked a SharedChild it already holds"
+            );
+            drop(owner);
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(me);
+            Guard {
+                guard: Some(guard),
+                owner: &self.owner,
+            }
+        }
+        #[cfg(not(test))]
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wake every waiter, in the critical section that wrote the state.
+    #[cfg_attr(not(test), allow(unused_variables, reason = "only a test build logs the wake"))]
+    fn notify(&self, lock: &mut Guard<'_>) {
+        #[cfg(test)]
+        lock.log.push(Logged::Notify);
+        self.condvar.notify_all();
+    }
+
+    /// `Condvar::wait` on `lock`.
+    fn cv_wait<'a>(&'a self, lock: Guard<'a>) -> Guard<'a> {
+        #[cfg(test)]
+        {
+            let mut lock = lock;
+            let inner = lock.guard.take().expect("a live guard");
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            let inner = self.condvar.wait(inner).unwrap_or_else(PoisonError::into_inner);
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
+            lock.guard = Some(inner);
+            lock
+        }
+        #[cfg(not(test))]
+        self.condvar.wait(lock).unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `Condvar::wait_timeout` on `lock`.
+    fn cv_wait_timeout<'a>(&'a self, lock: Guard<'a>, dur: Duration) -> Guard<'a> {
+        #[cfg(test)]
+        {
+            let mut lock = lock;
+            let inner = lock.guard.take().expect("a live guard");
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            let (inner, _) = self
+                .condvar
+                .wait_timeout(inner, dur)
+                .unwrap_or_else(PoisonError::into_inner);
+            *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
+            lock.guard = Some(inner);
+            lock
+        }
+        #[cfg(not(test))]
+        {
+            let (lock, _) = self
+                .condvar
+                .wait_timeout(lock, dur)
+                .unwrap_or_else(PoisonError::into_inner);
+            lock
+        }
     }
 
     /// The handle that names the child, or `None` when it was reaped elsewhere before adoption.
@@ -155,7 +313,10 @@ impl SharedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            Some(Target::pid(self.id.pid(), None))
+            // Gone at adoption: reaped elsewhere, so nothing is consumed by a bare pid.
+            self.identity
+                .unique()
+                .map(|unique| Target::pid(self.id.pid(), Some(unique)))
         }
         #[cfg(windows)]
         {
@@ -220,8 +381,8 @@ impl SharedChild {
             State::W { .. } => self.peeked_status(&target),
             State::N => match exit_only::try_reap(&target)? {
                 Reap::Reaped(reaped) => {
-                    lock.state = State::E(reaped);
-                    self.condvar.notify_all();
+                    lock.set(State::E(reaped));
+                    self.notify(&mut lock);
                     drop(lock);
                     self.log_unreadable(reaped);
                     status_of(reaped).map(Some)
@@ -238,38 +399,37 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
-    /// Hard-kill the child. Already-exited (or already reaped by us) is success.
+    /// Hard-kill the child. Already-exited, reaped by us, or reaped elsewhere is success, logged
+    /// at `debug` where nothing was sent.
+    ///
+    /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
+    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
+    ///   no reap of ours can run between the state read and the call.
+    /// - **Windows:** through the process handle.
     pub(crate) fn kill(&self) -> io::Result<()> {
-        #[cfg_attr(
-            target_os = "linux",
-            allow(
-                unused_mut,
-                reason = "only the non-Linux branch calls `lock.child.kill()`, which needs `&mut`"
-            )
-        )]
-        let mut lock = self.lock();
+        let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return Ok(());
         }
+        #[cfg(test)]
+        exit_only::seams::signal_sent();
         #[cfg(target_os = "linux")]
         {
-            use rustix::process::{pidfd_send_signal, Signal};
-            let Some(pidfd) = &self.pidfd else {
-                return Err(echild());
-            };
-            #[cfg(test)]
-            exit_only::seams::signal_sent();
-            match pidfd_send_signal(pidfd, Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            use std::os::fd::AsFd;
+            crate::signal::via_pidfd(
+                self.pidfd.as_ref().map(AsFd::as_fd),
+                self.id(),
+                crate::signal::Sig::Kill,
+            )
+            .map(drop)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            #[cfg(test)]
-            exit_only::seams::signal_sent();
-            // By pid on macOS, under the lock: no reap of ours can run between the state read
-            // and the call.
+            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill).map(drop)
+        }
+        #[cfg(windows)]
+        {
+            let mut lock = lock;
             lock.child.kill()
         }
     }

@@ -95,6 +95,10 @@ mod wait;
 
 #[cfg(feature = "tokio")]
 mod bounded;
+#[cfg(all(test, unix))]
+mod send_log;
+#[cfg(unix)]
+mod signal;
 
 #[cfg(test)]
 mod log_capture;
