@@ -69,7 +69,7 @@ impl<'a> HolderGuard<'a> {
     pub(super) fn sleep(&mut self, dur: std::time::Duration) {
         let lock = self.lock.take().unwrap_or_else(|| self.sc.lock());
         #[cfg(test)]
-        super::seams::before_condvar_block();
+        super::seams::before_condvar_block(Some(dur));
         let (lock, _) = self
             .sc
             .condvar

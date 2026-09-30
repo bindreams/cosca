@@ -294,7 +294,7 @@ pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
 /// The assert-free start-time read every `exit_only` start check uses, and the purpose that
 /// names each read.
 #[cfg(target_os = "macos")]
-pub(crate) use backend::{pbi_start_quiet, ReadPurpose};
+pub(crate) use backend::{kinfo_read, pbi_read_quiet, pbi_start_quiet, ReadPurpose};
 
 /// The `pbi_start_quiet` forcing seam.
 #[cfg(all(target_os = "macos", test))]

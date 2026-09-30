@@ -112,6 +112,9 @@ pub(crate) enum Target<'a> {
     Pid {
         pid: u32,
         start: Option<crate::identity::StartToken>,
+        /// Whether the caller holds an `EVFILT_PROC` knote on `pid` that has not fired
+        /// `NOTE_REAP`: a real reap would then be announced on it.
+        knote: bool,
         _lt: std::marker::PhantomData<&'a ()>,
     },
     /// A process handle: pinned.
@@ -126,7 +129,20 @@ impl Target<'_> {
         Target::Pid {
             pid,
             start,
+            knote: false,
             _lt: std::marker::PhantomData,
+        }
+    }
+
+    /// This target, for a caller that holds an unfired `EVFILT_PROC` knote on it.
+    pub(crate) fn with_knote(self) -> Self {
+        match self {
+            Target::Pid { pid, start, _lt, .. } => Target::Pid {
+                pid,
+                start,
+                knote: true,
+                _lt,
+            },
         }
     }
 }

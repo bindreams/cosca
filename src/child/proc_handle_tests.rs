@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::ProcHandle;
 use super::{std_teardown_action, StdTeardown};
 
 // The a36b0244 fix: the `Std` teardown arm must key on the OBSERVED kill result, NOT on any
@@ -29,16 +31,19 @@ fn any_other_kill_error_also_never_blocks() {
 mod own_reap {
     use std::time::{Duration, Instant};
 
-    use shared_child::SharedChild;
-
     use super::super::ProcHandle;
+
+    fn adopt_child(child: std::process::Child) -> crate::child::shared::SharedChild {
+        let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
+        crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"))
+    }
 
     fn adopt(argv: &[&str]) -> (ProcHandle, u32) {
         let mut cmd = std::process::Command::new(argv[0]);
         cmd.args(&argv[1..]);
         let child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
         let pid = child.id();
-        (ProcHandle::std(SharedChild::new(child).expect("adopt")), pid)
+        (ProcHandle::std(adopt_child(child)), pid)
     }
 
     /// A running child, killed but not yet reaped.
@@ -51,12 +56,16 @@ mod own_reap {
         h
     }
 
+    /// Adoption never reaps, so an already-exited child is still a zombie afterwards, and the
+    /// handle's own `wait` is the reap.
     #[test]
-    fn adopting_an_already_exited_child_is_an_own_reap() {
+    fn adopting_an_already_exited_child_is_not_a_reap() {
         let mut cmd = std::process::Command::new("true");
         let child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
         crate::test_child::wait_until_zombie(child.id());
-        let h = ProcHandle::std(SharedChild::new(child).expect("adopt"));
+        let h = ProcHandle::std(adopt_child(child));
+        assert!(!h.has_reaped());
+        h.wait().expect("wait");
         assert!(h.has_reaped());
     }
 
@@ -92,4 +101,55 @@ mod own_reap {
             .is_some());
         assert!(h.has_reaped());
     }
+}
+
+// The reap after a successful kill =====
+
+/// A live blocker adopted as a `Std` handle. The child is ended by the teardown under test.
+#[cfg(unix)]
+fn std_handle() -> (ProcHandle, std::process::ChildStdin) {
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
+    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    (ProcHandle::std(shared), stdin)
+}
+
+/// The levels the teardown logged for its child, with the reap after the kill failing with
+/// `errno`.
+#[cfg(unix)]
+fn teardown_levels_when_the_reap_fails(errno: i32) -> Vec<log::Level> {
+    use crate::child::shared::seams::{self, ForcedWait};
+    crate::log_capture::install();
+    let (handle, _stdin) = std_handle();
+    let marker = format!("teardown of child {}", handle.id());
+    let mark = crate::log_capture::mark();
+    let forced = seams::force_unlocked_wait(ForcedWait::Errno(errno));
+    handle.teardown_on_drop();
+    drop(forced);
+    // The forced failure left the killed child unreaped: reap it for real.
+    handle.wait().expect("reap the killed child");
+    crate::log_capture::records_since_on_current_thread(mark, &marker)
+        .into_iter()
+        .map(|(level, _)| level)
+        .collect()
+}
+
+/// A reap that fails after the kill is not dropped silently.
+///
+/// Mutant: `_ = s.wait()`.
+#[cfg(unix)]
+#[test]
+fn a_failed_teardown_reap_is_warned() {
+    assert_eq!(teardown_levels_when_the_reap_fails(libc::EIO), [log::Level::Warn]);
+}
+
+/// `ECHILD` (someone else reaped the child) is logged, at `debug`.
+///
+/// Mutant: every failure at `warn`; or none logged.
+#[cfg(unix)]
+#[test]
+fn a_teardown_reap_that_meets_echild_is_debug() {
+    assert_eq!(teardown_levels_when_the_reap_fails(libc::ECHILD), [log::Level::Debug]);
 }

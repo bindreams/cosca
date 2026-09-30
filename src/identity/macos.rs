@@ -79,7 +79,29 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
+    /// The identity check just before a signal.
+    Kill,
+    /// The check after a by-pid `ECHILD`, that the pid still names our child.
+    Echild,
+    /// The `kinfo` read that arbitrates an `ECHILD` whose `Echild` read said `ESRCH`.
+    EchildExiting,
+    /// A `Running` peek's, that the pid still names our child.
+    Running,
 }
+
+/// What a by-pid identity read saw: the start time, and whether launchd owns `pid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PbiRead {
+    pub(crate) start: StartToken,
+    /// The parent is launchd (pid 1). A child of ours that a tracer held is handed back to us, or
+    /// its zombie stays on the tracer's list; when the tracer dies first, XNU reparents the
+    /// zombie to launchd instead (measured on CI: `p_stat` `SZOMB`, `ppid` 1, `P_TRACED` clear,
+    /// `p_oppid` still ours), and nothing hands it back.
+    pub(crate) orphaned: bool,
+}
+
+/// The pid launchd runs as, the parent of every orphan.
+const LAUNCHD: RawPid = 1;
 
 /// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees
 /// zombies and never waits on `P_LINTRANSIT` (a `sysctl(KERN_PROC_PID)` read sleeps while the
@@ -87,9 +109,14 @@ pub(crate) enum ReadPurpose {
 /// failure is a value, never [`contract_violation`]: `Gone` for `ESRCH`, `Unknown` for the rest,
 /// with a `warn` naming `purpose` for those.
 pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<StartToken> {
+    pbi_read_quiet(pid, purpose).map(|read| read.start)
+}
+
+/// [`pbi_start_quiet`], with whether launchd owns the process.
+pub(crate) fn pbi_read_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<PbiRead> {
     #[cfg(test)]
-    if let Some(forced) = quiet_fault::take(purpose) {
-        return forced;
+    if let Some((forced, orphaned)) = quiet_fault::take(purpose) {
+        return forced.map(|start| PbiRead { start, orphaned });
     }
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -104,7 +131,10 @@ pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<Sta
         )
     };
     if n == size {
-        return Resolved::Found(token_of_bsd(&info));
+        return Resolved::Found(PbiRead {
+            start: token_of_bsd(&info),
+            orphaned: info.pbi_ppid == LAUNCHD,
+        });
     }
     if n <= 0 {
         let e = std::io::Error::last_os_error();
@@ -116,6 +146,22 @@ pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<Sta
     }
     log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read wrote {n} bytes, expected {size}");
     Resolved::Unknown
+}
+
+/// [`pbi_read_quiet`] through the `kinfo` sysctl alone, which sees a process between
+/// `P_REF_DEAD` and the zombie that `proc_pidinfo` answers `ESRCH` for. `Unknown` when the
+/// sysctl is refused.
+pub(crate) fn kinfo_read(pid: RawPid, purpose: ReadPurpose) -> Resolved<PbiRead> {
+    #[cfg(test)]
+    if let Some((forced, orphaned)) = quiet_fault::take(purpose) {
+        return forced.map(|start| PbiRead { start, orphaned });
+    }
+    #[cfg(not(test))]
+    let _ = purpose;
+    kinfo::kinfo(pid).map(|info| PbiRead {
+        start: token_of_kinfo(&info),
+        orphaned: info.e_ppid() == LAUNCHD as libc::pid_t,
+    })
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
@@ -358,43 +404,50 @@ pub(crate) mod fault {
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
 
-/// Forces one [`pbi_start_quiet`] purpose to a chosen result, below the syscall.
+/// Forces [`pbi_start_quiet`] and [`kinfo_start`] reads of chosen purposes to chosen results,
+/// below the syscall.
 #[cfg(test)]
 pub(crate) mod quiet_fault {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::{ReadPurpose, Resolved, StartToken};
 
+    /// One force: its id, the purpose, the answer, and the orphaned flag.
+    type Force = (u64, ReadPurpose, Resolved<StartToken>, bool);
+
     thread_local! {
-        static FORCED: RefCell<Option<(ReadPurpose, Resolved<StartToken>)>> = const { RefCell::new(None) };
+        static FORCED: RefCell<Vec<Force>> = const { RefCell::new(Vec::new()) };
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
     }
 
     #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
+    pub(crate) struct Forced(u64);
 
-    /// The next `pbi_start_quiet` for `purpose` on this thread answers `result`. Other purposes
-    /// are untouched.
+    /// The next read for `purpose` on this thread answers `result`. Other purposes are untouched.
+    /// Forces for different purposes, or for the same one, queue.
     pub(crate) fn force_quiet_read_error_once(purpose: ReadPurpose, result: Resolved<StartToken>) -> Forced {
-        FORCED.with(|f| *f.borrow_mut() = Some((purpose, result)));
-        Forced(())
+        force_quiet_read_once(purpose, result, false)
+    }
+
+    /// [`force_quiet_read_error_once`], with the read's orphaned flag.
+    pub(crate) fn force_quiet_read_once(purpose: ReadPurpose, result: Resolved<StartToken>, orphaned: bool) -> Forced {
+        let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
+        FORCED.with(|f| f.borrow_mut().push((id, purpose, result, orphaned)));
+        Forced(id)
     }
 
     impl Drop for Forced {
         fn drop(&mut self) {
-            FORCED.with(|f| *f.borrow_mut() = None);
+            FORCED.with(|f| f.borrow_mut().retain(|(id, ..)| *id != self.0));
         }
     }
 
-    pub(super) fn take(purpose: ReadPurpose) -> Option<Resolved<StartToken>> {
+    pub(super) fn take(purpose: ReadPurpose) -> Option<(Resolved<StartToken>, bool)> {
         FORCED.with(|f| {
-            let mut slot = f.borrow_mut();
-            match *slot {
-                Some((p, r)) if p == purpose => {
-                    *slot = None;
-                    Some(r)
-                }
-                _ => None,
-            }
+            let mut forced = f.borrow_mut();
+            let at = forced.iter().position(|(_, p, ..)| *p == purpose)?;
+            let (_, _, result, orphaned) = forced.remove(at);
+            Some((result, orphaned))
         })
     }
 }

@@ -52,7 +52,7 @@ impl SharedChild {
     /// from the clock after the wake.
     fn block<'a>(&'a self, lock: MutexGuard<'a, Inner>, remaining: Option<Duration>) -> MutexGuard<'a, Inner> {
         #[cfg(test)]
-        super::seams::before_condvar_block();
+        super::seams::before_condvar_block(remaining);
         let Some(remaining) = remaining else {
             return self.condvar.wait(lock).unwrap_or_else(PoisonError::into_inner);
         };
