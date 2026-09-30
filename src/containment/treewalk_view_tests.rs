@@ -140,7 +140,8 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
                 "{name}: the snapshot is the first view read"
             );
             drop(forced);
-            assert_unassessable_naming(result, &format!("the process snapshot could not be taken: {cause}"));
+            assert_unassessable_naming(result.clone(), "the process snapshot could not be taken");
+            assert_unassessable_naming(result, cause);
         }
     }
 }
@@ -162,7 +163,8 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
                 "{name}: the anchor is the second view read"
             );
             drop(forced);
-            assert_unassessable_naming(result, &format!("pid {pid} identity could not be read: {cause}"));
+            assert_unassessable_naming(result.clone(), &format!("pid {pid} identity could not be read"));
+            assert_unassessable_naming(result, cause);
         }
     }
 }
@@ -195,10 +197,8 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
             "{name}: the anchor is the second view read"
         );
         drop(forced);
-        assert_unassessable_naming(
-            result,
-            &format!("pid {} identity could not be read: forced by a test", id.pid()),
-        );
+        assert_unassessable_naming(result.clone(), &format!("pid {} identity could not be read", id.pid()));
+        assert_unassessable_naming(result, "forced by a test");
         release(child);
     }
 }
