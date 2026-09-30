@@ -180,20 +180,16 @@ impl Child {
         self.proc.try_wait().map_err(Error::Io)
     }
 
-    /// Is this a wrapper-elevated child a plain parent may be unable to signal?
-    /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
-    fn is_elevated_wrapper(&self) -> bool {
-        matches!(
-            self.elevation.as_ref().map(|r| &r.via),
-            Some(crate::elevation::ElevatedVia::Wrapped(_) | crate::elevation::ElevatedVia::WindowsUac)
-        )
-    }
-
     /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike [`Process::kill`](crate::Process::kill), this
     /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
     ///
-    /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
-    /// `Ok`, and on Linux one by a seccomp or LSM filter is
+    /// On a wrapper-elevated child the OS may refuse the signal (`EPERM` / `ACCESS_DENIED`); when
+    /// the child is still running that is
+    /// [`Error::Elevation`](crate::error::Error::Elevation) with
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), as for
+    /// [`terminate`](Child::terminate) and the escalation of
+    /// [`graceful_shutdown`](Child::graceful_shutdown). A refusal for a child that has already
+    /// exited is `Ok`, and on Linux one by a seccomp or LSM filter is
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming `kill`.
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
@@ -203,7 +199,11 @@ impl Child {
         // an elevated wrapper child becomes the typed `Unkillable`.
         match self.proc.kill() {
             Ok(()) => Ok(()),
-            Err(e) => crate::refusal::resolve_kill_error(e, self.id, self.is_elevated_wrapper()),
+            Err(e) => crate::refusal::resolve_kill_error(
+                e,
+                self.id,
+                crate::elevation::is_elevated_wrapper(self.elevation.as_ref()),
+            ),
         }
     }
 
@@ -292,7 +292,11 @@ impl Child {
         // handle-based kill covers that, so its failure is contract-relevant.
         let backstop = match self.proc.kill() {
             Ok(()) => Ok(()),
-            Err(e) => crate::refusal::resolve_kill_error(e, self.id, self.is_elevated_wrapper()),
+            Err(e) => crate::refusal::resolve_kill_error(
+                e,
+                self.id,
+                crate::elevation::is_elevated_wrapper(self.elevation.as_ref()),
+            ),
         };
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");

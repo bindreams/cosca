@@ -573,3 +573,94 @@ fn graceful_tree_non_containment_terminate_error_fails_fast() {
     assert_still_running(&mut child, stdin);
     cleanup(&mut child);
 }
+
+// Signalling an elevated child =====
+
+fn elevated_via(via: crate::elevation::ElevatedVia) -> crate::elevation::ElevationReport {
+    crate::elevation::ElevationReport {
+        via,
+        stripped_env: Vec::new(),
+        stdio: crate::elevation::ElevatedStdio::Passthrough,
+    }
+}
+
+fn wrapped() -> crate::elevation::ElevatedVia {
+    crate::elevation::ElevatedVia::Wrapped(crate::elevation::Backend::Pkexec)
+}
+
+fn is_unkillable(err: &crate::error::Error) -> bool {
+    matches!(
+        err,
+        crate::error::Error::Elevation {
+            kind: crate::error::ElevationErrorKind::Unkillable,
+            ..
+        }
+    )
+}
+
+// `terminate` must report a refused signal on a wrapper-elevated child the way `kill` does.
+#[test]
+fn terminate_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = blocker();
+    child.set_elevation(Some(elevated_via(wrapped())));
+    let denied = fault::deny_terminate();
+    let err = child.terminate().expect_err("the signal is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child);
+}
+
+// The pre-existing `kill` mapping, pinned through the same seam as the escalation test below
+// (which is Unix-only) so the kill seam is exercised on every platform.
+#[test]
+fn kill_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = blocker();
+    child.set_elevation(Some(elevated_via(wrapped())));
+    let denied = fault::deny_kill();
+    let err = child.kill().expect_err("the kill is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child);
+}
+
+// Only a wrapper-elevated child is remapped: an already-elevated parent's child is an ordinary
+// child, and an unelevated one is untouched.
+#[test]
+fn terminate_permission_denied_stays_io_unless_a_wrapper_elevated_the_child() {
+    for report in [
+        None,
+        Some(elevated_via(crate::elevation::ElevatedVia::AlreadyElevated)),
+        Some(elevated_via(crate::elevation::ElevatedVia::MacosOsascript)),
+    ] {
+        let (mut child, stdin) = blocker();
+        child.set_elevation(report);
+        let denied = fault::deny_terminate();
+        let err = child.terminate().expect_err("the signal is denied");
+        drop(denied);
+        assert!(
+            matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err:?}"
+        );
+        drop(stdin);
+        cleanup(&mut child);
+    }
+}
+
+// The escalation kill inside `graceful_shutdown` is the same refusal as `kill()`. `ZERO` grace
+// polls once and escalates; the term-ignoring child cannot have exited from the cooperative half.
+#[cfg(unix)]
+#[test]
+fn graceful_shutdown_escalation_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = kill_only_blocker();
+    child.set_elevation(Some(elevated_via(wrapped())));
+    let denied = fault::deny_kill();
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("the escalation kill is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child);
+}

@@ -38,6 +38,59 @@ pub(crate) mod fault {
     pub(crate) fn forced_watch_error() -> crate::error::Error {
         crate::error::Error::Io(std::io::Error::other("forced grace-watch failure (test seam)"))
     }
+
+    thread_local! {
+        static DENY_TERMINATE: Cell<bool> = const { Cell::new(false) };
+        static DENY_KILL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes the cooperative signal (`crate::graceful::signal`) or the hard kill of an owned child
+    /// (`ProcHandle::kill`, `ProcSource::start_kill`) fail on THIS thread with the privilege
+    /// refusal the platform's classification produces for a live target the OS will not let this
+    /// process signal (see [`crate::refusal::refused`]), until dropped. It stands in for that
+    /// classified outcome, so the `Unkillable` mapping is testable where no root child exists;
+    /// the classification itself is tested against real children.
+    #[must_use = "dropping this immediately lifts the denial; bind it for the probe's duration"]
+    pub(crate) struct Denied {
+        terminate: bool,
+        kill: bool,
+    }
+    pub(crate) fn deny_terminate() -> Denied {
+        DENY_TERMINATE.with(|f| f.set(true));
+        Denied {
+            terminate: true,
+            kill: false,
+        }
+    }
+    pub(crate) fn deny_kill() -> Denied {
+        DENY_KILL.with(|f| f.set(true));
+        Denied {
+            terminate: false,
+            kill: true,
+        }
+    }
+    impl Drop for Denied {
+        fn drop(&mut self) {
+            if self.terminate {
+                DENY_TERMINATE.with(|f| f.set(false));
+            }
+            if self.kill {
+                DENY_KILL.with(|f| f.set(false));
+            }
+        }
+    }
+    pub(crate) fn terminate_denied() -> bool {
+        DENY_TERMINATE.with(Cell::get)
+    }
+    pub(crate) fn kill_denied() -> bool {
+        DENY_KILL.with(Cell::get)
+    }
+    pub(crate) fn denied_error() -> std::io::Error {
+        crate::refusal::refused(
+            crate::refusal::TargetState::Running,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+    }
 }
 
 /// Test-only seam on the std backend's `wait_deadline` call (`ProcHandle::Std`), standing in for

@@ -693,3 +693,97 @@ async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
     assert_still_running(&mut child, stdin).await;
     cleanup(&mut child).await;
 }
+
+// Signalling an elevated child =====
+// Async twins of the tests of the same names in `src/child/graceful_tests.rs`.
+
+fn elevated_wrapper() -> crate::elevation::ElevationReport {
+    crate::elevation::ElevationReport {
+        via: crate::elevation::ElevatedVia::Wrapped(crate::elevation::Backend::Pkexec),
+        stripped_env: Vec::new(),
+        stdio: crate::elevation::ElevatedStdio::Passthrough,
+    }
+}
+
+fn is_unkillable(err: &crate::error::Error) -> bool {
+    matches!(
+        err,
+        crate::error::Error::Elevation {
+            kind: crate::error::ElevationErrorKind::Unkillable,
+            ..
+        }
+    )
+}
+
+#[tokio::test]
+async fn async_terminate_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = blocker();
+    child.set_elevation(Some(elevated_wrapper()));
+    let denied = fault::deny_terminate();
+    let err = child.terminate().expect_err("the signal is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child).await;
+}
+
+#[tokio::test]
+async fn async_kill_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = blocker();
+    child.set_elevation(Some(elevated_wrapper()));
+    let denied = fault::deny_kill();
+    let err = child.kill().expect_err("the kill is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child).await;
+}
+
+// Only a wrapper-elevated child is remapped: an already-elevated parent's child is an ordinary
+// child, `osascript` runs as the caller, and an unelevated one is untouched. Async twin of
+// `terminate_permission_denied_stays_io_unless_a_wrapper_elevated_the_child`.
+#[tokio::test]
+async fn async_permission_denied_stays_io_unless_a_wrapper_elevated_the_child() {
+    for via in [
+        None,
+        Some(crate::elevation::ElevatedVia::AlreadyElevated),
+        Some(crate::elevation::ElevatedVia::MacosOsascript),
+    ] {
+        let (mut child, stdin) = blocker();
+        child.set_elevation(via.clone().map(|via| crate::elevation::ElevationReport {
+            via,
+            stripped_env: Vec::new(),
+            stdio: crate::elevation::ElevatedStdio::Passthrough,
+        }));
+        let denied = fault::deny_terminate();
+        let terminate = child.terminate().expect_err("the signal is denied");
+        drop(denied);
+        let denied = fault::deny_kill();
+        let kill = child.kill().expect_err("the kill is denied");
+        drop(denied);
+        for err in [terminate, kill] {
+            assert!(
+                matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+                "{via:?}: got {err:?}"
+            );
+        }
+        drop(stdin);
+        cleanup(&mut child).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn async_graceful_shutdown_escalation_on_an_elevated_wrapper_child_reports_unkillable() {
+    let (mut child, stdin) = kill_only_blocker().await;
+    child.set_elevation(Some(elevated_wrapper()));
+    let denied = fault::deny_kill();
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect_err("the escalation kill is denied");
+    drop(denied);
+    assert!(is_unkillable(&err), "got {err:?}");
+    drop(stdin);
+    cleanup(&mut child).await;
+}

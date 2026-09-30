@@ -107,6 +107,36 @@ fn async_graceful_shutdown_escalation_refused_by_a_filter_is_unsupported_naming_
 }
 
 #[test]
+fn async_a_refused_pidfd_open_is_unsupported_naming_pidfd_open_not_unkillable() {
+    use crate::wait::backend::fault::force_pidfd_open_errno_once;
+    for (errno, name) in [
+        (rustix::io::Errno::PERM, "EPERM"),
+        (rustix::io::Errno::ACCESS, "EACCES"),
+        (rustix::io::Errno::NODEV, "ENODEV"),
+    ] {
+        let err = run(&[], move || async move {
+            let (mut child, stdin) = crate::test_child::held_contained_blocker_async(crate::Stdio::pipe());
+            child.set_elevation(wrapped());
+            let forced = force_pidfd_open_errno_once(errno);
+            let err = child.terminate().expect_err("pidfd_open is refused");
+            drop(forced);
+            finish(child, stdin).await;
+            err
+        });
+        match &err {
+            Error::Unsupported { platform, detail, .. } => {
+                assert_eq!(*platform, "linux");
+                assert!(
+                    detail.contains(&format!("refused here: pidfd_open answered {name}")),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected Unsupported for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn async_an_exited_unreaped_child_is_ok_even_when_a_filter_refuses_the_signal() {
     for report in reports() {
         let (terminated, killed) = run(&[libc::SYS_pidfd_send_signal, libc::SYS_kill], move || async move {

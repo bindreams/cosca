@@ -52,9 +52,16 @@ impl Child {
     /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
-    /// **Refused signal.** A signal the OS refuses for a child that has already exited is `Ok`, and
-    /// on Linux a refusal by a seccomp or LSM filter is
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming the syscall.
+    /// **Elevated child.** On Unix, a child a wrapper (`sudo`, `pkexec`, ...) elevated may be
+    /// beyond this process's reach: when the kernel refuses the signal for privilege the error is
+    /// [`Error::Elevation`](crate::error::Error::Elevation) with
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), whose
+    /// detail says the child is still running, exactly as for [`kill`](Child::kill). A child that
+    /// has already exited is `Ok`, and on Linux a refusal by a seccomp or LSM filter is
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) naming the syscall. A
+    /// UAC-elevated child on Windows is never `Unkillable` here: its console-group mechanism is
+    /// [`GracefulMechanism::Unknown`](crate::graceful::GracefulMechanism::Unknown), so `terminate`
+    /// is `Unsupported` before any OS call. (`kill` can report it.)
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
@@ -65,7 +72,15 @@ impl Child {
     /// before it has run at all should use [`kill`](Child::kill), which is honest about being
     /// forced.
     pub fn terminate(&self) -> Result<(), Error> {
-        crate::graceful::signal(self.graceful, self.id)
+        // The `Unkillable` mapping has a production path on Unix only. On Windows the only elevated
+        // child is UAC's, whose mechanism is `Unknown`: `signal` refuses it with `Unsupported`
+        // before any OS call, so no refusal reaches the mapping there.
+        crate::graceful::signal(self.graceful, self.id).map_err(|e| {
+            crate::elevation::map_elevated_signal_error(
+                e,
+                crate::elevation::is_elevated_wrapper(self.elevation.as_ref()),
+            )
+        })
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -79,6 +94,10 @@ impl Child {
     /// Every caveat on [`terminate`](Child::terminate) applies to the cooperative half, and a
     /// cooperative-signal error propagates immediately: no grace is waited, nothing is killed,
     /// and the child is left running for the caller to `kill`.
+    ///
+    /// On an elevated child a refused signal — the cooperative one or the escalation kill — is
+    /// [`Error::Elevation`](crate::error::Error::Elevation) with
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     ///
     /// **Windows: the two halves have different radii.** The cooperative half reaches the
     /// child's whole console group; the forced half reaches only the child. So a descendant
@@ -114,7 +133,7 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.kill()?; // escalate, classified as `kill` is; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        self.kill()?; // escalate (`Unkillable` on an elevated wrapper child, as `kill`); an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;

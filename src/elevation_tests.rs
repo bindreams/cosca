@@ -181,28 +181,91 @@ fn detect_reports_macos() {
     assert!(h.arg_max.is_some(), "kern.argmax must be readable on macOS");
 }
 
+// The one gate both `Child` types consult before a refused signal becomes `Unkillable`. Every
+// variant is pinned, so a mutant that widens it (any `Some`, `MacosOsascript`, `AlreadyElevated`)
+// or narrows it (no `WindowsUac`, no `Wrapped`) fails on the row it changes.
 #[test]
-fn kill_error_on_an_elevated_wrapper_is_unkillable() {
-    use crate::error::{ElevationErrorKind, Error};
-    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-    let e = super::map_elevated_kill_error(eperm, /* elevated_wrapper */ true);
+fn is_elevated_wrapper_is_true_only_for_a_wrapper_or_uac() {
+    use super::{is_elevated_wrapper, Backend, ElevatedStdio, ElevatedVia, ElevationReport};
+    let report = |via| ElevationReport {
+        via,
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::Passthrough,
+    };
+    assert!(!is_elevated_wrapper(None), "no elevation requested");
+    for backend in [
+        Backend::Auto,
+        Backend::Run0,
+        Backend::Sudo,
+        Backend::Doas,
+        Backend::Pkexec,
+    ] {
+        assert!(
+            is_elevated_wrapper(Some(&report(ElevatedVia::Wrapped(backend)))),
+            "Wrapped({backend:?})"
+        );
+    }
     assert!(
-        matches!(
-            e,
-            Error::Elevation {
-                kind: ElevationErrorKind::Unkillable,
-                ..
-            }
-        ),
-        "{e:?}"
+        is_elevated_wrapper(Some(&report(ElevatedVia::WindowsUac))),
+        "WindowsUac"
     );
+    assert!(
+        !is_elevated_wrapper(Some(&report(ElevatedVia::MacosOsascript))),
+        "MacosOsascript: osascript runs as the caller"
+    );
+    assert!(
+        !is_elevated_wrapper(Some(&report(ElevatedVia::AlreadyElevated))),
+        "AlreadyElevated: an ordinary child of an already-root parent"
+    );
+}
+
+fn privilege_refusal(state: crate::refusal::TargetState) -> std::io::Error {
+    crate::refusal::refused(state, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+}
+
+#[test]
+fn kill_error_on_an_elevated_wrapper_is_unkillable_and_says_it_is_still_running() {
+    use crate::error::{ElevationErrorKind, Error};
+    let e = super::map_elevated_kill_error(
+        privilege_refusal(crate::refusal::TargetState::Running),
+        /* elevated_wrapper */ true,
+    );
+    match e {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            detail,
+        } => assert!(detail.contains("still running"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn unkillable_detail_says_when_the_state_could_not_be_determined() {
+    use crate::error::Error;
+    let e = super::map_elevated_kill_error(privilege_refusal(crate::refusal::TargetState::Unknown), true);
+    match e {
+        Error::Elevation { detail, .. } => {
+            assert!(!detail.contains("still running"), "{detail}");
+            assert!(detail.contains("could not be determined"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
 fn kill_error_on_a_plain_child_stays_io() {
     use crate::error::Error;
+    let e = super::map_elevated_kill_error(privilege_refusal(crate::refusal::TargetState::Running), false);
+    assert!(matches!(e, Error::Io(_)), "{e:?}");
+}
+
+// Only the signal call's own refusal is `Unkillable`. A `PermissionDenied` from anywhere else on
+// the path (an untagged one) is not a statement about the target and stays `Io`.
+#[test]
+fn an_untagged_permission_denied_stays_io_even_on_an_elevated_wrapper() {
+    use crate::error::Error;
     let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-    assert!(matches!(super::map_elevated_kill_error(eperm, false), Error::Io(_)));
+    assert!(matches!(super::map_elevated_kill_error(eperm, true), Error::Io(_)));
 }
 
 #[test]

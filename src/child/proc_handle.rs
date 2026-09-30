@@ -58,6 +58,10 @@ impl ProcHandle {
 
     /// Hard-kill the process (already-exited is success).
     pub(crate) fn kill(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if crate::wait::fault::kill_denied() {
+            return Err(crate::wait::fault::denied_error());
+        }
         match self {
             ProcHandle::Std(s) => s.kill(),
             #[cfg(windows)]

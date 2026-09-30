@@ -92,6 +92,10 @@ impl std::fmt::Display for GracefulMechanism {
 /// Matched exhaustively with no wildcard, so a future variant is a compile error at the one
 /// place this decision is made.
 pub(crate) fn signal(mechanism: GracefulMechanism, id: crate::identity::ProcessId) -> Result<(), crate::error::Error> {
+    #[cfg(test)]
+    if crate::wait::fault::terminate_denied() {
+        return Err(crate::error::Error::Io(crate::wait::fault::denied_error()));
+    }
     match mechanism {
         GracefulMechanism::Process => crate::wait::terminate(id),
         // One arm for both. This process's console list is readable, but absence from it does
