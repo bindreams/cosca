@@ -14,24 +14,36 @@
 //! **Settling.** The helper acts on a stop only once it has settled, every tracee thread out of
 //! the running state: see [`sys::stop`].
 //!
-//! **Signals.** The tracee's stops are passed on as a debugger does. XNU discards a stop signal
-//! (`SIGSTOP`, `SIGTSTP`, `SIGTTIN` or `SIGTTOU` with the default action) that `PT_CONTINUE`
-//! delivers to a still-traced tracee (xnu `kern_sig.c`, `issignal`). So the helper keeps the
-//! first such stop signal that stops the tracee, releases the tracee without it (`S2k`, `S3k`,
-//! `S4k`), and re-sends it with `kill(2)` after `PT_DETACH` (`S4r`); XNU discards it only if
-//! the detach left the tracee stopped (measured on CI: sometimes on macOS 26). A `SIGCONT`
-//! passed on later drops it, since it would have continued the stopped tracee. Every other
-//! signal is delivered at once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). That includes a stop
-//! signal the tracee catches, which runs its handler instead of stopping, and one it ignores
-//! (`SIG_IGN`), which `issignal` discards (`case SIG_IGN`) as it would without tracing: passing
-//! it on loses nothing, and re-sending it after the detach would be discarded too. The tracee's
-//! disposition is read from `kinfo_proc`'s `p_sigcatch` and `p_sigignore`
-//! ([`sys::disposition`]) while it is stopped. A thread in user mode cannot change it under the
-//! read (`task_suspend_internal` stops it); a thread blocked in the kernel inside `sigaction`
-//! (say on a page fault after `copyin`, before `setsigvec`) can, so the read is a best effort
-//! there (`kern_sig.c`, `sigaction`). A `SIGSTOP` in S2 or S4
-//! is taken for the one the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a
-//! client's own `SIGSTOP` there is indistinguishable from it.
+//! **Signals.** The tracee's stops are passed on as a debugger does, with `PT_CONTINUE` (`S2s`,
+//! `S3s`, `S4s`), but for stop signals (`SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`), which it
+//! releases with no signal. `PT_CONTINUE` with a signal `psignal`s it (xnu `mach_process.c`), and
+//! for a stop signal `psignal_internal` clears a `SIGCONT` pending on the tracee (`contsigmask`),
+//! which no untraced run would lose. What the helper does instead depends on the stop signal's
+//! disposition, read from `kinfo_proc`'s `p_sigcatch` and `p_sigignore` ([`sys::disposition`])
+//! while the tracee is stopped:
+//!
+//! - The default action: XNU discards it anyway when `PT_CONTINUE` delivers it to a still-traced
+//!   tracee (`kern_sig.c`, `issignal`). The helper keeps it (`S2k`, `S3k`, `S4k`) and re-sends it
+//!   with `kill(2)` after `PT_DETACH` (`S4r`); XNU discards the re-sent one only if the detach left
+//!   the tracee stopped (measured on CI: sometimes on macOS 26). From then until a `SIGCONT` the
+//!   tracee counts as stopped, so a later default-action one is not kept: an untraced stopped
+//!   process discards it (`psignal_internal`).
+//! - Caught: the helper holds it (`S2h`, `S3h`, `S4h`) and re-sends it after the detach too, so
+//!   its handler runs late, not at once.
+//! - Ignored (`SIG_IGN`): dropped (`S2i`, `S3i`, `S4i`). `issignal` would drop it on the release
+//!   (`case SIG_IGN`), and an untraced run drops it when it is sent (`psignal_internal`).
+//!
+//! The kept and held signals are re-sent in the order they came. A `SIGCONT` passed on drops the
+//! kept one, which it would have continued, and each held one that came while the tracee counted
+//! as stopped, which an untraced run leaves pending and the `SIGCONT` cancels. A held or kept
+//! signal is never re-sent if the tracee exits while traced.
+//!
+//! A thread in user mode cannot change the disposition under the read (`task_suspend_internal`
+//! stops it); a thread blocked in the kernel inside `sigaction` (say on a page fault after
+//! `copyin`, before `setsigvec`) can, so the read is a best effort there (`kern_sig.c`,
+//! `sigaction`). A `SIGSTOP` in S2 or S4 is taken for the one the attach or S4 sent, which
+//! `PT_CONTINUE` or `PT_DETACH` discards; a client's own `SIGSTOP` there is indistinguishable
+//! from it.
 //!
 //! | State | Event or result | Next | Report |
 //! |---|---|---|---|
@@ -50,16 +62,20 @@
 //! | S1h | `NOTE_EXIT` | S5 | |
 //! | S2 Release | a `SIGSTOP` (the attach's) holds the tracee: `PT_CONTINUE` succeeds | S3 | `attached` |
 //! | S2 | the tracee stopped by another stop signal with the default action | keep it, release the tracee; S2k, then S2b | |
-//! | S2 | the tracee stopped by any other signal, or a stop signal it catches or ignores | pass it on; S2s, then S2b | |
+//! | S2 | the tracee stopped by a stop signal it catches | hold it, release the tracee; S2h, then S2b | |
+//! | S2 | the tracee stopped by a stop signal it ignores | release the tracee without it; S2i, then S2b | |
+//! | S2 | the tracee stopped by any other signal | pass it on; S2s, then S2b | |
 //! | S2 | the tracee not stopped yet or its stop settling, or `PT_CONTINUE` fails with `EBUSY` | S2b | |
 //! | S2b Backoff | timeout | retry S2's stop check | |
 //! | S2b | `NOTE_EXIT`, signal byte or EOF | done: nothing may happen before `attached` | `error` |
 //! | S2 | the stop peek, the disposition read, the release or `PT_CONTINUE` fails otherwise | done | `error` |
 //! | S3 Traced | `SIGCHLD`, the tracee stopped by a stop signal with the default action | keep it, release the tracee; S3k, then S3 | |
-//! | S3 | `SIGCHLD`, the tracee stopped by any other signal, or a stop signal it catches or ignores | pass it on; S3s, then S3 | |
+//! | S3 | `SIGCHLD`, the tracee stopped by a stop signal it catches | hold it, release the tracee; S3h, then S3 | |
+//! | S3 | `SIGCHLD`, the tracee stopped by a stop signal it ignores | release the tracee without it; S3i, then S3 | |
+//! | S3 | `SIGCHLD`, the tracee stopped by any other signal | pass it on; S3s, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee not stopped | S3 | |
 //! | S3 | `SIGCHLD`, the stop settling | S3 with a backoff timeout that peeks again | |
-//! | S3 | the disposition read or the release fails with `ESRCH` (the tracee is exiting) | S3 | |
+//! | S3 | the release fails with `ESRCH` (the tracee is exiting; its disposition read succeeds, so the read's `ESRCH` comes only by injection) | S3 | |
 //! | S3 | the stop peek, the disposition read or the release fails otherwise | done | `error` |
 //! | S3, `auto` | `NOTE_EXIT` (wins over a byte in the same batch) | S5 | |
 //! | S3, `auto` | signal byte or EOF | S4 | |
@@ -69,12 +85,14 @@
 //! | S3, `hold` | `NOTE_EXIT` and a signal byte or EOF in one batch | S3x, then S5 | `exited` |
 //! | S3x Exited, held | signal byte or EOF | S5 | |
 //! | S3x | `NOTE_EXIT` (only by injection: it is one-shot) | done | `error` |
-//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` succeeds, then a kept stop signal is re-sent (S4r) | done | `detached` |
-//! | S4 | re-sending the kept stop signal fails | done | `error` |
+//! | S4 Detach | `SIGSTOP` sent, then a `SIGSTOP` holds the tracee: `PT_DETACH` succeeds, then each kept or held stop signal is re-sent (S4r) | done | `detached` |
+//! | S4 | a re-send fails | done | `error` |
 //! | S4 | the tracee stopped by another stop signal with the default action | keep it, release the tracee; S4k, then S4b | |
-//! | S4 | the tracee stopped by any other signal, or a stop signal it catches or ignores | pass it on; S4s, then S4b | |
+//! | S4 | the tracee stopped by a stop signal it catches | hold it, release the tracee; S4h, then S4b | |
+//! | S4 | the tracee stopped by a stop signal it ignores | release the tracee without it; S4i, then S4b | |
+//! | S4 | the tracee stopped by any other signal | pass it on; S4s, then S4b | |
 //! | S4 | the tracee not stopped yet or its stop settling, or `PT_DETACH` fails with `EBUSY` | S4b | |
-//! | S4 | `SIGSTOP`, the disposition read, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
+//! | S4 | `SIGSTOP`, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting; the disposition read's `ESRCH` comes only by injection) | S6, or S5 if `NOTE_EXIT` was seen | |
 //! | S4 | the stop peek fails, or any other error | done | `error` |
 //! | S4b Backoff | `NOTE_EXIT` | S5 | |
 //! | S4b | timeout, signal byte (ignored) or EOF | back to S4's stop check | |
@@ -139,7 +157,7 @@ pub(super) fn main() {
             trace,
             forces: &mut forces,
             note_exit_seen,
-            kept: None,
+            resend: Vec::new(),
             blocked: None,
             eof_seen: false,
         }
@@ -390,6 +408,28 @@ fn to(state: State) -> Step {
 
 const EXIT: Step = Ok(Next::Exit);
 
+/// A stop signal to re-send after `PT_DETACH`.
+struct Resend {
+    signal: i32,
+    /// Kept, with the default action: the tracee counts as stopped while it is here.
+    kept: bool,
+    /// Dropped by a `SIGCONT` passed on later.
+    cancellable: bool,
+}
+
+/// How [`Machine::pass_on`] releases the tracee from a stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// A default-action stop signal: kept for the re-send, released without it (`k`).
+    Keep,
+    /// A caught stop signal: held for the re-send, released without it (`h`).
+    Hold,
+    /// An ignored stop signal: released without it (`i`).
+    Drop,
+    /// Any other signal: passed on with `PT_CONTINUE` (`s`).
+    Deliver,
+}
+
 struct Machine<'f> {
     pid: u32,
     mode: Mode,
@@ -397,8 +437,8 @@ struct Machine<'f> {
     trace: bool,
     forces: &'f mut Forces,
     note_exit_seen: bool,
-    /// The stop signal to re-send after `PT_DETACH`.
-    kept: Option<i32>,
+    /// The stop signals to re-send after `PT_DETACH`, in the order they came.
+    resend: Vec<Resend>,
     /// The last `blocking` report, until any other report follows it.
     blocked: Option<String>,
     eof_seen: bool,
@@ -611,9 +651,9 @@ impl Machine<'_> {
         }
     }
 
-    /// After `PT_DETACH`: re-sends the kept stop signal, which XNU would have discarded.
+    /// After `PT_DETACH`: re-sends the kept and held stop signals, in the order they came.
     fn detached(&mut self) -> Step {
-        if let Some(signal) = self.kept.take() {
+        for Resend { signal, .. } in std::mem::take(&mut self.resend) {
             let sent = self.forces.result("S4r").unwrap_or_else(|| sys::kill(self.pid, signal));
             if let Err(e) = sent {
                 return self.fail(e, "S4");
@@ -642,35 +682,59 @@ impl Machine<'_> {
         })
     }
 
-    /// Releases the tracee from a stop by `signal`: keeps a default-action stop signal and
-    /// releases the tracee without it (`<tag>k`), or delivers any other signal (`<tag>s`),
-    /// including a stop signal the tracee catches or ignores.
+    /// Releases the tracee from a stop by `signal` (see the module docs): a stop signal with no
+    /// signal, keeping it (`<tag>k`), holding it (`<tag>h`) or dropping it (`<tag>i`) by its
+    /// disposition; any other signal by delivering it (`<tag>s`).
     fn pass_on(&mut self, tag: &str, signal: i32) -> Result<Result<(), i32>, Gone> {
-        let keep = if is_stop_signal(signal) {
+        let release = if is_stop_signal(signal) {
             match self
                 .forces
                 .disposition(&format!("{tag}disp"))
                 .unwrap_or_else(|| sys::disposition(self.pid, signal))
             {
-                Ok(Disposition::Default) => true,
-                Ok(Disposition::Caught | Disposition::Ignored) => false,
+                Ok(Disposition::Default) => Release::Keep,
+                Ok(Disposition::Caught) => Release::Hold,
+                Ok(Disposition::Ignored) => Release::Drop,
                 Err(e) => return Ok(Err(e)),
             }
         } else {
-            false
+            Release::Deliver
         };
-        let delivered = if keep { 0 } else { signal };
+        let delivered = if release == Release::Deliver { signal } else { 0 };
         let result = self
             .forces
             .result(&format!("{tag}cont"))
             .unwrap_or_else(|| sys::cont(self.pid, delivered));
         if result.is_ok() {
-            if keep {
-                self.kept.get_or_insert(signal);
-            } else if signal == libc::SIGCONT {
-                self.kept = None;
-            }
-            self.enter(&format!("{tag}{}", if keep { "k" } else { "s" }))?;
+            let stopped = self.resend.iter().any(|r| r.kept);
+            let suffix = match release {
+                Release::Keep => {
+                    if !stopped {
+                        self.resend.push(Resend {
+                            signal,
+                            kept: true,
+                            cancellable: true,
+                        });
+                    }
+                    "k"
+                }
+                Release::Hold => {
+                    self.resend.push(Resend {
+                        signal,
+                        kept: false,
+                        cancellable: stopped,
+                    });
+                    "h"
+                }
+                Release::Drop => "i",
+                Release::Deliver => {
+                    if signal == libc::SIGCONT {
+                        self.resend.retain(|r| !r.cancellable);
+                    }
+                    "s"
+                }
+            };
+            self.enter(&format!("{tag}{suffix}"))?;
         }
         Ok(result)
     }

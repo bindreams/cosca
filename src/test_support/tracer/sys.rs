@@ -155,14 +155,17 @@ pub(super) enum Disposition {
     Ignored,
 }
 
-/// `signal`'s disposition in `pid`. `Err(ESRCH)` if `pid` is gone, `Err(EPERM)` if the kernel
+/// `signal`'s disposition in `pid`. `Err(ESRCH)` once `pid` is reaped, `Err(EPERM)` if the kernel
 /// refused the query.
+///
+/// An exiting process, a zombie included, is still found, and reports every signal ignored
+/// while it keeps its handlers (xnu `kern_exit.c`, `proc_prepareexit` sets `p_sigignore`): a
+/// handler wins, which is the answer it gave while it lived.
 pub(super) fn disposition(pid: u32, signal: i32) -> Result<Disposition, i32> {
     use crate::identity::{kinfo::kinfo, Resolved};
     match kinfo(pid as _) {
         Resolved::Found(info) => {
             let (ignored, caught) = (info.kp_proc.sig_ignored(signal), info.kp_proc.sig_caught(signal));
-            debug_assert!(!(ignored && caught), "signal {signal} is both ignored and caught");
             Ok(if caught {
                 Disposition::Caught
             } else if ignored {

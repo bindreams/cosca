@@ -69,8 +69,9 @@ pub(crate) enum Report {
     /// The helper reaped the tracee, so XNU has handed the zombie back to the test.
     Reaped,
     /// The tracee is no longer traced and is the test's child again. Every signal that stopped
-    /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal is
-    /// re-sent after the detach, unless a later `SIGCONT` cancelled it (see [`machine`]).
+    /// it, but the `SIGSTOP`s the attach and the detach sent, was delivered: a stop signal it
+    /// does not ignore is re-sent after the detach, unless a later `SIGCONT` cancelled it, and an
+    /// ignored one is dropped (see [`machine`]).
     /// Measured on CI: on macOS 15 the tracee runs, or is job-stopped by the re-sent signal; on
     /// macOS 26 it may instead stay stopped by the detach's `SIGSTOP`, against which XNU discards
     /// the re-sent one. So the test ends it with `SIGKILL` through its handle, which ends it
