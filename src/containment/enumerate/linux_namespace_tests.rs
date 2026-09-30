@@ -38,10 +38,12 @@ fn fixture_enumerate_inner() {
     }
 }
 
-/// A file mounted over a process's `stat` is not read: the process is omitted, not listed with
-/// the fake parent. Mutant: "read `stat` with a plain `openat`".
+/// A file mounted over a process's `stat` is not read, and the live process behind it cannot be
+/// left out (its subtree would go with it): the snapshot is `Unassessable` naming the pid and the
+/// mount. Mutants: "read `stat` with a plain `openat`"; "skip a pid whose `stat` lies beyond a
+/// mount".
 #[test]
-fn namespaces_a_stat_mounted_over_is_omitted_not_read() {
+fn namespaces_a_stat_mounted_over_is_unassessable() {
     if !ns::enabled() {
         return;
     }
@@ -63,13 +65,15 @@ fn fixture_enumerate_stat_overmount() {
     std::fs::write(&fake, format!("{pid} (fake) S 4242 999 {zeros} 1 0\n")).expect("write the fake stat");
     ns::bind_over(&fake, std::path::Path::new(&format!("/proc/{pid}/stat")));
 
-    let snapshot = process_parents().expect("the /proc view is this namespace's");
-    assert!(
-        !snapshot.iter().any(|&(p, _)| p == pid),
-        "a stat behind a mount must be omitted, got {:?}",
-        snapshot.iter().find(|&&(p, _)| p == pid)
-    );
-    assert!(snapshot.contains(&(std::process::id(), std::os::unix::process::parent_id())));
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(
+                detail.contains(&format!("{pid}/stat lies beyond a mount in /proc")),
+                "the error must name the pid and the mount: {detail}"
+            );
+        }
+        other => panic!("a stat behind a mount must fail the snapshot, got {other:?}"),
+    }
 
     _ = child.kill();
     _ = child.wait();

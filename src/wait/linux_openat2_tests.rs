@@ -11,10 +11,7 @@ fn assert_names_openat2(result: Result<Option<rustix::fd::OwnedFd>, Error>, errn
     match result {
         Err(Error::Unsupported { op, detail, platform }) => {
             assert_eq!(platform, "linux");
-            assert_eq!(
-                detail,
-                format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {errno_name}")
-            );
+            assert_eq!(detail, crate::identity::openat2_refused_message(errno_name));
             // The caller's operation, not one shared string: owned children reach this path too.
             assert_eq!(op, "process terminate");
         }

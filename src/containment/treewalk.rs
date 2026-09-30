@@ -431,3 +431,11 @@ mod treewalk_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "treewalk_view_tests.rs"]
 mod treewalk_view_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "treewalk_blind_tests.rs"]
+mod treewalk_blind_tests;
+
+#[cfg(all(test, windows))]
+#[path = "treewalk_toolhelp_tests.rs"]
+mod treewalk_toolhelp_tests;

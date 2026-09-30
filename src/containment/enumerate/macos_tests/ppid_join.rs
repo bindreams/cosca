@@ -153,3 +153,55 @@ fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
         other => panic!("expected Unassessable, got {other:?}"),
     }
 }
+
+/// A pid denied its ppid read leaves its subtree out of the edges, and a walk over them would skip
+/// it: `process_parents` is `Unassessable` naming the denied count and a sample. Mutant: "`denied >
+/// 0` still returns `Ok`".
+#[test]
+fn a_denied_ppid_read_is_unassessable_naming_the_count_and_a_sample() {
+    let me = std::process::id() as libc::c_int;
+    let _forced = super::super::fault::force_denied(&[me]);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("1 of "), "{detail}");
+            assert!(detail.contains(&format!("sample: [{me}]")), "{detail}");
+            assert!(source.is_none());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
+
+/// `snapshot` keeps its own policy for the same denial: the fd-marker sweep folds the count into
+/// its `incomplete` accounting, so it gets the edges it could read and the count. Mutant:
+/// "`snapshot` fails like `process_parents`".
+#[test]
+fn snapshot_reports_a_denied_ppid_read_as_a_count_not_an_error() {
+    let me = std::process::id() as libc::c_int;
+    let _forced = super::super::fault::force_denied(&[me]);
+    let (pids, edges, denied) = super::super::snapshot();
+    assert_eq!(denied, 1);
+    assert!(pids.contains(&(me as u32)));
+    assert!(!edges.iter().any(|&(pid, _)| pid == me as u32));
+}
+
+/// A failed edge allocation is `Unassessable`, not an empty tree. Mutant: "`join_edges`' failure is
+/// an empty snapshot".
+#[test]
+fn a_failed_edge_allocation_is_unassessable_not_an_empty_snapshot() {
+    let _forced = super::super::fault::force_join_alloc_failure();
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, source }) => {
+            assert!(detail.contains("edge buffer"), "{detail}");
+            assert!(source.is_some());
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+}
+
+/// `snapshot`'s blind-pass arm: a failed join is an empty table and a zero count, which the
+/// fd-marker sweep reads as an incomplete pass. Mutant: "a failed join returns the pid list".
+#[test]
+fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
+    let _forced = super::super::fault::force_join_alloc_failure();
+    assert_eq!(super::super::snapshot(), (Vec::new(), Vec::new(), 0));
+}
