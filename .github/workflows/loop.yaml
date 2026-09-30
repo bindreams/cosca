@@ -23,9 +23,13 @@ jobs:
         run: cargo nextest run --lib --no-run --locked
       - name: Loop
         run: |
+          set +e
           sw_vers
+          sysctl -n hw.ncpu
+          (yes >/dev/null &) ; (yes >/dev/null &) ; (yes >/dev/null &)
           fails=0
-          for i in $(seq 1 600); do
-            cargo nextest run --lib --locked -E 'test(=test_support::tracer::tracer_tests::s4_passes_a_stopping_signal_through_before_detaching)' >run.log 2>&1 || { fails=$((fails+1)); echo "--- run $i FAILED"; grep -E "DIAG|panicked|TIMEOUT|left:|right:|assertion" run.log | head -6; }
+          for i in $(seq 1 200); do
+            cargo nextest run --lib --locked -E 'test(/tracer_tests::/)' >run.log 2>&1 || { fails=$((fails+1)); echo "--- run $i FAILED"; grep -E "DIAG|panicked|TIMEOUT|left:|right:|assertion|FAIL " run.log | head -12; }
           done
-          echo "RESULT ${{ matrix.runner }}: $fails failures of 600"
+          echo "RESULT ${{ matrix.runner }}: $fails failing iterations of 200"
+          pkill yes
