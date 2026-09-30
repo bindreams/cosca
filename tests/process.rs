@@ -635,15 +635,14 @@ fn accept_tree_panics_when_the_root_dies_before_connecting_after_another_member_
     let addr = listener.local_addr().unwrap().to_string();
 
     // Plays "the grandchild": connects, tags 'G', and blocks, alive and silent for the whole test.
-    let mut grandchild = std::process::Command::new(common::testbin())
-        .args(["control-block", &addr, "G"])
-        .env(common::ACK_ENV, "1")
-        .spawn()
-        .expect("spawn the grandchild");
+    let mut grandchild = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["control-block", &addr, "G"])
+            .env(common::ACK_ENV, "1"),
+    )
+    .expect("spawn the grandchild");
     // Plays "the root": alive, but never connects.
-    let mut root = std::process::Command::new(common::testbin())
-        .args(["sleep-marker"])
-        .spawn()
+    let mut root = common::spawn_locked(std::process::Command::new(common::testbin()).args(["sleep-marker"]))
         .expect("spawn a root that stays alive without ever connecting");
     let root_pid = root.id();
 
