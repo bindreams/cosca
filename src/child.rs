@@ -191,13 +191,19 @@ impl Child {
 
     /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike [`Process::kill`](crate::Process::kill), this
     /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
+    ///
+    /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
+    /// `Ok`.
     pub fn kill(&self) -> Result<(), Error> {
         // Both backends return Ok(()) for an already-exited child (std delegates to
         // std::process::Child::kill; the raw path maps an already-dead TerminateProcess to Ok).
-        // EPERM/ACCESS_DENIED on an elevated wrapper child becomes the typed `Unkillable`.
-        self.proc
-            .kill()
-            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+        // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok` (Linux refuses a
+        // signal to a root-owned zombie), and a privilege refusal of an elevated wrapper child
+        // becomes the typed `Unkillable`.
+        match self.proc.kill() {
+            Ok(()) => Ok(()),
+            Err(e) => crate::refusal::resolve_kill_error(e, self.id, self.is_elevated_wrapper()),
+        }
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -283,10 +289,10 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
-        let backstop = self
-            .proc
-            .kill()
-            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
+        let backstop = match self.proc.kill() {
+            Ok(()) => Ok(()),
+            Err(e) => crate::refusal::resolve_kill_error(e, self.id, self.is_elevated_wrapper()),
+        };
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
         }

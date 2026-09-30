@@ -428,11 +428,15 @@ impl Child {
     /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
     /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
     /// `wait().await` (or `Drop`) collects the exit status.
+    ///
+    /// A signal the OS refuses (`EPERM` / `ACCESS_DENIED`) for a child that has already exited is
+    /// `Ok`.
     pub fn kill(&mut self) -> Result<(), Error> {
-        // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
-        // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
+        // A refusal (EPERM/ACCESS_DENIED) is classified: an exited child is `Ok`, and a privilege
+        // refusal of an elevated wrapper child becomes `Unkillable`.
+        let elevated_wrapper = self.is_elevated_wrapper();
         match self.proc_mut().start_kill() {
-            Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
+            Err(Error::Io(e)) => crate::refusal::resolve_kill_error(e, self.id(), elevated_wrapper),
             other => other,
         }
     }

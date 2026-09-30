@@ -52,6 +52,8 @@ impl Child {
     /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
+    /// **Refused signal.** A signal the OS refuses for a child that has already exited is `Ok`.
+    ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
     /// delivered in that window ends it during loader init rather than through its own handler.
@@ -110,7 +112,7 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        self.kill()?; // escalate, classified as `kill` is; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
@@ -443,3 +445,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "graceful_tests.rs"]
 mod graceful_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "refusal_tests.rs"]
+mod refusal_tests;

@@ -52,6 +52,9 @@ pub enum ElevationErrorKind {
     NoTty,
     /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
     /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
+    ///
+    /// Not this: a child that had already exited (`Ok`; Linux answers `EPERM` for a root-owned
+    /// zombie).
     #[error("could not terminate an elevated child: permission denied")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to

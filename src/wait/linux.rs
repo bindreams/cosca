@@ -410,23 +410,27 @@ pub(crate) fn block_until_exit(id: ProcessId, deadline: Option<Option<Instant>>)
 }
 
 pub(crate) fn kill(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Kill)? else {
-        return Ok(());
-    };
-    match pidfd_send_signal(&pidfd, Signal::KILL) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
-        Err(e) => Err(Error::Io(std::io::Error::from(e))),
-    }
+    signal(id, Signal::KILL, PidfdOp::Kill)
 }
 
 pub(crate) fn terminate(id: ProcessId) -> Result<(), Error> {
-    let Some(pidfd) = open_verified(id, PidfdOp::Terminate)? else {
+    signal(id, Signal::TERM, PidfdOp::Terminate)
+}
+
+/// Send `sig` to `id` through a fresh, identity-verified pidfd. Only the signal syscall's own
+/// `EPERM` is classified (see [`crate::refusal`]): one from `pidfd_open` is a refused syscall, and
+/// [`open_verified`] has already said so.
+fn signal(id: ProcessId, sig: Signal, op: PidfdOp) -> Result<(), Error> {
+    let Some(pidfd) = open_verified(id, op)? else {
         return Ok(());
     };
-    match pidfd_send_signal(&pidfd, Signal::TERM) {
+    match pidfd_send_signal(&pidfd, sig) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::SRCH) => Ok(()), // exited between re-verify and signal
+        Err(rustix::io::Errno::PERM) => crate::refusal::resolve(
+            crate::refusal::linux::classify_pidfd(id, pidfd.as_fd())?,
+            std::io::Error::from(rustix::io::Errno::PERM),
+        ),
         Err(e) => Err(Error::Io(std::io::Error::from(e))),
     }
 }

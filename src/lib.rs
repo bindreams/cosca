@@ -14,6 +14,9 @@
 //!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
 //!   [`Error::Io`](error::Error::Io) naming the syscall. `main` does not require a pidfd
 //!   at spawn yet ([#341](https://github.com/bindreams/cosca/issues/341)).
+//! - `pidfd_send_signal` needs 5.1, and `Child::terminate` uses it. `Child::kill` uses `kill(2)`.
+//!   An `EPERM` from either for an already-exited child is `Ok`; one for a live child of a more
+//!   privileged user is an ordinary permission error.
 //! - `waitid(P_PIDFD)` needs 5.4, and is what a pidfd-based reap needs. On `main` only the cgroup
 //!   leaf reaps that way; an owned child's waits and reaps still go by pid
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
@@ -92,6 +95,8 @@ pub use command::Command;
 
 mod wait;
 
+mod refusal;
+
 #[cfg(test)]
 mod log_capture;
 
@@ -111,10 +116,13 @@ mod test_privilege;
 mod test_own_process;
 #[cfg(all(test, unix))]
 mod test_own_process_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod test_seccomp;
 #[cfg(all(test, unix))]
 mod test_stdio;
 #[cfg(all(test, unix))]
 mod test_stdio_tests;
+
 #[cfg(all(test, target_os = "macos"))]
 mod test_support;
 
