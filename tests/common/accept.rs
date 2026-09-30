@@ -65,6 +65,12 @@ pub use async_impl::{accept_or_die_async, accept_or_die_async_also};
 #[cfg(windows)]
 pub use win::wait_handles;
 
+#[cfg(target_os = "linux")]
+#[path = "accept/signalled.rs"]
+mod signalled;
+#[cfg(target_os = "linux")]
+pub use signalled::accept_or_signalled;
+
 /// A child process the caller owns and has not reaped.
 pub trait Target {
     fn pid(&self) -> u32;

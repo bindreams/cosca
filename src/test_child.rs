@@ -391,7 +391,7 @@ fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::Proces
 
     use rustix::event::{poll, PollFd, PollFlags};
 
-    let Some(pidfd) = crate::wait::backend::open_verified(target, "its exit cannot be observed")
+    let Some(pidfd) = crate::wait::backend::open_verified(target, crate::wait::backend::PidfdOp::Wait)
         .expect("open a pidfd to watch the target")
     else {
         return WatchEvent::Died;
@@ -1192,10 +1192,7 @@ fn spawn_connects_and_exits(
     if acked {
         cmd.env(ack::ACK_ENV, "1");
     }
-    let child = {
-        let _guard = crate::child::spawn::spawn_lock();
-        cmd.spawn().expect("spawn the connects-and-exits fixture")
-    };
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the connects-and-exits fixture");
     let target = crate::Process::from_pid(child.id())
         .found()
         .expect("resolve the freshly spawned fixture's pid")
