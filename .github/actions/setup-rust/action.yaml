@@ -14,13 +14,13 @@ runs:
   steps:
     - name: Install Rust toolchain
       id: rust-toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       with:
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ~/.cargo/registry
@@ -29,7 +29,7 @@ runs:
         restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
 
     - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
     - name: Enable sccache for cargo
       shell: bash
