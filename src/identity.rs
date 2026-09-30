@@ -175,6 +175,9 @@ impl ProcessId {
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified, Opened};
 
 #[cfg(target_os = "linux")]
+pub(crate) use backend::pid_stat;
+
+#[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView, ViewUnreadable};
 
 /// The error for a by-pid read of `subject` that answered [`Resolved::Unknown`] because the
