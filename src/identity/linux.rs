@@ -17,7 +17,7 @@ mod read_namespace_tests;
 
 use std::time::{Duration, SystemTime};
 
-use self::proc_view::{ProcDir, ProcView};
+use self::proc_view::ProcDir;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::parse_starttime_jiffies;
 use super::{Liveness, RawPid, Resolved, StartToken};
@@ -97,11 +97,7 @@ pub(super) fn signal_says_no_such_process(pid: RawPid) -> bool {
     signal_probe(pid) == SignalProbe::NoSuchProcess
 }
 
-pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
-    start_token_from(pid, read_stat(pid))
-}
-
-/// [`start_token`], and the unusable `/proc` view behind an `Unknown`, when that is why.
+/// The start token of `pid`, and the unusable `/proc` view behind an `Unknown`, when that is why.
 pub(super) fn start_token_explained(pid: RawPid) -> (Resolved<StartToken>, Option<proc_view::ViewUnreadable>) {
     let (stat, cause) = read_stat_explained(pid);
     (start_token_from(pid, stat), cause)

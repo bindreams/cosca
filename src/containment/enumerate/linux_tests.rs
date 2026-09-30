@@ -208,7 +208,7 @@ fn an_unparsable_stat_is_unassessable_naming_the_pid() {
 #[should_panic(expected = "the kernel printed an unparseable stat")]
 fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
     let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
-    let _ = process_parents();
+    drop(process_parents());
 }
 
 /// Without the assertion (release), the scan still refuses to drop the pid. Mutant: "an unparsable
