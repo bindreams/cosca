@@ -7,6 +7,8 @@
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
 //! the checked `/proc` view cannot be built, and `open_verified` is `Unsupported` naming `openat2`.
+//! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support`]),
+//! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
 use std::os::fd::AsFd;
 use std::time::Instant;

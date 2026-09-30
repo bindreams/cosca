@@ -140,7 +140,15 @@ pub enum Error {
     ///   either way no pidfd is possible.
     ///
     /// Any other failure is transient and surfaces as [`Error::Io`], prefixed `pidfd_open:`
-    /// (`EMFILE`, `ENFILE`, `ENOMEM`). A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
+    /// (`EMFILE`, `ENFILE`, `ENOMEM`).
+    ///
+    /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
+    /// program can run. It first calls `pidfd_open` on its own process: a refusal is this
+    /// variant with `op` `spawn`, and no child was forked. The child is then held before `exec`
+    /// until the parent has opened its pidfd; if that fails the child never runs the program and
+    /// the failure is this variant (a refusal) or [`Error::Io`] (a transient failure).
+    ///
+    /// A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
     /// for a non-leader thread) is not an error: the operation reports it as exited.
     #[error("{op} is not supported on {platform}: {detail}")]
     Unsupported {
