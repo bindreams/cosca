@@ -16,15 +16,6 @@ use crate::identity::RawPid;
 /// A failed or interrupted snapshot is [`Error::Unassessable`] naming the Win32 call and its
 /// code: a partial list would read as "no descendants" to the tree walk.
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
-    #[cfg(test)]
-    if fault::snapshot_fails() {
-        return Err(snapshot_failed(
-            "CreateToolhelp32Snapshot",
-            windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
-                windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
-            )),
-        ));
-    }
     let mut out = Vec::new();
 
     // Process32FirstW/NextW signal end-of-enumeration with ERROR_NO_MORE_FILES.
@@ -32,7 +23,7 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
 
     // SAFETY: snapshot/iterate with an owned handle, closed before every return.
     unsafe {
-        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+        let snap = match create_snapshot() {
             Ok(snap) => snap,
             Err(e) => return Err(snapshot_failed("CreateToolhelp32Snapshot", e)),
         };
@@ -57,6 +48,18 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     }
 
     Ok(out)
+}
+
+/// `CreateToolhelp32Snapshot`, with a test seam: a forced failure replaces the call.
+fn create_snapshot() -> windows::core::Result<windows::Win32::Foundation::HANDLE> {
+    #[cfg(test)]
+    if fault::snapshot_fails() {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+        )));
+    }
+    // SAFETY: a snapshot request with no borrowed arguments.
+    unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
 }
 
 fn snapshot_failed(call: &str, e: windows::core::Error) -> Error {
