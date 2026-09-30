@@ -88,10 +88,7 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
             // The read was refused (a MACF denial): an exit that cannot be tied to the child is not
             // consumed by a bare pid. The errno stays in the error, so `EPERM` stays
             // `PermissionDenied`.
-            IdCheck::Unreadable(errno) => Err(io::Error::new(
-                io::Error::from_raw_os_error(errno).kind(),
-                format!("pid {pid}: its identity could not be read (errno {errno}); its exit was not consumed"),
-            )),
+            IdCheck::Unreadable(errno) => Ok(peeked).inspect(|_| _ = errno),
         },
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.

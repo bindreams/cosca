@@ -181,13 +181,7 @@ impl SharedChild {
             Ok(identity) => identity,
             Err(errno) => {
                 return Err((
-                    Error::Unassessable {
-                        detail: format!(
-                            "pid {}: its identity could not be read (errno {errno}); the child was not adopted",
-                            id.pid()
-                        ),
-                        source: Some(io::Error::from_raw_os_error(errno)),
-                    },
+                    Error::Io(io::Error::from_raw_os_error(errno)),
                     child,
                 ));
             }
