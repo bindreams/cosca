@@ -6,7 +6,7 @@ mod graceful;
 
 #[path = "child/proc_source.rs"]
 mod proc_source;
-pub(crate) use proc_source::ProcSource;
+pub(crate) use proc_source::{ProcSource, Sent};
 
 #[path = "child/reaper.rs"]
 pub(super) mod reaper;
@@ -19,6 +19,7 @@ use crate::child::ParentEnd;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::signal::Sig;
 use crate::stdio::Fd;
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
@@ -431,17 +432,22 @@ impl Child {
         self.proc_mut().try_wait()
     }
 
-    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid, and a
-    /// refused Linux `pidfd_open` cannot fail it.
-    /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
-    /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
-    /// `wait().await` (or `Drop`) collects the exit status.
+    /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds,
+    /// and on Windows through the process handle, so neither can race a recycled pid; a refused
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid after a peek that
+    /// finds no foreign reap, and a reap by someone else between the peek and the send is
+    /// principle 5's accepted gap.
+    /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by
+    /// someone else (where tokio's `start_kill` answered `ESRCH`, this answers `Ok` on Linux and
+    /// macOS).
+    /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
-        // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc_mut().start_kill() {
+        // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
+        match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
-            other => other,
+            Err(other) => Err(other),
+            Ok(Sent::Delivered | Sent::Gone) => Ok(()),
         }
     }
 
@@ -665,6 +671,14 @@ impl Child {
 #[path = "child_drop_tests.rs"]
 mod child_drop_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/pid_reuse_tests.rs"]
+mod pid_reuse_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/macos_kill_tests.rs"]
+mod macos_kill_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
@@ -815,10 +829,17 @@ impl Drop for Child {
         let killed = if reaper::fault::take_force_kill_failure() {
             Err(Error::Io(std::io::Error::other("forced kill failure (test seam)")))
         } else {
-            os.proc_mut().start_kill()
+            os.proc_mut().signal(Sig::Kill)
         };
         #[cfg(not(test))]
-        let killed = os.proc_mut().start_kill();
+        let killed = os.proc_mut().signal(Sig::Kill);
+        // Nothing was delivered because the child is gone (reaped by someone else, and its pid
+        // possibly reused): there is nothing to wait for, and a worker waiting on the number
+        // would park on whatever holds it now. Its resources release with this handle instead.
+        if matches!(killed, Ok(Sent::Gone)) {
+            log::debug!("async child {pid} was already gone on drop; releasing it without a reap");
+            return;
+        }
         if killed.is_err() {
             if !matches!(os.proc_mut().try_wait(), Ok(Some(_))) {
                 log::warn!("async child {pid} could not be terminated on drop; leaving it running");

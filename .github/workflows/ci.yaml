@@ -132,10 +132,14 @@ jobs:
     timeout-minutes: 15
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
-    # sandbox, so every step consents. Windows has no tracer tests.
+    # sandbox, so every step consents. Windows has no tracer tests. The STALE_PID_SEND group
+    # (macOS) sends a signal to a pid it has just freed, to show the send is logged before the
+    # syscall.
     env:
       COSCA_TEST_TRACER: "1"
       COSCA_TEST_TRACER_CONSENT: "1"
+      COSCA_TEST_STALE_PID_SEND: "1"
+      COSCA_TEST_STALE_PID_SEND_CONSENT: "1"
 
     steps:
       - uses: actions/checkout@v4

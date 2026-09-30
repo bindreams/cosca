@@ -6,6 +6,10 @@
 pub(crate) mod proc_view;
 
 #[cfg(test)]
+#[path = "linux/fault.rs"]
+pub(crate) mod fault;
+
+#[cfg(test)]
 #[path = "linux/read_tests.rs"]
 mod read_tests;
 
@@ -96,6 +100,10 @@ pub(super) fn start_token_in(proc_dir: &ProcDir, pid: RawPid) -> Resolved<StartT
 }
 
 fn start_token_from(pid: RawPid, stat: Resolved<Vec<u8>>) -> Resolved<StartToken> {
+    #[cfg(test)]
+    if let Some(aliased) = fault::on_read(pid, matches!(stat, Resolved::Found(_))) {
+        return Resolved::Found(aliased);
+    }
     match stat {
         // RAW jiffies are the identity token — NOT converted to wall-clock.
         Resolved::Found(stat) => match parse_starttime_jiffies(&stat) {
