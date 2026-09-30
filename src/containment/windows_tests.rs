@@ -742,8 +742,10 @@ fn walk_verdict_with_only_skips_names_the_last_skip() {
 #[test]
 fn walk_verdict_accepts_a_walk_that_resumed_a_thread() {
     use super::{walk_verdict, Walk};
-    let mut walk = Walk::default();
-    walk.resumed = 1;
+    let mut walk = Walk {
+        resumed: 1,
+        ..Walk::default()
+    };
     walk.skip("thread 7 no longer exists".to_owned());
     walk_verdict(4321, walk).expect("a resumed thread with stale siblings is a success");
 }
