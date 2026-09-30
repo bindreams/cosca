@@ -25,10 +25,11 @@
 //! attach to any child of the test.
 //!
 //! **Contract: it behaves like a debugger, for the signals cosca's tests send.** A tracer owns
-//! the tracee's signal delivery: XNU hands it every signal first, as a stop, `SIGKILL` included,
-//! and `SIGKILL` then lands on the tracee's next release whatever the tracer passes on (xnu
-//! `kern_sig.c`, `psignal_internal` and `issignal`). So the helper promises only what a debugger
-//! does, for the sequences its tests drive:
+//! the tracee's signal delivery: XNU hands it every signal as a stop, except a `SIGKILL` sent
+//! while the tracee is stopped, which lands on its next release. A `SIGKILL` the tracer does see
+//! lands on release whatever the tracer passes on (xnu `kern_sig.c`, `psignal_internal` and
+//! `issignal`). So the helper promises only what a debugger does, for the sequences its tests
+//! drive:
 //!
 //! - It attaches, holds the tracee stopped under `S1:hold`, and continues it.
 //! - It continues each stop and passes its signal on ([`machine`]'s **Signals**): `SIGTERM`,
