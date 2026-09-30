@@ -136,7 +136,8 @@ pub(super) enum Stop {
 /// In that window the thread runs, or blocks uninterruptibly on a kernel lock (`proc_list_lock`,
 /// the tracer's proc lock, `proc_klist_lock`, the tracer's signal lock), and every such wait is
 /// `THREAD_UNINT`. Its `sigwait` wait is `THREAD_INTERRUPTIBLE`. So a stop counts only once every
-/// thread of the tracee is neither running nor uninterruptible: [`parked`].
+/// thread of the tracee is [`parked`]: neither running nor in an uninterruptible wait, unless it
+/// has never started.
 pub(super) fn stop(pid: u32) -> Result<Stop, i32> {
     let info = peek(pid, libc::WSTOPPED | libc::WNOHANG)?;
     if info.si_pid == 0 {
@@ -168,6 +169,13 @@ fn pidinfo<T>(pid: u32, flavor: libc::c_int, arg: u64, buf: &mut [T]) -> Result<
 
 /// `Ok(true)` if every thread of `pid` is [`parked`].
 fn threads_parked(pid: u32) -> Result<bool, i32> {
+    Ok(threads(pid)?
+        .iter()
+        .all(|thread| parked(thread.pth_run_state, thread.pth_flags)))
+}
+
+/// Every thread of `pid`, or the errno.
+pub(super) fn threads(pid: u32) -> Result<Vec<libc::proc_threadinfo>, i32> {
     // SAFETY: `proc_taskinfo` is plain data; all-zero is a valid value.
     let mut task: [libc::proc_taskinfo; 1] = unsafe { std::mem::zeroed() };
     pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut task)?;
@@ -180,23 +188,36 @@ fn threads_parked(pid: u32) -> Result<bool, i32> {
         }
         handles.resize(handles.len() * 2, 0);
     };
-    for &handle in &handles[..listed] {
-        // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
-        let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
-        pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
-        if !parked(thread[0].pth_run_state) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    handles[..listed]
+        .iter()
+        .map(|&handle| {
+            // SAFETY: `proc_threadinfo` is plain data; all-zero is a valid value.
+            let mut thread: [libc::proc_threadinfo; 1] = unsafe { std::mem::zeroed() };
+            pidinfo(pid, libc::PROC_PIDTHREADINFO, handle, &mut thread)?;
+            Ok(thread[0])
+        })
+        .collect()
 }
 
-/// Whether a thread in `run_state` (`pth_run_state`) waits interruptibly or is suspended. XNU
-/// reports a thread that is running or runnable as `TH_STATE_RUNNING`, and one in a
-/// `THREAD_UNINT` wait as `TH_STATE_UNINTERRUPTIBLE` (`thread.c`,
-/// `retrieve_thread_basic_info`).
-fn parked(run_state: i32) -> bool {
-    !matches!(run_state, libc::TH_STATE_RUNNING | libc::TH_STATE_UNINTERRUPTIBLE)
+/// Whether a thread in `run_state` with `flags` (`pth_run_state`, `pth_flags`) waits
+/// interruptibly, is suspended, or has never run. XNU reports a running or runnable thread as
+/// `TH_STATE_RUNNING`, and one in a `THREAD_UNINT` wait as `TH_STATE_UNINTERRUPTIBLE`
+/// (`thread.c`, `retrieve_thread_basic_info`).
+///
+/// A created thread that has not started yet also reports `TH_STATE_UNINTERRUPTIBLE` (its
+/// template state is `TH_WAIT | TH_UNINT`), and stays so while the stop holds the task: a
+/// thread created during the stop starts only on its release (`thread.c`,
+/// `thread_create_with_options_internal`; `thread_act.c`, `thread_release`). It has no kernel
+/// stack yet (`TH_FLAGS_SWAPPED`; stacks come at first dispatch, `sched_prim.c`,
+/// `thread_invoke`), while every wait in the stop's window keeps its stack
+/// (`thread_block(THREAD_CONTINUE_NULL)`). So a stackless uninterruptible thread counts as
+/// parked; without that, such a stop would never settle.
+fn parked(run_state: i32, flags: i32) -> bool {
+    match run_state {
+        libc::TH_STATE_RUNNING => false,
+        libc::TH_STATE_UNINTERRUPTIBLE => flags & libc::TH_FLAGS_SWAPPED != 0,
+        _ => true,
+    }
 }
 
 /// `Ok` while `pid` is this process's unreaped child: a `waitid` peek that neither blocks nor
