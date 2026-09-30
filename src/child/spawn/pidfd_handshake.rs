@@ -38,15 +38,24 @@
 //! `shutdown`, not from a close. A process forked without `exec`, by any thread in or outside
 //! cosca, holds copies of both ends, and a close waits for every copy; a `shutdown` does not.
 //!
-//! - The parent shuts the child's end once nothing is left to report. A failed `spawn()` means
-//!   that at once: std collected the child, or never forked. A successful one means the child has
-//!   execed or died, except that std returns before the child's hooks even run when this process
-//!   has two of fds 0 to 2 closed (see [`ReportChannel`]). So the parent then waits for the helper
-//!   to finish or the child to exit, watched through a pidfd opened on its number while it is an
-//!   unreaped child, and shuts the end only if the child exited first. The watch is never
-//!   signalled through.
+//! - The parent closes its own copy of the child's end as soon as `spawn()` returns. With no other
+//!   copy, the child's death or a failed hook then closes the last one, and the helper reads EOF
+//!   by itself.
+//! - A copy made by a fork without `exec` (any thread, in or outside cosca) outlives the child, so
+//!   the parent can also force EOF: `shutdown` of the read side of its own end. It does so once
+//!   nothing is left to report. A failed `spawn()` means that at once: std collected the child, or
+//!   never forked. A successful one means the child has execed or died, except that std returns
+//!   before the child's hooks even run when this process has two of fds 0 to 2 closed (see
+//!   [`ReportChannel`]). So the parent then waits for the helper to finish or the child to exit,
+//!   watched through a pidfd opened on its number, and forces EOF only if the child exited first.
+//!   The watch is never signalled through. See [`child_exited_before_the_helper_finished`] for the
+//!   window that watch leaves open until #383.
 //! - The helper shuts the parent's end when it is done, and when it unwinds. A child still waiting
 //!   for its verdict reads EOF, which is abort: the helper never has to send one.
+//!
+//! A descriptor created while one of fds 0 to 2 is closed lands on it, and is moved above
+//! ([`above_stdio`]). A concurrent `dup2` onto a closed stdio slot during a spawn is outside this
+//! module's contract.
 //!
 //! [`ReportChannel`]: crate::containment::cgroup::channel::ReportChannel
 //!
@@ -110,9 +119,9 @@ pub(crate) trait Spawned {
     fn pid(&self) -> Option<u32>;
     /// Reap this child through `pidfd`: it never ran the program, and is dead or on its way out.
     fn reap_unexecuted(self, pidfd: OwnedFd);
-    /// Give up on this child: it died before it could send a pidfd, so there is none to reap it
-    /// through.
-    fn abandon_unreported(self);
+    /// Give up on this child: no pidfd reached this process, so there is none to reap it through.
+    /// `why` says what happened to the report.
+    fn abandon_unreported(self, why: &str);
 }
 
 impl Spawned for std::process::Child {
@@ -125,8 +134,8 @@ impl Spawned for std::process::Child {
         super::teardown_through_pidfd(Some(self.id()), pidfd);
     }
 
-    fn abandon_unreported(self) {
-        leave_unreaped(Some(self.id()));
+    fn abandon_unreported(self, why: &str) {
+        leave_unreaped(Some(self.id()), why);
     }
 }
 
@@ -134,8 +143,9 @@ impl Spawned for std::process::Child {
 enum Outcome {
     /// The child sent its pidfd and was told to go.
     Opened(OwnedFd),
-    /// The child sent its pidfd, and its end was closed or shut before it could be told to go: it
-    /// never ran the program.
+    /// The child sent its pidfd, and its end was closed or shut before GO was sent: it never ran
+    /// the program. A GO sent before the child died is buffered and delivered, and the spawn then
+    /// succeeds with a child that dies later, as any child may.
     Gone(OwnedFd),
     /// The spawn cannot go on. The child was not told to go, so it aborts at EOF. Carries the
     /// child's pidfd if it sent one.
@@ -202,11 +212,25 @@ impl Pending {
 
 /// `fd`, moved to 3 or above: with 0, 1 or 2 closed, the lowest free number is one, and the
 /// application may `dup2` its stdio back over it.
+///
+/// This narrows that hazard, it does not close it: no syscall that makes a descriptor takes a
+/// minimum number, so each one (`socketpair`, `eventfd`, the watch's `pidfd_open`, the
+/// `SCM_RIGHTS` install) creates it at the lowest free number first, and the move follows. A
+/// `dup2` by another thread onto a closed stdio slot in that gap is outside this function's
+/// contract, as it is outside every other spawn's.
 fn above_stdio(fd: OwnedFd) -> Result<OwnedFd, Error> {
+    above_stdio_keeping(fd).map_err(|(e, _)| e)
+}
+
+/// [`above_stdio`], handing `fd` back if it could not be moved.
+fn above_stdio_keeping(fd: OwnedFd) -> Result<OwnedFd, (Error, OwnedFd)> {
     if fd.as_raw_fd() >= 3 {
         return Ok(fd);
     }
-    rustix::io::fcntl_dupfd_cloexec(&fd, 3).map_err(|e| Error::Io(crate::error::io_context("fcntl", e.into())))
+    match rustix::io::fcntl_dupfd_cloexec(&fd, 3) {
+        Ok(moved) => Ok(moved),
+        Err(e) => Err((Error::Io(crate::error::io_context("fcntl", e.into())), fd)),
+    }
 }
 
 /// Shuts `fd`'s socket both ways, so every copy of either end reads EOF.
@@ -214,6 +238,16 @@ fn shut(fd: &OwnedFd) {
     // An `AF_UNIX` socketpair end is always connected: `shutdown` has nothing to refuse.
     if let Err(e) = rustix::net::shutdown(fd, Shutdown::Both) {
         log::warn!("pidfd handshake: shutdown of the channel failed: {e}");
+        debug_assert!(false, "shutdown of a socketpair end failed: {e}");
+    }
+}
+
+/// Makes the helper's `recvmsg` on the parent's end read EOF, whatever copies of the child's end
+/// exist: a shutdown of the read side, which a close of the other end's copies cannot do.
+fn force_eof(parent_end: &OwnedFd) {
+    // An `AF_UNIX` socketpair end is always connected: `shutdown` has nothing to refuse.
+    if let Err(e) = rustix::net::shutdown(parent_end, Shutdown::Read) {
+        log::warn!("pidfd handshake: shutdown of the parent's end failed: {e}");
         debug_assert!(false, "shutdown of a socketpair end failed: {e}");
     }
 }
@@ -249,8 +283,9 @@ impl Handshake {
     ///   status pipe as success) and the helper at EOF. It is dead but unreaped, and its number
     ///   cannot be trusted without a pidfd, so it is left unreaped and warned about, as a macOS
     ///   `Drop` leaves a child it cannot verify. The spawn fails.
-    /// - A child that sent its pidfd and still never ran the program is reaped through it, and the
-    ///   spawn fails.
+    /// - A child that sent its pidfd and died before GO was sent never ran the program: the send
+    ///   meets its closed end, the child is reaped through the pidfd, and the spawn fails. A child
+    ///   that dies after GO was sent is a child that died: the spawn succeeded.
     /// - A spawn that fails after its fork: std collected the child, or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
     ///   through it.
@@ -264,25 +299,31 @@ impl Handshake {
         let seams = fault::take_helper_seams();
         #[cfg(test)]
         let helper_seams = seams.clone();
+        #[cfg(test)]
+        let mut ends = fault::EndProbes::start(&child_end);
         // Written, not closed, when the helper is done: a forked copy cannot hold it off.
         let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
             .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
         let done = above_stdio(done)?;
         let done = &done;
+        // Borrowed by the helper, so this thread can still force EOF on it.
+        let parent_end = &parent_end;
 
         std::thread::scope(|scope| {
+            #[cfg(test)]
+            let _open_held_verdict = seams.open_on_drop();
             let helper = std::thread::Builder::new()
                 .name("cosca-pidfd-handshake".into())
                 .spawn_scoped(scope, move || {
                     let outcome = {
                         let _shut = ShutOnDrop {
-                            parent_end: &parent_end,
+                            parent_end,
                             done,
                             #[cfg(test)]
                             seams: &helper_seams,
                         };
                         help(
-                            &parent_end,
+                            parent_end,
                             #[cfg(test)]
                             &helper_seams,
                         )
@@ -305,20 +346,30 @@ impl Handshake {
             fault::fork_holder_if_armed();
             let spawned = spawn();
             shared.live.store(false, Ordering::Release);
+            #[cfg(test)]
+            fault::spawn_returned(spawned.as_ref().ok().and_then(Spawned::pid));
+            // This thread's copy goes first: the child, or a hook that failed, closing its own copy
+            // then gives the helper EOF, with nothing left to wait for.
+            drop(child_end);
+            #[cfg(test)]
+            ends.check_copies_closed();
             let finished = match &spawned {
                 // std collected the child, or never forked.
                 Err(_) => true,
                 Ok(child) => child_exited_before_the_helper_finished(child.pid(), done),
             };
-            // Nothing is left to report: the helper reads EOF, whatever copies of this end exist.
+            // Nothing is left to report, but a copy of the child's end made by a fork without
+            // `exec` (any thread, in or outside cosca) outlives the child and keeps the helper
+            // from EOF: force it.
             if finished {
-                shut(&child_end);
+                force_eof(parent_end);
                 #[cfg(test)]
-                fault::record_child_end_shut(&child_end);
+                ends.forced_eof();
             }
             #[cfg(test)]
+            ends.finish(parent_end);
+            #[cfg(test)]
             seams.release_verdict(spawned.as_ref().ok().and_then(Spawned::pid));
-            drop(child_end);
             let outcome = join_helper(
                 helper,
                 #[cfg(test)]
@@ -360,21 +411,38 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         debug_assert!(false, "a spawned child without a pid: {pid:?}");
         return false;
     };
-    // A watch only. The child is unreaped, so its number is its own unless something else reaped
-    // it, which `ESRCH` or the peek's `ECHILD` shows: it has exited either way.
+    // A watch only, opened by number. The number is the child's own while the child is an unreaped
+    // child of this process; `ESRCH` or the peek's `ECHILD` shows that something else reaped it.
+    //
+    // The window that remains, until #383 (an atomic pidfd) removes the watch: the number can be
+    // reaped by a foreign reaper (a `SIG_IGN` host, another thread's `waitpid(-1)`) and taken by a
+    // RUNNING child of this process, and then the watch opens that child and the peek answers
+    // `Running`. Nothing is signalled through the watch, but the poll below then waits until the
+    // helper is done or that child exits. It needs ALL of:
+    //  1. the child dies before it reports, so the helper is not done when this code looks;
+    //  2. a fork without `exec` (any thread) copied the child's end while `spawn()` ran, so the
+    //     helper cannot read EOF by itself: without a copy, the helper finishes at the child's death
+    //     and ends the poll at once;
+    //  3. a foreign reap of the child;
+    //  4. the number taken by a running child of this process before the watch opens.
+    // Closed stdio is NOT needed.
     let watch = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
         Ok(watch) => match above_stdio(watch) {
             Ok(watch) => watch,
             Err(e) => {
                 log::warn!(
-                    "pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report"
+                    "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
+                    super::named(pid)
                 );
                 return false;
             }
         },
         Err(Errno::SRCH) => return true,
         Err(e) => {
-            log::warn!("pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report");
+            log::warn!(
+                "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
+                super::named(pid)
+            );
             return false;
         }
     };
@@ -382,16 +450,20 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         Ok(Peek::Foreign(_) | Peek::Exit(_)) => return true,
         Ok(Peek::Running) => {}
         Err(e) => {
-            log::warn!("pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report");
+            log::warn!(
+                "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
+                super::named(pid)
+            );
             debug_assert!(false, "waitid on a spawned child's pidfd failed: {e}");
             return false;
         }
     }
-    #[cfg(test)]
-    fault::before_awaiting_the_child();
     let mut fds = [PollFd::new(done, PollFlags::IN), PollFd::new(&watch, PollFlags::IN)];
     if let Err(e) = helper_done(&mut fds, None) {
-        log::warn!("pid {pid:?}: poll on the spawn handshake failed ({e}); the spawn waits for its report");
+        log::warn!(
+            "{}: poll on the spawn handshake failed ({e}); the spawn waits for its report",
+            super::named(pid)
+        );
         debug_assert!(false, "poll on an eventfd and a pidfd failed: {e}");
         return false;
     }
@@ -422,10 +494,19 @@ fn help(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Outcom
         Ok(Report::Eof) => return Outcome::NoReport,
         Err(e) => return Outcome::Failed(e, None),
     };
-    // A pidfd in a stdio slot could be replaced under it: it is given up, and the child aborts.
-    let pidfd = match above_stdio(pidfd) {
+    // A pidfd in a stdio slot could be replaced under it, so it is moved above them. If that fails
+    // it is still the child's pidfd, and the spawn fails with it in hand: the child is not told to
+    // go, and is reaped through it.
+    #[cfg(test)]
+    let moved = match seams.take_move_errno() {
+        Some(errno) => Err((Error::Io(io::Error::from(errno)), pidfd)),
+        None => above_stdio_keeping(pidfd),
+    };
+    #[cfg(not(test))]
+    let moved = above_stdio_keeping(pidfd);
+    let pidfd = match moved {
         Ok(pidfd) => pidfd,
-        Err(e) => return Outcome::Failed(e, None),
+        Err((e, pidfd)) => return Outcome::Failed(e, Some(pidfd)),
     };
     match send_go(
         parent_end,
@@ -598,10 +679,10 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
         (Ok(child), Outcome::Gone(pidfd)) => {
-            let pid = child.pid();
+            let named = super::named(child.pid());
             child.reap_unexecuted(pidfd);
             Err(Error::Io(io::Error::other(format!(
-                "the spawned child (pid {pid:?}) died before exec: the program never ran"
+                "the spawned child ({named}) died before exec: the program never ran"
             ))))
         }
         (Ok(child), Outcome::Failed(e, Some(pidfd))) => {
@@ -609,14 +690,14 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held
             Err(e)
         }
         (Ok(child), Outcome::Failed(e, None)) => {
-            child.abandon_unreported();
+            child.abandon_unreported(&format!("its pidfd could not be used ({e})"));
             Err(e)
         }
         (Ok(child), Outcome::NoReport) => {
-            let pid = child.pid();
-            child.abandon_unreported();
+            let named = super::named(child.pid());
+            child.abandon_unreported("it died before it sent its pidfd");
             Err(Error::Io(io::Error::other(format!(
-                "the spawned child (pid {pid:?}) died before it could send its pidfd"
+                "the spawned child ({named}) died before it could send its pidfd"
             ))))
         }
         // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
@@ -647,19 +728,26 @@ pub(crate) fn await_unexecuted_exit(pidfd: &OwnedFd, pid: Option<u32>) {
     // It never execed, so it has this process's credentials: nothing but its being gone, which the
     // helper answers `Ok`, can refuse.
     if let Err(e) = crate::signal::via_pidfd(Some(pidfd.as_fd()), pid.unwrap_or(0), crate::signal::Sig::Kill) {
-        log::warn!("pid {pid:?}: a spawned child that never ran could not be killed: {e}");
+        log::warn!(
+            "{}: a spawned child that never ran could not be killed: {e}",
+            super::named(pid)
+        );
         debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
     }
     if let Err(e) = wait_visible_exit(&Target::PidFd(pidfd.as_fd())) {
-        log::warn!("pid {pid:?}: a spawned child that never ran could not be waited on: {e}");
+        log::warn!(
+            "{}: a spawned child that never ran could not be waited on: {e}",
+            super::named(pid)
+        );
         debug_assert!(false, "waitid on an unexecuted child's pidfd failed: {e}");
     }
 }
 
-/// Warns that a dead child stays unreaped: without its pidfd its number cannot be trusted.
-fn leave_unreaped(pid: Option<u32>) {
+/// Warns that a child stays unreaped: without its pidfd its number cannot be trusted.
+fn leave_unreaped(pid: Option<u32>, why: &str) {
     log::warn!(
-        "pid {pid:?} died before it sent its pidfd; it is left unreaped, as cosca never reaps a Linux child by pid"
+        "{}: {why}; it is left unreaped, as cosca never reaps a Linux child by pid",
+        super::named(pid)
     );
     #[cfg(test)]
     fault::leaked_pid(pid);
@@ -748,14 +836,15 @@ fn send_report(fd: RawFd, tag: i32, value: i32, pidfd: RawFd) -> io::Result<()> 
     if pidfd >= 0 {
         let fd_len = std::mem::size_of::<RawFd>() as libc::c_uint;
         header.msg_control = control.0.as_mut_ptr().cast();
+        // `as _`: `size_t` on glibc, `socklen_t` on musl.
         // SAFETY: arithmetic on a length.
-        header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_len) } as usize;
+        header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_len) } as _;
         // SAFETY: `control` is aligned and large enough for one descriptor's header and data.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&header);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as usize;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), pidfd);
         }
     }

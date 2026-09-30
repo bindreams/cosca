@@ -13,7 +13,7 @@ use rustix::io::Errno;
 use rustix::net::ReturnFlags;
 
 use super::fault::{self, ChildFault};
-use super::{classify_send, parse_report, Delivery, Report, REPORT_ERRNO, REPORT_LEN, REPORT_PIDFD};
+use super::{classify_send, parse_report, Delivery, Outcome, Report, REPORT_ERRNO, REPORT_LEN, REPORT_PIDFD};
 use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::Stdio;
@@ -64,14 +64,34 @@ fn raw_command(program: &str) -> (std::process::Command, super::Pending) {
     (std_cmd, pending)
 }
 
+/// What an armed `run` saw of the channel's ends: no copy of the child's end held by the spawning
+/// thread once `spawn()` returned, and the helper at EOF once the wait was over.
+fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
+    let ends = ends.unwrap_or_else(|| panic!("{what}: the end probes saw no run"));
+    assert!(
+        !ends.child_end_copy_held,
+        "{what}: the spawning thread must close its copy of the child's end as soon as spawn() returns"
+    );
+    assert!(
+        ends.eof_reached,
+        "{what}: the helper must read EOF once the wait for the child is over"
+    );
+    ends
+}
+
 // Normal spawns =====
 
-/// Mutant: a handshake that leaves the child held forever (the spawn hangs) or aborts it.
+/// Mutants: a handshake that leaves the child held forever (the spawn hangs: bounded by the nextest
+/// override) or aborts it; EOF forced on a child that is still reporting.
 #[test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
+    let probes = fault::arm_end_probes();
     let child = cmd.spawn().expect("a normal spawn succeeds");
+    drop(probes);
+    let ends = assert_ends_closed(fault::take_ends(), "a normal spawn");
+    assert!(!ends.eof_forced, "a live child that reports is never cut off");
     assert_eq!(fault::spawns(), 1);
     assert!(child.wait().expect("wait").success());
     assert_no_child_of_this_thread("after the wait");
@@ -385,17 +405,16 @@ fn a_later_hook_failure_leaves_nothing_to_kill() {
 /// A child whose hook fails before it reports ends the helper at EOF, and the spawn reports the
 /// child's error.
 ///
-/// Mutant: the parent does not shut its end of the child's socket.
+/// Mutant: the spawning thread keeps its copy of the child's end open past `spawn()` (the helper
+/// then never reads EOF).
 #[test]
 fn a_child_that_fails_before_reporting_ends_the_spawn() {
     let (mut cmd, reader) = marker_command();
     let armed = fault::arm_child_fault(ChildFault::Fail);
+    let probes = fault::arm_end_probes();
     let err = cmd.spawn().err();
-    assert_eq!(
-        fault::child_end_shut(),
-        Some(true),
-        "the parent must shut the child's end once the spawn returns"
-    );
+    drop(probes);
+    assert_ends_closed(fault::take_ends(), "a child that fails before reporting");
     drop(armed);
 
     match err.expect("a child that fails before exec fails the spawn") {
@@ -407,25 +426,23 @@ fn a_child_that_fails_before_reporting_ends_the_spawn() {
 }
 
 /// As above, with a process forked without `exec` holding a copy of the child's end: the helper
-/// still reads EOF, because the end is shut, not just closed.
+/// still reads EOF, because the parent shuts its own end for reading, not just closes the child's.
 ///
-/// Mutant: the parent does not shut its end of the child's socket (the helper would wait forever
-/// on the copy).
+/// Mutant: the parent does not force EOF after a failed spawn (the helper would wait forever on
+/// the copy).
 #[test]
 fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
     let (mut cmd, reader) = marker_command();
     let holder = fault::arm_fork_holder();
     let armed = fault::arm_child_fault(ChildFault::Fail);
+    let probes = fault::arm_end_probes();
     let err = cmd.spawn().err();
+    drop(probes);
     drop(armed);
-    let shut = fault::child_end_shut();
+    let ends = assert_ends_closed(fault::take_ends(), "a failed spawn with a forked copy");
     drop(holder);
 
-    assert_eq!(
-        shut,
-        Some(true),
-        "the parent must shut the child's end, whatever copies of it exist"
-    );
+    assert!(ends.eof_forced, "only a forced EOF reaches the helper through the copy");
     match err.expect("a child that fails before exec fails the spawn") {
         Error::Io(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO), "{e:?}"),
         other => panic!("expected Io, got {other:?}"),
@@ -435,27 +452,24 @@ fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
 }
 
 /// A child killed before it reports, with a process forked without `exec` holding a copy of its
-/// end: `spawn()` returns, the child has exited, and the parent shuts the end so the helper reads
-/// EOF.
+/// end: `spawn()` returns, the child has exited, and the parent forces EOF so the helper reads it.
 ///
-/// Mutant: the parent does not shut its end of the child's socket (the helper would wait forever
-/// on the copy).
+/// Mutant: the parent never watches the child, so it never forces EOF (the helper would wait
+/// forever on the copy).
 #[test]
 fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
     let (mut cmd, reader) = marker_command();
     fault::reset_leaked_pid();
     let holder = fault::arm_fork_holder();
     let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let probes = fault::arm_end_probes();
     let err = cmd.spawn().err();
+    drop(probes);
     drop(armed);
-    let shut = fault::child_end_shut();
+    let ends = assert_ends_closed(fault::take_ends(), "a killed child with a forked copy");
     drop(holder);
 
-    assert_eq!(
-        shut,
-        Some(true),
-        "the parent must shut the child's end once the child has exited"
-    );
+    assert!(ends.eof_forced, "only a forced EOF reaches the helper through the copy");
     assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
     let pid = fault::take_leaked_pid()
         .expect("the unreaped child is named")
@@ -469,8 +483,8 @@ fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
 /// With two of fds 0 to 2 closed, std's status pipe sits on a stdio slot the child replaces, and
 /// `spawn()` returns before the child's hooks run. The child still reports, and runs the program.
 ///
-/// Mutant: the parent shuts the child's end as soon as `spawn()` returns (the child's report then
-/// fails, and so does the spawn).
+/// Mutant: the parent forces EOF as soon as `spawn()` returns (the child's report then fails, and
+/// so does the spawn; the probe says the EOF was forced).
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[test]
@@ -497,11 +511,12 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
         cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
             .expect("wire the slot to the file");
     }
-    // The child waits at its hook until the parent, its spawn returned, waits for it in turn.
+    // The child waits at its hook until the parent's spawn has returned.
     let armed = fault::arm_child_fault(ChildFault::Gate(gate_read.as_raw_fd()));
-    let release = fault::before_awaiting_the_child_do({
+    let probes = fault::arm_end_probes();
+    let release = fault::after_spawn_returns_do({
         let gate_write = Rc::clone(&gate_write);
-        move || {
+        move |_| {
             let mut gate = gate_write.borrow_mut().take().expect("the gate is held");
             gate.write_all(b"x").expect("release the child");
         }
@@ -510,12 +525,15 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
     let spawned = cmd.spawn();
     drop(restore);
     drop(release);
+    drop(probes);
     drop(armed);
     // Released whatever happened, before any assert: a child held forever holds the file.
     if let Some(mut gate) = gate_write.borrow_mut().take() {
         gate.write_all(b"x").expect("release the child");
     }
 
+    let ends = assert_ends_closed(fault::take_ends(), "a spawn that returns before the hooks run");
+    assert!(!ends.eof_forced, "a child that has not exited is never cut off");
     let child = spawned.expect("the spawn must succeed");
     assert!(child.wait().expect("wait").success());
     let mut written = String::new();
@@ -534,14 +552,20 @@ fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
     let (mut cmd, reader) = marker_command();
     fault::reset_leaked_pid();
     let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let probes = fault::arm_end_probes();
     let err = cmd.spawn().err();
+    drop(probes);
     drop(armed);
 
+    assert_ends_closed(fault::take_ends(), "a child killed before it reports");
     let err = err.expect("a child killed before it reports fails the spawn");
     let pid = fault::take_leaked_pid()
         .expect("the unreaped child is named")
         .expect("it has a pid");
-    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        format!("the spawned child (pid {pid}) died before it could send its pidfd")
+    );
     // The test owns this cleanup: the pid is this thread's unreaped zombie.
     let mut status = 0;
     // SAFETY: `pid` is this thread's own zombie child, so waiting on it is sound.
@@ -553,18 +577,16 @@ fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
 
 /// A spawn that fails before any fork still ends the helper thread: `run` returns.
 ///
-/// Mutant: the parent does not shut its end of the child's socket (`run` hangs).
+/// Mutant: the spawning thread keeps its copy of the child's end open (`run` hangs).
 #[test]
 fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let (_std_cmd, pending) = raw_command("true");
     let guard = super::super::spawn_lock();
     let handshake = pending.open(&guard).expect("open");
+    let probes = fault::arm_end_probes();
     let result = handshake.run(|| Err::<std::process::Child, _>(std::io::Error::other("failed before the fork")));
-    assert_eq!(
-        fault::child_end_shut(),
-        Some(true),
-        "the parent must shut the child's end once the spawn returns"
-    );
+    drop(probes);
+    assert_ends_closed(fault::take_ends(), "a spawn that fails before the fork");
     drop(guard);
 
     match result {
@@ -592,6 +614,13 @@ fn the_helper_is_joined_before_the_spawn_returns() {
 }
 
 // Pid namespaces =====
+
+/// A private procfs of this pid namespace on `/proc`: where `/proc/sys` is read-only (a container
+/// without `systempaths=unconfined`), `ns_last_pid` cannot be written through the inherited one.
+fn own_procfs() {
+    ns::enter_private_mount_ns();
+    ns::mount_proc(std::path::Path::new("/proc"));
+}
 
 /// The child dies after it sent its pidfd; a foreign reaper reaps it, and the number goes to
 /// another child of this process before the parent acts on the report. The pidfd names the dead
@@ -622,6 +651,7 @@ fn fixture_reused_number_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;
     }
+    own_procfs();
     let (mut cmd, reader) = marker_command();
     let reuser: Rc<RefCell<Option<std::process::Child>>> = Rc::default();
     let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
@@ -674,6 +704,113 @@ fn fixture_reused_number_init() {
     assert!(!program_ran(cmd, reader));
 }
 
+/// A child dies before it reports; a foreign reaper reaps it, and its number goes to another
+/// running child of this process, all before the parent looks at the child. Nothing holds a copy of
+/// the child's end, so the helper reads EOF when the child dies, and the spawn returns at once
+/// instead of waiting for the reuser to exit.
+///
+/// Mutant: the spawning thread keeps its copy of the child's end past `spawn()` (the probe finds it
+/// held; without the probe the spawn blocks until the reuser exits).
+#[test]
+fn namespaces_a_reused_number_never_holds_the_spawn_when_the_child_dies_unreported() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_unreported_death_driver));
+}
+
+#[test]
+fn fixture_unreported_death_driver() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_new_pid_ns_for_children();
+    ns::run(fixture_path!(fixture_unreported_death_init));
+}
+
+/// Pid 1 of a fresh pid namespace, where only this fixture allocates numbers.
+#[test]
+fn fixture_unreported_death_init() {
+    if !ns::is_child_in_new_pid_ns() {
+        return;
+    }
+    own_procfs();
+    let (mut cmd, reader) = marker_command();
+    fault::reset_leaked_pid();
+    let reuser: Rc<RefCell<Option<std::process::Child>>> = Rc::default();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let probes = fault::arm_end_probes();
+    let after = fault::after_spawn_returns_do({
+        let reuser = Rc::clone(&reuser);
+        move |pid| {
+            let pid = pid.expect("the spawned child's pid");
+            // A foreign reaper: the child is dead of its own SIGKILL.
+            // SAFETY: `pid` is this thread's own child, which kills itself.
+            let reaped = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+            assert_eq!(
+                reaped,
+                pid as i32,
+                "reap the child: {}",
+                std::io::Error::last_os_error()
+            );
+            ns::set_last_pid(pid - 1);
+            #[allow(clippy::disallowed_methods, reason = "the enclosing cosca spawn holds spawn_lock")]
+            let next = std::process::Command::new("cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the reuser");
+            assert_eq!(
+                next.id(),
+                pid,
+                "precondition: the reuser takes the reaped child's number"
+            );
+            *reuser.borrow_mut() = Some(next);
+        }
+    });
+    let err = cmd.spawn().err();
+    drop(after);
+    drop(probes);
+    drop(armed);
+
+    let mut reuser = reuser.borrow_mut().take().expect("the after-spawn hook ran");
+    let running = reuser.try_wait();
+    // Before anything else: the reuser must still be running, so the spawn did not wait for it.
+    let ends = fault::take_ends();
+    reuser.kill().expect("kill the reuser");
+    reuser.wait().expect("reap the reuser");
+    assert!(
+        matches!(running, Ok(None)),
+        "the spawn returned only once the reuser exited: {running:?}"
+    );
+    assert_ends_closed(ends, "a child that died before reporting");
+    let err = err.expect("a child that died before reporting fails the spawn");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the spawned child (pid {}) died before it could send its pidfd",
+            reuser.id()
+        )
+    );
+    assert!(!program_ran(cmd, reader));
+}
+
+/// A panic in the verdict hook fails the test; it does not leave the helper parked at the hold
+/// where the scope waits for it.
+///
+/// Mutant: the gate is opened only after the hook returns (the test hangs: bounded by the nextest
+/// override).
+#[test]
+#[should_panic(expected = "the verdict hook panicked on purpose")]
+fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
+    let (mut cmd, _reader) = marker_command();
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns(|_| panic!("the verdict hook panicked on purpose"));
+    drop(cmd.spawn());
+    drop(held);
+    drop(armed);
+}
+
 /// A thread that unshared its pid namespace for children cannot start threads, so it cannot run
 /// the handshake: the spawn fails before any fork, naming that cause.
 #[test]
@@ -704,4 +841,73 @@ fn fixture_unshared_thread() {
     );
     assert_eq!(fault::spawns(), 0, "nothing may be forked");
     assert!(!program_ran(cmd, reader));
+}
+
+// The helper's own steps =====
+
+/// A report read from a socketpair, through `help`, with `seams`.
+fn help_with_report(seams: &fault::HelperSeams) -> Outcome {
+    let (parent_end, child_end) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .expect("socketpair");
+    let pidfd = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
+        .expect("a pidfd on this process");
+    super::send_report(
+        std::os::fd::AsRawFd::as_raw_fd(&child_end),
+        REPORT_PIDFD,
+        0,
+        std::os::fd::AsRawFd::as_raw_fd(&pidfd),
+    )
+    .expect("send the report");
+    drop(pidfd);
+    super::help(&parent_end, seams)
+}
+
+/// A pidfd whose move above the stdio slots fails is still the child's pidfd: it is handed on, so
+/// the child can be reaped through it.
+///
+/// Mutant: the pidfd is dropped when its move fails.
+#[test]
+fn a_pidfd_that_cannot_move_above_stdio_is_still_handed_on() {
+    let seams = fault::HelperSeams::failing_move(Errno::MFILE);
+    match help_with_report(&seams) {
+        Outcome::Failed(Error::Io(e), Some(_)) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE), "{e:?}"),
+        Outcome::Failed(e, pidfd) => panic!("expected EMFILE with the pidfd, got {e:?}, pidfd {}", pidfd.is_some()),
+        _ => panic!("a failed move must fail the spawn"),
+    }
+}
+
+/// A child left unreaped is worded by why, not always as a death before its report.
+#[test]
+fn an_abandoned_child_is_worded_by_its_cause() {
+    struct Recorder(std::rc::Rc<RefCell<Option<String>>>);
+    impl super::Spawned for Recorder {
+        fn pid(&self) -> Option<u32> {
+            Some(4)
+        }
+        fn reap_unexecuted(self, _: OwnedFd) {
+            panic!("there is no pidfd to reap through");
+        }
+        fn abandon_unreported(self, why: &str) {
+            *self.0.borrow_mut() = Some(why.to_string());
+        }
+    }
+
+    let said = std::rc::Rc::new(RefCell::new(None));
+    let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
+    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed).err();
+    assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("the report was cut short"));
+    let why = said.borrow_mut().take().expect("the child was abandoned");
+    assert!(
+        why.contains("the report was cut short") && !why.contains("died"),
+        "{why}"
+    );
+
+    super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport).err();
+    let why = said.borrow_mut().take().expect("the child was abandoned");
+    assert!(why.contains("died before it sent its pidfd"), "{why}");
 }

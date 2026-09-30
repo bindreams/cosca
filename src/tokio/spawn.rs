@@ -510,16 +510,22 @@ impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
         match self.try_wait() {
             Ok(Some(_)) => {}
             // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
-            Ok(None) => log::debug!("pid {:?}: held by a tracer; left to tokio's reaper", self.id()),
-            Err(e) => log::debug!("pid {:?}: already reaped by someone else ({e})", self.id()),
+            Ok(None) => log::debug!(
+                "{}: held by a tracer; left to tokio's reaper",
+                crate::child::spawn::named(self.id())
+            ),
+            Err(e) => log::debug!(
+                "{}: already reaped by someone else ({e})",
+                crate::child::spawn::named(self.id())
+            ),
         }
     }
 
     /// tokio reaps it, on drop or from its orphan queue.
-    fn abandon_unreported(self) {
+    fn abandon_unreported(self, why: &str) {
         log::debug!(
-            "pid {:?} died before it sent its pidfd; left to tokio's reaper",
-            self.id()
+            "{}: {why}; left to tokio's reaper",
+            crate::child::spawn::named(self.id())
         );
     }
 }

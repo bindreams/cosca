@@ -1039,7 +1039,7 @@ trait Unadopted: Send + 'static {
 }
 
 /// `pid {pid}`, or what stands for an unknown one.
-fn named(pid: Option<u32>) -> String {
+pub(crate) fn named(pid: Option<u32>) -> String {
     match pid {
         Some(pid) => format!("pid {pid}"),
         None => "the spawned child (pid unknown)".to_string(),

@@ -72,19 +72,35 @@ thread_local! {
     static VERDICT_HOOK: RefCell<Option<VerdictHook>> = const { RefCell::new(None) };
     static HOLDER_ARMED: Cell<bool> = const { Cell::new(false) };
     static HOLDER: RefCell<Option<Holder>> = const { RefCell::new(None) };
-    static CHILD_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
+    static ENDS_ARMED: Cell<bool> = const { Cell::new(false) };
+    static ENDS: Cell<Option<Ends>> = const { Cell::new(None) };
+    static AFTER_SPAWN: RefCell<Option<VerdictHook>> = const { RefCell::new(None) };
     static PARENT_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
     static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
 }
 
-/// Run `hook` once on this thread when the next `run`, its spawn returned, is about to block until
-/// the helper is done or the child has exited.
-pub(crate) fn before_awaiting_the_child_do(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&BEFORE_AWAITING, hook)
+/// Disarms the after-spawn hook on drop.
+#[must_use = "dropping this disarms the hook at once"]
+pub(crate) struct AfterSpawn(());
+
+/// Run `hook` once on the spawning thread, with the child's pid if the spawn succeeded, when the
+/// NEXT `run`'s `spawn()` has returned: this thread still holds the child's end, and nothing has
+/// yet waited on the child or the helper. Fires whatever `spawn()` answered.
+pub(crate) fn after_spawn_returns_do(hook: impl FnOnce(Option<u32>) + 'static) -> AfterSpawn {
+    AFTER_SPAWN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    AfterSpawn(())
 }
 
-pub(super) fn before_awaiting_the_child() {
-    crate::oneshot_hook::fire(&BEFORE_AWAITING);
+impl Drop for AfterSpawn {
+    fn drop(&mut self) {
+        AFTER_SPAWN.with(|h| h.borrow_mut().take());
+    }
+}
+
+pub(super) fn spawn_returned(pid: Option<u32>) {
+    if let Some(hook) = AFTER_SPAWN.with(|h| h.borrow_mut().take()) {
+        hook(pid);
+    }
 }
 
 // The child =====
@@ -209,6 +225,121 @@ pub(super) fn fork_holder_if_armed() {
 
 // Shutdown probes =====
 
+/// What the armed end probes saw in one `run`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ends {
+    /// Whether, once `spawn()` returned and the spawning thread had closed its copy, this process
+    /// still held a copy of the child's end. A held copy keeps the helper from reading EOF when the
+    /// child dies, so the wait for the child can then hang on an unrelated process.
+    pub(crate) child_end_copy_held: bool,
+    /// Whether the parent's end read EOF once the wait for the child was over, whatever copies of
+    /// the child's end exist.
+    pub(crate) eof_reached: bool,
+    /// Whether the parent forced that EOF (a child that exited while a copy of its end was held).
+    pub(crate) eof_forced: bool,
+}
+
+/// Disarms the end probes on drop.
+#[must_use = "dropping this disarms the probes at once"]
+pub(crate) struct ArmedEndProbes(());
+
+/// Probe the NEXT `run` on this thread; [`take_ends`] reads what it saw. Each probe shuts what it
+/// found wrong, so a regression fails its test at an assert rather than hanging it.
+pub(crate) fn arm_end_probes() -> ArmedEndProbes {
+    ENDS_ARMED.with(|a| a.set(true));
+    ENDS.with(|e| e.set(None));
+    ArmedEndProbes(())
+}
+
+impl Drop for ArmedEndProbes {
+    fn drop(&mut self) {
+        ENDS_ARMED.with(|a| a.set(false));
+    }
+}
+
+/// What the last armed `run` on this thread saw.
+pub(crate) fn take_ends() -> Option<Ends> {
+    ENDS.with(Cell::take)
+}
+
+/// One `run`'s end probes, if armed.
+pub(super) struct EndProbes {
+    /// The child's end: its device and inode, which name the socket in every descriptor table.
+    child_end: Option<(u64, u64)>,
+    held: bool,
+    forced: bool,
+}
+
+impl EndProbes {
+    pub(super) fn start(child_end: &OwnedFd) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        let armed = ENDS_ARMED.with(|a| a.replace(false));
+        let child_end = armed.then(|| {
+            let meta = std::fs::File::from(child_end.try_clone().expect("clone the child's end")).metadata();
+            let meta = meta.expect("stat the child's end");
+            (meta.dev(), meta.ino())
+        });
+        EndProbes {
+            child_end,
+            held: false,
+            forced: false,
+        }
+    }
+
+    /// After the spawning thread closed its copy: any descriptor of this process still naming the
+    /// child's end is a leak. It is shut, so the helper can end.
+    pub(super) fn check_copies_closed(&mut self) {
+        use std::os::fd::{BorrowedFd, RawFd};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let Some((dev, ino)) = self.child_end else { return };
+        let entries = std::fs::read_dir("/proc/self/fd").expect("list this process's descriptors");
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            if !(meta.file_type().is_socket() && meta.dev() == dev && meta.ino() == ino) {
+                continue;
+            }
+            let Ok(fd) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
+                continue;
+            };
+            self.held = true;
+            // SAFETY: a descriptor of this process, open when listed; only shut, never closed.
+            _ = rustix::net::shutdown(unsafe { BorrowedFd::borrow_raw(fd) }, rustix::net::Shutdown::Both);
+        }
+    }
+
+    pub(super) fn forced_eof(&mut self) {
+        self.forced = true;
+    }
+
+    /// Once the wait for the child is over: the parent's end must read EOF. If not, shuts it.
+    pub(super) fn finish(self, parent_end: &OwnedFd) {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+        if self.child_end.is_none() {
+            return;
+        }
+        // `RDHUP` is reported only if asked for: a read side shut, by `shutdown` or by the peer's
+        // last close.
+        let mut fds = [PollFd::new(parent_end, PollFlags::RDHUP)];
+        poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })).expect("poll the parent's end");
+        let eof_reached = fds[0].revents().contains(PollFlags::RDHUP);
+        if !eof_reached {
+            _ = rustix::net::shutdown(parent_end, rustix::net::Shutdown::Both);
+        }
+        ENDS.with(|e| {
+            e.set(Some(Ends {
+                child_end_copy_held: self.held,
+                eof_reached,
+                eof_forced: self.forced,
+            }))
+        });
+    }
+}
+
 /// Whether `fd`'s socket is shut both ways (`POLLHUP`, a check that does not block). If not, shuts
 /// it, so a mutant that forgot fails its test at an assert rather than hanging it.
 fn probe_shut(fd: &OwnedFd) -> bool {
@@ -221,15 +352,6 @@ fn probe_shut(fd: &OwnedFd) -> bool {
         _ = rustix::net::shutdown(fd, rustix::net::Shutdown::Both);
     }
     shut
-}
-
-pub(super) fn record_child_end_shut(fd: &OwnedFd) {
-    CHILD_END_SHUT.with(|c| c.set(Some(probe_shut(fd))));
-}
-
-/// Whether the last `run` on this thread had shut the child's end once its spawn returned.
-pub(crate) fn child_end_shut() -> Option<bool> {
-    CHILD_END_SHUT.with(Cell::take)
 }
 
 /// Whether the last `run` on this thread's helper had shut the parent's end when it finished.
@@ -298,6 +420,8 @@ impl Gate {
 pub(crate) struct HelperSeams {
     probe: Option<HelperProbe>,
     send_errnos: Arc<Mutex<VecDeque<Errno>>>,
+    /// Makes the helper's move of the received pidfd above the stdio slots fail with this.
+    move_errno: Arc<Mutex<Option<Errno>>>,
     verdict: Option<Gate>,
     parent_end_shut: Arc<Mutex<Option<bool>>>,
 }
@@ -308,6 +432,7 @@ pub(super) fn take_helper_seams() -> HelperSeams {
         send_errnos: Arc::new(Mutex::new(SEND_ERRNOS.with(|s| std::mem::take(&mut *s.borrow_mut())))),
         verdict: VERDICT_HOOK.with(|h| h.borrow().is_some()).then(Gate::default),
         parent_end_shut: Arc::default(),
+        ..HelperSeams::default()
     }
 }
 
@@ -333,6 +458,18 @@ impl HelperSeams {
             .pop_front()
     }
 
+    /// Seams for a helper that fails to move the pidfd it received, with `errno`.
+    pub(crate) fn failing_move(errno: Errno) -> Self {
+        HelperSeams {
+            move_errno: Arc::new(Mutex::new(Some(errno))),
+            ..HelperSeams::default()
+        }
+    }
+
+    pub(super) fn take_move_errno(&self) -> Option<Errno> {
+        self.move_errno.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
     /// The helper, once it has the child's report.
     pub(super) fn wait_verdict(&self) {
         if let Some(gate) = &self.verdict {
@@ -340,7 +477,7 @@ impl HelperSeams {
         }
     }
 
-    /// The spawning thread, once the spawn has returned and the child's end is shut.
+    /// The spawning thread, once the spawn has returned and the wait for the child is over.
     pub(super) fn release_verdict(&self, pid: Option<u32>) {
         if let Some(gate) = &self.verdict {
             if let Some(hook) = VERDICT_HOOK.with(|h| h.borrow_mut().take()) {
@@ -348,6 +485,12 @@ impl HelperSeams {
             }
             gate.open();
         }
+    }
+
+    /// Opens the held verdict when dropped, unwinding included: a panic on the spawning thread (a
+    /// hook, an assert) must fail the test, not leave the helper parked where the scope joins it.
+    pub(super) fn open_on_drop(&self) -> OpenOnDrop {
+        OpenOnDrop(self.verdict.clone())
     }
 
     /// The helper, as it shuts the parent's end.
@@ -363,6 +506,18 @@ impl HelperSeams {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         PARENT_END_SHUT.with(|c| c.set(shut));
+    }
+}
+
+/// See [`HelperSeams::open_on_drop`].
+#[must_use = "dropping this opens the gate at once"]
+pub(super) struct OpenOnDrop(Option<Gate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.open();
+        }
     }
 }
 
