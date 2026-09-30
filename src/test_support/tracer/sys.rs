@@ -215,7 +215,8 @@ pub(super) fn threads(pid: u32) -> Result<Vec<libc::proc_threadinfo>, i32> {
 fn parked(run_state: i32, flags: i32) -> bool {
     match run_state {
         libc::TH_STATE_RUNNING => false,
-        libc::TH_STATE_UNINTERRUPTIBLE => flags & libc::TH_FLAGS_SWAPPED != 0,
+        // MUTANT: no exemption.
+        libc::TH_STATE_UNINTERRUPTIBLE => flags & 0 != 0,
         _ => true,
     }
 }
