@@ -23,20 +23,29 @@ trap 'rm -f -- "${err:?}"' EXIT
 
 case "$(uname -s)" in
 Linux)
-    # `n` acks only after `unshare(CLONE_NEWUSER)` succeeded, so `+N` proves both that the setuid
-    # bit took effect and that the root helper may create a user namespace on this runner.
+    # `n` acks only after `unshare(CLONE_NEWUSER)` succeeded. The new namespace maps no uid, so the
+    # `r` after it must then fail with EINVAL and exit 3. Together with the `+N` this proves that
+    # the setuid bit took effect and that the root helper may create a user namespace here.
     want="+N"
-    out="$(printf n | "$helper" setuid-stdin-block root 2> "$err")" || fail "'$helper setuid-stdin-block root' exited nonzero: $(cat "$err")"
+    rc=0
+    out="$(printf nr | "$helper" setuid-stdin-block root 2> "$err")" || rc=$?
+    [[ "$out" == "$want" ]] || fail "the helper printed '$out', expected '$want': $(cat "$err")"
+    [[ "$rc" == 3 ]] || fail "the helper exited $rc, expected 3 (the setresuid after unshare must fail): $(cat "$err")"
+    if ! grep -qF 'setresuid(0, 0, 0)' "$err" || ! grep -qF 'Invalid argument' "$err"; then
+        fail "the helper's stderr does not name the failed setresuid(0, 0, 0) with EINVAL, so no user namespace was created: $(cat "$err")"
+    fi
     ;;
 Darwin)
-    # The module doc calls a setuid-root helper unreliable on macOS (SIP); this measures it.
+    # Measured on macos-latest (job 109789120504): the helper reaches uid 0. This keeps measuring it.
     want="+"
-    out="$("$helper" setuid-stdin-block root < /dev/null 2> "$err")" || fail "'$helper setuid-stdin-block root' exited nonzero: $(cat "$err")"
+    rc=0
+    out="$("$helper" setuid-stdin-block root < /dev/null 2> "$err")" || rc=$?
+    [[ "$out" == "$want" ]] || fail "the helper printed '$out', expected '$want': $(cat "$err")"
+    [[ "$rc" == 0 ]] || fail "the helper exited nonzero ($rc): $(cat "$err")"
     ;;
 *)
     fail "unsupported OS $(uname -s)"
     ;;
 esac
 
-[[ "$out" == "$want" ]] || fail "the helper printed '$out', expected '$want': $(cat "$err")"
 echo "setuid lane ok: the helper reached uid 0 (printed '$out')"
