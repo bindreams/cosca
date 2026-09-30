@@ -38,10 +38,17 @@
 //! `shutdown`, not from a close. A process forked without `exec`, by any thread in or outside
 //! cosca, holds copies of both ends, and a close waits for every copy; a `shutdown` does not.
 //!
-//! - The parent shuts the child's end once `spawn()` has returned: the child has execed or died, or
-//!   the spawn failed before the fork. Nothing is left to report, and the helper reads EOF.
+//! - The parent shuts the child's end once nothing is left to report. A failed `spawn()` means
+//!   that at once: std collected the child, or never forked. A successful one means the child has
+//!   execed or died, except that std returns before the child's hooks even run when this process
+//!   has two of fds 0 to 2 closed (see [`ReportChannel`]). So the parent then waits for the helper
+//!   to finish or the child to exit, watched through a pidfd opened on its number while it is an
+//!   unreaped child, and shuts the end only if the child exited first. The watch is never
+//!   signalled through.
 //! - The helper shuts the parent's end when it is done, and when it unwinds. A child still waiting
 //!   for its verdict reads EOF, which is abort: the helper never has to send one.
+//!
+//! [`ReportChannel`]: crate::containment::cgroup::channel::ReportChannel
 //!
 //! The helper is a scoped thread, joined before [`Handshake::run`] returns: nothing detached,
 //! nothing global. Linux refuses a new thread to a thread whose pid namespace for children is not
@@ -211,9 +218,10 @@ fn shut(fd: &OwnedFd) {
     }
 }
 
-/// Shuts the parent's end when dropped, unwinding included.
+/// Shuts the parent's end, then says the helper is done, when dropped, unwinding included.
 struct ShutOnDrop<'a> {
     parent_end: &'a OwnedFd,
+    done: &'a OwnedFd,
     #[cfg(test)]
     seams: &'a fault::HelperSeams,
 }
@@ -223,6 +231,11 @@ impl Drop for ShutOnDrop<'_> {
         shut(self.parent_end);
         #[cfg(test)]
         self.seams.record_parent_end_shut(self.parent_end);
+        // An eventfd counter never fills at one write per spawn.
+        if let Err(e) = rustix::io::write(self.done, &1u64.to_ne_bytes()) {
+            log::warn!("pidfd handshake: the helper could not say it is done: {e}");
+            debug_assert!(false, "write to the handshake's eventfd failed: {e}");
+        }
     }
 }
 
@@ -251,6 +264,11 @@ impl Handshake {
         let seams = fault::take_helper_seams();
         #[cfg(test)]
         let helper_seams = seams.clone();
+        // Written, not closed, when the helper is done: a forked copy cannot hold it off.
+        let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
+        let done = above_stdio(done)?;
+        let done = &done;
 
         std::thread::scope(|scope| {
             let helper = std::thread::Builder::new()
@@ -259,6 +277,7 @@ impl Handshake {
                     let outcome = {
                         let _shut = ShutOnDrop {
                             parent_end: &parent_end,
+                            done,
                             #[cfg(test)]
                             seams: &helper_seams,
                         };
@@ -286,10 +305,17 @@ impl Handshake {
             fault::fork_holder_if_armed();
             let spawned = spawn();
             shared.live.store(false, Ordering::Release);
-            // The child has execed or died, or was never forked: nothing is left to report.
-            shut(&child_end);
-            #[cfg(test)]
-            fault::record_child_end_shut(&child_end);
+            let finished = match &spawned {
+                // std collected the child, or never forked.
+                Err(_) => true,
+                Ok(child) => child_exited_before_the_helper_finished(child.pid(), done),
+            };
+            // Nothing is left to report: the helper reads EOF, whatever copies of this end exist.
+            if finished {
+                shut(&child_end);
+                #[cfg(test)]
+                fault::record_child_end_shut(&child_end);
+            }
             #[cfg(test)]
             seams.release_verdict(spawned.as_ref().ok().and_then(Spawned::pid));
             drop(child_end);
@@ -301,6 +327,75 @@ impl Handshake {
             conclude(spawned, outcome)
         })
     }
+}
+
+/// After a successful `spawn()`: blocks until the helper is done or the child has exited, and says
+/// whether the child exited while the helper still waited. The wait is the child's own progress
+/// to its report, as `spawn()`'s is to `exec`.
+fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> bool {
+    use std::os::fd::AsFd;
+
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    use crate::wait::exit_only::{peek, Peek, Target};
+
+    let helper_done = |fds: &mut [PollFd<'_>], timeout: Option<&Timespec>| loop {
+        match poll(fds, timeout) {
+            Ok(_) => return Ok(()),
+            // `ENOMEM` is the kernel's transient shortage, not an answer.
+            Err(Errno::INTR | Errno::NOMEM) => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    // Normally the child reported and execed: the helper is done, and nothing needs watching.
+    let mut fds = [PollFd::new(done, PollFlags::IN)];
+    let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
+    if helper_done(&mut fds, Some(&zero)).is_ok() && fds[0].revents().contains(PollFlags::IN) {
+        return false;
+    }
+    let Some(raw) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        debug_assert!(false, "a spawned child without a pid: {pid:?}");
+        return false;
+    };
+    // A watch only. The child is unreaped, so its number is its own unless something else reaped
+    // it, which `ESRCH` or the peek's `ECHILD` shows: it has exited either way.
+    let watch = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
+        Ok(watch) => match above_stdio(watch) {
+            Ok(watch) => watch,
+            Err(e) => {
+                log::warn!(
+                    "pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report"
+                );
+                return false;
+            }
+        },
+        Err(Errno::SRCH) => return true,
+        Err(e) => {
+            log::warn!("pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report");
+            return false;
+        }
+    };
+    match peek(&Target::PidFd(watch.as_fd())) {
+        Ok(Peek::Foreign(_) | Peek::Exit(_)) => return true,
+        Ok(Peek::Running) => {}
+        Err(e) => {
+            log::warn!("pid {pid:?}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report");
+            debug_assert!(false, "waitid on a spawned child's pidfd failed: {e}");
+            return false;
+        }
+    }
+    #[cfg(test)]
+    fault::before_awaiting_the_child();
+    let mut fds = [PollFd::new(done, PollFlags::IN), PollFd::new(&watch, PollFlags::IN)];
+    if let Err(e) = helper_done(&mut fds, None) {
+        log::warn!("pid {pid:?}: poll on the spawn handshake failed ({e}); the spawn waits for its report");
+        debug_assert!(false, "poll on an eventfd and a pidfd failed: {e}");
+        return false;
+    }
+    !fds[0].revents().contains(PollFlags::IN) && !fds[1].revents().is_empty()
 }
 
 /// The helper thread could not be started, so nothing was forked.

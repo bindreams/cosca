@@ -434,6 +434,96 @@ fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
     assert!(!program_ran(cmd, reader));
 }
 
+/// A child killed before it reports, with a process forked without `exec` holding a copy of its
+/// end: `spawn()` returns, the child has exited, and the parent shuts the end so the helper reads
+/// EOF.
+///
+/// Mutant: the parent does not shut its end of the child's socket (the helper would wait forever
+/// on the copy).
+#[test]
+fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
+    let (mut cmd, reader) = marker_command();
+    fault::reset_leaked_pid();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let err = cmd.spawn().err();
+    drop(armed);
+    let shut = fault::child_end_shut();
+    drop(holder);
+
+    assert_eq!(
+        shut,
+        Some(true),
+        "the parent must shut the child's end once the child has exited"
+    );
+    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    let pid = fault::take_leaked_pid()
+        .expect("the unreaped child is named")
+        .expect("it has a pid");
+    // SAFETY: `pid` is this thread's own zombie child, so waiting on it is sound.
+    let reaped = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+    assert_eq!(reaped, pid as i32);
+    assert!(!program_ran(cmd, reader));
+}
+
+/// With two of fds 0 to 2 closed, std's status pipe sits on a stdio slot the child replaces, and
+/// `spawn()` returns before the child's hooks run. The child still reports, and runs the program.
+///
+/// Mutant: the parent shuts the child's end as soon as `spawn()` returns (the child's report then
+/// fails, and so does the spawn).
+///
+/// Runs in a process of its own: closing 1 and 2 is process-wide.
+#[test]
+fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
+    use std::io::{Seek, Write};
+    use std::os::fd::AsRawFd;
+
+    use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
+    use crate::test_stdio::RestoreStdio;
+
+    let Some(done) = own_process(
+        test_path!(a_spawn_that_returns_before_the_hooks_run_still_runs_the_program),
+        spawn,
+    ) else {
+        return;
+    };
+    let mut file = tempfile::tempfile().expect("tempfile");
+    let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
+    let gate_write = Rc::new(RefCell::new(Some(gate_write)));
+    let mut cmd = Command::new();
+    cmd.args(["sh", "-c", "echo ran"]);
+    for slot in [1, 2] {
+        cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
+            .expect("wire the slot to the file");
+    }
+    // The child waits at its hook until the parent, its spawn returned, waits for it in turn.
+    let armed = fault::arm_child_fault(ChildFault::Gate(gate_read.as_raw_fd()));
+    let release = fault::before_awaiting_the_child_do({
+        let gate_write = Rc::clone(&gate_write);
+        move || {
+            let mut gate = gate_write.borrow_mut().take().expect("the gate is held");
+            gate.write_all(b"x").expect("release the child");
+        }
+    });
+    let restore = RestoreStdio::close(&done, &[1, 2]);
+    let spawned = cmd.spawn();
+    drop(restore);
+    drop(release);
+    drop(armed);
+    // Released whatever happened, before any assert: a child held forever holds the file.
+    if let Some(mut gate) = gate_write.borrow_mut().take() {
+        gate.write_all(b"x").expect("release the child");
+    }
+
+    let child = spawned.expect("the spawn must succeed");
+    assert!(child.wait().expect("wait").success());
+    let mut written = String::new();
+    file.rewind().expect("rewind the file");
+    file.read_to_string(&mut written).expect("read the file");
+    assert_eq!(written, "ran\n");
+}
+
 /// A child killed before it reports: std reads the closed status pipe as success, the helper
 /// reads EOF. The child is dead, unreaped and pidless-to-us, so it is left unreaped and named,
 /// and the spawn fails.

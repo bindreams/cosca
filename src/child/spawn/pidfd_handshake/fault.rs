@@ -21,6 +21,8 @@ pub(crate) enum ChildFault {
     Sigkill,
     /// It kills itself after it sent its pidfd, before it reads its verdict.
     SigkillAfterReport,
+    /// It reads one byte from this fd, inherited across the fork, before it reports.
+    Gate(i32),
 }
 
 impl ChildFault {
@@ -29,6 +31,14 @@ impl ChildFault {
         match self {
             ChildFault::Fail => Err(io::Error::from_raw_os_error(libc::EIO)),
             ChildFault::Sigkill => kill_self(),
+            ChildFault::Gate(fd) => {
+                let mut byte = 0u8;
+                // SAFETY: a one-byte read into this frame; retried on `EINTR` only.
+                while unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } < 0
+                    && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                {}
+                Ok(())
+            }
             ChildFault::None | ChildFault::SigkillAfterReport => Ok(()),
         }
     }
@@ -37,7 +47,7 @@ impl ChildFault {
     pub(super) fn apply_after_report(self) -> io::Result<()> {
         match self {
             ChildFault::SigkillAfterReport => kill_self(),
-            ChildFault::None | ChildFault::Fail | ChildFault::Sigkill => Ok(()),
+            ChildFault::None | ChildFault::Fail | ChildFault::Sigkill | ChildFault::Gate(_) => Ok(()),
         }
     }
 }
@@ -64,6 +74,17 @@ thread_local! {
     static HOLDER: RefCell<Option<Holder>> = const { RefCell::new(None) };
     static CHILD_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
     static PARENT_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
+    static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+}
+
+/// Run `hook` once on this thread when the next `run`, its spawn returned, is about to block until
+/// the helper is done or the child has exited.
+pub(crate) fn before_awaiting_the_child_do(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_AWAITING, hook)
+}
+
+pub(super) fn before_awaiting_the_child() {
+    crate::oneshot_hook::fire(&BEFORE_AWAITING);
 }
 
 // The child =====
