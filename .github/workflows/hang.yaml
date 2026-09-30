@@ -46,7 +46,7 @@ jobs:
           PY
           git diff --stat
       - name: Loop
-        run: STRESS=${{ matrix.stress }} .github/scripts/hangloop.sh ${{ matrix.n }} "" 'test(/shared_tests::tracer::macos/)' 600
+        run: STRESS=${{ matrix.stress }} bash .github/scripts/hangloop.sh ${{ matrix.n }} "" 'test(/shared_tests::tracer::macos/)' 600
         continue-on-error: ${{ startsWith(matrix.variant, 'm') }}
       - name: Upload logs
         if: always()
