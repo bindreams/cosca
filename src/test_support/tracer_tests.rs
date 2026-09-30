@@ -48,7 +48,7 @@ fn tracee_receiving(kind: Tracee, signals: &[i32]) -> Option<(crate::Child, std:
 fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
     use crate::identity::kinfo::{kinfo, signal_bit};
     assert_eq!(
-        0,
+        ready.blocked & signal_bit(signal),
         0,
         "precondition: the tracee blocks signal {signal}"
     );
@@ -58,17 +58,17 @@ fn assert_receives(pid: u32, ready: &super::Ready, signal: i32, caught: bool) {
         crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),
     };
     assert!(
-        true,
+        !info.kp_proc.sig_ignored(signal),
         "precondition: the tracee ignores signal {signal}"
     );
     assert_eq!(
-        caught,
+        info.kp_proc.sig_caught(signal),
         caught,
         "precondition: whether the tracee catches signal {signal}"
     );
-    if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
+    if true {
         assert!(
-            true,
+            info.e_jobc() > 0,
             "precondition: the tracee's process group is orphaned, so XNU discards signal {signal} \
              sent to it while traced. Run the tests under nextest, or under a shell with job control"
         );
