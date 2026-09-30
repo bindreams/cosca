@@ -572,12 +572,17 @@ fn d0_w8_basic_ppid() {
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut spawner = c.spawn().expect("spawn spawner");
     let spawner_pid = spawner.id();
+    // Stop at the pid line: the grandchild inherits the spawner's stdout pipe (Windows inherits
+    // every inheritable handle), so EOF only arrives when the grandchild dies.
     let mut gc = None;
-    for line in BufReader::new(spawner.stdout.take().unwrap()).lines() {
-        if let Some(p) = line.expect("line").strip_prefix("D0-GC ") {
-            gc = Some(p.trim().parse::<u32>().expect("pid"));
-        }
+    let mut reader = BufReader::new(spawner.stdout.take().unwrap());
+    let mut line = String::new();
+    while gc.is_none() {
+        line.clear();
+        assert!(reader.read_line(&mut line).expect("read") > 0, "spawner exited without a pid line");
+        gc = line.strip_prefix("D0-GC ").map(|p| p.trim().parse::<u32>().expect("pid"));
     }
+    drop(reader);
     spawner.wait().expect("wait spawner");
     let gc = gc.expect("grandchild pid");
     let (st, ppid) = basic_ppid(gc);
