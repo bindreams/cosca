@@ -1,0 +1,39 @@
+name: stress
+on:
+  pull_request:
+env:
+  COSCA_TEST_ROOT: "0"
+  COSCA_TEST_TRACER: "1"
+  COSCA_TEST_TRACER_CONSENT: "1"
+jobs:
+  mutants:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Mutants
+        run: |
+          set +e
+          f=src/test_support/tracer/machine.rs
+          run() {
+            name=$1; from=$2; to=$3
+            python3 - "$f" "$from" "$to" <<'PY'
+          import sys
+          p, a, b = sys.argv[1:]
+          s = open(p).read()
+          assert s.count(a) == 1, (a, s.count(a))
+          open(p, "w").write(s.replace(a, b))
+          PY
+            cargo nextest run --lib --locked -E 'test(s4_passes_a_caught_stop_signal_through)' >mut.log 2>&1
+            code=$?
+            echo "=== MUTANT $name: exit $code"
+            grep -E "panicked|handler had not run|assertion|left:|right:|TIMEOUT|SIGTERM|FAIL|PASS" mut.log | head -8
+            git checkout -q -- "$f"
+          }
+          run "pass signal 0" 'let delivered = if keep { 0 } else { signal };' 'let delivered = if keep || tag == "S4" { 0 } else { signal };'
+          run "S4 keeps a caught stop" 'Ok(Disposition::Caught | Disposition::Ignored) => false,' 'Ok(Disposition::Caught) => tag == "S4", Ok(Disposition::Ignored) => false,'
+          run "S4 keeps every stop signal" 'Ok(Disposition::Caught | Disposition::Ignored) => false,' 'Ok(Disposition::Caught | Disposition::Ignored) => tag == "S4",'
