@@ -37,6 +37,10 @@ pub mod test_own_process;
 #[cfg(unix)]
 #[path = "../../src/test_stdio.rs"]
 pub mod test_stdio;
+// The `COSCA_TEST_SETUID` gate, shared with the library's tests.
+#[cfg(unix)]
+#[path = "../../src/test_privilege/setuid.rs"]
+pub mod setuid;
 
 pub fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")

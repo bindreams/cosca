@@ -32,6 +32,11 @@ mod console_identity;
 #[path = "../tests/common/accept.rs"]
 mod accept;
 
+/// The `setuid-stdin-block` mode.
+#[cfg(unix)]
+#[path = "setuid_stdin_block.rs"]
+mod setuid_stdin_block;
+
 /// The `report-breakaway` mode: job-object shapes and the three spawn vehicles.
 #[cfg(windows)]
 #[path = "breakaway.rs"]
@@ -584,6 +589,8 @@ fn main() {
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf);
         }
+        #[cfg(unix)]
+        "setuid-stdin-block" => setuid_stdin_block::run(&args),
         #[cfg(unix)]
         "setuid-control-block" => {
             // Only ever exec'd from a SEPARATE, pre-provisioned copy of this binary that CI
