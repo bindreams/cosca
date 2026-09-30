@@ -42,6 +42,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["test-util"] }
 # The test harness for `harness = false` targets.
 skuld = "0.5.0"
+# Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `SharedChild`,
+# and needs a deadline-bounded wait on a child it also kills from another handle.
+shared_child = { version = "1", features = ["timeout"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is
