@@ -245,3 +245,26 @@ fn term_group_on_an_all_zombie_group_is_ok() {
     let mut child = child;
     child.wait().expect("reap");
 }
+
+/// A missing `openat2` reaches the caller as `Error::Unsupported`, as it does from a wait or a
+/// spawn, not as `Unassessable` with the kind buried in `source`. Mutant: "`verify` maps every
+/// unlistable group to `Unassessable`".
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_group_and_term_group_without_openat2_are_unsupported() {
+    use crate::error::Error;
+    use crate::identity::proc_view_fault::force_openat2_errno;
+    for (name, call) in [("kill_group", kill_group as fn(i32) -> _), ("term_group", term_group)] {
+        let forced = force_openat2_errno(rustix::io::Errno::NOSYS);
+        let err = call(i32::MAX).expect_err("no openat2, no listing");
+        drop(forced);
+        match err {
+            Error::Unsupported { op, platform, detail } => {
+                assert_eq!(platform, "linux", "{name}");
+                assert!(op.contains(&i32::MAX.to_string()), "{name}: {op}");
+                assert!(detail.contains("cosca requires openat2"), "{name}: {detail}");
+            }
+            other => panic!("{name}: expected Unsupported, got {other:?}"),
+        }
+    }
+}

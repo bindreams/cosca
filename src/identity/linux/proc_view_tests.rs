@@ -7,8 +7,8 @@ use crate::test_child::namespaces as ns;
 
 use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
-    classify_ns_links, classify_status, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget, ProcDir, ProcView,
-    Verdict, ViewUnreadable,
+    classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in_view, proc_view, PidfdTarget,
+    ProcDir, ProcView, Verdict, ViewUnreadable,
 };
 
 fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
@@ -465,12 +465,56 @@ fn fixture_own_procfs_unprivileged() {
 
 // Listing =====
 
-/// Only decimal-named entries are pids. Mutant: "every entry is a pid" — `self` fails to parse
-/// and aborts, or `thread-self` is counted.
+/// The real `/proc` holds `self`, `thread-self`, `net`, `sys`, ...; listing it must skip them, not
+/// fail on them. Mutant: "every entry is a pid" — the first non-numeric name aborts the listing.
 #[test]
 fn pids_lists_the_numeric_entries_including_this_process() {
     let pids = ProcDir::open().expect("/proc opens").pids().expect("list");
     assert!(pids.contains(&std::process::id()), "{pids:?}");
+}
+
+fn names(list: &[&[u8]]) -> Vec<io::Result<Vec<u8>>> {
+    list.iter().map(|n| Ok(n.to_vec())).collect()
+}
+
+/// Non-pid names are excluded, not errors. Mutant: "keep every name that parses" / "abort on the
+/// first name that is not a pid".
+#[test]
+fn collect_pids_excludes_names_that_are_not_pids() {
+    let listed: &[&[u8]] = &[
+        b"1",
+        b"self",
+        b"thread-self",
+        b"net",
+        b"sys",
+        b"",
+        b"+5",
+        b"-5",
+        b"1a",
+        b" 7",
+        b"\xff\xfe",
+        b"4194304",
+    ];
+    assert_eq!(collect_pids(names(listed)).expect("list"), vec![1, 4_194_304]);
+}
+
+/// An all-digit name that is no `u32` is a corrupt listing, never a member dropped in silence.
+/// Mutant: "`.parse().ok()` drops it".
+#[test]
+fn collect_pids_is_an_error_for_an_all_digit_name_that_overflows() {
+    for name in [&b"4294967296"[..], b"99999999999999999999"] {
+        let err = collect_pids(names(&[b"1", name])).expect_err("a corrupt listing is an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains(std::str::from_utf8(name).unwrap()), "{err}");
+    }
+}
+
+/// A listing failure part-way is the listing's failure, not a shorter list.
+#[test]
+fn collect_pids_propagates_a_listing_error() {
+    let items = vec![Ok(b"1".to_vec()), Err(io::Error::from_raw_os_error(libc::EIO))];
+    let err = collect_pids(items).expect_err("listing error");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
 }
 
 /// `into_dir` yields the directory of a `Same` view and names the cause of any other.

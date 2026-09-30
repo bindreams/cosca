@@ -34,10 +34,9 @@ fn fixture_group_inner() {
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
-/// A file mounted over a member's `stat` after the scan started is a mount below `/proc`, which
-/// no read crosses: a member whose record cannot be read that way makes the listing an error,
-/// never an exclusion. Mutant: "read `stat` with a plain `openat`" — the fake record (another
-/// pgid) is read and the live member is silently excluded.
+/// A file mounted over a member's `stat` is a mount below `/proc`, which no read crosses: the
+/// listing is an error, never an exclusion. Mutant: "read `stat` with a plain `openat`" — the fake
+/// record (another pgid) is read and the live member is silently excluded.
 #[test]
 fn namespaces_a_stat_mounted_over_a_member_is_an_error_not_an_exclusion() {
     if !ns::enabled() {

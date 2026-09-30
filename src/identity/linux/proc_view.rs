@@ -87,9 +87,8 @@ impl ViewUnreadable {
         })
     }
 
-    /// The requirement text ("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered
-    /// <ERRNO>"), when `openat2` being refused is why the view could not be established. For
-    /// callers whose error type is not [`Error`].
+    /// The `openat2` requirement text, when `openat2` being refused is why the view could not be
+    /// established. For callers whose error type is not [`Error`].
     pub(crate) fn openat2_requirement(&self) -> Option<String> {
         self.openat2_refused
             .map(|errno| format!("cosca requires openat2 (Linux ≥ 5.6), refused here: openat2 answered {errno}"))
@@ -175,19 +174,8 @@ impl ProcDir {
 
     /// The pids listed under this `/proc`: its decimal-named entries.
     pub(crate) fn pids(&self) -> io::Result<Vec<u32>> {
-        let mut pids = Vec::new();
-        for entry in rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)? {
-            let entry = entry?;
-            // Decimal names only: `self`, `thread-self`, `net`, ... are not pids.
-            if let Some(pid) = std::str::from_utf8(entry.file_name().to_bytes())
-                .ok()
-                .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|name| name.parse::<u32>().ok())
-            {
-                pids.push(pid);
-            }
-        }
-        Ok(pids)
+        let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
+        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
     }
 
     /// Whether the symlink at `path` under this `/proc` exists, without following it.
@@ -390,6 +378,35 @@ fn parse_fdinfo_pid(fdinfo: &str) -> Option<PidfdTarget> {
             REAPED => Some(PidfdTarget::Reaped),
             _ => u32::try_from(p).ok().map(PidfdTarget::Pid),
         })
+}
+
+/// The pids among directory entry `names`: the all-digit ones. `self`, `thread-self`, `net`, ...
+/// are not pids. An all-digit name that is no `u32` is a corrupt listing, so an error: a live
+/// process dropped from the list would read as one that is not there.
+fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Result<Vec<u32>> {
+    /// The kernel's `PID_MAX_LIMIT` on 64-bit.
+    const PID_MAX_LIMIT: u32 = 1 << 22;
+    let mut pids = Vec::new();
+    for name in names {
+        let name = name?;
+        if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        // All ASCII digits, so UTF-8; the only way to fail is overflow.
+        let text = String::from_utf8_lossy(&name);
+        let pid = text.parse::<u32>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the /proc entry {text:?} is all digits but not a pid: {e}"),
+            )
+        })?;
+        debug_assert!(
+            pid <= PID_MAX_LIMIT,
+            "/proc lists pid {pid} beyond the kernel's PID_MAX_LIMIT"
+        );
+        pids.push(pid);
+    }
+    Ok(pids)
 }
 
 #[cfg(test)]
