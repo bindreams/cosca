@@ -18,6 +18,9 @@ use std::net::{TcpListener, TcpStream};
 pub mod cgroup;
 pub mod payload;
 
+#[cfg(target_os = "linux")]
+pub mod seccomp;
+
 mod accept;
 pub use accept::*;
 
