@@ -2,6 +2,8 @@
 //! `/proc/<pid>/stat` as the start token; `is_running` via process state; `created_at` via
 //! `/proc/stat` `btime` and `_SC_CLK_TCK`.
 
+#[path = "linux/pid_stat.rs"]
+pub(crate) mod pid_stat;
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 
