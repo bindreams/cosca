@@ -11,10 +11,11 @@
 //!   between the snapshot and the query, a sandbox denies the fallback's own sysctl (rare —
 //!   EPERM/EACCES there is a DESIGNED `Unknown`, not a second EPERM gap), or `e_ppid == 0`
 //!   mid fork() on both reads (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
-//! - A failed snapshot is `Error::Unassessable` from `process_parents`, never an empty list: a
-//!   tree walk over an empty snapshot finds no descendants. [`snapshot`] is the other consumer
-//!   (the fd-marker sweep) and reports the same failure as an empty pid list, which that sweep
-//!   already treats as a blind pass.
+//! - A failed snapshot, or a pid denied its ppid read, is `Error::Unassessable` from
+//!   `process_parents`, never an empty or partial list: a tree walk over one skips the subtree.
+//!   [`snapshot`] is the other consumer (the fd-marker sweep): it reports a failure as an empty
+//!   pid list, which that sweep treats as a blind pass, and a denial as a count it folds into its
+//!   own accounting.
 //! - `proc_listallpids`' fill path caps its walk at `min(nprocs + 20, our buffer capacity)`,
 //!   using an UNLOCKED read of `nprocs` taken before the process list locks (confirmed
 //!   against XNU's `bsd/kern/proc_info.c`). Our buffer capacity is the sizing call's answer
@@ -299,7 +300,6 @@ fn all_pids_or_empty(pids: std::io::Result<Vec<libc::c_int>>) -> Vec<libc::c_int
     })
 }
 
-/// [`try_all_pids`] through [`all_pids_or_empty`].
 fn all_pids() -> Vec<libc::c_int> {
     all_pids_or_empty(try_all_pids())
 }
@@ -405,13 +405,10 @@ pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
     Ok(edges)
 }
 
-/// One line per snapshot, not one per denied pid.
+/// One `debug` line per snapshot, not per denied pid; `Marker::sweep`'s doc explains why the count
+/// is not escalated into `incomplete`.
 fn log_denied(denied: usize, total: usize, sample: &[libc::c_int]) {
     if denied > 0 {
-        // A snapshot with many EPERM/ESRCH-adjacent denials (commonly a sandboxed sysctl refusal
-        // or a fork()-in-progress read - see `ppid_of`'s doc - though the exact per-pid cause is
-        // not recorded) must not flood the log; `Marker::sweep`'s own doc explains why this count
-        // is NOT escalated into `incomplete` there.
         log::debug!(
             "containment snapshot: {denied} of {total} pids denied a ppid read; their subtrees are \
              invisible to the ppid-walk channel this round; sample: {sample:?}"

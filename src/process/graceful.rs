@@ -58,9 +58,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// [`Error::Unassessable`] when the process table cannot be read (on Linux, `/proc` is not
-    /// this pid namespace's): descendants cannot be found, so NOTHING is killed, the root
-    /// included, and the error names the cause.
+    /// [`Error::Unassessable`] when the process table cannot be read: nothing is killed, the root
+    /// included.
     pub fn kill_tree(&self) -> Result<(), Error> {
         crate::containment::treewalk::hard_kill(self.id)
     }
