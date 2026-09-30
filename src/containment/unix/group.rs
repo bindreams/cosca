@@ -166,50 +166,21 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     for pid in proc_dir.pids()? {
-        let stat = match read_member_stat(&proc_dir, pid) {
-            Ok(bytes) => bytes,
-            Err(e) => match e.raw_os_error() {
-                // Exited mid-scan, or hidden by `hidepid`. Deliberately NOT propagated, and NOT
-                // disambiguated by probing with `kill(pid, 0)`: this loop scans ALL of `/proc`,
-                // not just `pgid`'s members, and a `hidepid` `/proc` answers a foreign-uid probe
-                // with `EPERM` too, so the first foreign-uid process anywhere would abort every
-                // `kill_group`/`term_group`. A pid not yet known to belong to `pgid` carries no
-                // information about it; the residual (a foreign-uid member of `pgid` itself) is
-                // documented on `Child::kill_tree`.
-                Some(libc::ENOENT | libc::ESRCH | libc::EACCES) => {
-                    log::debug!("containment::unix::group::members: /proc/{pid}/stat unreadable ({e}); excluding it");
-                    continue;
-                }
-                // `EPERM` is also a seccomp filter's answer to `openat2` installed mid-scan, which
-                // would hit every pid: it is `hidepid`'s only if the checked directory still answers.
-                Some(libc::EPERM) => match check_dir_answers(&proc_dir) {
-                    Ok(()) => {
-                        log::debug!("containment::unix::group::members: /proc/{pid}/stat hidden ({e}); excluding it");
-                        continue;
-                    }
-                    Err(refusal) => {
-                        return Err(std::io::Error::other(format!(
-                            "containment::unix::group::members: {pid}/stat answered {e} and the checked /proc \
-                             then refused self/stat: {refusal}"
-                        )));
-                    }
-                },
-                // The checked directory refused to cross a mount, so the record is not the kernel's.
-                Some(libc::EXDEV | libc::ELOOP) => {
-                    return Err(std::io::Error::other(format!(
-                        "containment::unix::group::members: {pid}/stat lies beyond a mount in /proc and was not \
-                         read: {e}"
-                    )));
-                }
-                // EMFILE, ENOMEM, EIO, ... say nothing about the pid; excluding it could clear a
-                // live group.
-                _ => {
-                    return Err(std::io::Error::other(format!(
-                        "containment::unix::group::members: {pid}/stat could not be read, so process group {pgid} \
-                         cannot be listed: {e}"
-                    )));
-                }
-            },
+        let stat = match crate::identity::pid_stat::read(&proc_dir, pid) {
+            Ok(crate::identity::pid_stat::PidStat::Read(bytes)) => bytes,
+            // A pid outside a `pgid` listing carries no information about it; the residual (a
+            // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
+            // `Child::kill_tree`.
+            Ok(crate::identity::pid_stat::PidStat::Skipped(e)) => {
+                log::debug!("containment::unix::group::members: /proc/{pid}/stat unreadable ({e}); excluding it");
+                continue;
+            }
+            // Excluding it could clear a live group.
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "containment::unix::group::members: {e}, so process group {pgid} cannot be listed"
+                )));
+            }
         };
         let Some(g) = parse_pgrp(&stat) else {
             // The stat line read but its pgrp field did not parse — a malformed/unexpected
@@ -242,26 +213,6 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
         });
     }
     Ok(out)
-}
-
-/// `pid`'s `stat` through the checked directory.
-#[cfg(target_os = "linux")]
-fn read_member_stat(proc_dir: &crate::identity::ProcDir, pid: u32) -> std::io::Result<Vec<u8>> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_stat_read_errno() {
-        return Err(std::io::Error::from_raw_os_error(errno));
-    }
-    proc_dir.read(&format!("{pid}/stat"))
-}
-
-/// Whether the checked directory still reads (`self/stat`).
-#[cfg(target_os = "linux")]
-fn check_dir_answers(proc_dir: &crate::identity::ProcDir) -> std::io::Result<()> {
-    #[cfg(test)]
-    if let Some(errno) = fault::forced_recheck_errno() {
-        return Err(std::io::Error::from_raw_os_error(errno));
-    }
-    proc_dir.read("self/stat").map(drop)
 }
 
 /// Other Unix: the crate supports Linux, macOS and Windows (see
@@ -751,40 +702,7 @@ pub(crate) mod fault {
     pub(crate) type ArmedAfterListing = crate::oneshot_hook::Armed;
 
     #[cfg(target_os = "linux")]
-    thread_local! {
-        static STAT_READ: std::cell::Cell<Option<(i32, Option<i32>)>> = const { std::cell::Cell::new(None) };
-    }
-
-    /// Disarms [`force_stat_read`] on drop.
-    #[cfg(target_os = "linux")]
-    #[must_use = "dropping this immediately disarms the forced read"]
-    pub(crate) struct ForcedStatRead(());
-
-    #[cfg(target_os = "linux")]
-    impl Drop for ForcedStatRead {
-        fn drop(&mut self) {
-            STAT_READ.with(|f| f.set(None));
-        }
-    }
-
-    /// Make EVERY per-pid `stat` read in `members` on THIS thread fail with `errno` until the
-    /// guard drops. `recheck` is what the "does the checked directory still answer" re-read
-    /// answers: `None` for success, `Some(errno)` for that failure.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn force_stat_read(errno: i32, recheck: Option<i32>) -> ForcedStatRead {
-        STAT_READ.with(|f| f.set(Some((errno, recheck))));
-        ForcedStatRead(())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn forced_recheck_errno() -> Option<i32> {
-        STAT_READ.with(|f| f.get()).and_then(|(_, recheck)| recheck)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn forced_stat_read_errno() -> Option<i32> {
-        STAT_READ.with(|f| f.get()).map(|(errno, _)| errno)
-    }
+    pub(crate) use crate::identity::pid_stat::fault::force_stat_read;
 }
 
 #[cfg(test)]
