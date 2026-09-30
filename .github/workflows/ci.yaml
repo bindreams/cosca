@@ -313,6 +313,7 @@ jobs:
         run: |
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
+          cargo test --locked --all-features --lib --tests --target ${{ matrix.target }} --no-run
           sudo -E bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
@@ -325,10 +326,11 @@ jobs:
             # Plain `cargo test` shares one process across tests, unlike nextest: the ignored cgroup
             # `own_process` tests run under that model here. Root cargo keeps the runner toolchain
             # via `sudo -E`; the target dir is handed back so later steps can write to it.
+            export PATH="$4"
             "$2" test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} -- --include-ignored cgroup || status=1
             chown -R "$3" "$PWD/target"
             exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)" "$PATH"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
       # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo nextest run`
