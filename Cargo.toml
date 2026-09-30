@@ -45,6 +45,9 @@ tempfile = "3"
 serde_json = "1"
 # `test-util`: `start_paused` virtual clock for the deadline tests. Dev-only.
 tokio = { version = "1", features = ["test-util"] }
+# Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `SharedChild`,
+# and needs a deadline-bounded wait on a child it also kills from another handle.
+shared_child = { version = "1", features = ["timeout"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is
