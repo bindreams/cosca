@@ -77,10 +77,10 @@ fn a_process_built_from_a_denied_identity_is_unknown_not_gone() {
     assert!(child.is_running(), "and it must still have been live throughout");
 }
 
-/// Pinned default: an unassessable anchor yields the same empty answers as a gone one.
+/// An unassessable anchor is an error, not the empty answer a gone one gives.
 #[cfg(windows)]
 #[test]
-fn parent_and_children_of_an_unassessable_anchor_are_empty() {
+fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -92,9 +92,13 @@ fn parent_and_children_of_an_unassessable_anchor_are_empty() {
         "precondition: unassessable"
     );
     let p = Process::from_id(id);
-    assert!(p.parent().is_none());
-    assert!(p.children(crate::Recursive::No).is_empty());
-    assert!(p.children(crate::Recursive::Yes).is_empty());
+    assert!(matches!(p.parent(), Err(crate::error::Error::Unassessable { .. })));
+    for recursive in [crate::Recursive::No, crate::Recursive::Yes] {
+        assert!(matches!(
+            p.children(recursive),
+            Err(crate::error::Error::Unassessable { .. })
+        ));
+    }
 }
 
 /// The ppid branch, distinct from the anchor branch: the subject resolves fine, but its
@@ -102,9 +106,8 @@ fn parent_and_children_of_an_unassessable_anchor_are_empty() {
 /// DACL is not inherited, so `cmd.exe` is unopenable while the `ping` it spawns is not.
 #[cfg(windows)]
 #[test]
-fn parent_of_a_process_whose_parent_is_access_denied_is_none_and_warns() {
+fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_ppid() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    crate::log_capture::install();
     let parent = crate::identity::windows_fixture::spawn_restricted_shell(PROCESS_SYNCHRONIZE.0);
     let kid_pid = parent.wait_for_child();
     assert!(parent.is_running(), "precondition: the denied parent must be live");
@@ -116,13 +119,23 @@ fn parent_of_a_process_whose_parent_is_access_denied_is_none_and_warns() {
         crate::identity::Resolved::Unknown,
         "precondition: the parent must be unassessable"
     );
-    let mark = crate::log_capture::mark();
-    assert!(kid.parent().is_none(), "an unassessable ppid yields no parent");
-    // Pinned to THIS fixture-s ppid and to this site-s prefix: `contains_since` bounds time
-    // only, and `treewalk::resolve_or_drop` emits a message sharing the "could not be
-    // queried" tail from any concurrent teardown in the same test process.
-    assert!(crate::log_capture::contains_since(
-        mark,
-        &format!("Process::parent: ppid {} could not be queried", parent.pid())
-    ));
+    match kid.parent() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains(&format!("ppid {}", parent.pid())), "{detail}");
+        }
+        other => panic!("an unassessable ppid must be Unassessable, got {other:?}"),
+    }
+}
+
+/// A gone or recycled anchor is a real "nothing": `Ok`, not an error. Mutant: "an error for a
+/// gone anchor".
+#[test]
+fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
+    let real = ProcessId::current();
+    let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
+    let p = Process::from_id(stale);
+    assert!(matches!(p.parent(), Ok(None)));
+    for recursive in [crate::Recursive::No, crate::Recursive::Yes] {
+        assert_eq!(p.children(recursive).expect("gone is not an error"), Vec::new());
+    }
 }

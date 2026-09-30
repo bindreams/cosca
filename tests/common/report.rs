@@ -114,7 +114,7 @@ fn is_contained_member(
         #[cfg(unix)]
         C::FdMarker | C::TreeWalk => cosca::Process::from_pid(grandchild)
             .found()
-            .and_then(|p| p.parent())
+            .and_then(|p| p.parent().expect("the grandchild's parent lookup failed"))
             .is_some_and(|parent| parent.id().pid() == root),
         _ => false,
     }

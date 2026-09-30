@@ -61,13 +61,13 @@ impl Process {
 
     /// The parent process, by identity (see [`Process::parent`](crate::Process::parent) for
     /// the identity-guard contract).
-    pub fn parent(&self) -> Option<Process> {
-        self.inner.parent().map(Process::from)
+    pub fn parent(&self) -> Result<Option<Process>, Error> {
+        Ok(self.inner.parent()?.map(Process::from))
     }
 
     /// The process's children (see [`Process::children`](crate::Process::children)).
-    pub fn children(&self, recursive: Recursive) -> Vec<Process> {
-        self.inner.children(recursive).into_iter().map(Process::from).collect()
+    pub fn children(&self, recursive: Recursive) -> Result<Vec<Process>, Error> {
+        Ok(self.inner.children(recursive)?.into_iter().map(Process::from).collect())
     }
 
     /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
