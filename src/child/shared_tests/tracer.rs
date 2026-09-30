@@ -75,62 +75,94 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
 //
 // macOS refuses `ptrace` attach with `EPERM` to an ad-hoc signed tracer unless the tracer carries
 // `com.apple.security.cs.debugger`. So each case re-execs a copy of this test binary signed with
-// it, in a fresh process (a tracer is per process, and `--test-threads=1` keeps the tracing
-// thread the waiting thread).
+// it, in a fresh process: the tracer is the whole process, not a thread.
 
 #[cfg(target_os = "macos")]
 mod macos {
     use std::io::Write as _;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::fixtures::Blocker;
+    use super::super::fixtures::{identity_of, Blocker};
+    use crate::child::shared::{SharedChild, State};
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
-    use crate::test_support::tracer::{attach_settled, AttachError};
+    use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
+    use crate::wait::exit_only::Reaped;
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
+
+    /// The failure bound of the driver's wait for its fixture. The fixture aborts from its own
+    /// [`BOUND`] watchdog well before, naming the step it hangs in, so this bound only ends a
+    /// fixture that never got that far (and is shorter than nextest's own, in `.config`).
+    const DRIVER_BOUND: Duration = Duration::from_secs(12);
 
     /// Run `fixture` in a re-exec of a debugger-entitled copy of this binary.
     pub(super) fn run_signed(fixture: &str) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let exe = dir.path().join("cosca_unit_tests");
-        std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
-        let plist = dir.path().join("debugger.plist");
-        std::fs::write(
-            &plist,
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>com.apple.security.cs.debugger</key><true/></dict></plist>
-"#,
-        )
-        .expect("write the entitlements");
-        let signed = crate::test_spawn::output_captured(
-            std::process::Command::new("codesign")
-                .args(["--force", "--sign", "-", "--entitlements"])
-                .arg(&plist)
-                .arg(&exe),
-        )
-        .expect("run codesign");
-        assert!(
-            signed.status.success(),
-            "codesign: {}",
-            String::from_utf8_lossy(&signed.stderr)
-        );
-
+        let exe = debugger_signed_copy(dir.path());
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--test-threads=1", "--exact", fixture])
-            .env(MARKER, std::process::id().to_string())
-            .env("COSCA_FIXTURE_PARENT_PID", std::process::id().to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        crate::test_child::configure_fixture_command(&mut cmd, fixture);
+        cmd.env(MARKER, std::process::id().to_string());
+        // As `run_fixture_output`: an inherited `RUST_TEST_NOCAPTURE` would turn libtest's output
+        // capture off.
+        cmd.env_remove("RUST_TEST_NOCAPTURE");
         let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the signed fixture");
-        let output = child.wait_with_output().expect("wait for the fixture");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-            "fixture {fixture} failed ({:?}):\n{stdout}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        match output_within(child, DRIVER_BOUND) {
+            Ok(output) => crate::test_child::assert_fixture_passed(fixture, &output),
+            Err(output) => panic!(
+                "fixture {fixture} was still running after {DRIVER_BOUND:?}, so it was killed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    /// `child`'s output once it exits (`Ok`), or, if it is still running after `bound`, its
+    /// output after it is killed and reaped (`Err`). `bound` is a failure bound on an external
+    /// event, never a synchronisation: a fixture that passes exits long before it.
+    fn output_within(
+        mut child: std::process::Child,
+        bound: Duration,
+    ) -> Result<std::process::Output, std::process::Output> {
+        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        }
+        let stdout = drain(child.stdout.take().expect("piped stdout"));
+        let stderr = drain(child.stderr.take().expect("piped stderr"));
+        // Adopted so that the kill below is identity-checked: the waiting thread may reap at any
+        // moment, and a bare pid could then name another process.
+        let id = identity_of(&child);
+        let shared = Arc::new(SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
+        let (tx, rx) = channel();
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            // The receiver outlives the waiter: a failed send needs no handling.
+            std::thread::spawn(move || _ = tx.send(shared.wait()))
+        };
+        let (status, in_time) = match rx.recv_timeout(bound) {
+            Ok(status) => (status, true),
+            Err(RecvTimeoutError::Timeout) => {
+                shared.kill().expect("kill the hung fixture");
+                (rx.recv().expect("the waiter ended without a result"), false)
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("the waiter ended without a result"),
+        };
+        waiter.join().expect("the waiter");
+        let output = std::process::Output {
+            status: status.expect("wait for the fixture"),
+            stdout: stdout.join().expect("stdout reader"),
+            stderr: stderr.join().expect("stderr reader"),
+        };
+        if in_time {
+            Ok(output)
+        } else {
+            Err(output)
+        }
     }
 
     /// The failure bound of a fixture that blocks on a traced child: if it is still running after
@@ -188,20 +220,26 @@ mod macos {
         }
     }
 
-    /// End a child stopped by [`attach_and_confirm_stop`]: `PT_KILL` sets `SRUN`, then `SIGKILL`
-    /// through the handle wakes a thread asleep in `read()` (`PT_KILL`'s own `SIGKILL` is only
-    /// posted to an `SSTOP` tracee, `kern_sig.c:2274`).
+    /// End a child stopped by [`attach_and_confirm_stop`]. `PT_KILL` does it: it posts `SIGKILL`
+    /// and releases the stopped thread, which then delivers the pending `SIGKILL`
+    /// (xnu-12377.121.6 `kern_sig.c:2794-2801`, "Necessary for PT_KILL"; `mach_process.c`
+    /// `PT_KILL`, then `resume`).
+    ///
+    /// The handle's `kill` does not: a `SIGKILL` to a traced child is taken by its tracer as a
+    /// stop, and posted only to one that already is stopped (`kern_sig.c:2275-2281`). A debugger
+    /// delays a kill and cannot cancel it. So the child is asserted still stopped after `kill`,
+    /// until `PT_KILL`.
     fn kill_stopped(blocker: &Blocker) {
-        // SAFETY: a plain ptrace request on this test's own child.
-        unsafe {
-            libc::ptrace(
-                libc::PT_KILL,
-                blocker.shared.id() as libc::pid_t,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
+        let pid = blocker.shared.id();
         blocker.shared.kill().expect("kill");
+        let stopped = settled_stop(pid);
+        assert!(
+            matches!(stopped, Ok(Some(_))),
+            "the handle's SIGKILL ended or released a traced child: {stopped:?}"
+        );
+        // SAFETY: a plain ptrace request on this test's own child.
+        let rc = unsafe { libc::ptrace(libc::PT_KILL, pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        assert_eq!(rc, 0, "PT_KILL: {}", std::io::Error::last_os_error());
     }
 
     fn assert_killed(status: std::process::ExitStatus) {
@@ -232,14 +270,14 @@ mod macos {
         attach_and_confirm_stop(&b);
         step("try_wait");
         assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
-        assert!(format!("{:?}", b.shared).contains("N"));
+        assert!(matches!(b.shared.lock().state, State::N));
         kill_stopped(&b);
         assert_killed(b.shared.wait().expect("wait"));
     }
 
     /// A child this process traces is reaped fully: XNU needs two reaps, because the first only
-    /// reparents the zombie to this same process (`kern_exit.c:2721-2773`), and the second peek
-    /// consumes it.
+    /// hands the zombie back to this same process (`reap_child_locked`, xnu-12377.121.6
+    /// `kern_exit.c:2863-2915`), and the second peek consumes it.
     ///
     /// Mutant: one consuming reap leaves the zombie, which the final peek still finds.
     #[test]
@@ -297,7 +335,10 @@ mod macos {
         let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, UniqRead::Refused(libc::EPERM));
         kill_stopped(&b);
         assert_killed(b.shared.wait().expect("wait"));
-        assert!(format!("{:?}", b.shared).contains("E("), "{:?}", b.shared);
+        assert!(
+            matches!(b.shared.lock().state, State::E(Reaped::Status(_))),
+            "the first reap's status is cached"
+        );
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);
     }
 }

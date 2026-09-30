@@ -18,6 +18,9 @@
 //! and EOF to end the session. Its stdout is the *report pipe*. The state machine and its
 //! transition table are in [`machine`].
 //!
+//! [`attach_settled`] is outside the helper's contract: it is the tracee's own parent attaching
+//! to it, a different shape that only `SharedChild`'s tracer tests need.
+//!
 //! **Entitlement (measured on CI).** macOS refuses `ptrace` attach with `EPERM` to an ad-hoc
 //! signed tracer unless the tracee carries `com.apple.security.get-task-allow` or the tracer
 //! carries `com.apple.security.cs.debugger`. So the helper runs from a copy of this binary
@@ -26,49 +29,11 @@
 
 use std::io::Write as _;
 
+mod attach;
 mod machine;
 mod sys;
 
-/// Why [`attach_settled`] did not return a settled stop.
-#[derive(Debug)]
-pub(crate) enum AttachError {
-    /// A request failed with this errno.
-    Errno(i32),
-    /// The tracee exited before it stopped, so no stop is coming: the `waitid` `si_code`
-    /// (`CLD_EXITED` 1, `CLD_KILLED` 2, `CLD_DUMPED` 3) and `si_status`.
-    Exited { code: i32, status: i32 },
-}
-
-/// Attach this process to its own child `pid` and return once the stop has settled, so the caller
-/// can act on it ([`sys::stop`] says why the settling matters). Unlike [`start`]'s helper, the
-/// caller is the tracee's parent and the tracer.
-///
-/// The stop raises no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks under
-/// a capped backoff: a deterministic condition, not a bet on time. It ends when the stop settles
-/// or the tracee is gone; an exited tracee never stops, so without that exit this would spin.
-pub(crate) fn attach_settled(pid: u32) -> Result<(), AttachError> {
-    sys::attach(pid).map_err(AttachError::Errno)?;
-    let mut backoff = std::time::Duration::from_millis(1);
-    loop {
-        match sys::stop(pid).map_err(AttachError::Errno)? {
-            sys::Stop::Stopped(_) => return Ok(()),
-            sys::Stop::Running | sys::Stop::Settling => {
-                // macOS reports a stop to a `WEXITED` wait too, so `si_code` says which it is.
-                let exited = sys::peek(pid, libc::WEXITED | libc::WNOHANG).map_err(AttachError::Errno)?;
-                if exited.si_pid != 0
-                    && matches!(exited.si_code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
-                {
-                    return Err(AttachError::Exited {
-                        code: exited.si_code,
-                        status: exited.si_status,
-                    });
-                }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
-            }
-        }
-    }
-}
+pub(crate) use attach::{attach_settled, settled_stop, AttachError};
 
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
@@ -373,7 +338,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
 
 /// Copies this test binary into `dir` and ad-hoc signs the copy with
 /// `com.apple.security.cs.debugger`, which macOS requires of a tracer (see the module docs).
-fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
     const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.cs.debugger</key><true/></dict></plist>
