@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use super::install_preserved;
 use super::{install, FdMapping};
 use crate::test_own_process::{own_process, test_path};
+use crate::test_spawn::spawn;
 use crate::test_stdio::RestoreStdio;
 
 /// A throwaway file holding `content`, rewound to its start so a child reading it from the
@@ -377,9 +378,10 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// through fd 3 instead of the mapping's real source.
 #[test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
-    let Some(done) = own_process(test_path!(
-        a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it
-    )) else {
+    let Some(done) = own_process(
+        test_path!(a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it),
+        spawn,
+    ) else {
         return;
     };
     let _restore = RestoreStdio::close(&done, &[2]);
@@ -429,9 +431,10 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 /// purposes across the fork, corrupting whichever one loses.
 #[test]
 fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
-    let Some(done) = own_process(test_path!(
-        a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops
-    )) else {
+    let Some(done) = own_process(
+        test_path!(a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops),
+        spawn,
+    ) else {
         return;
     };
     let _restore = RestoreStdio::close(&done, &[2]);

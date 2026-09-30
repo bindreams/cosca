@@ -6,6 +6,9 @@
 //! test its own process. A guard that restores the state cannot fix it, because the damage
 //! happens inside the window.
 //!
+//! Also mounted by `#[path]` into `tests/common`, so it names nothing of its crate: the caller
+//! passes the [`Spawn`] hook that takes `spawn_lock` around the fork.
+//!
 //! # The gate
 //!
 //! The parent re-executes the test binary as
@@ -36,9 +39,13 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::{parent_id, CommandExt as _};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+/// Forks `command` with `spawn_lock` held for the fork alone: `test_spawn::spawn` in the library's
+/// tests, `common::spawn_locked` in the integration tests.
+pub(crate) type Spawn = fn(&mut Command) -> std::io::Result<Child>;
 
 /// The role marker: `<parent pid>:<token fd>:<test>`. See the module doc.
 pub(crate) const ENV: &str = "COSCA_TEST_OWN_PROCESS";
@@ -51,6 +58,10 @@ const RETURNED: &[u8] = b"returned";
 
 /// The path of the `#[test] fn` `$name`, for [`own_process`]. `let _: fn() = $name;` makes a
 /// stale name a compile error rather than a filter that matches nothing.
+#[allow(
+    unused_macros,
+    reason = "unused in the integration binaries that mount this file only for `tests/common`"
+)]
 macro_rules! test_path {
     ($name:ident) => {{
         let _: fn() = $name;
@@ -77,8 +88,7 @@ pub(crate) enum Role {
 
 /// The argv (after the program name) of a re-executed test.
 ///
-/// `--include-ignored` lets the child run an `#[ignore]`d gated test; it becomes droppable when
-/// #234 removes the last `#[ignore]`.
+/// `--include-ignored` lets the child run an `#[ignore]`d gated test.
 pub(crate) fn child_args(test: &str) -> [&str; 4] {
     ["--exact", test, "--test-threads=1", "--include-ignored"]
 }
@@ -136,13 +146,29 @@ impl Drop for Completion {
 }
 
 /// Call first in a test that changes process-global state:
-/// `let Some(done) = own_process(test_path!(this_fn)) else { return };`.
+/// `let Some(done) = own_process(test_path!(this_fn), spawn) else { return };`.
 ///
 /// In the parent this re-executes the test binary to run only this test, waits for it, and
 /// panics with its output unless it passed; it returns `None`. In the child it returns the
 /// [`Completion`] to hold for the whole body, which runs alone in its process.
 #[must_use = "`let Some(done) = own_process(..) else { return };`: without the witness the test is not isolated"]
-pub(crate) fn own_process(path: &str) -> Option<Completion> {
+pub(crate) fn own_process(path: &str, spawn: Spawn) -> Option<Completion> {
+    if let Some(done) = child_completion(path) {
+        return Some(done);
+    }
+    if let Err(failure) = run(test_filter(path), &[], spawn) {
+        panic!("{failure}");
+    }
+    None
+}
+
+/// The [`Completion`] if this process was re-executed for `path` by its real parent, else `None`
+/// with nothing run. For a test whose parent does more than one [`run`], such as one per case.
+///
+/// The role is decided by [`role`], never by the presence of an environment variable, which a
+/// shell export or an outer harness can set.
+#[must_use = "without the witness the test is not isolated"]
+pub(crate) fn child_completion(path: &str) -> Option<Completion> {
     let test = test_filter(path);
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match role(std::env::var(ENV).ok().as_deref(), parent_id(), &args, test) {
@@ -155,9 +181,6 @@ pub(crate) fn own_process(path: &str) -> Option<Completion> {
                  expected {:?}",
                 child_args(test)
             );
-            if let Err(failure) = run(test, &[]) {
-                panic!("{failure}");
-            }
             None
         }
     }
@@ -226,8 +249,9 @@ pub(crate) fn drain(token_read: &mut std::io::PipeReader) -> std::io::Result<Vec
     }
 }
 
-/// Re-executes this test binary to run only `test`, with `env` added, and reports how it went.
-pub(crate) fn run(test: &str, env: &[(&str, &str)]) -> Result<(), Failure> {
+/// Re-executes this test binary to run only `test`, with `env` added, and reports how it went. `spawn`
+/// forks the child.
+pub(crate) fn run(test: &str, env: &[(&str, &str)], spawn: Spawn) -> Result<(), Failure> {
     let (mut token_read, token_write) = std::io::pipe().expect("create the completion pipe");
     // `drain` never waits for EOF, so a fork that inherits `token_write` before it is
     // close-on-exec (not every fork takes the lock) cannot delay the verdict.
@@ -261,8 +285,8 @@ pub(crate) fn run(test: &str, env: &[(&str, &str)]) -> Result<(), Failure> {
             Ok(())
         });
     }
-    // `test_spawn::spawn` takes `spawn_lock` for the fork alone, so this function takes it once.
-    let child = crate::test_spawn::spawn(&mut command).expect("re-execute the test binary");
+    // `spawn` already holds `spawn_lock` across the fork; do not take it here.
+    let child = spawn(&mut command).expect("re-execute the test binary");
     drop(token_write);
     let output = child.wait_with_output().expect("wait for the isolated run");
     let token = drain(&mut token_read).expect("read the completion pipe");
