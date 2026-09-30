@@ -56,8 +56,6 @@ pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, std::io::PipeWriter) 
 
 /// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
 /// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`.
-// Gated with its consumers: `tokio::wait_tests`, and the Unix-only cgroup and kqueue tests.
-#[cfg(any(unix, feature = "tokio"))]
 pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
     let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
     cmd.args(&BLOCKER_ARGV[1..])
@@ -128,6 +126,75 @@ pub(crate) fn await_member_ready(child: &mut std::process::Child) {
     // Hand the pipe back rather than dropping it: the member outlives this call, and closing
     // the read end under a live child would make any later write to it a `SIGPIPE`.
     child.stdout = Some(out.into_inner());
+}
+
+/// A [`member_command`] in its own group that exits `0` at EOF (the plain member's `read` fails
+/// there, so the script would exit `1`): an unsignalled member ends by a clean exit, which a
+/// signal cannot fake.
+#[cfg(unix)]
+pub(crate) fn exiting_member_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("echo $$; read _ignored; exit 0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    cmd
+}
+
+/// A live [`exiting_member_command`] child that has announced itself, and its identity.
+#[cfg(unix)]
+pub(crate) fn live_exiting_member() -> (std::process::Child, crate::identity::ProcessId) {
+    let mut child = crate::test_spawn::spawn(&mut exiting_member_command()).expect("spawn the member");
+    await_member_ready(&mut child);
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the live member resolves");
+    (child, id)
+}
+
+/// End a [`live_exiting_member`] by EOF and assert it was never signalled: only a clean exit
+/// proves no `SIGKILL`/`SIGTERM` arrived, which a `try_wait` straight after a signal cannot.
+#[cfg(unix)]
+pub(crate) fn release_unsignalled(mut child: std::process::Child) {
+    use std::os::unix::process::ExitStatusExt;
+    drop(child.stdin.take());
+    let status = child.wait().expect("reap the member");
+    assert_eq!(status.signal(), None, "the member must not have been signalled");
+    assert_eq!(status.code(), Some(0), "the member must exit by itself");
+}
+
+/// A live [`BLOCKER_ARGV`] (`findstr`) child with piped stdin and stdout, and its identity.
+#[cfg(windows)]
+pub(crate) fn live_findstr_blocker() -> (std::process::Child, crate::identity::ProcessId) {
+    let child =
+        crate::test_spawn::spawn(&mut held_std_blocker(std::process::Stdio::piped())).expect("spawn the blocker");
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the live blocker resolves");
+    (child, id)
+}
+
+/// Finish a [`live_findstr_blocker`] and assert it was never terminated: fed a matching line and
+/// EOF it exits `0` and echoes the match, and `TerminateProcess` gives neither.
+#[cfg(windows)]
+pub(crate) fn release_findstr_unterminated(mut child: std::process::Child) {
+    use std::io::{Read as _, Write as _};
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin.write_all(b"x\r\n").expect("write to the blocker");
+    drop(stdin);
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_end(&mut output)
+        .expect("read stdout to EOF");
+    let status = child.wait().expect("reap the blocker");
+    assert!(status.success(), "the blocker must exit by itself, got {status:?}");
+    assert!(
+        output.contains(&b'x'),
+        "the blocker must echo its match, got {output:?}"
+    );
 }
 
 /// Proves a `cat` blocker is alive and responsive: writes a byte to its stdin and reads it back

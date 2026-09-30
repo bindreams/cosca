@@ -51,6 +51,10 @@ const DENIED_SAMPLE_CAP: usize = 5;
 /// per-call either way: a dropped edge drops the pid's whole subtree in
 /// `treewalk::descendants_with`, and [`snapshot`] is what surfaces the aggregate.
 fn ppid_of(pid: libc::c_int) -> Resolved<RawPid> {
+    #[cfg(test)]
+    if fault::is_denied(pid) {
+        return Resolved::Unknown;
+    }
     crate::identity::macos_ppid_of(pid as RawPid)
 }
 
@@ -338,6 +342,12 @@ type Joined = (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>);
 /// `Unassessable` rather than as an empty process tree. `pids.len()` over-estimates the edge
 /// count, since some entries are filtered or fail the join.
 fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
+    #[cfg(test)]
+    if fault::join_alloc_fails() {
+        return Err(std::io::Error::other(
+            "an edge buffer could not be allocated (test fault injected)",
+        ));
+    }
     let mut edges = Vec::new();
     edges.try_reserve_exact(pids.len()).map_err(|e| {
         std::io::Error::other(format!(
@@ -423,6 +433,56 @@ pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
     log_denied(denied, raw.len(), &sample);
     let pids = raw.into_iter().filter(|&p| p > 0).map(|p| p as RawPid).collect();
     (pids, edges, denied)
+}
+
+/// Test-only seams inside [`join_edges`] and [`ppid_of`].
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static DENIED: RefCell<Vec<libc::c_int>> = const { RefCell::new(Vec::new()) };
+        static JOIN_ALLOC_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Disarms every forced fault on THIS thread on drop.
+    #[must_use = "dropping this immediately disarms the forced faults"]
+    pub(crate) struct Forced(());
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            DENIED.with(|d| d.borrow_mut().clear());
+            JOIN_ALLOC_FAILS.with(|f| f.set(false));
+            super::FORCE_BLIND.with(|c| c.set(false));
+        }
+    }
+
+    /// [`force_blind_snapshot_for_next_call`](super::force_blind_snapshot_for_next_call) disarmed
+    /// by the guard, so a test that panics first cannot leave it armed.
+    pub(crate) fn force_blind_snapshot() -> Forced {
+        super::force_blind_snapshot_for_next_call(true);
+        Forced(())
+    }
+
+    /// Make the ppid read of each of `pids` answer `Resolved::Unknown` (denied) on THIS thread.
+    pub(crate) fn force_denied(pids: &[libc::c_int]) -> Forced {
+        DENIED.with(|d| d.borrow_mut().extend_from_slice(pids));
+        Forced(())
+    }
+
+    /// Make EVERY [`join_edges`](super::join_edges) on THIS thread fail its edge-buffer allocation.
+    pub(crate) fn force_join_alloc_failure() -> Forced {
+        JOIN_ALLOC_FAILS.with(|f| f.set(true));
+        Forced(())
+    }
+
+    pub(super) fn is_denied(pid: libc::c_int) -> bool {
+        DENIED.with(|d| d.borrow().contains(&pid))
+    }
+
+    pub(super) fn join_alloc_fails() -> bool {
+        JOIN_ALLOC_FAILS.with(|f| f.get())
+    }
 }
 
 #[cfg(test)]

@@ -29,6 +29,10 @@ mod graceful;
 #[path = "child_tests.rs"]
 mod child_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/kill_tree_view_tests.rs"]
+mod kill_tree_view_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {

@@ -197,7 +197,7 @@ pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Err
 
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::fault as proc_view_fault;
+pub(crate) use backend::proc_view::{fault as proc_view_fault, openat2_refused_message};
 
 #[cfg(target_os = "linux")]
 impl ProcessId {
@@ -228,6 +228,19 @@ impl ProcessId {
 /// `macos/kinfo.rs`. Containment's process-group listing reads it too.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::kinfo;
+
+/// Make every by-pid identity read of `pid` on THIS thread answer `Unknown` until the guard drops:
+/// an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on macOS) for a live pid.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
+    proc_view_fault::force_identity_stat_errno(pid, libc::EACCES)
+}
+
+/// [`force_unknown_identity`] on macOS.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
+    backend::fault::force_unknown(pid)
+}
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see

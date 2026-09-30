@@ -16,6 +16,15 @@ use crate::identity::RawPid;
 /// A failed or interrupted snapshot is [`Error::Unassessable`] naming the Win32 call and its
 /// code: a partial list would read as "no descendants" to the tree walk.
 pub(crate) fn process_parents() -> Result<Vec<(RawPid, RawPid)>, Error> {
+    #[cfg(test)]
+    if fault::snapshot_fails() {
+        return Err(snapshot_failed(
+            "CreateToolhelp32Snapshot",
+            windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+                windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+            )),
+        ));
+    }
     let mut out = Vec::new();
 
     // Process32FirstW/NextW signal end-of-enumeration with ERROR_NO_MORE_FILES.
@@ -55,5 +64,36 @@ fn snapshot_failed(call: &str, e: windows::core::Error) -> Error {
     Error::Unassessable {
         detail: format!("the process snapshot could not be taken: {call} failed ({e})"),
         source: Some(std::io::Error::from(e)),
+    }
+}
+
+/// Test-only seam: make the ToolHelp snapshot fail.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SNAPSHOT_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Disarms [`force_snapshot_failure`] on drop.
+    #[must_use = "dropping this immediately disarms the forced failure"]
+    pub(crate) struct Forced(());
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            SNAPSHOT_FAILS.with(|f| f.set(false));
+        }
+    }
+
+    /// Make EVERY [`process_parents`](super::process_parents) on THIS thread fail as if
+    /// `CreateToolhelp32Snapshot` were refused, until the guard drops.
+    pub(crate) fn force_snapshot_failure() -> Forced {
+        SNAPSHOT_FAILS.with(|f| f.set(true));
+        Forced(())
+    }
+
+    pub(super) fn snapshot_fails() -> bool {
+        SNAPSHOT_FAILS.with(|f| f.get())
     }
 }

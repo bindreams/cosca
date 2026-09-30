@@ -47,3 +47,7 @@ pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
 pub(crate) fn force_blind_snapshot_for_next_call(force: bool) {
     backend::force_blind_snapshot_for_next_call(force)
 }
+
+/// Test-only re-export of the backend's fault seams, for the tree-walk propagation tests.
+#[cfg(all(test, any(target_os = "macos", windows)))]
+pub(crate) use backend::fault as backend_fault;
