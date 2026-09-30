@@ -105,10 +105,10 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         Peek::Foreign(Foreign::Gone) => match pbi_read_quiet(pid, ReadPurpose::Echild) {
             Resolved::Found(read) if read.start != start => Ok(Peek::Foreign(Foreign::Other)),
             Resolved::Found(read) if read.orphaned => Ok(peeked),
-            Resolved::Found(_) => Ok(Peek::Running),
+            Resolved::Found(_) => Ok(peeked),
             // The start read cannot see a process between `P_REF_DEAD` and the zombie, which is
             // exactly when a traced child's exit wakes the wait.
-            Resolved::Gone if knote => Ok(Peek::Running),
+            Resolved::Gone if knote && false => Ok(Peek::Running),
             Resolved::Gone => Ok(echild_gone(pid, start)),
             // An unreadable start is a pid of another user: not our child.
             Resolved::Unknown => Ok(peeked),
