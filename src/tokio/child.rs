@@ -449,7 +449,13 @@ impl Child {
         match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             Err(other) => Err(other),
-            Ok(Sent::Delivered | Sent::Gone) => Ok(()),
+            Ok(Sent::Delivered) => Ok(()),
+            Ok(Sent::Gone) => {
+                // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
+                #[cfg(unix)]
+                self.proc_mut().forget_if_foreign();
+                Ok(())
+            }
         }
     }
 

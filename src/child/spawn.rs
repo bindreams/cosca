@@ -1445,6 +1445,7 @@ pub(crate) mod fault {
     pub(crate) fn run_at(point: SpawnPoint, pid: u32) {
         SPAWN_PID.with(|p| p.set(Some(pid)));
         crate::oneshot_hook::fire(hook_at(point));
+        SPAWN_PID.with(|p| p.set(None));
     }
 
     /// The pid of the child the spawn that fired the running hook has just forked.

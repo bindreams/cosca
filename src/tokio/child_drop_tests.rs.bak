@@ -18,7 +18,7 @@ async fn a_disarmed_killed_drop_routes_its_drain_wait_through_the_reaper_pool() 
     use crate::identity::ProcessId;
 
     use super::reaper::test_probe::{arm, DropProbe, ReapOutcome};
-    use super::{Child, OsResources};
+    use super::{Child, OsResources, ProcSource};
 
     // Not populated, so the leaf's own drain wait (wherever it runs) returns at once instead of
     // blocking on an inotify event nothing would ever fire.
@@ -103,7 +103,7 @@ async fn a_disarmed_never_killed_drop_does_not_route_through_the_reaper_pool() {
     use crate::identity::ProcessId;
 
     use super::reaper::test_probe::{arm, DropProbe};
-    use super::{Child, OsResources};
+    use super::{Child, OsResources, ProcSource};
 
     let fake = FakeLeaf::new("cosca-async-disarmed-never-killed-routing", false);
     let leaf = entered_leaf_at(fake.leaf.clone());

@@ -923,3 +923,13 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
     teardown.assert_killed();
 }
+
+/// The spawn pid is readable only inside a hook: a stale one from an earlier spawn must not answer.
+#[test]
+fn spawn_pid_is_cleared_once_the_hook_has_run() {
+    fault::run_at(fault::SpawnPoint::BeforeIdentity, 4242);
+    assert!(
+        std::panic::catch_unwind(fault::spawn_pid).is_err(),
+        "spawn_pid must panic outside a hook"
+    );
+}

@@ -16,7 +16,7 @@ use crate::test_child::pid_reuse::{
 };
 use crate::tokio::Command;
 
-use super::reaper::test_probe::{arm, assert_consumed, DropProbe};
+use super::reaper::test_probe::{arm, assert_consumed, DropProbe, ReapOutcome};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -317,4 +317,59 @@ in_fresh_pid_ns!(
     fixture_tokio_spawn_identity_reaps_driver,
     fixture_tokio_spawn_identity_reaps_init,
     spawn_identity_failure_teardown_reaps_nothing_body
+);
+
+// The reaper's forget -----
+
+/// A live child is dropped: the kill is delivered and the reap job parks at the probe's gate. While
+/// it waits, the child is reaped behind the job's back and its pid reused. The job then finds the
+/// pidfd foreign and must forget the child, not drop it (which would reap the stranger by pid).
+///
+/// Mutant: `run_teardown` does not forget on `Foreign`.
+fn teardown_forgets_a_child_reaped_while_it_waited_body() {
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let pid = child.id().pid();
+
+        let (entered, _entered_rx) = mpsc::channel();
+        let (started, started_rx) = mpsc::channel();
+        let (gate_tx, gate) = mpsc::channel::<()>();
+        let (outcome_tx, outcome) = mpsc::channel();
+        arm(DropProbe {
+            entered,
+            started,
+            gate,
+            outcome: outcome_tx,
+        });
+        drop(child);
+        assert_consumed();
+        started_rx.recv().expect("a worker must take the job");
+
+        let reuser = reap_behind_and_reuse(pid);
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+        drop(gate_tx);
+        assert!(
+            matches!(outcome.recv(), Ok(ReapOutcome::Reaped(_))),
+            "the job must complete"
+        );
+
+        let record = rustix::process::waitid(
+            WaitId::Pid(Pid::from_raw(reuser.id() as i32).expect("pid")),
+            WaitIdOptions::EXITED,
+        )
+        .expect("the reuser's exit record must still be unconsumed")
+        .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop((reuser, writer));
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_teardown_forgets_a_child_reaped_while_it_waited,
+    fixture_tokio_teardown_forgets_driver,
+    fixture_tokio_teardown_forgets_init,
+    teardown_forgets_a_child_reaped_while_it_waited_body
 );

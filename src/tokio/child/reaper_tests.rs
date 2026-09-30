@@ -84,7 +84,7 @@ fn bare_job(origin: ThreadId, probe: Option<DropProbe>) -> super::ReapJob {
     let pid = proc.id().expect("a freshly spawned child has a pid");
     super::ReapJob {
         os: super::super::OsResources {
-            proc: Some(super::super::ProcSource::tokio(proc)),
+            proc: Some(crate::tokio::child::child_reap_tests::proc_source(proc)),
             ..Default::default()
         },
         pid,
@@ -570,4 +570,36 @@ async fn a_worker_survives_a_teardown_that_unwinds() {
         matches!(ends.outcome.recv(), Ok(ReapOutcome::Reaped(_))),
         "the surviving worker must keep draining the queue"
     );
+}
+
+/// A wait region that panics leaves the release region to drop the backend, which would reap by
+/// pid a child something else already reaped. On evidence of a foreign reap the release forgets
+/// it first.
+///
+/// Mutant: no `forget_if_foreign` before the release.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_panicked_wait_region_forgets_a_foreign_reaped_child_before_the_release() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    let mut job = bare_job(std::thread::current().id(), None);
+    job.force_panic = true;
+    let pid = job.pid;
+    crate::tokio::child::child_reap_tests::wait_exited_unreaped(pid);
+    #[cfg(target_os = "macos")]
+    let _evidence = {
+        let forced = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+        job.os
+            .proc_mut()
+            .signal(crate::signal::Sig::Kill)
+            .expect("latching signal");
+        forced
+    };
+    #[cfg(target_os = "linux")]
+    let _evidence = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+
+    super::run_teardown(job);
+
+    crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid); // the release did not reap it
 }

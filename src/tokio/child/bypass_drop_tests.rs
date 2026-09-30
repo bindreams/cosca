@@ -115,7 +115,11 @@ fn force_evidence(child: &mut crate::tokio::Child) -> impl Sized {
     {
         // The `kill`'s peek sees the "foreign reap" and sets the latch; nothing is sent.
         let forced = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
-        child.kill().expect("a kill of a foreign-reaped child answers Ok");
+        // Not `Child::kill`, which would forget the child before the drop under test.
+        child
+            .proc_mut()
+            .signal(crate::signal::Sig::Kill)
+            .expect("a signal to a foreign-reaped child answers Ok");
         forced
     }
 }

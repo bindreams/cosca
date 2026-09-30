@@ -146,6 +146,11 @@ impl ProcSource {
 
     /// Block until the child exits, returning its status.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
+        #[cfg(target_os = "macos")]
+        if self.latched() {
+            self.forget_foreign();
+            return Err(gone());
+        }
         match self {
             ProcSource::Tokio { child: c, .. } => c.wait().await.map_err(Error::Io),
             #[cfg(unix)]
@@ -155,8 +160,20 @@ impl ProcSource {
         }
     }
 
+    /// macOS: a foreign reap was seen, so tokio's wait by pid may reap another child's pid.
+    #[cfg(target_os = "macos")]
+    fn latched(&self) -> bool {
+        matches!(self, ProcSource::Tokio { child, foreign }
+            if child.id().is_some() && foreign.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Exit status if the child has already exited (non-blocking).
     pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
+        #[cfg(target_os = "macos")]
+        if self.latched() {
+            self.forget_foreign();
+            return Err(gone());
+        }
         match self {
             ProcSource::Tokio { child: c, .. } => c.try_wait().map_err(Error::Io),
             #[cfg(unix)]
@@ -239,6 +256,9 @@ impl ProcSource {
                 }
                 let e = std::io::Error::last_os_error();
                 if e.raw_os_error() == Some(libc::ESRCH) {
+                    // XNU answers 0 for an unreaped zombie, so `ESRCH` after a peek that found
+                    // our child means someone reaped it in between.
+                    foreign.store(true, Relaxed);
                     log::debug!("kill({pid}, {sig:?}): the child is already gone");
                     return Ok(Sent::Gone);
                 }
@@ -385,11 +405,15 @@ impl ProcSource {
                 stderr: None,
             },
         );
-        let ProcSource::Tokio { mut child, .. } = old else {
+        let ProcSource::Tokio { child, .. } = old else {
             unreachable!("only a Tokio backend is not already forgotten on Unix");
         };
+        // Forgotten before anything can unwind: a consumer's `Log` impl is untrusted, and a panic
+        // out of it while tokio's `Child` is a live local would drop it and reap by pid.
+        let mut child = std::mem::ManuallyDrop::new(child);
         let pid = child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string());
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        *self = ProcSource::Foreign { stdin, stdout, stderr };
         log::debug!("child {pid} was reaped by someone else; it will not be reaped by pid");
         let leak = if cfg!(target_os = "linux") {
             "tokio's pidfd and its reactor registration"
@@ -397,8 +421,6 @@ impl ProcSource {
             "tokio's SIGCHLD watch"
         };
         log::warn!("child {pid} was reaped by someone else; forgetting tokio's handle for it leaks {leak}");
-        std::mem::forget(child);
-        *self = ProcSource::Foreign { stdin, stdout, stderr };
     }
 
     /// A process handle pins its process, so nothing on Windows is reaped behind the owner's back.
@@ -411,8 +433,9 @@ impl ProcSource {
     /// that release the backend without waiting.
     ///
     /// - **macOS:** the latch is set.
-    /// - **Linux:** a `peek` through the pidfd answers `Foreign`. The pidfd gives certainty; with
-    ///   no pidfd there is no evidence either way.
+    /// - **Linux:** a `peek` through the pidfd answers `Foreign`. The pidfd gives certainty. No
+    ///   pidfd at all means the child was already gone when the spawn handshake looked for it,
+    ///   which is the same evidence, as it is for [`wait_and_reap`](ProcSource::wait_and_reap).
     #[cfg(unix)]
     pub(crate) fn forget_if_foreign(&mut self) {
         let evident = match self {
@@ -421,7 +444,7 @@ impl ProcSource {
             ProcSource::Tokio { child, pidfd } => {
                 use crate::wait::exit_only::{self, Peek, Target};
                 child.id().is_some()
-                    && pidfd.as_ref().is_some_and(|fd| {
+                    && pidfd.as_ref().is_none_or(|fd| {
                         matches!(
                             exit_only::peek(&Target::PidFd(std::os::fd::AsFd::as_fd(fd))),
                             Ok(Peek::Foreign(_))

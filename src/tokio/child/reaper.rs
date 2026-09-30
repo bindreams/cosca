@@ -343,6 +343,13 @@ pub(crate) fn run_teardown(job: ReapJob) {
         panic!("forced glue panic (test seam)");
     }
 
+    // A wait region that unwound may have left a foreign-reaped child un-forgotten, and the release
+    // below would drop it by pid. Its own catch keeps this function from ever unwinding.
+    #[cfg(unix)]
+    if waited.is_err() {
+        _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| os.proc_mut().forget_if_foreign()));
+    }
+
     let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if waited.is_err() {
             log::error!("reaping child {pid} panicked; releasing its resources anyway");

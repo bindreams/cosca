@@ -2,7 +2,7 @@ use super::{ProcSource, Waited};
 
 /// `child` as a backend. Linux: holding a pidfd the test opened itself, as the spawn does (a raw
 /// tokio child has none).
-fn proc_source(child: ::tokio::process::Child) -> ProcSource {
+pub(in crate::tokio::child) fn proc_source(child: ::tokio::process::Child) -> ProcSource {
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
@@ -14,10 +14,20 @@ fn proc_source(child: ::tokio::process::Child) -> ProcSource {
     ProcSource::tokio(child)
 }
 
+/// Blocks until `pid` has exited, without consuming its exit record.
+#[cfg(unix)]
+pub(in crate::tokio::child) fn wait_exited_unreaped(pid: u32) {
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waits for this process's own child without consuming it.
+    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+}
+
 /// Consumes `pid`'s exit record with a raw `waitid(P_PID)`, behind its owner's back. Blocks until
 /// the child has exited.
 #[cfg(unix)]
-fn reap_behind_the_owner(pid: u32) {
+pub(in crate::tokio::child) fn reap_behind_the_owner(pid: u32) {
     // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: consumes the exit record of this process's own child.
@@ -161,13 +171,17 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
 #[tokio::test]
 async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_reap() {
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
-    let mut proc = proc_source(spawn_a_tokio_child_that_exits());
+    let child = spawn_a_tokio_child_that_exits();
+    let real_pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
     let not_our_child = i32::MAX as u32;
 
     assert_eq!(proc.wait_and_reap(not_our_child), Waited::Foreign);
 
     assert_eq!(reaps.recorded(), vec![], "a failed waitid must record no reap");
-    proc.wait().await.expect("reap the real child");
+    // The latch is set, so the real child is forgotten, not waited on by tokio.
+    proc.forget_foreign();
+    reap_behind_the_owner(real_pid);
 }
 
 /// Linux: a child with no pidfd has nothing to prove it ours, and tokio's by-pid reap must not
@@ -274,4 +288,88 @@ fn exit_status_from_parts_encodes_a_dumped_child() {
     assert_eq!(killed.signal(), Some(libc::SIGKILL));
     assert!(!killed.core_dumped(), "{killed:?}");
     assert_eq!(super::exit_status_from_parts(libc::CLD_EXITED, 3).code(), Some(3));
+}
+
+/// A backend that forgets its child must do so before it logs: an untrusted logger that panics
+/// unwinds out of the forget, and a tokio `Child` still in hand would then be dropped, reaping
+/// the child by pid.
+///
+/// Mutant: `forget_foreign` logs before `mem::forget`.
+#[cfg(unix)]
+#[tokio::test]
+async fn tokio_forget_foreign_forgets_before_it_logs() {
+    crate::log_capture::install();
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    wait_exited_unreaped(pid);
+
+    let unwound = {
+        let _panics = crate::log_capture::panic_on(&format!("child {pid} "));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| proc.forget_foreign()))
+    };
+    assert!(unwound.is_err(), "the logger must have panicked out of the forget");
+
+    reap_behind_the_owner(pid); // still ours to consume: nothing reaped it by pid
+    assert!(proc.is_reaped());
+}
+
+/// `wait_and_reap_blocking` on a child reaped behind its owner's back forgets it.
+///
+/// Mutant: no forget in `wait_and_reap_blocking`.
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
+    let mut child = spawn_cosca_child_that_exits();
+    reap_behind_the_owner(child.id().pid());
+
+    child.wait_and_reap_blocking();
+
+    assert!(child.proc_mut().is_reaped(), "a foreign-reaped child must be forgotten");
+}
+
+/// `kill` that finds the child gone forgets a foreign reap, so a later drop or wait cannot reap
+/// by pid.
+///
+/// Mutant: `Child::kill` does not forget on `Sent::Gone`.
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_of_a_foreign_reaped_child_forgets_it() {
+    let mut child = spawn_cosca_child_that_exits();
+    reap_behind_the_owner(child.id().pid());
+
+    child.kill().expect("a kill of a foreign-reaped child answers Ok");
+
+    assert!(child.proc_mut().is_reaped(), "a foreign-reaped child must be forgotten");
+}
+
+#[cfg(unix)]
+fn spawn_cosca_child_that_exits() -> crate::tokio::Child {
+    let mut cmd = crate::tokio::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe")).args([
+        "cosca_unit_tests",
+        "--exact",
+        "__cosca_no_such_test__",
+    ]);
+    cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    cmd.stderr(crate::stdio::Stdio::null()).expect("stderr null");
+    cmd.spawn().expect("spawn")
+}
+
+/// Linux: a backend with no pidfd has nothing to prove the child ours, which is evidence of a
+/// foreign reap, as it is for `wait_and_reap`.
+///
+/// Mutant: `forget_if_foreign` takes a missing pidfd for no evidence.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn forget_if_foreign_with_no_pidfd_forgets() {
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = ProcSource::tokio(child);
+    wait_exited_unreaped(pid);
+
+    proc.forget_if_foreign();
+
+    assert!(proc.is_reaped());
+    reap_behind_the_owner(pid); // the zombie was left alone
 }
