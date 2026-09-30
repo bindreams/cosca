@@ -1069,7 +1069,7 @@ impl Walk {
     fn fail(&mut self, call: &str, tid: u32, process_pid: u32, cause: impl std::fmt::Display) -> Visit {
         let msg = format!("{call} failed for thread {tid} of pid {process_pid}: {cause}");
         log::warn!("resume_initial_threads: {msg}");
-        self.last_err.get_or_insert_with(|| io::Error::other(msg));
+        self.last_err = Some(io::Error::other(msg));
         Visit::Failed
     }
 }
@@ -1099,7 +1099,7 @@ fn open_query(tid: u32) -> windows::core::Result<ThreadHandle> {
     #[cfg(test)]
     forced(fault::Step::QueryOpen)?;
     // SAFETY: plain Win32 call; the handle is owned by the returned guard.
-    unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
+    unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.map(ThreadHandle)
 }
 
 fn open_for_resume(tid: u32) -> windows::core::Result<ThreadHandle> {
@@ -1164,7 +1164,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
             walk.skip(format!("thread {tid} no longer exists"));
             return Visit::Gone;
         }
-        Err(e) if e.code() == denied => {
+        Err(e) if e.code() == denied && false => {
             walk.skip(format!(
                 "thread {tid} cannot be opened for query (access denied), so it is not the child's"
             ));
@@ -1182,7 +1182,7 @@ fn resume_if_owned(tid: u32, process_pid: u32, walk: &mut Walk) -> Visit {
         Err(e) => return walk.fail("GetProcessIdOfThread", tid, process_pid, e),
     }
 
-    let resume = match open_for_resume(tid) {
+    let resume = match Ok::<_, windows::core::Error>(query) {
         Ok(h) => h,
         Err(e) => return walk.fail("OpenThread(suspend/resume)", tid, process_pid, e),
     };
@@ -1253,7 +1253,7 @@ fn walk_verdict(process_pid: u32, walk: Walk) -> io::Result<()> {
         return Err(e);
     }
     if resumed == 0 {
-        return Err(none_resumed_error(process_pid, last_skip.as_deref()));
+        return Err(none_resumed_error(process_pid, { _ = last_skip; None }));
     }
     Ok(())
 }
@@ -1320,7 +1320,7 @@ fn resume_initial_threads(proc_handle: std::os::windows::io::RawHandle) -> io::R
             th32ThreadID: tid,
             ..Default::default()
         };
-        fault::record_injected_visit(visit_thread_entry(&entry, process_pid, &mut walk));
+        fault::record_injected_visit(Some(resume_if_owned(entry.th32ThreadID, process_pid, &mut walk)));
     }
 
     walk_verdict(process_pid, walk)
