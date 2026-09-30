@@ -337,9 +337,9 @@ fn help(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Outcom
         #[cfg(test)]
         seams,
     ) {
-        Sent::Delivered => Outcome::Opened(pidfd),
-        Sent::Gone => Outcome::Gone(pidfd),
-        Sent::Failed(e) => Outcome::Failed(
+        Delivery::Delivered => Outcome::Opened(pidfd),
+        Delivery::Gone => Outcome::Gone(pidfd),
+        Delivery::Failed(e) => Outcome::Failed(
             Error::Io(crate::error::io_context(
                 "pidfd handshake: sending the child its go-ahead",
                 e,
@@ -441,7 +441,7 @@ fn parse_report(
 
 /// What sending GO came to.
 #[derive(Debug)]
-enum Sent {
+enum Delivery {
     Delivered,
     /// The child's end is closed or shut: the child is dead, or `spawn()` returned without it
     /// execing.
@@ -449,7 +449,7 @@ enum Sent {
     Failed(io::Error),
 }
 
-fn send_go(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Sent {
+fn send_go(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Delivery {
     loop {
         #[cfg(test)]
         let sent = match seams.take_send_errno() {
@@ -465,20 +465,20 @@ fn send_go(parent_end: &OwnedFd, #[cfg(test)] seams: &fault::HelperSeams) -> Sen
 }
 
 /// What a `send` of GO answered; `None` to send again.
-fn classify_send(sent: Result<usize, Errno>) -> Option<Sent> {
+fn classify_send(sent: Result<usize, Errno>) -> Option<Delivery> {
     match sent {
-        Ok(1) => Some(Sent::Delivered),
+        Ok(1) => Some(Delivery::Delivered),
         Ok(n) => {
             debug_assert!(
                 false,
                 "SOCK_SEQPACKET sends a message whole or not at all; sent {n} of 1"
             );
-            Some(Sent::Failed(io::Error::from_raw_os_error(libc::EMSGSIZE)))
+            Some(Delivery::Failed(io::Error::from_raw_os_error(libc::EMSGSIZE)))
         }
         Err(Errno::INTR) => None,
         // `ECONNRESET` is the same close, with a message still unread in the child's end.
-        Err(Errno::PIPE | Errno::CONNRESET) => Some(Sent::Gone),
-        Err(e) => Some(Sent::Failed(e.into())),
+        Err(Errno::PIPE | Errno::CONNRESET) => Some(Delivery::Gone),
+        Err(e) => Some(Delivery::Failed(e.into())),
     }
 }
 
@@ -549,13 +549,11 @@ pub(crate) fn await_unexecuted_exit(pidfd: &OwnedFd, pid: Option<u32>) {
 
     use crate::wait::exit_only::{wait_visible_exit, Target};
 
-    // It never execed, so it has this process's credentials: only `ESRCH` (reaped) can refuse.
-    match rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL) {
-        Ok(()) | Err(Errno::SRCH) => {}
-        Err(e) => {
-            log::warn!("pid {pid:?}: a spawned child that never ran could not be killed: {e}");
-            debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
-        }
+    // It never execed, so it has this process's credentials: nothing but its being gone, which the
+    // helper answers `Ok`, can refuse.
+    if let Err(e) = crate::signal::via_pidfd(Some(pidfd.as_fd()), pid.unwrap_or(0), crate::signal::Sig::Kill) {
+        log::warn!("pid {pid:?}: a spawned child that never ran could not be killed: {e}");
+        debug_assert!(false, "SIGKILL through a pidfd to an unexecuted child failed: {e}");
     }
     if let Err(e) = wait_visible_exit(&Target::PidFd(pidfd.as_fd())) {
         log::warn!("pid {pid:?}: a spawned child that never ran could not be waited on: {e}");

@@ -1094,11 +1094,15 @@ impl Unadopted for PidfdChild {
         self.pid
     }
     fn kill(&mut self) -> std::io::Result<()> {
-        // A zombie takes the signal too, so an exited child is `Ok`; `ESRCH` is reaped elsewhere.
-        match rustix::process::pidfd_send_signal(&self.pidfd, rustix::process::Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        use std::os::fd::AsFd;
+        // A zombie takes the signal too, so an exited child is `Ok`, and so is one reaped elsewhere.
+        // An unknown pid (a child tokio dropped) is named 0 in the helper's log.
+        crate::signal::via_pidfd(
+            Some(self.pidfd.as_fd()),
+            self.pid.unwrap_or(0),
+            crate::signal::Sig::Kill,
+        )
+        .map(drop)
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         use crate::wait::exit_only::{try_reap, Reap, Reaped};

@@ -13,7 +13,7 @@ use rustix::io::Errno;
 use rustix::net::ReturnFlags;
 
 use super::fault::{self, ChildFault};
-use super::{classify_send, parse_report, Report, Sent, REPORT_ERRNO, REPORT_LEN, REPORT_PIDFD};
+use super::{classify_send, parse_report, Delivery, Report, REPORT_ERRNO, REPORT_LEN, REPORT_PIDFD};
 use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::Stdio;
@@ -230,14 +230,14 @@ fn a_truncated_report_is_an_error_and_a_whole_one_is_read() {
 /// Mutant: every send error is taken as the child being gone.
 #[test]
 fn only_a_closed_end_makes_an_undelivered_go_mean_gone() {
-    assert!(matches!(classify_send(Ok(1)), Some(Sent::Delivered)));
+    assert!(matches!(classify_send(Ok(1)), Some(Delivery::Delivered)));
     assert!(classify_send(Err(Errno::INTR)).is_none(), "EINTR must send again");
     for errno in [Errno::PIPE, Errno::CONNRESET] {
-        assert!(matches!(classify_send(Err(errno)), Some(Sent::Gone)), "{errno:?}");
+        assert!(matches!(classify_send(Err(errno)), Some(Delivery::Gone)), "{errno:?}");
     }
     for errno in [Errno::NOBUFS, Errno::NOMEM, Errno::AGAIN] {
         match classify_send(Err(errno)) {
-            Some(Sent::Failed(e)) => assert_eq!(e.raw_os_error(), Some(errno.raw_os_error())),
+            Some(Delivery::Failed(e)) => assert_eq!(e.raw_os_error(), Some(errno.raw_os_error())),
             other => panic!("{errno:?} must fail the spawn, got {other:?}"),
         }
     }

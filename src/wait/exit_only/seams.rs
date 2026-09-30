@@ -108,8 +108,8 @@ pub(crate) fn take_forced_si_code() -> Option<i32> {
     FORCED_SI_CODE.with(Cell::take)
 }
 
-/// The next blocking `waitid` in `wait_visible_exit` on this thread finds no record, which the
-/// kernel never answers.
+/// The next blocking `waitid` in `wait_visible_exit` or `reap_blocking` on this thread finds no
+/// record, which the kernel never answers.
 #[cfg(target_os = "linux")]
 pub(crate) fn force_visible_none_once() -> Forced {
     FORCED_VISIBLE_NONE.with(|f| f.set(true));
