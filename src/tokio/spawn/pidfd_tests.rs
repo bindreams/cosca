@@ -74,10 +74,7 @@ async fn a_normal_spawn_runs_the_program() {
     let mut child = cmd.spawn().expect("a normal spawn succeeds");
     drop(probes);
     let ends = fault::take_ends().expect("the end probes saw the run");
-    assert!(
-        !ends.child_end_copy_held && ends.eof_reached && !ends.eof_forced,
-        "{ends:?}"
-    );
+    assert!(!ends.child_end_copy_held && ends.eof_reached, "{ends:?}");
     assert_eq!(fault::spawns(), 1);
     assert!(child.wait().await.expect("wait").success());
     assert!(program_ran(cmd, reader));

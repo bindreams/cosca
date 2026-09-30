@@ -367,6 +367,8 @@ impl Handshake {
                 ends.forced_eof();
             }
             #[cfg(test)]
+            fault::wait_over();
+            #[cfg(test)]
             ends.finish(parent_end);
             #[cfg(test)]
             seams.release_verdict(spawned.as_ref().ok().and_then(Spawned::pid));
@@ -458,6 +460,8 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
             return false;
         }
     }
+    #[cfg(test)]
+    fault::before_awaiting_the_child();
     let mut fds = [PollFd::new(done, PollFlags::IN), PollFd::new(&watch, PollFlags::IN)];
     if let Err(e) = helper_done(&mut fds, None) {
         log::warn!(

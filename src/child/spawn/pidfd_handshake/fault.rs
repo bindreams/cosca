@@ -75,6 +75,7 @@ thread_local! {
     static ENDS_ARMED: Cell<bool> = const { Cell::new(false) };
     static ENDS: Cell<Option<Ends>> = const { Cell::new(None) };
     static AFTER_SPAWN: RefCell<Option<VerdictHook>> = const { RefCell::new(None) };
+    static WAIT_OVER: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static PARENT_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
     static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
 }
@@ -101,6 +102,28 @@ pub(super) fn spawn_returned(pid: Option<u32>) {
     if let Some(hook) = AFTER_SPAWN.with(|h| h.borrow_mut().take()) {
         hook(pid);
     }
+}
+
+/// Run `hook` once on this thread when the next `run`, its spawn returned, is about to block until
+/// the helper is done or the child has exited. Not reached if the wait is skipped or answered at
+/// once.
+pub(crate) fn before_awaiting_the_child_do(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_AWAITING, hook)
+}
+
+pub(super) fn before_awaiting_the_child() {
+    crate::oneshot_hook::fire(&BEFORE_AWAITING);
+}
+
+/// Run `hook` once on this thread when the next `run`'s wait for the child is over, whatever it
+/// answered: the place for a release that must happen on every path, so a fixture held for the
+/// wait that a regression skips cannot hang the test.
+pub(crate) fn wait_over_do(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&WAIT_OVER, hook)
+}
+
+pub(super) fn wait_over() {
+    crate::oneshot_hook::fire(&WAIT_OVER);
 }
 
 // The child =====

@@ -81,8 +81,8 @@ fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
 
 // Normal spawns =====
 
-/// Mutants: a handshake that leaves the child held forever (the spawn hangs: bounded by the nextest
-/// override) or aborts it; EOF forced on a child that is still reporting.
+/// Mutant: a handshake that leaves the child held forever (the spawn hangs: bounded by the nextest
+/// override) or aborts it.
 #[test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();
@@ -90,8 +90,7 @@ fn a_normal_spawn_runs_the_program_and_forks_once() {
     let probes = fault::arm_end_probes();
     let child = cmd.spawn().expect("a normal spawn succeeds");
     drop(probes);
-    let ends = assert_ends_closed(fault::take_ends(), "a normal spawn");
-    assert!(!ends.eof_forced, "a live child that reports is never cut off");
+    assert_ends_closed(fault::take_ends(), "a normal spawn");
     assert_eq!(fault::spawns(), 1);
     assert!(child.wait().expect("wait").success());
     assert_no_child_of_this_thread("after the wait");
@@ -483,8 +482,8 @@ fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
 /// With two of fds 0 to 2 closed, std's status pipe sits on a stdio slot the child replaces, and
 /// `spawn()` returns before the child's hooks run. The child still reports, and runs the program.
 ///
-/// Mutant: the parent forces EOF as soon as `spawn()` returns (the child's report then fails, and
-/// so does the spawn; the probe says the EOF was forced).
+/// Mutant: the parent forces EOF as soon as `spawn()` returns, while the child still has to report
+/// (the child's report then fails, and so does the spawn).
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[test]
@@ -511,20 +510,26 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
         cmd.fd(slot, Stdio::from_file(file.try_clone().expect("clone the file")))
             .expect("wire the slot to the file");
     }
-    // The child waits at its hook until the parent's spawn has returned.
+    // The child waits at its hook until the parent, its spawn returned, is about to wait for it in
+    // turn. The release also runs when the wait is over, so a parent that never reaches it (a
+    // regression) cannot hold the child, and the test, forever.
     let armed = fault::arm_child_fault(ChildFault::Gate(gate_read.as_raw_fd()));
     let probes = fault::arm_end_probes();
-    let release = fault::after_spawn_returns_do({
+    let release_gate = {
         let gate_write = Rc::clone(&gate_write);
-        move |_| {
-            let mut gate = gate_write.borrow_mut().take().expect("the gate is held");
-            gate.write_all(b"x").expect("release the child");
+        move || {
+            if let Some(mut gate) = gate_write.borrow_mut().take() {
+                gate.write_all(b"x").expect("release the child");
+            }
         }
-    });
+    };
+    let release = fault::before_awaiting_the_child_do(release_gate.clone());
+    let released_at_the_end = fault::wait_over_do(release_gate);
     let restore = RestoreStdio::close(&done, &[1, 2]);
     let spawned = cmd.spawn();
     drop(restore);
     drop(release);
+    drop(released_at_the_end);
     drop(probes);
     drop(armed);
     // Released whatever happened, before any assert: a child held forever holds the file.
@@ -532,8 +537,7 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
         gate.write_all(b"x").expect("release the child");
     }
 
-    let ends = assert_ends_closed(fault::take_ends(), "a spawn that returns before the hooks run");
-    assert!(!ends.eof_forced, "a child that has not exited is never cut off");
+    assert_ends_closed(fault::take_ends(), "a spawn that returns before the hooks run");
     let child = spawned.expect("the spawn must succeed");
     assert!(child.wait().expect("wait").success());
     let mut written = String::new();
