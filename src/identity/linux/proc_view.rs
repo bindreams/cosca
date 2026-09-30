@@ -423,6 +423,7 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCE_PROC_VIEW: Cell<Option<ForcedView>> = const { Cell::new(None) };
+        static FORCE_PROC_VIEW_SKIP: Cell<u32> = const { Cell::new(0) };
         static FORCE_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
         static FORCE_FDINFO: Cell<Option<Result<super::PidfdTarget, i32>>> = const { Cell::new(None) };
         static FORCE_OPENAT2_ERRNO: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
@@ -437,6 +438,7 @@ pub(crate) mod fault {
     impl Drop for Forced {
         fn drop(&mut self) {
             FORCE_PROC_VIEW.with(|f| f.set(None));
+            FORCE_PROC_VIEW_SKIP.with(|f| f.set(0));
             FORCE_FDINFO.with(|f| f.set(None));
             FORCE_STATUS.with(|f| f.take());
             FORCE_OPENAT2_ERRNO.with(|f| f.set(None));
@@ -483,6 +485,13 @@ pub(crate) mod fault {
         Forced(())
     }
 
+    /// Force the [`proc_view`](super::proc_view) on THIS thread that follows `skip` real ones,
+    /// so a caller whose first read must pass (an anchor) fails only at a later one.
+    pub(crate) fn force_proc_view_after(skip: u32, view: ForcedView) -> Forced {
+        FORCE_PROC_VIEW_SKIP.with(|f| f.set(skip));
+        force_proc_view_once(view)
+    }
+
     /// Force the NEXT [`pidfd_pid_in_view`](super::pidfd_pid_in_view) on THIS thread to answer
     /// `Ok(pid)`, or to fail reading with the raw `errno`.
     pub(crate) fn force_fdinfo_once(answer: Result<super::PidfdTarget, i32>) -> Forced {
@@ -491,6 +500,14 @@ pub(crate) mod fault {
     }
 
     pub(crate) fn take_forced_proc_view() -> Option<ForcedView> {
+        let skipped = FORCE_PROC_VIEW_SKIP.with(|f| {
+            let n = f.get();
+            f.set(n.saturating_sub(1));
+            n > 0
+        });
+        if skipped {
+            return None;
+        }
         FORCE_PROC_VIEW.with(|f| f.take())
     }
 

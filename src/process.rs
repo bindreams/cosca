@@ -94,99 +94,82 @@ impl Process {
     /// The parent process, by identity. Identity-guarded against pid-reuse: a genuine parent
     /// predates this child, so a recycled `ppid` naming a process created AFTER it (later
     /// token) is rejected by the same token rule as [`children`](Self::children) — sound,
-    /// modulo the per-OS same-tick residual the whole crate shares. `None` if there is no
-    /// resolvable parent or `self` itself was recycled, or if the process table cannot be read
-    /// (logged at `warn`, naming the cause; this method has no error channel).
-    pub fn parent(&self) -> Option<Process> {
+    /// modulo the per-OS same-tick residual the whole crate shares.
+    ///
+    /// `Ok(None)` means there is none: `self` has no parent (pid 1), the parent has exited, or
+    /// `self` is gone or was recycled. It is never an answer to a question that could not be
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unassessable`]: `self` (or its parent) exists but cannot be queried, or the
+    ///   process table cannot be read or trusted (on Linux, a `/proc` that is not this pid
+    ///   namespace's).
+    /// - [`Error::Unsupported`]: on Linux, `openat2` is unavailable (Linux ≥ 5.6).
+    pub fn parent(&self) -> Result<Option<Process>, Error> {
         // Anchor: a query against a recycled self pid is meaningless. An Unknown anchor
-        // cannot rule that out either, so it is treated the same — the alternative is
-        // enumerating a stranger's tree.
+        // cannot rule that out either, so it is an error — the alternative is enumerating a
+        // stranger's tree.
         match self.id.exists() {
             Existence::Present => {}
-            Existence::Gone => return None,
-            Existence::Unknown => {
-                log::warn!(
-                    "Process::parent: pid {} is unassessable{} — returning None",
-                    self.id.pid(),
-                    unassessable_cause(self.id)
-                );
-                return None;
-            }
+            Existence::Gone => return Ok(None),
+            Existence::Unknown => return Err(unqueryable(&format!("pid {}", self.id.pid()))),
         }
-        // A query, not a kill or a wait, and the return type has no error channel: an unreadable
-        // process table reads as "no parent", said at `warn` with its cause.
-        let parents = match crate::containment::enumerate::process_parents() {
-            Ok(parents) => parents,
-            Err(e) => {
-                log::warn!("Process::parent: {e} — reporting no parent");
-                return None;
-            }
-        };
-        let ppid = parents
+        let parents = crate::containment::enumerate::process_parents()?;
+        let Some(ppid) = parents
             .iter()
             .find(|&&(pid, _)| pid == self.id.pid())
-            .map(|&(_, ppid)| ppid)?;
+            .map(|&(_, ppid)| ppid)
+        else {
+            return Ok(None);
+        };
         // A process is never its own parent (treewalk's convention).
         if ppid == self.id.pid() {
-            return None;
+            return Ok(None);
         }
-        // The SECOND collapse point in this function: folding an access-denied parent into
-        // "no parent" with no trace would reproduce the same Unknown-into-absence collapse
-        // the anchor check above exists to avoid.
+        // The SECOND Unknown-into-absence collapse point: an access-denied parent is not
+        // "no parent".
         let parent = match ProcessId::of(ppid) {
             Resolved::Found(p) => p,
-            Resolved::Gone => return None,
-            Resolved::Unknown => {
-                log::warn!("Process::parent: ppid {ppid} could not be queried (access denied?) — reporting no parent");
-                return None;
-            }
+            Resolved::Gone => return Ok(None),
+            Resolved::Unknown => return Err(unqueryable(&format!("ppid {ppid}"))),
         };
         // Identity guard: a genuine parent predates this child, so the child's start token
         // orders at-or-after the parent's. A recycled ppid names a process created AFTER
         // this one (later token) — reject it.
-        crate::containment::treewalk::keeps_token(
+        Ok(crate::containment::treewalk::keeps_token(
             self.id.start_token_raw(),
             parent.start_token_raw(),
             crate::containment::treewalk::ALLOW_EQUAL_TOKEN,
         )
-        .then_some(Process { id: parent })
+        .then_some(Process { id: parent }))
     }
 
     /// The process's children. `Recursive::No` = direct children; `Recursive::Yes` = the
     /// whole subtree. Identity-guarded against pid-reuse by the tree-walk token rule (a
     /// candidate is kept only if its start token orders at-or-after this process). Snapshot;
-    /// best-effort. Empty, with a `warn` naming the cause, if the process table cannot be read:
-    /// empty does not prove there are no children.
-    pub fn children(&self, recursive: Recursive) -> Vec<Process> {
+    /// best-effort.
+    ///
+    /// An empty list means there are none (or `self` is gone or was recycled); a process table
+    /// that cannot be read is an error, never an empty list.
+    ///
+    /// # Errors
+    ///
+    /// As [`parent`](Self::parent).
+    pub fn children(&self, recursive: Recursive) -> Result<Vec<Process>, Error> {
         // Anchor: a recycled self pid maps the whole query onto a stranger. An Unknown
         // anchor cannot rule that out either.
         match self.id.exists() {
             Existence::Present => {}
-            Existence::Gone => return Vec::new(),
-            Existence::Unknown => {
-                log::warn!(
-                    "Process::children: pid {} is unassessable{} — returning none",
-                    self.id.pid(),
-                    unassessable_cause(self.id)
-                );
-                return Vec::new();
-            }
+            Existence::Gone => return Ok(Vec::new()),
+            Existence::Unknown => return Err(unqueryable(&format!("pid {}", self.id.pid()))),
         }
-        // A query, not a kill or a wait, and the return type has no error channel: an unreadable
-        // process table reads as "no children", said at `warn` with its cause. Callers that act
-        // on the answer (`kill_tree`, `terminate_tree`) do not use this method; they error.
-        let parents = match crate::containment::enumerate::process_parents() {
-            Ok(parents) => parents,
-            Err(e) => {
-                log::warn!("Process::children: {e} — returning none");
-                return Vec::new();
-            }
-        };
+        let parents = crate::containment::enumerate::process_parents()?;
         let ids = match recursive {
             Recursive::No => crate::containment::treewalk::children_of(self.id, &parents),
             Recursive::Yes => crate::containment::treewalk::descendants(self.id, &parents),
         };
-        ids.into_iter().map(|id| Process { id }).collect()
+        Ok(ids.into_iter().map(|id| Process { id }).collect())
     }
 
     /// Hard-kill the process by identity (`SIGKILL` / `TerminateProcess`). Already-dead ⇒
@@ -201,11 +184,15 @@ impl Process {
     }
 }
 
-/// ` (<why>)` when the `/proc` view is why `id` reads `Unknown` (Linux: `openat2` missing, a
-/// diverged or unreadable view), else empty: `hidepid` and a racing exit have no view to blame.
-fn unassessable_cause(id: ProcessId) -> String {
-    crate::identity::unknown_identity_error(&format!("pid {}", id.pid()))
-        .map_or_else(String::new, |e| format!(" ({e})"))
+/// The error for a `subject` (`pid N` / `ppid N`) that exists but reads `Unknown`. On Linux the
+/// `/proc` view is named when it is why ([`Error::Unsupported`] for a missing `openat2`,
+/// [`Error::Unassessable`] for a diverged or unreadable view); otherwise (`hidepid`, access
+/// denied, a racing exit) there is no view to blame.
+fn unqueryable(subject: &str) -> Error {
+    crate::identity::unknown_identity_error(subject).unwrap_or_else(|| Error::Unassessable {
+        detail: format!("{subject} exists but could not be queried (access denied?)"),
+        source: None,
+    })
 }
 
 #[cfg(test)]
