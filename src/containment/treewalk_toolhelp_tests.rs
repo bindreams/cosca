@@ -20,7 +20,8 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 /// return the error".
 #[test]
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
-    let walks: [(&str, fn(ProcessId) -> Result<(), Error>); 2] = [
+    type Walk = fn(ProcessId) -> Result<(), Error>;
+    let walks: [(&str, Walk); 2] = [
         ("hard_kill", |id| super::hard_kill(id)),
         ("kill_tree", |id| crate::Process::from_id(id).kill_tree()),
     ];

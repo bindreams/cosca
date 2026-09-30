@@ -49,15 +49,12 @@ async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root()
             .any(|(level, m)| *level == log::Level::Warn && m.contains("may be orphaned")),
         "{records:?}"
     );
-    // The root outlives nothing else here (its stdin is held), so its death is the kill's doing.
-    // Awaiting an exit that a mutant would never cause: the bound is the failure report.
-    let exited = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        crate::tokio::Process::from_id(id).wait(),
-    )
-    .await;
+    // Its stdin is held, so only the drop can end the root; the bound is the failure report.
+    let exited = crate::tokio::Process::from_id(id)
+        .wait_timeout(std::time::Duration::from_secs(30))
+        .await;
     assert!(
-        matches!(exited, Ok(Ok(()))),
+        matches!(exited, Ok(true)),
         "the root must be killed by the drop: {exited:?}"
     );
 }
