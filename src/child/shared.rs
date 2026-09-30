@@ -164,7 +164,7 @@ impl SharedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            Some(Target::pid(self.id.pid(), Some(self.start())))
+            Some(Target::pid(self.id.pid(), None))
         }
         #[cfg(windows)]
         {

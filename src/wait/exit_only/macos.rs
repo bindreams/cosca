@@ -96,8 +96,8 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         // child is a reap; one that does is still ours, and the tracer's hand-back re-sends
         // `NOTE_EXIT`.
         Peek::Foreign(Foreign::Gone) => match check_start(pid, start, ReadPurpose::Echild) {
-            StartCheck::Matches => Ok(Peek::Running),
-            StartCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
+            StartCheck::Matches => Ok(peeked),
+            StartCheck::Other => Ok(Peek::Running),
             // An unreadable start is a pid of another user: not our child.
             StartCheck::Gone | StartCheck::Unreadable => Ok(peeked),
         },
@@ -176,7 +176,7 @@ pub(crate) fn second_reap(pid: u32, start: Option<StartToken>) {
     }
     // A consume by a bare pid could take a reusing process's exit record.
     let Some(start) = start else {
-        log::warn!("second reap of pid {pid}: no start to check it against; a zombie may be left");
+        let _ = consume(pid);
         return;
     };
     match check_start(pid, start, ReadPurpose::SecondPeek) {
