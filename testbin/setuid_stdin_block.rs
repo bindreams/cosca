@@ -18,7 +18,9 @@
 //! | `d` | `setresuid(caller, caller, 0)` | `D` |
 //! | `r` | `setresuid(0, 0, 0)` | `R` |
 //! | `n` | `unshare(CLONE_NEWUSER)` | `N` |
-//! | `x` | `setresuid(caller + 1, caller + 1, caller + 1)`, which fails without `CAP_SETUID` | `X` |
+//!
+//! After `n` the process is in a new user namespace that maps no uid, so every credential command
+//! (`d`, `r`) fails with `EINVAL` and exits 3.
 
 use std::io::{Read, Write};
 use std::process::exit;
@@ -103,7 +105,6 @@ fn command(cmd: u8, caller: libc::uid_t) -> u8 {
                 Err(format!("unshare(CLONE_NEWUSER): {}", std::io::Error::last_os_error()))
             }
         }
-        b'x' => setres(caller + 1, caller + 1, caller + 1).map(|()| b'X'),
         other => Err(format!("unknown command {other:#x}")),
     };
     result.unwrap_or_else(|e| die(&e))

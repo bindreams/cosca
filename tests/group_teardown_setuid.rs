@@ -15,11 +15,10 @@
 //! Linux only. The original bug was reproduced (and is reproduced here) via `/proc`-based group
 //! membership and `kill(2)`'s real permission check (`kill_ok_by_cred`, `kernel/signal.c`),
 //! which requires the target's REAL uid — not merely its effective/saved uid — to differ from
-//! the caller's. macOS is deliberately excluded, not silently skipped there: SIP and the
-//! hardened-runtime/notarization requirements on modern macOS make a locally-built setuid-root
-//! binary unreliable to provision in CI (SIP can strip privileges from unsigned/ad-hoc-signed
-//! binaries depending on where they live and how they were built), and there is no equivalent to
-//! Linux's straightforward "chown root, chmod u+s, exec" contract to build an honest CI lane on.
+//! the caller's. This test is Linux-only. macOS is not excluded because a setuid-root helper cannot
+//! be provisioned there: the macOS root lane does provision a working one (job 109789120504: the
+//! lane check printed `setuid lane ok: the helper reached uid 0`). Porting this scenario to macOS
+//! is a separate scope decision.
 //! Windows has no setuid concept at all. `containment::unix::group::members` itself is only
 //! implemented for Linux and macOS (see that module), so this gap does not exist on Windows
 //! regardless.

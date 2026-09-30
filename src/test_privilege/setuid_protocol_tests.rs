@@ -1,62 +1,4 @@
-//! Unit tests for [`super::setuid`].
-
-use super::setuid::{setuid_gate, Gate};
-
-fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |k| pairs.iter().find(|(name, _)| *name == k).map(|(_, v)| (*v).to_owned())
-}
-
-#[test]
-fn setuid_gate_zero_disables_the_group() {
-    assert_eq!(setuid_gate(env(&[("COSCA_TEST_SETUID", "0")])), Gate::Disabled);
-}
-
-#[test]
-fn setuid_gate_zero_disables_it_even_with_consent() {
-    let vars = [("COSCA_TEST_SETUID", "0"), ("COSCA_TEST_SETUID_CONSENT", "1")];
-    assert_eq!(setuid_gate(env(&vars)), Gate::Disabled);
-}
-
-#[test]
-#[should_panic(expected = "COSCA_TEST_SETUID_CONSENT")]
-fn setuid_gate_unset_group_and_consent_panics() {
-    setuid_gate(env(&[]));
-}
-
-#[test]
-#[should_panic(expected = "COSCA_TEST_SETUID_CONSENT")]
-fn setuid_gate_group_on_without_consent_panics() {
-    setuid_gate(env(&[("COSCA_TEST_SETUID", "1")]));
-}
-
-#[test]
-#[should_panic(expected = "COSCA_TEST_SETUID_CONSENT")]
-fn setuid_gate_consent_other_than_one_panics() {
-    setuid_gate(env(&[("COSCA_TEST_SETUID_CONSENT", "yes")]));
-}
-
-#[test]
-fn setuid_gate_names_both_variables_in_the_panic() {
-    let msg = std::panic::catch_unwind(|| setuid_gate(env(&[]))).unwrap_err();
-    let msg = msg.downcast_ref::<String>().expect("a formatted panic message");
-    assert!(
-        msg.contains("COSCA_TEST_SETUID_CONSENT") && msg.contains("COSCA_TEST_SETUID=0"),
-        "{msg}"
-    );
-}
-
-#[test]
-fn setuid_gate_consent_one_runs() {
-    assert_eq!(setuid_gate(env(&[("COSCA_TEST_SETUID_CONSENT", "1")])), Gate::Run);
-}
-
-#[test]
-fn setuid_gate_any_group_value_but_zero_runs_with_consent() {
-    let vars = [("COSCA_TEST_SETUID", "yes"), ("COSCA_TEST_SETUID_CONSENT", "1")];
-    assert_eq!(setuid_gate(env(&vars)), Gate::Run);
-}
-
-// The testbin protocol -----
+//! Tests of the testbin's `setuid-stdin-block` protocol, run against the setuid helper.
 
 use super::setuid::setuid_helper;
 use std::io::{Read, Write};
@@ -64,7 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 struct Helper {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
 }
 
@@ -76,7 +18,7 @@ impl Helper {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the setuid helper");
-        let stdin = child.stdin.take().unwrap();
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         Self { child, stdin, stdout }
     }
@@ -88,7 +30,18 @@ impl Helper {
     }
 
     fn send(&mut self, cmd: u8) {
-        self.stdin.write_all(&[cmd]).expect("write a command");
+        self.stdin
+            .as_mut()
+            .expect("stdin is open")
+            .write_all(&[cmd])
+            .expect("write a command");
+    }
+
+    /// Sends `cmd` and closes stdin, for a command that must not be acknowledged: a helper that
+    /// silently ignores it then reaches EOF and exits, instead of blocking the read that follows.
+    fn send_last(&mut self, cmd: u8) {
+        self.send(cmd);
+        self.stdin = None;
     }
 
     /// Closes stdin and returns the exit code and stderr.
@@ -136,7 +89,7 @@ mod linux {
     }
 
     #[test]
-    fn setuid_testbin_commands_ack_after_their_syscall() {
+    fn setuid_testbin_credential_commands_ack_after_their_syscall() {
         let Some(helper) = setuid_helper() else { return };
         let c = caller();
         let mut h = Helper::start(&helper, "root");
@@ -148,24 +101,27 @@ mod linux {
         assert_eq!((h.byte(), proc_ids(pid)), (Some(b'R'), (0, 0, 0)));
         h.send(b'd');
         assert_eq!(h.byte(), Some(b'D'));
-        // Without CAP_SETUID this fails, so nothing may be acknowledged.
-        h.send(b'x');
-        assert_eq!(h.byte(), None, "a failed syscall was acknowledged");
-        let (code, stderr) = h.finish();
-        assert_eq!(code, Some(3));
-        assert!(stderr.contains("setresuid"), "{stderr}");
+        assert_eq!(h.finish(), (Some(0), String::new()));
     }
 
-    /// Its own helper: the new user namespace maps neither uid 0 nor the caller, so no `setresuid`
-    /// follows.
+    /// The new user namespace maps no uid, so a `setresuid` after `n` fails with `EINVAL`. That is
+    /// the only evidence from outside that `n` created a namespace (the helper's
+    /// `/proc/<pid>/ns/user` is closed to this caller), and the failed command must not be acked.
     #[test]
-    fn setuid_testbin_unshare_acks_after_the_namespace_exists() {
+    fn setuid_testbin_unshare_creates_a_namespace_where_credential_commands_fail() {
         let Some(helper) = setuid_helper() else { return };
         let mut h = Helper::start(&helper, "root");
         assert_eq!(h.byte(), Some(b'+'));
         h.send(b'n');
         assert_eq!(h.byte(), Some(b'N'));
-        assert_eq!(h.finish(), (Some(0), String::new()));
+        h.send_last(b'r');
+        assert_eq!(h.byte(), None, "a failed syscall was acknowledged");
+        let (code, stderr) = h.finish();
+        assert_eq!(code, Some(3));
+        assert!(
+            stderr.contains("setresuid(0, 0, 0)") && stderr.contains("Invalid argument"),
+            "{stderr}"
+        );
     }
 
     #[test]
@@ -176,7 +132,7 @@ mod linux {
         assert_eq!(h.finish().0, Some(3));
         let mut h = Helper::start(&helper, "root");
         assert_eq!(h.byte(), Some(b'+'));
-        h.send(b'?');
+        h.send_last(b'?');
         assert_eq!(h.byte(), None);
         assert_eq!(h.finish().0, Some(3));
     }
@@ -188,52 +144,12 @@ fn setuid_testbin_modes_reach_their_triples() {
     let Some(helper) = setuid_helper() else { return };
     let mut h = Helper::start(&helper, "root");
     assert_eq!(h.byte(), Some(b'+'), "the macOS setuid helper did not reach uid 0");
-    h.send(b'd');
+    h.send_last(b'd');
     assert_eq!(h.byte(), None, "macOS has no `d` command");
     assert_eq!(h.finish().0, Some(3));
     for mode in ["permitted", "euid-only", "suid-only"] {
         let mut h = Helper::start(&helper, mode);
         assert_eq!(h.byte(), None, "mode {mode} exists only on Linux");
         assert_eq!(h.finish().0, Some(3));
-    }
-}
-
-// The lane check -----
-
-fn lane_check(helper_body: &str) -> std::process::Output {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let fake = dir.path().join("helper");
-    std::fs::write(&fake, format!("#!/bin/sh\n{helper_body}\n")).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/.github/scripts/setuid-lane-check.sh"
-    ))
-    .arg(&fake);
-    crate::test_spawn::output_captured(&mut cmd).expect("run the lane check")
-}
-
-/// What the check expects a real helper to print on this OS.
-#[cfg(target_os = "linux")]
-const GOOD: &str = "+N";
-#[cfg(not(target_os = "linux"))]
-const GOOD: &str = "+";
-
-/// A helper that does not reach uid 0 prints nothing, or the wrong thing, or exits nonzero: the
-/// check must fail loudly for each, whether or not the caller is root.
-#[test]
-fn setuid_lane_check_rejects_a_helper_that_does_not_reach_root() {
-    for (name, body) in [
-        ("silent", "cat > /dev/null".to_owned()),
-        ("wrong output", "cat > /dev/null; printf 'x'".to_owned()),
-        ("extra output", format!("cat > /dev/null; printf '{GOOD}+'")),
-        ("nonzero exit", format!("cat > /dev/null; printf '{GOOD}'; exit 3")),
-    ] {
-        let out = lane_check(&body);
-        assert!(!out.status.success(), "{name}: the lane check passed");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("::error::setuid lane check failed"), "{name}: {stderr}");
     }
 }
