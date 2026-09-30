@@ -178,22 +178,24 @@ jobs:
       - name: Run tests (serde feature)
         run: cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
 
-      # nextest gives every test a process of its own, which hides any test that changes
-      # process-global state (fd 0/1/2, RLIMIT_NOFILE) under `cargo test`'s threads-in-one-process
-      # model. These tests re-execute themselves via `test_own_process` to stay correct in both, so
-      # this step keeps that property from regressing. Same env as the steps above.
+      # nextest runs each test in its own process, which hides tests that mutate process-global
+      # state (fd 0/1/2, RLIMIT_NOFILE). Plain `cargo test` shares one process, so this step guards
+      # the `test_own_process` isolation. Every invocation runs and the step fails at the end, so
+      # one failing configuration does not hide the other. `timeout-minutes` bounds a hang.
       - name: Run plain cargo test (Unix)
         if: matrix.os == 'linux' || matrix.os == 'darwin'
+        timeout-minutes: 12
         run: |
-          set -euxo pipefail
-          cargo test --locked --lib --target ${{ matrix.target }}
-          cargo test --locked --all-features --test spawn_io --test tokio_io --target ${{ matrix.target }}
+          set -uxo pipefail
+          status=0
+          cargo test --locked --no-fail-fast --lib --tests --target ${{ matrix.target }} || status=1
+          cargo test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} || status=1
+          exit "$status"
 
-      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16); this and
-      # the step above are the only ones in this job that use plain `cargo test`. cosca has no
-      # doctests today.
+      # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16), so they use
+      # plain `cargo test`. cosca has no doctests today.
       - name: Run doctests
-        run: cargo test --locked --doc --all-features --target ${{ matrix.target }}
+        run: cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
 
       - name: Check rustdoc
         shell: bash
@@ -311,15 +313,22 @@ jobs:
         run: |
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
-          sudo bash -euxc '
+          sudo -E bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
-            exec "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
+            status=0
+            "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture --run-ignored all -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
+            # Plain `cargo test` shares one process across tests, unlike nextest: the ignored cgroup
+            # `own_process` tests run under that model here. Root cargo keeps the runner toolchain
+            # via `sudo -E`; the target dir is handed back so later steps can write to it.
+            "$2" test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} -- --include-ignored cgroup || status=1
+            chown -R "$3" "$PWD/target"
+            exit "$status"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)"
 
       # Live setuid-root process-group teardown test (issue #61) is `#[ignore]`d by default
       # (see tests/group_teardown_setuid.rs's module docs) — an ordinary `cargo nextest run`
