@@ -136,6 +136,16 @@ fn consume(pid: u32) -> io::Result<Option<Record>> {
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     let (pid, unique) = pid_and_unique(target);
+    #[cfg(test)]
+    if std::env::var("ADV346_MUT").as_deref() == Ok("a") {
+        use std::os::unix::process::ExitStatusExt;
+        let mut st = 0;
+        // SAFETY: mutant a (throwaway): a waitpid(WNOHANG) reap.
+        let r = unsafe { libc::waitpid(pid as i32, &mut st, libc::WNOHANG) };
+        if r == pid as i32 {
+            return Ok(Reap::Reaped(super::Reaped::Status(std::process::ExitStatus::from_raw(st))));
+        }
+    }
     match peek(target)? {
         Peek::Exit(_) => {}
         Peek::Running => return Ok(Reap::Running),
@@ -158,6 +168,10 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         Err(e) if is_echild(&e) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) => return Err(e),
     };
+    #[cfg(test)]
+    if std::env::var("ADV346_MUT").as_deref() == Ok("b") {
+        return Ok(Reap::Reaped(first));
+    }
     second_reap(pid, second_unique);
     Ok(Reap::Reaped(first))
 }
@@ -204,6 +218,10 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
             return;
         }
         IdCheck::Unreadable(_) => {
+            #[cfg(test)]
+            if std::env::var("ADV346_MUT").as_deref() == Ok("c") {
+                panic!("mutant c: a refused identity read in the second reap");
+            }
             log::warn!("second reap of pid {pid}: its identity could not be read; a zombie may be left");
             return;
         }

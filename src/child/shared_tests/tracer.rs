@@ -183,6 +183,11 @@ mod macos {
                 panic!("the tracee exited before it stopped (si_code {code}, si_status {status})")
             }
         }
+        if std::env::var("ADV346_MUT").as_deref() == Ok("w") {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
     }
 
     /// End a child stopped by [`attach_and_confirm_stop`]: `PT_KILL` sets `SRUN`, then `SIGKILL`
@@ -198,7 +203,53 @@ mod macos {
                 0,
             )
         };
-        blocker.shared.kill().expect("kill");
+        if std::env::var("ADV346_MUT").as_deref() != Ok("d") {
+            blocker.shared.kill().expect("kill");
+        }
+    }
+
+    /// PROBE (throwaway): a traced, running child sent SIGKILL through its handle stops for the
+    /// tracer (CLD_TRAPPED, status 9) instead of dying; the kill lands on the next release.
+    #[test]
+    fn probe_sigkill_to_a_running_tracee_is_a_stop_for_the_tracer() {
+        if !crate::test_support::require_group("TRACER") {
+            return;
+        }
+        if !crate::test_child::is_marked_fixture_reexec(MARKER) {
+            return run_signed(crate::test_child::fixture_path!(
+                probe_sigkill_to_a_running_tracee_is_a_stop_for_the_tracer
+            ));
+        }
+        let _dog = watchdog("probe");
+        step("spawn yes");
+        let mut cmd = std::process::Command::new("/usr/bin/yes");
+        cmd.stdout(std::process::Stdio::null());
+        let child = crate::test_spawn::spawn(&mut cmd).expect("spawn yes");
+        let id = super::super::fixtures::identity_of(&child);
+        let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+        let pid = shared.id();
+        step("attach and settle");
+        attach_settled(pid).expect("attach_settled");
+        step("resume");
+        // SAFETY: plain ptrace request on our own tracee.
+        let rc = unsafe { libc::ptrace(libc::PT_CONTINUE, pid as i32, std::ptr::dangling_mut(), 0) };
+        assert_eq!(rc, 0, "PT_CONTINUE: {}", std::io::Error::last_os_error());
+        step("kill through the handle");
+        shared.kill().expect("kill");
+        step("waitid stop-or-exit");
+        // SAFETY: zeroed siginfo_t is valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(r, 0, "waitid: {}", std::io::Error::last_os_error());
+        _ = writeln!(std::io::stderr(), "PROBE: after SIGKILL si_code {} si_status {}", info.si_code, info.si_status);
+        assert_eq!((info.si_code, info.si_status), (libc::CLD_TRAPPED, libc::SIGKILL), "SIGKILL to a traced child");
+        step("settle, then PT_KILL");
+        crate::test_support::tracer::settle(pid).expect("settle");
+        // SAFETY: plain ptrace request on our own tracee.
+        let rc = unsafe { libc::ptrace(libc::PT_KILL, pid as i32, std::ptr::null_mut(), 0) };
+        assert_eq!(rc, 0, "PT_KILL: {}", std::io::Error::last_os_error());
+        step("wait");
+        assert_killed(shared.wait().expect("wait"));
     }
 
     fn assert_killed(status: std::process::ExitStatus) {

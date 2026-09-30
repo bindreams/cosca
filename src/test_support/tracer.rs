@@ -48,6 +48,11 @@ pub(crate) enum AttachError {
 /// or the tracee is gone; an exited tracee never stops, so without that exit this would spin.
 pub(crate) fn attach_settled(pid: u32) -> Result<(), AttachError> {
     sys::attach(pid).map_err(AttachError::Errno)?;
+    settle(pid)
+}
+
+/// PROBE (throwaway): wait until an existing stop settles.
+pub(crate) fn settle(pid: u32) -> Result<(), AttachError> {
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
         match sys::stop(pid).map_err(AttachError::Errno)? {
