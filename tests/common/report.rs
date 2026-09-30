@@ -26,6 +26,7 @@ thread_local! {
     static LAST_REPORTED: Cell<Option<u32>> = const { Cell::new(None) };
     static LAST_REPORTED_ID: Cell<Option<ProcessId>> = const { Cell::new(None) };
     static LAST_REPORTED_LIVENESS: Cell<Option<Liveness>> = const { Cell::new(None) };
+    static LAST_REPORTED_CONTAINED: Cell<Option<bool>> = const { Cell::new(None) };
     #[cfg(feature = "tokio")]
     static LAST_ASYNC_ROOT: Cell<Option<ProcessId>> = const { Cell::new(None) };
 }
@@ -60,6 +61,7 @@ fn record(pid: u32) {
     LAST_REPORTED.with(|c| c.set(Some(pid)));
     LAST_REPORTED_ID.with(|c| c.set(None));
     LAST_REPORTED_LIVENESS.with(|c| c.set(None));
+    LAST_REPORTED_CONTAINED.with(|c| c.set(None));
 }
 
 fn record_id(id: ProcessId) {
@@ -72,6 +74,50 @@ fn record_id(id: ProcessId) {
 /// for cannot have preceded the teardown it is testing.
 pub fn last_reported_grandchild_liveness() -> Option<Liveness> {
     LAST_REPORTED_LIVENESS.with(Cell::get)
+}
+
+/// Whether the most recently reported grandchild was, when identified and before any unwind, a
+/// structural member of its root's containment (see [`is_contained_member`]). `None` means the
+/// check did not run. A test that unwinds and then waits asserts `Some(true)`, so a containment
+/// that silently does nothing fails at once instead of hanging the wait.
+pub fn last_reported_grandchild_contained() -> Option<bool> {
+    LAST_REPORTED_CONTAINED.with(Cell::get)
+}
+
+/// Whether `grandchild` is inside the containment `containment` of the still-held `root`.
+/// `containment` is the root's own mechanism; `in_job` answers job membership (Windows only).
+/// Uncontained and nested (`Delegated`) roots own no tree, so they never contain it.
+fn is_contained_member(
+    containment: cosca::Containment,
+    root: u32,
+    grandchild: u32,
+    in_job: impl FnOnce(u32) -> bool,
+) -> bool {
+    use cosca::Containment as C;
+    // Each platform's arms use a different subset of the inputs.
+    let _ = (root, &in_job);
+    match containment {
+        C::None | C::Delegated => false,
+        #[cfg(windows)]
+        C::JobObject => in_job(grandchild),
+        #[cfg(target_os = "linux")]
+        C::CgroupV2 => {
+            let leaf = |pid: &str| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+            let (mine, roots, theirs) = (leaf("self"), leaf(&root.to_string()), leaf(&grandchild.to_string()));
+            theirs.is_some() && theirs == roots && theirs != mine
+        }
+        #[cfg(unix)]
+        C::ProcessGroup | C::Session => {
+            // SAFETY: `getpgid` only reads the target's group id.
+            unsafe { libc::getpgid(grandchild as libc::pid_t) == root as libc::pid_t }
+        }
+        #[cfg(unix)]
+        C::FdMarker | C::TreeWalk => cosca::Process::from_pid(grandchild)
+            .found()
+            .and_then(|p| p.parent())
+            .is_some_and(|parent| parent.id().pid() == root),
+        _ => false,
+    }
 }
 
 fn parse_pid(line: &str) -> u32 {
@@ -97,7 +143,7 @@ fn identify(pid: u32) -> ProcessId {
 
 /// Accepts the root's report connection, reads its pid line watching the root, captures the
 /// grandchild's identity and releases the root. See the module doc.
-pub fn report_grandchild(report: &TcpListener, root: &mut impl Target) -> ProcessId {
+pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> ProcessId {
     let root_pid = root.pid();
     let mut stream = accept_or_die(report, root);
     let mut line = Vec::new();
@@ -116,6 +162,13 @@ pub fn report_grandchild(report: &TcpListener, root: &mut impl Target) -> Proces
         line.extend_from_slice(&buf[..n]);
     }
     let id = identify(parse_pid(std::str::from_utf8(&line).expect("the report is UTF-8")));
+    let contained = is_contained_member(root.containment(), root_pid, id.pid(), |_pid| {
+        #[cfg(windows)]
+        return root.test_job_handle_contains(_pid);
+        #[cfg(not(windows))]
+        false
+    });
+    LAST_REPORTED_CONTAINED.with(|c| c.set(Some(contained)));
     release(stream);
     id
 }
@@ -153,6 +206,13 @@ pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &
         died_before_reporting(root_pid, "the grandchild pid");
     }
     let id = identify(parse_pid(&line));
+    let contained = is_contained_member(root.containment(), root_pid, id.pid(), |_pid| {
+        #[cfg(windows)]
+        return root.test_job_handle_contains(_pid);
+        #[cfg(not(windows))]
+        false
+    });
+    LAST_REPORTED_CONTAINED.with(|c| c.set(Some(contained)));
     stream
         .write_all(&[super::accept::ack::ACK_BYTE])
         .await

@@ -1136,6 +1136,11 @@ async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_conne
     let id = common::last_reported_grandchild_id()
         .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
     assert_eq!(
+        common::last_reported_grandchild_contained(),
+        Some(true),
+        "the grandchild must be inside the root's containment when identified, or the drop does not kill it"
+    );
+    assert_eq!(
         common::last_reported_grandchild_liveness(),
         Some(cosca::identity::Liveness::Alive),
         "the grandchild must be alive when identified, so its exit is the containment kill's"
