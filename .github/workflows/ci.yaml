@@ -336,10 +336,11 @@ jobs:
 
       # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
       # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become
-      # truly unsignalable by this job's ordinary unprivileged user: issue #61's fix against a REAL
-      # mixed process group. Only preparing the helper copy needs root; the tests run as the normal
-      # runner user, no sudo. The lane check fails the lane unless the helper really reaches uid 0
-      # and may create a user namespace; an unusable helper never becomes a silent skip.
+      # truly unsignalable by this job's ordinary unprivileged user, giving a REAL mixed process
+      # group. Only preparing the helper copy needs root; the tests run as the normal runner user,
+      # no sudo. The lane check fails the lane unless the helper really reaches uid 0 and may
+      # create a user namespace. The group is the tests named `setuid_*` and the
+      # `group_teardown_setuid` binary (see principle 10).
       - name: Set up setuid-root helper (Linux)
         if: matrix.os == 'linux'
         run: |

@@ -32,7 +32,6 @@ mod console_identity;
 #[path = "../tests/common/accept.rs"]
 mod accept;
 
-/// The `setuid-stdin-block` mode.
 #[cfg(unix)]
 #[path = "setuid_stdin_block.rs"]
 mod setuid_stdin_block;
@@ -603,46 +602,14 @@ fn main() {
             let tag = args.get(3).map(String::as_str).unwrap_or("?");
             let mut sock = crate::ack::connect_control(addr).unwrap();
 
-            // The setuid-root file bit must already have made us effective-root at exec
-            // time. If not, the copy is not actually setuid-root (wrong owner/mode) or the
-            // filesystem it lives on is mounted `nosuid` — report loudly, never silently
-            // proceed as an ordinary (killable) process, which would make the caller's
-            // later "still alive" assertion pass for the wrong reason.
-            // Safety: geteuid() has no preconditions.
-            let euid_before = unsafe { libc::geteuid() };
-            if euid_before != 0 {
-                sock.write_all(
-                    format!(
-                        "F effective uid is {euid_before}, not 0 at exec — the setuid-root bit \
-                         did not take effect (wrong owner/mode on COSCA_TEST_SETUID_HELPER's \
-                         target, or a nosuid mount)\n"
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-                sock.flush().unwrap();
-                exit(3);
-            }
-            // setuid(0): collapse the REAL uid to 0 too, not just the effective/saved uid the
-            // exec-time setuid bit already granted. This is what makes us unsignalable by the
-            // original unprivileged caller IN FACT: the kernel's own permission check
-            // (`kill_ok_by_cred`) treats a matching REAL uid as sufficient permission on its
-            // own, so without this call our real uid would still equal the caller's and this
-            // whole scenario would not reproduce the bug at all — see group.rs's module docs.
-            // Safety: setuid() has no preconditions; failure is reported below, not ignored.
-            let rc = unsafe { libc::setuid(0) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                sock.write_all(format!("F setuid(0) failed: {err}\n").as_bytes())
-                    .unwrap();
-                sock.flush().unwrap();
-                exit(3);
-            }
-            // Safety: getuid()/geteuid() have no preconditions.
-            let (ruid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
-            if ruid != 0 || euid != 0 {
-                sock.write_all(format!("F post-setuid(0) ids are ruid={ruid} euid={euid}, expected 0/0\n").as_bytes())
-                    .unwrap();
+            // The shared provisioning check: the setuid-root bit must already have made us
+            // effective-root at exec time (else the copy has the wrong owner/mode or sits on a
+            // `nosuid` mount), and we then collapse every uid to 0. That the REAL uid is 0 too is
+            // what makes us unsignalable by the original unprivileged caller IN FACT: the kernel's
+            // `kill_ok_by_cred` accepts a matching REAL uid on its own. A failure is reported over
+            // the socket, never as a silently killable "ready" process.
+            if let Err(reason) = setuid_stdin_block::provision("root") {
+                sock.write_all(format!("F {reason}\n").as_bytes()).unwrap();
                 sock.flush().unwrap();
                 exit(3);
             }

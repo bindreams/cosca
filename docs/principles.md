@@ -219,8 +219,12 @@ test rather than running it. The check may be a skuld fixture, but either way a 
 a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
 the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
 `COSCA_TEST_ROOT_CONSENT=1`. `COSCA_TEST_NAMESPACES` (tests that unshare mount and pid
-namespaces) has a consent variable too; some system-affecting groups have no
-`COSCA_TEST_<GROUP>` at all; see [#234].
+namespaces) has a consent variable too. So does `COSCA_TEST_SETUID` (tests that run a setuid-root
+copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the helper only in the
+Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there. Its
+members are the tests whose names start with `setuid_` and the `group_teardown_setuid` binary, the
+same name-prefix convention as `namespaces_`; a new member takes the gate and that prefix. Some
+system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle

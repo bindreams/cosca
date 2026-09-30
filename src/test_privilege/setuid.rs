@@ -6,8 +6,9 @@
 //! `COSCA_TEST_SETUID_HELPER` names a copy of `cosca_testbin` that is owned by root with the
 //! set-user-ID bit, on a filesystem not mounted `nosuid`.
 
+use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const GROUP: &str = "COSCA_TEST_SETUID";
 const CONSENT: &str = "COSCA_TEST_SETUID_CONSENT";
@@ -39,27 +40,55 @@ pub fn setuid_gate(var: impl Fn(&str) -> Option<String>) -> Gate {
 /// The helper's path, or `None` when the group is disabled.
 ///
 /// # Panics
-/// When the gate panics, when `COSCA_TEST_SETUID_HELPER` is unset, when the file is not owned by
-/// root with the set-user-ID bit, or when the caller is root (then nothing is unsignalable by it).
+/// When the gate panics, or as [`check_helper`] does.
 pub fn setuid_helper() -> Option<PathBuf> {
     if setuid_gate(|k| std::env::var(k).ok()) == Gate::Disabled {
         return None;
     }
-    let helper = std::env::var_os(HELPER).unwrap_or_else(|| {
+    // SAFETY: `geteuid` has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    Some(check_helper(std::env::var_os(HELPER), stat, euid))
+}
+
+/// What [`check_helper`] needs to know about the helper file.
+pub struct Meta {
+    pub uid: u32,
+    pub mode: u32,
+    pub is_file: bool,
+}
+
+/// [`Meta`] of `path`, following symlinks.
+pub fn stat(path: &Path) -> std::io::Result<Meta> {
+    let meta = std::fs::metadata(path)?;
+    Ok(Meta {
+        uid: meta.uid(),
+        mode: meta.mode(),
+        is_file: meta.is_file(),
+    })
+}
+
+/// The validated helper path.
+///
+/// # Panics
+/// When `helper` (`COSCA_TEST_SETUID_HELPER`) is unset, when `stat` fails, when the path is not a
+/// regular file, when the file is not owned by root with the set-user-ID bit, or when the caller
+/// (`euid`) is root, since then nothing is unsignalable by it.
+pub fn check_helper(helper: Option<OsString>, stat: impl FnOnce(&Path) -> std::io::Result<Meta>, euid: u32) -> PathBuf {
+    let helper = helper.unwrap_or_else(|| {
         panic!("{HELPER} is not set: point it at a root-owned, mode u+s copy of cosca_testbin (CI's \"Set up setuid-root helper\" step)")
     });
     let path = PathBuf::from(helper);
-    let meta = std::fs::metadata(&path).unwrap_or_else(|e| panic!("{HELPER}={path:?} is unreadable: {e}"));
+    let meta = stat(&path).unwrap_or_else(|e| panic!("{HELPER}={path:?} is unreadable: {e}"));
+    assert!(meta.is_file, "{HELPER}={path:?} is not a regular file");
     assert!(
-        meta.uid() == 0 && meta.mode() & 0o4000 != 0,
+        meta.uid == 0 && meta.mode & 0o4000 != 0,
         "{HELPER}={path:?} must be owned by root with the set-user-ID bit (owner uid {}, mode {:o}): chown root and chmod u+s it",
-        meta.uid(),
-        meta.mode() & 0o7777
+        meta.uid,
+        meta.mode & 0o7777
     );
-    // SAFETY: `geteuid` has no preconditions.
     assert!(
-        unsafe { libc::geteuid() } != 0,
+        euid != 0,
         "the caller is root, so the setuid helper is signalable by it and the group tests nothing: run as an unprivileged user"
     );
-    Some(path)
+    path
 }

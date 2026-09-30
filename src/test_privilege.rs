@@ -8,6 +8,9 @@ pub(crate) mod setuid;
 #[path = "test_privilege/setuid_gate_tests.rs"]
 mod setuid_gate_tests;
 #[cfg(test)]
+#[path = "test_privilege/setuid_helper_tests.rs"]
+mod setuid_helper_tests;
+#[cfg(test)]
 #[path = "test_privilege/setuid_lane_check_tests.rs"]
 mod setuid_lane_check_tests;
 #[cfg(test)]

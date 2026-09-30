@@ -88,20 +88,24 @@ mod linux {
         }
     }
 
+    /// From every mode the caller's and root's uid are still among the current ids, so `d` then
+    /// `r` succeed and are acknowledged only once the kernel shows the new triple.
     #[test]
-    fn setuid_testbin_credential_commands_ack_after_their_syscall() {
+    fn setuid_testbin_credential_commands_ack_after_their_syscall_in_every_mode() {
         let Some(helper) = setuid_helper() else { return };
         let c = caller();
-        let mut h = Helper::start(&helper, "root");
-        assert_eq!(h.byte(), Some(b'+'));
-        let pid = h.child.id();
-        h.send(b'd');
-        assert_eq!((h.byte(), proc_ids(pid)), (Some(b'D'), (c, c, 0)));
-        h.send(b'r');
-        assert_eq!((h.byte(), proc_ids(pid)), (Some(b'R'), (0, 0, 0)));
-        h.send(b'd');
-        assert_eq!(h.byte(), Some(b'D'));
-        assert_eq!(h.finish(), (Some(0), String::new()));
+        for mode in ["root", "permitted", "euid-only", "suid-only"] {
+            let mut h = Helper::start(&helper, mode);
+            assert_eq!(h.byte(), Some(b'+'), "mode {mode}");
+            let pid = h.child.id();
+            h.send(b'd');
+            assert_eq!((h.byte(), proc_ids(pid)), (Some(b'D'), (c, c, 0)), "mode {mode} d");
+            h.send(b'r');
+            assert_eq!((h.byte(), proc_ids(pid)), (Some(b'R'), (0, 0, 0)), "mode {mode} r");
+            h.send(b'd');
+            assert_eq!(h.byte(), Some(b'D'), "mode {mode} d again");
+            assert_eq!(h.finish(), (Some(0), String::new()), "mode {mode}");
+        }
     }
 
     /// The new user namespace maps no uid, so a `setresuid` after `n` fails with `EINVAL`. That is
@@ -129,12 +133,16 @@ mod linux {
         let Some(helper) = setuid_helper() else { return };
         let mut h = Helper::start(&helper, "bogus");
         assert_eq!(h.byte(), None);
-        assert_eq!(h.finish().0, Some(3));
+        let (code, stderr) = h.finish();
+        assert_eq!(code, Some(3));
+        assert!(stderr.contains("unknown mode \"bogus\""), "{stderr}");
         let mut h = Helper::start(&helper, "root");
         assert_eq!(h.byte(), Some(b'+'));
         h.send_last(b'?');
         assert_eq!(h.byte(), None);
-        assert_eq!(h.finish().0, Some(3));
+        let (code, stderr) = h.finish();
+        assert_eq!(code, Some(3));
+        assert!(stderr.contains("unknown command 0x3f"), "{stderr}");
     }
 }
 
@@ -146,10 +154,17 @@ fn setuid_testbin_modes_reach_their_triples() {
     assert_eq!(h.byte(), Some(b'+'), "the macOS setuid helper did not reach uid 0");
     h.send_last(b'd');
     assert_eq!(h.byte(), None, "macOS has no `d` command");
-    assert_eq!(h.finish().0, Some(3));
+    let (code, stderr) = h.finish();
+    assert_eq!(code, Some(3));
+    assert!(stderr.contains("command 0x64 exists only on Linux"), "{stderr}");
     for mode in ["permitted", "euid-only", "suid-only"] {
         let mut h = Helper::start(&helper, mode);
         assert_eq!(h.byte(), None, "mode {mode} exists only on Linux");
-        assert_eq!(h.finish().0, Some(3));
+        let (code, stderr) = h.finish();
+        assert_eq!(code, Some(3), "mode {mode}");
+        assert!(
+            stderr.contains(&format!("mode \"{mode}\" exists only on Linux")),
+            "{mode}: {stderr}"
+        );
     }
 }

@@ -1,99 +1,186 @@
-//! Tests of `.github/scripts/setuid-lane-check.sh` against fake helpers.
+//! Tests of `.github/scripts/setuid-lane-check.sh` against fake helpers. The script takes its uid
+//! and OS from `SETUID_LANE_CHECK_UID` and `SETUID_LANE_CHECK_OS`, so every case runs on every host
+//! and none depends on who the caller is.
 
-/// A helper body that behaves as a real one does on this OS.
-#[cfg(target_os = "linux")]
-const GOOD: &str = "cat > /dev/null; printf '+N'; echo 'setuid-stdin-block: setresuid(0, 0, 0): Invalid argument (os error 22)' >&2; exit 3";
-#[cfg(not(target_os = "linux"))]
-const GOOD: &str = "cat > /dev/null; printf '+'";
+use std::io::Write as _;
+use std::path::Path;
+use std::process::{Output, Stdio};
 
-/// The output a real helper prints on this OS.
-#[cfg(target_os = "linux")]
-const GOOD_OUT: &str = "+N";
-#[cfg(not(target_os = "linux"))]
-const GOOD_OUT: &str = "+";
+const LINUX: &str = "Linux";
+const DARWIN: &str = "Darwin";
 
-fn lane_check(helper_body: &str) -> std::process::Output {
+/// The real helper's stderr line when `r` follows `n` on Linux.
+const EINVAL_LINE: &str = "setuid-stdin-block: setresuid(0, 0, 0): Invalid argument (os error 22)";
+
+/// The invocation the script must make: `printf nr | helper setuid-stdin-block root` on Linux,
+/// `helper setuid-stdin-block root </dev/null` on macOS. A fake exits 99 on any other.
+fn prelude(os: &str) -> &'static str {
+    match os {
+        LINUX => r#"[ "$#" = 2 ] && [ "$1" = setuid-stdin-block ] && [ "$2" = root ] && [ "$(cat)" = nr ] || exit 99;"#,
+        _ => r#"[ "$#" = 2 ] && [ "$1" = setuid-stdin-block ] && [ "$2" = root ] && [ -z "$(cat)" ] || exit 99;"#,
+    }
+}
+
+/// A fake that behaves as a real helper does on `os`.
+fn good(os: &str) -> String {
+    match os {
+        LINUX => format!("{} printf '+N'; echo '{EINVAL_LINE}' >&2; exit 3", prelude(os)),
+        _ => format!("{} printf '+'", prelude(os)),
+    }
+}
+
+/// Writes an executable script. The write descriptor must be closed before anything execs the
+/// file, or `exec` fails with `ETXTBSY`; a fork that never execs, from another test thread, would
+/// inherit it, so no such fork may land inside the write.
+fn write_executable(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt as _;
+    let _guard = crate::child::spawn::spawn_lock();
+    assert!(
+        crate::test_spawn::held_by_this_thread(),
+        "the fake must be written under spawn_lock"
+    );
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn lane_check(os: &str, uid: &str, body: &str) -> Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = dir.path().join("helper");
-    std::fs::write(&fake, format!("#!/bin/sh\n{helper_body}\n")).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&fake, body);
     let mut cmd = std::process::Command::new("bash");
     cmd.arg(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/scripts/setuid-lane-check.sh"
     ))
-    .arg(&fake);
+    .arg(&fake)
+    .env("SETUID_LANE_CHECK_OS", os)
+    .env("SETUID_LANE_CHECK_UID", uid);
     crate::test_spawn::output_captured(&mut cmd).expect("run the lane check")
 }
 
-/// The script rejects a caller that is root, before it looks at the helper. Every case below
-/// names its own reason, so a root run fails here instead of passing vacuously.
-fn assert_unprivileged_caller() {
-    // SAFETY: `geteuid` has no preconditions.
-    assert_ne!(
-        unsafe { libc::geteuid() },
-        0,
-        "the lane check tests need an unprivileged caller: the script rejects uid 0 before it reads the helper"
+fn assert_rejected(name: &str, out: &Output, reason: &str) {
+    assert!(!out.status.success(), "{name}: the lane check passed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("::error::setuid lane check failed") && stderr.contains(reason),
+        "{name}: expected the reason {reason:?}, got: {stderr}"
     );
 }
 
 #[test]
 fn setuid_lane_check_accepts_a_helper_that_behaves_like_a_real_one() {
-    assert_unprivileged_caller();
-    let out = lane_check(GOOD);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("setuid lane ok"),
-        "{out:?}"
+    for os in [LINUX, DARWIN] {
+        let out = lane_check(os, "1000", &good(os));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{os}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("setuid lane ok"),
+            "{os}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn setuid_lane_check_rejects_a_root_caller_before_reading_the_helper() {
+    for os in [LINUX, DARWIN] {
+        let out = lane_check(os, "0", &good(os));
+        assert_rejected(os, &out, "the caller is uid 0");
+    }
+}
+
+#[test]
+fn setuid_lane_check_rejects_an_unsupported_os() {
+    assert_rejected(
+        "Plan9",
+        &lane_check("Plan9", "1000", &good(LINUX)),
+        "unsupported OS Plan9",
     );
 }
 
 /// A helper that does not reach uid 0 prints nothing, or the wrong thing, or exits wrongly: the
 /// check must fail for each, and say why.
 #[test]
-fn setuid_lane_check_rejects_a_helper_that_does_not_reach_root() {
-    assert_unprivileged_caller();
-    let mut cases = vec![
-        ("silent", "cat > /dev/null".to_owned(), "printed ''".to_owned()),
+fn setuid_lane_check_rejects_a_linux_helper_that_does_not_reach_root() {
+    let p = prelude(LINUX);
+    for (name, tail, reason) in [
+        ("silent", "".to_owned(), "printed ''"),
+        ("wrong output", "printf 'x'".to_owned(), "printed 'x'"),
+        ("extra output", "printf '+N+'".to_owned(), "printed '+N+'"),
+        ("no failure after unshare", "printf '+N'".to_owned(), "exited 0"),
         (
-            "wrong output",
-            "cat > /dev/null; printf 'x'".to_owned(),
-            "printed 'x'".to_owned(),
+            "exit 1 with the right stderr",
+            format!("printf '+N'; echo '{EINVAL_LINE}' >&2; exit 1"),
+            "exited 1",
         ),
         (
-            "extra output",
-            format!("cat > /dev/null; printf '{GOOD_OUT}+'"),
-            format!("printed '{GOOD_OUT}+'"),
-        ),
-    ];
-    #[cfg(target_os = "linux")]
-    cases.extend([
-        (
-            "no failure after unshare",
-            "cat > /dev/null; printf '+N'".to_owned(),
-            "exited 0".to_owned(),
+            "only the syscall named",
+            "printf '+N'; echo 'setresuid(0, 0, 0): boom' >&2; exit 3".to_owned(),
+            "does not name the failed setresuid",
         ),
         (
-            "failure without the EINVAL",
-            "cat > /dev/null; printf '+N'; echo boom >&2; exit 3".to_owned(),
-            "does not name the failed setresuid".to_owned(),
+            "only the errno named",
+            "printf '+N'; echo 'Invalid argument' >&2; exit 3".to_owned(),
+            "does not name the failed setresuid",
         ),
-    ]);
-    #[cfg(not(target_os = "linux"))]
-    cases.push((
-        "nonzero exit",
-        format!("cat > /dev/null; printf '{GOOD_OUT}'; exit 3"),
-        "exited nonzero".to_owned(),
-    ));
-    for (name, body, reason) in cases {
-        let out = lane_check(&body);
-        assert!(!out.status.success(), "{name}: the lane check passed");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("::error::setuid lane check failed") && stderr.contains(&reason),
-            "{name}: expected the reason {reason:?}, got: {stderr}"
+        (
+            "neither named",
+            "printf '+N'; echo boom >&2; exit 3".to_owned(),
+            "does not name the failed setresuid",
+        ),
+    ] {
+        assert_rejected(name, &lane_check(LINUX, "1000", &format!("{p} {tail}")), reason);
+    }
+}
+
+#[test]
+fn setuid_lane_check_rejects_a_macos_helper_that_does_not_reach_root() {
+    let p = prelude(DARWIN);
+    for (name, tail, reason) in [
+        ("silent", "", "printed ''"),
+        ("wrong output", "printf 'x'", "printed 'x'"),
+        ("extra output", "printf '++'", "printed '++'"),
+        ("exit 3", "printf '+'; exit 3", "exited nonzero (3)"),
+        ("exit 1", "printf '+'; exit 1", "exited nonzero (1)"),
+    ] {
+        assert_rejected(name, &lane_check(DARWIN, "1000", &format!("{p} {tail}")), reason);
+    }
+}
+
+/// The fakes above are only as strict as their prelude: it must exit 99 on any other invocation.
+#[test]
+fn setuid_lane_check_fake_rejects_any_other_invocation() {
+    fn run(os: &str, args: &[&str], stdin: &str) -> Option<i32> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("helper");
+        write_executable(&fake, &good(os));
+        let mut cmd = std::process::Command::new(&fake);
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the fake");
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        child.wait().expect("wait for the fake").code()
+    }
+    let real = ["setuid-stdin-block", "root"];
+    assert_eq!(run(LINUX, &real, "nr"), Some(3));
+    assert_eq!(run(DARWIN, &real, ""), Some(0));
+    for os in [LINUX, DARWIN] {
+        let stdin = if os == LINUX { "nr" } else { "" };
+        assert_eq!(
+            run(os, &["setuid-stdin-block", "permitted"], stdin),
+            Some(99),
+            "{os} mode"
+        );
+        assert_eq!(run(os, &["other", "root"], stdin), Some(99), "{os} subcommand");
+        assert_eq!(run(os, &["setuid-stdin-block"], stdin), Some(99), "{os} arity");
+        assert_eq!(
+            run(os, &["setuid-stdin-block", "root", "x"], stdin),
+            Some(99),
+            "{os} extra arg"
         );
     }
+    assert_eq!(run(LINUX, &real, "n"), Some(99), "linux stdin");
+    assert_eq!(run(LINUX, &real, ""), Some(99), "linux empty stdin");
+    assert_eq!(run(DARWIN, &real, "n"), Some(99), "darwin stdin");
 }

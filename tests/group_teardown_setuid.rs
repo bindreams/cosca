@@ -15,10 +15,7 @@
 //! Linux only. The original bug was reproduced (and is reproduced here) via `/proc`-based group
 //! membership and `kill(2)`'s real permission check (`kill_ok_by_cred`, `kernel/signal.c`),
 //! which requires the target's REAL uid — not merely its effective/saved uid — to differ from
-//! the caller's. This test is Linux-only. macOS is not excluded because a setuid-root helper cannot
-//! be provisioned there: the macOS root lane does provision a working one (job 109789120504: the
-//! lane check printed `setuid lane ok: the helper reached uid 0`). Porting this scenario to macOS
-//! is a separate scope decision.
+//! the caller's. The scenario rests on `/proc` and Linux `kill` semantics.
 //! Windows has no setuid concept at all. `containment::unix::group::members` itself is only
 //! implemented for Linux and macOS (see that module), so this gap does not exist on Windows
 //! regardless.
@@ -34,14 +31,11 @@
 //! step exercises this path.
 //!
 //! # Gating
-//! The `COSCA_TEST_SETUID` group of `docs/principles.md`, through `common::setuid`: on unless
-//! `COSCA_TEST_SETUID=0`, and an enabled run fails unless `COSCA_TEST_SETUID_CONSENT=1`.
-//! `COSCA_TEST_SETUID_HELPER` must hold the absolute path to a pre-provisioned COPY of
-//! `cosca_testbin` that CI has `chown root:root` + `chmod u+s`'d (see the "Set up setuid-root
-//! helper" step); an unset or unusable helper fails loudly. The spawned helper
-//! (`setuid-control-block` in `testbin/main.rs`) checks that it really reached real uid 0 and
-//! reports it over the control socket used for the readiness handshake, so a nosuid mount or a
-//! wrong owner/mode surfaces as a loud panic here, not a false green.
+//! The `COSCA_TEST_SETUID` group, through `common::setuid` (its docs give the rule and what
+//! `COSCA_TEST_SETUID_HELPER` must be). The spawned helper (`setuid-control-block` in
+//! `testbin/main.rs`) runs the shared provisioning check of `setuid-stdin-block` and reports a
+//! failure over the control socket used for the readiness handshake, so a nosuid mount or a wrong
+//! owner/mode surfaces as a loud panic here, not a false green.
 
 // The whole file is Linux-only in purpose (see the module docs above) — gated here, once, rather
 // than on every item, so the file compiles to nothing (no unused-code warnings) elsewhere.
@@ -229,10 +223,6 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
             .and_then(|()| out.flush())
             .expect("announce the re-run");
     }
-    assert!(
-        std::path::Path::new(helper).is_file(),
-        "COSCA_TEST_SETUID_HELPER={helper:?} does not point at an existing file"
-    );
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let addr = listener.local_addr().unwrap().to_string();
