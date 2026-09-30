@@ -31,12 +31,21 @@
 //!
 //! # A child under a debugger
 //!
-//! On Linux and macOS a debugger that traces a [`Child`] owns its signal delivery: the kernel
-//! hands the debugger every signal but `SIGKILL` first, and the debugger decides whether the
-//! child gets it. So [`Child::kill`] always ends a traced child, while a graceful signal, such as
-//! the one [`Child::terminate_tree`] sends, is the debugger's to deliver. [`Child::wait`] returns
-//! once the debugger lets go: after it detaches and the child exits, or after the child dies and
-//! the debugger collects the exit, which hands it back.
+//! A debugger that traces a [`Child`] owns its signal delivery: a graceful signal, such as the
+//! one [`Child::terminate_tree`] sends, reaches the child only if the debugger passes it on.
+//! [`Child::kill`] differs by OS:
+//!
+//! - On Linux the kernel delivers `SIGKILL` past the debugger ([ptrace(2)]: "An exception is
+//!   SIGKILL, which has its usual effect"), so the child dies at once.
+//! - On macOS the debugger gets `SIGKILL` first too, as a stop, but cannot cancel it: the child
+//!   dies once the debugger resumes it, detaches or exits. A debugger that keeps the child
+//!   stopped delays the kill until then.
+//!
+//! [`Child::wait`] returns the child's exit once the debugger lets go of it: when it detaches, when
+//! it collects the exit, which hands the child back, or when it exits itself, which kills the
+//! child on macOS and detaches it on Linux.
+//!
+//! [ptrace(2)]: https://man7.org/linux/man-pages/man2/ptrace.2.html
 
 // `SpawnLockGuard` is `#[must_use]`, but only this lint keeps `let _ = spawn_lock();` (a lock released
 // at once) flagged, as rustc's `let_underscore_lock` did when the guard was a `MutexGuard`. Discard a
