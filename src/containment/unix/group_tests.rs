@@ -530,6 +530,9 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
             text.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
             "{errno}: {text}"
         );
+        if matches!(errno, libc::EXDEV | libc::ELOOP) {
+            assert!(text.contains("beyond a mount"), "{errno}: {text}");
+        }
         let pid = text.split("/stat").next().unwrap().rsplit(' ').next().unwrap();
         assert!(
             pid.parse::<u32>().is_ok(),

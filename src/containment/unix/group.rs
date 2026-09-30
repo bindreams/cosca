@@ -194,9 +194,15 @@ pub(crate) fn members(pgid: i32) -> std::io::Result<Vec<Member>> {
                         )));
                     }
                 },
-                // EXDEV/ELOOP: the checked directory refused to cross a mount, so the record is not
-                // the kernel's. EMFILE, ENOMEM, EIO, ... say nothing about the pid; excluding it
-                // could clear a live group.
+                // The checked directory refused to cross a mount, so the record is not the kernel's.
+                Some(libc::EXDEV | libc::ELOOP) => {
+                    return Err(std::io::Error::other(format!(
+                        "containment::unix::group::members: {pid}/stat lies beyond a mount in /proc and was not \
+                         read: {e}"
+                    )));
+                }
+                // EMFILE, ENOMEM, EIO, ... say nothing about the pid; excluding it could clear a
+                // live group.
                 _ => {
                     return Err(std::io::Error::other(format!(
                         "containment::unix::group::members: {pid}/stat could not be read, so process group {pgid} \
