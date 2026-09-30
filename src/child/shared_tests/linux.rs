@@ -17,6 +17,28 @@ fn far() -> Instant {
 
 // S11: a zombie only its tracer sees =====
 
+/// A blocking `waitid` that finds no record is a contract breach, not a ptrace stop: it asserts in
+/// a debug build and is an error in a release build, never a `Running` the holder loops on.
+///
+/// Mutant: `Ok(None)` folded into the non-exit arm, which answers `Running`.
+#[test]
+fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let target = b.shared.target().expect("a pidfd");
+    let forced = exit_seams::force_visible_none_once();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::wait::exit_only::wait_visible_exit(&target)
+    }));
+    drop(forced);
+    if cfg!(debug_assertions) {
+        assert!(outcome.is_err(), "a debug build asserts the contract");
+    } else {
+        let err = outcome.expect("release returns").expect_err("a breach is an error");
+        assert!(err.to_string().contains("no record"), "{err}");
+    }
+}
+
 /// S11: an unbounded holder whose reap finds nothing after a real exit blocks in
 /// `waitid(WNOWAIT)` rather than re-polling: the pidfd stays readable, so a re-poll would spin at
 /// 100% CPU until the tracer lets go.
@@ -101,7 +123,8 @@ fn a_holder_in_its_blocking_waitid_holds_no_lock() {
 /// Principle 13 for the `poll` wait: every armed timeout is at most the time remaining, and an
 /// expired wait takes one final peek and starts no further round.
 ///
-/// Mutant: an unbounded poll under a deadline (its `debug_assert!` fires); no final peek.
+/// Mutant: an unbounded poll under a deadline (its `debug_assert!` fires); no final peek; every
+/// round armed with 1ns.
 #[test]
 fn a_deadline_poll_arms_the_remaining_time_and_peeks_once_at_expiry() {
     let b = Blocker::spawn();
@@ -125,6 +148,11 @@ fn a_deadline_poll_arms_the_remaining_time_and_peeks_once_at_expiry() {
     let armed = crate::wait::block_probe::take();
     assert!(!armed.is_empty(), "the wait must have blocked at least once");
     let mut previous = Duration::from_millis(50);
+    assert_eq!(
+        armed[0],
+        Some(previous),
+        "the first round must be armed with the whole remaining time"
+    );
     for a in armed {
         let a = a.expect("a deadline wait arms a bounded timeout");
         assert!(a <= previous, "armed {a:?} with only {previous:?} remaining");

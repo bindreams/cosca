@@ -3,12 +3,11 @@
 
 use std::io;
 use std::process::ExitStatus;
-use std::sync::{MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::holder::HolderGuard;
 use super::unlocked::Unlocked;
-use super::{echild, status_of, Inner, SharedChild, State};
+use super::{echild, status_of, Guard, SharedChild, State};
 use crate::wait::exit_only::{self, Reap};
 
 impl SharedChild {
@@ -50,11 +49,11 @@ impl SharedChild {
 
     /// One `Condvar` block, under the lock: `remaining` is clamped, and the caller decides expiry
     /// from the clock after the wake.
-    fn block<'a>(&'a self, lock: MutexGuard<'a, Inner>, remaining: Option<Duration>) -> MutexGuard<'a, Inner> {
+    fn block<'a>(&'a self, lock: Guard<'a>, remaining: Option<Duration>) -> Guard<'a> {
         #[cfg(test)]
-        super::seams::before_condvar_block();
+        super::seams::before_condvar_block(remaining);
         let Some(remaining) = remaining else {
-            return self.condvar.wait(lock).unwrap_or_else(PoisonError::into_inner);
+            return self.cv_wait(lock);
         };
         let armed = crate::wait::clamp_block(remaining);
         debug_assert!(armed <= remaining, "a block was armed longer than the time remaining");
@@ -62,17 +61,14 @@ impl SharedChild {
         crate::wait::block_probe::record(Some(armed));
         #[cfg(test)]
         let started = Instant::now();
-        let (lock, _) = self
-            .condvar
-            .wait_timeout(lock, armed)
-            .unwrap_or_else(PoisonError::into_inner);
+        let lock = self.cv_wait_timeout(lock, armed);
         #[cfg(test)]
         crate::wait::test_clock::advance_by_elapsed_if_frozen(started.elapsed());
         lock
     }
 
     /// Become the holder: write `W`, wait unlocked, then settle the result under the lock.
-    fn hold<'a>(&'a self, lock: MutexGuard<'a, Inner>, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
+    fn hold<'a>(&'a self, lock: Guard<'a>, deadline: Option<Instant>) -> io::Result<Option<ExitStatus>> {
         let mut holder = HolderGuard::arm(self, lock);
         holder.unlock();
         let mut waited = self.unlocked_wait(deadline);

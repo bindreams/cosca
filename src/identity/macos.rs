@@ -69,53 +69,243 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
     StartToken::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
 }
 
-/// Which `exit_only` read a `pbi_start_quiet` call is, so a test can inject a result into one
-/// read without touching the others, and a `warn` can name the read.
+/// Which identity read a [`uniq_info`] or [`held_by`] call is, so a test can inject a result into
+/// one read without touching the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadPurpose {
-    /// A start-checked peek's, just before its consume.
+    /// The child's identity, read at spawn.
+    Adopt,
+    /// The re-read just before a signal.
+    Kill,
+    /// A peek that found an exit record, just before its consume.
     Peek,
-    /// The own-zombie start read before the first reap, for the second peek.
+    /// A peek that found the child running.
+    Running,
+    /// A peek that got `ECHILD`: does the pid still name our child, and who holds it?
+    Echild,
+    /// The own-zombie read before the first reap, for the second peek.
     PreReap,
     /// The second peek's.
     SecondPeek,
 }
 
-/// `pid`'s start time through `proc_pidinfo(PROC_PIDTBSDINFO)` with `arg = 1`, which sees
-/// zombies and never waits on `P_LINTRANSIT` (a `sysctl(KERN_PROC_PID)` read sleeps while the
-/// pid's `exec` is in transit, which a hung NFS or FUSE mount can stretch without bound). Every
-/// failure is a value, never [`contract_violation`]: `Gone` for `ESRCH`, `Unknown` for the rest,
-/// with a `warn` naming `purpose` for those.
-pub(crate) fn pbi_start_quiet(pid: RawPid, purpose: ReadPurpose) -> Resolved<StartToken> {
-    #[cfg(test)]
-    if let Some(forced) = quiet_fault::take(purpose) {
-        return forced;
-    }
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer and size match.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            1,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
+/// The pid launchd runs as, the parent of every orphan.
+pub(crate) const LAUNCHD: RawPid = 1;
+
+/// `PROC_PIDUNIQIDENTIFIERINFO`, `proc_info_private.h`. Private, and read unprivileged: the kernel
+/// answers it for any user's process (`NO_CHECK_SAME_USER`, `proc_info.c`).
+const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+
+// `libc::PROC_PIDT_SHORTBSDINFO` is also `NO_CHECK_SAME_USER`, unlike `PROC_PIDTBSDINFO`, which is
+// refused for any process whose effective uid is not ours.
+
+/// `struct proc_uniqidentifierinfo` (`proc_info_private.h`, 56 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_idversion: i32,
+    p_orig_ppidversion: i32,
+    p_reserve2: u64,
+    p_reserve3: u64,
+}
+const _: () = assert!(std::mem::size_of::<ProcUniqIdentifierInfo>() == 56);
+
+/// What `proc_pidinfo(pid, 17, ...)` says of a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UniqInfo {
+    /// The process's 64-bit id, never reused and kept across `exec`.
+    pub(crate) unique_id: u64,
+}
+
+/// The outcome of a `proc_pidinfo` read by pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UniqRead {
+    Found(UniqInfo),
+    /// `ESRCH`. With `arg = 1` a process is resolved from `P_REF_DEAD` until its reap
+    /// (`proc_pidinfo` falls back to `proc_find_zombref`, which accepts `P_REF_DEAD`: xnu-12377
+    /// `proc_info.c:2198-2215`, `kern_proc.c:814-817` and `:1131`), so this means reaped.
+    Gone,
+    /// Any other errno (`EPERM` from a MACF denial, ...): the read failed.
+    Refused(i32),
+}
+
+/// Runs `proc_pidinfo(pid, flavor, arg = 1, ...)` into `buf`. `arg = 1` sees zombies. It never
+/// waits on `P_LINTRANSIT` (xnu-12377.121.6 and xnu-10063.101.15: `proc_info.c` has no
+/// `proc_transwait`; `proc_find` waits only for the brief `P_REF_WILL_EXEC | P_REF_IN_EXEC` switch
+/// after exec's point of no return, as `kill(2)` does). `n <= 0` is classified by errno.
+fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadErr> {
+    let size = std::mem::size_of::<T>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes up to `size` bytes into `buf`; pointer and size match.
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, flavor, 1, buf as *mut T as *mut libc::c_void, size) };
     if n == size {
-        return Resolved::Found(token_of_bsd(&info));
+        return Ok(());
     }
     if n <= 0 {
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ESRCH) {
-            return Resolved::Gone;
-        }
-        log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read failed: {e}");
-        return Resolved::Unknown;
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        return Err(if errno == libc::ESRCH {
+            ReadErr::Gone
+        } else {
+            ReadErr::Refused(errno)
+        });
     }
-    log::warn!("proc_pidinfo({pid}) for the {purpose:?} start read wrote {n} bytes, expected {size}");
-    Resolved::Unknown
+    log::warn!("proc_pidinfo({pid}, {flavor}) wrote {n} bytes, expected {size}");
+    Err(ReadErr::Refused(libc::EIO))
+}
+
+/// `pid`'s unique id through `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)`. Unprivileged for any
+/// user's process, and it sees zombies.
+pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
+    #[cfg(test)]
+    if let Some(forced) = uniq_fault::take(purpose) {
+        return forced;
+    }
+    #[cfg(not(test))]
+    let _ = purpose;
+    // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
+    let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    match pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, &mut info) {
+        Ok(()) => UniqRead::Found(UniqInfo {
+            unique_id: info.p_uniqueid,
+        }),
+        Err(ReadErr::Gone) => UniqRead::Gone,
+        Err(ReadErr::Refused(errno)) => UniqRead::Refused(errno),
+    }
+}
+
+/// What [`held_by`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The process still has the expected unique id, and this parent pid.
+    Parent(u32),
+    /// The pid names another process now.
+    Other,
+    /// Reaped.
+    Gone,
+    /// A read failed with this errno.
+    Refused(i32),
+}
+
+/// The parent pid of the process whose unique id is `expected`. The parent is read through
+/// `PROC_PIDT_SHORTBSDINFO`, between two unique-id reads: the same id before and after proves the
+/// parent read was of that process, because a unique id is never reused.
+pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held {
+    let same = |read: UniqRead| match read {
+        UniqRead::Found(info) if info.unique_id == expected => Ok(()),
+        UniqRead::Found(_) => Err(Held::Other),
+        UniqRead::Gone => Err(Held::Gone),
+        UniqRead::Refused(errno) => Err(Held::Refused(errno)),
+    };
+    if let Err(held) = same(uniq_info(pid, purpose)) {
+        return held;
+    }
+    let ppid = short_ppid(pid);
+    if let Err(held) = same(uniq_info(pid, purpose)) {
+        return held;
+    }
+    match ppid {
+        Ok(ppid) => Held::Parent(ppid),
+        // The id matched before and after this read, so the process was in the pid hash at both
+        // ends and cannot have been reaped in between. Flavors 13 and 17 share one lookup
+        // (`proc_find`, then `proc_find_zombref`, `proc_info.c:2199-2215`) and one
+        // `NO_CHECK_SAME_USER` policy (`:2230-2236`), so xnu cannot answer `ESRCH` here.
+        Err(ReadErr::Gone) => {
+            debug_assert!(
+                false,
+                "pid {pid}: its parent read said ESRCH between two matching id reads"
+            );
+            Held::Gone
+        }
+        Err(ReadErr::Refused(errno)) => Held::Refused(errno),
+    }
+}
+
+/// Why a `proc_pidinfo` read by pid failed: `ESRCH`, or any other errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadErr {
+    Gone,
+    Refused(i32),
+}
+
+fn short_ppid(pid: RawPid) -> Result<u32, ReadErr> {
+    #[cfg(test)]
+    if let Some(forced) = ppid_fault::take() {
+        return forced;
+    }
+    // SAFETY: all-zero is a valid `ProcBsdShortInfo`.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info.pbsi_ppid)
+}
+
+/// Forces [`uniq_info`] of a purpose below the syscall.
+#[cfg(test)]
+pub(crate) mod uniq_fault {
+    use std::cell::RefCell;
+
+    use super::{ReadPurpose, UniqRead};
+
+    thread_local! {
+        static FORCED: RefCell<Vec<(ReadPurpose, UniqRead)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
+    pub(crate) struct Forced(());
+
+    /// The next `uniq_info` for `purpose` on this thread answers `read`. Forces queue.
+    pub(crate) fn force_uniq_read_once(purpose: ReadPurpose, read: UniqRead) -> Forced {
+        FORCED.with(|f| f.borrow_mut().push((purpose, read)));
+        Forced(())
+    }
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.borrow_mut().clear());
+        }
+    }
+
+    pub(super) fn take(purpose: ReadPurpose) -> Option<UniqRead> {
+        FORCED.with(|f| {
+            let mut forced = f.borrow_mut();
+            let at = forced.iter().position(|(p, _)| *p == purpose)?;
+            Some(forced.remove(at).1)
+        })
+    }
+}
+
+/// Forces the parent read of [`held_by`] below the syscall.
+#[cfg(test)]
+pub(crate) mod ppid_fault {
+    use std::cell::RefCell;
+
+    use super::ReadErr;
+
+    thread_local! {
+        static FORCED: RefCell<Vec<Result<u32, ReadErr>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
+    pub(crate) struct Forced(());
+
+    /// The next parent read on this thread answers `read`. Forces queue.
+    pub(crate) fn force_ppid_once(read: Result<u32, ReadErr>) -> Forced {
+        FORCED.with(|f| f.borrow_mut().push(read));
+        Forced(())
+    }
+
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.borrow_mut().clear());
+        }
+    }
+
+    pub(super) fn take() -> Option<Result<u32, ReadErr>> {
+        FORCED.with(|f| {
+            let mut forced = f.borrow_mut();
+            (!forced.is_empty()).then(|| forced.remove(0))
+        })
+    }
 }
 
 pub(super) fn start_token(pid: RawPid) -> Resolved<StartToken> {
@@ -357,44 +547,3 @@ pub(crate) mod fault {
 #[cfg(test)]
 #[path = "macos/ppid_tests.rs"]
 mod ppid_tests;
-
-/// Forces one [`pbi_start_quiet`] purpose to a chosen result, below the syscall.
-#[cfg(test)]
-pub(crate) mod quiet_fault {
-    use std::cell::RefCell;
-
-    use super::{ReadPurpose, Resolved, StartToken};
-
-    thread_local! {
-        static FORCED: RefCell<Option<(ReadPurpose, Resolved<StartToken>)>> = const { RefCell::new(None) };
-    }
-
-    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
-
-    /// The next `pbi_start_quiet` for `purpose` on this thread answers `result`. Other purposes
-    /// are untouched.
-    pub(crate) fn force_quiet_read_error_once(purpose: ReadPurpose, result: Resolved<StartToken>) -> Forced {
-        FORCED.with(|f| *f.borrow_mut() = Some((purpose, result)));
-        Forced(())
-    }
-
-    impl Drop for Forced {
-        fn drop(&mut self) {
-            FORCED.with(|f| *f.borrow_mut() = None);
-        }
-    }
-
-    pub(super) fn take(purpose: ReadPurpose) -> Option<Resolved<StartToken>> {
-        FORCED.with(|f| {
-            let mut slot = f.borrow_mut();
-            match *slot {
-                Some((p, r)) if p == purpose => {
-                    *slot = None;
-                    Some(r)
-                }
-                _ => None,
-            }
-        })
-    }
-}
