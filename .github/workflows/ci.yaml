@@ -25,6 +25,8 @@ env:
   COSCA_TEST_NAMESPACES: "0"
   # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
   COSCA_TEST_SETUID: "0"
+  # The cgroup drop tests need a delegated cgroup: only the cgroup step below runs them.
+  COSCA_TEST_CGROUP_DROP: "0"
 
 jobs:
   lint:
@@ -321,6 +323,8 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             export COSCA_TEST_CGROUP=1
+            # The workflow turns COSCA_TEST_CGROUP_DROP off; this lane is where those tests run.
+            export COSCA_TEST_CGROUP_DROP=1 COSCA_TEST_CGROUP_DROP_CONSENT=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0

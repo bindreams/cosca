@@ -129,6 +129,56 @@ impl Attachment {
     }
 }
 
+/// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DropView {
+    pub(crate) root_pid: u32,
+    /// The root has been reaped, so its number may name another process.
+    pub(crate) root_reaped: bool,
+    /// This handle already killed the tree completely.
+    pub(crate) tree_killed: bool,
+}
+
+#[cfg(unix)]
+impl DropView {
+    /// Read the state both `Child` drops decide on. `own_reap` is the handle's own knowledge
+    /// that it reaped the root; the root's number is read for the rest.
+    pub(crate) fn read(id: crate::identity::ProcessId, own_reap: bool, tree_killed: &TreeKilled) -> DropView {
+        let root_pid = id.pid();
+        let now = crate::child::root_identity_now(root_pid);
+        if !own_reap && now.is_unknown() {
+            log::debug!(
+                "Child::drop: the root's number ({root_pid}) could not be read; treating the root as not reaped"
+            );
+        }
+        DropView {
+            root_pid,
+            root_reaped: crate::child::root_reaped(own_reap, id, now),
+            tree_killed: tree_killed.is_set(),
+        }
+    }
+}
+
+/// Whether a `Child` handle has already killed its tree completely (`kill_tree`, the sweep of
+/// `graceful_shutdown_tree`, a failed elevated spawn's cleanup). A later drop that skips a
+/// number-named kill then has nothing left behind to warn about.
+#[derive(Debug, Default)]
+pub(crate) struct TreeKilled(std::sync::atomic::AtomicBool);
+
+impl TreeKilled {
+    /// Record a complete kill: `Ok`, and for a `TreeWalk` no unresolved member. A kill that failed
+    /// or left members behind must not be marked, so a later drop still warns about them.
+    pub(crate) fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the Unix drop decision"))]
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Owns the OS containment resource for a spawned child; `hard_kill`/`terminate`
 /// act on the tree, `disarm` neutralizes teardown for `detach()`. `None` =
 /// uncontained (lone-process semantics).
@@ -180,7 +230,23 @@ impl Attached {
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
-        match self {
+        self.hard_kill_report().0
+    }
+
+    /// [`hard_kill`](Self::hard_kill), and record in `killed` that the tree is gone when the kill
+    /// was complete: `Ok`, and for a `TreeWalk` also a walk with no unresolved member. A kill
+    /// that failed or left members behind marks nothing.
+    pub(crate) fn hard_kill_marking(&self, killed: &TreeKilled) -> Result<(), crate::error::Error> {
+        let (result, complete) = self.hard_kill_report();
+        if result.is_ok() && complete {
+            killed.mark();
+        }
+        result
+    }
+
+    /// The kill's result, and whether it was complete. Only a `TreeWalk`'s `Ok` can be incomplete.
+    fn hard_kill_report(&self) -> (Result<(), crate::error::Error>, bool) {
+        let result = match self {
             Attached::None | Attached::Delegated => Ok(()),
             #[cfg(unix)]
             Attached::ProcessGroup(pgid) => crate::containment::unix::kill_group(*pgid),
@@ -190,8 +256,15 @@ impl Attached {
             Attached::JobObject(job) => job.hard_kill().map_err(Error::Io),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill(),
-            Attached::TreeWalk(root) => crate::containment::treewalk::hard_kill(*root),
-        }
+            Attached::TreeWalk(root) => {
+                return match crate::containment::treewalk::hard_kill(*root) {
+                    Ok(complete) => (Ok(()), complete),
+                    Err(e) => (Err(e), false),
+                };
+            }
+        };
+        let complete = result.is_ok();
+        (result, complete)
     }
 
     /// Whether `result`, from [`hard_kill`](Self::hard_kill), is a `TreeWalk` refusal to walk: the
@@ -288,6 +361,70 @@ impl Attached {
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.has_pgid(),
             _ => false,
+        }
+    }
+
+    /// What [`hard_kill`](Self::hard_kill) would do to the tree by the root's own number, phrased
+    /// as actions for a log line; `None` if it would do nothing of the kind. A cgroup and a Job
+    /// Object name the tree through a kernel object, so a reaped root changes nothing for them.
+    ///
+    /// A process group is the root's number. A `TreeWalk` walks ppid edges from it, and on Unix
+    /// that names no descendant of the reaped root: reparenting cleared those edges, so the only
+    /// processes with that ppid belong to whoever reused the number. A macOS fd marker does both.
+    #[cfg(unix)]
+    fn named_by_root_number(&self, root_pid: u32) -> Option<String> {
+        match self {
+            Attached::ProcessGroup(pgid) => Some(format!("kill its process group (pgid {pgid})")),
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => {
+                // A group only if the mode made one, and a walk only if the root's identity was
+                // read at attach: a root that had already exited has none.
+                let actions: Vec<String> = [
+                    m.pgid().map(|pgid| format!("kill its process group (pgid {pgid})")),
+                    m.has_root()
+                        .then(|| format!("walk the process table from the root's pid (root pid {root_pid})")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                (!actions.is_empty()).then(|| actions.join(" or "))
+            }
+            Attached::TreeWalk(_) => Some(format!(
+                "walk the process table from the root's pid (root pid {root_pid})"
+            )),
+            _ => None,
+        }
+    }
+
+    /// [`hard_kill`](Self::hard_kill) for a drop. Once the root is reaped nothing pins its number, so no channel that names the tree by that number may run: not the
+    /// `killpg`, not a ppid walk from the root's pid, not a kill of the root by that pid. Each
+    /// could hit an unrelated process that reused the number. A macOS fd marker still sweeps its
+    /// marker holders, which are named by identity. Cgroup and Job Object never skip.
+    ///
+    /// A skip logs a `warn` naming what it skipped and the remedy (`kill_tree()` before the reap),
+    /// or a `debug` when this handle already killed the tree completely (`view.tree_killed`).
+    #[cfg(unix)]
+    pub(crate) fn hard_kill_for_drop(&self, view: DropView) -> Result<(), crate::error::Error> {
+        let Some(skipped) = self.named_by_root_number(view.root_pid).filter(|_| view.root_reaped) else {
+            return self.hard_kill();
+        };
+        if view.tree_killed {
+            log::debug!(
+                "Child::drop: the root is already reaped and this handle already killed the tree, \
+                 so this drop does not {skipped}"
+            );
+        } else {
+            log::warn!(
+                "Child::drop: the root is already reaped, so this drop does not {skipped}, \
+                 whose number may now belong to an unrelated process. Descendants that outlived \
+                 the reaped root are not torn down by this drop; call kill_tree() before wait() \
+                 to end them (https://github.com/bindreams/cosca/issues/382)"
+            );
+        }
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.hard_kill_holders_only(),
+            _ => Ok(()),
         }
     }
 

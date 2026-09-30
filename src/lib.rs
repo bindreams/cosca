@@ -119,7 +119,7 @@ mod test_own_process_tests;
 mod test_stdio;
 #[cfg(all(test, unix))]
 mod test_stdio_tests;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod test_support;
 
 #[cfg(test)]
