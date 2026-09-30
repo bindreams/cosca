@@ -77,10 +77,12 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::io::Write as _;
     use std::time::Duration;
 
     use super::super::fixtures::Blocker;
     use crate::identity::{quiet_fault, ReadPurpose, Resolved};
+    use crate::test_support::tracer::{attach_settled, resume};
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
 
@@ -142,7 +144,9 @@ mod macos {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                eprintln!(
+                // Not `eprintln!`: libtest captures that, and the abort would lose it.
+                _ = writeln!(
+                    std::io::stderr(),
                     "WATCHDOG: {name} still running after {BOUND:?}; last step: {}",
                     step_name()
                 );
@@ -155,7 +159,7 @@ mod macos {
     static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
 
     pub(super) fn step(name: &'static str) {
-        eprintln!("step: {name}");
+        _ = writeln!(std::io::stderr(), "step: {name}");
         *STEP.lock().unwrap_or_else(|e| e.into_inner()) = name;
     }
 
@@ -163,52 +167,24 @@ mod macos {
         *STEP.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Attach to `blocker`'s child with `PT_ATTACHEXC` and wait, without consuming it, until its
-    /// stop is visible. `waitid` cannot block here: under `PT_ATTACHEXC` the stop raises a Mach
-    /// exception with no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks
-    /// with a capped backoff.
+    /// Attach to `blocker`'s child and wait, without consuming it, until its stop has settled: a
+    /// `PT_CONTINUE` before the tracee's threads have parked wakes nothing, and the tracee never
+    /// runs again ([`attach_settled`]).
     fn attach_and_confirm_stop(blocker: &Blocker) {
-        step("attach");
+        step("attach and settle");
         let pid = blocker.shared.id();
-        // SAFETY: a plain ptrace request on this test's own child.
-        let r = unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid as libc::pid_t, std::ptr::null_mut(), 0) };
-        assert_eq!(r, 0, "PT_ATTACHEXC: {}", std::io::Error::last_os_error());
-        step("confirm the stop");
-        let mut interval = Duration::from_millis(1);
-        loop {
-            // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let r = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            assert_eq!(r, 0, "waitid: {}", std::io::Error::last_os_error());
-            if info.si_pid != 0 {
-                return;
-            }
-            std::thread::sleep(interval);
-            interval = (interval * 2).min(Duration::from_millis(50));
+        if let Err(e) = attach_settled(pid) {
+            panic!("attach: {}", std::io::Error::from_raw_os_error(e));
         }
     }
 
     fn continue_tracee(blocker: &Blocker) {
-        // SAFETY: as above; `1` resumes from where the tracee stopped.
-        let r = unsafe {
-            libc::ptrace(
-                libc::PT_CONTINUE,
-                blocker.shared.id() as libc::pid_t,
-                std::ptr::dangling_mut::<libc::c_char>(),
-                0,
-            )
-        };
-        assert_eq!(r, 0, "PT_CONTINUE: {}", std::io::Error::last_os_error());
+        if let Err(e) = resume(blocker.shared.id()) {
+            panic!("PT_CONTINUE: {}", std::io::Error::from_raw_os_error(e));
+        }
     }
 
-    /// `try_wait` on a child stopped under this process's own `PT_ATTACHEXC` returns `None` and
+    /// `try_wait` on a child stopped under this process's own `PT_ATTACH` returns `None` and
     /// leaves the state `N`.
     ///
     /// Mutant: a `waitpid(WNOHANG)` reap returns the stop as a status and writes `E`.

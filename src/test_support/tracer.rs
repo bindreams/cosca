@@ -29,6 +29,31 @@ use std::io::Write as _;
 mod machine;
 mod sys;
 
+/// Attach this process to its own child `pid` and return once the stop has settled, so the caller
+/// can `PT_CONTINUE` it ([`sys::stop`] says why the settling matters). Unlike [`start`]'s helper,
+/// the caller is the tracee's parent and the tracer. Returns the errno of the failing request.
+///
+/// The stop raises no wakeup of a waiting parent (`kern_sig.c:2723-2733`), so this re-checks under
+/// a capped backoff; a deterministic condition, not a bet on time.
+pub(crate) fn attach_settled(pid: u32) -> Result<(), i32> {
+    sys::attach(pid)?;
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match sys::stop(pid)? {
+            sys::Stop::Stopped(_) => return Ok(()),
+            sys::Stop::Running | sys::Stop::Settling => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// `PT_CONTINUE` delivering no signal to a tracee [`attach_settled`] returned for.
+pub(crate) fn resume(pid: u32) -> Result<(), i32> {
+    sys::resume(pid)
+}
+
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
 /// What the helper does once the traced tracee exits.
