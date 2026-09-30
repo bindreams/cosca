@@ -23,7 +23,9 @@
 //! passed on later drops it, since it would have continued the stopped tracee. Every other
 //! signal is delivered at once with `PT_CONTINUE` (`S2s`, `S3s`, `S4s`). A `SIGSTOP` in S2 or S4
 //! is taken for the one the attach or S4 sent, which `PT_CONTINUE` or `PT_DETACH` discards; a
-//! client's own `SIGSTOP` there is indistinguishable from it.
+//! client's own `SIGSTOP` there is indistinguishable from it. Posting `SIGCONT` clears a pending
+//! stop signal (xnu `kern_sig.c`, `psignal_internal`), so after passing a `SIGCONT` on in S2 or
+//! S4 the helper re-sends the `SIGSTOP` it waits for (`S2c`, `S4c`).
 //!
 //! | State | Event or result | Next | Report |
 //! |---|---|---|---|
@@ -43,10 +45,11 @@
 //! | S2 Release | a `SIGSTOP` (the attach's) holds the tracee: `PT_CONTINUE` succeeds | S3 | `attached` |
 //! | S2 | the tracee stopped by another stop signal | keep it, release the tracee; S2k, then S2b | |
 //! | S2 | the tracee stopped by any other signal | pass it on; S2s, then S2b | |
+//! | S2 | the signal passed on is `SIGCONT` | re-send `SIGSTOP`; S2s, S2c, then S2b | |
 //! | S2 | the tracee not stopped yet or its stop settling, or `PT_CONTINUE` fails with `EBUSY` | S2b | |
 //! | S2b Backoff | timeout | retry S2's stop check | |
 //! | S2b | `NOTE_EXIT`, signal byte or EOF | done: nothing may happen before `attached` | `error` |
-//! | S2 | the stop peek, the release or `PT_CONTINUE` fails otherwise | done | `error` |
+//! | S2 | the stop peek, the release, `PT_CONTINUE` or the re-send fails otherwise | done | `error` |
 //! | S3 Traced | `SIGCHLD`, the tracee stopped by a stop signal | keep it, release the tracee; S3k, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee stopped by any other signal | pass it on; S3s, then S3 | |
 //! | S3 | `SIGCHLD`, the tracee not stopped | S3 | |
@@ -65,8 +68,9 @@
 //! | S4 | re-sending the kept stop signal fails | done | `error` |
 //! | S4 | the tracee stopped by another stop signal | keep it, release the tracee; S4k, then S4b | |
 //! | S4 | the tracee stopped by any other signal | pass it on; S4s, then S4b | |
+//! | S4 | the signal passed on is `SIGCONT` | re-send `SIGSTOP`; S4s, S4c, then S4b | |
 //! | S4 | the tracee not stopped yet or its stop settling, or `PT_DETACH` fails with `EBUSY` | S4b | |
-//! | S4 | `SIGSTOP`, the release or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
+//! | S4 | `SIGSTOP`, the release, the re-send or `PT_DETACH` fails with `ESRCH` (the tracee is exiting) | S6, or S5 if `NOTE_EXIT` was seen | |
 //! | S4 | the stop peek fails, or any other error | done | `error` |
 //! | S4b Backoff | `NOTE_EXIT` | S5 | |
 //! | S4b | timeout, signal byte (ignored) or EOF | back to S4's stop check | |
@@ -196,7 +200,8 @@ struct Forces(Vec<(String, String)>);
 /// `SIGNAL`, `EOF`, joined by `+` for one batch) in place of a `kevent`. `S1hstop`, `S2stop`,
 /// `S3stop` and `S4stop` replace the stop peek's answer (a signal name, `none`, `settling`, or an
 /// errno); `S2cont`, `S3cont` and `S4cont` replace the release's or
-/// pass-through's result, and `S4r` the re-send's. `S4sigstop` takes `0` to skip S4's `SIGSTOP`,
+/// pass-through's result, `S4r` the kept signal's re-send's, and `S2c` and `S4c` the `SIGSTOP`
+/// re-send's after a `SIGCONT`. `S4sigstop` takes `0` to skip S4's `SIGSTOP`,
 /// `1` to send it, or an errno for its result; by default it is sent only when `S4`'s result is
 /// not forced, because a real stop would leave a tracee the test needs to end by EOF stopped.
 /// `seed:NOTE_EXIT` marks `NOTE_EXIT` as seen from the start, for S4's "else S5" branch that no
@@ -212,6 +217,7 @@ const FORCE_TAGS: &[&str] = &[
     "S2b",
     "S2stop",
     "S2cont",
+    "S2c",
     "S3",
     "S3stop",
     "S3cont",
@@ -221,6 +227,7 @@ const FORCE_TAGS: &[&str] = &[
     "S4stop",
     "S4cont",
     "S4sigstop",
+    "S4c",
     "S4r",
     "S5",
     "S6",
@@ -267,6 +274,7 @@ impl Forces {
             "settling" => Ok(Stop::Settling),
             "SIGTERM" => Ok(Stop::Stopped(libc::SIGTERM)),
             "SIGTSTP" => Ok(Stop::Stopped(libc::SIGTSTP)),
+            "SIGCONT" => Ok(Stop::Stopped(libc::SIGCONT)),
             name => Err(errno_named(name)),
         })
     }
@@ -613,11 +621,27 @@ impl Machine<'_> {
             Err(e) => Check::PeekFailed(e),
             Ok(Stop::Stopped(libc::SIGSTOP)) => Check::Result(act(self.pid)),
             Ok(Stop::Stopped(signal)) => match self.pass_on(tag, signal)? {
+                Ok(()) if signal == libc::SIGCONT => Check::Result(self.restop(tag)?),
                 Ok(()) => Check::Result(Err(libc::EBUSY)),
                 Err(e) => Check::Result(Err(e)),
             },
             Ok(Stop::Running | Stop::Settling) => Check::Result(Err(libc::EBUSY)),
         })
+    }
+
+    /// Re-sends the `SIGSTOP` that S2 or S4 waits for, which the `SIGCONT` just passed on
+    /// cleared (`<tag>c`). `Err(EBUSY)` once sent, so the check backs off.
+    fn restop(&mut self, tag: &str) -> Result<Result<(), i32>, Gone> {
+        let tag = format!("{tag}c");
+        let sent = self
+            .forces
+            .result(&tag)
+            .unwrap_or_else(|| sys::kill(self.pid, libc::SIGSTOP));
+        if let Err(e) = sent {
+            return Ok(Err(e));
+        }
+        self.enter(&tag)?;
+        Ok(Err(libc::EBUSY))
     }
 
     /// Releases the tracee from a stop by `signal`: keeps a stop signal and releases the tracee

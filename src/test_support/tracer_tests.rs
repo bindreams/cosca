@@ -545,6 +545,39 @@ fn s2_keeps_a_stop_signal_until_after_the_detach() {
     end_stopped(tracee);
 }
 
+/// XNU clears a pending stop signal when it posts `SIGCONT` (`kern_sig.c`, `psignal_internal`),
+/// so the pass-through cancels the test's `SIGSTOP`, pending on the held tracee in place of the
+/// attach's. The peek is injected. Mutant: S2 does not re-send `SIGSTOP` after passing a
+/// `SIGCONT` on, and waits forever for a stop that never comes.
+#[test]
+fn s2_restops_after_passing_a_sigcont_through() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "S1:hold,S2stop:SIGCONT").attach(&mut tracee);
+    expect(&mut th, &HELD);
+    send(pid, libc::SIGSTOP);
+    th.signal();
+    expect(
+        &mut th,
+        &["S2", "S2s", "S2c", "S2b", "S2b*", "attached", "S3", "blocking S3 eof"],
+    );
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    drop(th);
+    assert_exited_cleanly(tracee);
+}
+
+/// Mutant: S2 ignores a failed `SIGSTOP` re-send.
+#[test]
+fn s2_a_failed_restop_fails() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGCONT,S2c:EPERM");
+    expect(&mut th, &["S2", "S2s", &err(libc::EPERM, "S2"), DONE]);
+    drop(th);
+    drop(stdin);
+    assert_sigkilled(tracee);
+}
+
 fn s2_fails(force: &str) {
     let Some((mut tracee, stdin)) = tracee() else { return };
     let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
@@ -1234,6 +1267,55 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
     end_stopped(tracee);
+}
+
+/// The attach's stop is kept (`S2:ok`), so S4's real `SIGSTOP` is pending when the injected peek
+/// passes a `SIGCONT` on, whose real post clears it (`kern_sig.c`, `psignal_internal`). Mutant:
+/// S4 does not re-send `SIGSTOP` after passing a `SIGCONT` on, and backs off forever.
+#[test]
+fn s4_restops_after_passing_a_sigcont_through() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let force = "S1:hold,S2:ok,S3:SIGNAL,S4sigstop:1,S4stop:SIGCONT";
+    let mut th = from_held(&mut tracee, force);
+    expect(
+        &mut th,
+        &[
+            "S2", "attached", "S3", "S4", "S4s", "S4c", "S4b", "S4b*", "detached", DONE,
+        ],
+    );
+    drop(th);
+    end_detached(tracee, stdin);
+}
+
+/// Mutant: S4 ignores a failed `SIGSTOP` re-send.
+#[test]
+fn s4_a_failed_restop_fails() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let force = "S1:hold,S2:ok,S3:SIGNAL,S4sigstop:0,S4stop:SIGCONT,S4c:EPERM";
+    let mut th = from_held(&mut tracee, force);
+    expect(
+        &mut th,
+        &["S2", "attached", "S3", "S4", "S4s", &err(libc::EPERM, "S4"), DONE],
+    );
+    drop(th);
+    drop(stdin);
+    assert_sigkilled(tracee);
+}
+
+/// Mutant: S4 fails when the re-send meets an exiting tracee.
+#[test]
+fn s4_a_restop_on_an_exiting_tracee_goes_to_exiting() {
+    let Some((mut tracee, stdin)) = tracee() else { return };
+    let force = "S1:hold,S2:ok,S3:SIGNAL,S4sigstop:0,S4stop:SIGCONT,S4c:ESRCH";
+    let mut th = from_held(&mut tracee, force);
+    expect(
+        &mut th,
+        &["S2", "attached", "S3", "S4", "S4s", "S6", "blocking S6 exit"],
+    );
+    drop(stdin);
+    expect(&mut th, &REAPED);
+    drop(th);
+    assert_exited_cleanly(tracee);
 }
 
 /// Mutant: S4 ignores a failed re-send.
