@@ -1717,3 +1717,81 @@ fn done_ignores_a_signal_byte_and_holds() {
     drop(th);
     assert_exited_cleanly(tracee);
 }
+
+// PROBE (throwaway, adv-377b) ===================================================================
+
+/// Every report, `Blocking` included, up to a terminal one.
+fn probe_reports(th: &mut TracerHelper<'_>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        let report = th.session.next_report().unwrap_or_else(|| panic!("helper exited after {seen:?}"));
+        let report = label(report);
+        let end = report == "reaped" || report == "detached" || report.starts_with("error");
+        seen.push(report);
+        if end {
+            return seen;
+        }
+    }
+}
+
+/// SIGKILL to a traced, running tracee: does XNU hand it to the tracer as a traced stop (S3s)?
+#[test]
+fn probe_sigkill_to_a_running_traced_tracee() {
+    let Some((mut tracee, _stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
+    expect(&mut th, &TO_S3);
+    send(pid, libc::SIGKILL);
+    let seen = probe_reports(&mut th);
+    eprintln!("PROBE-RUNNING reports after SIGKILL: {seen:?}");
+    drop(th);
+    let status = tracee.wait().expect("wait");
+    eprintln!("PROBE-RUNNING status: {status:?}");
+    assert!(
+        seen.iter().any(|r| r == "S3s"),
+        "SIGKILL did not reach the tracer as a traced stop: {seen:?}"
+    );
+}
+
+/// SIGKILL to a held (traced-stopped, settled) tracee: is it still SSTOP once kill(2) returns,
+/// and does the helper's release still find it stopped (`attached`)?
+#[test]
+fn probe_sigkill_to_a_held_tracee() {
+    let Some((mut tracee, _stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
+    expect(&mut th, &HELD);
+    send(pid, libc::SIGKILL);
+    let after = sys::pbi_status(pid);
+    eprintln!("PROBE-HELD pbi_status right after SIGKILL: {after:?} (SSTOP={})", libc::SSTOP);
+    th.signal();
+    let seen = probe_reports(&mut th);
+    eprintln!("PROBE-HELD reports after the release byte: {seen:?}");
+    drop(th);
+    let status = tracee.wait().expect("wait");
+    eprintln!("PROBE-HELD status: {status:?}");
+    assert_eq!(after, Ok(libc::SSTOP), "SIGKILL set the held tracee running");
+    assert!(seen.iter().any(|r| r == "attached"), "the release did not find it stopped: {seen:?}");
+}
+
+/// Untraced `BlockSigtstp` tracee (only its reading thread blocks SIGTSTP): does it still stop?
+#[test]
+fn probe_block_sigtstp_still_receives_sigtstp() {
+    if !crate::test_support::require_group("TRACER") {
+        return;
+    }
+    let (mut tracee, ready) = super::spawn_tracee(Tracee::BlockSigtstp);
+    let stdin = tracee.stdin().expect("stdin");
+    let pid = tracee.id().pid();
+    eprintln!("PROBE-BLOCK reading-thread mask {:#x}", ready.blocked);
+    send(pid, libc::SIGTSTP);
+    drop(stdin);
+    let info = await_change(pid);
+    eprintln!("PROBE-BLOCK after SIGTSTP: si_code {} si_status {}", info.si_code, info.si_status);
+    if info.si_code == libc::CLD_STOPPED {
+        end_stopped(tracee);
+    } else {
+        assert_exited_cleanly(tracee);
+    }
+    assert_eq!((info.si_code, info.si_status), (libc::CLD_STOPPED, libc::SIGTSTP));
+}
