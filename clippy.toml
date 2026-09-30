@@ -1,3 +1,7 @@
+# Every ban below guards against accidental calls, not deliberate ones: a function declared locally
+# in an `extern` block (e.g. `chdir`, ntdll's `RtlSetCurrentDirectory_U`) is at no listed path, so
+# clippy cannot see it; review covers it.
+#
 # Flag-less pipe constructors -----
 #
 # The pipe(2)/pipe2 wrappers in this crate's dependency graph that take no flags argument, so their
