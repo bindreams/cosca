@@ -33,9 +33,7 @@ runs:
 
     - name: Enable sccache for cargo
       shell: bash
-      run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      run: bash "${{ github.action_path }}/enable-sccache.sh"
 
     - name: Log toolchain versions
       shell: bash
