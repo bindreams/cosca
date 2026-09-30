@@ -21,6 +21,9 @@ env:
   NEXTEST_VERSION: "0.9.137"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`.
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/)"
+  # Also gated on `COSCA_TEST_ROOT`, but they switch to real unprivileged uids, so only lanes
+  # that are real root with `setuid` (not `unshare -r`, not uid 1000) add them.
+  UID_SWITCH_TESTS: "binary(process_root)"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
   # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
@@ -504,6 +507,7 @@ jobs:
         include:
           - lane: root
             docker_flags: ""
+            uid_switch: "true"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x2"
@@ -519,6 +523,7 @@ jobs:
             expect_userns: "1"
           - lane: root, DAC_READ_SEARCH
             docker_flags: "--cap-add DAC_READ_SEARCH"
+            uid_switch: "true"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x6"
@@ -526,6 +531,7 @@ jobs:
             expect_capamb: "0x0"
           - lane: root, foreign TMPDIR
             docker_flags: ""
+            uid_switch: "true"
             prefix: ""
             expect_uid: "0"
             expect_capeff_has: "0x2"
@@ -567,6 +573,8 @@ jobs:
             -e COSCA_TEST_ROOT=1 \
             -e COSCA_TEST_ROOT_CONSENT=1 \
             -e PRIVILEGE_TESTS \
+            -e UID_SWITCH_TESTS \
+            -e UID_SWITCH="${{ matrix.uid_switch }}" \
             -e FOREIGN_TMPDIR="${{ matrix.foreign_tmpdir }}" \
             -e PREFIX="${{ matrix.prefix }}" \
             -e EXPECT_UID="${{ matrix.expect_uid }}" \
@@ -660,7 +668,7 @@ jobs:
           exec sudo -E bash -euxc '
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
-            exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS"
+            exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS | $UID_SWITCH_TESTS"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
 
       - name: Print the process table

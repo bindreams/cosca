@@ -59,19 +59,18 @@ fn foreign_kill_surfaces_permission_denied(#[fixture(consent_root)] _consent: &(
     // lock like every raw fork in this suite (see `common::output_locked`). `control-echo-pid`,
     // not `control-block`: the survival check below needs a target that stays responsive, not
     // merely present, to prove the denied kill didn't land.
-    let target = {
-        let _guard = cosca::test_spawn_lock();
+    let target = common::spawn_locked(
         std::process::Command::new(&target_bin)
             .args(["control-echo-pid", &addr, "R"])
+            .env(common::ACK_ENV, "1") // `accept_or_die` acks; the target reads it before sending its tag
             .uid(common::TARGET_UID)
-            .gid(common::TARGET_UID)
-            .spawn()
-            .expect("spawn the target under an unprivileged uid")
-    };
-    let target = KillOnDrop::new(target);
+            .gid(common::TARGET_UID),
+    )
+    .expect("spawn the target under an unprivileged uid");
+    let mut target = KillOnDrop::new(target);
     let target_pid = target.id();
 
-    let mut sock = common::accept_or_die(&listener, target_pid);
+    let mut sock = common::accept_or_die(&listener, &mut target);
     let (tag, reported_pid) = common::read_tag_and_pid(&mut sock);
     assert_eq!(tag, b'R', "unexpected control tag from the target");
     assert_eq!(

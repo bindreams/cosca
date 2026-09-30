@@ -4,7 +4,6 @@
 //! section" pile — see its own history for why.
 
 use std::ffi::OsStr;
-use std::net::{TcpListener, TcpStream};
 
 // Conditional-test groups =========================================================================
 //
@@ -269,6 +268,19 @@ impl KillOnDrop {
 }
 
 #[cfg(unix)]
+impl super::Target for KillOnDrop {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn has_exited(&mut self) -> bool {
+        self.try_wait()
+            .expect("try_wait the control target before watching it")
+            .is_some()
+    }
+}
+
+#[cfg(unix)]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let Some(mut child) = self.0.take() else { return };
@@ -300,169 +312,4 @@ pub fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> st
     std::fs::copy(src, &dest).expect("copy into the scratch directory");
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod the copy world-executable");
     dest
-}
-
-/// Blocks until either `listener` gets an incoming connection, or the target process
-/// (`target_pid`) exits first — via the OS's own process-exit notification (a `pidfd` on Linux, a
-/// `kqueue`'s `EVFILT_PROC`/`NOTE_EXIT` on macOS), never a pipe. A pipe's EOF is hidden by any
-/// descendant still holding its write end open, and a plain blocking `accept()` would hang forever
-/// if the target dies first.
-///
-/// No thread, no reconnect: a background thread that RECONNECTED to `listener`'s own address on
-/// death was measured to be unsound — the OS can reissue that port to an unrelated later listener.
-///
-/// The exit notification is a PROMPT to check again, not proof: a target that connects and then
-/// exits immediately races its own exit signal against the connection already in the backlog. Once
-/// it fires, a final NON-BLOCKING `accept()` ([`final_peek_or_die`]) is the authority.
-///
-/// **KNOWN, TEMPORARY duplicate** of `common::accept_or_die` in bindreams/cosca#232 (Unix arms
-/// only, copied from 523466d2). #204 forks from a base that predates #232, so it cannot import
-/// that one. Once #232 is on `main` and this branch rebases past it, delete this copy and
-/// `final_peek_or_die` and use the canonical helper.
-#[cfg(target_os = "linux")]
-pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    use std::os::fd::AsRawFd;
-
-    let raw = rustix::process::Pid::from_raw(target_pid as i32).expect("a spawned child's pid is never 0");
-    let pidfd = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
-        Ok(fd) => fd,
-        // Already gone: the exit-first race arriving before the watch could be armed.
-        Err(rustix::io::Errno::SRCH) => return final_peek_or_die(listener, target_pid),
-        Err(e) => panic!(
-            "pidfd_open({target_pid}) for the death-watch: {}",
-            std::io::Error::from(e)
-        ),
-    };
-
-    let mut fds = [
-        libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("poll while waiting for a control connection: {e}");
-        }
-        // POLLNVAL would mean this function handed poll() a bad fd, a contract it owns end to end.
-        debug_assert_eq!(
-            fds[0].revents & libc::POLLNVAL,
-            0,
-            "the control listener's fd went invalid mid-wait"
-        );
-        debug_assert_eq!(fds[1].revents & libc::POLLNVAL, 0, "the pidfd went invalid mid-wait");
-        // An error on the LISTENER is a real, externally-caused condition: surfaced in every build.
-        if fds[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-            panic!(
-                "the control listener reported an error while waiting for a connection (revents={:#x})",
-                fds[0].revents
-            );
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            return listener.accept().expect("accept a control connection").0;
-        }
-        if fds[1].revents & libc::POLLIN != 0 {
-            return final_peek_or_die(listener, target_pid);
-        }
-    }
-}
-
-/// macOS sibling of the Linux `accept_or_die`: one `kqueue` carrying an `EVFILT_PROC`/`NOTE_EXIT`
-/// watch on the target and an `EVFILT_READ` watch on the listener.
-#[cfg(target_os = "macos")]
-pub fn accept_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    use std::os::fd::AsRawFd;
-
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
-    let kq = Kqueue::new().expect("kqueue() for the death-watch");
-    let changes = [
-        KEvent::new(
-            target_pid as usize,
-            EventFilter::EVFILT_PROC,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::NOTE_EXIT,
-            0,
-            0,
-        ),
-        KEvent::new(
-            listener.as_raw_fd() as usize,
-            EventFilter::EVFILT_READ,
-            EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
-            FilterFlag::empty(),
-            0,
-            0,
-        ),
-    ];
-    let mut receipts = [changes[0]; 2];
-    kq.kevent(&changes, &mut receipts, None)
-        .expect("kevent(EV_ADD) to arm the death-watch and the listener watch");
-    for r in &receipts {
-        // EV_RECEIPT makes EV_ADD synchronous and always reports EV_ERROR, with the outcome
-        // (0 = armed OK) in `data`: the only way to observe an EV_ADD failure at all.
-        assert!(
-            r.flags().contains(EvFlags::EV_ERROR),
-            "EV_RECEIPT should always report EV_ERROR: {r:?}"
-        );
-        let errno = r.data() as i32;
-        if r.filter() == Ok(EventFilter::EVFILT_PROC) && errno == libc::ESRCH {
-            // Already gone: the exit-first race, as in the Linux SRCH case.
-            return final_peek_or_die(listener, target_pid);
-        }
-        assert_eq!(
-            errno,
-            0,
-            "kevent(EV_ADD) receipt for {:?} reported errno {errno}",
-            r.filter()
-        );
-    }
-
-    let mut events = [changes[0]; 2];
-    loop {
-        let n = kq
-            .kevent(&[], &mut events, None)
-            .expect("kevent while waiting for a control connection");
-        for ev in &events[..n] {
-            debug_assert!(
-                !ev.flags().contains(EvFlags::EV_ERROR),
-                "an armed kevent reported EV_ERROR: {ev:?}"
-            );
-            match ev.filter() {
-                Ok(EventFilter::EVFILT_READ) => return listener.accept().expect("accept a control connection").0,
-                Ok(EventFilter::EVFILT_PROC) => return final_peek_or_die(listener, target_pid),
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Once the exit notification fires, a non-blocking `accept()` is the actual authority; see
-/// [`accept_or_die`].
-fn final_peek_or_die(listener: &TcpListener, target_pid: u32) -> TcpStream {
-    listener
-        .set_nonblocking(true)
-        .expect("set the listener nonblocking for the final accept peek");
-    let peek = listener.accept();
-    listener
-        .set_nonblocking(false)
-        .expect("restore the listener to blocking mode after the peek");
-    match peek {
-        Ok((stream, _)) => stream,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            panic!("the control target (pid {target_pid}) died before it connected")
-        }
-        Err(e) => panic!("accept during the final peek before declaring pid {target_pid} died: {e}"),
-    }
 }

@@ -35,8 +35,7 @@ reported as `ignored`, never a failure), plus separate CONSENT, `COSCA_TEST_ROOT
 off, `=1` consents — an unmet consent FAILS the test, since the switch being on is not the same as
 meaning to run it). "Switch on" alone never assumes the environment happens to run as root — never
 a silent skip, never a false pass on every unprivileged machine. CI provisions root for exactly
-these tests (see `.github/workflows/ci.yaml`'s "Run root-precondition tests" step) on Linux and
-macOS.
+these tests: the root lanes in `.github/workflows/ci.yaml` (`UID_SWITCH_TESTS`) on Linux and macOS.
 
 These tests run as root, spawn real children under real, different unprivileged uids, and
 re-exec themselves as one of those uids (`READER_UID`) to make the call under test — never run
@@ -71,10 +70,9 @@ docker run --rm --network none \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_NET_OFFLINE=true \
     -e COSCA_TEST_ROOT_CONSENT=1 \
-    -e SKULD_LABELS=ROOT \
     -w /repo \
     rust:1 \
-    cargo nextest run --offline -E "binary(process) | binary(process_root)"
+    cargo nextest run --offline -E "binary(process_root)"
 )
 docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 ```
