@@ -42,6 +42,19 @@ impl Blocker {
         }
     }
 
+    /// A blocker that a tracer's attach cannot kill, unlike `cat` ([`spawn_std_tracee`]).
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn_traceable() -> Blocker {
+        let mut child = crate::test_support::tracer::spawn_std_tracee();
+        let stdin = child.stdin.take().expect("piped stdin");
+        let id = identity_of(&child);
+        let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+        Blocker {
+            shared: Arc::new(shared),
+            stdin: Some(stdin),
+        }
+    }
+
     /// End the child: close its stdin, so it reads EOF and exits.
     pub(super) fn end_child(&mut self) {
         drop(self.stdin.take());
