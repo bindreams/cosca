@@ -17,6 +17,13 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 filter = 'test(/pidfd_handshake_tests::(a_spawn_that_fails_before_the_fork_ends_the_helper|a_child_that_fails_before_reporting_its_pid_ends_the_spawn|a_child_killed_before_reporting_its_pid)/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# A spawn-failure teardown that waits by pid on a child whose pid a stranger now holds blocks on
+# that stranger's exit, which never comes. The bound is the failure edge for that regression; with
+# correct code the test finishes in milliseconds.
+[[profile.default.overrides]]
+filter = 'test(/namespaces_tokio_spawn_identity_failure_teardown_/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [profile.ci]
 fail-fast = false
 

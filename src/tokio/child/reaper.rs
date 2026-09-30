@@ -56,6 +56,8 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use super::Waited;
+
 /// Everything `Drop` hands over. The resource group is carried whole and in its own declaration
 /// order, so both what travels and the order it is released in live in exactly one place —
 /// [`OsResources`](super::OsResources).
@@ -329,7 +331,9 @@ pub(crate) fn run_teardown(job: ReapJob) {
         if force_panic {
             panic!("forced teardown panic (test seam)");
         }
-        os.proc_mut().wait_and_reap(pid);
+        if os.proc_mut().wait_and_reap(pid) == Waited::Foreign {
+            os.proc_mut().forget_foreign();
+        }
     }));
 
     // The glue. Only a seeded fault reaches this, and only to give `work`'s recovery guard the

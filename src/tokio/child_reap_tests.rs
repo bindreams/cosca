@@ -1,3 +1,30 @@
+use super::{ProcSource, Waited};
+
+/// `child` as a backend. Linux: holding a pidfd the test opened itself, as the spawn does (a raw
+/// tokio child has none).
+fn proc_source(child: ::tokio::process::Child) -> ProcSource {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        let pid = child.id().expect("tokio owns an un-reaped child");
+        let pidfd = pidfd_open(Pid::from_raw(pid as i32).expect("pid"), PidfdFlags::empty()).expect("pidfd_open");
+        ProcSource::tokio(child).with_pidfd(pidfd)
+    }
+    #[cfg(not(target_os = "linux"))]
+    ProcSource::tokio(child)
+}
+
+/// Consumes `pid`'s exit record with a raw `waitid(P_PID)`, behind its owner's back. Blocks until
+/// the child has exited.
+#[cfg(unix)]
+fn reap_behind_the_owner(pid: u32) {
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: consumes the exit record of this process's own child.
+    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED) };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+}
+
 // `wait_and_reap` is the half of the teardown primitive that a caller which has ALREADY killed
 // uses. Its whole point is that it issues no kill of its own, so its wait rests on the caller's
 // kill instead of on a second one that can be refused.
@@ -17,7 +44,7 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
     use std::io::{Read, Write};
 
     let (listener, addr) = crate::test_child::registration_rendezvous();
-    let mut child = {
+    let child = {
         // Raw tokio bypasses cosca's spawn path, so `spawn_tokio` takes `spawn_lock()` for it.
         crate::test_spawn::spawn_tokio(
             ::tokio::process::Command::new(std::env::current_exe().expect("current_exe"))
@@ -33,6 +60,7 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
         .expect("spawn the rendezvous fixture")
     };
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
 
     let (mut sock, _) = listener.accept().expect("accept the fixture's rendezvous connection");
     let mut tag = [0u8; 1];
@@ -42,11 +70,11 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
     sock.write_all(b"g").expect("release the fixture");
     sock.flush().expect("flush the release byte");
 
-    super::wait_and_reap(&mut child, pid, true);
+    assert_eq!(proc.wait_and_reap(pid), Waited::Exited);
 
     // No poll loop and no retry: `try_wait` is called exactly once, immediately. It can only
     // report an exit if `wait_and_reap` already blocked until the child had one.
-    let status = child
+    let status = proc
         .try_wait()
         .expect("try_wait")
         .expect("wait_and_reap must return only after the child has exited");
@@ -72,9 +100,8 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
     .expect("spawn")
 }
 
-// `done_ok` is the whole diagnostic: an already-reaped child is legal for `Drop` (the user may
-// have `wait()`ed) and a broken precondition for a caller whose child was never awaited. Both
-// arms are pinned, so neither loosening the assert nor hard-firing it survives.
+// An already-reaped child is a broken precondition for a caller whose child was never awaited, and
+// `Drop` checks `is_reaped` before it reaches here, so the assert has no legal caller to spare.
 //
 // Debug-only oracle, `kinfo_tests`' calm-release shape: `debug_assert!` is compiled out in the
 // release lane, where the same straight-line code returns instead — which the post-call assert
@@ -85,20 +112,13 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
 )]
 #[tokio::test]
 async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited() {
-    let mut child = spawn_a_tokio_child_that_exits();
+    let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
-    child.wait().await.expect("wait");
-    super::wait_and_reap(&mut child, pid, false);
+    let mut proc = proc_source(child);
+    proc.wait().await.expect("wait");
+    proc.wait_and_reap(pid);
     // Only reachable in release (debug panicked above, as expected):
-    assert!(child.id().is_none(), "the child was reaped by the wait() above");
-}
-
-#[tokio::test]
-async fn wait_and_reap_accepts_an_already_reaped_child_the_caller_may_have_awaited() {
-    let mut child = spawn_a_tokio_child_that_exits();
-    let pid = child.id().expect("tokio owns an un-reaped child");
-    child.wait().await.expect("wait");
-    super::wait_and_reap(&mut child, pid, true); // `Drop`'s disposition: legal, returns quietly
+    assert!(proc.is_reaped(), "the child was reaped by the wait() above");
 }
 
 // The value the elevated-spawn cleanup path passes. That child is killed and reaped without ever
@@ -132,41 +152,89 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
     );
 }
 
-// `waitid` failing with anything but EINTR is a real OS outcome, not a contract violation: it must
-// be logged at warn and the wait abandoned, in every build. A pid that is not this process's child
-// makes `waitid` fail with ECHILD while tokio still owns the real child (`id()` is `Some`).
-#[cfg(unix)]
+// A wait that cannot prove the child is still ours is `Foreign`, and records no reap: a fabricated
+// exit-0 record would make `TeardownBlocker::assert_killed` blame the kill for a failed wait.
+//
+// macOS: a pid that is not this process's child makes `waitid` fail with `ECHILD` while tokio still
+// owns the real child (`id()` is `Some`).
+#[cfg(target_os = "macos")]
 #[tokio::test]
-async fn wait_and_reap_warns_and_returns_when_waitid_fails() {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let mut child = spawn_a_tokio_child_that_exits();
-    assert!(child.id().is_some(), "tokio owns an un-reaped child");
+async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_reap() {
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let mut proc = proc_source(spawn_a_tokio_child_that_exits());
     let not_our_child = i32::MAX as u32;
 
-    super::wait_and_reap(&mut child, not_our_child, true);
-
-    assert_eq!(
-        crate::log_capture::levels_since(mark, &format!("waitid on pid {not_our_child} failed")),
-        [log::Level::Warn]
-    );
-    child.wait().await.expect("reap the real child");
-}
-
-// A `waitid` that failed reaped nothing, so it records nothing: a fabricated exit-0 record would
-// make `TeardownBlocker::assert_killed` blame the kill for a failed wait.
-#[cfg(unix)]
-#[tokio::test]
-async fn wait_and_reap_records_no_reap_when_waitid_fails() {
-    let reaps = crate::child::spawn::fault::record_teardown_reaps();
-    let mut child = spawn_a_tokio_child_that_exits();
-    // Not `i32::MAX`: the warn-test above counts that pid's log line.
-    let not_our_child = i32::MAX as u32 - 1;
-
-    super::wait_and_reap(&mut child, not_our_child, true);
+    assert_eq!(proc.wait_and_reap(not_our_child), Waited::Foreign);
 
     assert_eq!(reaps.recorded(), vec![], "a failed waitid must record no reap");
-    child.wait().await.expect("reap the real child");
+    proc.wait().await.expect("reap the real child");
+}
+
+/// Linux: a child with no pidfd has nothing to prove it ours, and tokio's by-pid reap must not
+/// run on its say-so.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tokio_wait_and_reap_with_no_pidfd_is_foreign() {
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = ProcSource::tokio(child);
+
+    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+
+    assert_eq!(reaps.recorded(), vec![], "no wait ran, so no reap is recorded");
+    proc.wait().await.expect("reap the real child");
+}
+
+/// A reaped-behind-its-back child the backend has been told to forget: `Foreign` warns once, naming
+/// the pid and what it leaks, and the backend reports itself reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn tokio_forget_foreign_warns_naming_the_leak() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    reap_behind_the_owner(pid);
+
+    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    proc.forget_foreign();
+
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, &format!("child {pid}"))
+        .into_iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "exactly one warning: {warns:?}");
+    assert!(warns[0].1.contains("leak"), "the warning must name the leak: {warns:?}");
+    assert!(proc.is_reaped(), "a forgotten child has nothing left to reap");
+}
+
+/// The streams are separate objects, so forgetting the child leaks nothing by keeping them: a
+/// caller who waits and then reads `stdout()` keeps its output.
+///
+/// Mutant: `forget_foreign` drops the streams.
+#[cfg(unix)]
+#[tokio::test]
+async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
+    use ::tokio::io::AsyncReadExt as _;
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("sh")
+            .args(["-c", "echo hello"])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    reap_behind_the_owner(pid);
+
+    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    proc.forget_foreign();
+
+    let mut stdout = proc.take_stdout().expect("the untaken stdout survives the forget");
+    let mut line = String::new();
+    stdout.read_to_string(&mut line).await.expect("read");
+    assert_eq!(line, "hello\n");
 }
 
 /// What `waitid(WEXITED | WNOWAIT)` reports for `pid`, decoded by `exit_status_of`.
