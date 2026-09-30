@@ -426,15 +426,17 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
     use std::os::fd::{AsFd, AsRawFd};
 
     use crate::test_own_process::{own_process, test_path};
+    use crate::test_spawn::spawn;
     use crate::test_stdio::RestoreStdio;
 
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    let Some(done) = own_process(test_path!(
-        cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio
-    )) else {
+    let Some(done) = own_process(
+        test_path!(cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio),
+        spawn,
+    ) else {
         return;
     };
 

@@ -6,8 +6,10 @@ use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 
 use crate::test_own_process::{
-    child_args, drain, is_reexecution, own_process, role, run, test_path, Completion, FailureKind, Role, ENV,
+    child_args, child_completion, drain, is_reexecution, own_process, role, run, test_path, Completion, FailureKind,
+    Role, ENV,
 };
+use crate::test_spawn::spawn;
 
 const FIXTURE: &str = "test_own_process_tests::fixture_records_its_pid_and_misbehaves_on_request";
 const MODE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_MODE";
@@ -17,7 +19,7 @@ const PIDFILE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_PIDFILE";
 
 #[test]
 fn the_body_runs_only_in_the_re_executed_process() {
-    let Some(_done) = own_process(test_path!(the_body_runs_only_in_the_re_executed_process)) else {
+    let Some(_done) = own_process(test_path!(the_body_runs_only_in_the_re_executed_process), spawn) else {
         return;
     };
     assert_eq!(
@@ -29,7 +31,7 @@ fn the_body_runs_only_in_the_re_executed_process() {
 /// Fixture driven by `MODE` and `PIDFILE`; the tests below run it via `run` or a subprocess.
 #[test]
 fn fixture_records_its_pid_and_misbehaves_on_request() {
-    let Some(_done) = own_process(test_path!(fixture_records_its_pid_and_misbehaves_on_request)) else {
+    let Some(_done) = own_process(test_path!(fixture_records_its_pid_and_misbehaves_on_request), spawn) else {
         return;
     };
     if let Some(path) = std::env::var_os(PIDFILE) {
@@ -80,12 +82,12 @@ fn child_inherits(fd: RawFd) -> bool {
 
 #[test]
 fn a_returning_body_passes_the_run() {
-    run(FIXTURE, &[]).expect("a body that returns normally passes");
+    run(FIXTURE, &[], spawn).expect("a body that returns normally passes");
 }
 
 #[test]
 fn a_failing_body_fails_the_run() {
-    let failure = run(FIXTURE, &[(MODE, "panic")]).expect_err("a body that panics must fail the run");
+    let failure = run(FIXTURE, &[(MODE, "panic")], spawn).expect_err("a body that panics must fail the run");
     assert!(matches!(failure.kind, FailureKind::Exited(_)), "got {:?}", failure.kind);
     assert!(
         failure.to_string().contains("asked to fail"),
@@ -95,13 +97,13 @@ fn a_failing_body_fails_the_run() {
 
 #[test]
 fn a_body_that_exits_zero_mid_way_fails_the_run() {
-    let failure = run(FIXTURE, &[(MODE, "exit")]).expect_err("exit(0) mid-body must not count as a pass");
+    let failure = run(FIXTURE, &[(MODE, "exit")], spawn).expect_err("exit(0) mid-body must not count as a pass");
     assert!(matches!(failure.kind, FailureKind::DidNotReturn), "got {failure}");
 }
 
 #[test]
 fn a_body_that_reports_completion_then_exits_non_zero_fails_the_run() {
-    let failure = run(FIXTURE, &[(MODE, "exit-after-done")]).expect_err("a non-zero exit is not a pass");
+    let failure = run(FIXTURE, &[(MODE, "exit-after-done")], spawn).expect_err("a non-zero exit is not a pass");
     assert!(matches!(failure.kind, FailureKind::Exited(_)), "got {failure}");
 }
 
@@ -109,12 +111,12 @@ fn a_body_that_reports_completion_then_exits_non_zero_fails_the_run() {
 /// with a copy of the parent's token.
 #[test]
 fn the_bodys_children_do_not_inherit_the_token_fd() {
-    run(FIXTURE, &[(MODE, "spawn-child")]).expect("the body's child must not hold the token fd");
+    run(FIXTURE, &[(MODE, "spawn-child")], spawn).expect("the body's child must not hold the token fd");
 }
 
 #[test]
 fn a_filter_that_matches_no_test_fails_the_run() {
-    let failure = run("test_own_process_tests::no_such_test", &[]).expect_err("nothing ran, so nothing passed");
+    let failure = run("test_own_process_tests::no_such_test", &[], spawn).expect_err("nothing ran, so nothing passed");
     assert!(matches!(failure.kind, FailureKind::NeverStarted), "got {failure}");
 }
 
@@ -371,4 +373,12 @@ fn a_reexecuted_child_that_is_not_accepted_panics_instead_of_re_executing() {
         format!("{stdout}{stderr}").contains("not accepted as its own process"),
         "{stdout}{stderr}"
     );
+}
+
+#[test]
+fn child_completion_in_an_ordinary_process_is_none_and_runs_nothing() {
+    assert!(child_completion(test_path!(
+        child_completion_in_an_ordinary_process_is_none_and_runs_nothing
+    ))
+    .is_none());
 }

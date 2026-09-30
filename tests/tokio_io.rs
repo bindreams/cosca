@@ -572,7 +572,13 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
-    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(&done, 256);
 
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -627,7 +633,14 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use tokio::io::AsyncReadExt;
 
-    let _restore = common::RestoreStdio::close(&[2]);
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+
+    let _restore = common::test_stdio::RestoreStdio::close(&done, &[2]);
 
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
@@ -663,10 +676,17 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
 async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Read, Seek, SeekFrom};
 
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(async_relocating_a_low_parent_fd_keeps_spawn_errors_reported),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+
     let out_f = tempfile::tempfile().expect("tempfile for stdout target");
     let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
 
-    let _restore = common::RestoreStdio::close(&[1, 2]);
+    let _restore = common::test_stdio::RestoreStdio::close(&done, &[1, 2]);
 
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "true"]);

@@ -1,9 +1,12 @@
 //! Closes this test process's std fds, for the tests that reproduce a bug seen only with one of them
 //! free.
+//!
+//! Also mounted by `#[path]` into `tests/common` beside `test_own_process`, so it names its
+//! sibling through `super::`, never `crate::`.
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
-use crate::test_own_process::Completion;
+use super::test_own_process::Completion;
 
 /// Dups each of `fds` aside and closes the original, restoring it on drop even if the test panics.
 ///

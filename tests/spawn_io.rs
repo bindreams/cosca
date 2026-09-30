@@ -456,7 +456,13 @@ fn unix_fd3_inherit_is_rejected() {
 #[cfg(unix)]
 #[test]
 fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
-    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(256);
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(unix_fd_out_of_range_fails_spawn_cleanly_not_abort),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+    let _rlimit_guard = common::RestoreRlimitNofile::lower_to(&done, 256);
 
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -514,9 +520,16 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use std::io::{Seek, SeekFrom};
 
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+
     let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
 
-    let _restore = common::RestoreStdio::close(&[2]);
+    let _restore = common::test_stdio::RestoreStdio::close(&done, &[2]);
 
     let mut cmd = Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "echo LEAK >&3"]);
@@ -554,10 +567,17 @@ fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
 fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Seek, SeekFrom};
 
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(relocating_a_low_parent_fd_keeps_spawn_errors_reported),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+
     let out_f = tempfile::tempfile().expect("tempfile for stdout target");
     let mut err_f = tempfile::tempfile().expect("tempfile for stderr target");
 
-    let _restore = common::RestoreStdio::close(&[1, 2]);
+    let _restore = common::test_stdio::RestoreStdio::close(&done, &[1, 2]);
 
     let mut cmd = Command::new();
     cmd.executable("/bin/sh").args(["sh", "-c", "true"]);
@@ -1638,23 +1658,27 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 /// for the report: the child may then land on either side of its leaf, but cosca must report the
 /// side it is on.
 ///
-/// Each case runs in a fresh copy of this test binary running only this test: a closed 0, 1 or 2
-/// is process-wide, so in a binary with other tests running it would hand their next `open` the
-/// slot, and with 2 closed a failing assertion's message would go nowhere.
+/// Each case runs in a fresh copy of this test binary running only this test
+/// (`test_own_process::run`): a closed 0, 1 or 2 is process-wide, so in a binary with other tests
+/// running it would hand their next `open` the slot, and with 2 closed a failing assertion's
+/// message would go nowhere.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires COSCA_TEST_CGROUP and a delegated cgroup"]
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
-    const NAME: &str = "linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child";
+    use common::test_own_process::{child_completion, run, test_filter, test_path};
+
+    let path = test_path!(linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child);
 
     stderr_log::install();
     assert!(
         std::env::var_os("COSCA_TEST_CGROUP").is_some(),
         "requires COSCA_TEST_CGROUP and a delegated cgroup"
     );
-    if let Ok(slots) = std::env::var(CLOSED_SLOTS_ENV) {
+    if let Some(done) = child_completion(path) {
+        let slots = std::env::var(CLOSED_SLOTS_ENV).unwrap_or_else(|e| panic!("{CLOSED_SLOTS_ENV}: {e}"));
         let deny_pidfd = std::env::var_os(DENY_PIDFD_ENV).is_some();
-        return spawn_with_slots_closed(&parse_closed_slots(&slots), deny_pidfd);
+        return spawn_with_slots_closed(&done, &parse_closed_slots(&slots), deny_pidfd);
     }
     // "" is the control: the same spawn with every slot open.
     let slot_cases = ["", "0", "1", "2", "1,2", "0,1", "0,2", "0,1,2"];
@@ -1662,21 +1686,13 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
         .into_iter()
         .flat_map(|deny| slot_cases.map(|slots| (slots, deny)))
         .filter_map(|(slots, deny)| {
-            let mut run = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-            run.args([NAME, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
-                .env(CLOSED_SLOTS_ENV, slots);
+            let mut env = vec![(CLOSED_SLOTS_ENV, slots)];
             if deny {
-                run.env(DENY_PIDFD_ENV, "1");
+                env.push((DENY_PIDFD_ENV, "1"));
             }
-            let out = common::output_locked(&mut run).expect("run this test with the slots closed");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            (!(out.status.success() && stdout.contains("1 passed"))).then(|| {
-                format!(
-                    "slots [{slots}], pidfd denied: {deny}: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            })
+            run(test_filter(path), &env, common::spawn_locked)
+                .err()
+                .map(|failure| format!("slots [{slots}], pidfd denied: {deny}: {failure}"))
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -1715,7 +1731,11 @@ fn parse_closed_slots(slots: &str) -> Vec<i32> {
 
 /// Spawn `cmd` with `slots` closed in this process across the spawn, and restore them.
 #[cfg(target_os = "linux")]
-fn spawn_with_std_slots_closed(cmd: &mut Command, slots: &[i32]) -> Result<cosca::Child, cosca::error::Error> {
+fn spawn_with_std_slots_closed(
+    _own_process: &common::test_own_process::Completion,
+    cmd: &mut Command,
+    slots: &[i32],
+) -> Result<cosca::Child, cosca::error::Error> {
     // Everything this process needs open is opened already, so nothing fills the gaps but the
     // spawn. Every slot is saved above 2 before any is closed: a plain `dup` would take a gap.
     // SAFETY: each slot is one of this process's own std descriptors; it is closed only across
@@ -1791,7 +1811,7 @@ fn accept_while_alive(listener: &std::net::TcpListener, pid: u32) -> std::net::T
 /// spawn a contained `sh` with `slots` closed in this process and each wired to a file in the
 /// child, then check what cosca reports against where the child really is.
 #[cfg(target_os = "linux")]
-fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
+fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &[i32], deny_pidfd: bool) {
     use std::io::{BufRead, Seek};
 
     const CONTENTS: &[u8] = b"untouched\n";
@@ -1822,7 +1842,7 @@ fn spawn_with_slots_closed(slots: &[i32], deny_pidfd: bool) {
                 if deny_pidfd {
                     deny_pidfd_open_on_this_thread();
                 }
-                spawn_with_std_slots_closed(&mut cmd, slots)
+                spawn_with_std_slots_closed(done, &mut cmd, slots)
             })
             .join()
             .expect("the spawning thread")
@@ -1950,4 +1970,29 @@ fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
     let _ = child.wait();
     let mut buf = [0u8; 1];
     assert_eq!(gc_stream.read(&mut buf).expect("read the grandchild's socket"), 0);
+}
+
+// The process-global-state guards =====
+
+#[cfg(unix)]
+#[test]
+fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
+    let Some(done) = common::test_own_process::own_process(
+        common::test_own_process::test_path!(restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it),
+        common::spawn_locked,
+    ) else {
+        return;
+    };
+    fn soft() -> libc::rlim_t {
+        // SAFETY: getrlimit with a valid out-parameter.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur
+    }
+    let before = soft();
+    assert!(before > 100, "the runner's soft limit {before} leaves nothing to lower");
+    let guard = common::RestoreRlimitNofile::lower_to(&done, 100);
+    assert_eq!(soft(), 100, "lower_to must lower the soft limit");
+    drop(guard);
+    assert_eq!(soft(), before, "drop must restore it");
 }
