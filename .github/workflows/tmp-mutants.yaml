@@ -1,0 +1,35 @@
+name: tmp mutants
+on:
+  pull_request:
+env:
+  NEXTEST_VERSION: "0.9.137"
+  COSCA_TEST_TRACER: "1"
+  COSCA_TEST_TRACER_CONSENT: "1"
+jobs:
+  mutants:
+    name: mutants (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Build tests
+        run: cargo nextest run --locked --no-run --lib --profile ci
+      - name: Mutants
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          for m in baseline m3 m4 m8a m8b m10; do
+            echo "=== MUTANT $m"
+            COSCA_MUT=$m cargo nextest run --locked --lib --profile ci --no-fail-fast \
+              -E 'test(/shared_tests::tracer::macos/) | test(/tracer::attach::/)' 2>&1 | tee "mut-$m.log" | grep -E "PASS|FAIL|TIMEOUT|SIGABRT|WATCHDOG|still running|PT_KILL|handle's SIGKILL|Summary|panicked" | head -40
+            echo "=== END $m"
+          done

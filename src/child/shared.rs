@@ -387,7 +387,14 @@ impl SharedChild {
                     self.log_unreadable(reaped);
                     status_of(reaped).map(Some)
                 }
-                Reap::Running => Ok(None),
+                Reap::Running => {
+                    if std::env::var("COSCA_MUT").as_deref() == Ok("m10") {
+                        lock.set(State::E(Reaped::Status(
+                            std::os::unix::process::ExitStatusExt::from_raw(0),
+                        )));
+                    }
+                    Ok(None)
+                }
                 Reap::Foreign(_) => Err(echild()),
             },
         }
@@ -425,7 +432,12 @@ impl SharedChild {
         }
         #[cfg(target_os = "macos")]
         {
-            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill).map(drop)
+            let r = crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill).map(drop);
+            if std::env::var("COSCA_MUT").as_deref() == Ok("m3") {
+                // SAFETY: a plain ptrace request.
+                unsafe { libc::ptrace(libc::PT_KILL, self.id() as libc::pid_t, std::ptr::null_mut(), 0) };
+            }
+            r
         }
         #[cfg(windows)]
         {

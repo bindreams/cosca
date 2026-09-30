@@ -92,6 +92,10 @@ mod macos {
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
 
+    fn mutant(name: &str) -> bool {
+        std::env::var("COSCA_MUT").as_deref() == Ok(name)
+    }
+
     /// The failure bound of the driver's wait for its fixture. The fixture aborts from its own
     /// [`BOUND`] watchdog well before, naming the step it hangs in, so this bound only ends a
     /// fixture that never got that far (and is shorter than nextest's own, in `.config`).
@@ -177,6 +181,10 @@ mod macos {
 
     pub(super) fn watchdog(name: &'static str) -> Watchdog {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        if mutant("m8b") {
+            std::mem::forget(rx);
+            return Watchdog(tx);
+        }
         std::thread::spawn(move || {
             if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
                 // Not `eprintln!`: libtest captures that, and the abort would lose it.
@@ -218,6 +226,12 @@ mod macos {
                 panic!("the tracee exited before it stopped (si_code {code}, si_status {status})")
             }
         }
+        if mutant("m8a") || mutant("m8b") {
+            step("hung by mutant");
+            loop {
+                std::thread::park();
+            }
+        }
     }
 
     /// End a child stopped by [`attach_and_confirm_stop`]. `PT_KILL` does it: it posts `SIGKILL`
@@ -237,6 +251,17 @@ mod macos {
             matches!(stopped, Ok(Some(_))),
             "the handle's SIGKILL ended or released a traced child: {stopped:?}"
         );
+        if mutant("m4") {
+            // SAFETY: a plain ptrace request on this test's own child.
+            unsafe {
+                libc::ptrace(
+                    libc::PT_DETACH,
+                    pid as libc::pid_t,
+                    std::ptr::dangling_mut::<libc::c_char>(),
+                    0,
+                )
+            };
+        }
         // SAFETY: a plain ptrace request on this test's own child.
         let rc = unsafe { libc::ptrace(libc::PT_KILL, pid as libc::pid_t, std::ptr::null_mut(), 0) };
         assert_eq!(rc, 0, "PT_KILL: {}", std::io::Error::last_os_error());
