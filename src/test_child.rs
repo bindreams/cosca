@@ -306,7 +306,10 @@ pub(crate) mod ack;
 /// Callers today are gated `windows` (`src/child/graceful_tests.rs`) or live under `src/tokio/`
 /// (`feature = "tokio"`, itself required for that whole module to exist) — under neither (e.g. a
 /// `--no-default-features` build on a non-Windows target), nothing calls this at all.
-#[cfg_attr(not(any(windows, feature = "tokio")), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, feature = "tokio")),
+    allow(dead_code, reason = "called only by the Windows and tokio tests")
+)]
 pub(crate) fn accept_or_die(
     listener: &std::net::TcpListener,
     target: crate::identity::ProcessId,
