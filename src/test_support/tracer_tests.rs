@@ -222,7 +222,7 @@ fn assert_terminated(tracee: crate::Child) {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "expected SIGTERM, got {status:?}");
 }
 
-/// After `detached`: the tracee may stay stopped (measured on CI on macOS 26), so it is ended
+/// After `detached`: the tracee may stay stopped (see [`Report::Detached`]), so it is ended
 /// with `SIGKILL` through its handle, before its stdin closes: a running one would otherwise
 /// exit on EOF first.
 fn end_detached(tracee: crate::Child, stdin: std::io::PipeWriter) {
@@ -238,8 +238,8 @@ fn end_stopped(tracee: crate::Child) {
 }
 
 /// After the detach, with the tracee's stdin closed: continues it with `SIGCONT` each time it is
-/// stopped, until it exits. Each `SIGCONT` answers a real stop: the detach's own `SIGSTOP` (measured
-/// on CI on macOS 26), or a re-sent stop signal.
+/// stopped, until it exits. Each `SIGCONT` answers a real stop: the detach's own `SIGSTOP` (see
+/// [`Report::Detached`]), or a re-sent stop signal.
 fn run_on_to_exit(pid: u32) {
     while await_change(pid).si_code == libc::CLD_STOPPED {
         send(pid, libc::SIGCONT);
@@ -1317,16 +1317,14 @@ fn s6_a_lone_sigchld_is_ignored() {
 
 // Signals ======================================================================================
 
-/// After the detach, with the tracee's stdin closed: it is job-stopped by the kept `signal`, or
-/// by the detach's own `SIGSTOP`, which XNU discards the re-sent signal against when it leaves
-/// the tracee stopped (measured on CI: sometimes on macOS 26, never on macOS 15).
+/// After the detach, with the tracee's stdin closed: it is job-stopped by the kept `signal`, which
+/// the detach delivered (S4 detaches from a stop by it).
 fn assert_job_stopped(pid: u32, signal: i32) {
     let info = await_change(pid);
-    assert!(
-        info.si_code == libc::CLD_STOPPED && [signal, libc::SIGSTOP].contains(&info.si_status),
-        "the detached tracee is not stopped by {signal} or SIGSTOP: si_code {}, si_status {}",
-        info.si_code,
-        info.si_status
+    assert_eq!(
+        (info.si_code, info.si_status),
+        (libc::CLD_STOPPED, signal),
+        "the detached tracee is not stopped by {signal}"
     );
 }
 
@@ -1561,7 +1559,7 @@ fn s4_holds_a_caught_stop_signal_until_after_the_detach() {
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL,S4sigstop:0", libc::SIGTSTP);
     expect(&mut th, &["S4", "S4b*", "S4h"]);
     send(pid, libc::SIGSTOP);
-    expect(&mut th, &["S4b*", "S4r", "detached", DONE]);
+    expect(&mut th, &["S4b*", "S4f", "S4b*", "S4r", "detached", DONE]);
     drop(th);
     drop(stdin);
     run_on_to_exit(pid);
@@ -1637,7 +1635,10 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
     }
 }
 
-/// Mutants: S4 passes a stop signal on; S4 detaches from any stop.
+/// The test's `SIGSTOP` stands in for S4's own, sent before the `SIGTSTP` stop was kept: S4
+/// releases it and stops the tracee with the kept `SIGTSTP` instead (`S4f`), which the detach
+/// then delivers. Mutants: S4 passes a stop signal on; S4 detaches from any stop; S4 detaches
+/// from the `SIGSTOP` stop.
 #[test]
 fn s4_keeps_a_stop_signal_until_after_the_detach() {
     let Some((mut tracee, stdin, _stdout)) = tracee() else {
@@ -1649,7 +1650,7 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL,S4sigstop:0", libc::SIGTSTP);
     expect(&mut th, &["S4", "S4b*", "S4k"]);
     send(pid, libc::SIGSTOP);
-    expect(&mut th, &["S4b*", "S4r", "detached", DONE]);
+    expect(&mut th, &["S4b*", "S4f", "S4b*", "S4r", "detached", DONE]);
     drop(th);
     drop(stdin);
     assert_job_stopped(pid, libc::SIGTSTP);
