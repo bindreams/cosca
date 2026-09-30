@@ -438,3 +438,178 @@ fn d0_m3_audittoken() {
     assert!(is_esrch(zr));
     let _ = z.0.wait();
 }
+
+// M4: flavor 13 (`PROC_PIDT_SHORTBSDINFO`) and the original parent of a traced process -----
+
+fn flavor13(pid: u32) -> (i32, i32, libc::proc_bsdshortinfo) {
+    // SAFETY: zeroed is a valid bit pattern for this plain struct.
+    let mut s: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `s` is a live buffer of the size passed.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as c_int,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut s as *mut libc::proc_bsdshortinfo).cast::<c_void>(),
+            std::mem::size_of::<libc::proc_bsdshortinfo>() as c_int,
+        )
+    };
+    let errno = if ret <= 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+    (ret, errno, s)
+}
+
+fn show13(tag: &str, pid: u32) {
+    let (ret, errno, s) = flavor13(pid);
+    let comm: String = s.pbsi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
+    d0!(
+        "M4",
+        "{tag}.f13 pid={pid} ret={ret} errno={} size={} pbsi_pid={} ppid={} pgid={} status={} flags={:#x} \
+         PROC_FLAG_SYSTEM={} PROC_FLAG_TRACED={} uid={} comm={comm}",
+        errname(errno),
+        std::mem::size_of::<libc::proc_bsdshortinfo>(),
+        s.pbsi_pid,
+        s.pbsi_ppid,
+        s.pbsi_pgid,
+        s.pbsi_status,
+        s.pbsi_flags,
+        s.pbsi_flags & 1 != 0,
+        s.pbsi_flags & 2 != 0,
+        s.pbsi_uid
+    );
+}
+
+/// `kinfo_proc` via `sysctl(KERN_PROC_PID)`: `(length, p_pid, p_oppid, e_ppid)`. The offsets are
+/// the 64-bit `extern_proc`/`eproc` layout; `p_pid` and `e_ppid` are cross-checked by the caller.
+fn kinfo(pid: u32) -> Option<(usize, i32, i32, i32)> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as c_int];
+    let mut len = 0usize;
+    // SAFETY: size query, then a read into a buffer of that size.
+    unsafe {
+        if libc::sysctl(mib.as_mut_ptr(), 4, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) != 0 || len < 568 {
+            return None;
+        }
+        let rd = |o: usize| i32::from_ne_bytes(buf[o..o + 4].try_into().unwrap());
+        Some((len, rd(40), rd(44), rd(560)))
+    }
+}
+
+fn show_kinfo(tag: &str, pid: u32) {
+    match kinfo(pid) {
+        None => d0!("M4", "{tag}.kinfo pid={pid} unavailable errno={}", errname(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))),
+        Some((len, p_pid, p_oppid, e_ppid)) => d0!(
+            "M4",
+            "{tag}.kinfo pid={pid} len={len} p_pid={p_pid} layout_ok={} p_oppid={p_oppid} e_ppid={e_ppid}",
+            p_pid == pid as i32
+        ),
+    }
+}
+
+fn show17(tag: &str, pid: u32) {
+    let (ret, errno, u) = flavor17(pid, 1);
+    d0!(
+        "M4",
+        "{tag}.f17 pid={pid} ret={ret} errno={} uniqueid={} puniqueid={} idversion={} orig_ppidversion={}",
+        errname(errno),
+        u.p_uniqueid,
+        u.p_puniqueid,
+        u.p_idversion,
+        u.p_orig_ppidversion
+    );
+}
+
+/// Role child: `PT_ATTACH`es to `D0_M4_TARGET`, reports the result, and detaches when stdin closes.
+#[test]
+fn d0_role_m4_tracer() {
+    if std::env::var("D0_ROLE").as_deref() != Ok("m4") {
+        return;
+    }
+    let target: i32 = std::env::var("D0_M4_TARGET").expect("target").parse().expect("pid");
+    // SAFETY: plain ptrace request.
+    let r = unsafe { libc::ptrace(libc::PT_ATTACH, target, std::ptr::null_mut(), 0) };
+    let errno = if r != 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+    println!("ATTACH ret={r} errno={} tracer_pid={}", errname(errno), std::process::id());
+    std::io::stdout().flush().expect("flush");
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    if r == 0 {
+        // SAFETY: plain ptrace request.
+        unsafe { libc::ptrace(libc::PT_DETACH, target, std::ptr::null_mut(), 0) };
+    }
+}
+
+fn traced_case(tag: &str, target: u32) {
+    let me = std::process::id();
+    show17("parent", me);
+    show13(&format!("{tag}.before"), target);
+    show17(&format!("{tag}.before"), target);
+    show_kinfo(&format!("{tag}.before"), target);
+
+    let mut t = Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", "macos::d0_role_m4_tracer", "--nocapture"])
+        .env("D0_ROLE", "m4")
+        .env("D0_M4_TARGET", target.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tracer");
+    let tracer_pid = t.id();
+    let stdin = t.stdin.take().unwrap();
+    let mut out = std::io::BufReader::new(t.stdout.take().unwrap());
+    let mut line = String::new();
+    let attach = loop {
+        line.clear();
+        assert!(std::io::BufRead::read_line(&mut out, &mut line).expect("read") > 0, "tracer exited early");
+        if line.starts_with("ATTACH ") {
+            break line.trim().to_string();
+        }
+    };
+    d0!("M4", "{tag}.tracer_pid={tracer_pid} {attach}");
+    show13(&format!("{tag}.after_attach"), target);
+    show17(&format!("{tag}.after_attach"), target);
+    show_kinfo(&format!("{tag}.after_attach"), target);
+    d0!("M4", "{tag}.original_parent_is_pid={me} (the probe); tracer is pid={tracer_pid}");
+    drop(stdin);
+    let _ = t.wait();
+}
+
+#[test]
+fn d0_m4_short_bsd_info() {
+    let me = std::process::id();
+    // SAFETY: plain getters.
+    let (ppid, pgrp) = unsafe { (libc::getppid(), libc::getpgrp()) };
+    d0!("M4", "self.expected ppid={ppid} pgid={pgrp}");
+    show13("self", me);
+    show_kinfo("self", me);
+    let live = sleeper();
+    show13("live_child", live.0.id());
+
+    show13("pid1_launchd", 1);
+    show13("pid0_kernel_task", 0);
+
+    // Zombie: NOTE_EXIT seen, not reaped.
+    let mut z = sleeper();
+    let zpid = z.0.id();
+    let w = Watch::new(zpid, libc::NOTE_EXIT);
+    z.0.kill().expect("kill");
+    w.next();
+    show13("zombie", zpid);
+    show_kinfo("zombie", zpid);
+    z.0.wait().expect("reap");
+    // A gone pid: reaped just above.
+    show13("gone_reaped", zpid);
+    show_kinfo("gone_reaped", zpid);
+    // A pid that never existed in this boot's recent range.
+    show13("gone_never_allocated", 99_998);
+
+    // Traced: a non-platform target (this test binary) and a platform one (`/bin/sleep`).
+    let rc = RoleChild::spawn();
+    traced_case("traced_probe_binary", rc.pid());
+    drop(rc);
+    let s = sleeper();
+    traced_case("traced_bin_sleep", s.0.id());
+}
