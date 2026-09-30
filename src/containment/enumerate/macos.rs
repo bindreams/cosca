@@ -8,9 +8,10 @@
 //! for zombies and EPERM-hidden cross-user processes):
 //!
 //! - Even with the fallback, an edge can still be dropped: the target pid genuinely exited
-//!   between the snapshot and the query, a sandbox denies the fallback's own sysctl (rare —
-//!   EPERM/EACCES there is a DESIGNED `Unknown`, not a second EPERM gap), or `e_ppid == 0`
-//!   mid fork() on both reads (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
+//!   between the snapshot and the query, or a sandbox denies the fallback's own sysctl
+//!   (EPERM/EACCES there is a DESIGNED, persistent `Unknown`, not a second EPERM gap). An
+//!   `e_ppid == 0` mid fork() on both reads is transient and never surfaces: `ppid_of` re-reads
+//!   it until it resolves (pid 1 excepted — see `identity::macos::ppid_of`'s doc).
 //! - A failed snapshot, or a pid denied its ppid read, is `Error::Unassessable` from
 //!   `process_parents`, never an empty or partial list: a tree walk over one skips the subtree.
 //!   [`snapshot`] is the other consumer (the fd-marker sweep): it reports a failure as an empty
@@ -47,8 +48,8 @@ const DENIED_SAMPLE_CAP: usize = 5;
 /// keeping a second `proc_pidinfo` call and a second copy of the guard here). The tri-state is
 /// forwarded whole, not collapsed to `Option`: [`join_edges`] needs to tell a genuine absence
 /// (`Gone` — the pid exited, a legitimate exclusion) apart from a refused query (`Unknown` —
-/// e.g. a sandboxed sysctl refusal, or the fork-in-progress `e_ppid == 0` window hitting both
-/// reads for this pid — a real gap in the ppid-walk channel, not a legitimate one). Silent
+/// a persistent sandboxed sysctl refusal, a real gap in the ppid-walk channel, not a
+/// legitimate one; the transient fork-in-progress window is resolved inside `ppid_of`). Silent
 /// per-call either way: a dropped edge drops the pid's whole subtree in
 /// `treewalk::descendants_with`, and [`snapshot`] is what surfaces the aggregate.
 fn ppid_of(pid: libc::c_int) -> Resolved<RawPid> {

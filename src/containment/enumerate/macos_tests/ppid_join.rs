@@ -205,3 +205,32 @@ fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
     let _forced = super::super::fault::force_join_alloc_failure();
     assert_eq!(super::super::snapshot(), (Vec::new(), Vec::new(), 0));
 }
+
+/// `fork()` in progress is transient: it resolves inside the read, so it is neither a denial nor
+/// an error. Mutant: "transient counted as denied".
+#[test]
+fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
+    use crate::identity::{macos_fault, PpidRead};
+    let me = std::process::id() as libc::c_int;
+    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(1)]);
+    let (edges, denied, _) = join_edges(&[me]).expect("edge buffer");
+    assert_eq!(denied, 0);
+    assert_eq!(edges, [(me as u32, 1)]);
+    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 3);
+}
+
+/// A persistent refusal is a denial, read once. Mutant: "a persistent refusal is retried" (a second
+/// read reaches the real one, which resolves it).
+#[test]
+fn a_persistent_refusal_is_a_denial_after_one_read() {
+    use crate::identity::{macos_fault, PpidRead};
+    let me = std::process::id() as libc::c_int;
+    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Refused]);
+    match process_parents() {
+        Err(crate::error::Error::Unassessable { detail, .. }) => {
+            assert!(detail.contains(&format!("sample: [{me}]")), "{detail}")
+        }
+        other => panic!("expected Unassessable, got {other:?}"),
+    }
+    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 1);
+}
