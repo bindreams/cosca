@@ -242,8 +242,9 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     // Synchronise on the pipe: read lines until the marker. libtest prints its own banner
     // first, so scan rather than reading a single line. EOF without the marker means the
     // helper died before writing — a real failure, reported as one.
-    let stdout = child.stdout.take().expect("piped stdout");
-    let ready = marker_seen(stdout);
+    // Borrowed, so the pipe stays open: a helper that prints after the marker (libtest's
+    // `ok`, in single-thread mode) must not find its stdout closed.
+    let ready = marker_seen(child.stdout.as_mut().expect("piped stdout"));
     assert!(ready, "the helper exited without writing its record");
 
     let json = std::fs::read_to_string(&path).expect("the record file is complete by now");
