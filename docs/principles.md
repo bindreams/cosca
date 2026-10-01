@@ -171,7 +171,8 @@ machine.
 
 A test that can't establish its precondition fails with a message that names the precondition and
 how to opt out explicitly. A test that mutates process-wide state (fds 0–2, rlimits, credentials,
-signal dispositions) runs in its own re-exec'd process (`alone()` in
+signal dispositions), or that forks without `spawn_lock` and so copies every other test's open
+descriptors, runs in its own re-exec'd process (`alone()` in
 [`test_support.rs`](../src/containment/cgroup/test_support.rs), `run_fixture_with_cwd()` in
 [`src/test_child.rs`](../src/test_child.rs)), under either test runner, and asserts that it does
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just

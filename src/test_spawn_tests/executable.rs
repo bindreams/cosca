@@ -96,7 +96,7 @@ fn an_unlocked_spawn_is_refused_in_a_process_shared_with_other_tests() {
     let tool = dir.path().join("tool");
     let (gate_read, mut gate_write) = std::io::pipe().expect("gate pipe");
     let gate_fd = gate_read.as_raw_fd();
-    let mut spawner = None;
+    let (mut spawner, mut forked) = (None, false);
     super::locked::write_executable_locked(&tool, 0o755, |file| {
         file.write_all(SCRIPT)?;
         let (mut report_read, report_write) = std::io::pipe()?;
@@ -116,16 +116,17 @@ fn an_unlocked_spawn_is_refused_in_a_process_shared_with_other_tests() {
             crate::test_spawn::spawn_unlocked(&mut cmd)
         }));
         // One byte: the child forked and is parked inside this write. EOF: refused before the fork.
-        let mut report = [0u8; 1];
-        report_read.read(&mut report)?;
+        forked = report_read.read(&mut [0u8; 1])? == 1;
         Ok(())
     })
     .expect("write the tool");
     let status = crate::test_spawn::status(&mut Command::new(&tool));
     gate_write.write_all(&[1]).expect("release a parked child");
     let spawned = spawner.expect("the spawner started").join();
-    if let Ok(Ok(mut child)) = spawned {
-        child.wait().expect("wait for the unlocked child");
+    if forked {
+        if let Ok(Ok(mut child)) = spawned {
+            child.wait().expect("wait for the unlocked child");
+        }
         assert_runs(&tool, status);
         panic!("the unlocked spawn forked in a process shared with other tests");
     }
