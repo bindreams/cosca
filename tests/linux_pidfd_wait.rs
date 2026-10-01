@@ -203,7 +203,7 @@ fn resume(pid: libc::pid_t) {
 
 /// A tid reporter that dies before connecting fails the helper naming the death, not hangs it.
 #[test]
-fn accept_or_die_reader_panics_when_the_tid_reporter_dies_before_connecting() {
+fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_connecting() {
     let (mut child, _writer, listener) = spawn_tid_reporter("--not-a-real-mode");
     let pid = child.id().pid();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_reader(&listener, &mut child)));

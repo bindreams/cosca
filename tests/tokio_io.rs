@@ -1187,17 +1187,17 @@ fn assert_died_before_connecting(message: &str, pid: u32) {
     );
 }
 
-/// Async sibling of the sync `spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
+/// Async sibling of the sync `death_watch_spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
 /// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+async fn death_watch_spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
 }
 
-/// Async sibling of `spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
+/// Async sibling of `death_watch_spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+async fn death_watch_spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
 }
@@ -1216,7 +1216,7 @@ fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca
 
 /// A target that dies before connecting makes `accept_or_die_async` panic naming it, not hang.
 #[tokio::test(flavor = "current_thread")]
-async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
+async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_first() {
     let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
     let pid = child.id().pid();
     let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
@@ -1226,7 +1226,7 @@ async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
 /// A target that connects and exits without waiting for the ack is dead whether or not its
 /// connection reached the accept queue. The child is awaited to completion first.
 #[tokio::test(flavor = "current_thread")]
-async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
     let pid = child.id().pid();
     let status = child.wait().await.expect("wait for the target to exit");
@@ -1237,7 +1237,7 @@ async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_
 
 /// An opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
 #[tokio::test(flavor = "current_thread")]
-async fn accept_or_die_async_acks_the_connection_it_accepts() {
+async fn death_watch_accept_or_die_async_acks_the_connection_it_accepts() {
     use std::io::{Read as _, Write as _};
     let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true);
     let mut sock = common::accept_or_die_async(&listener, &mut child).await;
@@ -1248,9 +1248,9 @@ async fn accept_or_die_async_acks_the_connection_it_accepts() {
     child.wait().await.expect("reap");
 }
 
-/// Async twin of `accept_or_die_also_reports_a_gone_descendant_as_dead`.
+/// Async twin of `death_watch_accept_or_die_also_reports_a_gone_descendant_as_dead`.
 #[tokio::test(flavor = "current_thread")]
-async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
+async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
     let (listener, _addr) = common::bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
@@ -1283,7 +1283,7 @@ async fn accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
 /// Only the GRANDCHILD dies (root alive, connected): the panic names the grandchild the root
 /// reported.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+async fn death_watch_spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
     // The async `Child` was dropped by the unwind before `panic_message_of` returned; the drop only
     // sends the kill.
@@ -1294,7 +1294,7 @@ async fn spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_whil
 
 /// [`spawn_echo_tree_async`]'s twin of the test above.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+async fn death_watch_spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
     common::wait_for_last_async_root();
     let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
@@ -1304,7 +1304,7 @@ async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting
 /// The root reports a live grandchild, then exits without connecting: the main loop fails on the
 /// root.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
+async fn death_watch_spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
     // Contained so unwinding kills the orphaned grandchild. The `Child` is dropped by the unwind
     // before `panic_message_of` returns, but the drop only sends the kill: wait for the exit by
     // identity.
@@ -1338,7 +1338,7 @@ async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_conne
 
 /// The root connects to the report address and exits without reporting.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
+async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-eof", |_| {})).await;
     common::wait_for_last_async_root();
     assert!(
