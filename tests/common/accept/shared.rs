@@ -80,7 +80,6 @@ pub fn run_watcher<T: Debug, E: Display>(
             if let Some(wake) = self.wake.take() {
                 self.outcome
                     .store(Err::<(), _>("the watcher panicked before wait_tree returned"));
-                wake();
             }
         }
     }

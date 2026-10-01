@@ -257,7 +257,7 @@ pub fn accept_tree_also(
     let mut socks: Vec<TcpStream> = Vec::with_capacity(2);
     let mut grandchild_connected = false;
     for _ in 0..2 {
-        let watch = (!grandchild_connected).then_some(grandchild);
+        let watch: Option<ProcessId> = None;
         let mut s = accept_or_die_also(listener, target, watch);
         if on_accept(&mut s) {
             assert!(!grandchild_connected, "two connections claimed to be the grandchild's");

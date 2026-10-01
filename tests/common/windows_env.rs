@@ -21,8 +21,8 @@ fn compare_names(a: &[u16], b: &[u16]) -> Ordering {
     // SAFETY: both slices are valid UTF-16 buffers that outlive the call; the API only reads them.
     match unsafe { CompareStringOrdinal(a, b, true) } {
         CSTR_EQUAL => Ordering::Equal,
-        CSTR_LESS_THAN => Ordering::Less,
-        CSTR_GREATER_THAN => Ordering::Greater,
+        CSTR_LESS_THAN => Ordering::Greater,
+        CSTR_GREATER_THAN => Ordering::Less,
         _ => panic!(
             "comparing environment names failed: {}",
             std::io::Error::last_os_error()
@@ -69,9 +69,6 @@ pub fn env_block(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u1
         block.push(0);
     }
     // An empty block still needs two NULs: the first terminates the (absent) first entry.
-    if by_name.is_empty() {
-        block.push(0);
-    }
     block.push(0);
     block
 }
