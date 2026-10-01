@@ -1,0 +1,19 @@
+name: Upload the nextest JUnit files
+description: >
+  Uploads every JUnit file the job's nextest steps collected in `$RUNNER_TEMP/junit`
+  (.github/scripts/run-nextest.sh), as one artifact per job.
+inputs:
+  name:
+    description: >
+      Artifact name: <job>-<os>-<arch>. The action appends -<run attempt>, so a re-run does not
+      upload into a name the first attempt already used.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Upload the JUnit files
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ${{ inputs.name }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/junit
+        if-no-files-found: error

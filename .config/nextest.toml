@@ -17,6 +17,10 @@ fail-fast = false
 # the noise of a loaded runner.
 leak-timeout = { period = "5s", result = "fail" }
 
+# Every nextest step in ci.yaml uploads this file as an artifact (the `upload-junit` action).
+[profile.ci.junit]
+path = "junit.xml"
+
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
 # `ShellExecuteExW` call likely to hang is wrapped in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
