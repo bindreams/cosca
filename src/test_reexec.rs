@@ -16,8 +16,8 @@ pub const SCRUBBED_ENV: [&str; 2] = ["SKULD_LABELS", "SKULD_NEXTEST_METADATA_PAT
 
 /// `Command::new(program)` for re-executing a test binary, without the [`SCRUBBED_ENV`] variables.
 ///
-/// For a `cosca::Command` or tokio launcher, which cannot take this value, remove
-/// [`SCRUBBED_ENV`] from it instead (tokio: `tokio::process::Command::from(command(program))`).
+/// A raw `tokio::process::Command` takes this value through `From`. For a `cosca::Command` or
+/// `crate::tokio::Command`, which cannot, remove [`SCRUBBED_ENV`] from it instead.
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     for var in SCRUBBED_ENV {

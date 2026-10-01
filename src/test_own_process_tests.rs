@@ -228,14 +228,20 @@ fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
         &[],
         &["--exact", TEST],
         &["--exact", TEST, "--test-threads=1"],
-        &["--exact", TEST, "--test-threads=4", "--include-ignored"],
+        &["--exact", TEST, "--test-threads=4", "--include-ignored", "--nocapture"],
         // The shape from before `--nocapture`.
         &["--exact", TEST, "--test-threads=1", "--include-ignored"],
         &["--exact", TEST, "--test-threads=1", "--nocapture", "--include-ignored"],
         &["--exact", TEST, "--test-threads=1", "--include-ignored", "other"],
-        &[TEST, "--exact", "--test-threads=1", "--include-ignored"],
-        &["--exact", "m::other", "--test-threads=1", "--include-ignored"],
-        &["--test-threads=1", "--include-ignored", "--exact", TEST],
+        &[TEST, "--exact", "--test-threads=1", "--include-ignored", "--nocapture"],
+        &[
+            "--exact",
+            "m::other",
+            "--test-threads=1",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        &["--test-threads=1", "--include-ignored", "--exact", TEST, "--nocapture"],
     ];
     for argv in shared {
         assert_eq!(

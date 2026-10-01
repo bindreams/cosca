@@ -4,7 +4,6 @@
 
 /// Skuld's capture is fd-level and drops a passing test's bytes, so the gate line and every
 /// stdout-based handshake need the child to run uncaptured.
-#[cfg(not(windows))]
 #[test]
 fn fixture_command_disables_capture() {
     let cmd = crate::test_child::fixture_command("m::t");
