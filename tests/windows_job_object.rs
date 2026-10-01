@@ -342,10 +342,13 @@ fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
         .filter(|e| !e.is_empty())
         .map(|e| &e[..e.iter().position(|&u| u == u16::from(b'=')).expect("NAME=value")])
         .collect();
+    // The oracle is `CompareStringOrdinal` itself, not the helper's own ordering.
     for pair in names.windows(2) {
+        // SAFETY: both slices are valid UTF-16 buffers that outlive the call; the API only reads them.
+        let order = unsafe { windows::Win32::Globalization::CompareStringOrdinal(pair[0], pair[1], true) };
         assert_eq!(
-            common::windows_env::compare_names(pair[0], pair[1]),
-            std::cmp::Ordering::Less,
+            order,
+            windows::Win32::Globalization::CSTR_LESS_THAN,
             "entries must be strictly ascending: {:?} then {:?}",
             String::from_utf16_lossy(pair[0]),
             String::from_utf16_lossy(pair[1])
