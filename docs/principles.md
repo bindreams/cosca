@@ -188,14 +188,13 @@ test harness cosca is migrating to ([#151]). Without that explicit `0` the test 
 fails on whatever an environment without support produces: a failed support check never turns into
 a skip.
 
-Today's gates take three shapes, none matching this: some are `#[ignore]`d and opted into with
-`--run-ignored` alone, with no `COSCA_TEST_*` variable at all (the Windows probes and canaries,
-`windows_process_cwd`, the elevation routes, and `dir_tests.rs`'s unshare test); some also assert
-an opt-in variable (`COSCA_TEST_ELEVATION*`); and
-some return early instead (every `gated()` caller in `tests/elevation.rs`, and every
-`require_group` caller, in the library and in `tests/`, whose groups are `CGROUP`, `NAMESPACES` and
-`TRACER`).
-[#234] tracks the migration and is the authoritative inventory of what's left.
+A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
+delegated cgroup with `unshare` permitted.
+
+Today's gates take two shapes, neither matching this: some assert an opt-in variable
+(`COSCA_TEST_ELEVATION*`), and some return early instead (every `gated()` caller in
+`tests/elevation.rs`, and every `require_group` caller, in the library and in `tests/`).
+[#234] tracks the migration, names the groups, and is the authoritative inventory of what's left.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
@@ -229,8 +228,13 @@ members are the tests whose names start with `setuid_` and the `group_teardown_s
 same name-prefix convention as `namespaces_`; a new member takes the gate and that prefix. So does
 `COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids): CI turns
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
-`COSCA_TEST_CGROUP` (the tests that need a delegated cgroup, whose names contain `cgroup` so the
-cgroup lane selects them): CI turns it off workflow-wide and the cgroup step opts in. Some
+`COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane, whose names contain `cgroup`
+so that lane selects them): CI turns it off workflow-wide and the cgroup step opts in. So do the
+Windows groups: `COSCA_TEST_WINDOWS_DRIVE_MAP` (`windows_process_cwd`'s drive mapping),
+`COSCA_TEST_WINDOWS_PATH_CANARY` (the `windows_path_resolution` canaries and surveys),
+`COSCA_TEST_WINDOWS_ELEVATING_PROBES` (`windows_shell_execute`) and
+`COSCA_TEST_WINDOWS_EXECUTING_PROBES` (`windows_shell_resolution` and `windows_elevation_routes`).
+CI turns each off workflow-wide and opts in only in the step or job that runs it. Some
 system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's

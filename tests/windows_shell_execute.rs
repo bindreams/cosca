@@ -13,12 +13,13 @@
 //! (`src/elevation/shell_file.rs`) stay conservative until the consent route is measured, and do
 //! not rest on these results.
 //!
-//! It ELEVATES, so the `windows-probes` workflow runs it in a step of its own, on a runner whose
-//! process is already elevated (GitHub's Windows runners are), so `runas` raises no prompt. It
-//! launches only copies of `cosca_testbin_image` — never a batch file — and registers one volatile
-//! App Paths key in HKLM and then one in HKCU, each deleted by a guard. Creating a volatile key also
-//! creates any missing parent volatile, and that parent is left behind (seen on arm64, whose HKCU
-//! has no `App Paths` key); it goes at the next reboot, with the ephemeral runner.
+//! It ELEVATES, so it is the `WINDOWS_ELEVATING_PROBES` group, which only the `windows-probes`
+//! workflow turns on, in a step of its own, on a runner whose process is already elevated (GitHub's
+//! Windows runners are), so `runas` raises no prompt. It launches only copies of
+//! `cosca_testbin_image` — never a batch file — and registers one volatile App Paths key in HKLM and
+//! then one in HKCU, each deleted by a guard. Creating a volatile key also creates any missing
+//! parent volatile, and that parent is left behind (seen on arm64, whose HKCU has no `App Paths`
+//! key); it goes at the next reboot, with the ephemeral runner.
 //!
 //! The tests share machine-wide state — the registry keys — so each holds [`serial`] for its
 //! whole body too, a holdover from when `cargo test` ran every test in one shared process and
@@ -30,6 +31,8 @@
 //! under nextest.
 #![cfg(windows)]
 
+#[path = "common/mod.rs"]
+mod common;
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 
@@ -369,8 +372,10 @@ fn last_component(path: &str) -> String {
 /// `.exe`, and a `.com` too — and finds nothing by a bare name, in `lpDirectory` or on `PATH`,
 /// where the same launch without the class finds both. `comfile` has no `runas` verb.
 #[test]
-#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
 fn classname_runas_needs_a_full_path() {
+    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
+        return;
+    }
     let _serial = serial();
     let l = layout();
     let mut failures: Vec<String> = Vec::new();
@@ -461,8 +466,10 @@ fn classname_runas_needs_a_full_path() {
 /// and `open` alike, and loads the registered image — but not when launched as `exefile`. An HKCU
 /// registration is not consulted at all; that is printed, not asserted.
 #[test]
-#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
 fn exefile_skips_the_app_paths_lookup() {
+    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
+        return;
+    }
     let _serial = serial();
     let l = layout();
     let app = OsStr::new(APP);
@@ -497,8 +504,10 @@ fn exefile_skips_the_app_paths_lookup() {
 /// alike: with `COSCA_PROBE_PCT=exp` set, `…\%COSCA_PROBE_PCT%\…` loads from, and runs in, the
 /// directory literally named that, not `…\exp\…`.
 #[test]
-#[ignore = "elevating probe: dispatch windows-probes with elevating=true"]
 fn exefile_takes_percent_literally() {
+    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
+        return;
+    }
     let _serial = serial();
     let l = layout();
     let literal_name = "%COSCA_PROBE_PCT%";

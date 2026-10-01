@@ -26,8 +26,10 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// either file's setup could silently make the two probes' conclusions stop actually comparing the
 /// same thing.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, marker) = probe_dir("dot-suppress");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
@@ -148,8 +150,10 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// failure here, never a conclusion about whether the dotted spelling opens the file: see
 /// `SHELL_EXECUTE_BOUND`'s doc.
 #[test]
-#[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
 fn does_a_trailing_dot_still_open_the_extensionless_file() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, marker) = probe_dir("dot-opens");
     let image_bin = PathBuf::from(env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let extensionless = dir.path().join("tool");

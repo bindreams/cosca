@@ -5,10 +5,13 @@ use super::{fd_path, LeafDir};
 /// `fd_path` names the calling thread's own descriptor, even in a thread that no longer shares
 /// the process's descriptor table: there `/proc/self/fd/<n>` is the thread-group leader's `<n>`.
 ///
-/// Container seccomp profiles refuse `unshare`, so the lane, which runs unconfined, runs this.
+/// Container seccomp profiles refuse `unshare`, so it is gated on `CGROUP`, which means the
+/// unconfined cgroup lane: a delegated cgroup with `unshare` permitted.
 #[test]
-#[ignore = "requires unshare(CLONE_FILES), which container seccomp profiles refuse; run in the cgroup lane"]
 fn cgroup_fd_path_names_the_calling_threads_own_descriptor() {
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let (leader_file, thread_file) = (dir.path().join("leader"), dir.path().join("thread"));
     std::fs::write(&leader_file, "").expect("create the leader's file");

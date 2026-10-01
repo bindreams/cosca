@@ -36,8 +36,10 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// and could neither prove nor disprove anything about what runs after this call — nothing observed
 /// after a no-handle handoff is measured by this probe.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_pathext_outrank_an_existing_extensionless_file() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let exe_marker = dir.path().join("precedence-exe.txt");
     let bat_marker = dir.path().join("precedence-bat.txt");
@@ -142,8 +144,10 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 /// race whatever the shell handed the file off to, and no wait, sleep or poll here would turn that
 /// race into proof.
 #[test]
-#[ignore = "launches a copied payload binary; opt in with --ignored, on a throwaway runner only"]
 fn does_an_existing_extensionless_file_ever_launch_directly() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let exe_marker = dir.path().join("no-bat-marker.txt");
 

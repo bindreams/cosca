@@ -76,13 +76,14 @@
 //! that forced class: "no App Paths, no bare-name search, % literal" — see that probe's doc for how
 //! its measurement reconciles with this file's no-class conclusion.
 //!
-//! # Why they are `#[ignore]`d
+//! # Why they are gated
 //!
 //! Most of them execute a batch file. That is the exact vector `reject_batch_path` exists to
-//! refuse, so it must never happen incidentally during `cargo nextest run`. Opt in explicitly:
+//! refuse, so it must never happen incidentally during `cargo nextest run`. They are the
+//! `WINDOWS_EXECUTING_PROBES` group (principle 9). Opt in explicitly:
 //!
 //! ```text
-//! cargo nextest run --test windows_shell_resolution --run-ignored only --no-capture
+//! COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT=1 cargo nextest run --test windows_shell_resolution --no-capture
 //! ```
 //!
 //! Or, from any host OS and without a local Windows VM, dispatch the `windows-probes` workflow with
@@ -98,6 +99,8 @@
 //! elevated process behind.
 #![cfg(windows)]
 
+#[path = "common/mod.rs"]
+mod common;
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 

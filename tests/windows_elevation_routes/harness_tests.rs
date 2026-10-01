@@ -45,3 +45,24 @@ fn extra_overrides_an_inherited_skuld_db_dir() {
         .collect();
     assert_eq!(db, [r"SKULD_DB_DIR=C:\probe\dir"]);
 }
+
+/// The re-run probe checks its group, so the gate and its consent pass by exact name; another
+/// variable that merely shares the prefix is the caller's own and stays behind.
+#[test]
+fn the_group_gate_and_its_consent_pass_by_exact_name_only() {
+    let block = env_block_from(
+        inherited(&[
+            ("COSCA_TEST_WINDOWS_EXECUTING_PROBES", "1"),
+            ("COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT", "1"),
+            ("COSCA_TEST_WINDOWS_EXECUTING_PROBES_TOKEN", "secret"),
+        ]),
+        &[],
+    );
+    assert_eq!(
+        entries(&block),
+        [
+            "COSCA_TEST_WINDOWS_EXECUTING_PROBES=1",
+            "COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT=1",
+        ]
+    );
+}

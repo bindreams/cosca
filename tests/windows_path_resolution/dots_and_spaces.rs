@@ -34,8 +34,10 @@ pub(crate) const ERROR_INVALID_NAME: i32 = 123;
 /// Relative inputs, so each is compared against the current directory `GetFullPathNameW` resolves
 /// them in.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     // (input, what follows the current directory in the result, why)
     let probes = [
         (r"x.bat\y\..", r"x.bat", "`..` pops `y`, exposing the batch file"),
@@ -121,8 +123,10 @@ fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
 /// `\\?\C:\dir\..` is `\\?\C:` naming `C:`. `C:\dir\x` must come back untouched, or the probe
 /// itself is broken.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     // (what follows `C:\dir\`, the plain result, its lpFilePart)
     const MEASURED: &[(&str, &str, Option<&str>)] = &[
         ("...", r"C:\dir\", None),
@@ -177,8 +181,10 @@ fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
 /// (name, spelling) pair gets its OWN directory, so a listing can never be ambiguous about which
 /// attempt produced which entry.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     canary("Windows", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
@@ -280,8 +286,10 @@ fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
 /// Each file holds its own name, so reading a spelling back says exactly which entry it reached.
 /// **Nothing here is executed**: the files are text, not images.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     const LOOKALIKES: &[&str] = &["x.bat.", "x.bat ", "x.bat"];
     canary("Windows", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
@@ -374,8 +382,10 @@ fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
 /// ([`a_final_dots_and_spaces_component_drops_out_and_pops_nothing`]), so a model of path
 /// normalisation needs both.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn an_interior_segment_loses_only_a_single_trailing_period() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     // (segment, what it becomes when not final)
     const INTERIOR: &[(&str, &str)] = &[
         ("x", "x"),
