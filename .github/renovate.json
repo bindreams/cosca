@@ -62,12 +62,12 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "prek hook revs in prek.toml",
+      "description": "prek hook revs in prek.toml, pinned by commit SHA with a `# frozen: <tag>` comment",
       "managerFilePatterns": [
         "/(^|/)prek\\.toml$/"
       ],
       "matchStrings": [
-        "repo = \"https://github\\.com/(?<depName>[^\"/]+/[^\"/]+)\"\\s*\\n(?:\\s*#[^\\n]*\\n)*\\s*rev = \"(?<currentValue>[^\"]+)\""
+        "repo = \"https://github\\.com/(?<depName>[^\"/]+/[^\"/]+)\"\\s*\\n(?:\\s*#[^\\n]*\\n)*\\s*rev = \"(?<currentDigest>[0-9a-f]{40})\"\\s*# frozen: (?<currentValue>\\S+)"
       ],
       "datasourceTemplate": "github-tags"
     }

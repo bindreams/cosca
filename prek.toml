@@ -36,7 +36,7 @@ pass_filenames = false
 
 [[repos]]
 repo = "https://github.com/pre-commit/pre-commit-hooks"
-rev = "v5.0.0"
+rev = "cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b" # frozen: v5.0.0
 hooks = [
   { id = "check-executables-have-shebangs" },
   # Rust inner attributes start with `#![...]`, which the shebang detector
@@ -47,7 +47,7 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
-rev = "3.2.1"
+rev = "3bea62898235acc3f05c1d9c33023345f6cd3c6f" # frozen: 3.2.1
 hooks = [
   # Rust gets `cargo fmt`; markdown gets prettier; both have stronger opinions
   # than .editorconfig and conflict on trailing whitespace, so exclude them.
@@ -57,7 +57,7 @@ hooks = [
 [[repos]]
 # Prettier (rather than mdformat) so trailing-two-space line breaks are preserved.
 repo = "https://github.com/rbubley/mirrors-prettier"
-rev = "v3.8.2"
+rev = "b25652612a4a3c1da8caccfca9af661db56b2c07" # frozen: v3.8.2
 hooks = [
   { id = "prettier", types = ["markdown"] },
 ]
