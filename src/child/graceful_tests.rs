@@ -553,6 +553,9 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
         let mut sock = crate::test_child::accept_or_signalled(&listener, &drained);
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("readiness tag");
+        std::mem::forget(sock);
+        panic!("injected assertion failure");
+        #[allow(unreachable_code)]
         term_fault::set_force_kill_tree_error(true);
         let err = child
             .graceful_shutdown_tree(Duration::from_secs(2))
