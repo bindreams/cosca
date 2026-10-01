@@ -79,6 +79,54 @@ thread_local! {
     static PARENT_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
     static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static VERDICT_GUARDED: Cell<bool> = const { Cell::new(false) };
+    static WATCH_FAULT: Cell<Option<WatchFault>> = const { Cell::new(None) };
+}
+
+// The watch =====
+
+/// How the next watch of an unreported child fails.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WatchFault {
+    /// Its `pidfd_open` fails with this.
+    Open(Errno),
+    /// Its `pidfd_open` succeeds and the move above the stdio slots fails with this.
+    Move(Errno),
+}
+
+/// Disarms the watch fault on drop.
+#[must_use = "dropping this disarms the fault at once"]
+pub(crate) struct ArmedWatchFault(());
+
+/// Make the NEXT watch of an unreported child fail as `fault` says.
+pub(crate) fn fail_watch(fault: WatchFault) -> ArmedWatchFault {
+    WATCH_FAULT.with(|f| f.set(Some(fault)));
+    ArmedWatchFault(())
+}
+
+impl Drop for ArmedWatchFault {
+    fn drop(&mut self) {
+        WATCH_FAULT.with(|f| f.set(None));
+    }
+}
+
+pub(super) fn watch_open_errno() -> Option<Errno> {
+    match WATCH_FAULT.with(Cell::get) {
+        Some(WatchFault::Open(errno)) => {
+            WATCH_FAULT.with(|f| f.set(None));
+            Some(errno)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn watch_move_errno() -> Option<Errno> {
+    match WATCH_FAULT.with(Cell::get) {
+        Some(WatchFault::Move(errno)) => {
+            WATCH_FAULT.with(|f| f.set(None));
+            Some(errno)
+        }
+        _ => None,
+    }
 }
 
 /// Disarms the after-spawn hook on drop.
@@ -125,6 +173,19 @@ pub(crate) fn wait_over_do(hook: impl FnOnce() + 'static) -> crate::oneshot_hook
 
 pub(super) fn wait_over() {
     crate::oneshot_hook::fire(&WAIT_OVER);
+}
+
+/// Fires the wait-over hook when dropped, unwinding included, if it has not fired: a panic on the
+/// spawning thread between `spawn()` returning and the wait's end must still release what the hook
+/// holds, or the scope joins a helper that waits for it. A hook that itself panics here is
+/// contained: a second panic during an unwind would abort.
+#[must_use = "dropping this fires the hook at once"]
+pub(super) struct WaitOverOnDrop;
+
+impl Drop for WaitOverOnDrop {
+    fn drop(&mut self) {
+        _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wait_over));
+    }
 }
 
 // The child =====
@@ -513,9 +574,15 @@ impl HelperSeams {
 
     /// Opens the held verdict when dropped, unwinding included: a panic on the spawning thread (a
     /// hook, an assert) must fail the test, not leave the helper parked where the scope joins it.
+    ///
+    /// The helper probe's gate opens too, but only when unwinding: opened at a normal exit it would
+    /// release a helper nobody joined.
     pub(super) fn open_on_drop(&self) -> OpenOnDrop {
         VERDICT_GUARDED.with(|g| g.set(true));
-        OpenOnDrop(self.verdict.clone())
+        OpenOnDrop {
+            verdict: self.verdict.clone(),
+            probe: self.probe.clone(),
+        }
     }
 
     /// The helper, as it shuts the parent's end.
@@ -536,7 +603,10 @@ impl HelperSeams {
 
 /// See [`HelperSeams::open_on_drop`].
 #[must_use = "dropping this opens the gate at once"]
-pub(super) struct OpenOnDrop(Option<Gate>);
+pub(super) struct OpenOnDrop {
+    verdict: Option<Gate>,
+    probe: Option<HelperProbe>,
+}
 
 /// Whether an [`OpenOnDrop`] is live on this thread.
 pub(crate) fn verdict_guarded() -> bool {
@@ -546,8 +616,11 @@ pub(crate) fn verdict_guarded() -> bool {
 impl Drop for OpenOnDrop {
     fn drop(&mut self) {
         VERDICT_GUARDED.with(|g| g.set(false));
-        if let Some(gate) = &self.0 {
+        if let Some(gate) = &self.verdict {
             gate.open();
+        }
+        if let Some(probe) = self.probe.as_ref().filter(|_| std::thread::panicking()) {
+            probe.release();
         }
     }
 }

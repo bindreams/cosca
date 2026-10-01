@@ -486,6 +486,9 @@ fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
 /// (the child's report then fails, and so does the spawn).
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
+///
+/// Precondition: std returns from `spawn()` before the child's hooks run, so the child is gated
+/// inside `spawn()` until the release; a std that blocks until `exec` hangs the test, not fails it.
 #[test]
 fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
     use std::io::{Seek, Write};
@@ -579,6 +582,71 @@ fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
     assert!(!program_ran(cmd, reader));
 }
 
+/// A child killed before it reports, with a copy of its end held, and a watch that fails as
+/// `fault` says: the parent still forces EOF, so the spawn does not wait on the holder. Returns the
+/// spawn's error text. The child is reaped here when the watch left it unreaped.
+fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> String {
+    let (mut cmd, reader) = marker_command();
+    fault::reset_leaked_pid();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let watch = fault::fail_watch(fault_kind);
+    let probes = fault::arm_end_probes();
+    let err = cmd.spawn().err();
+    drop(probes);
+    drop(watch);
+    drop(armed);
+    let ends = fault::take_ends();
+    drop(holder);
+
+    let ends = assert_ends_closed(ends, &format!("a killed child, a held copy and {fault_kind:?}"));
+    assert!(
+        ends.eof_forced,
+        "{fault_kind:?}: only a forced EOF reaches the helper through the copy"
+    );
+    let err = err
+        .expect("a child killed before it reports fails the spawn")
+        .to_string();
+    if let Some(Some(pid)) = fault::take_leaked_pid() {
+        // SAFETY: `pid` is this thread's own zombie child, so waiting on it is sound.
+        let reaped = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+        assert_eq!(reaped, pid as i32);
+    }
+    assert!(!program_ran(cmd, reader));
+    err
+}
+
+/// A watch that cannot be opened or moved forces EOF and names its cause, whatever the cause.
+///
+/// Mutant: any such failure only warns and returns "keep waiting" (the spawn then waits on the
+/// holder, and the end probes shut the channel and report no forced EOF).
+#[test]
+fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
+    for fault_kind in [
+        fault::WatchFault::Open(Errno::MFILE),
+        fault::WatchFault::Open(Errno::NFILE),
+        fault::WatchFault::Open(Errno::NOMEM),
+        fault::WatchFault::Move(Errno::MFILE),
+    ] {
+        let (fault::WatchFault::Open(errno) | fault::WatchFault::Move(errno)) = fault_kind;
+        let said = killed_child_with_a_failing_watch(fault_kind);
+        assert!(
+            said.contains("its exit could not be watched") && said.contains(&errno.to_string()),
+            "{fault_kind:?}: {said}"
+        );
+    }
+}
+
+/// A watch that finds the number names no child of this process (`ESRCH`; `ENOENT` or `EINVAL`
+/// where a thread took it) means the child is gone: EOF is forced, and the death is the cause.
+#[test]
+fn a_number_that_names_no_child_forces_eof() {
+    for errno in [Errno::SRCH, Errno::NOENT, Errno::INVAL] {
+        let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno));
+        assert!(said.ends_with("died before it could send its pidfd"), "{errno}: {said}");
+    }
+}
+
 /// A spawn that fails before any fork still ends the helper thread: `run` returns.
 ///
 /// Mutant: the spawning thread keeps its copy of the child's end open (`run` hangs).
@@ -615,6 +683,48 @@ fn the_helper_is_joined_before_the_spawn_returns() {
     );
     assert!(child.wait().expect("wait").success());
     assert!(program_ran(cmd, reader));
+}
+
+/// A panic on the spawning thread after `spawn()` returned still fires the wait-over hook, which
+/// releases what a test holds for the wait (the closed-stdio child's gate).
+///
+/// Mutant: the hook fires only on the normal path (a panic leaves the held child gated, and the
+/// scope joins a helper that waits for it).
+#[test]
+fn a_panic_after_the_spawn_still_fires_the_wait_over_hook() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let (mut cmd, _reader) = marker_command();
+    let fired = Rc::new(std::cell::Cell::new(false));
+    let after = fault::after_spawn_returns_do(|_| panic!("the after-spawn hook panicked on purpose"));
+    let over = fault::wait_over_do({
+        let fired = Rc::clone(&fired);
+        move || fired.set(true)
+    });
+    let result = catch_unwind(AssertUnwindSafe(|| cmd.spawn().err()));
+    drop(over);
+    drop(after);
+
+    assert!(result.is_err(), "the hook's panic goes on");
+    assert!(fired.get(), "the wait-over hook must fire on the way out");
+}
+
+/// A panic on the spawning thread still opens the helper probe's gate, so the join does not hang.
+///
+/// Mutant: the gate opens only at the join (a panic before it leaves the helper held at its end,
+/// and the scope waits for it).
+#[test]
+fn a_panic_after_the_spawn_still_opens_the_helper_probe() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let (mut cmd, _reader) = marker_command();
+    let probe = fault::arm_helper_probe();
+    let after = fault::after_spawn_returns_do(|_| panic!("the after-spawn hook panicked on purpose"));
+    let result = catch_unwind(AssertUnwindSafe(|| cmd.spawn().err()));
+    drop(after);
+
+    assert!(result.is_err(), "the hook's panic goes on");
+    assert!(probe.finished(), "the helper must have run to its end");
 }
 
 // Pid namespaces =====
@@ -935,4 +1045,99 @@ fn an_abandoned_child_is_worded_by_its_cause() {
     super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport).err();
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(why.contains("died before it sent its pidfd"), "{why}");
+}
+
+/// A child dies before it reports and a foreign reaper reaps it, a copy of its end is held, and the
+/// number goes to a THREAD of this process: the watch finds no thread-group leader (`ENOENT` or
+/// `EINVAL`, by kernel), so the child is gone and EOF is forced. The spawn does not wait on the
+/// holder.
+///
+/// Mutant: only `ESRCH` means gone (the spawn waits on the holder; the end probes shut the channel
+/// and report no forced EOF).
+#[test]
+fn namespaces_a_thread_taking_the_number_never_holds_the_spawn() {
+    if !ns::enabled() {
+        return;
+    }
+    ns::run(fixture_path!(fixture_thread_reuse_driver));
+}
+
+#[test]
+fn fixture_thread_reuse_driver() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_new_pid_ns_for_children();
+    ns::run(fixture_path!(fixture_thread_reuse_init));
+}
+
+/// Pid 1 of a fresh pid namespace, where only this fixture allocates numbers.
+#[test]
+fn fixture_thread_reuse_init() {
+    if !ns::is_child_in_new_pid_ns() {
+        return;
+    }
+    own_procfs();
+    let (mut cmd, reader) = marker_command();
+    fault::reset_leaked_pid();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel::<u32>();
+    let reuser: Rc<RefCell<Option<std::thread::JoinHandle<()>>>> = Rc::default();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let probes = fault::arm_end_probes();
+    let after = fault::after_spawn_returns_do({
+        let reuser = Rc::clone(&reuser);
+        move |pid| {
+            let pid = pid.expect("the spawned child's pid");
+            // A foreign reaper: the child is dead of its own SIGKILL.
+            // SAFETY: `pid` is this thread's own child, which kills itself.
+            let reaped = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+            assert_eq!(
+                reaped,
+                pid as i32,
+                "reap the child: {}",
+                std::io::Error::last_os_error()
+            );
+            ns::set_last_pid(pid - 1);
+            let thread = std::thread::spawn(move || {
+                // SAFETY: `gettid` takes no arguments.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                tid_tx.send(tid).expect("report the thread's id");
+                // Alive until the test is done: the number stays taken.
+                _ = stop_rx.recv();
+            });
+            assert_eq!(
+                tid_rx.recv().expect("the thread's id"),
+                pid,
+                "precondition: the thread takes the reaped child's number"
+            );
+            *reuser.borrow_mut() = Some(thread);
+        }
+    });
+    let err = cmd.spawn().err();
+    drop(after);
+    drop(probes);
+    drop(armed);
+    let ends = fault::take_ends();
+    drop(holder);
+    drop(stop_tx);
+    reuser
+        .borrow_mut()
+        .take()
+        .expect("the after-spawn hook ran")
+        .join()
+        .expect("join the thread");
+
+    let ends = assert_ends_closed(ends, "a thread that took a reaped child's number");
+    assert!(ends.eof_forced, "a number that names no leader means the child is gone");
+    let pid = fault::take_leaked_pid()
+        .expect("the unreaped child is named")
+        .expect("it has a pid");
+    assert_eq!(
+        err.expect("a child that died before reporting fails the spawn")
+            .to_string(),
+        format!("the spawned child (pid {pid}) died before it could send its pidfd")
+    );
+    assert!(!program_ran(cmd, reader));
 }

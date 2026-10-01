@@ -153,6 +153,9 @@ enum Outcome {
     Failed(Error, Option<OwnedFd>),
     /// EOF before any report: the child died before it could report, or never reached its hook.
     NoReport,
+    /// [`Outcome::NoReport`], the EOF forced because the child's exit could not be watched. Carries
+    /// why.
+    Unwatched(String),
 }
 
 /// Registers the hook on `cmd`, as its FIRST `pre_exec` hook where the caller can arrange it: the
@@ -344,6 +347,8 @@ impl Handshake {
             };
 
             #[cfg(test)]
+            let _wait_over = fault::WaitOverOnDrop;
+            #[cfg(test)]
             fault::count_spawn();
             #[cfg(test)]
             fault::fork_holder_if_armed();
@@ -356,10 +361,20 @@ impl Handshake {
             drop(child_end);
             #[cfg(test)]
             ends.check_copies_closed();
+            let mut unwatched = None;
             let finished = match &spawned {
                 // std collected the child, or never forked.
                 Err(_) => true,
-                Ok(child) => child_exited_before_the_helper_finished(child.pid(), done),
+                Ok(child) => match child_exited_before_the_helper_finished(child.pid(), done) {
+                    Watch::Running => false,
+                    Watch::Exited => true,
+                    // Not knowing is no reason to wait on a copy this process cannot see: with
+                    // open stdio the child has execed or died, so nothing is lost by the EOF.
+                    Watch::Unwatchable(cause) => {
+                        unwatched = Some(cause);
+                        true
+                    }
+                },
             };
             // Nothing is left to report, but a copy of the child's end made by a fork without
             // `exec` (any thread, in or outside cosca) outlives the child and keeps the helper
@@ -380,15 +395,30 @@ impl Handshake {
                 #[cfg(test)]
                 &seams,
             );
+            let outcome = match (outcome, unwatched) {
+                (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
+                (outcome, _) => outcome,
+            };
             conclude(spawned, outcome)
         })
     }
 }
 
+/// What the wait after a successful `spawn()` found.
+enum Watch {
+    /// The helper finished first, or there is nothing to watch.
+    Running,
+    /// The child exited while the helper still waited, or its number names no child of this one.
+    Exited,
+    /// The child could not be watched, for this cause.
+    Unwatchable(String),
+}
+
 /// After a successful `spawn()`: blocks until the helper is done or the child has exited, and says
 /// whether the child exited while the helper still waited. The wait is the child's own progress
-/// to its report, as `spawn()`'s is to `exec`.
-fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> bool {
+/// to its report, as `spawn()`'s is to `exec`. A child that cannot be watched is
+/// [`Watch::Unwatchable`]: the caller forces EOF, as for an exit.
+fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> Watch {
     use std::os::fd::AsFd;
 
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -407,75 +437,89 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     let mut fds = [PollFd::new(done, PollFlags::IN)];
     let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
     if helper_done(&mut fds, Some(&zero)).is_ok() && fds[0].revents().contains(PollFlags::IN) {
-        return false;
+        return Watch::Running;
     }
     let Some(raw) = pid
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(rustix::process::Pid::from_raw)
     else {
         debug_assert!(false, "a spawned child without a pid: {pid:?}");
-        return false;
+        return Watch::Running;
+    };
+    let unwatchable = |what: &str, e: &dyn std::fmt::Display| {
+        let cause = format!("{what}: {e}");
+        log::warn!(
+            "{}: the spawned child's exit cannot be watched ({cause}); the wait for its report is ended",
+            super::named(pid)
+        );
+        Watch::Unwatchable(cause)
     };
     // A watch only, opened by number. The number is the child's own while the child is an unreaped
-    // child of this process. After a foreign reap, `ESRCH` or the peek's `ECHILD` shows it only
-    // while the number is still free.
+    // child of this process. After a foreign reap, it shows only while the number is free
+    // (`ESRCH`, or the peek's `ECHILD`), or names no thread-group leader (`ENOENT` or `EINVAL`,
+    // by kernel: a thread of this process took it).
     //
     // The window that remains, until #383 (an atomic pidfd) removes the watch: the number can be
     // reaped by a foreign reaper (a `SIG_IGN` host, another thread's `waitpid(-1)`) and taken by a
-    // RUNNING child of this process, and then the watch opens that child and the peek answers
-    // `Running`. Nothing is signalled through the watch, but the poll below then waits until the
-    // helper is done or that child exits. It needs ALL of:
+    // RUNNING child or tracee of this process, and then the watch opens that process and the peek
+    // answers `Running`. Nothing is signalled through the watch, but the poll below then waits
+    // until the helper is done or that process exits. It needs ALL of:
     //  1. the child dies before it reports, so the helper is not done when this code looks;
-    //  2. a fork without `exec` (any thread) copied the child's end while `spawn()` ran, so the
-    //     helper cannot read EOF by itself: without a copy, the helper finishes at the child's death
-    //     and ends the poll at once;
+    //  2. a fork without `exec` (any thread) copied the child's end, at any point from
+    //     `Pending::open` until the spawning thread closes its own copy after `spawn()`, so the
+    //     helper cannot read EOF by itself: without a copy, the helper finishes at the child's
+    //     death and ends the poll at once;
     //  3. a foreign reap of the child;
-    //  4. the number taken by a running child of this process before the watch opens.
-    // Closed stdio is NOT needed.
-    let watch = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
-        Ok(watch) => match above_stdio(watch) {
-            Ok(watch) => watch,
-            Err(e) => {
-                log::warn!(
-                    "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
-                    super::named(pid)
-                );
-                return false;
+    //  4. the number taken, before the watch opens, by a process that is a RUNNING child or tracee
+    //     of this process (`waitid` on its pidfd answers "nothing to report" for both).
+    // Closed stdio is NOT needed. A number taken by a thread, a zombie child or a non-child is
+    // not in the window, and neither is a watch that cannot be opened: those force EOF.
+    #[cfg(test)]
+    let injected = fault::watch_open_errno();
+    #[cfg(not(test))]
+    let injected = None;
+    let opened = match injected {
+        Some(errno) => Err(errno),
+        None => rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()),
+    };
+    let watch = match opened {
+        Ok(watch) => {
+            #[cfg(test)]
+            let moved = match fault::watch_move_errno() {
+                Some(errno) => Err(Error::Io(io::Error::from(errno))),
+                None => above_stdio(watch),
+            };
+            #[cfg(not(test))]
+            let moved = above_stdio(watch);
+            match moved {
+                Ok(watch) => watch,
+                Err(e) => return unwatchable("moving its pidfd above stdio", &e),
             }
-        },
-        Err(Errno::SRCH) => return true,
-        Err(e) => {
-            log::warn!(
-                "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
-                super::named(pid)
-            );
-            return false;
         }
+        // The child was reaped, and the number is free or names no thread-group leader.
+        Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Watch::Exited,
+        Err(e) => return unwatchable("pidfd_open", &e),
     };
     match peek(&Target::PidFd(watch.as_fd())) {
-        Ok(Peek::Foreign(_) | Peek::Exit(_)) => return true,
+        Ok(Peek::Foreign(_) | Peek::Exit(_)) => return Watch::Exited,
         Ok(Peek::Running) => {}
         Err(e) => {
-            log::warn!(
-                "{}: the spawned child's exit cannot be watched ({e}); the spawn waits for its report",
-                super::named(pid)
-            );
             debug_assert!(false, "waitid on a spawned child's pidfd failed: {e}");
-            return false;
+            return unwatchable("waitid on its pidfd", &e);
         }
     }
     #[cfg(test)]
     fault::before_awaiting_the_child();
     let mut fds = [PollFd::new(done, PollFlags::IN), PollFd::new(&watch, PollFlags::IN)];
     if let Err(e) = helper_done(&mut fds, None) {
-        log::warn!(
-            "{}: poll on the spawn handshake failed ({e}); the spawn waits for its report",
-            super::named(pid)
-        );
         debug_assert!(false, "poll on an eventfd and a pidfd failed: {e}");
-        return false;
+        return unwatchable("poll on its pidfd", &e);
     }
-    !fds[0].revents().contains(PollFlags::IN) && !fds[1].revents().is_empty()
+    if !fds[0].revents().contains(PollFlags::IN) && !fds[1].revents().is_empty() {
+        Watch::Exited
+    } else {
+        Watch::Running
+    }
 }
 
 /// The helper thread could not be started, so nothing was forked.
@@ -721,7 +765,14 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held
             }
             Err(e)
         }
-        (Err(e), Outcome::NoReport) => Err(Error::Io(e)),
+        (Ok(child), Outcome::Unwatched(cause)) => {
+            let named = super::named(child.pid());
+            child.abandon_unreported("it sent no pidfd, and its exit could not be watched");
+            Err(Error::Io(io::Error::other(format!(
+                "the spawned child ({named}) sent no pidfd, and its exit could not be watched ({cause})"
+            ))))
+        }
+        (Err(e), Outcome::NoReport | Outcome::Unwatched(_)) => Err(Error::Io(e)),
     }
 }
 
