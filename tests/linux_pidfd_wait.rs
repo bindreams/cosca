@@ -85,8 +85,16 @@ fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
     };
 
     // This thread is the tracer: it must attach, wait and resume.
-    // SAFETY: PTRACE_SEIZE on this process's own child; the argument list matches the request.
-    let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE, leader, 0, libc::PTRACE_O_TRACECLONE) };
+    // SAFETY: PTRACE_SEIZE on this process's own child. `ptrace` is variadic and the kernel reads
+    // `addr`/`data` at full width, so pass pointer-width values.
+    let seized = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SEIZE,
+            leader,
+            std::ptr::null_mut::<libc::c_void>(),
+            libc::PTRACE_O_TRACECLONE as usize as *mut libc::c_void,
+        )
+    };
     assert_eq!(seized, 0, "PTRACE_SEIZE: {}", std::io::Error::last_os_error());
     tracer
         .writer()
@@ -96,11 +104,19 @@ fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
     // The leader stops at its clone event; the new thread starts stopped.
     let clone_event = wait_stop(leader);
     let mut new_tid: libc::c_ulong = 0;
-    // SAFETY: PTRACE_GETEVENTMSG writes one `unsigned long` through the data pointer.
-    let got = unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, leader, 0, &raw mut new_tid) };
+    // SAFETY: PTRACE_GETEVENTMSG writes one `unsigned long` through the data pointer. `ptrace` is
+    // variadic and the kernel reads `addr`/`data` at full width, so pass pointer-width values.
+    let got = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETEVENTMSG,
+            leader,
+            std::ptr::null_mut::<libc::c_void>(),
+            &raw mut new_tid,
+        )
+    };
+    assert_eq!(got, 0, "PTRACE_GETEVENTMSG: {}", std::io::Error::last_os_error());
     let worker = new_tid as libc::pid_t;
     tracer.worker = Some(worker);
-    assert_eq!(got, 0, "PTRACE_GETEVENTMSG: {}", std::io::Error::last_os_error());
     assert_eq!(clone_event >> 16, libc::PTRACE_EVENT_CLONE, "status {clone_event:#x}");
     wait_stop(worker);
     resume(leader);
@@ -192,7 +208,15 @@ fn wait_stop(pid: libc::pid_t) -> i32 {
 }
 
 fn resume(pid: libc::pid_t) {
-    // SAFETY: PTRACE_CONT on a stopped tracee of this thread, delivering no signal.
-    let rc = unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) };
+    // SAFETY: PTRACE_CONT on a stopped tracee of this thread, delivering no signal. `ptrace` is
+    // variadic and the kernel reads `addr`/`data` at full width, so pass pointer-width values.
+    let rc = unsafe {
+        libc::ptrace(
+            libc::PTRACE_CONT,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
     assert_eq!(rc, 0, "PTRACE_CONT({pid}): {}", std::io::Error::last_os_error());
 }
