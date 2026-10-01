@@ -25,6 +25,45 @@ fail-fast = false
 # the noise of a loaded runner.
 leak-timeout = { period = "5s", result = "fail" }
 
+# Every nextest step in ci.yaml uploads this file as an artifact (the `upload-junit` action).
+[profile.ci.junit]
+path = "junit.xml"
+
+# One profile per Unix step in ci.yaml (`.github/scripts/run-nextest.py` selects it through
+# `NEXTEST_PROFILE`), so a straggler from one step can only ever write that step's own JUnit file.
+# Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows keeps the shared `ci`
+# profile (run-nextest.ps1): after a failed or timed-out step every later step is skipped, so
+# nothing a surviving process writes can reach a published file.
+[profile.ci-tests]
+inherits = "ci"
+
+[profile.ci-pty]
+inherits = "ci"
+
+[profile.ci-tokio]
+inherits = "ci"
+
+[profile.ci-serde]
+inherits = "ci"
+
+[profile.ci-release]
+inherits = "ci"
+
+[profile.ci-release-tokio]
+inherits = "ci"
+
+[profile.ci-cgroup]
+inherits = "ci"
+
+[profile.ci-setuid]
+inherits = "ci"
+
+[profile.ci-setuid-root]
+inherits = "ci"
+
+[profile.ci-root]
+inherits = "ci"
+
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
 # `ShellExecuteExW` call likely to hang is wrapped in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
