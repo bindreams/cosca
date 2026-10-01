@@ -108,12 +108,34 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// zombie collectable.
 #[cfg(unix)]
 pub fn block_until_zombie(pid: cosca::identity::RawPid) {
+    zombie_record(pid);
+}
+
+/// [`block_until_zombie`], then the zombie's exit status, still without reaping it.
+#[cfg(unix)]
+pub fn zombie_exit_status(pid: cosca::identity::RawPid) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    let si = zombie_record(pid);
+    #[cfg(target_os = "linux")]
+    // SAFETY: `waitid` returned a `SIGCHLD` record, whose status field is set.
+    let status = unsafe { si.si_status() };
+    #[cfg(target_os = "macos")]
+    let status = si.si_status;
+    // A wait status: an exit code in the second byte, or the terminating signal in the first.
+    match si.si_code {
+        libc::CLD_EXITED => std::process::ExitStatus::from_raw((status & 0xff) << 8),
+        _ => std::process::ExitStatus::from_raw(status & 0x7f),
+    }
+}
+
+#[cfg(unix)]
+fn zombie_record(pid: cosca::identity::RawPid) -> libc::siginfo_t {
     loop {
         let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `si` is a valid, correctly-sized out-param; `pid` is our own unreaped child.
         let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
         if rc == 0 {
-            return;
+            return si;
         }
         // EINTR is a restart, not a failure — the codebase's convention for every blocking
         // syscall (see `wait/macos.rs`, `identity/macos/kinfo.rs`).
@@ -141,9 +163,10 @@ pub fn block_until_zombie(pid: cosca::identity::RawPid) {
 /// left in this crate: `spawn_io.rs`'s `stderr_log::install` is now a thin alias for it.
 mod log_capture {
     use std::sync::{Mutex, OnceLock};
+    use std::thread::ThreadId;
 
     struct CaptureLog;
-    static RECORDS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+    static RECORDS: Mutex<Vec<(log::Level, String, ThreadId)>> = Mutex::new(Vec::new());
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
     impl log::Log for CaptureLog {
@@ -153,7 +176,10 @@ mod log_capture {
         fn log(&self, record: &log::Record<'_>) {
             let text = record.args().to_string();
             eprintln!("[{}] {text}", record.level());
-            RECORDS.lock().unwrap().push((record.level(), text));
+            RECORDS
+                .lock()
+                .unwrap()
+                .push((record.level(), text, std::thread::current().id()));
         }
         fn flush(&self) {}
     }
@@ -172,7 +198,18 @@ mod log_capture {
     }
 
     pub fn contains_since(mark: usize, needle: &str) -> bool {
-        RECORDS.lock().unwrap()[mark..].iter().any(|(_, m)| m.contains(needle))
+        RECORDS.lock().unwrap()[mark..]
+            .iter()
+            .any(|(_, m, _)| m.contains(needle))
+    }
+
+    /// [`contains_since`] for records emitted on this thread only: what this thread's own drops
+    /// logged, unmixed with the tests `cargo test` runs on other threads of the same process.
+    pub fn contains_since_on_this_thread(mark: usize, needle: &str) -> bool {
+        let me = std::thread::current().id();
+        RECORDS.lock().unwrap()[mark..]
+            .iter()
+            .any(|(_, m, thread)| *thread == me && m.contains(needle))
     }
 
     /// The levels of every record emitted at or after `mark` that contains `needle`: the twin of
@@ -181,12 +218,14 @@ mod log_capture {
     pub fn levels_since(mark: usize, needle: &str) -> Vec<log::Level> {
         RECORDS.lock().unwrap()[mark..]
             .iter()
-            .filter(|(_, m)| m.contains(needle))
-            .map(|(level, _)| *level)
+            .filter(|(_, m, _)| m.contains(needle))
+            .map(|(level, _, _)| *level)
             .collect()
     }
 }
-pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
+pub use log_capture::{
+    contains_since, contains_since_on_this_thread, install as install_log_capture, levels_since, mark as log_mark,
+};
 
 pub mod test_enablement;
 pub use test_enablement::require_group;

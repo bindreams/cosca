@@ -1224,11 +1224,15 @@ async fn accept_or_die_async_panics_loudly_when_the_target_dies_first() {
 }
 
 /// A target that connects and exits without waiting for the ack is dead whether or not its
-/// connection reached the accept queue. The child is awaited to completion first.
+/// connection reached the accept queue. The child has exited first, and on Unix is left unreaped
+/// as the harness requires.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
     let pid = child.id().pid();
+    #[cfg(unix)]
+    let status = common::zombie_exit_status(pid);
+    #[cfg(windows)]
     let status = child.wait().await.expect("wait for the target to exit");
     assert!(status.success(), "control-once should exit 0, got {status}");
     let message = panic_message_of(async move { common::accept_or_die_async(&listener, &mut child).await }).await;
@@ -1305,35 +1309,59 @@ async fn spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting
 /// root.
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
-    // Contained so unwinding kills the orphaned grandchild. The `Child` is dropped by the unwind
-    // before `panic_message_of` returns, but the drop only sends the kill: wait for the exit by
-    // identity.
+    async_root_dies_after_reporting().await;
+}
+
+/// The test above with the root's exit complete before the harness first looks at it, where the
+/// look used to reap it.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_after_reporting_before_the_harness_looks() {
+    let _exited = common::on_release(common::until_reapable);
+    async_root_dies_after_reporting().await;
+}
+
+/// Contained so unwinding kills the orphaned grandchild. The `Child` is dropped by the unwind
+/// before `panic_message_of` returns, but the drop only sends the kill: wait for the exits by
+/// identity.
+async fn async_root_dies_after_reporting() {
+    common::install_log_capture();
+    let mark = common::log_mark();
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-then-exit", |cmd| {
         cmd.contain();
     }))
     .await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
-    let id = common::last_reported_grandchild_id()
-        .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
-    assert_eq!(
-        common::last_reported_grandchild_contained(),
-        Some(true),
-        "the grandchild must be inside the root's containment when identified, or the drop does not kill it"
-    );
-    assert_eq!(
-        common::last_reported_grandchild_liveness(),
-        Some(cosca::identity::Liveness::Alive),
-        "the grandchild must be alive when identified, so its exit is the containment kill's"
-    );
-    cosca::Process::from_id(id)
-        .wait()
-        .expect("wait for the orphaned grandchild");
+    common::wait_for_the_dropped_trees_grandchild(mark, &message);
     common::wait_for_last_async_root();
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(
         !message.contains(&format!("(pid {grandchild})")),
         "the live grandchild must not be the one blamed: {message:?}"
     );
+}
+
+/// A contained root that dies after spawning its grandchild and before reporting it: the report
+/// read must not reap the root, or the drop skips its group kill and the grandchild outlives the
+/// tree. The hook lets the root become a zombie before the read's first look, where tokio's macOS
+/// reaper used to reap it.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tree_async_panics_when_the_root_dies_after_spawning_before_reporting() {
+    common::install_log_capture();
+    let mark = common::log_mark();
+    let _exited = common::on_report_accepted(common::until_reapable);
+    let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-then-report-eof", |cmd| {
+        cmd.contain();
+    }))
+    .await;
+    assert!(
+        message.contains("died before it reported the grandchild pid"),
+        "got: {message:?}"
+    );
+    assert!(
+        !common::drop_skipped_its_kill(mark),
+        "the tree's drop skipped its kill because the report read reaped the root, which leaves the grandchild running"
+    );
+    common::wait_for_last_async_root();
 }
 
 /// The root connects to the report address and exits without reporting.

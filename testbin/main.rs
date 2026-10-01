@@ -533,6 +533,24 @@ fn main() {
             let addr = std::env::var("COSCA_TEST_GC_PID_ADDR").expect("COSCA_TEST_GC_PID_ADDR");
             let _sock = crate::ack::connect_control(addr).unwrap();
         }
+        "spawn-grandchild-then-report-eof" => {
+            // spawn-grandchild-report-eof after spawning a live grandchild: a contained tree whose
+            // root dies between its grandchild and its report, leaving the grandchild in the tree.
+            let addr = args[2].clone();
+            let exe = std::env::current_exe().unwrap();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
+            )]
+            let _gc = KeptGrandchild(
+                std::process::Command::new(exe)
+                    .args(["control-block", &addr, "G"])
+                    .spawn()
+                    .unwrap(),
+            );
+            let report = std::env::var("COSCA_TEST_GC_PID_ADDR").expect("COSCA_TEST_GC_PID_ADDR");
+            let _sock = crate::ack::connect_control(report).unwrap();
+        }
         "hold-until-stdin-eof" => {
             // Alive and silent until the test closes our stdin, then exits 0: an exit the test
             // triggers at a moment of its choosing, with no network involved.
