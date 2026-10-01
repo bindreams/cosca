@@ -27,6 +27,9 @@ pub use accept::*;
 #[cfg(target_os = "macos")]
 pub mod kevent_eintr;
 
+#[cfg(windows)]
+pub mod windows_env;
+
 mod locked;
 pub use locked::*;
 
