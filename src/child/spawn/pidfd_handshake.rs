@@ -43,8 +43,9 @@
 //!   by itself.
 //! - A copy made by a fork without `exec` (any thread, in or outside cosca) outlives the child, so
 //!   the parent can also force EOF: `shutdown` of the read side of its own end. It does so once
-//!   nothing is left to report. A failed `spawn()` means that at once: std collected the child, or
-//!   never forked. A successful one means the child has execed or died, except that std returns
+//!   nothing is left to report. A failed `spawn()` means that at once: std collected the child (by its own
+//!   by-pid wait, see residuals b and c in [`child_exited_before_the_helper_finished`]), or never
+//!   forked. A successful one means the child has execed or died, except that std returns
 //!   before the child's hooks even run when this process has two of fds 0 to 2 closed (see
 //!   [`ReportChannel`]). So the parent then waits for the helper to finish or the child to exit,
 //!   watched through a pidfd opened on its number, and forces EOF only if the child exited first.
@@ -292,7 +293,8 @@ impl Handshake {
     /// Runs `spawn` (the fork) with the helper thread alive beside it, then answers the pidfd.
     ///
     /// - A failed `pidfd_open` in the child is the error, whatever `spawn` answered: the child
-    ///   aborted, and std collected it.
+    ///   aborted, and std collected it by pid (see residuals b and c in
+    ///   [`child_exited_before_the_helper_finished`]).
     /// - If the helper thread cannot be started, `spawn` is never called: no child exists.
     /// - A child killed before it reported leaves `spawn` answering `Ok` (std reads the closed
     ///   status pipe as success) and the helper at EOF. It is dead but unreaped, and its number
@@ -303,7 +305,8 @@ impl Handshake {
     ///   end (this thread's goes when `spawn()` returns). If the send meets a closed end, the child
     ///   is reaped through the pidfd and the spawn fails. Otherwise GO is buffered, and the spawn
     ///   succeeds with a child that died. Either way the pidfd names it.
-    /// - A spawn that fails after its fork: std collected the child, or tokio dropped it neither
+    /// - A spawn that fails after its fork: std collected the child (see residuals b and c in
+    ///   [`child_exited_before_the_helper_finished`]), or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
     ///   through it.
     pub(crate) fn run<T: Spawned>(self, spawn: impl FnOnce() -> io::Result<T>) -> Result<Held<T>, Error> {
@@ -380,7 +383,7 @@ impl Handshake {
             ends.check_copies_closed();
             let mut unwatched = None;
             let finished = match &spawned {
-                // std collected the child, or never forked.
+                // std collected the child (its by-pid wait, residuals b and c), or never forked.
                 Err(_) => true,
                 Ok(child) => match child_exited_before_the_helper_finished(child.pid(), done) {
                     Watch::Running => false,
@@ -504,7 +507,7 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     //     that wait. Nothing hooks the parent inside that interval.
     //  b. After a pre-exec failure report (an exec failure, or a handshake abort), std waits for
     //     the child by pid. With `SIGCHLD` set to `SIG_IGN` that wait fails and std panics, where
-    //     `posix_spawn` returns `Err(NotFound)`.
+    //     `posix_spawn` returns the exec error (`PermissionDenied` for a mode-644 file, say).
     //  c. In the same wait, a foreign reap of the child plus reuse of its number lets std wait on,
     //     and reap, an unrelated child, losing its exit status.
     #[cfg(test)]
