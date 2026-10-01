@@ -89,8 +89,8 @@ if ($vcRuntimeInstalled) {
     Write-Host "devvm: installed VC++ redistributable"
 }
 
-# This version matches CI's own cargo-nextest pin (.github/workflows/ci.yaml, tool:
-# cargo-nextest@0.9.146). Installing the same version here means `devvm.py run
+# This version matches CI's own cargo-nextest pin (`NEXTEST_VERSION` in
+# .github/workflows/ci.yaml). Installing the same version here means `devvm.py run
 # windows-x64 -- cargo nextest run ...` matches what CI actually runs, instead of whatever
 # a fresh install would resolve to today.
 #
@@ -103,12 +103,14 @@ if ($vcRuntimeInstalled) {
 # binary - it runs fine regardless of the local toolchain being the GNU host triplet above,
 # since nextest only shells out to `cargo build` and then runs the resulting test binaries
 # directly; it doesn't need to have been built with the same toolchain itself.
-$nextestVersion = "0.9.146"
+#
 # SHA-256 of the exact release asset, fetched and independently verified (both against
 # the GitHub release's own asset digest and a fresh `shasum -a 256` of a freshly downloaded
 # copy) 2026-10-01. Checked before extracting (below) so a corrupted or tampered download is a
-# hard failure, never silently `Expand-Archive`'d.
-$nextestSha256 = "0fa689815c8157e4633225b6b173184b3d546eb6ffb754c3d0e6ea5973284a20"
+# hard failure, never silently `Expand-Archive`'d. The release tag and checksum share one line,
+# so Renovate's github-release-attachments lookup moves both together.
+$nextestTag = "cargo-nextest-0.9.146"; $nextestSha256 = "0fa689815c8157e4633225b6b173184b3d546eb6ffb754c3d0e6ea5973284a20"
+$nextestVersion = $nextestTag -replace '^cargo-nextest-', ''
 $installedVersion = if (Get-Command cargo-nextest -ErrorAction SilentlyContinue) {
     ((cargo nextest --version 2>$null) -split " ")[1]
 } else {

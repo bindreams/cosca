@@ -140,6 +140,22 @@
     },
     {
       "customType": "regex",
+      "description": "cargo-nextest release assets the devvm scripts download: tag and SHA-256 on one line, so the digest moves with the version",
+      "managerFilePatterns": [
+        "/^scripts/devvm/provision/(linux-rust\\.sh|windows-rust\\.ps1)$/"
+      ],
+      "matchStrings": [
+        "NEXTEST_TAG=\"(?<currentValue>cargo-nextest-[^\"]+)\" NEXTEST_SHA256=\"(?<currentDigest>[0-9a-f]{64})\"",
+        "\\$nextestTag = \"(?<currentValue>cargo-nextest-[^\"]+)\"; \\$nextestSha256 = \"(?<currentDigest>[0-9a-f]{64})\""
+      ],
+      "depNameTemplate": "nextest-rs/nextest",
+      "datasourceTemplate": "github-release-attachments",
+      "depTypeTemplate": "ci-tool",
+      "matchStringsStrategy": "any",
+      "versioningTemplate": "regex:^cargo-nextest-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "customType": "regex",
       "description": "cargo-hack installed by taiki-e/install-action",
       "managerFilePatterns": [
         "/^\\.github/.+\\.ya?ml$/"

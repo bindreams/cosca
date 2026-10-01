@@ -20,8 +20,8 @@ else
     echo "devvm: installed $("$HOME/.cargo/bin/cargo" --version)"
 fi
 
-# This version matches CI's own cargo-nextest pin (.github/workflows/ci.yaml, tool:
-# cargo-nextest@0.9.146). Installing the same version here means `devvm.py run <linux
+# This version matches CI's own cargo-nextest pin (`NEXTEST_VERSION` in
+# .github/workflows/ci.yaml). Installing the same version here means `devvm.py run <linux
 # guest> -- cargo nextest run ...` matches what CI actually runs, instead of whatever a
 # fresh install would resolve to today.
 #
@@ -32,7 +32,27 @@ fi
 # CPU — not hung, just too slow to be workable for a throwaway VM that gets destroyed and
 # recreated often. The prebuilt binary is standalone; it doesn't need to have been built with
 # the same toolchain as whatever `cargo` ends up building cosca's own test binaries with.
-NEXTEST_VERSION="0.9.146"
+#
+# SHA-256 of the exact release asset, fetched and independently verified (both against the
+# GitHub release's own asset digest and a fresh `shasum -a 256` of a freshly downloaded copy)
+# 2026-10-01. Checked before extracting (below) so a corrupted or tampered download is a hard
+# failure, never silently `tar -x`'d. Each arm keeps its release tag and checksum on one line,
+# so Renovate's github-release-attachments lookup moves both together.
+case "$(uname -m)" in
+x86_64)
+    NEXTEST_TARGET="x86_64-unknown-linux-gnu"
+    NEXTEST_TAG="cargo-nextest-0.9.146" NEXTEST_SHA256="682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428"
+    ;;
+aarch64)
+    NEXTEST_TARGET="aarch64-unknown-linux-gnu"
+    NEXTEST_TAG="cargo-nextest-0.9.146" NEXTEST_SHA256="b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9"
+    ;;
+*)
+    echo "devvm: no known cargo-nextest release target for uname -m '$(uname -m)'" >&2
+    exit 1
+    ;;
+esac
+NEXTEST_VERSION="${NEXTEST_TAG#cargo-nextest-}"
 CARGO="$HOME/.cargo/bin/cargo"
 # `cargo nextest --version` is multi-line ("cargo-nextest X (hash date)", then "release:
 # X", "commit-hash: ...", "commit-date: ...", "host: ..." - confirmed directly, 2026-09-23).
@@ -44,24 +64,6 @@ INSTALLED_VERSION="$("$CARGO" nextest --version 2>/dev/null | head -n1 | awk '{p
 if [ "$INSTALLED_VERSION" = "$NEXTEST_VERSION" ]; then
     echo "devvm: cargo-nextest $NEXTEST_VERSION already present, skipping"
 else
-    # SHA-256 of the exact release asset, fetched and independently verified (both against
-    # the GitHub release's own asset digest and a fresh `shasum -a 256` of a freshly
-    # downloaded copy) 2026-10-01. Checked before extracting (below) so a corrupted or
-    # tampered download is a hard failure, never silently `tar -x`'d.
-    case "$(uname -m)" in
-    x86_64)
-        NEXTEST_TARGET="x86_64-unknown-linux-gnu"
-        NEXTEST_SHA256="682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428"
-        ;;
-    aarch64)
-        NEXTEST_TARGET="aarch64-unknown-linux-gnu"
-        NEXTEST_SHA256="b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9"
-        ;;
-    *)
-        echo "devvm: no known cargo-nextest release target for uname -m '$(uname -m)'" >&2
-        exit 1
-        ;;
-    esac
     NEXTEST_TARBALL="/tmp/cargo-nextest-$NEXTEST_VERSION.tar.gz"
     curl --proto '=https' --tlsv1.2 -sSf -L -o "$NEXTEST_TARBALL" \
         "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$NEXTEST_TARGET.tar.gz"
