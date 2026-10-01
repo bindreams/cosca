@@ -493,15 +493,20 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     // not in the window, and neither is a watch that cannot be set up (open, move, peek or poll) or a
     // panic on the spawning thread: those force EOF.
     //
-    // A separate residual, owned by std's fork path (std 1.90 to 1.98), until #383 removes the
-    // handshake: std makes its own CLOEXEC status `socketpair` before it forks, drops its write end
-    // after, and blocks reading the other until every copy of the write end is closed. A fork
-    // without `exec` between that `socketpair` and std's `fork` holds a copy, and `spawn()` then
-    // waits in std for as long as the holder lives, with a healthy child and no death, reap or
-    // reuse needed. The handshake cannot end that wait. Without a `pre_exec` hook std takes
-    // `posix_spawn` and has no such channel; the hook puts every Linux spawn on this path, as an fd
-    // mapping already did. No test pins it: nothing hooks the parent between std's `socketpair`
-    // and `fork`.
+    // Separate residuals, owned by std's fork path (std 1.90 to 1.98), until #383 removes the
+    // handshake. Without a `pre_exec` hook std takes `posix_spawn` and has none of them; the hook
+    // puts every Linux spawn on this path, as an fd mapping already did. No test pins them.
+    //  a. std makes its own CLOEXEC status `socketpair` before it forks, drops its write end just
+    //     after the fork returns in the parent, and blocks reading the other until every copy of
+    //     the write end is closed. A fork without `exec` between that `socketpair` and std's close
+    //     of the write end holds a copy, and `spawn()` waits in std for as long as the holder
+    //     lives, with a healthy child and no death, reap or reuse needed. The handshake cannot end
+    //     that wait. Nothing hooks the parent inside that interval.
+    //  b. After a pre-exec failure report (an exec failure, or a handshake abort), std waits for
+    //     the child by pid. With `SIGCHLD` set to `SIG_IGN` that wait fails and std panics, where
+    //     `posix_spawn` returns `Err(NotFound)`.
+    //  c. In the same wait, a foreign reap of the child plus reuse of its number lets std wait on,
+    //     and reap, an unrelated child, losing its exit status.
     #[cfg(test)]
     let injected = fault::watch_open_errno();
     #[cfg(not(test))]
