@@ -825,15 +825,14 @@ fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
     use std::net::TcpListener;
     let main = TcpListener::bind("127.0.0.1:0").expect("bind");
     let report = TcpListener::bind("127.0.0.1:0").expect("bind");
-    // A closed port: the relay's report connection is refused, so it dies before reporting.
-    let refused = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let refused_addr = refused.local_addr().unwrap().to_string();
-    drop(refused);
+    // An address with no port never resolves, so the relay's report connection fails at once. A
+    // port freed by dropping a listener could be taken by another test and answered.
+    let refused_addr = "no-port";
     let mut root = common::spawn_locked(
         std::process::Command::new(common::testbin())
             .args(["spawn-orphan-escapee", &main.local_addr().unwrap().to_string()])
             .env(common::ACK_ENV, "1")
-            .env(common::GC_PID_ADDR_ENV, &refused_addr),
+            .env(common::GC_PID_ADDR_ENV, refused_addr),
     )
     .expect("spawn the orphan tree");
     let root_pid = root.id();
