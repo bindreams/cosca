@@ -149,8 +149,9 @@ jobs:
             runner: windows-latest
             other: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
-    # Set from measured durations; see the PR description.
-    timeout-minutes: 30
+    # Measured on this job: 243 s (linux), 615 s (windows, the slowest). 20 min is 1.95x the
+    # slowest, a failure bound for a hang and not an expectation.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -189,7 +190,8 @@ jobs:
       - name: Test the libtest guard
         if: ${{ !cancelled() }}
         shell: bash
-        timeout-minutes: 5
+        # Measured: 18 s (linux), 91 s (windows, the slowest); 3 min is 2x the slowest.
+        timeout-minutes: 3
         run: bash .github/scripts/libtest-guard-tests.sh
 
   test:
@@ -234,7 +236,10 @@ jobs:
             target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    # Windows/amd64 is the slowest lane. Its measured durations: 549-737 s before the libtest guard
+    # ran inside clippy.sh, 868-1105 s with it, 984 s on the latest run. 30 min is 1.63x the
+    # 1105 s maximum; 25 min was 1.36x.
+    timeout-minutes: 30
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
     # sandbox, so every step consents. Windows has no tracer tests.
