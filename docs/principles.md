@@ -172,11 +172,13 @@ machine.
 A test that can't establish its precondition fails with a message that names the precondition and
 how to opt out explicitly. A test that mutates process-wide state (fds 0–2, rlimits, credentials,
 signal dispositions), or that forks without `spawn_lock` and so copies every other test's open
-descriptors, runs in its own re-exec'd process (`alone()` in
-[`test_support.rs`](../src/containment/cgroup/test_support.rs), `run_fixture_with_cwd()` in
-[`src/test_child.rs`](../src/test_child.rs)), under either test runner, and asserts that it does
-through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
-an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
+descriptors, runs in its own re-exec'd process through `own_process()`
+([`src/test_own_process.rs`](../src/test_own_process.rs)), under either test runner. Its
+process-per-test gate ([#201], [#210]) checks the re-exec's argv shape, not just an environment
+variable, and `test_spawn::spawn_unlocked` refuses to fork in any process the gate did not admit.
+A fixture that needs its own cwd or credentials re-execs through `run_fixture_with_cwd()` or
+`run_fixture()` in [`src/test_child.rs`](../src/test_child.rs) instead; it may not fork unlocked.
+`RestoreFd2` is brought under the gate by [#201] and tracked in [#223].
 
 `#[ignore]` marks only a specific, temporary regression on `main`: the owner (a human) accepts the
 known failure and disables that one test until it's fixed. Never for a group.

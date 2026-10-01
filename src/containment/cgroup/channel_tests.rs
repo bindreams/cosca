@@ -1,4 +1,5 @@
-use crate::containment::cgroup::test_support::{alone, block_on, childs_copy, fork_running, reap};
+use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
+use crate::test_own_process::{own_process, test_path};
 use crate::containment::cgroup::PlacementReport;
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
@@ -202,7 +203,7 @@ fn a_send_after_the_abandonment_read_fails_rather_than_go_unread() {
 
 /// A child end whose parent closed the channel with the child's intent still unread — leaving
 /// *proceed* queued first, when `proceed` — which gives the child's next send `ECONNRESET`, not
-/// `EPIPE`. Only in a test run [`alone`].
+/// `EPIPE`. Only in a test that runs in its own process ([`own_process`]).
 #[cfg(target_os = "linux")]
 fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containment::cgroup::ReportSlot) {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
@@ -221,14 +222,14 @@ fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containme
 
 /// The parent's close with a message unread resets the channel: the child's send fails with
 /// `ECONNRESET`, read as the end of the exchange exactly as `EPIPE` is — *proceed* queued is a
-/// decision, none an abandonment. A child that took it for an error would fail a decided spawn. Run
-/// [`alone`].
+/// decision, none an abandonment. A child that took it for an error would fail a decided spawn. Runs
+/// in its own process ([`own_process`]).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
-    if !alone("containment::cgroup::channel::channel_tests::a_reset_channel_ends_the_exchange_as_a_closed_one_does") {
+    let Some(_alone) = own_process(test_path!(a_reset_channel_ends_the_exchange_as_a_closed_one_does), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     // The setup gives a real `ECONNRESET`, which a plain send shows.
     let (_end, slot) = reset_by_the_parent(false);
     // SAFETY: `_end` keeps the child's end open; the buffer is on this frame.
@@ -253,13 +254,13 @@ fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
 
 /// A child that sent its intent and report before the parent decided finds the channel closed, not
 /// reset: `proceed` reads what was queued before it closes. The child's next send then fails with
-/// `EPIPE`, and finds *proceed*. Run [`alone`].
+/// `EPIPE`, and finds *proceed*. Run in its own process ([`own_process`]).
 #[cfg(target_os = "linux")]
 #[test]
 fn proceed_reads_what_was_sent_before_it_closes() {
-    if !alone("containment::cgroup::channel::channel_tests::proceed_reads_what_was_sent_before_it_closes") {
+    let Some(_alone) = own_process(test_path!(proceed_reads_what_was_sent_before_it_closes), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (_end, slot) = childs_copy(&channel);
     // SAFETY: the channel is open.

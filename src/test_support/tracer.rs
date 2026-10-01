@@ -373,26 +373,18 @@ pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf 
 "#;
     let exe = dir.join("tracer-helper");
     let plist = dir.join("entitlements.plist");
-    let codesign = {
-        // Writes and the fork under one guard, for the reason `write_executable_locked` gives; it
-        // takes the lock itself, so cannot write here.
-        let _guard = crate::child::spawn::spawn_lock();
-        std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
-        std::fs::write(&plist, ENTITLEMENTS).expect("write the entitlements plist");
-        let mut cmd = std::process::Command::new("/usr/bin/codesign");
-        cmd.args(["--sign", "-", "--force", "--entitlements"])
-            .arg(&plist)
-            .arg(&exe)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        // `test_spawn::spawn` would re-take the non-reentrant lock; `_guard` is spawn_lock.
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "`_guard` is spawn_lock, held over the copy and the fork"
-        )]
-        cmd.spawn().expect("spawn codesign")
-    };
+    let mut source = std::fs::File::open(std::env::current_exe().expect("current_exe")).expect("open the test binary");
+    crate::test_spawn::locked::write_executable_locked(&exe, 0o755, |f| std::io::copy(&mut source, f).map(drop))
+        .expect("copy the test binary");
+    std::fs::write(&plist, ENTITLEMENTS).expect("write the entitlements plist");
+    let mut cmd = std::process::Command::new("/usr/bin/codesign");
+    cmd.args(["--sign", "-", "--force", "--entitlements"])
+        .arg(&plist)
+        .arg(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let codesign = crate::test_spawn::spawn(&mut cmd).expect("spawn codesign");
     let out = codesign.wait_with_output().expect("wait for codesign");
     assert!(
         out.status.success(),

@@ -19,13 +19,7 @@ fn cgroup_fd_path_names_the_calling_threads_own_descriptor() {
 
     let thread_file_ = thread_file.clone();
     let named = std::thread::spawn(move || {
-        // SAFETY: `unshare(CLONE_FILES)` gives this thread a private copy of the table.
-        assert_eq!(
-            unsafe { libc::unshare(libc::CLONE_FILES) },
-            0,
-            "unshare: {}",
-            std::io::Error::last_os_error()
-        );
+        crate::test_spawn::unshare_files_locked(|| {}).expect("unshare(CLONE_FILES)");
         let own = std::fs::File::open(&thread_file_).expect("open the thread's file");
         // SAFETY: `n` is open in this thread's private table; replacing it touches only that table.
         assert_eq!(unsafe { libc::dup2(own.as_raw_fd(), n) }, n, "dup2");

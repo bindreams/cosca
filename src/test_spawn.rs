@@ -82,6 +82,20 @@ pub(crate) fn assert_may_fork_unlocked() {
     );
 }
 
+/// `unshare(CLONE_FILES)` for the calling thread, under `spawn_lock`. The thread's private copy of
+/// the descriptor table holds every descriptor open at that moment for as long as the thread
+/// lives, just as a forked child does. `on_contended` runs first if the lock is held.
+#[cfg(target_os = "linux")]
+pub(crate) fn unshare_files_locked(on_contended: impl FnOnce()) -> io::Result<()> {
+    let _held = crate::child::spawn::spawn_lock_tracked(on_contended);
+    // SAFETY: `unshare(CLONE_FILES)` only gives this thread its own copy of the table.
+    if unsafe { libc::unshare(libc::CLONE_FILES) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// [`Command::output`] with `spawn_lock` held for the spawn only. Like `output`, it overrides
 /// stdin (null) and stdout/stderr (piped), discarding any caller setting.
 #[cfg_attr(

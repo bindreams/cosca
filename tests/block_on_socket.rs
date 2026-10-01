@@ -48,7 +48,9 @@ impl Drop for Spawned {
 fn spawn_payload(addr: &str, nonce: &str) -> Spawned {
     let mut c = Command::new(common::testbin());
     c.args(["block-on-socket", addr, nonce]);
-    Spawned(SharedChild::spawn(&mut c).expect("spawn block-on-socket"))
+    // `SharedChild::spawn` forks inside shared_child, out of clippy's sight and without the lock.
+    let child = common::spawn_locked(&mut c).expect("spawn block-on-socket");
+    Spawned(SharedChild::new(child).expect("share the payload"))
 }
 
 #[test]

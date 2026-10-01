@@ -89,24 +89,21 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         .set_permissions(std::fs::Permissions::from_mode(0o600))
         .expect("chmod the log");
     drop(log_file);
-    {
-        // No fork in this binary may hold the fake open for writing when it is exec'd.
-        let _guard = cosca::test_spawn_lock();
-        let testbin = std::fs::read(common::testbin()).expect("read testbin");
-        let mut fake = create_in(&real_dir, c"pkexec-impl", 0o755);
-        fake.write_all(&testbin).expect("write the fake pkexec");
-        fake.set_permissions(std::fs::Permissions::from_mode(0o755))
-            .expect("chmod pkexec");
-        let mut version = create_in(&real_dir, c"version", 0o644);
-        writeln!(version, "{version_line}").expect("write the version");
-        version
-            .set_permissions(std::fs::Permissions::from_mode(0o644))
-            .expect("chmod version");
-        let mut tool = create_in(&target, c"tool", 0o644);
-        writeln!(tool, "#!/bin/sh").expect("write tool");
-        tool.set_permissions(std::fs::Permissions::from_mode(0o644))
-            .expect("chmod tool");
-    }
+    let testbin = std::fs::read(common::testbin()).expect("read testbin");
+    common::write_opened_executable_locked(|| Ok(create_in(&real_dir, c"pkexec-impl", 0o755)), 0o755, |f| {
+        f.write_all(&testbin)
+    })
+    .expect("write the fake pkexec");
+    let mut version = create_in(&real_dir, c"version", 0o644);
+    writeln!(version, "{version_line}").expect("write the version");
+    version
+        .set_permissions(std::fs::Permissions::from_mode(0o644))
+        .expect("chmod version");
+    // Not executable, but handed to exec all the same.
+    common::write_opened_executable_locked(|| Ok(create_in(&target, c"tool", 0o644)), 0o644, |f| {
+        writeln!(f, "#!/bin/sh")
+    })
+    .expect("write tool");
     std::os::unix::fs::symlink("../real/pkexec-impl", bin.join("pkexec")).expect("link bin/pkexec");
     assert_eq!(
         std::fs::canonicalize(bin.join("pkexec")).expect("canonicalize pkexec"),

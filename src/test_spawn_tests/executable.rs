@@ -139,3 +139,48 @@ fn an_unlocked_spawn_is_refused_in_a_process_shared_with_other_tests() {
     assert!(message.contains("a fork without spawn_lock"), "{message}");
     assert_runs(&tool, status);
 }
+
+/// `unshare(CLONE_FILES)` from another thread, started inside the write: the private table it
+/// copies is a fork's in all but name, so it waits out the write too. Container seccomp profiles
+/// refuse `unshare`; the cgroup lane, which runs unconfined, runs this.
+#[test]
+fn cgroup_an_unshared_fd_table_cannot_copy_a_write_in_progress() {
+    if !crate::test_support::require_group("CGROUP") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = dir.path().join("tool");
+    let (gate_read, mut gate_write) = std::io::pipe().expect("gate pipe");
+    let gate_fd = gate_read.as_raw_fd();
+    let (events, events_rx) = mpsc::channel::<Event>();
+    let mut unsharer = None;
+    super::locked::write_executable_locked(&tool, 0o755, |file| {
+        file.write_all(SCRIPT)?;
+        let contended = events.clone();
+        let unshared = events.clone();
+        unsharer = Some(std::thread::spawn(move || {
+            let result = crate::test_spawn::unshare_files_locked(|| {
+                _ = contended.send(Event::Contended);
+            });
+            _ = unshared.send(Event::Forked);
+            // The private table lives as long as this thread.
+            block_on(gate_fd);
+            result
+        }));
+        // As in `a_locked_fork_cannot_land_inside_write_executable_locked`.
+        loop {
+            match events_rx.recv().expect("the unsharer reports") {
+                Event::Forked => break,
+                Event::Contended if crate::test_spawn::held_by_this_thread() => break,
+                Event::Contended => {}
+            }
+        }
+        Ok(())
+    })
+    .expect("write the tool");
+    let status = crate::test_spawn::status(&mut Command::new(&tool));
+    gate_write.write_all(&[1]).expect("release the unsharing thread");
+    let unshared = unsharer.expect("the unsharer started").join().expect("unsharer");
+    unshared.expect("unshare(CLONE_FILES)");
+    assert_runs(&tool, status);
+}

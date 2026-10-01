@@ -17,9 +17,7 @@ fn blocker() -> (Child, crate::tokio::ChildStdin) {
 }
 
 #[cfg(target_os = "linux")]
-use crate::containment::cgroup::test_support::alone;
-#[cfg(target_os = "linux")]
-use crate::test_child::fixture_path;
+use crate::test_own_process::{own_process, test_path};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -65,7 +63,7 @@ mod linux {
     /// belongs to tokio's reaper once the child is dropped, and a `#[tokio::test]` runtime that
     /// this thread never yields to has not run it. That holds only in a process running this one
     /// test (tokio's orphan queue is process-global, and any runtime that parks drains it), so
-    /// [`ended_after_closing`](Self::ended_after_closing) requires `alone()`.
+    /// [`ended_after_closing`](Self::ended_after_closing) requires its own process (`own_process`).
     pub(super) struct Pidfd(OwnedFd);
 
     impl Pidfd {
@@ -97,12 +95,12 @@ mod linux {
         /// closed; one nothing killed exits `0`. The drop's own `try_wait` may reap a root that
         /// something already ended, which leaves no status to read: that is
         /// [`Ended::ReapedWhileStdinOpen`].
-        /// The read is exact only under `alone()`: nothing else reaps before this thread yields to
+        /// The read is exact only in a test that has its process to itself (`own_process`): nothing else reaps before this thread yields to
         /// a runtime.
         pub(super) fn ended_after_closing(&self, stdin: crate::tokio::ChildStdin) -> Ended {
             debug_assert!(
-                std::env::var_os("COSCA_TEST_ALONE").is_some(),
-                "`ended_after_closing` is exact only in a process running this test alone (`alone()`): \
+                crate::test_own_process::runs_alone(),
+                "`ended_after_closing` is exact only in a process running this test alone (`own_process`): \
                  tokio's orphan queue is process-global"
             );
             let reaped_while_open = self.reaped();
@@ -163,9 +161,9 @@ fn thread_ids() -> std::collections::BTreeSet<String> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_async_drop_starts_no_thread() {
-    if !alone(fixture_path!(an_async_drop_starts_no_thread)) {
+    let Some(_alone) = own_process(test_path!(an_async_drop_starts_no_thread), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let (child, _stdin) = blocker();
     let before = thread_ids();
     drop(child);
@@ -181,9 +179,9 @@ async fn an_async_drop_starts_no_thread() {
 async fn an_async_drop_closes_tokios_own_descriptors() {
     use std::os::fd::AsRawFd as _;
 
-    if !alone(fixture_path!(an_async_drop_closes_tokios_own_descriptors)) {
+    let Some(_alone) = own_process(test_path!(an_async_drop_closes_tokios_own_descriptors), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
@@ -289,9 +287,9 @@ async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::C
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_kill_on_drop_drop_kills_the_root() {
-    if !alone(fixture_path!(a_kill_on_drop_drop_kills_the_root)) {
+    let Some(_alone) = own_process(test_path!(a_kill_on_drop_drop_kills_the_root), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let (child, stdin, _stdout) = ignoring_blocker().await;
     let root = linux::Pidfd::of(&child);
     drop(child);
@@ -372,9 +370,9 @@ async fn an_async_drop_removes_an_already_drained_leaf() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
-    if !alone(fixture_path!(a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks)) {
+    let Some(_alone) = own_process(test_path!(a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let name = "cosca-async-drop-opted-out-armed";
     let (fake, leaf) = linux::fake_leaf(name, true);
     let mut cmd = crate::command::Command::new();
@@ -403,11 +401,9 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
-    if !alone(fixture_path!(
-        a_disarmed_never_killed_drop_never_kills_and_logs_at_debug
-    )) {
+    let Some(_alone) = own_process(test_path!(a_disarmed_never_killed_drop_never_kills_and_logs_at_debug), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let name = "cosca-async-drop-disarmed-never-killed";
     let (fake, leaf) = linux::fake_leaf(name, true);
     let (child, stdin) = blocker();
@@ -430,9 +426,9 @@ async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
-    if !alone(fixture_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on)) {
+    let Some(_alone) = own_process(test_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on), crate::test_spawn::spawn) else {
         return;
-    }
+    };
     let name = "cosca-async-drop-handoff";
     let (fake, leaf) = linux::fake_leaf(name, false);
     let (child, stdin) = blocker();
