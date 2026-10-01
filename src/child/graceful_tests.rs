@@ -538,46 +538,45 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     cmd.env(crate::test_child::ack::ACK_ENV, "1");
     cmd.contain();
-    let child = cmd.spawn().expect("spawn");
-    // The fixture exits at once and its descendant connects: see `accept_or_signalled`.
-    let drained = crate::test_child::DrainSignal::new();
-    std::thread::scope(|scope| {
-        scope.spawn(|| drained.watch(|| child.wait_tree()));
-        // The tree is killed before the scope joins the watcher.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Blocks until the survivor has connected, which it does only once it exists in its
-            // own process group (see the fixture's own doc).
-            let mut sock = crate::test_child::accept_or_signalled(&listener, &drained);
-            let mut tag = [0u8; 1];
-            sock.read_exact(&mut tag).expect("readiness tag");
-            term_fault::set_force_kill_tree_error(true);
-            let err = child
-                .graceful_shutdown_tree(Duration::from_secs(2))
-                .expect_err("the forced sweep failure must surface");
-            assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-            assert!(
-                !term_fault::kill_tree_armed(),
-                "the sweep must have consumed the forced-failure seam"
-            );
-        }));
-        // The forced failure was a stub, so the survivor lives; the real sweep (seam consumed)
-        // kills it and drains the job. A failed kill leaves the watcher joining a live tree, so it
-        // is reported with the assertion that was unwinding.
-        if let Err(e) = child.kill_tree() {
-            let unwinding = outcome.as_ref().err().map(|p| {
-                p.downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            });
-            panic!(
-                "cleanup kill_tree failed ({e}); the watcher cannot drain a live tree; unwinding from: {unwinding:?}"
-            );
-        }
-        if let Err(payload) = outcome {
-            std::panic::resume_unwind(payload);
-        }
-    });
+    let child = std::sync::Arc::new(cmd.spawn().expect("spawn"));
+    // The fixture exits at once and its descendant connects: see `accept_or_signalled`. The
+    // watcher is detached, so the test returns its assertion or a failed kill even if the job
+    // never drains.
+    let drained = std::sync::Arc::new(crate::test_child::DrainSignal::new());
+    {
+        let (child, drained) = (child.clone(), drained.clone());
+        std::thread::spawn(move || drained.watch(|| child.wait_tree()));
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Blocks until the survivor has connected, which it does only once it exists in its
+        // own process group (see the fixture's own doc).
+        let mut sock = crate::test_child::accept_or_signalled(&listener, &drained);
+        let mut tag = [0u8; 1];
+        sock.read_exact(&mut tag).expect("readiness tag");
+        term_fault::set_force_kill_tree_error(true);
+        let err = child
+            .graceful_shutdown_tree(Duration::from_secs(2))
+            .expect_err("the forced sweep failure must surface");
+        assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+        assert!(
+            !term_fault::kill_tree_armed(),
+            "the sweep must have consumed the forced-failure seam"
+        );
+    }));
+    // The forced failure was a stub, so the survivor lives; the real sweep (seam consumed) kills it
+    // and drains the job.
+    if let Err(e) = child.kill_tree() {
+        let unwinding = outcome.as_ref().err().map(|p| {
+            p.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        });
+        panic!("cleanup kill_tree failed ({e}); unwinding from: {unwinding:?}");
+    }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 // `accept_or_signalled` fails once the job drains with nothing having connected, instead of

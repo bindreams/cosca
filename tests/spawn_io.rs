@@ -1641,51 +1641,54 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     // Not `common::accept_or_die`: the root exits at once by design (it backgrounds the worker),
     // so watching its pid would misreport that exit. The leaf draining bounds the wait instead:
     // see `accept_or_signalled`.
-    let drained = common::DrainSignal::new();
-    let (leaf, mut worker) = std::thread::scope(|scope| {
-        scope.spawn(|| drained.watch(|| child.wait_tree()));
-        // The tree is killed before the scope joins the watcher.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let worker = common::accept_or_signalled(&listener, &drained);
-            let mut worker = std::io::BufReader::new(worker);
-            let mut hello = String::new();
-            worker.read_line(&mut hello).expect("read the worker's hello");
-            assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
-            let worker_pid: u32 = hello[1..].trim().parse().expect("the worker's pid");
-            let leaf = common::cgroup::cgroup_of(worker_pid);
-            // Proof of life, after the spawn returned: a round trip only a live worker completes.
-            worker.get_mut().write_all(b"x").expect("write to the worker");
-            let mut echo = [0u8; 1];
-            worker
-                .read_exact(&mut echo)
-                .expect("the worker must still be alive to echo — cosca killed it at spawn time");
-            assert_eq!(&echo, b"x");
+    // The watcher is detached, so the test returns its assertion or a failed kill even if the tree
+    // never drains.
+    let child = std::sync::Arc::new(child);
+    let drained = std::sync::Arc::new(common::DrainSignal::new());
+    let watcher = {
+        let (child, drained) = (child.clone(), drained.clone());
+        std::thread::spawn(move || drained.watch(|| child.wait_tree()))
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let worker = common::accept_or_signalled(&listener, &drained);
+        let mut worker = std::io::BufReader::new(worker);
+        let mut hello = String::new();
+        worker.read_line(&mut hello).expect("read the worker's hello");
+        assert!(hello.starts_with('G'), "expected the worker's tag, got {hello:?}");
+        let worker_pid: u32 = hello[1..].trim().parse().expect("the worker's pid");
+        let leaf = common::cgroup::cgroup_of(worker_pid);
+        // Proof of life, after the spawn returned: a round trip only a live worker completes.
+        worker.get_mut().write_all(b"x").expect("write to the worker");
+        let mut echo = [0u8; 1];
+        worker
+            .read_exact(&mut echo)
+            .expect("the worker must still be alive to echo — cosca killed it at spawn time");
+        assert_eq!(&echo, b"x");
 
-            // The leaf owns the worker: its kill reaches it.
-            child.kill_tree().expect("kill_tree");
-            (leaf, worker)
-        }));
-        match outcome {
-            Ok(v) => v,
-            Err(payload) => {
-                // A failed kill leaves the watcher joining a live tree: report it with the
-                // assertion that was unwinding.
-                if let Err(e) = child.kill_tree() {
-                    panic!(
-                        "cleanup kill_tree failed ({e}); the watcher cannot drain a live tree; unwinding from: {}",
-                        common::panic_message(payload)
-                    );
-                }
-                std::panic::resume_unwind(payload)
+        // The leaf owns the worker: its kill reaches it.
+        child.kill_tree().expect("kill_tree");
+        (leaf, worker)
+    }));
+    let (leaf, mut worker) = match outcome {
+        Ok(v) => v,
+        Err(payload) => {
+            if let Err(e) = child.kill_tree() {
+                panic!(
+                    "cleanup kill_tree failed ({e}); unwinding from: {}",
+                    common::panic_message(payload)
+                );
             }
+            std::panic::resume_unwind(payload)
         }
-    });
+    };
     child.wait().expect("reap the root");
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
 
-    // The worker's socket closes before it leaves the leaf; `Drop` waits for it to.
+    // The worker is dead, so the leaf drains and the watcher ends; `Drop` then removes the leaf.
+    watcher.join().expect("the drain watcher");
+    let child = std::sync::Arc::try_unwrap(child).unwrap_or_else(|_| panic!("the watcher released its handle"));
     drop(child);
     assert!(
         !leaf.exists(),

@@ -30,6 +30,20 @@ impl DrainSignal {
         rustix::io::write(&self.fd, &1u64.to_ne_bytes()).expect("signal the drain");
     }
 
+    /// Whether the drain has been signalled, by a zero-timeout poll: it never blocks.
+    pub fn is_signalled(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let mut fd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fd` is a valid pollfd for the call's duration.
+        let n = unsafe { libc::poll(&mut fd, 1, 0) };
+        assert!(n >= 0, "poll the drain eventfd: {}", std::io::Error::last_os_error());
+        n > 0 && fd.revents & libc::POLLIN != 0
+    }
+
     /// Records the result of `wait_tree` and wakes the acceptor.
     pub fn record<T: Debug, E: Display>(&self, result: Result<T, E>) {
         self.outcome.store(result);

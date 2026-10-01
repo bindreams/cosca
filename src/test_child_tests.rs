@@ -116,16 +116,22 @@ fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_q
     );
 }
 
-/// A watcher whose `wait_tree` panics still wakes the acceptor, with an error.
+/// A watcher whose `wait_tree` panics signals the drain at once, with an error outcome. The
+/// signal is read with a zero-timeout wait, so a missing wake fails by assertion.
 #[cfg(windows)]
 #[test]
 fn death_watch_a_panicking_watcher_wakes_the_acceptor_with_an_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let drained = super::DrainSignal::new();
+    assert!(!drained.is_signalled(), "nothing has signalled the drain yet");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drained.watch(|| -> Result<(), String> { panic!("wait_tree blew up") })
     }));
     assert!(unwound.is_err(), "the watcher's panic must propagate");
+    assert!(
+        drained.is_signalled(),
+        "a panicking watcher must still signal the drain"
+    );
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::accept_or_signalled(&listener, &drained)
     }))
