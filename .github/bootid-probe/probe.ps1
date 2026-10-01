@@ -19,6 +19,41 @@ public static class BootProbe {
         int st = NtQuerySystemInformation(cls, buf, len, out ret);
         return "0x" + st.ToString("X8") + " ret=" + ret;
     }
+    [StructLayout(LayoutKind.Sequential)] public struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)] public struct OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+    [DllImport("ntdll.dll")] public static extern int NtOpenSymbolicLinkObject(out IntPtr h, uint access, ref OBJECT_ATTRIBUTES oa);
+    [DllImport("ntdll.dll")] public static extern int NtOpenKey(out IntPtr h, uint access, ref OBJECT_ATTRIBUTES oa);
+    [DllImport("ntdll.dll")] public static extern int NtQueryObject(IntPtr h, int cls, byte[] buf, int len, out int ret);
+    [DllImport("ntdll.dll")] public static extern int NtQueryKey(IntPtr h, int cls, byte[] buf, int len, out int ret);
+    [DllImport("ntdll.dll")] public static extern int NtClose(IntPtr h);
+    static OBJECT_ATTRIBUTES Oa(string name, out IntPtr us) {
+        UNICODE_STRING u = new UNICODE_STRING();
+        u.Length = (ushort)(name.Length * 2); u.MaximumLength = (ushort)(name.Length * 2 + 2);
+        u.Buffer = Marshal.StringToHGlobalUni(name);
+        us = Marshal.AllocHGlobal(Marshal.SizeOf(u)); Marshal.StructureToPtr(u, us, false);
+        OBJECT_ATTRIBUTES oa = new OBJECT_ATTRIBUTES(); oa.Length = Marshal.SizeOf(oa); oa.ObjectName = us; oa.Attributes = 0x40;
+        return oa;
+    }
+    // Symbolic-link objects carry a CreationTime (OBJECT_BASIC_INFORMATION @0x30).
+    public static string SymlinkCreationTime(string name) {
+        IntPtr us; OBJECT_ATTRIBUTES oa = Oa(name, out us); IntPtr h;
+        int st = NtOpenSymbolicLinkObject(out h, 1, ref oa);
+        if (st != 0) return "open 0x" + st.ToString("X8");
+        byte[] b = new byte[56]; int ret; st = NtQueryObject(h, 0, b, 56, out ret); NtClose(h);
+        if (st != 0) return "query 0x" + st.ToString("X8");
+        long t = BitConverter.ToInt64(b, 0x30);
+        return t.ToString() + " (" + DateTime.FromFileTimeUtc(t).ToString("o") + ")";
+    }
+    // KEY_BASIC_INFORMATION.LastWriteTime @0.
+    public static string KeyLastWrite(string name) {
+        IntPtr us; OBJECT_ATTRIBUTES oa = Oa(name, out us); IntPtr h;
+        int st = NtOpenKey(out h, 0x20019, ref oa);
+        if (st != 0) return "open 0x" + st.ToString("X8");
+        byte[] b = new byte[512]; int ret; st = NtQueryKey(h, 0, b, 512, out ret); NtClose(h);
+        if (st != 0) return "query 0x" + st.ToString("X8");
+        long t = BitConverter.ToInt64(b, 0);
+        return t.ToString() + " (" + DateTime.FromFileTimeUtc(t).ToString("o") + ")";
+    }
     public static string ProcInfo(int cls, out byte[] buf) {
         int ret; buf = new byte[96];
         int st = NtQueryInformationProcess(GetCurrentProcess(), cls, buf, buf.Length, out ret);
@@ -77,6 +112,13 @@ if ($b.Length -ge 64) {
 # Image bases (ASLR image bias is chosen once per boot)
 foreach ($m in "ntdll.dll", "kernel32.dll", "kernelbase.dll") {
     Out-KV ("base." + $m) ("0x{0:X}" -f [BootProbe]::GetModuleHandleW($m).ToInt64())
+}
+
+foreach ($n in "\SystemRoot", "\KnownDlls\KnownDllPath", "\DosDevices", "\Global??\C:") {
+    Out-KV ("objlink." + $n) ([BootProbe]::SymlinkCreationTime($n))
+}
+foreach ($n in "\REGISTRY", "\REGISTRY\MACHINE", "\REGISTRY\MACHINE\HARDWARE") {
+    Out-KV ("keylw." + $n) ([BootProbe]::KeyLastWrite($n))
 }
 
 $t = 0; [void][BootProbe]::QueryUnbiasedInterruptTime([ref]$t)

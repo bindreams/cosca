@@ -16,6 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: probe (elevated)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/bootid-probe/probe.ps1
+      - name: probe (low integrity, standard user)
+        continue-on-error: true
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/bootid-probe/unpriv.ps1
       - name: runner metadata
         shell: bash
         run: echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
