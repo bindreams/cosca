@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-/// Handler runs since process start. One test per binary uses this, so a baseline read at install
-/// time identifies this test's deliveries.
+/// Handler runs since process start. The interrupter reads it before each signal and waits for it
+/// to change, so only its own deliveries are waited on.
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -59,32 +59,48 @@ fn is_waiting(port: u32) -> bool {
     info[RUN_STATE] == TH_STATE_WAITING
 }
 
-/// The running interrupter; [`finish`](Self::finish) joins it and restores the signal handler.
+/// The running interrupter. Dropping it, whether through [`finish`](Self::finish) or by unwinding,
+/// stops and joins the helper, restores the signal handler and clears this thread's retry counter.
 pub struct Interrupter {
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
     previous: libc::sigaction,
     waiter_returned: Arc<AtomicBool>,
     retries: Arc<AtomicUsize>,
 }
 
 impl Interrupter {
-    /// Call once the wait has returned or panicked. Fails unless the wait retried an `EINTR`
-    /// on this thread since [`interrupt_once_blocked`]: a wait that never saw one proved nothing, and a wait that
-    /// panicked on one did not retry.
+    /// Call once the wait has returned or panicked. Fails unless the wait retried an `EINTR` on
+    /// this thread since [`interrupt_once_blocked`]: a wait that never saw one proved nothing, and
+    /// a wait that panicked on one did not retry.
     pub fn finish(self) {
+        let retries = self.retries.clone();
+        drop(self);
+        assert!(
+            retries.load(Ordering::SeqCst) >= 1,
+            "the interrupted kevent wait never retried after EINTR"
+        );
+    }
+}
+
+impl Drop for Interrupter {
+    fn drop(&mut self) {
         self.waiter_returned.store(true, Ordering::SeqCst);
-        self.thread.join().expect("the interrupter thread");
+        if let Some(thread) = self.thread.take() {
+            if let Err(panic) = thread.join() {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
         RETRIES.with(|r| *r.borrow_mut() = None);
-        let retried = self.retries.load(Ordering::SeqCst);
-        assert!(retried >= 1, "the interrupted kevent wait never retried after EINTR");
         // SAFETY: restores the action `interrupt_once_blocked` replaced.
         let rc = unsafe { libc::sigaction(libc::SIGUSR2, &self.previous, std::ptr::null_mut()) };
-        assert_eq!(rc, 0, "restore SIGUSR2: {}", std::io::Error::last_os_error());
+        debug_assert_eq!(rc, 0, "restore SIGUSR2: {}", std::io::Error::last_os_error());
     }
 }
 
 /// Call on the thread that is about to block in `kevent`. `release` runs on the helper thread
-/// once the waiter has been interrupted at least once.
+/// once the wait has counted an `EINTR` retry, and never if the wait returns first.
 pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interrupter {
     // SAFETY: a zeroed `sigaction` is a valid starting value; the handler only touches an atomic.
     let (previous, rc) = unsafe {
@@ -134,7 +150,7 @@ pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interr
         release();
     });
     Interrupter {
-        thread,
+        thread: Some(thread),
         previous,
         waiter_returned,
         retries,

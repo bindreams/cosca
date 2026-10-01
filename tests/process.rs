@@ -782,6 +782,12 @@ fn accept_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_
     let mut root = cmd.spawn().expect("spawn the tree");
     let grandchild = common::report_grandchild(&report, &mut root);
     let grandchild_pid = grandchild.pid();
+    // The root connects as soon as it is released. Waiting for the grandchild's exit first makes
+    // accept #1 report it dead on every interleaving; otherwise the root could connect first and
+    // leave the failure to accept #2, which a regression to a plain `accept()` would block on.
+    cosca::Process::from_id(grandchild)
+        .wait()
+        .expect("wait for the grandchild to exit");
 
     // Every accept that arms must watch the grandchild too. A mutant that drops it from the watch
     // would otherwise leave the second accept watching only the live root, blocked forever.
