@@ -149,9 +149,10 @@ jobs:
             runner: windows-latest
             other: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
-    # Measured on this job: 243 s (linux), 615 s (windows, the slowest). 20 min is 1.95x the
-    # slowest, a failure bound for a hang and not an expectation.
-    timeout-minutes: 20
+    # Measured on this job: 243 s and 743 s (linux; the slow run spent 8 min in apt-get), 449 and
+    # 615 s (windows), 251 s (darwin). 25 min is 2x the slowest, a failure bound for a hang and
+    # not an expectation.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
