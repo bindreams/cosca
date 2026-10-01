@@ -90,9 +90,11 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         .expect("chmod the log");
     drop(log_file);
     let testbin = std::fs::read(common::testbin()).expect("read testbin");
-    common::write_opened_executable_locked(|| Ok(create_in(&real_dir, c"pkexec-impl", 0o755)), 0o755, |f| {
-        f.write_all(&testbin)
-    })
+    common::write_opened_executable_locked(
+        || Ok(create_in(&real_dir, c"pkexec-impl", 0o755)),
+        0o755,
+        |f| f.write_all(&testbin),
+    )
     .expect("write the fake pkexec");
     let mut version = create_in(&real_dir, c"version", 0o644);
     writeln!(version, "{version_line}").expect("write the version");
@@ -100,9 +102,11 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
         .set_permissions(std::fs::Permissions::from_mode(0o644))
         .expect("chmod version");
     // Not executable, but handed to exec all the same.
-    common::write_opened_executable_locked(|| Ok(create_in(&target, c"tool", 0o644)), 0o644, |f| {
-        writeln!(f, "#!/bin/sh")
-    })
+    common::write_opened_executable_locked(
+        || Ok(create_in(&target, c"tool", 0o644)),
+        0o644,
+        |f| writeln!(f, "#!/bin/sh"),
+    )
     .expect("write tool");
     std::os::unix::fs::symlink("../real/pkexec-impl", bin.join("pkexec")).expect("link bin/pkexec");
     assert_eq!(

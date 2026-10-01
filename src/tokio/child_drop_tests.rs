@@ -179,7 +179,10 @@ async fn an_async_drop_starts_no_thread() {
 async fn an_async_drop_closes_tokios_own_descriptors() {
     use std::os::fd::AsRawFd as _;
 
-    let Some(_alone) = own_process(test_path!(an_async_drop_closes_tokios_own_descriptors), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(an_async_drop_closes_tokios_own_descriptors),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     let mut cmd = crate::tokio::Command::new();
@@ -370,7 +373,10 @@ async fn an_async_drop_removes_an_already_drained_leaf() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
-    let Some(_alone) = own_process(test_path!(a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     let name = "cosca-async-drop-opted-out-armed";
@@ -401,7 +407,10 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
-    let Some(_alone) = own_process(test_path!(a_disarmed_never_killed_drop_never_kills_and_logs_at_debug), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(a_disarmed_never_killed_drop_never_kills_and_logs_at_debug),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     let name = "cosca-async-drop-disarmed-never-killed";
@@ -426,7 +435,10 @@ async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
-    let Some(_alone) = own_process(test_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     let name = "cosca-async-drop-handoff";

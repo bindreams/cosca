@@ -1,6 +1,6 @@
 use crate::containment::cgroup::test_support::{block_on, childs_copy, fork_running, reap};
-use crate::test_own_process::{own_process, test_path};
 use crate::containment::cgroup::PlacementReport;
+use crate::test_own_process::{own_process, test_path};
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
 /// cgroup-free: fd -1 is never writable, so the child's `write` always fails with `EBADF`,
@@ -227,7 +227,10 @@ fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containme
 #[cfg(target_os = "linux")]
 #[test]
 fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
-    let Some(_alone) = own_process(test_path!(a_reset_channel_ends_the_exchange_as_a_closed_one_does), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(a_reset_channel_ends_the_exchange_as_a_closed_one_does),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     // The setup gives a real `ECONNRESET`, which a plain send shows.
@@ -258,7 +261,10 @@ fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
 #[cfg(target_os = "linux")]
 #[test]
 fn proceed_reads_what_was_sent_before_it_closes() {
-    let Some(_alone) = own_process(test_path!(proceed_reads_what_was_sent_before_it_closes), crate::test_spawn::spawn) else {
+    let Some(_alone) = own_process(
+        test_path!(proceed_reads_what_was_sent_before_it_closes),
+        crate::test_spawn::spawn,
+    ) else {
         return;
     };
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
