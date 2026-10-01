@@ -35,20 +35,10 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
         len: filter.len() as u16,
         filter: filter.as_ptr().cast_mut(),
     };
-    // SAFETY: prctl is variadic: pass every trailing arg at full unsigned-long width (musl reads all four); an int-width arg leaves the upper half undefined.
+    rustix::thread::set_no_new_privs(true).expect("no_new_privs");
+    // SAFETY: `program` and `filter` outlive the call, and the kernel copies them. rustix wraps no
+    // seccomp-filter `prctl`; musl reads every argument as `unsigned long`, hence the casts.
     unsafe {
-        assert_eq!(
-            libc::prctl(
-                libc::PR_SET_NO_NEW_PRIVS,
-                1 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong
-            ),
-            0,
-            "no_new_privs: {}",
-            std::io::Error::last_os_error()
-        );
         assert_eq!(
             libc::prctl(
                 libc::PR_SET_SECCOMP,
@@ -61,12 +51,11 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
             "seccomp: {}",
             std::io::Error::last_os_error()
         );
-        let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0);
-        assert_eq!(pidfd, -1, "pidfd_open must be denied");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(errno),
-            "pidfd_open must answer the requested errno"
-        );
     }
+    let denied = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty());
+    assert_eq!(
+        denied.map(drop).map_err(|e| e.raw_os_error()),
+        Err(errno),
+        "pidfd_open must be denied with the requested errno"
+    );
 }

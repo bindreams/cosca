@@ -226,24 +226,13 @@ fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
         return;
     }
     let b = Blocker::spawn_with(|cmd| {
-        // SAFETY: `prctl` is async-signal-safe and touches only the forked child.
+        // SAFETY: `set_ptracer` is a raw `prctl` syscall, async-signal-safe, and touches only the
+        // forked child.
         unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(
-                    libc::PR_SET_PTRACER,
-                    libc::PR_SET_PTRACER_ANY,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                ) != 0
-                {
-                    let e = std::io::Error::last_os_error();
-                    // `EINVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
-                    if e.raw_os_error() != Some(libc::EINVAL) {
-                        return Err(e);
-                    }
-                }
-                Ok(())
+            cmd.pre_exec(|| match rustix::process::set_ptracer(rustix::process::PTracer::Any) {
+                // `INVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
+                Ok(()) | Err(rustix::io::Errno::INVAL) => Ok(()),
+                Err(e) => Err(e.into()),
             });
         }
     });

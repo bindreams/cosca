@@ -472,11 +472,9 @@ fn main() {
             // SAFETY: `marker_fd` was just confirmed open above; F_DUPFD_CLOEXEC duplicates it,
             // setting FD_CLOEXEC on the NEW copy only — the original descriptor is untouched
             // (still open, still non-CLOEXEC).
-            let dup = unsafe { libc::fcntl(marker_fd, libc::F_DUPFD_CLOEXEC, 0) };
-            assert!(
-                dup >= 0,
-                "F_DUPFD_CLOEXEC({marker_fd}) failed: {}",
-                std::io::Error::last_os_error()
+            let dup = std::os::fd::IntoRawFd::into_raw_fd(
+                rustix::io::fcntl_dupfd_cloexec(unsafe { rustix::fd::BorrowedFd::borrow_raw(marker_fd) }, 0)
+                    .unwrap_or_else(|e| panic!("F_DUPFD_CLOEXEC({marker_fd}) failed: {e}")),
             );
             assert!(
                 dup < marker_fd,
@@ -1463,7 +1461,8 @@ fn main() {
             // makes it this new session's controlling terminal. Both are one-shot syscalls.
             unsafe {
                 assert!(libc::setsid() != -1, "setsid failed");
-                assert!(libc::ioctl(3, libc::TIOCSCTTY as _, 0) != -1, "TIOCSCTTY failed");
+                let slave = rustix::fd::BorrowedFd::borrow_raw(3);
+                rustix::process::ioctl_tiocsctty(slave).unwrap_or_else(|e| panic!("TIOCSCTTY failed: {e}"));
             }
             let present = cosca::elevation::controlling_terminal_present();
             println!("{}", if present { "1" } else { "0" });

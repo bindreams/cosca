@@ -237,8 +237,15 @@ fn close_range_except_or_exit(keep: &[RawFd], exit_code_on_failure: i32, force_f
         if first > last {
             return;
         }
-        // SAFETY: close_range(2) with no flags; both bounds are non-negative.
-        let rc = unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0) };
+        // SAFETY: close_range(2) with no flags; both bounds are non-negative. rustix has no wrapper.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first as libc::c_long,
+                last as libc::c_long,
+                0 as libc::c_long,
+            )
+        };
         if rc != 0 {
             exit_child(exit_code_on_failure);
         }

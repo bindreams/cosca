@@ -29,9 +29,8 @@ fn a_child_without_a_process() -> Child {
 }
 
 fn nonblocking(fd: &impl std::os::fd::AsFd) {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).expect("F_GETFL"));
-    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("F_SETFL");
+    let flags = rustix::fs::fcntl_getfl(fd).expect("F_GETFL");
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).expect("F_SETFL");
 }
 
 /// `Reader` planted over a pipe's WRITE end: tokio's `Receiver` rejects it (not readable). Returns

@@ -1838,10 +1838,11 @@ fn spawn_with_std_slots_closed(
     // the spawn and restored from its saved copy before anything else runs.
     let saved: Vec<(i32, i32)> = slots
         .iter()
-        .map(|&slot| unsafe {
-            let saved = libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 3);
-            assert!(saved >= 3, "dup({slot}): {}", std::io::Error::last_os_error());
-            (slot, saved)
+        .map(|&slot| {
+            // SAFETY: `slot` is one of this process's std descriptors, open until restored below.
+            let saved = rustix::io::fcntl_dupfd_cloexec(unsafe { rustix::fd::BorrowedFd::borrow_raw(slot) }, 3)
+                .unwrap_or_else(|e| panic!("dup({slot}): {e}"));
+            (slot, std::os::fd::IntoRawFd::into_raw_fd(saved))
         })
         .collect();
     for &(slot, _) in &saved {

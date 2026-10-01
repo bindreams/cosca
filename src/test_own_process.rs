@@ -37,11 +37,9 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::{parent_id, CommandExt as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
-
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 /// Forks `command` with `spawn_lock` held for the fork alone: `test_spawn::spawn` in the library's
 /// tests, `common::spawn_locked` in the integration tests.
@@ -190,14 +188,14 @@ pub(crate) fn child_completion(path: &str) -> Option<Completion> {
 /// Takes the token pipe and reports that the role was accepted.
 fn accept(token_fd: RawFd) -> Completion {
     // The body's own children must not inherit the token.
-    // SAFETY: F_SETFD on a descriptor number; failure is checked.
-    let set = unsafe { libc::fcntl(token_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    assert_eq!(
-        set,
-        0,
-        "the token fd {token_fd} is not open: {}",
-        std::io::Error::last_os_error()
+    // SAFETY: `token_fd` is open (checked below).
+    let set = rustix::io::fcntl_setfd(
+        unsafe { rustix::fd::BorrowedFd::borrow_raw(token_fd) },
+        rustix::io::FdFlags::CLOEXEC,
     );
+    if let Err(e) = set {
+        panic!("the token fd {token_fd} is not open: {e}");
+    }
     // SAFETY: the parent passed this pipe end down for this process alone.
     let mut token = unsafe { File::from_raw_fd(token_fd) };
     token.write_all(STARTED).expect("report that the isolated run started");
@@ -232,9 +230,9 @@ impl std::fmt::Display for Failure {
 /// Stops at end of file or at `WouldBlock`, never waiting for EOF: another process can hold the
 /// write end for as long as it lives, and every byte the exited process wrote is already there.
 pub(crate) fn drain(token_read: &mut std::io::PipeReader) -> std::io::Result<Vec<u8>> {
-    let flags = fcntl(token_read.as_fd(), FcntlArg::F_GETFL).expect("read the token pipe's flags");
+    let flags = rustix::fs::fcntl_getfl(&*token_read).expect("read the token pipe's flags");
     debug_assert!(
-        OFlag::from_bits_retain(flags).contains(OFlag::O_NONBLOCK),
+        flags.contains(rustix::fs::OFlags::NONBLOCK),
         "the token pipe's read end must be nonblocking"
     );
     let mut token = Vec::new();
@@ -256,7 +254,7 @@ pub(crate) fn run(test: &str, env: &[(&str, &str)], spawn: Spawn) -> Result<(), 
     let (mut token_read, token_write) = std::io::pipe().expect("create the completion pipe");
     // `drain` never waits for EOF, so a fork that inherits `token_write` before it is
     // close-on-exec (not every fork takes the lock) cannot delay the verdict.
-    fcntl(token_read.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("make the completion pipe non-blocking");
+    rustix::fs::fcntl_setfl(&token_read, rustix::fs::OFlags::NONBLOCK).expect("make the completion pipe non-blocking");
     // `try_clone` lands at fd 3 or above, out of reach of the child's stdio setup even when
     // the parent has fd 0-2 closed.
     let token_write = OwnedFd::from(token_write);
@@ -280,10 +278,9 @@ pub(crate) fn run(test: &str, env: &[(&str, &str)], spawn: Spawn) -> Result<(), 
     // is close-on-exec, so this clears the flag in the child alone.
     unsafe {
         command.pre_exec(move || {
-            if libc::fcntl(token_fd, libc::F_SETFD, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+            // `token_fd` is the token pipe, open in this forked child.
+            let fd = rustix::fd::BorrowedFd::borrow_raw(token_fd);
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
         });
     }
     // `spawn` already holds `spawn_lock` across the fork; do not take it here.

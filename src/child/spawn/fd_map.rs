@@ -30,12 +30,12 @@
 //!    (see [`install`]) — std's OWN stdio setup (`.stdin()`/`.stdout()`/`.stderr()`) runs its
 //!    `dup2`s in the child BEFORE any `pre_exec` hook, so a mapping source left at fd 0/1/2
 //!    would otherwise be silently clobbered before this module's own `pre_exec` ever ran;
-//!  - makes every post-fork syscall through raw `libc` calls whose return value is checked and
-//!    turned into an `io::Error` on failure — except the one `close` of a temporary this module
-//!    exclusively owns (see [`dup_avoiding`]), whose result is intentionally ignored: on Linux a
-//!    same-process `close` can legitimately report `EIO`/`EINTR` well after the descriptor is
-//!    released (e.g. a flush error on an NFS/FUSE-backed mapping source), so treating that as
-//!    fatal would abort an otherwise-fine spawn — never through nix's `dup2_raw`;
+//!  - checks every post-fork syscall (raw `libc` or rustix) and turns a failure into an
+//!    `io::Error` — except the one `close` of a temporary this module exclusively owns (see
+//!    [`dup_avoiding`]), whose result is intentionally ignored: on Linux a same-process `close`
+//!    can legitimately report `EIO`/`EINTR` well after the descriptor is released (e.g. a flush
+//!    error on an NFS/FUSE-backed mapping source), so treating that as fatal would abort an
+//!    otherwise-fine spawn;
 //!  - retries a syscall interrupted by `EINTR`, with no arbitrary bound (mirrors the
 //!    codebase's other `pre_exec`/raw-syscall retry sites — see e.g.
 //!    `containment::cgroup::channel`).
@@ -56,7 +56,7 @@
 //! returns `Ok`. Not fixed here: filed as #192, to land with a cosca-owned error channel.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 
 /// A parent-fd -> child-fd mapping to install as part of `std_cmd`'s `pre_exec` dup2 plan.
@@ -246,7 +246,11 @@ fn preserve(fds: &[OwnedFd]) -> io::Result<()> {
 /// `fcntl(fd, F_DUPFD_CLOEXEC, min)` — a fresh, `FD_CLOEXEC`-set duplicate of `fd`, at the
 /// lowest available number `>= min`. Retries `EINTR`.
 fn dup_fd_cloexec_at_or_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
-    retry_eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min) })
+    // SAFETY: `fd` is a mapping source this plan keeps open for the call.
+    let from = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    rustix::io::retry_on_intr(|| rustix::io::fcntl_dupfd_cloexec(from, min))
+        .map(IntoRawFd::into_raw_fd)
+        .map_err(io::Error::from)
 }
 
 /// A `FD_CLOEXEC` temporary duplicate of `fd`, at a number not in `forbidden` (every `child_fd`
@@ -300,7 +304,9 @@ fn dup2_onto(oldfd: RawFd, newfd: RawFd) -> io::Result<()> {
 /// `fcntl(fd, F_SETFD, 0)` — clears every fd flag (in practice just `FD_CLOEXEC`). Retries
 /// `EINTR`.
 fn clear_cloexec(fd: RawFd) -> io::Result<()> {
-    retry_eintr(|| unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }).map(|_| ())
+    // SAFETY: `fd` is a descriptor of this plan, open for the call.
+    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    rustix::io::retry_on_intr(|| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())).map_err(io::Error::from)
 }
 
 /// Retry a raw libc call that reports failure as `-1` with `errno` set, absorbing `EINTR`. No

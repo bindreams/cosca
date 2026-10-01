@@ -70,25 +70,14 @@ mod marker_eof_tests;
 /// does not guarantee.
 const LOW_WATER_MARK: isize = 1 << 20; // 1 MiB (requested; effectively min(this, pipe capacity))
 
-/// Make the read end non-blocking (idempotent). Raw `libc::fcntl`, matching the crate's
-/// existing style (`src/elevation/posix.rs`) rather than `nix::fcntl`. The read end belongs
-/// solely to the supervisor, so the file-status flag is ours to set.
+/// Make the read end non-blocking (idempotent). The read end belongs solely to the supervisor,
+/// so the file-status flag is ours to set.
 fn ensure_nonblocking(read_end: BorrowedFd<'_>) -> Result<(), Error> {
-    let fd = read_end.as_raw_fd();
-    // SAFETY: fcntl(F_GETFL/F_SETFL) on a live borrowed fd; no pointer args beyond the flags.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
-        }
-        if flags & libc::O_NONBLOCK != 0 {
-            return Ok(());
-        }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
-        }
+    let flags = rustix::fs::fcntl_getfl(read_end).map_err(|e| Error::Io(e.into()))?;
+    if flags.contains(rustix::fs::OFlags::NONBLOCK) {
+        return Ok(());
     }
-    Ok(())
+    rustix::fs::fcntl_setfl(read_end, flags | rustix::fs::OFlags::NONBLOCK).map_err(|e| Error::Io(e.into()))
 }
 
 /// Read and discard up to `n` bytes, tolerating short reads. Bounded by `n` — a count the

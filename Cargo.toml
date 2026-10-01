@@ -118,20 +118,24 @@ windows = { version = "0.62", features = [
 # 0.2.187 added `proc_bsdshortinfo` and `PROC_PIDT_SHORTBSDINFO`; 0.2.189 is what is locked.
 libc = "0.2.189"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
+# Typed `fcntl` wrappers: the raw call is variadic, and the right argument width differs per libc.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
 event-listener = "5"
 # The random part of a cgroup leaf's name.
 getrandom = "0.4"
-rustix = { version = "1", features = ["process", "event", "net", "fs", "thread"] }
+# cgroup syscalls; typed `ioctl`, `prctl`, `pidfd_open`.
+rustix = { version = "1", features = ["process", "event", "net", "thread"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Raw Mach threads for the tracer helper's thread-listing tests.
 mach2 = "0.7"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "1", default-features = false, features = ["mount"] }
+# `pty`: `ioctl_tiocgptpeer`.
+rustix = { version = "1", default-features = false, features = ["mount", "pty"] }
 
 [[test]]
 name = "process"

@@ -356,8 +356,8 @@ impl ReportSlot {
     /// # Safety
     /// As [`ReportSlot::send`].
     pub(super) unsafe fn send_intent(self) -> io::Result<Delivery> {
-        // Safety: async-signal-safe syscalls on this process's own pid.
-        let pid = unsafe { libc::getpid() };
+        // A raw syscall, so async-signal-safe.
+        let pid = rustix::process::getpid();
         #[cfg(test)]
         let (pidfd_denied, proc_denied) = (
             fault::take_force_child_pidfd_failure(),
@@ -365,11 +365,11 @@ impl ReportSlot {
         );
         #[cfg(not(test))]
         let (pidfd_denied, proc_denied) = (false, false);
-        // Safety: as above; a pidfd is opened close-on-exec.
         let pidfd = if pidfd_denied {
             -1
         } else {
-            unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd }
+            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                .map_or(-1, std::os::fd::IntoRawFd::into_raw_fd)
         };
         let (handle, kind) = if pidfd >= 0 {
             (pidfd, HANDLE_PIDFD)
@@ -388,7 +388,7 @@ impl ReportSlot {
             (dir, if dir >= 0 { HANDLE_PROC_DIR } else { HANDLE_NONE })
         };
         // Safety: the caller's guarantee; `handle` is this process's own or -1.
-        let sent = unsafe { self.send(TAG_INTENT, pid, kind, handle) };
+        let sent = unsafe { self.send(TAG_INTENT, pid.as_raw_nonzero().get(), kind, handle) };
         if handle >= 0 {
             // Safety: the descriptor opened above, closed once.
             unsafe { libc::close(handle) };

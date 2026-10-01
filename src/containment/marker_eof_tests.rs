@@ -72,12 +72,8 @@ fn spawn_marker_holder(script: &str) -> (crate::Child, std::io::PipeReader, std:
 /// kernel-reported — used to prove a drain did or did not happen, rather than inferring it
 /// from a verdict that reports the same thing (`MembersRemain`) either way.
 fn fionread(fd: BorrowedFd<'_>) -> i32 {
-    let mut n: libc::c_int = 0;
-    // SAFETY: FIONREAD via ioctl writes exactly one `c_int`; `fd` is a valid, open descriptor
-    // for the duration of this call.
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut n) };
-    assert_eq!(rc, 0, "FIONREAD ioctl failed: {}", std::io::Error::last_os_error());
-    n
+    let n = rustix::io::ioctl_fionread(fd).unwrap_or_else(|e| panic!("FIONREAD ioctl failed: {e}"));
+    i32::try_from(n).expect("a pipe's buffered byte count fits an i32")
 }
 
 #[path = "marker_eof_tests/deadline.rs"]
@@ -671,17 +667,9 @@ async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
 /// smaller writes let the growth straddle two of them (measured 16384, then 65536). Shared with
 /// `deadline`.
 fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
-    let fd = w.as_raw_fd();
-    // SAFETY: `fd` is a valid, open descriptor for the whole call; `F_GETFL`/`F_SETFL` is a
-    // well-formed pair on it.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
-    assert_eq!(
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0,
-        "fcntl F_SETFL O_NONBLOCK failed: {}",
-        std::io::Error::last_os_error()
-    );
+    let flags = rustix::fs::fcntl_getfl(w).unwrap_or_else(|e| panic!("fcntl F_GETFL failed: {e}"));
+    rustix::fs::fcntl_setfl(w, flags | rustix::fs::OFlags::NONBLOCK)
+        .unwrap_or_else(|e| panic!("fcntl F_SETFL O_NONBLOCK failed: {e}"));
     let buf = vec![0u8; 1 << 20];
     loop {
         match nix::unistd::write(w, &buf) {

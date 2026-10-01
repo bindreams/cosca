@@ -4,7 +4,7 @@
 //! Also mounted by `#[path]` into `tests/common` beside `test_own_process`, so it names its
 //! sibling through `super::`, never `crate::`.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 
 use super::test_own_process::Completion;
 
@@ -21,15 +21,10 @@ impl RestoreStdio {
             saved: Vec::with_capacity(fds.len()),
         };
         for &fd in fds {
-            // SAFETY: F_DUPFD_CLOEXEC(fd, 3) duplicates `fd` to a fresh number >= 3, checked below.
-            let saved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-            assert!(
-                saved >= 0,
-                "dup fd {fd} aside before closing it: {}",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: `saved` was just returned by a successful F_DUPFD_CLOEXEC.
-            restore.saved.push((fd, unsafe { OwnedFd::from_raw_fd(saved) }));
+            // SAFETY: `fd` is open: the caller names a descriptor of this process to close.
+            let saved = rustix::io::fcntl_dupfd_cloexec(unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) }, 3)
+                .unwrap_or_else(|e| panic!("dup fd {fd} aside before closing it: {e}"));
+            restore.saved.push((fd, saved));
             // SAFETY: closing a descriptor number; the result is checked.
             let closed = unsafe { libc::close(fd) };
             assert_eq!(
