@@ -143,9 +143,10 @@ impl Spawned for std::process::Child {
 enum Outcome {
     /// The child sent its pidfd and was told to go.
     Opened(OwnedFd),
-    /// The child sent its pidfd, and its end was closed or shut before GO was sent: it never ran
-    /// the program. A GO sent before the child died is buffered and delivered, and the spawn then
-    /// succeeds with a child that dies later, as any child may.
+    /// The child sent its pidfd, and every copy of its end was closed or shut before GO was sent:
+    /// it never ran the program. A GO sent while any copy was still open is buffered, even if the
+    /// child had already died: this thread holds a copy until `spawn()` returns. The spawn then
+    /// succeeds with a child that dies without running the program, as any child may die.
     Gone(OwnedFd),
     /// The spawn cannot go on. The child was not told to go, so it aborts at EOF. Carries the
     /// child's pidfd if it sent one.
@@ -283,9 +284,11 @@ impl Handshake {
     ///   status pipe as success) and the helper at EOF. It is dead but unreaped, and its number
     ///   cannot be trusted without a pidfd, so it is left unreaped and warned about, as a macOS
     ///   `Drop` leaves a child it cannot verify. The spawn fails.
-    /// - A child that sent its pidfd and died before GO was sent never ran the program: the send
-    ///   meets its closed end, the child is reaped through the pidfd, and the spawn fails. A child
-    ///   that dies after GO was sent is a child that died: the spawn succeeded.
+    /// - A child that sent its pidfd and died before its verdict never ran the program. Which
+    ///   answer it gets is a race between the helper's GO and the close of the last copy of its
+    ///   end (this thread's goes when `spawn()` returns). If the send meets a closed end, the child
+    ///   is reaped through the pidfd and the spawn fails. Otherwise GO is buffered, and the spawn
+    ///   succeeds with a child that died. Either way the pidfd names it.
     /// - A spawn that fails after its fork: std collected the child, or tokio dropped it neither
     ///   killed nor reaped. The pidfd tells which, and a child still there is killed and reaped
     ///   through it.
@@ -414,7 +417,8 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         return false;
     };
     // A watch only, opened by number. The number is the child's own while the child is an unreaped
-    // child of this process; `ESRCH` or the peek's `ECHILD` shows that something else reaped it.
+    // child of this process. After a foreign reap, `ESRCH` or the peek's `ECHILD` shows it only
+    // while the number is still free.
     //
     // The window that remains, until #383 (an atomic pidfd) removes the watch: the number can be
     // reaped by a foreign reaper (a `SIG_IGN` host, another thread's `waitpid(-1)`) and taken by a
