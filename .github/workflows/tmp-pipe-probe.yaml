@@ -1,0 +1,31 @@
+# THROWAWAY (#483): shows nextest 0.9.137 leaking a test's capture pipe into a concurrent sibling on macOS.
+name: tmp pipe probe
+on:
+  pull_request:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        nextest: ["0.9.137", "0.9.146"]
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ matrix.nextest }}
+      - name: Build
+        working-directory: tmp-probe
+        run: cargo build --tests
+      # Each test asserts it inherited no pipe beyond stdio; five runs of 3000 tests.
+      - name: Probe
+        working-directory: tmp-probe
+        run: |
+          rc=0
+          for i in 1 2 3 4 5; do
+            cargo nextest run --no-fail-fast -j 48 --final-status-level fail > "run$i.log" 2>&1 || rc=1
+            grep -E "Summary" "run$i.log"
+          done
+          grep -h -m3 "inherited foreign" run*.log || true
+          exit $rc
