@@ -304,9 +304,9 @@ fn dropping_a_live_job_reaps_every_descendant() {
     drop(root);
 }
 
-/// The environment block keeps names Windows keeps apart: `straße` and `STRASSE` (Rust's
-/// `to_uppercase` folds both to `STRASSE`), and two different malformed names (it folds both to
-/// U+FFFD). It still merges names that differ only in case, the later spelling winning.
+/// The block keeps names Windows keeps apart (`straße`/`STRASSE`, two different malformed names)
+/// and merges names differing only in case, the later spelling winning. Its entries come out in
+/// ascending ordinal-ignore-case order, as `CreateProcessW` requires.
 #[test]
 fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
     use std::ffi::OsString;
@@ -334,6 +334,20 @@ fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
         "{entries:?}"
     );
     assert!(block.ends_with(&[0, 0]), "the block ends with a double NUL");
+    let names: Vec<&[u16]> = block
+        .split(|&u| u == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| &e[..e.iter().position(|&u| u == u16::from(b'=')).expect("NAME=value")])
+        .collect();
+    for pair in names.windows(2) {
+        assert_eq!(
+            common::windows_env::compare_names(pair[0], pair[1]),
+            std::cmp::Ordering::Less,
+            "entries must be strictly ascending: {:?} then {:?}",
+            String::from_utf16_lossy(pair[0]),
+            String::from_utf16_lossy(pair[1])
+        );
+    }
     // The two malformed names are told apart by the raw units, which a lossy decode cannot show.
     let raw: Vec<&[u16]> = block.split(|&u| u == 0).collect();
     for unit in [0xD800u16, 0xD801] {
@@ -343,4 +357,10 @@ fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
             "{unit:#x}"
         );
     }
+}
+
+/// An empty environment is still a valid block: two NULs, the first ending the absent first entry.
+#[test]
+fn env_block_of_nothing_is_a_double_nul() {
+    assert_eq!(common::windows_env::env_block([]), [0, 0]);
 }
