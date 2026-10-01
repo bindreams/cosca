@@ -123,8 +123,6 @@ impl SharedChild {
         let target = Target::PidFd(pidfd.as_fd());
         let Some(deadline) = deadline else {
             holder.unlock();
-            #[cfg(test)]
-            exit_only::seams::step(exit_only::seams::HolderStep::BlockingWaitid);
             return match exit_only::wait_visible_exit(&target)? {
                 Peek::Foreign(_) => Ok(Unlocked::Gone),
                 _ => Ok(Unlocked::ExitSeen),

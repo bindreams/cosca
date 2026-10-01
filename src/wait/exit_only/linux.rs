@@ -17,6 +17,8 @@ fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
 /// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
 /// zeroes the `siginfo_t` first). `EINTR` retries.
 pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
+    #[cfg(test)]
+    super::seams::waitid_called(options.bits());
     loop {
         match waitid(WaitId::PidFd(fd), options) {
             Ok(status) => {
@@ -69,6 +71,8 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 }
 
 pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
+    #[cfg(test)]
+    super::seams::step(super::seams::HolderStep::BlockingWaitid);
     #[cfg(test)]
     let forced_none = super::seams::take_forced_visible_none();
     #[cfg(not(test))]
