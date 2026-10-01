@@ -259,3 +259,59 @@ fn verify_allows_the_planned_harness_false_flip_and_nothing_back() {
     .unwrap();
     assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
 }
+
+// A flipped target is still compared ------------------------------------------------------------
+
+const FLIP_A: &str = "[[test]]\nname = \"a\"\npath = \"tests/a.rs\"\nharness = false\n";
+
+/// `toy` with a paused tokio test in `a`, applied and flipped, as T would land it.
+fn flipped() -> (tempfile::TempDir, PathBuf) {
+    let (d, root) = toy();
+    write(
+        &root,
+        "tests/a.rs",
+        "mod common;\n#[tokio::test(start_paused = true)]\nasync fn a() {}\n",
+    );
+    git(&root, &["commit", "-q", "-a", "-m", "paused"]);
+    assert_eq!(
+        code(&run(&root, &["apply", "src/lib.rs", "tests/a.rs", "tests/b.rs"])),
+        0
+    );
+    append_manifest(&root, FLIP_A);
+    (d, root)
+}
+
+#[test]
+fn a_legitimate_flip_verifies() {
+    let (_d, root) = flipped();
+    let out = run(&root, &["verify", "HEAD"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn verify_still_compares_the_files_of_a_flipped_target() {
+    let a = "tests/a.rs";
+    let paused = "#[skuld::test(runtime = crate::tokio::test_runtime::paused)]";
+    for (what, edit) in [
+        (
+            "a smuggled test",
+            (String::new(), "#[skuld::test]\nfn smuggled() { panic!() }\n".to_owned()),
+        ),
+        ("a new #[ignore]", (paused.to_owned(), format!("{paused}\n#[ignore]"))),
+        (
+            "a dropped paused runtime",
+            (paused.to_owned(), "#[skuld::test]".to_owned()),
+        ),
+    ] {
+        let (_d, root) = flipped();
+        let text = read(&root, a);
+        let changed = if edit.0.is_empty() {
+            format!("{text}{}", edit.1)
+        } else {
+            text.replace(&edit.0, &edit.1)
+        };
+        assert_ne!(changed, text, "{what}");
+        write(&root, a, &changed);
+        assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1, "{what}");
+    }
+}

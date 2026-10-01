@@ -374,7 +374,7 @@ pub fn verify_targets(manifest: Option<&Path>, rev: &str) -> Result<Vec<Mismatch
     let mut out = target_mismatches(&old_keys, &new_keys);
     let roots: Vec<PathBuf> = new_keys
         .iter()
-        .filter(|k| old_keys.contains(k))
+        .filter(|k| old_keys.iter().any(|o| o.identity() == k.identity()))
         .map(|k| new.workspace_root.join(&k.src))
         .collect();
     out.extend(verify(&git, &modtree::FsSource, &roots)?);
