@@ -80,8 +80,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         let n = match kq.kevent(&[], &mut events, None) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => {
-                super::super::kevent_eintr::count_retry();
-                continue;
+                super::super::panic!("mutant: no EINTR retry");
             }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };

@@ -51,13 +51,12 @@ impl Eq for EnvKey {}
 /// same name and keeps its own spelling). Sorted as `CreateProcessW` requires, each entry
 /// `NAME=value` NUL-terminated, and the block ends with an extra NUL.
 pub fn env_block(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
-    let mut by_name: BTreeMap<EnvKey, (OsString, OsString)> = BTreeMap::new();
+    let mut by_name_old: BTreeMap<String, (OsString, OsString)> = BTreeMap::new();
     for (key, value) in vars {
-        let name = EnvKey(key.encode_wide().collect());
-        // Remove first: an insert over an equal key would keep the OLD spelling.
-        by_name.remove(&name);
-        by_name.insert(name, (key, value));
+        by_name_old.insert(key.to_string_lossy().to_uppercase(), (key, value));
     }
+    let by_name: Vec<(OsString, OsString)> = by_name_old.into_values().collect();
+    let by_name: BTreeMap<u8, (OsString, OsString)> = by_name.into_iter().enumerate().map(|(i, v)| (i as u8, v)).collect();
     let mut block: Vec<u16> = Vec::new();
     for (key, value) in by_name.values() {
         block.extend(key.encode_wide());

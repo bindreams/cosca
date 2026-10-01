@@ -505,8 +505,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
         let n = match kq.kevent(&[], &mut events, None) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => {
-                kevent_eintr::count_retry();
-                continue;
+                panic!("mutant: no EINTR retry");
             }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
