@@ -49,8 +49,7 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
 #[cfg(target_os = "macos")]
 #[test]
 fn accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
-    #[path = "../tests/common/kevent_eintr.rs"]
-    mod kevent_eintr;
+    use super::kevent_eintr;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
     let mut cmd = std::process::Command::new("/bin/cat");

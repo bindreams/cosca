@@ -79,7 +79,10 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         // tokio installs when any test in this process spawns a child.
         let n = match kq.kevent(&[], &mut events, None) {
             Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                super::super::kevent_eintr::count_retry();
+                continue;
+            }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
         for ev in &events[..n] {
