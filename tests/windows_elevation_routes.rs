@@ -63,18 +63,33 @@
 //! Both are set by the `executing` job of `.github/workflows/windows-probes.yaml`, which runs only
 //! when dispatched with `run_executing_probes`, on a GitHub-hosted runner: an ephemeral VM
 //! destroyed after the job. They must never be set on a machine anyone depends on.
-#![cfg(windows)]
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(windows)]
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 
+#[cfg(windows)]
 #[path = "windows_elevation_routes/harness.rs"]
 mod harness;
+#[cfg(windows)]
 #[path = "windows_elevation_routes/logon_routes.rs"]
 mod logon_routes;
+#[cfg(windows)]
 #[path = "windows_elevation_routes/scheduled_task.rs"]
 mod scheduled_task;
+#[cfg(windows)]
 #[path = "windows_elevation_routes/token_filtering.rs"]
 mod token_filtering;
+
+#[cfg(windows)]
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
+}
+
+#[cfg(not(windows))]
+fn main() {}

@@ -16,7 +16,7 @@ fn inherited(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
     pairs.iter().map(|&(k, v)| (k.into(), v.into())).collect()
 }
 
-#[test]
+#[skuld::test]
 fn a_skuld_db_dir_passed_in_extra_reaches_the_block() {
     let dir = std::path::Path::new(r"C:\probe\dir");
     let block = env_block_from(inherited(&[("PATH", "p")]), &[skuld_db_dir(dir)]);
@@ -28,14 +28,14 @@ fn a_skuld_db_dir_passed_in_extra_reaches_the_block() {
 }
 
 /// The parent's directory belongs to the parent's account: a child under another one cannot write it.
-#[test]
+#[skuld::test]
 fn an_inherited_skuld_db_dir_is_not_forwarded() {
     let block = env_block_from(inherited(&[("PATH", "p"), ("SKULD_DB_DIR", r"C:\parent")]), &[]);
     let entries = entries(&block);
     assert!(entries.iter().all(|e| !e.starts_with("SKULD_DB_DIR=")), "{entries:?}");
 }
 
-#[test]
+#[skuld::test]
 fn extra_overrides_an_inherited_skuld_db_dir() {
     let dir = std::path::Path::new(r"C:\probe\dir");
     let block = env_block_from(inherited(&[("SKULD_DB_DIR", r"C:\parent")]), &[skuld_db_dir(dir)]);

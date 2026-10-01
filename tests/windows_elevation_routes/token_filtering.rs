@@ -54,7 +54,7 @@ use crate::windows_probe::mark_test_passed;
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
 /// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
 /// token, nothing more.
-#[test]
+#[skuld::test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn measure_this_token() {
     let mut out = String::new();
@@ -118,7 +118,7 @@ fn measure_this_token() {
 /// `CreateProcessAsUser`/`CreateProcessWithToken` chain is even reachable from a filtered caller.
 ///
 /// Read-only: `PROCESS_QUERY_LIMITED_INFORMATION` plus `TOKEN_QUERY`, nothing else.
-#[test]
+#[skuld::test]
 #[ignore = "platform probe; opt in with --ignored and COSCA_PROBE_INSPECT_PID=<pid>"]
 fn measure_another_process_token() {
     // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
@@ -236,7 +236,7 @@ fn measure_another_process_token() {
 /// The UAC policy in force. Without these values a token-shape measurement is uninterpretable: on
 /// a machine with `EnableLUA=0` there is no filtering to observe and every result below would be
 /// a misleading "elevation just works".
-#[test]
+#[skuld::test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn measure_uac_policy() {
     const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
@@ -278,7 +278,7 @@ fn measure_uac_policy() {
 /// [`unelevated_caller_view`], which takes the same measurement at medium integrity and is the one
 /// that can actually answer the question — but only when its own report confirms
 /// `TokenIsElevated=false`; see that function's doc for when it cannot.
-#[test]
+#[skuld::test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn linked_token_chain_here() {
     let mut out = String::new();
@@ -317,7 +317,7 @@ fn linked_token_chain_here() {
 /// `TokenLinkedToken` — the genuine filtered token Windows made, not an imitation. Otherwise one
 /// is synthesised by disabling the Administrators SID and stamping the medium integrity label,
 /// which is close but NOT identical, and the report says which was used.
-#[test]
+#[skuld::test]
 #[ignore = "platform probe; opt in with --ignored"]
 fn unelevated_caller_view() {
     let own = open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)
@@ -598,7 +598,7 @@ fn synthesise_medium_token(own: &Token) -> Token {
 /// is assumed"? `windows_shell_resolution.rs` measured `ShellExecuteEx` violating the intuitive
 /// reading of ITS docs twice, so this claim is measured rather than trusted. It is the whole
 /// reason a `CreateProcess*` route would be an improvement.
-#[test]
+#[skuld::test]
 #[ignore = "plants a batch file next to the target; opt in with --ignored"]
 fn does_createprocessw_lpapplicationname_apply_pathext() {
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
@@ -676,7 +676,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
 /// **Question 2's first step.** Which logon types return a FILTERED token for an account in
 /// Administrators, and which return the full one? `LogonUser` is where UAC token filtering is
 /// applied, so this is where the chain either starts or dies.
-#[test]
+#[skuld::test]
 #[ignore = "creates a local user account; opt in with --ignored on a throwaway host"]
 fn which_logon_types_return_a_filtered_token() {
     require_gate("COSCA_PROBE_ALLOW_ACCOUNTS", "creates and deletes local user accounts");

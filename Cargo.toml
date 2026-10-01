@@ -143,6 +143,11 @@ name = "process_root"
 path = "tests/process_root.rs"
 harness = false
 
+[[test]]
+name = "windows_elevation_routes"
+path = "tests/windows_elevation_routes.rs"
+harness = false
+
 [[bin]]
 name = "cosca_testbin"
 path = "testbin/main.rs"
