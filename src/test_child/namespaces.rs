@@ -23,6 +23,13 @@ pub(crate) fn run(fixture: &str) {
     super::run_fixture_command(fixture, super::fixture_command(fixture));
 }
 
+/// [`run`] with `env` set on the child only.
+pub(crate) fn run_with_env(fixture: &str, env: &[(&str, &Path)]) {
+    let mut cmd = super::fixture_command(fixture);
+    cmd.envs(env.iter().copied());
+    super::run_fixture_command(fixture, cmd);
+}
+
 /// Whether this process is the re-exec'd child of [`run`]; a fixture is also picked up by an
 /// ordinary suite run, where it must do nothing.
 pub(crate) fn is_child() -> bool {

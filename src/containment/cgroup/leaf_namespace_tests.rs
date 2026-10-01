@@ -64,7 +64,15 @@ fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
     if !enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_leaf_no_proc));
+    // The fixture chroots and never leaves, so it cannot remove a directory it made: it must not
+    // make one. `TMPDIR` is the driver's own, so a directory it left behind shows up here.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    ns::run_with_env(fixture_path!(fixture_leaf_no_proc), &[("TMPDIR", scratch.path())]);
+    let left: Vec<_> = std::fs::read_dir(scratch.path())
+        .expect("read the scratch directory")
+        .map(|e| e.expect("directory entry").path())
+        .collect();
+    assert!(left.is_empty(), "the fixture left {left:?} behind");
 }
 
 #[test]
