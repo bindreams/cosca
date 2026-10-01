@@ -77,7 +77,12 @@ fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
         fixture_path!(fixture_leaf_no_proc),
         &[("TMPDIR", scratch.path()), (CHROOT_ROOT_ENV, &root)],
     );
-    std::fs::remove_dir(&root).expect("remove the chroot root");
+    if let Err(e) = std::fs::remove_dir(&root) {
+        let inside: Vec<_> = std::fs::read_dir(&root)
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+        panic!("remove the chroot root {root:?}: {e}; the fixture left {inside:?} inside it");
+    }
     let left: Vec<_> = std::fs::read_dir(scratch.path())
         .expect("read the scratch directory")
         .map(|e| e.expect("directory entry").path())
