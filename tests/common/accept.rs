@@ -6,13 +6,16 @@
 //! - The target is an unreaped child the caller owns: a [`Target`] (`cosca::Child`,
 //!   `std::process::Child`). A pid only names a process while it is an unreaped child (a zombie
 //!   at worst) or a handle to it is open. Every entry point
-//!   first calls [`Target::has_exited`], a `try_wait`: `true` means the target is dead (and now
-//!   reaped, its status cached for the caller's own later `wait`), so the pid is never opened;
-//!   `false` means it is unreaped now and stays so, because nothing but the caller's own `wait`
-//!   or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps only
-//!   inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
+//!   first calls [`Target::has_exited`]: `true` means the target is dead, so the pid is never
+//!   opened; `false` means it is unreaped now and stays so, because nothing but the caller's own
+//!   `wait` or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps
+//!   only inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
 //!   `pidfd_open`, `kqueue` or `OpenProcess`. The caller must not `wait` on the target
 //!   concurrently.
+//! - Nothing here reaps a Unix `cosca::Child`. Its drop kills a contained tree by the root's
+//!   number only while the unreaped root pins it, and skips the kill once the root is reaped
+//!   (#382). A helper that panics on a dead root unwinds into exactly that drop, which must
+//!   still end the root's descendants.
 //! - The target performs the accept handshake ([`ack`]): after `connect()` it blocks until
 //!   the harness has accepted the connection and written the ack byte, before doing anything
 //!   else, including exiting. This is what makes the verdict deterministic: `connect()` returning
@@ -65,10 +68,12 @@ pub use async_impl::{accept_or_die_async, accept_or_die_async_also};
 #[cfg(windows)]
 pub use win::wait_handles;
 
-/// A child process the caller owns and has not reaped.
+/// A child process the caller owns and has not reaped. A `std::process::Child` may also be one the
+/// caller has already waited on: its `try_wait` answers from the status std cached.
 pub trait Target {
     fn pid(&self) -> u32;
-    /// `try_wait`: `true` when the target has exited, in which case it is now reaped.
+    /// `true` when the target has exited. A `std::process::Child` is then reaped; a Unix
+    /// `cosca::Child` is left unreaped for its drop (see the module doc).
     fn has_exited(&mut self) -> bool;
 }
 
@@ -78,9 +83,61 @@ impl Target for cosca::Child {
     }
 
     fn has_exited(&mut self) -> bool {
+        #[cfg(unix)]
+        return has_exited_unreaped(self.id());
+        #[cfg(windows)]
         self.try_wait()
             .expect("try_wait the control target before watching it")
             .is_some()
+    }
+}
+
+/// Whether the child `id` has exited, without reaping it. `id` must name an unreaped child of this
+/// process (debug-asserted): its zombie then pins the pid, so the identity read names the child
+/// itself, and a zombie reads `Dead`.
+#[cfg(unix)]
+pub(crate) fn has_exited_unreaped(id: ProcessId) -> bool {
+    use cosca::identity::Liveness;
+    debug_assert!(
+        is_unreaped_child(id.pid()),
+        "the control target (pid {}) must be an unreaped child of this process",
+        id.pid()
+    );
+    match id.is_alive() {
+        Liveness::Alive => false,
+        Liveness::Dead => true,
+        Liveness::Unknown => panic!(
+            "the OS would not say whether the control target (pid {}) is alive",
+            id.pid()
+        ),
+    }
+}
+
+/// Whether `pid` is a child of this process that nothing has reaped: `waitid(WEXITED | WNOHANG |
+/// WNOWAIT)` answers `ECHILD` for anything else.
+#[cfg(unix)]
+fn is_unreaped_child(pid: u32) -> bool {
+    loop {
+        // SAFETY: `siginfo_t` is plain old data; all-zero is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable `siginfo_t` for the whole call.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return false,
+            _ => panic!("waitid(P_PID, {pid}, WEXITED | WNOHANG | WNOWAIT): {e}"),
+        }
     }
 }
 
