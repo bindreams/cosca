@@ -7,6 +7,9 @@ use crate::identity::ProcDir;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
+/// The empty directory `fixture_leaf_no_proc` chroots into, made and removed by its driver.
+const CHROOT_ROOT_ENV: &str = "COSCA_FIXTURE_CHROOT_ROOT";
+
 /// Whether to run: the `CGROUP` group is on, as well as the `NAMESPACES` one.
 fn enabled() -> bool {
     ns::enabled() && crate::test_support::require_group("CGROUP")
@@ -64,10 +67,17 @@ fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
     if !enabled() {
         return;
     }
-    // The fixture chroots and never leaves, so it cannot remove a directory it made: it must not
-    // make one. `TMPDIR` is the driver's own, so a directory it left behind shows up here.
+    // The fixture chroots and never leaves, so it cannot remove a directory: the driver makes the
+    // chroot root and removes it. `TMPDIR` is the driver's own too, so anything the fixture makes
+    // and leaves shows up in `scratch`.
     let scratch = tempfile::tempdir().expect("tempdir");
-    ns::run_with_env(fixture_path!(fixture_leaf_no_proc), &[("TMPDIR", scratch.path())]);
+    let root = scratch.path().join("root");
+    std::fs::create_dir(&root).expect("mkdir the chroot root");
+    ns::run_with_env(
+        fixture_path!(fixture_leaf_no_proc),
+        &[("TMPDIR", scratch.path()), (CHROOT_ROOT_ENV, &root)],
+    );
+    std::fs::remove_dir(&root).expect("remove the chroot root");
     let left: Vec<_> = std::fs::read_dir(scratch.path())
         .expect("read the scratch directory")
         .map(|e| e.expect("directory entry").path())
@@ -82,8 +92,8 @@ fn fixture_leaf_no_proc() {
     }
     let (leaf, mut member, _own) = occupied_leaf();
     let pid = member.id();
-    let empty = tempfile::tempdir().expect("tempdir");
-    ns::chroot_into(empty.path());
+    let root = std::env::var_os(CHROOT_ROOT_ENV).expect("the driver names the chroot root");
+    ns::chroot_into(std::path::Path::new(&root));
 
     let err = leaf.holds(pid).expect_err("a missing /proc has no membership to read");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
