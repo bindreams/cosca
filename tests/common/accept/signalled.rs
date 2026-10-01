@@ -1,15 +1,16 @@
 //! The drain-signalled accept, for a target whose own pid cannot be watched.
 
 use std::fmt::{Debug, Display};
-use std::sync::Mutex;
 
 use rustix::fd::OwnedFd;
+
+use super::{first_ready, run_watcher, DrainOutcome, Ready};
 
 /// How a tree's drain wait ended, handed from the watcher thread to [`accept_or_signalled`]: a
 /// wait that FAILED must not be reported as the tree having drained.
 pub struct DrainSignal {
     fd: OwnedFd,
-    outcome: Mutex<Option<Result<String, String>>>,
+    outcome: DrainOutcome,
 }
 
 impl Default for DrainSignal {
@@ -22,24 +23,23 @@ impl DrainSignal {
     pub fn new() -> Self {
         Self {
             fd: rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).expect("create the drain eventfd"),
-            outcome: Mutex::new(None),
+            outcome: DrainOutcome::default(),
         }
     }
 
-    /// Records the result of `wait_tree` and wakes the acceptor. The outcome is stored before
-    /// the eventfd is written, so an acceptor woken by the eventfd always finds it.
-    pub fn record<T: Debug, E: Display>(&self, result: Result<T, E>) {
-        let outcome = result.map(|drain| format!("{drain:?}")).map_err(|e| e.to_string());
-        *self.outcome.lock().expect("the drain outcome lock") = Some(outcome);
+    fn wake(&self) {
         rustix::io::write(&self.fd, &1u64.to_ne_bytes()).expect("signal the drain");
     }
 
-    fn fail(&self) -> ! {
-        match self.outcome.lock().expect("the drain outcome lock").take() {
-            Some(Ok(drain)) => panic!("the leaf drained ({drain}) before anything connected"),
-            Some(Err(e)) => panic!("wait_tree failed while waiting for a connection: {e}"),
-            None => unreachable!("the drain eventfd is written only after the outcome is stored"),
-        }
+    /// Records the result of `wait_tree` and wakes the acceptor.
+    pub fn record<T: Debug, E: Display>(&self, result: Result<T, E>) {
+        self.outcome.store(result);
+        self.wake();
+    }
+
+    /// Runs `wait` (a `wait_tree`) and records its result; a `wait` that panics records an error.
+    pub fn watch<T: Debug, E: Display>(&self, wait: impl FnOnce() -> Result<T, E>) {
+        run_watcher(&self.outcome, || self.wake(), wait);
     }
 }
 
@@ -49,9 +49,8 @@ impl DrainSignal {
 /// leaf emptying is the death of every possible connector.
 ///
 /// `drained` is a [`DrainSignal`] that a watcher thread records into when the leaf drains
-/// (`wait_tree` returning, Ok or Err). The watcher only signals; this thread is the only one that ever calls `accept()`.
-/// One `poll()` waits on both. A connector waits for the ack after connecting, so it cannot have
-/// drained the leaf with a connection still queued: a drain with nothing accepted is a failure.
+/// (`wait_tree` returning, Ok or Err); only this thread accepts. One `poll()` waits on both. A
+/// connector waits for the ack after connecting, so a drain with nothing accepted is a failure.
 pub fn accept_or_signalled(listener: &std::net::TcpListener, drained: &DrainSignal) -> std::net::TcpStream {
     use std::os::fd::AsRawFd as _;
 
@@ -80,13 +79,12 @@ pub fn accept_or_signalled(listener: &std::net::TcpListener, drained: &DrainSign
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             panic!("the listener reported an error (revents={:#x})", fds[0].revents);
         }
-        // The drain is checked first, as `accept_or_die` checks exits first.
-        if fds[1].revents & libc::POLLIN != 0 {
-            drained.fail();
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            let (stream, _) = listener.accept().expect("accept a connection");
-            return super::ack_now(stream);
+        let drain = fds[1].revents & libc::POLLIN != 0;
+        let connection = fds[0].revents & libc::POLLIN != 0;
+        match first_ready(drain, connection) {
+            Some(Ready::Exit) => drained.outcome.fail("leaf"),
+            Some(Ready::Source) => return super::accept_and_ack(listener),
+            None => {}
         }
     }
 }
