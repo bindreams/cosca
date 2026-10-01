@@ -216,11 +216,30 @@ fn assert_exited_cleanly(tracee: crate::Child) {
     assert!(status.success(), "expected the tracee's own clean exit, got {status:?}");
 }
 
+/// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit (`sys/proc.h`). XNU sets it
+/// from `P_LEXIT`, which is never cleared (xnu `kern_sysctl.c`, `fill_user64_externproc`).
+const P_WEXIT: libc::c_int = 0x0000_2000;
+
+/// Whether the tracee `pid`, this test's unreaped child, has begun to exit.
+fn exiting(pid: u32) -> bool {
+    match crate::identity::kinfo::kinfo(pid as _) {
+        crate::identity::Resolved::Found(info) => info.kp_proc.p_flag & P_WEXIT != 0,
+        crate::identity::Resolved::Gone => panic!("the unreaped tracee {pid} is gone"),
+        crate::identity::Resolved::Unknown => panic!("kinfo refused to read the tracee {pid}"),
+    }
+}
+
 /// The tracee was killed with `SIGKILL`: by XNU when its tracer exited while tracing it, or by
 /// this test.
+///
+/// A stop record of a tracee that has begun to exit is not a stop. When its tracer exits, XNU
+/// wakes a stopped tracee with `SIGKILL` before its `psignal` would mark it running. A tracee
+/// that starts exiting first makes that `psignal` a no-op, and stays `SSTOP` until it is a
+/// zombie. Until then `waitid` reports it as stopped, with its exit status 9 (#463).
 fn assert_sigkilled(tracee: crate::Child) {
-    let info = await_change(tracee.id().pid());
-    if info.si_code == libc::CLD_STOPPED {
+    let pid = tracee.id().pid();
+    let info = await_change(pid);
+    if info.si_code == libc::CLD_STOPPED && !exiting(pid) {
         tracee.kill().expect("kill the stopped tracee");
         panic!("expected SIGKILL, but the tracee is stopped by {}", info.si_status);
     }
@@ -629,6 +648,23 @@ fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
     sys::peek(pid, libc::WEXITED).expect("waitid the killed tracee");
     let _stale = ForcedStop::arm(libc::SIGKILL);
     assert_sigkilled(tracee);
+}
+
+/// Mutant: `exiting` holds for a tracee that is only stopped, so `assert_sigkilled` would wait
+/// on it forever.
+#[test]
+fn a_stopped_tracee_is_not_exiting() {
+    let Some((tracee, _stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    send(pid, libc::SIGSTOP);
+    let info = await_change(pid);
+    assert_eq!(
+        (info.si_code, info.si_status),
+        (libc::CLD_STOPPED, libc::SIGSTOP),
+        "the tracee after SIGSTOP"
+    );
+    assert!(!exiting(pid), "the stopped tracee {pid} reads as exiting");
+    end_stopped(tracee);
 }
 
 /// Mutant: S1h's EOF goes to S2.
