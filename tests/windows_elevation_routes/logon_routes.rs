@@ -25,7 +25,7 @@ use crate::windows_probe::mark_test_passed;
 ///
 /// Also measures, in the same call, the two capabilities `ShellExecuteEx` cannot offer: an
 /// explicit environment block, and `STARTF_USESTDHANDLES` redirection of the child's stdout.
-#[test]
+#[skuld::test]
 #[ignore = "creates a local user account; opt in with --ignored on a throwaway host"]
 fn does_create_process_with_logon_elevate() {
     require_gate(

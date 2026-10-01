@@ -1,0 +1,27 @@
+name: tmp-win-probe
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: tmp elevation-route probe (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Run the identity-changing probes
+        shell: bash
+        env:
+          COSCA_PROBE_ALLOW_ACCOUNTS: "1"
+        run: |
+          cargo nextest run --locked --profile ci --target x86_64-pc-windows-msvc --test windows_elevation_routes --run-ignored only --no-capture -E 'test(unelevated_caller_view) | test(does_create_process_with_logon_elevate)'

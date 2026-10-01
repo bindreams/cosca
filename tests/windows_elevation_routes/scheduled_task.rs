@@ -15,7 +15,7 @@ use crate::windows_probe::mark_test_passed;
 /// Deliberately does NOT run the task. Observing the resulting process's integrity would mean
 /// waiting on the Task Scheduler service with no handle to wait on, and the registration answer is
 /// the one that decides the route.
-#[test]
+#[skuld::test]
 #[ignore = "registers and deletes a scheduled task; opt in with --ignored on a throwaway host"]
 fn can_this_caller_register_a_runlevel_highest_task() {
     require_gate("COSCA_PROBE_ALLOW_STATE", "registers and deletes a scheduled task");
