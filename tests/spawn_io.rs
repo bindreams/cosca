@@ -1646,11 +1646,8 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     // watcher never touches the listener.
     let drained = common::DrainSignal::new();
     let (leaf, mut worker) = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            drained.record(child.wait_tree());
-        });
-        // Whatever happens below, the tree must be killed before the scope joins the watcher, or a
-        // failing assertion would leave the watcher (and so the scope) waiting on a live tree.
+        scope.spawn(|| drained.watch(|| child.wait_tree()));
+        // The tree is killed before the scope joins the watcher.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let worker = common::accept_or_signalled(&listener, &drained);
             let mut worker = std::io::BufReader::new(worker);
@@ -1674,12 +1671,19 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
         match outcome {
             Ok(v) => v,
             Err(payload) => {
-                let _ = child.kill_tree();
+                // A failed kill leaves the watcher joining a live tree: report it with the
+                // assertion that was unwinding.
+                if let Err(e) = child.kill_tree() {
+                    panic!(
+                        "cleanup kill_tree failed ({e}); the watcher cannot drain a live tree; unwinding from: {}",
+                        common::panic_message(payload)
+                    );
+                }
                 std::panic::resume_unwind(payload)
             }
         }
     });
-    let _ = child.wait();
+    child.wait().expect("reap the root");
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must reach the worker the exited root left behind");
@@ -1712,9 +1716,7 @@ fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anythi
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let drained = common::DrainSignal::new();
     let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            drained.record(child.wait_tree());
-        });
+        scope.spawn(|| drained.watch(|| child.wait_tree()));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             common::accept_or_signalled(&listener, &drained)
         }))
@@ -1724,7 +1726,7 @@ fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anythi
         message.starts_with("the leaf drained (") && message.ends_with(") before anything connected"),
         "got: {message:?}"
     );
-    let _ = child.wait();
+    child.wait().expect("reap the root");
 }
 
 /// The unified-hierarchy path in the contents of a `/proc/<pid>/cgroup` file.
@@ -1980,7 +1982,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
     assert_eq!(&echo, b"x");
 
     child.kill_tree().expect("kill_tree");
-    let _ = child.wait();
+    child.wait().expect("reap the root");
     let mut buf = [0u8; 1];
     let n = worker.read(&mut buf).expect("read the worker's control socket");
     assert_eq!(n, 0, "cgroup.kill must kill the worker");
