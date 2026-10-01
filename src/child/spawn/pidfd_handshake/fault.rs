@@ -78,6 +78,7 @@ thread_local! {
     static WAIT_OVER: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static PARENT_END_SHUT: Cell<Option<bool>> = const { Cell::new(None) };
     static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static VERDICT_GUARDED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Disarms the after-spawn hook on drop.
@@ -513,6 +514,7 @@ impl HelperSeams {
     /// Opens the held verdict when dropped, unwinding included: a panic on the spawning thread (a
     /// hook, an assert) must fail the test, not leave the helper parked where the scope joins it.
     pub(super) fn open_on_drop(&self) -> OpenOnDrop {
+        VERDICT_GUARDED.with(|g| g.set(true));
         OpenOnDrop(self.verdict.clone())
     }
 
@@ -536,8 +538,14 @@ impl HelperSeams {
 #[must_use = "dropping this opens the gate at once"]
 pub(super) struct OpenOnDrop(Option<Gate>);
 
+/// Whether an [`OpenOnDrop`] is live on this thread.
+pub(crate) fn verdict_guarded() -> bool {
+    VERDICT_GUARDED.with(Cell::get)
+}
+
 impl Drop for OpenOnDrop {
     fn drop(&mut self) {
+        VERDICT_GUARDED.with(|g| g.set(false));
         if let Some(gate) = &self.0 {
             gate.open();
         }

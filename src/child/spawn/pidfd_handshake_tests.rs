@@ -802,8 +802,8 @@ fn fixture_unreported_death_init() {
 /// A panic in the verdict hook fails the test; it does not leave the helper parked at the hold
 /// where the scope waits for it.
 ///
-/// Mutant: the gate is opened only after the hook returns (the test hangs: bounded by the nextest
-/// override).
+/// Mutant: the gate is opened only after the hook returns. This test then hangs, bounded by the
+/// nextest override; `the_verdict_hook_runs_under_a_guard_that_opens_the_hold` fails at once.
 #[test]
 #[should_panic(expected = "the verdict hook panicked on purpose")]
 fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
@@ -813,6 +813,27 @@ fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
     drop(cmd.spawn());
     drop(held);
     drop(armed);
+}
+
+/// The verdict hook runs while a guard that opens the held verdict on unwind is live. This is the
+/// fast twin of the test above: without the guard, that one can only hang.
+///
+/// Mutant: the gate is opened only after the hook returns.
+#[test]
+fn the_verdict_hook_runs_under_a_guard_that_opens_the_hold() {
+    let (mut cmd, _reader) = marker_command();
+    let guarded = Rc::new(Cell::new(None));
+    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
+    let held = fault::hold_verdict_until_spawn_returns({
+        let guarded = Rc::clone(&guarded);
+        move |_| guarded.set(Some(fault::verdict_guarded()))
+    });
+    drop(cmd.spawn());
+    drop(held);
+    drop(armed);
+
+    assert_eq!(guarded.get(), Some(true), "the hook ran, under the guard");
+    assert!(!fault::verdict_guarded(), "the guard is gone once the spawn returns");
 }
 
 /// A thread that unshared its pid namespace for children cannot start threads, so it cannot run
