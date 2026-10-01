@@ -33,6 +33,11 @@ if ($Mode -eq 'etw') {
     exit 0
 }
 
+if ($Mode -eq 'preempt') {
+    [Probe]::Preempt(1500)
+    exit 0
+}
+
 if ($Mode -eq 'order') {
     [Probe]::Order(6)
     exit 0

@@ -22,7 +22,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: ETW manifest
         run: ./tmp-probe/probe.ps1 manifest
-      - name: ETW ground truth
-        run: ./tmp-probe/probe.ps1 etw
-      - name: pid vs sequence ordering
-        run: ./tmp-probe/probe.ps1 order
+      - name: pid vs sequence ordering under preemption
+        run: ./tmp-probe/probe.ps1 preempt

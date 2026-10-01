@@ -243,6 +243,149 @@ public static class Probe
         foreach (var x in xs) Kill(x.pi);
     }
 
+    // Preemption experiment =================================================================
+    // N's creator shares CPU 0 with a higher-priority load thread that alternates busy and idle
+    // phases, so N's creation is preempted at arbitrary points for longer than one X creation.
+    // Timing only shapes where preemption lands; every verdict rests on CID and seq order.
+
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+    [DllImport("kernel32.dll")] static extern UIntPtr SetThreadAffinityMask(IntPtr h, UIntPtr mask);
+    [DllImport("kernel32.dll")] static extern bool SetThreadPriority(IntPtr h, int prio);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateWaitableTimerExW(IntPtr sa, IntPtr name, uint flags, uint access);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetWaitableTimer(IntPtr h, ref long due, int period, IntPtr cb, IntPtr arg, bool resume);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateThread(IntPtr h, uint code);
+
+    static void Pin(ulong mask, int prio)
+    {
+        if (SetThreadAffinityMask(GetCurrentThread(), (UIntPtr)mask) == UIntPtr.Zero) throw new Exception("SetThreadAffinityMask");
+        if (!SetThreadPriority(GetCurrentThread(), prio)) throw new Exception("SetThreadPriority");
+    }
+
+    static void FreeDrain()
+    {
+        foreach (var h in drainThreads) { TerminateThread(h, 0); WaitForSingleObject(h, 0xFFFFFFFF); CloseHandle(h); }
+        drainThreads.Clear();
+    }
+
+    static readonly Dictionary<string, int> tally = new Dictionary<string, int>();
+    static void Count(string k) { int v; tally.TryGetValue(k, out v); tally[k] = v + 1; }
+
+    static void TrialP(int t, ulong helperMask)
+    {
+        FreeDrain();
+        if (!Drain(32)) throw new Exception("drain failed");
+        ulong floor = frontier;
+        var xs = new List<X>();
+        var preDone = new ManualResetEventSlim(false);
+        int stop = 0;
+        Exception helperErr = null;
+        var helper = new Thread(() =>
+        {
+            try
+            {
+                Pin(helperMask, 0);
+                int after = 0;
+                while (true)
+                {
+                    var x = new X();
+                    x.pi = Spawn(false, IntPtr.Zero);
+                    x.seq = Seq(x.pi.hProcess);
+                    xs.Add(x);
+                    if (xs.Count == 2) preDone.Set();
+                    if (Volatile.Read(ref stop) != 0 && ++after >= 2) break;
+                }
+            }
+            catch (Exception e) { helperErr = e; preDone.Set(); }
+        });
+        helper.Start();
+        preDone.Wait();
+        PROCESS_INFORMATION n = new PROCESS_INFORMATION();
+        try { n = Spawn(false, IntPtr.Zero); }
+        finally { Volatile.Write(ref stop, 1); helper.Join(); }
+        if (helperErr != null) throw helperErr;
+
+        ulong nseq = Seq(n.hProcess), npid = n.dwProcessId, ntid = n.dwThreadId;
+        Func<X, bool> fresh = x => x.pi.dwProcessId > floor;
+        bool mono = true; ulong last = 0;
+        foreach (var x in xs) if (fresh(x)) { if (x.pi.dwProcessId <= last) mono = false; last = x.pi.dwProcessId; }
+
+        if (npid <= floor || ntid <= floor || !mono) Count("UNPOSITIONED");
+        else
+        {
+            int iS = xs.FindIndex(x => x.seq > nseq);
+            int lastBelowPid = xs.FindLastIndex(x => fresh(x) && x.pi.dwProcessId < npid);
+            int lastBelowTid = xs.FindLastIndex(x => fresh(x) && x.pi.dwProcessId < ntid);
+            int iP = xs.FindIndex(x => fresh(x) && x.pi.dwProcessId > npid);
+            int seqEnd = iS < 0 ? xs.Count : iS;
+            bool refuted = iS >= 0 && lastBelowPid > iS;          // s_N < s_X(iS) < a_X(j>iS) < a_N
+            bool pidFirst = iP >= 0 && seqEnd >= iP + 2;          // a_N < a_X(iP) < s_X(j>iP) < s_N
+            bool pidTidGap = xs.Exists(x => fresh(x) && x.pi.dwProcessId > npid && x.pi.dwProcessId < ntid);
+            bool seqTidGap = iS >= 0 && lastBelowTid > iS;        // s_N < s_X(iS) < a_X(j>iS) < a_tid(N)
+            Count("positioned");
+            if (refuted) { Count("REFUTED(seq-before-pid)"); Console.WriteLine("REFUTED trial {0}: N.pid={1} N.tid={2} N.seq={3}", t, npid, ntid, nseq); }
+            if (pidFirst) Count("PID-BEFORE-SEQ(observed gap)");
+            if (!refuted && !pidFirst) Count("UNRESOLVED(adjacent)");
+            if (pidTidGap) Count("control: X pid between N.pid and N.tid");
+            if (seqTidGap) Count("control: X created between N.seq and N.tid");
+            if (refuted || pidFirst || t < 3)
+            {
+                var sb = new StringBuilder();
+                foreach (var x in xs) sb.AppendFormat(" [{0}{1} seq={2}]", x.pi.dwProcessId, fresh(x) ? "" : "(old)", x.seq);
+                Console.WriteLine("trial {0}: N pid={1} tid={2} seq={3} floor={4} X:{5}", t, npid, ntid, nseq, floor, sb);
+            }
+        }
+        See(npid); See(ntid);
+        foreach (var x in xs) { See(x.pi.dwProcessId); See(x.pi.dwThreadId); }
+        Kill(n);
+        foreach (var x in xs) Kill(x.pi);
+    }
+
+    public static void Preempt(int trials)
+    {
+        exitThread = GetProcAddress(GetModuleHandleW("kernel32.dll"), "ExitThread");
+        int cpus = Environment.ProcessorCount;
+        Console.WriteLine("cpus={0} trials={1}", cpus, trials);
+        if (cpus < 2) throw new Exception("needs at least 2 CPUs");
+        ulong helperMask = ((cpus >= 64) ? ulong.MaxValue : ((1UL << cpus) - 1)) & ~1UL;
+        int stopLoad = 0;
+        Exception err = null;
+        var load = new Thread(() =>
+        {
+            Pin(1, 15);
+            IntPtr timer = CreateWaitableTimerExW(IntPtr.Zero, IntPtr.Zero, 2 /*HIGH_RESOLUTION*/, 0x1F0003);
+            if (timer == IntPtr.Zero) throw new Exception("CreateWaitableTimerExW " + Marshal.GetLastWin32Error());
+            var rng = new Random(12345);
+            while (Volatile.Read(ref stopLoad) == 0)
+            {
+                long due = -rng.Next(1000, 8000);             // idle 0.1-0.8 ms (100 ns units)
+                SetWaitableTimer(timer, ref due, 0, IntPtr.Zero, IntPtr.Zero, false);
+                WaitForSingleObject(timer, 0xFFFFFFFF);
+                ulong now, end;
+                QueryInterruptTimePrecise(out now);
+                end = now + (ulong)rng.Next(20000, 50000);     // busy 2-5 ms
+                while (now < end && Volatile.Read(ref stopLoad) == 0) QueryInterruptTimePrecise(out now);
+            }
+            CloseHandle(timer);
+        });
+        var main = new Thread(() =>
+        {
+            try
+            {
+                Pin(1, 0);
+                for (int t = 0; t < trials; t++) TrialP(t, helperMask);
+            }
+            catch (Exception e) { err = e; }
+            finally { Volatile.Write(ref stopLoad, 1); }
+        });
+        load.Start();
+        main.Start();
+        main.Join();
+        load.Join();
+        FreeDrain();
+        foreach (var kv in tally) Console.WriteLine("TALLY {0} = {1}", kv.Key, kv.Value);
+        if (err != null) throw err;
+    }
+
     public static void Order(int trialsPerVariant)
     {
         exitThread = GetProcAddress(GetModuleHandleW("kernel32.dll"), "ExitThread");
