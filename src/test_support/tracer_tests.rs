@@ -173,10 +173,40 @@ fn send(pid: u32, signal: i32) {
     assert_eq!(sys::kill(pid, signal), Ok(()), "kill({pid}, {signal})");
 }
 
+thread_local! {
+    /// Seam: a stop signal the next [`await_change`] reports in place of `waitid`'s record.
+    static FORCED_STOP: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arms [`FORCED_STOP`] until dropped.
+struct ForcedStop;
+
+impl ForcedStop {
+    fn arm(signal: i32) -> ForcedStop {
+        FORCED_STOP.set(Some(signal));
+        ForcedStop
+    }
+}
+
+impl Drop for ForcedStop {
+    fn drop(&mut self) {
+        FORCED_STOP.set(None);
+    }
+}
+
 /// Blocks until the tracee, this test's child again, has exited or stopped, and returns that
 /// record without consuming it. The test has closed the tracee's stdin, so a running tracee
 /// exits.
 fn await_change(pid: u32) -> libc::siginfo_t {
+    if let Some(signal) = FORCED_STOP.take() {
+        // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = libc::SIGCHLD;
+        info.si_code = libc::CLD_STOPPED;
+        info.si_pid = pid as libc::pid_t;
+        info.si_status = signal;
+        return info;
+    }
     sys::peek(pid, libc::WEXITED | libc::WSTOPPED).expect("waitid the tracee")
 }
 
@@ -586,6 +616,19 @@ fn s1h_a_signal_byte_goes_to_release() {
     assert_handed_back(pid);
     drop(th);
     assert_exited_cleanly(tracee);
+}
+
+/// XNU can report a tracee it killed for its exiting tracer as stopped by 9 until it is a zombie
+/// (#463). Replays that record for a tracee that is exiting from `SIGKILL`, this test's own.
+/// Mutant: `assert_sigkilled` takes the stop record of an exiting tracee for a stop.
+#[test]
+fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
+    let Some((tracee, _stdin)) = tracee() else { return };
+    let pid = tracee.id().pid();
+    send(pid, libc::SIGKILL);
+    sys::peek(pid, libc::WEXITED).expect("waitid the killed tracee");
+    let _stale = ForcedStop::arm(libc::SIGKILL);
+    assert_sigkilled(tracee);
 }
 
 /// Mutant: S1h's EOF goes to S2.
