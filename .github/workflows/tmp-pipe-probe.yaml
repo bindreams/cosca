@@ -22,6 +22,9 @@ jobs:
       - name: Probe
         working-directory: tmp-probe
         run: |
+          # The runner hands every step its own pipes (fds 143, 146): close all fds >= 3 so a probe
+          # failure can only be a pipe nextest leaked between its own tests.
+          for f in /dev/fd/*; do n=${f##*/}; if [ "$n" -gt 2 ]; then eval "exec $n>&-" 2>/dev/null || true; fi; done
           rc=0
           for i in 1 2 3 4 5; do
             cargo nextest run --no-fail-fast -j 48 --final-status-level fail > "run$i.log" 2>&1 || rc=1
