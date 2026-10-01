@@ -159,6 +159,7 @@ enum Block {
     Until {
         interval: Option<Duration>,
         deadline: Option<Option<Instant>>,
+        fixed: Option<Duration>,
     },
 }
 
@@ -169,8 +170,12 @@ impl Block {
     fn timeout(self) -> Option<Duration> {
         match self {
             Block::Poll => Some(Duration::ZERO),
-            Block::Until { interval, deadline } => {
-                let armed = match (interval, crate::wait::remaining(deadline)) {
+            Block::Until {
+                interval,
+                deadline,
+                fixed,
+            } => {
+                let armed = match (interval, fixed) {
                     (Some(interval), Some(left)) => Some(interval.min(left)),
                     (Some(interval), None) => Some(interval),
                     (None, left) => left,
@@ -223,6 +228,7 @@ pub(crate) fn await_reapable_on(
     deadline: Option<Instant>,
 ) -> io::Result<Waited> {
     let deadline = deadline.map(Some);
+    let fixed = crate::wait::remaining(deadline);
     let mut backoff = register(kq, pid)?;
     let mut interval = BACKOFF_START;
     let mut events = [blank(); BATCH];
@@ -265,6 +271,7 @@ pub(crate) fn await_reapable_on(
         let block = Block::Until {
             interval: backoff.then_some(interval),
             deadline,
+            fixed,
         };
         let n = kevent_round(kq, &mut events, block)?;
         let (reaped, exited) = scan(&events[..n]);
