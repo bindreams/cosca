@@ -125,12 +125,45 @@ pub fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// zombie collectable.
 #[cfg(unix)]
 pub fn block_until_zombie(pid: cosca::identity::RawPid) {
+    zombie_record(pid);
+}
+
+/// [`block_until_zombie`], then the zombie's exit status, still without reaping it.
+#[cfg(unix)]
+pub fn zombie_exit_status(pid: cosca::identity::RawPid) -> std::process::ExitStatus {
+    let si = zombie_record(pid);
+    #[cfg(target_os = "linux")]
+    // SAFETY: `waitid` returned a `SIGCHLD` record, whose status field is set.
+    let status = unsafe { si.si_status() };
+    #[cfg(target_os = "macos")]
+    let status = si.si_status;
+    wait_status(si.si_code, status)
+}
+
+/// The wait status std would decode for a `SIGCHLD` record's `si_code` and `si_status`, which
+/// `waitid(WEXITED)` only reports for an exit.
+#[cfg(unix)]
+fn wait_status(si_code: libc::c_int, si_status: libc::c_int) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    match si_code {
+        libc::CLD_EXITED => std::process::ExitStatus::from_raw((si_status & 0xff) << 8),
+        libc::CLD_DUMPED => std::process::ExitStatus::from_raw((si_status & 0x7f) | 0x80),
+        libc::CLD_KILLED => std::process::ExitStatus::from_raw(si_status & 0x7f),
+        other => {
+            debug_assert!(false, "waitid(WEXITED) reported si_code {other}, which is not an exit");
+            std::process::ExitStatus::from_raw(si_status & 0x7f)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn zombie_record(pid: cosca::identity::RawPid) -> libc::siginfo_t {
     loop {
         let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `si` is a valid, correctly-sized out-param; `pid` is our own unreaped child.
         let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
         if rc == 0 {
-            return;
+            return si;
         }
         // EINTR is a restart, not a failure — the codebase's convention for every blocking
         // syscall (see `wait/macos.rs`, `identity/macos/kinfo.rs`).

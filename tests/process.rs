@@ -547,31 +547,32 @@ fn death_watch_spawn_tree_panics_when_the_grandchild_dies_before_connecting_whil
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
 #[skuld::test]
 fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
-    // Contained so unwinding kills the orphaned grandchild (it would otherwise outlive the test
-    // holding its stdio). The kill is only sent on drop, so wait for the grandchild's exit by
-    // identity (never a reissued pid).
-    let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+    root_dies_after_reporting(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+}
+
+/// [`death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting`] with the root's exit
+/// complete before the harness first looks at it.
+#[skuld::test]
+fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_the_harness_looks() {
+    let seam = common::reapable_after_release();
+    let message = root_dies_after_reporting(|| common::spawn_tree("spawn-grandchild-report-then-exit", true));
+    assert_died_before_connecting(&message, seam.root().expect("the seam waited on the released root"));
+}
+
+/// Runs `spawn_tree`, which must panic on a root that exits right after reporting its grandchild,
+/// and returns the panic message. Contained so unwinding kills the orphaned grandchild.
+fn root_dies_after_reporting<R>(spawn_tree: impl FnOnce() -> R) -> String {
+    common::install_log_capture();
+    let mark = common::log_mark();
+    let message = panic_message_of(spawn_tree);
     assert!(message.contains("died before it connected"), "got: {message:?}");
-    let id = common::last_reported_grandchild_id()
-        .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
-    assert_eq!(
-        common::last_reported_grandchild_contained(),
-        Some(true),
-        "the grandchild must be inside the root's containment when identified, or the drop does not kill it"
-    );
-    assert_eq!(
-        common::last_reported_grandchild_liveness(),
-        Some(cosca::identity::Liveness::Alive),
-        "the grandchild must be alive when identified, so its exit is the containment kill's"
-    );
-    cosca::Process::from_id(id)
-        .wait()
-        .expect("wait for the orphaned grandchild");
+    common::wait_for_the_dropped_trees_grandchild(mark, &message);
     let grandchild = common::last_reported_grandchild().expect("the root reported before it exited");
     assert!(
         !message.contains(&format!("(pid {grandchild})")),
         "the live grandchild must not be the one blamed: {message:?}"
     );
+    message
 }
 
 /// The root connects to the report address and exits without reporting: the failure names that,
