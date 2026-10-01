@@ -6,6 +6,9 @@
 //! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. Run them in a container,
 //! VM, or CI's root lane, never on a developer host.
 
+mod chroot_scratch;
+pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch};
+
 use std::path::Path;
 
 use rustix::mount::{mount, mount_bind, mount_change, MountPropagationFlags};
