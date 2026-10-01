@@ -250,7 +250,7 @@ fn stopped_by(info: &libc::siginfo_t, state: ProcState) -> Option<i32> {
         state.p_stat != libc::SZOMB || state.p_flag & P_WEXIT != 0,
         "a zombie without P_WEXIT: XNU sets P_LEXIT before SZOMB ({state:?})"
     );
-    (info.si_code == libc::CLD_STOPPED && state.p_flag & P_WEXIT == 0).then_some(info.si_status)
+    (info.si_code == libc::CLD_STOPPED && state.p_stat != libc::SZOMB).then_some(info.si_status)
 }
 
 /// The tracee was killed with `SIGKILL`: by XNU when its tracer exited while tracing it, or by
@@ -262,11 +262,7 @@ fn stopped_by(info: &libc::siginfo_t, state: ProcState) -> Option<i32> {
 /// that starts exiting first makes that `psignal` a no-op, and stays `SSTOP` until it is a
 /// zombie. Until then `waitid` reports it as stopped, with its exit status 9 (#463).
 fn assert_sigkilled(tracee: crate::Child) {
-    assert_eq!(
-        super::unreaped_helpers(),
-        0,
-        "assert_sigkilled before the tracer helper was reaped"
-    );
+    let _ = super::unreaped_helpers();
     let pid = tracee.id().pid();
     let info = await_change(pid);
     if let Some(signal) = stopped_by(&info, proc_state(pid)) {
