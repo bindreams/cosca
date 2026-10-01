@@ -47,6 +47,9 @@ pub mod test_own_process;
 #[cfg(unix)]
 #[path = "../../src/test_stdio.rs"]
 pub mod test_stdio;
+// Re-exec builder, shared with the library's tests.
+#[path = "../../src/test_reexec.rs"]
+pub mod test_reexec;
 // The `COSCA_TEST_SETUID` gate, shared with the library's tests.
 #[cfg(unix)]
 #[path = "../../src/test_privilege/setuid.rs"]

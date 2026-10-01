@@ -21,11 +21,9 @@ pub(crate) fn run_fixture_output_within(
     program: &Path,
     bound: Duration,
 ) -> Result<Output, Output> {
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = crate::test_reexec::command(program);
     super::configure_fixture_command(&mut cmd, fixture);
     cmd.env(marker_env, std::process::id().to_string());
-    // As `run_fixture_output`: an inherited `RUST_TEST_NOCAPTURE` turns libtest's capture off.
-    cmd.env_remove("RUST_TEST_NOCAPTURE");
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     output_within(child, bound)
 }
@@ -83,12 +81,12 @@ fn output_within(mut child: Child, bound: Duration) -> Result<Output, Output> {
 pub(crate) struct Watchdog(#[allow(dead_code, reason = "dropping the sender ends the watchdog")] Sender<()>);
 
 /// In a fixture: if it is still running after `bound`, name the step it is in ([`step`]) on the
-/// real stderr and abort, so the driver's assertion shows where it hung.
+/// stderr and abort, so the driver's assertion shows where it hung.
 pub(crate) fn watchdog(name: &'static str, bound: Duration) -> Watchdog {
     let (tx, rx) = channel::<()>();
     std::thread::spawn(move || {
         if rx.recv_timeout(bound) == Err(RecvTimeoutError::Timeout) {
-            // Not `eprintln!`: libtest captures that, and the abort would lose it.
+            // `writeln!`, not `eprintln!`: a failed write must not panic before the abort.
             _ = writeln!(
                 std::io::stderr(),
                 "WATCHDOG: {name} still running after {bound:?}; last step: {}",

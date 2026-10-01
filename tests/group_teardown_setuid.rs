@@ -110,11 +110,11 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
 fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
     use std::os::unix::process::CommandExt as _;
 
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    let mut cmd = common::test_reexec::command(std::env::current_exe().expect("this test binary"));
     cmd.args([
         "--exact",
         test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
-        "--nocapture",
+        common::test_reexec::NOCAPTURE,
         "--test-threads=1",
     ])
     .env(RERUN_ENV, std::process::id().to_string())

@@ -413,8 +413,8 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
     let exe = std::env::current_exe().expect("current_exe");
     let fixture = crate::test_child::fixture_path!(fixture_reports_job_breakaway_probe);
     let child = crate::test_spawn::spawn(
-        std::process::Command::new(&exe)
-            .args(["--test-threads=1", "--exact", fixture])
+        crate::test_reexec::command(&exe)
+            .args(crate::test_reexec::fixture_args(fixture))
             .env(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped()),

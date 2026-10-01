@@ -83,7 +83,7 @@ fn foreign_kill_surfaces_permission_denied() {
     let exe = std::env::current_exe().expect("this test binary's own path");
     let reader_bin = common::world_executable_copy(&exe, scratch.path());
     let status = common::status_locked(
-        std::process::Command::new(&reader_bin)
+        common::test_reexec::command(&reader_bin)
             .uid(common::READER_UID)
             .gid(common::READER_UID)
             .env(ENV_TARGET_PID, format!("{}:{target_pid}", std::process::id())),

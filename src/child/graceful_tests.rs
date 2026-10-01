@@ -313,6 +313,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
                 crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
             ));
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
+        crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     }
     cmd.contain();
     #[cfg_attr(
@@ -516,8 +517,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // process would itself own and then close on its own exit. That connect-and-tag IS the
 // happens-before edge (the grandchild cannot tag until its own code is running, in its own
 // group), over the same control-channel shape `tests/common::spawn_tree` uses (a stdout byte
-// would not work here: libtest captures a passing test's own `print!` output and discards it, so
-// it would never reach a piped reader — see the fixture's own doc). `sock` is held for this
+// would not work here: the fixture's stdout is null — see the fixture's own doc). `sock` is held for this
 // whole test: dropping it would deliver EOF and let the grandchild exit on its own, defeating
 // the MembersRemain fixture.
 #[cfg(windows)]
@@ -535,6 +535,7 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
             crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
         ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
     // Blocks until the fixture has connected — which it does only after the grandchild survivor

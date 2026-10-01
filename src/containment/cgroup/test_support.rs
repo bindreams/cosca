@@ -303,8 +303,14 @@ pub(crate) fn alone(name: &str) -> bool {
         return true;
     }
     let out = crate::test_spawn::output_captured(
-        std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([name, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
+        crate::test_reexec::command(std::env::current_exe().expect("this test binary"))
+            .args([
+                name,
+                "--exact",
+                "--include-ignored",
+                crate::test_reexec::NOCAPTURE,
+                "--test-threads=1",
+            ])
             .env(ALONE, name),
     )
     .expect("run the test alone");

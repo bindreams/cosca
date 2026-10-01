@@ -175,8 +175,8 @@ fn already_elevated(c: &mut Command) -> Result<Command, Error> {
     Ok(rw.derived.expect("the already-elevated rewrite derives a command"))
 }
 
-/// Write to the real stderr: libtest captures `eprintln!`, and the fixture exits without
-/// returning, so a captured line would never be printed.
+/// Write to stderr, ignoring a failed write: `eprintln!` would panic on one, and the fixture
+/// exits without returning.
 fn report(line: &str) {
     use std::io::Write;
     _ = writeln!(std::io::stderr(), "{line}");

@@ -329,12 +329,10 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     let exe_dir = tempfile::tempdir().expect("create a directory for the signed helper");
     let exe = debugger_signed_copy(exe_dir.path());
     let marker = DEFAULT_MARKER.to_string();
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args([
-        "--test-threads=1",
-        "--exact",
-        crate::test_child::fixture_path!(uh_helper_entry),
-    ])
+    let mut cmd = crate::test_reexec::command(exe);
+    cmd.args(crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
+        uh_helper_entry
+    )))
     .env("COSCA_UH_ROLE", "helper")
     .env("COSCA_UH_MODE", mode.as_env())
     .env("COSCA_UH_MARKER", &marker)
@@ -546,14 +544,12 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::Command::new();
     cmd.executable(&exe)
-        .args([
-            "cosca_unit_tests",
-            "--test-threads=1",
-            "--exact",
-            crate::test_child::fixture_path!(uh_tracee_fixture),
-        ])
+        .args(crate::test_child::fixture_argv(crate::test_child::fixture_path!(
+            uh_tracee_fixture
+        )))
         .env("COSCA_UH_ROLE", "tracee")
         .env("COSCA_UH_KIND", format!("{kind:?}"));
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
@@ -655,7 +651,6 @@ fn uh_tracee_fixture() {
             _ => caught |= 1 << (signal - 1),
         }
     }
-    // Raw `stdout()`, not `println!`, which libtest captures.
     let line = format!("\n{TRACEE_READY} blocked={blocked} pgrp={pgrp} caught={caught} ignored={ignored}\n");
     let mut out = std::io::stdout().lock();
     out.write_all(line.as_bytes())

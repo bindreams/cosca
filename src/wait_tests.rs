@@ -557,11 +557,11 @@ fn fixture_round_check_violation_while_panicking() {
 
 /// A violation found while the thread is already panicking (a Drop path) cannot panic again, and
 /// must not be stored where nothing reads it or a spin could go on: it ends the process with the
-/// message on the real stderr and `VIOLATION_EXIT_CODE`, and no crash report.
+/// message on stderr and `VIOLATION_EXIT_CODE`, and no crash report.
 ///
 /// Mutant: store the violation and return -> the child exits with the test's own failure (101).
-/// Mutant: panic regardless of `thread::panicking()` -> the double panic aborts, and the message
-/// goes to libtest's capture; the exit code differs whatever the environment.
+/// Mutant: panic regardless of `thread::panicking()` -> the double panic aborts, and the exit
+/// code differs whatever the environment.
 #[test]
 fn round_check_exits_when_it_fires_while_panicking() {
     let output = crate::test_child::run_fixture_output(
@@ -586,6 +586,6 @@ fn round_check_exits_when_it_fires_while_panicking() {
     );
     assert!(
         stderr.contains("drop path") && stderr.contains("no progress"),
-        "the exit names its site and cause on the real stderr:\n{stderr}"
+        "the exit names its site and cause on stderr:\n{stderr}"
     );
 }

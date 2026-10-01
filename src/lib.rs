@@ -133,6 +133,9 @@ mod relayed_probe;
 #[cfg(test)]
 mod test_child;
 
+#[cfg(test)]
+mod test_reexec;
+
 #[cfg(all(test, unix))]
 mod test_privilege;
 
