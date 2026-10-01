@@ -41,3 +41,38 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
         "more.com must exit 0 on stdin EOF, or a natural end reads as a kill: {status:?}"
     );
 }
+
+/// macOS `kevent` returns `EINTR` even under `SA_RESTART`, so a signal handled while
+/// `watch_macos` is parked must retry the wait, not panic. The helper
+/// signals the waiting thread, then closes the target's stdin: the wait must survive the signal
+/// and still report the exit.
+#[cfg(target_os = "macos")]
+#[test]
+fn accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
+    #[path = "../tests/common/kevent_eintr.rs"]
+    mod kevent_eintr;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
+    let mut cmd = std::process::Command::new("/bin/cat");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn a target that waits for its stdin to close");
+    let target = crate::Process::from_pid(child.id())
+        .found()
+        .expect("resolve the freshly spawned target")
+        .id();
+    let stdin = child.stdin.take();
+    let interrupter = kevent_eintr::interrupt_once_blocked(move || drop(stdin));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_child::accept_or_die(&listener, target)
+    }));
+    interrupter.finish();
+    let payload = result.expect_err("accept_or_die must panic for an exited target");
+    let message = payload.downcast_ref::<String>().cloned().expect("string panic payload");
+    assert_eq!(
+        message,
+        format!("the control target (pid {}) died before it connected", target.pid())
+    );
+    child.wait().expect("reap the target");
+}

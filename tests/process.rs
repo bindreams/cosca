@@ -351,6 +351,30 @@ fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     child.wait().expect("reap");
 }
 
+/// macOS `kevent` returns `EINTR` even under `SA_RESTART`, so a signal handled while the wait is
+/// parked must retry it, not panic. The helper signals the waiting thread, then closes the
+/// target's stdin: the wait must survive the signal and still report the exit.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut child = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .arg("hold-until-stdin-eof")
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn a target that waits for its stdin to close");
+    let pid = child.id();
+    let stdin = child.stdin.take();
+    let interrupter = common::kevent_eintr::interrupt_once_blocked(move || drop(stdin));
+    let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
+    interrupter.finish();
+    assert_died_before_connecting(&message, pid);
+    child.wait().expect("reap");
+}
+
 /// A target that `has_exited` is dead, and its pid (here one that cannot exist) is never opened:
 /// a reaped pid could name a stranger.
 #[skuld::test]

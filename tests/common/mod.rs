@@ -24,6 +24,9 @@ pub mod seccomp;
 mod accept;
 pub use accept::*;
 
+#[cfg(target_os = "macos")]
+pub mod kevent_eintr;
+
 mod locked;
 pub use locked::*;
 
