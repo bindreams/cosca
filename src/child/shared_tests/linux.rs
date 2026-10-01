@@ -28,7 +28,7 @@ fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
     let target = b.shared.target().expect("a pidfd");
     let forced = exit_seams::force_visible_none_once();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::wait::exit_only::wait_visible_exit(&target)
+        crate::wait::exit_only::wait_visible_exit(&target, b.shared.id())
     }));
     drop(forced);
     if cfg!(debug_assertions) {

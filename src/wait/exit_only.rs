@@ -150,10 +150,10 @@ pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 /// another process traces is visible only to its tracer, so a pidfd that polls readable can still
 /// have nothing to peek at or reap; this blocks in `waitid(P_PIDFD, WEXITED | WNOWAIT)` until the
 /// tracer lets go. A stop cannot wake it: an invisible zombie means this process is not the
-/// tracer. Consumes nothing.
+/// tracer. Consumes nothing. `pid` is the child's, which the blocking `waitid` must answer with.
 #[cfg(target_os = "linux")]
-pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
-    linux::wait_visible_exit(target)
+pub(crate) fn wait_visible_exit(target: &Target<'_>, pid: u32) -> io::Result<Peek> {
+    linux::wait_visible_exit(target, pid)
 }
 
 // The wait status of an `si_code` record =====

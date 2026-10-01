@@ -68,7 +68,13 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     }
 }
 
-pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
+/// Block in `waitid(P_PIDFD, WEXITED | WNOWAIT)` until the exit of the child `pid` is visible.
+///
+/// Contract: a blocking `waitid` answers with the child it was asked about, so `si_pid == pid`.
+/// A `waitid` that returned without waiting (`WNOHANG`) leaves `si_pid` zero.
+pub(super) fn wait_visible_exit(target: &Target<'_>, pid: u32) -> io::Result<Peek> {
+    #[cfg(test)]
+    super::seams::step(super::seams::HolderStep::BlockingWaitid);
     #[cfg(test)]
     let forced_none = super::seams::take_forced_visible_none();
     #[cfg(not(test))]
@@ -76,7 +82,7 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
     let record = if forced_none {
         Ok(None)
     } else {
-        waitid_record(pidfd(target), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT)
+        blocking_waitid_record(pidfd(target), pid)
     };
     match record {
         Ok(Some(record)) if is_exit_record(record.si_code) => Ok(Peek::Exit(reaped_from_record(record))),
@@ -84,6 +90,42 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
         Ok(None) => no_record(),
         Err(Errno::CHILD) => Ok(Peek::Foreign(Foreign::Gone)),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// The blocking `waitid(P_PIDFD, WEXITED | WNOWAIT)`, through libc for `si_pid`, which rustix does
+/// not expose. `EINTR` retries.
+fn blocking_waitid_record(fd: BorrowedFd<'_>, pid: u32) -> Result<Option<Record>, Errno> {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a live pidfd and `info` is a valid out-pointer.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            match Errno::from_io_error(&io::Error::last_os_error()) {
+                Some(Errno::INTR) => continue,
+                Some(e) => return Err(e),
+                None => unreachable!("waitid fails with an errno"),
+            }
+        }
+        // SAFETY: the `siginfo_t` of a successful `waitid` has valid `si_pid` and `si_status`.
+        let (si_pid, si_status) = unsafe { (info.si_pid(), info.si_status()) };
+        debug_assert_eq!(
+            si_pid, pid as libc::pid_t,
+            "a blocking waitid(P_PIDFD, WEXITED) answered for another pid, or returned without waiting"
+        );
+        return Ok((info.si_signo != 0).then_some(Record {
+            si_code: info.si_code,
+            si_status,
+        }));
     }
 }
 

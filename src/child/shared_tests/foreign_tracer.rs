@@ -4,13 +4,15 @@
 //! A tracee that dies while a foreign tracer holds it is a zombie the tracer alone can see: its
 //! pidfd is readable, the parent's `waitid` finds no record, and the parent's own record appears
 //! only after the tracer hands the zombie back: by reaping it with `waitpid`, or by exiting
-//! (`exit_ptrace` detaches it; a debugger that quits). Both are tested. The tracer here is a re-exec of this
-//! test binary ([`foreign_tracer_helper`]); the tracee allows it with `PR_SET_PTRACER`, which
-//! Yama's scope 1 requires of a tracer that is no ancestor.
+//! (`exit_ptrace` detaches it; a debugger that quits). Both are tested. The tracer here is a
+//! re-exec of this test binary ([`foreign_tracer_helper`]); the tracee allows it with
+//! `PR_SET_PTRACER`, which Yama's scope 1 requires of a tracer that is no ancestor.
 
+use std::cell::Cell;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -61,19 +63,22 @@ fn foreign_tracer_helper() {
         return;
     }
     assert_eq!(go[0], REAP, "an unknown go byte");
-    loop {
+    let status = loop {
         let mut status = 0;
         // SAFETY: `status` is a valid out-pointer.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
-        if r == -1 {
-            let e = std::io::Error::last_os_error();
-            assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitpid: {e}");
-            continue;
+        if r != -1 {
+            break status;
         }
-        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            break;
-        }
-    }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitpid: {e}");
+    };
+    // The driver saw the pidfd readable, so the tracee is a zombie, which `waitpid` reports before
+    // any stop.
+    assert!(
+        libc::WIFEXITED(status) || libc::WIFSIGNALED(status),
+        "waitpid: not an exit: {status:#x}"
+    );
     say("reaped");
 }
 
@@ -89,9 +94,9 @@ impl Drop for Helper {
 
 /// What the waiting thread reports.
 enum Msg {
-    /// The holder is about to block, unlocked, in `waitid`.
-    AtBlockingWaitid,
-    /// The holder took a second `step`: it re-polls instead of blocking.
+    /// The holder, thread `tid`, is about to block, unlocked, in `waitid`.
+    AtBlockingWaitid(libc::pid_t),
+    /// The holder took a second `step` before blocking: it spins instead of blocking.
     Spun(HolderStep),
     /// `wait` returned, with the holder's steps.
     Done(std::io::Result<std::process::ExitStatus>, Vec<HolderStep>),
@@ -109,15 +114,54 @@ fn expect_line(lines: &mut impl Iterator<Item = std::io::Result<String>>, expect
     panic!("the helper ended without reporting {expected:?}");
 }
 
+/// Where the holder thread is.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    /// Asleep in a `waitid` that waits.
+    Blocked,
+    /// The thread is gone.
+    Finished,
+}
+
+/// Re-reads `/proc/self/task/<tid>/syscall` until the thread sleeps in a `waitid` without
+/// `WNOHANG`, or is gone. Both are conditions the holder reaches by itself, so the only exit is
+/// the condition; the pauses between reads are a backoff, not a bound.
+fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
+    let path = format!("/proc/self/task/{tid}/syscall");
+    let mut pause = std::time::Duration::from_micros(50);
+    loop {
+        match std::fs::read_to_string(&path) {
+            // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `running`, or `-1 <sp> <pc>`.
+            Ok(text) => {
+                let mut fields = text.split_whitespace();
+                let nr = fields.next().and_then(|n| n.parse::<libc::c_long>().ok());
+                // `waitid(idtype, id, infop, options, rusage)`: `options` is the fourth argument.
+                let options = fields
+                    .nth(3)
+                    .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok());
+                if nr == Some(libc::SYS_waitid) && options.is_some_and(|o| o & libc::WNOHANG as u64 == 0) {
+                    return Holder::Blocked;
+                }
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return Holder::Finished,
+            Err(e) => panic!("read {path}: {e}"),
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(5));
+    }
+}
+
 /// A zombie held by a foreign tracer is running to `try_wait`; `wait` blocks, unlocked, in
 /// `waitid` rather than re-polling the readable pidfd until the tracer lets go, and then returns
 /// the kill. The tracer lets go by reaping it.
 ///
 /// Mutants: a `waitid` that finds no record read as the child being gone (`try_wait` fails); a
-/// holder that re-polls instead of blocking, whether by a non-blocking peek (the steps repeat
-/// `BlockingWaitid, Reap`) or by polling again (a second `Poll` is reported, so the driver fails
-/// instead of waiting for a `BlockingWaitid` that never comes); a blocking `waitid` under the
-/// lock; a `wait` that returns before the tracer's reap.
+/// holder that spins instead of blocking, whether by re-polling, by looping on the reap, or by a
+/// non-blocking peek in place of the blocking `waitid` (a second `Poll` or `Reap` is reported
+/// before any `BlockingWaitid`, so the driver fails instead of waiting for one); a blocking
+/// `waitid` that is `WNOHANG` (the holder asserts `si_pid`, as the tracee is still held, and the
+/// driver sees the thread gone); a blocking `waitid` under the lock; a `wait` that returns before
+/// the tracer's reap.
 #[test]
 fn a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait() {
     hand_back(REAP);
@@ -138,7 +182,14 @@ fn hand_back(go_byte: u8) {
         // SAFETY: `prctl` is async-signal-safe and touches only the forked child.
         unsafe {
             cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) != 0 {
+                if libc::prctl(
+                    libc::PR_SET_PTRACER,
+                    libc::PR_SET_PTRACER_ANY,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
                     let e = std::io::Error::last_os_error();
                     // `EINVAL`: no Yama, so nothing restricts a tracer and nothing needs allowing.
                     if e.raw_os_error() != Some(libc::EINVAL) {
@@ -191,28 +242,48 @@ fn hand_back(go_byte: u8) {
         let shared = Arc::clone(&b.shared);
         move || {
             exit_seams::holder_steps();
+            let blocked = Rc::new(Cell::new(false));
+            let spin = |step| {
+                let spun = tx.clone();
+                let blocked = Rc::clone(&blocked);
+                move || {
+                    if !blocked.get() {
+                        _ = spun.send(Msg::Spun(step));
+                    }
+                }
+            };
+            // Hooks fire in registration order: the first of each passes, a second is a spin.
+            let _first_poll = exit_seams::on_holder_step(HolderStep::Poll, || {});
+            let _first_reap = exit_seams::on_holder_step(HolderStep::Reap, || {});
+            let _second_poll = exit_seams::on_holder_step(HolderStep::Poll, spin(HolderStep::Poll));
+            let _second_reap = exit_seams::on_holder_step(HolderStep::Reap, spin(HolderStep::Reap));
             let at_block = tx.clone();
             let _hook = exit_seams::on_holder_step(HolderStep::BlockingWaitid, move || {
-                _ = at_block.send(Msg::AtBlockingWaitid);
-            });
-            // Hooks fire in registration order: the first `Poll` passes, a second is a re-poll.
-            let _first_poll = exit_seams::on_holder_step(HolderStep::Poll, || {});
-            let spun = tx.clone();
-            let _second_poll = exit_seams::on_holder_step(HolderStep::Poll, move || {
-                _ = spun.send(Msg::Spun(HolderStep::Poll));
+                blocked.set(true);
+                _ = at_block.send(Msg::AtBlockingWaitid(rustix::thread::gettid().as_raw_nonzero().get()));
             });
             let result = shared.wait();
             _ = tx.send(Msg::Done(result, exit_seams::holder_steps()));
         }
     });
     match rx.recv().expect("the waiter reports") {
-        Msg::AtBlockingWaitid => {}
+        Msg::AtBlockingWaitid(tid) => {
+            // The tracee stays alive, held by the tracer, until the holder is asleep in the
+            // blocking `waitid` or has finished: a `waitid` that did not block then has nothing
+            // to answer with.
+            if await_blocked_or_finished(tid) == Holder::Finished {
+                match waiter.join() {
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    Ok(()) => panic!("the holder finished while the tracer still held the zombie"),
+                }
+            }
+        }
         Msg::Spun(step) => panic!("the holder took a second {step:?} instead of blocking in waitid"),
         Msg::Done(result, steps) => {
             panic!("wait returned {result:?} ({steps:?}) while the tracer still held the zombie")
         }
     }
-    // The hook runs after the holder gave up the lock and before it blocks.
+    // The holder gave up the lock before it blocked, and is asleep in `waitid`.
     let printed = format!("{:?}", b.shared);
     assert!(printed.contains("W {"), "the holder is in W: {printed}");
     assert!(
