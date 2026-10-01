@@ -124,37 +124,29 @@ pub(crate) fn signal_cancel(event: &OwnedHandle) {
     }
 }
 
-/// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
-/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited by `deadline`;
-/// `None` = unbounded. `deadline` is an absolute instant on the real clock, fixed by the caller
-/// before any hop to another thread; every re-arm recomputes against it.
+/// Opens `id` for waiting and verifies the handle names that process. `None`: it is gone, or its
+/// pid was recycled before the open. The caller closes the handle.
 #[cfg_attr(
-    not(feature = "tokio"),
+    not(any(feature = "tokio", test)),
     allow(
         dead_code,
-        reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+        reason = "only consumers are block_until_exit_or_cancel's (behind the tokio feature) and the unit-test fixtures"
     )
 )]
-pub(crate) fn block_until_exit_or_cancel(
-    id: ProcessId,
-    deadline: Option<Instant>,
-    cancel: &OwnedHandle,
-) -> Result<bool, Error> {
-    #[cfg(feature = "tokio")]
-    crate::bounded::assert_may_block("waiting for a process to exit or be cancelled");
+pub(crate) fn open_verified(id: ProcessId) -> Result<Option<HANDLE>, Error> {
     let handle = match crate::identity::windows_open_classified(
         id.pid(),
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
     ) {
         Opened::Found(h) => h,
-        Opened::Gone => return Ok(true), // no such pid => exited
+        Opened::Gone => return Ok(None), // no such pid => exited
         // Denied on a LIVE process => a real failure: reporting "exited" would let a
         // supervisor conclude a healthy service had died. The error comes from the
         // classifier, not `last_os_error()`: `is_alive()` below runs a whole
         // open/query/wait cycle that would overwrite the thread-s last-error first.
         Opened::Denied(e) => {
             return match id.is_alive() {
-                Liveness::Dead => Ok(true),
+                Liveness::Dead => Ok(None),
                 Liveness::Alive | Liveness::Unknown => {
                     log::warn!(
                         "wait: pid {} could not be opened to watch for its exit ({e}) - reporting an error, not an exit",
@@ -174,7 +166,7 @@ pub(crate) fn block_until_exit_or_cancel(
         HandleIdentity::Same => {}
         HandleIdentity::Different => {
             close(handle);
-            return Ok(true); // recycled before open - the original is gone
+            return Ok(None); // recycled before open - the original is gone
         }
         HandleIdentity::Unreadable(e) => {
             log::warn!(
@@ -188,6 +180,30 @@ pub(crate) fn block_until_exit_or_cancel(
             });
         }
     }
+    Ok(Some(handle))
+}
+
+/// `block_until_exit`, releasable early: returns `Ok(false)` as soon as `cancel` is signaled
+/// (the process wins a tie — it is the lower wait index). `Ok(true)` = exited by `deadline`;
+/// `None` = unbounded. `deadline` is an absolute instant on the real clock, fixed by the caller
+/// before any hop to another thread; every re-arm recomputes against it.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(
+        dead_code,
+        reason = "only consumer is tokio::wait::grace_wait and the async raw backend, behind the tokio feature"
+    )
+)]
+pub(crate) fn block_until_exit_or_cancel(
+    id: ProcessId,
+    deadline: Option<Instant>,
+    cancel: &OwnedHandle,
+) -> Result<bool, Error> {
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("waiting for a process to exit or be cancelled");
+    let Some(handle) = open_verified(id)? else {
+        return Ok(true); // gone, or its pid was recycled: the original is gone
+    };
     #[cfg(test)]
     crate::wait::read_probe::mark("identity verified");
     // Test-only seam proving (immediately, not by elapsed time) that this wait is never
