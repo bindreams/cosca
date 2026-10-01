@@ -757,12 +757,10 @@ fn sh_exit_code(script: &[u8]) -> Option<i32> {
 /// An executable script at `path` that exits with `code`.
 #[cfg(unix)]
 fn exit_tool(path: &Path, code: i32) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write as _;
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    // Under the lock, as every tool written in this binary is: see `test_child::cwd_and_path_tools`.
-    let _guard = crate::child::spawn::spawn_lock();
-    std::fs::write(path, format!("#!/bin/sh\nexit {code}\n")).expect("write tool");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    crate::test_spawn::locked::write_executable_locked(path, 0o755, |f| write!(f, "#!/bin/sh\nexit {code}\n"))
+        .expect("write tool");
 }
 
 /// The composed script runs a leading-dash program through the real `/bin/sh`.

@@ -86,11 +86,11 @@ fn marker_tool(dir: &std::path::Path, marker: &str, code: i32) {
     std::fs::DirBuilder::new().mode(0o700).create(dir).expect("mkdir");
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
     std::fs::write(dir.join(marker), "").expect("write marker");
-    let tool = dir.join("tool");
-    // Under the lock for the reason `cwd_and_path_tools` gives.
-    let _guard = crate::child::spawn::spawn_lock();
-    std::fs::write(&tool, format!("#!/bin/sh\n[ -f ./{marker} ] || exit 3\nexit {code}\n")).expect("write tool");
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    crate::test_spawn::locked::write_executable_locked(&dir.join("tool"), 0o755, |f| {
+        use std::io::Write as _;
+        write!(f, "#!/bin/sh\n[ -f ./{marker} ] || exit 3\nexit {code}\n")
+    })
+    .expect("write tool");
 }
 
 const FIXTURE_UNREACHABLE_CWD_TEST: &str =

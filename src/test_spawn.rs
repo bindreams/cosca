@@ -12,6 +12,12 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
+// The integration tests' wrappers, compiled from their real source; the library's tests write
+// executables with them too.
+#[cfg(unix)]
+#[path = "../tests/common/locked.rs"]
+pub(crate) mod locked;
+
 thread_local! {
     static BETWEEN_SPAWN_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
 }
@@ -52,6 +58,28 @@ pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Child> {
     let _held = Held::take();
     #[allow(clippy::disallowed_methods, reason = "`_held` is spawn_lock")]
     cmd.spawn()
+}
+
+/// [`Command::spawn`] WITHOUT `spawn_lock`: the control for a test that measures the lock. Only a
+/// test running in its own process may call it (see [`assert_may_fork_unlocked`]).
+#[cfg(unix)]
+pub(crate) fn spawn_unlocked(cmd: &mut Command) -> io::Result<Child> {
+    assert_may_fork_unlocked();
+    #[allow(clippy::disallowed_methods, reason = "the deliberately unlocked control spawn")]
+    cmd.spawn()
+}
+
+/// Panics unless this process runs one test alone (`test_own_process`). A fork without
+/// `spawn_lock` in a process shared with other tests gives its child a copy of every descriptor
+/// they have open: a fake being written, which then fails to exec with `ETXTBSY`, or a pipe's
+/// write end, whose reader then waits for that child too.
+#[cfg(unix)]
+pub(crate) fn assert_may_fork_unlocked() {
+    assert!(
+        crate::test_own_process::runs_alone(),
+        "a fork without spawn_lock outside a test's own process: run the test through \
+         test_own_process::own_process"
+    );
 }
 
 /// [`Command::output`] with `spawn_lock` held for the spawn only. Like `output`, it overrides

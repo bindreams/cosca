@@ -197,9 +197,9 @@ pub(super) fn copy_exe_to_traversable_scratch() -> (tempfile::TempDir, std::path
         .expect("chmod the exe-copy scratch dir world-traversable");
     let src = std::env::current_exe().expect("current_exe");
     let dest = dir.path().join("fixture-exe");
-    std::fs::copy(&src, &dest).expect("copy the test binary into the traversable scratch dir");
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the exe copy world-readable+executable");
+    let mut source = std::fs::File::open(&src).expect("open the test binary");
+    crate::test_spawn::locked::write_executable_locked(&dest, 0o755, |f| std::io::copy(&mut source, f).map(drop))
+        .expect("copy the test binary into the traversable scratch dir, world-readable+executable");
     if let Err(e) = check_path_traversable_by(&dest) {
         panic!("copied fixture exe: {e}");
     }

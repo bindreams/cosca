@@ -241,11 +241,11 @@ fn posix_askpass_auth_reaches_root() {
     let dir = std::env::temp_dir().join(format!("askpass-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("askpass.sh");
-    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{pw}'\n")).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    common::write_executable_locked(&script, 0o700, |f| {
+        use std::io::Write as _;
+        write!(f, "#!/bin/sh\nprintf '%s\\n' '{pw}'\n")
+    })
+    .unwrap();
     let mut c = cosca::Command::new();
     c.args(["id", "-u"])
         .elevation_backend(cosca::elevation::Backend::Sudo)

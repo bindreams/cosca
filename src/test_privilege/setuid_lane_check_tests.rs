@@ -29,18 +29,12 @@ fn good(os: &str) -> String {
     }
 }
 
-/// Writes an executable script. The write descriptor must be closed before anything execs the
-/// file, or `exec` fails with `ETXTBSY`; a fork that never execs, from another test thread, would
-/// inherit it, so no such fork may land inside the write.
+/// Writes an executable script.
 fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _guard = crate::child::spawn::spawn_lock();
-    assert!(
-        crate::test_spawn::held_by_this_thread(),
-        "the fake must be written under spawn_lock"
-    );
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_spawn::locked::write_executable_locked(path, 0o755, |f| {
+        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+    })
+    .expect("write the fake");
 }
 
 fn lane_check(os: &str, uid: &str, body: &str) -> Output {

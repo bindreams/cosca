@@ -374,8 +374,8 @@ pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf 
     let exe = dir.join("tracer-helper");
     let plist = dir.join("entitlements.plist");
     let codesign = {
-        // Writes and the fork under one guard, as `test_child::cwd_and_path_tools` does: no
-        // concurrent fork may hold the copy's writable descriptor.
+        // Writes and the fork under one guard, for the reason `write_executable_locked` gives; it
+        // takes the lock itself, so cannot write here.
         let _guard = crate::child::spawn::spawn_lock();
         std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the test binary");
         std::fs::write(&plist, ENTITLEMENTS).expect("write the entitlements plist");

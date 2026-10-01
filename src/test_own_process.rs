@@ -186,8 +186,17 @@ pub(crate) fn child_completion(path: &str) -> Option<Completion> {
     }
 }
 
+/// Set once this process accepts the child role; see [`runs_alone`].
+static ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process accepted the child role, so the one test it runs has it to itself.
+pub(crate) fn runs_alone() -> bool {
+    ALONE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Takes the token pipe and reports that the role was accepted.
 fn accept(token_fd: RawFd) -> Completion {
+    ALONE.store(true, std::sync::atomic::Ordering::SeqCst);
     // The body's own children must not inherit the token.
     // SAFETY: F_SETFD on a descriptor number; failure is checked.
     let set = unsafe { libc::fcntl(token_fd, libc::F_SETFD, libc::FD_CLOEXEC) };

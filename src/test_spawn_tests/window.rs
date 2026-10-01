@@ -86,10 +86,6 @@ enum Spawner {
     Common,
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "`Spawner::Unlocked` is the deliberately unlocked control spawn"
-)]
 fn run(spawner: Spawner) -> Outcome {
     let spawn_under_the_lock = !matches!(spawner, Spawner::Unlocked);
     use std::os::unix::process::CommandExt;
@@ -125,7 +121,7 @@ fn run(spawner: Spawner) -> Outcome {
             });
         }
         match spawner {
-            Spawner::Unlocked => cmd.spawn(),
+            Spawner::Unlocked => crate::test_spawn::spawn_unlocked(&mut cmd),
             Spawner::TestSpawn => crate::test_spawn::spawn(&mut cmd),
             Spawner::Common => super::locked::spawn_locked(&mut cmd),
         }
@@ -141,13 +137,10 @@ fn run(spawner: Spawner) -> Outcome {
 
     let (events, events_rx) = mpsc::channel::<Event>();
     let forker = std::thread::spawn(move || {
-        // Unlocked: fork without the lock; waiting for it could deadlock with another test's locked
-        // spawn, since the parked raw child holds that spawn's exec-error pipe open until the gate
-        // opens.
-        let guard = spawn_under_the_lock.then(|| {
-            crate::child::spawn::spawn_lock_tracked(|| {
-                _ = events.send(Event::Contended);
-            })
+        // The unlocked control runs in a process of its own, so no other test's spawn holds the
+        // lock while its raw child is parked.
+        let guard = crate::child::spawn::spawn_lock_tracked(|| {
+            _ = events.send(Event::Contended);
         });
         let pid = fork_counting_writers(&pipe_fds(identity), seen_fd, hold_fd);
         drop(guard);
@@ -196,8 +189,18 @@ fn run(spawner: Spawner) -> Outcome {
 /// A raw spawn that skips `spawn_lock` lets a lock-respecting fork happen mid-spawn, and that
 /// fork's child inherits the raw child's `Stdio::piped()` write end. A reader of that pipe would
 /// wait for the fork to exit as well.
+///
+/// Its two unlocked forks run in a process of their own: here they would also copy every other
+/// test's open descriptors.
 #[test]
 fn an_unlocked_raw_spawn_leaks_its_piped_end_into_a_concurrent_fork() {
+    use crate::test_own_process::{own_process, test_path};
+    let Some(_alone) = own_process(
+        test_path!(an_unlocked_raw_spawn_leaks_its_piped_end_into_a_concurrent_fork),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     let outcome = run(Spawner::Unlocked);
     assert!(!outcome.raw_forked_under_the_lock, "the control spawn takes no lock");
     assert_eq!(outcome.first, Event::Forked, "this forker never waits on the lock");

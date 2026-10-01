@@ -155,9 +155,9 @@ impl Drop for KillOnDrop {
 
 /// Copies `src` into `dir` as `0o755`; `dir` must already be world-traversable.
 pub fn world_executable_copy(src: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let dest = dir.join(src.file_name().expect("src has a file name"));
-    std::fs::copy(src, &dest).expect("copy into the scratch directory");
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod the copy world-executable");
+    let mut source = std::fs::File::open(src).expect("open the copy's source");
+    super::write_executable_locked(&dest, 0o755, |f| std::io::copy(&mut source, f).map(drop))
+        .expect("copy into the scratch directory, world-executable");
     dest
 }

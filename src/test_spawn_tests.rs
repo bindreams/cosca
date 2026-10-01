@@ -5,9 +5,12 @@
 #[path = "test_spawn_tests/window.rs"]
 mod window;
 
-// The integration tests' wrappers, compiled from their real source.
-#[path = "../tests/common/locked.rs"]
-mod locked;
+#[cfg(target_os = "linux")]
+#[path = "test_spawn_tests/executable.rs"]
+mod executable;
+
+use super::locked;
+use crate::test_own_process::{own_process, test_path};
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -71,9 +74,11 @@ fn status_forks_under_the_lock() {
 /// ambient state.
 #[test]
 fn a_plain_spawn_forks_outside_the_lock() {
+    let Some(_alone) = own_process(test_path!(a_plain_spawn_forks_outside_the_lock), super::spawn) else {
+        return;
+    };
     let held = lock_held_at_fork(|cmd| {
-        #[allow(clippy::disallowed_methods, reason = "control: the deliberately unlocked raw spawn")]
-        cmd.spawn().expect("spawn").wait().expect("wait");
+        super::spawn_unlocked(cmd).expect("spawn").wait().expect("wait");
     });
     assert_eq!(held, Some(false));
 }

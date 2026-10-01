@@ -55,3 +55,33 @@ pub async fn output_locked_tokio(cmd: &mut ::tokio::process::Command) -> std::io
 pub async fn status_locked_tokio(cmd: &mut ::tokio::process::Command) -> std::io::Result<ExitStatus> {
     spawn_locked_tokio(cmd)?.wait().await
 }
+
+/// Creates `path` with `mode` (truncating any file there), lets `fill` write its contents and
+/// closes it, all under `cosca::test_spawn_lock()`. Every file a test execs is written here.
+///
+/// A fork while the file is open for writing leaves the forked child a copy of the descriptor
+/// until it execs or exits, and `execve` of the file fails with `ETXTBSY` until then. Every fork in
+/// a process that runs other tests takes this lock, so none lands inside the write. Renaming a
+/// finished file into place would not help: the rename keeps the inode that the copy refers to.
+///
+/// `fill` runs under the lock, so it must not spawn.
+#[cfg(unix)]
+pub fn write_executable_locked(
+    path: &std::path::Path,
+    mode: u32,
+    fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let _guard = cosca::test_spawn_lock();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    fill(&mut file)?;
+    // The umask may have narrowed the create mode.
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    drop(file);
+    Ok(())
+}
