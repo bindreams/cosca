@@ -177,6 +177,11 @@ mod macos {
 
     pub(super) fn watchdog(name: &'static str) -> Watchdog {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        if std::env::var_os("COSCA_ADV346C").is_some() {
+            // Probe: watchdog off, so only the driver's bound can end a hung fixture.
+            std::mem::forget(rx);
+            return Watchdog(tx);
+        }
         std::thread::spawn(move || {
             if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
                 // Not `eprintln!`: libtest captures that, and the abort would lose it.
@@ -242,6 +247,16 @@ mod macos {
         assert_eq!(rc, 0, "PT_KILL: {}", std::io::Error::last_os_error());
     }
 
+    /// Probe: park this thread for good when `COSCA_ADV346C` names `at`.
+    fn adv_hang(at: &str) {
+        if std::env::var("COSCA_ADV346C").as_deref() == Ok(at) {
+            _ = writeln!(std::io::stderr(), "ADV346C: hanging at {at}");
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
     fn assert_killed(status: std::process::ExitStatus) {
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
@@ -267,7 +282,9 @@ mod macos {
         let _dog = watchdog("try_wait on a stopped tracee");
         step("spawn");
         let b = Blocker::spawn();
+        adv_hang("after-spawn");
         attach_and_confirm_stop(&b);
+        adv_hang("after-attach");
         step("try_wait");
         assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
         assert!(matches!(b.shared.lock().state, State::N));

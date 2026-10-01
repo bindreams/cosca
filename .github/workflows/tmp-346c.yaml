@@ -1,0 +1,71 @@
+name: tmp-346c probes
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: never
+  COSCA_TEST_ROOT: "0"
+  COSCA_TEST_UID_SWITCH: "0"
+  COSCA_TEST_NAMESPACES: "0"
+  COSCA_TEST_SETUID: "0"
+  COSCA_TEST_CGROUP: "0"
+  COSCA_TEST_TRACER: "1"
+  COSCA_TEST_TRACER_CONSENT: "1"
+  NAME: child::shared::shared_tests::tracer::macos::try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped
+
+jobs:
+  probe:
+    name: probe (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.137
+      - name: Build tests
+        run: |
+          cargo nextest run --locked --no-run --lib --target ${{ matrix.target }} --profile ci
+          cargo test --locked --no-run --lib --target ${{ matrix.target }}
+      - name: Baseline x15 (nextest)
+        timeout-minutes: 10
+        run: |
+          for i in $(seq 1 15); do
+            cargo nextest run --locked --lib --target ${{ matrix.target }} --profile ci --no-fail-fast \
+              -E 'test(/^child::shared::shared_tests::tracer::macos::/) | test(/^test_support::tracer::attach::/)' 2>&1 \
+              | grep -E '^\s+(PASS|FAIL|TIMEOUT|SIGABRT|SIGKILL)|Summary' || true
+          done
+      - name: Hang after attach, watchdog off (nextest)
+        timeout-minutes: 3
+        env:
+          COSCA_ADV346C: after-attach
+        run: |
+          cargo nextest run --locked --lib --target ${{ matrix.target }} --profile ci -E "test(=$NAME)" 2>&1 | grep -vE '^\s+(Compiling|Finished|Running)' | tail -40 || true
+      - name: Hang after spawn, watchdog off (nextest)
+        timeout-minutes: 3
+        env:
+          COSCA_ADV346C: after-spawn
+        run: |
+          cargo nextest run --locked --lib --target ${{ matrix.target }} --profile ci -E "test(=$NAME)" 2>&1 | grep -vE '^\s+(Compiling|Finished|Running)' | tail -40 || true
+      - name: Hang after attach, watchdog off (plain cargo test)
+        timeout-minutes: 3
+        env:
+          COSCA_ADV346C: after-attach
+        run: |
+          start=$(date +%s)
+          cargo test --locked --lib --target ${{ matrix.target }} -- --exact "$NAME" 2>&1 | tail -30 || true
+          echo "elapsed: $(( $(date +%s) - start ))s"
+          echo "leftover cat processes:"; pgrep -lx cat || echo none
