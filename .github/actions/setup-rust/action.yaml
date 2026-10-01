@@ -1,5 +1,5 @@
 name: Set up Rust build environment
-description: Installs stable Rust, caches the cargo registry, and configures sccache.
+description: Installs the Rust toolchain pinned in .github/ci-toolchain, caches the cargo registry, and configures sccache.
 inputs:
   components:
     description: "Extra rustup components (e.g. 'clippy, rustfmt')"
@@ -12,15 +12,23 @@ inputs:
 runs:
   using: composite
   steps:
+    # The checkout must precede this action. The pin file is CI-only: Cargo.toml's
+    # rust-version is the MSRV, a different thing.
+    - name: Read the toolchain pin
+      id: pin
+      shell: bash
+      run: echo "version=$(tr -d '[:space:]' < "${GITHUB_WORKSPACE:?}/.github/ci-toolchain")" >> "$GITHUB_OUTPUT"
+
     - name: Install Rust toolchain
       id: rust-toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
       with:
+        toolchain: ${{ steps.pin.outputs.version }}
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ~/.cargo/registry
@@ -29,7 +37,9 @@ runs:
         restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
 
     - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      with:
+        version: v0.18.0
 
     - name: Enable sccache for cargo
       shell: bash

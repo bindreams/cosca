@@ -1,0 +1,183 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "automerge": true,
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "description": "Cargo.toml keeps library version ranges; the lockfile is the pin, so updates within range touch only Cargo.lock",
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
+      "description": "Renovate's built-in github-actions manager also reads prek-action's `prek-version` input, with tags in a form that does not match the pinned value; the custom manager owns it",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "prek"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Actions only the release workflows run: PR CI never exercises them, so a green PR proves nothing and they are never automerged",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "rust-lang/crates-io-auth-action"
+      ],
+      "groupName": "release-actions",
+      "automerge": false
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "cargo"
+    },
+    {
+      "matchFileNames": [
+        "prek.toml"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "prek"
+    },
+    {
+      "matchDepTypes": [
+        "ci-tool"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "ci-tools"
+    },
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "prek hook revs in prek.toml, pinned by commit SHA with a `# frozen: <tag>` comment",
+      "managerFilePatterns": [
+        "/^prek\\.toml$/"
+      ],
+      "matchStrings": [
+        "repo = \"https://github\\.com/(?<depName>[^\"/]+/[^\"/]+)\"\\s*\\n(?:\\s*#[^\\n]*\\n)*\\s*rev = \"(?<currentDigest>[0-9a-f]{40})\"\\s*# frozen: (?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "description": "CI Rust toolchain pin (.github/ci-toolchain, read by setup-rust)",
+      "managerFilePatterns": [
+        "/^\\.github/ci-toolchain$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"
+      ],
+      "depNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-nextest: one version in ci.yaml, windows-probes.yaml and .config/nextest.toml, moved together",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/(ci|windows-probes)\\.yaml$/",
+        "/^\\.config/nextest\\.toml$/"
+      ],
+      "matchStrings": [
+        "NEXTEST_VERSION: \"(?<currentValue>[^\"]+)\"",
+        "nextest-version = \\{ required = \"(?<currentValue>[^\"]+)\" \\}"
+      ],
+      "depNameTemplate": "cargo-nextest",
+      "datasourceTemplate": "crate",
+      "depTypeTemplate": "ci-tool",
+      "matchStringsStrategy": "any",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-hack installed by taiki-e/install-action",
+      "managerFilePatterns": [
+        "/^\\.github/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "tool: cargo-hack@(?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "cargo-hack",
+      "datasourceTemplate": "crate",
+      "depTypeTemplate": "ci-tool",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "sccache installed by mozilla-actions/sccache-action",
+      "managerFilePatterns": [
+        "/^\\.github/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n\\s+version: (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "mozilla/sccache",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool"
+    },
+    {
+      "customType": "regex",
+      "description": "prek installed by j178/prek-action",
+      "managerFilePatterns": [
+        "/^\\.github/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "prek-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n\\s+prek-version: (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "j178/prek",
+      "datasourceTemplate": "github-releases",
+      "depTypeTemplate": "ci-tool",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ]
+}

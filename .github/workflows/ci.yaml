@@ -17,7 +17,7 @@ env:
   # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
   # something as root opt out (principles 9 and 10).
   COSCA_TEST_ROOT: "0"
-  # One place for values several jobs share. `.config/nextest.toml` requires the same nextest.
+  # One place for values several jobs share. `.config/nextest.toml` and windows-probes.yaml carry the same nextest version; one Renovate manager moves all three.
   NEXTEST_VERSION: "0.9.137"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
   # gated on `COSCA_TEST_UID_SWITCH`.
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
       # find a toolchain.
@@ -49,13 +49,15 @@ jobs:
 
       # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
-      - uses: j178/prek-action@v2
+      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
+        with:
+          prek-version: 0.5.3
 
       - name: Test release helper scripts
         shell: bash
@@ -153,7 +155,7 @@ jobs:
       COSCA_TEST_TRACER_CONSENT: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -163,7 +165,7 @@ jobs:
           components: ${{ matrix.lint && 'clippy' || '' }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
@@ -548,12 +550,12 @@ jobs:
             expect_capeff_lacks: "0x4"
             expect_capamb: "0x2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: ./.github/actions/setup-rust
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
@@ -599,12 +601,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: ./.github/actions/setup-rust
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
