@@ -199,15 +199,19 @@ impl Drop for ForcedStop {
 /// exits.
 fn await_change(pid: u32) -> libc::siginfo_t {
     if let Some(signal) = FORCED_STOP.take() {
-        // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        info.si_signo = libc::SIGCHLD;
-        info.si_code = libc::CLD_STOPPED;
-        info.si_pid = pid as libc::pid_t;
-        info.si_status = signal;
-        return info;
+        return record(libc::CLD_STOPPED, signal);
     }
     sys::peek(pid, libc::WEXITED | libc::WSTOPPED).expect("waitid the tracee")
+}
+
+/// A `waitid` record of `code` and `status`.
+fn record(code: i32, status: i32) -> libc::siginfo_t {
+    // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    info.si_signo = libc::SIGCHLD;
+    info.si_code = code;
+    info.si_status = status;
+    info
 }
 
 /// The tracee's own clean exit (stdin EOF).
@@ -220,28 +224,54 @@ fn assert_exited_cleanly(tracee: crate::Child) {
 /// from `P_LEXIT`, which is never cleared (xnu `kern_sysctl.c`, `fill_user64_externproc`).
 const P_WEXIT: libc::c_int = 0x0000_2000;
 
-/// Whether the tracee `pid`, this test's unreaped child, has begun to exit.
-fn exiting(pid: u32) -> bool {
+/// The part of a process's `kinfo_proc` that [`stopped_by`] reads.
+#[derive(Clone, Copy, Debug)]
+struct ProcState {
+    p_stat: u32,
+    p_flag: libc::c_int,
+}
+
+/// The [`ProcState`] of `pid`, this test's unreaped child.
+fn proc_state(pid: u32) -> ProcState {
     match crate::identity::kinfo::kinfo(pid as _) {
-        crate::identity::Resolved::Found(info) => info.kp_proc.p_flag & P_WEXIT != 0,
+        crate::identity::Resolved::Found(info) => ProcState {
+            p_stat: info.kp_proc.p_stat as u32,
+            p_flag: info.kp_proc.p_flag,
+        },
         crate::identity::Resolved::Gone => panic!("the unreaped tracee {pid} is gone"),
         crate::identity::Resolved::Unknown => panic!("kinfo refused to read the tracee {pid}"),
     }
 }
 
+/// The signal that stops the tracee, from its `waitid` record and its `state` read after it, or
+/// `None` if it ends. A stop record of a tracee that has begun to exit is not a stop (#463).
+fn stopped_by(info: &libc::siginfo_t, state: ProcState) -> Option<i32> {
+    debug_assert!(
+        state.p_stat != libc::SZOMB || state.p_flag & P_WEXIT != 0,
+        "a zombie without P_WEXIT: XNU sets P_LEXIT before SZOMB ({state:?})"
+    );
+    (info.si_code == libc::CLD_STOPPED && state.p_flag & P_WEXIT == 0).then_some(info.si_status)
+}
+
 /// The tracee was killed with `SIGKILL`: by XNU when its tracer exited while tracing it, or by
-/// this test.
+/// this test. Runs only once this thread's helpers are reaped: XNU hands the tracee back to the
+/// test before it kills it, so until then a held tracee reads as stopped.
 ///
 /// A stop record of a tracee that has begun to exit is not a stop. When its tracer exits, XNU
 /// wakes a stopped tracee with `SIGKILL` before its `psignal` would mark it running. A tracee
 /// that starts exiting first makes that `psignal` a no-op, and stays `SSTOP` until it is a
 /// zombie. Until then `waitid` reports it as stopped, with its exit status 9 (#463).
 fn assert_sigkilled(tracee: crate::Child) {
+    assert_eq!(
+        super::unreaped_helpers(),
+        0,
+        "assert_sigkilled before the tracer helper was reaped"
+    );
     let pid = tracee.id().pid();
     let info = await_change(pid);
-    if info.si_code == libc::CLD_STOPPED && !exiting(pid) {
+    if let Some(signal) = stopped_by(&info, proc_state(pid)) {
         tracee.kill().expect("kill the stopped tracee");
-        panic!("expected SIGKILL, but the tracee is stopped by {}", info.si_status);
+        panic!("expected SIGKILL, but the tracee is stopped by {signal}");
     }
     let status = tracee.wait().expect("wait for the tracee");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "expected SIGKILL, got {status:?}");
@@ -650,21 +680,64 @@ fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
     assert_sigkilled(tracee);
 }
 
-/// Mutant: `exiting` holds for a tracee that is only stopped, so `assert_sigkilled` would wait
-/// on it forever.
+/// Mutant: `stopped_by` takes a tracee that is only stopped for one that ends, so
+/// `assert_sigkilled` would wait on it forever.
 #[test]
-fn a_stopped_tracee_is_not_exiting() {
+fn a_stopped_tracee_reads_as_stopped() {
     let Some((tracee, _stdin)) = tracee() else { return };
     let pid = tracee.id().pid();
     send(pid, libc::SIGSTOP);
     let info = await_change(pid);
     assert_eq!(
-        (info.si_code, info.si_status),
-        (libc::CLD_STOPPED, libc::SIGSTOP),
+        stopped_by(&info, proc_state(pid)),
+        Some(libc::SIGSTOP),
         "the tracee after SIGSTOP"
     );
-    assert!(!exiting(pid), "the stopped tracee {pid} reads as exiting");
     end_stopped(tracee);
+}
+
+/// Only `P_WEXIT` makes a stop record not a stop. The first row is the #463 state: `SSTOP` with
+/// `P_LEXIT`, before the tracee is a zombie. Mutants: `stopped_by` keys on the zombie state, on
+/// any flag, or ignores the flags.
+#[test]
+fn stopped_by_keys_on_p_wexit_alone() {
+    let others = !P_WEXIT;
+    let rows = [
+        (libc::CLD_STOPPED, libc::SIGKILL, libc::SSTOP, P_WEXIT, None),
+        (libc::CLD_STOPPED, libc::SIGKILL, libc::SSTOP, P_WEXIT | others, None),
+        (libc::CLD_STOPPED, libc::SIGKILL, libc::SZOMB, P_WEXIT, None),
+        (libc::CLD_STOPPED, libc::SIGSTOP, libc::SSTOP, 0, Some(libc::SIGSTOP)),
+        (
+            libc::CLD_STOPPED,
+            libc::SIGSTOP,
+            libc::SSTOP,
+            others,
+            Some(libc::SIGSTOP),
+        ),
+        (libc::CLD_STOPPED, libc::SIGTSTP, libc::SRUN, 0, Some(libc::SIGTSTP)),
+        (libc::CLD_KILLED, libc::SIGKILL, libc::SZOMB, P_WEXIT, None),
+        (libc::CLD_EXITED, 0, libc::SZOMB, P_WEXIT, None),
+    ];
+    for (code, status, p_stat, p_flag, expected) in rows {
+        let state = ProcState { p_stat, p_flag };
+        assert_eq!(
+            stopped_by(&record(code, status), state),
+            expected,
+            "si_code {code}, si_status {status}, {state:?}"
+        );
+    }
+}
+
+/// Mutant: `assert_sigkilled` reads the tracee while a helper is unreaped.
+#[test]
+fn assert_sigkilled_needs_the_helpers_reaped() {
+    let Some((tracee, stdin)) = tracee() else { return };
+    let pending = super::start(Mode::Auto);
+    // Closed, so without the check the tracee's clean exit fails the test, not a hang.
+    drop(stdin);
+    let message = panic_of(|| assert_sigkilled(tracee));
+    assert!(message.contains("before the tracer helper was reaped"), "{message}");
+    drop(pending);
 }
 
 /// Mutant: S1h's EOF goes to S2.

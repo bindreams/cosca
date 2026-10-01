@@ -65,6 +65,16 @@ pub(crate) use attach::{attach_settled, settled_stop, AttachError};
 
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
+thread_local! {
+    /// This thread's helpers launched and not yet reaped.
+    static UNREAPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many helpers this thread launched and has not reaped yet.
+fn unreaped_helpers() -> usize {
+    UNREAPED.get()
+}
+
 /// What the helper does once the traced tracee exits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -279,6 +289,7 @@ impl Session {
             }
         }
         let status = self.helper.wait().expect("reap the tracer helper");
+        UNREAPED.set(UNREAPED.get() - 1);
         if let Some(state) = stuck {
             if !panicking {
                 panic!(
@@ -348,6 +359,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     // Under `spawn_lock()` (via `test_spawn`): macOS pipes get `FD_CLOEXEC` after `pipe()`, so a
     // concurrent fork could otherwise inherit this helper's pipe ends.
     let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the tracer helper");
+    UNREAPED.set(UNREAPED.get() + 1);
     let signal_tx = helper.stdin.take().expect("the helper's stdin is piped");
     let rx = std::io::BufReader::new(helper.stdout.take().expect("the helper's stdout is piped"));
     Pending {
