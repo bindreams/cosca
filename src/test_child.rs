@@ -3,6 +3,10 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaces;
 
+#[cfg(target_os = "macos")]
+#[path = "../tests/common/kevent_eintr.rs"]
+mod kevent_eintr;
+
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
@@ -512,7 +516,10 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
         // tokio installs when any test in this process spawns a child.
         let n = match kq.kevent(&[], &mut events, None) {
             Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                kevent_eintr::count_retry();
+                continue;
+            }
             Err(e) => panic!("kevent while waiting for a control connection: {e}"),
         };
         for ev in &events[..n] {

@@ -682,7 +682,11 @@ fn healthy_tree_arms_a_watch_for_each_accept() {
     root.wait().expect("reap the root");
     grandchild.kill().expect("kill the grandchild");
     grandchild.wait().expect("reap the grandchild");
-    assert_eq!(armings.get(), 2, "each accept over a healthy tree must arm a death watch");
+    assert_eq!(
+        armings.get(),
+        2,
+        "each accept over a healthy tree must arm a death watch"
+    );
 }
 
 /// `accept_tree` must fail promptly when the first member to connect is the grandchild and the
