@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use cosca::identity::{Existence, ProcessId};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::{notify_armed, Source, WatchEvent};
+use super::{first_ready, notify_armed, Ready, Source, WatchEvent};
 
 pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>) -> WatchEvent {
     let source_fd = match source {
@@ -91,15 +91,15 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
                 "an armed kevent reported EV_ERROR: {ev:?}"
             );
         }
-        // An exit among the events returned together wins over a ready source, as on Linux.
-        if let Some(ev) = events[..n]
+        let exited = events[..n]
             .iter()
             .find(|ev| ev.filter() == Ok(EventFilter::EVFILT_PROC))
-        {
-            return WatchEvent::Died(ev.ident() as u32);
-        }
-        if events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ)) {
-            return WatchEvent::Ready;
+            .map(|ev| ev.ident() as u32);
+        let source_ready = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ));
+        match first_ready(exited.is_some(), source_ready) {
+            Some(Ready::Exit) => return WatchEvent::Died(exited.expect("an exit was seen")),
+            Some(Ready::Source) => return WatchEvent::Ready,
+            None => {}
         }
     }
 }

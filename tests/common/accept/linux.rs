@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use cosca::identity::{Existence, ProcessId};
 
-use super::{notify_armed, Source, WatchEvent};
+use super::{first_ready, notify_armed, Ready, Source, WatchEvent};
 
 fn open(pid: u32) -> Result<OwnedFd, rustix::io::Errno> {
     let raw = rustix::process::Pid::from_raw(pid as i32).expect("a watched pid is never 0");
@@ -63,7 +63,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
             panic!("poll while waiting for a control connection: {e}");
         }
         for f in &fds {
-            debug_assert_eq!(f.revents & libc::POLLNVAL, 0, "a polled fd went invalid mid-wait");
+            assert_eq!(f.revents & libc::POLLNVAL, 0, "a polled fd went invalid mid-wait");
         }
         // An error on a LISTENER is a real, externally-caused condition, surfaced in every build.
         // (A stream reports HUP at EOF, which is a readable event, not an error.)
@@ -73,14 +73,16 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
                 fds[0].revents
             );
         }
-        // Exits before the source: see `accept_or_die_also`.
-        for (i, (pid, _)) in watched.iter().enumerate() {
-            if fds[i + 1].revents & libc::POLLIN != 0 {
-                return WatchEvent::Died(*pid);
-            }
-        }
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            return WatchEvent::Ready;
+        let exited = watched
+            .iter()
+            .enumerate()
+            .find(|(i, _)| fds[i + 1].revents & libc::POLLIN != 0)
+            .map(|(_, (pid, _))| *pid);
+        let source_ready = fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+        match first_ready(exited.is_some(), source_ready) {
+            Some(Ready::Exit) => return WatchEvent::Died(exited.expect("an exit was seen")),
+            Some(Ready::Source) => return WatchEvent::Ready,
+            None => {}
         }
     }
 }

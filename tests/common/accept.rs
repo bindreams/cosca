@@ -40,6 +40,11 @@ use cosca::identity::ProcessId;
 pub mod ack;
 pub use ack::ACK_ENV;
 
+#[path = "accept/shared.rs"]
+mod shared;
+#[allow(unused_imports, reason = "each test binary uses a subset")]
+pub use shared::{accept_and_ack, ack_now, first_ready, run_watcher, DrainOutcome, Ready};
+
 #[cfg(target_os = "linux")]
 #[path = "accept/linux.rs"]
 mod linux;
@@ -176,19 +181,6 @@ pub(crate) fn wait_for_exit(pid: u32) {
 /// Waits until `stream` has bytes (or EOF) to read, or `target_pid` exits first.
 pub(crate) fn wait_readable(stream: &TcpStream, target_pid: u32) -> WatchEvent {
     platform::wait(Source::Stream(stream), target_pid, None)
-}
-
-/// Accepts the connection the wait reported ready and writes the ack byte to it.
-fn accept_and_ack(listener: &TcpListener) -> TcpStream {
-    let (stream, _) = listener.accept().expect("accept a control connection");
-    ack_now(stream)
-}
-
-/// Writes the ack to `stream`, which the caller has accepted and left in blocking mode.
-pub(crate) fn ack_now(mut stream: TcpStream) -> TcpStream {
-    ack::send_ack(&mut stream)
-        .unwrap_or_else(|e| panic!("writing the accept acknowledgement to the control connection failed: {e}"));
-    stream
 }
 
 // Test seam =====
