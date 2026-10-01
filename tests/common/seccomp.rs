@@ -35,11 +35,28 @@ pub fn deny_pidfd_open_on_this_thread(errno: i32) {
         len: filter.len() as u16,
         filter: filter.as_ptr().cast_mut(),
     };
-    // SAFETY: plain prctl calls; `program` and `filter` outlive the second, which copies them.
+    // SAFETY: prctl is variadic: pass every trailing arg at full unsigned-long width (musl reads all four); an int-width arg leaves the upper half undefined.
     unsafe {
-        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
         assert_eq!(
-            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            libc::prctl(
+                libc::PR_SET_NO_NEW_PRIVS,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong
+            ),
+            0,
+            "no_new_privs: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &program,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong
+            ),
             0,
             "seccomp: {}",
             std::io::Error::last_os_error()
