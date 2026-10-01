@@ -11,7 +11,7 @@ use syn::visit::Visit;
 use syn::{Attribute, Item, ItemFn, ItemMacro, Meta};
 
 use crate::attr::{self, Hidden, Origin, Runtime, TestAttr};
-use crate::modtree::{self, ParsedFile, Source};
+use crate::modtree::{self, ParsedFile, Root, Source};
 use crate::shapes;
 
 /// What `apply` may touch.
@@ -226,33 +226,68 @@ fn is_cfg_inner(a: &Attribute) -> bool {
     matches!(a.style, syn::AttrStyle::Inner(_)) && a.path().is_ident("cfg")
 }
 
+/// True when `before` is empty or its last line is blank.
+fn blank_before(before: &str) -> bool {
+    let Some(rest) = before.strip_suffix('\n') else {
+        return before.is_empty();
+    };
+    rest.rsplit('\n').next().is_some_and(|l| l.trim().is_empty())
+}
+
+/// The length of a whole blank line at the start of `rest`, newline included.
+fn blank_line_len(rest: &str) -> Option<usize> {
+    let nl = rest.find('\n')?;
+    rest[..nl].trim().is_empty().then_some(nl + 1)
+}
+
 fn hoist(p: &mut Planner<'_>, file: &syn::File) {
     let cfgs: Vec<&Attribute> = file.attrs.iter().filter(|a| is_cfg_inner(a)).collect();
     if cfgs.is_empty() {
         return;
     }
     let mut outer = String::new();
+    let (mut last_end, mut carried_blank) = (None, false);
     for a in &cfgs {
         let open = p.index.offset(a.bracket_token.span.open().start());
         let close = p.index.offset(a.bracket_token.span.close().end());
         outer.push('#');
         outer.push_str(&p.index.src[open..close]);
         outer.push('\n');
-        // Delete the whole line the inner attribute sat on, when it had it to itself.
         let start = p.index.offset(a.pound_token.span.start());
+        let src = p.index.src;
+        let bof = p.index.starts[0];
+        let line_start = src[..start].rfind('\n').map_or(bof, |i| i + 1).max(bof);
+        let whole_line = src[line_start..start].trim().is_empty();
         let mut end = close;
-        let rest = &p.index.src[end..];
-        let trimmed = rest.trim_start_matches([' ', '\t']);
-        if let Some(after) = trimmed.strip_prefix("\r\n").or_else(|| trimmed.strip_prefix('\n')) {
-            end = p.index.src.len() - after.len();
+        let trimmed = src[end..].trim_start_matches([' ', '\t']);
+        let ends_line = if let Some(after) = trimmed.strip_prefix("\r\n").or_else(|| trimmed.strip_prefix('\n')) {
+            end = src.len() - after.len();
+            true
+        } else {
+            false
+        };
+        let mut from = start;
+        if whole_line && ends_line {
+            from = line_start;
+            // Deleting the line must not leave a blank line at the top, or two in a row.
+            let before_blank = if last_end == Some(line_start) {
+                carried_blank
+            } else {
+                blank_before(&src[bof..line_start])
+            };
+            if before_blank {
+                end += blank_line_len(&src[end..]).unwrap_or(0);
+            }
+            carried_blank = before_blank;
         }
+        last_end = Some(end);
         p.edits.push(Edit {
-            start,
+            start: from,
             end,
             text: String::new(),
         });
     }
-    for item in file.items.iter().filter(|i| !shapes::is_hoist_exempt(i)) {
+    for item in file.items.iter().filter(|i| !shapes::is_hoist_exempt(i, p.path)) {
         if let Item::Verbatim(_) = item {
             p.refuse(
                 item.span().start(),
@@ -316,18 +351,17 @@ pub enum Outcome {
 /// Plans a rewrite of every file reachable from `roots`, refusing a file that changes and is
 /// also reachable from one of `unflipped`.
 pub fn apply(source: &dyn Source, roots: &[PathBuf], unflipped: &[PathBuf], opts: Options) -> Result<Outcome> {
-    let mut files: BTreeMap<PathBuf, ParsedFile> = BTreeMap::new();
-    for root in roots {
-        for f in modtree::walk(source, root)? {
-            match files.get_mut(&f.path) {
-                Some(existing) => existing.is_root |= f.is_root,
-                None => {
-                    files.insert(f.path.clone(), f);
-                }
-            }
-        }
-    }
-    let applied_roots: BTreeSet<PathBuf> = roots.iter().map(|r| modtree::normalize(r)).collect();
+    let roots: Vec<Root> = roots.iter().map(Root::crate_root).collect();
+    apply_roots(source, &roots, unflipped, opts)
+}
+
+/// [`apply`] over roots that may be module files.
+pub fn apply_roots(source: &dyn Source, roots: &[Root], unflipped: &[PathBuf], opts: Options) -> Result<Outcome> {
+    let files: BTreeMap<PathBuf, ParsedFile> = modtree::walk_roots(source, roots)?
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+    let applied_roots: BTreeSet<PathBuf> = roots.iter().map(|r| modtree::normalize(&r.path)).collect();
     let mut reach: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for u in unflipped {
         let u = modtree::normalize(u);

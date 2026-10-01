@@ -298,3 +298,59 @@ fn a_root_also_reached_as_a_module_is_still_a_root_for_additions() {
     let roots = [PathBuf::from(ROOT), PathBuf::from("/t/m.rs")];
     assert_eq!(verify(&old, &new, &roots).unwrap(), Vec::new());
 }
+
+#[test]
+fn a_smuggled_include_that_is_not_src_test_harness_is_a_mismatch() {
+    let old = [("/t/tests/r.rs", "#[test]\nfn a() {}\n")];
+    let roots = [PathBuf::from("/t/tests/r.rs")];
+    let run = |new: &[(&str, &str)]| {
+        verify(&MemSource::new(&old), &MemSource::new(new), &roots)
+            .unwrap()
+            .len()
+    };
+    let base = "#[skuld::test]\nfn a() {}\n";
+    // Right shape, wrong resolved file.
+    let wrong = format!("{base}#[path = \"../tests/src/test_harness.rs\"]\nmod test_harness;\n");
+    assert!(
+        run(&[
+            ("/t/tests/r.rs", &wrong),
+            ("/t/tests/src/test_harness.rs", "#[skuld::test] fn smuggled() {}\n")
+        ]) >= 1
+    );
+    // Pathless, so it resolves under `tests/`.
+    let pathless = format!("{base}mod test_harness;\n");
+    assert!(
+        run(&[
+            ("/t/tests/r.rs", &pathless),
+            ("/t/tests/test_harness.rs", "#[skuld::test] fn smuggled() {}\n")
+        ]) >= 1
+    );
+    // The planned include is forgiven.
+    let planned = format!("{base}#[path = \"../src/test_harness.rs\"]\nmod test_harness;\n");
+    assert_eq!(run(&[("/t/tests/r.rs", &planned)]), 0);
+}
+
+const EXACT_MAIN: &str =
+    "fn main() {\n    let mut runner = skuld::TestRunner::new();\n    runner.libtest_names();\n    runner.run()\n}\n";
+
+#[test]
+fn an_exact_main_the_old_revision_had_is_compared_not_dropped() {
+    assert_eq!(check(EXACT_MAIN, EXACT_MAIN), Vec::<String>::new());
+    assert_eq!(check(EXACT_MAIN, "").len(), 1);
+}
+
+#[test]
+fn a_decorated_main_or_net_is_not_forgiven() {
+    let old = "#[test]\nfn a() {}\n";
+    let base = "#[skuld::test]\nfn a() {}\n";
+    for extra in [
+        format!("#[inline]\n{EXACT_MAIN}"),
+        format!("pub {EXACT_MAIN}"),
+        "#[deprecated]\nextern crate skuld;\n".to_owned(),
+    ] {
+        assert_eq!(check(old, &format!("{base}{extra}")).len(), 1, "{extra}");
+    }
+    // The shapes the units add: `cfg` on main, `macro_use`/`allow`/`cfg` on the net.
+    let ok = format!("{base}#[cfg(test)]\n{EXACT_MAIN}#[cfg(test)]\n#[allow(unused_imports, reason = \"net\")]\n#[macro_use]\nextern crate skuld;\n");
+    assert_eq!(check(old, &ok), Vec::<String>::new());
+}

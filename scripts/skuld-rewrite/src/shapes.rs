@@ -1,10 +1,12 @@
 //! The exact items a flip adds to a root, and the macro-arm structure `macro_rules!` bodies share.
 
+use std::path::{Path, PathBuf};
+
 use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::{Attribute, Item, ItemExternCrate, ItemFn, ItemMod, Meta};
 
-use crate::modtree::HARNESS_MOD;
+use crate::modtree::{normalize, HARNESS_MOD};
 
 fn is_cfg(a: &Attribute) -> bool {
     matches!(a.style, syn::AttrStyle::Outer) && a.path().is_ident("cfg")
@@ -45,16 +47,40 @@ pub fn is_exact_main(f: &ItemFn) -> bool {
     body == [new, names, run] || body == [new, names, known, run]
 }
 
-/// `mod test_harness;` with only `cfg` and `path = "..src/test_harness.rs"` attributes.
-pub fn is_exact_include(m: &ItemMod) -> bool {
+/// Where `mod test_harness;` declared directly in the root file `file` would be loaded from.
+fn include_target(m: &ItemMod, file: &Path) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    let mut path = None;
+    for a in &m.attrs {
+        if let Meta::NameValue(nv) = &a.meta {
+            if nv.path.is_ident("path") {
+                match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s), ..
+                    }) => path = Some(s.value()),
+                    _ => return None,
+                }
+            }
+        }
+    }
+    Some(normalize(
+        &dir.join(path.unwrap_or_else(|| format!("{HARNESS_MOD}.rs"))),
+    ))
+}
+
+/// The one file a root's include may load: `src/test_harness.rs` of the root's package, which is
+/// the directory above the root file's own.
+pub fn harness_file(root: &Path) -> Option<PathBuf> {
+    Some(normalize(&root.parent()?.parent()?.join("src").join("test_harness.rs")))
+}
+
+/// `mod test_harness;` in the root file `file`, with only `cfg` and `path` attributes, that loads
+/// exactly the package's `src/test_harness.rs`.
+pub fn is_exact_include(m: &ItemMod, file: &Path) -> bool {
     m.ident == HARNESS_MOD
         && m.content.is_none()
-        && m.attrs.iter().all(|a| {
-            is_cfg(a)
-                || matches!(&a.meta, Meta::NameValue(nv) if nv.path.is_ident("path")
-                    && matches!(&nv.value, syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
-                        if s.value().ends_with("src/test_harness.rs")))
-        })
+        && m.attrs.iter().all(|a| is_cfg(a) || a.path().is_ident("path"))
+        && include_target(m, file).is_some_and(|t| harness_file(file) == Some(t))
 }
 
 /// `extern crate skuld;`, optionally under `macro_use`, `allow` and `cfg`; never renamed.
@@ -68,10 +94,10 @@ pub fn is_exact_net(e: &ItemExternCrate) -> bool {
 }
 
 /// The items `--hoist-crate-cfg` leaves alone and `verify` restores around.
-pub fn is_hoist_exempt(item: &Item) -> bool {
+pub fn is_hoist_exempt(item: &Item, file: &Path) -> bool {
     match item {
         Item::Fn(f) => f.sig.ident == "main",
-        Item::Mod(m) => is_exact_include(m),
+        Item::Mod(m) => is_exact_include(m, file),
         _ => false,
     }
 }

@@ -350,3 +350,90 @@ fn a_root_also_reached_as_a_module_is_still_hoisted() {
     assert_eq!(out.len(), 1, "{out:?}");
     assert_eq!(out[0], ("/t/m.rs".to_owned(), "#[cfg(unix)]\nfn a() {}\n".to_owned()));
 }
+
+#[test]
+fn raw_identifier_spellings_map_or_refuse_like_the_plain_ones() {
+    assert_eq!(
+        one("#[r#test]\nfn a() {}\n", Options::default()),
+        "#[skuld::test]\nfn a() {}\n"
+    );
+    assert_eq!(
+        one("#[tokio::r#test]\nasync fn a() {}\n", Options::default()),
+        "#[skuld::test]\nasync fn a() {}\n"
+    );
+    assert_eq!(
+        one(
+            "#[r#tokio::test(start_paused = true)]\nasync fn a() {}\n",
+            Options::default()
+        ),
+        "#[skuld::test(runtime = crate::tokio::test_runtime::paused)]\nasync fn a() {}\n"
+    );
+    for src in [
+        "#[cfg_attr(unix, r#test)]\nfn a() {}\n",
+        "#[core::prelude::v1::r#test]\nfn a() {}\n",
+        "macro_rules! m { () => { #[cfg_attr(unix, r#test)] fn a() {} }; }\n",
+        "some_macro! { #[r#test] fn a() {} }\n",
+    ] {
+        assert_eq!(refused_lines(src, Options::default()).len(), 1, "{src}");
+    }
+}
+
+fn rustfmt_clean(src: &str) -> bool {
+    use std::io::Write;
+    let mut child = std::process::Command::new("rustfmt")
+        .args(["--check", "--edition", "2021"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(src.as_bytes()).unwrap();
+    child.wait().unwrap().success()
+}
+
+#[test]
+fn hoisting_leaves_no_blank_line_rustfmt_rejects() {
+    let hoist = Options {
+        hoist_crate_cfg: true,
+        ..Options::default()
+    };
+    let cases = [
+        (
+            "#![cfg(unix)]\n\n#[test]\nfn a() {}\n",
+            "#[cfg(unix)]\n#[skuld::test]\nfn a() {}\n",
+        ),
+        (
+            "//! d\n\n#![cfg(unix)]\n\nuse std::io;\n",
+            "//! d\n\n#[cfg(unix)]\nuse std::io;\n",
+        ),
+        (
+            "#![cfg(unix)]\n#![cfg(feature = \"x\")]\n\nuse std::io;\n",
+            "#[cfg(unix)]\n#[cfg(feature = \"x\")]\nuse std::io;\n",
+        ),
+        (
+            "//! d\n#![cfg(unix)]\n\nuse std::io;\n",
+            "//! d\n\n#[cfg(unix)]\nuse std::io;\n",
+        ),
+    ];
+    for (src, want) in cases {
+        assert!(rustfmt_clean(src), "input must be clean: {src:?}");
+        let got = one(src, hoist);
+        assert_eq!(got, want);
+        assert!(rustfmt_clean(&got), "{got:?}");
+    }
+}
+
+#[test]
+fn hoisting_deletes_a_crlf_line_whole() {
+    let src = "#![cfg(unix)]\r\n#[test]\r\nfn a() {}\r\n";
+    assert_eq!(
+        one(
+            src,
+            Options {
+                hoist_crate_cfg: true,
+                ..Options::default()
+            }
+        ),
+        "#[cfg(unix)]\n#[skuld::test]\r\nfn a() {}\r\n"
+    );
+}

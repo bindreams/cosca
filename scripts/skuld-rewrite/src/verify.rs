@@ -92,8 +92,8 @@ fn is_exact_main(i: &Item) -> bool {
     matches!(i, Item::Fn(f) if shapes::is_exact_main(f))
 }
 
-fn is_exact_include(i: &Item) -> bool {
-    matches!(i, Item::Mod(m) if shapes::is_exact_include(m))
+fn is_exact_include(i: &Item, file: &Path) -> bool {
+    matches!(i, Item::Mod(m) if shapes::is_exact_include(m, file))
 }
 
 fn is_exact_net(i: &Item) -> bool {
@@ -103,11 +103,17 @@ fn is_exact_net(i: &Item) -> bool {
 /// In a root, removes what a flip adds (`main`, the label include, the `extern crate skuld` net)
 /// in exactly the shapes the units add, unless the old revision had it; then restores a hoisted
 /// crate-level `#![cfg]`. Other files are compared as they are.
-fn undo_additions(new: &mut syn::File, old: &syn::File) {
+fn undo_additions(new: &mut syn::File, old: &syn::File, file: &Path) {
     for (is, has) in [
-        (is_exact_main as fn(&Item) -> bool, old.items.iter().any(is_exact_main)),
-        (is_exact_include, old.items.iter().any(is_exact_include)),
-        (is_exact_net, old.items.iter().any(is_exact_net)),
+        (
+            &is_exact_main as &dyn Fn(&Item) -> bool,
+            old.items.iter().any(is_exact_main),
+        ),
+        (
+            &|i| is_exact_include(i, file),
+            old.items.iter().any(|i| is_exact_include(i, file)),
+        ),
+        (&is_exact_net, old.items.iter().any(is_exact_net)),
     ] {
         if !has {
             new.items.retain(|i| !is(i));
@@ -126,11 +132,16 @@ fn undo_additions(new: &mut syn::File, old: &syn::File) {
         })
     };
     // `apply` leaves `main` and the include unhoisted, so they neither carry nor lose the cfg.
-    if !new.items.iter().filter(|i| !shapes::is_hoist_exempt(i)).all(carries) {
+    if !new
+        .items
+        .iter()
+        .filter(|i| !shapes::is_hoist_exempt(i, file))
+        .all(carries)
+    {
         return;
     }
     let outer: Vec<Attribute> = cfgs.iter().map(|a| (*a).clone()).collect();
-    for item in new.items.iter_mut().filter(|i| !shapes::is_hoist_exempt(i)) {
+    for item in new.items.iter_mut().filter(|i| !shapes::is_hoist_exempt(i, file)) {
         if let Some(attrs) = item_attrs_mut(item) {
             attrs.drain(..outer.len());
         }
@@ -177,9 +188,9 @@ fn order_inner_cfgs(file: &mut syn::File) {
     file.attrs = rest;
 }
 
-fn canonicalize(mut file: syn::File, old: Option<&syn::File>, is_root: bool) -> syn::File {
-    if let (Some(old), true) = (old, is_root) {
-        undo_additions(&mut file, old);
+fn canonicalize(mut file: syn::File, old: Option<&syn::File>, root_path: Option<&Path>) -> syn::File {
+    if let (Some(old), Some(path)) = (old, root_path) {
+        undo_additions(&mut file, old, path);
     }
     Canon.visit_file_mut(&mut file);
     order_inner_cfgs(&mut file);
@@ -250,8 +261,8 @@ pub fn verify(old: &dyn Source, new: &dyn Source, roots: &[PathBuf]) -> Result<V
             });
             continue;
         };
-        let canon_old = canonicalize(o.ast.clone(), None, false);
-        let canon_new = canonicalize(n.ast.clone(), Some(&o.ast), n.is_root);
+        let canon_old = canonicalize(o.ast.clone(), None, None);
+        let canon_new = canonicalize(n.ast.clone(), Some(&o.ast), n.is_root.then_some(path.as_path()));
         if let Some(detail) = diff(&canon_old, &canon_new) {
             out.push(Mismatch {
                 path: path.clone(),
@@ -267,22 +278,42 @@ pub fn key(path: &Path) -> PathBuf {
     modtree::normalize(path)
 }
 
-/// A target as `verify` identifies it: where it lives is relative to its own revision's root.
+/// A target as `verify` identifies it. Where it lives is relative to its own revision's root.
+/// Everything libtest can see of it is here: whether it runs, what gates it, and its harness.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TargetKey {
     pub name: String,
     pub kinds: Vec<String>,
     pub src: PathBuf,
+    pub test: bool,
+    pub doctest: bool,
+    pub required_features: Vec<String>,
+    pub bench: Option<bool>,
+    pub harness: bool,
+}
+
+impl TargetKey {
+    /// The key without `harness`, which is allowed to change in one direction.
+    fn identity(&self) -> TargetKey {
+        TargetKey {
+            harness: true,
+            ..self.clone()
+        }
+    }
 }
 
 fn keys(listing: &targets::Listing) -> Result<Vec<TargetKey>> {
     let mut out = Vec::new();
     for t in &listing.targets {
-        let src = t.src_path.strip_prefix(&listing.workspace_root)?.to_owned();
         out.push(TargetKey {
             name: t.name.clone(),
             kinds: t.kinds.clone(),
-            src,
+            src: t.src_path.strip_prefix(&listing.workspace_root)?.to_owned(),
+            test: t.test,
+            doctest: t.doctest,
+            required_features: t.required_features.clone(),
+            bench: t.bench,
+            harness: t.harness,
         });
     }
     out.sort();
@@ -290,22 +321,30 @@ fn keys(listing: &targets::Listing) -> Result<Vec<TargetKey>> {
     Ok(out)
 }
 
-/// The targets only one side has. A target deleted, added or repointed is a change that file
-/// comparison never sees, because the file just stops being a root.
+/// What differs between two target sets. A target deleted, added, repointed, disabled or gated is
+/// a change that file comparison never sees. A harness may be switched off (the planned flip) and
+/// never back on.
 pub fn target_mismatches(old: &[TargetKey], new: &[TargetKey]) -> Vec<Mismatch> {
-    let describe = |k: &TargetKey, side: &str| Mismatch {
+    let describe = |k: &TargetKey, what: &str| Mismatch {
         path: k.src.clone(),
-        detail: format!(
-            "target `{}` ({}) exists in the {side} revision only",
-            k.name,
-            k.kinds.join(", ")
-        ),
+        detail: format!("target `{}` ({}) {what}", k.name, k.kinds.join(", ")),
     };
-    old.iter()
-        .filter(|k| !new.contains(k))
-        .map(|k| describe(k, "old"))
-        .chain(new.iter().filter(|k| !old.contains(k)).map(|k| describe(k, "new")))
-        .collect()
+    let mut out = Vec::new();
+    for k in old {
+        match new.iter().find(|n| n.identity() == k.identity()) {
+            None => out.push(describe(k, "differs or is missing in the new revision")),
+            Some(n) if n.harness && !k.harness => {
+                out.push(describe(k, "had `harness = false` and now has the default harness"))
+            }
+            Some(_) => {}
+        }
+    }
+    out.extend(
+        new.iter()
+            .filter(|k| !old.iter().any(|o| o.identity() == k.identity()))
+            .map(|k| describe(k, "differs or is missing in the old revision")),
+    );
+    out
 }
 
 /// Compares the target sets of `rev` and the working tree, then every file reachable from each

@@ -130,12 +130,47 @@ struct Ctx {
     root_top: bool,
 }
 
+/// Where a walk starts.
+#[derive(Clone, Debug)]
+pub struct Root {
+    pub path: PathBuf,
+    /// True for `lib.rs`, `main.rs`, `mod.rs` and every cargo target's file: their `mod x;` looks
+    /// beside them. False for a module file such as `quote.rs`, whose children sit in `quote/`.
+    pub mod_rs_like: bool,
+    /// True for a crate root, where a flip adds `main` and the label include.
+    pub is_root: bool,
+}
+
+impl Root {
+    pub fn crate_root(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mod_rs_like: true,
+            is_root: true,
+        }
+    }
+}
+
 /// Every file reachable from `root` through `mod` declarations, root first, each once.
 /// Modules are followed whatever their `cfg`: a file for another OS is still part of the tree.
 pub fn walk(source: &dyn Source, root: &Path) -> Result<Vec<ParsedFile>> {
+    walk_roots(source, &[Root::crate_root(root)])
+}
+
+/// [`walk`] from several roots at once. A file is parsed once, in the context that reaches it
+/// first, so list the crate roots before the module files they own.
+pub fn walk_roots(source: &dyn Source, roots: &[Root]) -> Result<Vec<ParsedFile>> {
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
-    visit_file(source, &normalize(root), true, true, &mut files, &mut seen)?;
+    for root in roots {
+        let path = normalize(&root.path);
+        visit_file(source, &path, root.mod_rs_like, root.is_root, &mut files, &mut seen)?;
+        if root.is_root {
+            if let Some(f) = files.iter_mut().find(|f| f.path == path) {
+                f.is_root = true;
+            }
+        }
+    }
     Ok(files)
 }
 
@@ -230,7 +265,7 @@ fn visit_items(
 ) -> Result<()> {
     for item in items {
         let Item::Mod(m) = item else { continue };
-        if ctx.root_top && crate::shapes::is_exact_include(m) {
+        if ctx.root_top && crate::shapes::is_exact_include(m, file) {
             continue;
         }
         let (paths, conditional) = path_attrs(m)?;

@@ -12,6 +12,14 @@ pub struct Target {
     pub kinds: Vec<String>,
     /// Canonical and absolute.
     pub src_path: PathBuf,
+    /// `cargo test` runs it.
+    pub test: bool,
+    pub doctest: bool,
+    pub required_features: Vec<String>,
+    /// The manifest's `harness`, true when unset.
+    pub harness: bool,
+    /// The manifest's `bench`, when set.
+    pub bench: Option<bool>,
 }
 
 /// The targets of every package in a workspace.
@@ -29,28 +37,52 @@ pub fn load(manifest: Option<&Path>) -> Result<Listing> {
         cmd.manifest_path(m);
     }
     let meta = cmd.exec().context("running cargo metadata")?;
-    let targets = meta
-        .packages
-        .iter()
-        .flat_map(|p| p.targets.iter())
-        .map(|t| {
+    let mut targets = Vec::new();
+    for package in &meta.packages {
+        let manifest: toml::Table = std::fs::read_to_string(package.manifest_path.as_std_path())
+            .context("reading a package manifest")?
+            .parse()
+            .with_context(|| format!("parsing {}", package.manifest_path))?;
+        for t in &package.targets {
             let src_path = std::fs::canonicalize(t.src_path.as_std_path())
                 .with_context(|| format!("resolving the source of target {}", t.name))?;
             let mut kinds: Vec<String> = t.kind.iter().map(ToString::to_string).collect();
             kinds.sort();
-            Ok(Target {
+            let declared = declaration(&manifest, &kinds, &t.name);
+            targets.push(Target {
                 name: t.name.clone(),
                 kinds,
                 src_path,
-            })
-        })
-        .collect::<Result<_>>()?;
+                test: t.test,
+                doctest: t.doctest,
+                required_features: t.required_features.clone(),
+                harness: declared.and_then(|d| d.get("harness")?.as_bool()).unwrap_or(true),
+                bench: declared.and_then(|d| d.get("bench")?.as_bool()),
+            });
+        }
+    }
     let workspace_root =
         std::fs::canonicalize(meta.workspace_root.as_std_path()).context("resolving the workspace root")?;
     Ok(Listing {
         workspace_root,
         targets,
     })
+}
+
+/// The manifest table that declares a target, if it declares one: `[lib]`, or the `[[bin]]`,
+/// `[[test]]`, `[[bench]]` or `[[example]]` entry of that name.
+fn declaration<'a>(manifest: &'a toml::Table, kinds: &[String], name: &str) -> Option<&'a toml::Table> {
+    let section = match kinds.first()?.as_str() {
+        "bin" | "test" | "bench" | "example" => kinds[0].as_str(),
+        "custom-build" => return None,
+        _ => return manifest.get("lib")?.as_table(),
+    };
+    manifest
+        .get(section)?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_table())
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
 }
 
 /// Every target of every package in the manifest.

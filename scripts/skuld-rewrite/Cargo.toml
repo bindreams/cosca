@@ -16,4 +16,5 @@ proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 quote = "=1.0.47"
 tar = "=0.4.46"
 tempfile = "=3.27.0"
+toml = "=1.1.6"
 syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }

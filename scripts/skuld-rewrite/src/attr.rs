@@ -2,6 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::ToTokens;
+use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Lit, Meta, Path, Token};
 
@@ -42,7 +43,7 @@ pub struct TestAttr {
 pub struct Unsupported(pub String);
 
 fn segments(path: &Path) -> Vec<String> {
-    path.segments.iter().map(|s| s.ident.to_string()).collect()
+    path.segments.iter().map(|s| s.ident.unraw().to_string()).collect()
 }
 
 /// `Some` when the path names a test attribute macro.
@@ -157,7 +158,7 @@ pub enum Hidden {
 
 fn mentions_test(ts: TokenStream) -> bool {
     ts.into_iter().any(|t| match t {
-        proc_macro2::TokenTree::Ident(i) => i == "test",
+        proc_macro2::TokenTree::Ident(i) => i.unraw() == "test",
         proc_macro2::TokenTree::Group(g) => mentions_test(g.stream()),
         _ => false,
     })
@@ -165,7 +166,7 @@ fn mentions_test(ts: TokenStream) -> bool {
 
 /// True when `path` ends in `test`, whatever precedes it.
 pub fn ends_in_test(path: &Path) -> bool {
-    path.segments.last().is_some_and(|s| s.ident == "test")
+    path.segments.last().is_some_and(|s| s.ident.unraw() == "test")
 }
 
 /// True when `meta` is a test attribute spelling that [`classify_meta`] does not map.

@@ -166,3 +166,47 @@ fn an_inline_or_repointed_test_harness_module_is_walked() {
         ["/t/b.rs", "/t/r.rs"]
     );
 }
+
+#[test]
+fn the_include_is_the_resolved_src_test_harness_file_and_nothing_else() {
+    // Right shape, wrong file: `/t/tests/src/test_harness.rs`.
+    let a = MemSource::new(&[
+        (
+            "/t/tests/r.rs",
+            "#[path = \"../tests/src/test_harness.rs\"]\nmod test_harness;\n",
+        ),
+        ("/t/tests/src/test_harness.rs", ""),
+    ]);
+    assert_eq!(
+        paths(&walk(&a, Path::new("/t/tests/r.rs")).unwrap()),
+        ["/t/tests/r.rs", "/t/tests/src/test_harness.rs"]
+    );
+    // No `#[path]`: resolves to `tests/test_harness.rs`, not `src/`.
+    let b = MemSource::new(&[
+        ("/t/tests/r.rs", "mod test_harness;\n"),
+        ("/t/tests/test_harness.rs", ""),
+    ]);
+    assert_eq!(
+        paths(&walk(&b, Path::new("/t/tests/r.rs")).unwrap()),
+        ["/t/tests/r.rs", "/t/tests/test_harness.rs"]
+    );
+    // The lib's `mod test_harness;` in `src/lib.rs` is the real one, and is skipped.
+    let c = MemSource::new(&[("/t/src/lib.rs", "#[cfg(test)]\nmod test_harness;\n")]);
+    assert_eq!(paths(&walk(&c, Path::new("/t/src/lib.rs")).unwrap()), ["/t/src/lib.rs"]);
+}
+
+#[test]
+fn an_include_below_a_root_top_level_is_walked_even_when_it_looks_exact() {
+    // Inside `mod x`, `../src/..` resolves from `tests/x/`, to `tests/src/test_harness.rs`.
+    let src = MemSource::new(&[
+        (
+            "/t/tests/r.rs",
+            "mod x {\n    #[path = \"../src/test_harness.rs\"]\n    mod test_harness;\n}\n",
+        ),
+        ("/t/tests/src/test_harness.rs", ""),
+    ]);
+    assert_eq!(
+        paths(&walk(&src, Path::new("/t/tests/r.rs")).unwrap()),
+        ["/t/tests/r.rs", "/t/tests/src/test_harness.rs"]
+    );
+}
