@@ -96,11 +96,12 @@ fn spurious_wake() {
 /// expired wait takes one final peek. Round 0 is woken by a real `SIGCHLD` before the deadline, so
 /// the wait must go round again, and the test tells that wake from a round after the deadline by
 /// the frozen clock, not by counting rounds (another test's child may wake this one too). The
-/// clock is held until round 1, so a runner stall before it cannot run the deadline out first.
+/// clock is held until round 1, so a runner stall before it cannot run the deadline out first;
+/// round 0 spends 1 ms of it explicitly, so round 1 has less left than round 0.
 ///
 /// Mutant: an unbounded `kevent` under a deadline (its `debug_assert!` fires); a round after the
-/// deadline (no expiry check before the block); a timeout above the time remaining; no final peek;
-/// the clock not held (the stall at round 0 ends the wait there).
+/// deadline (no expiry check before the block); a timeout above the time remaining, or computed
+/// once per wait; no final peek; the clock not held (the stall at round 0 ends the wait there).
 #[test]
 fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let (mut child, stdin) = spawn_blocker();
@@ -118,6 +119,7 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
             remainings.borrow_mut().push(left);
             if round == 0 {
                 stall(limit);
+                crate::wait::test_clock::advance(Duration::from_millis(1));
                 spurious_wake();
             }
         }
