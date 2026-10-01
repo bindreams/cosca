@@ -6,13 +6,14 @@
 //! - The target is an unreaped child the caller owns: a [`Target`] (`cosca::Child`,
 //!   `std::process::Child`). A pid only names a process while it is an unreaped child (a zombie
 //!   at worst) or a handle to it is open. Every entry point
-//!   first calls [`Target::has_exited`], a `try_wait`: `true` means the target is dead (and now
-//!   reaped, its status cached for the caller's own later `wait`), so the pid is never opened;
-//!   `false` means it is unreaped now and stays so, because nothing but the caller's own `wait`
-//!   or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps only
-//!   inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
+//!   first calls [`Target::has_exited`]: `true` means the target is dead, so the pid is never
+//!   opened; `false` means it is unreaped now and stays so, because nothing but the caller's own
+//!   `wait` or `try_wait` reaps a `cosca::Child` (`SharedChild` starts no reaper thread; it reaps
+//!   only inside `wait` and `try_wait`, and never at adoption). The pid is then a stable name for
 //!   `pidfd_open`, `kqueue` or `OpenProcess`. The caller must not `wait` on the target
 //!   concurrently.
+//! - Nothing here reaps a Unix `cosca::Child`: its drop kills a contained tree only while the
+//!   unreaped root pins the pid, and a helper's panic unwinds into that drop.
 //! - The target performs the accept handshake ([`ack`]): after `connect()` it blocks until
 //!   the harness has accepted the connection and written the ack byte, before doing anything
 //!   else, including exiting. This is what makes the verdict deterministic: `connect()` returning
@@ -79,7 +80,8 @@ pub use signalled::{accept_or_signalled, DrainSignal};
 /// A child process the caller owns and has not reaped.
 pub trait Target {
     fn pid(&self) -> u32;
-    /// `try_wait`: `true` when the target has exited, in which case it is now reaped.
+    /// `true` when the target has exited. A `std::process::Child` is then reaped; a Unix
+    /// `cosca::Child` is left unreaped for its drop (see the module doc).
     fn has_exited(&mut self) -> bool;
 }
 
@@ -89,12 +91,65 @@ impl Target for cosca::Child {
     }
 
     fn has_exited(&mut self) -> bool {
+        #[cfg(unix)]
+        return has_exited_unreaped(self.id());
+        #[cfg(windows)]
         self.try_wait()
             .expect("try_wait the control target before watching it")
             .is_some()
     }
 }
 
+/// Whether the child `id` has exited, without reaping it. `id` must be an unreaped child of this
+/// process: its zombie pins the pid and reads `Dead`.
+#[cfg(unix)]
+pub(crate) fn has_exited_unreaped(id: ProcessId) -> bool {
+    use cosca::identity::Liveness;
+    debug_assert!(
+        is_unreaped_child(id.pid()),
+        "the control target (pid {}) must be an unreaped child of this process",
+        id.pid()
+    );
+    match id.is_alive() {
+        Liveness::Alive => false,
+        Liveness::Dead => true,
+        Liveness::Unknown => panic!(
+            "the OS would not say whether the control target (pid {}) is alive",
+            id.pid()
+        ),
+    }
+}
+
+/// Whether `pid` is a child of this process that nothing has reaped (`waitid` answers `ECHILD`
+/// otherwise).
+#[cfg(unix)]
+fn is_unreaped_child(pid: u32) -> bool {
+    loop {
+        // SAFETY: `siginfo_t` is plain old data; all-zero is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable `siginfo_t` for the whole call.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return false,
+            _ => panic!("waitid(P_PID, {pid}, WEXITED | WNOHANG | WNOWAIT): {e}"),
+        }
+    }
+}
+
+/// A single process, whose drop kills no tree, so reaping it here skips nothing. One the caller has
+/// already waited on answers from std's cached status.
 impl Target for std::process::Child {
     fn pid(&self) -> u32 {
         self.id()

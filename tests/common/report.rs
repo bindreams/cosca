@@ -313,13 +313,15 @@ pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &
         .expect("set the report stream nonblocking");
     let mut stream = ::tokio::net::TcpStream::from_std(std_stream).expect("wrap the report stream for tokio");
     let mut line = String::new();
+    // Watched without reaping, as in `accept_or_die_async`.
+    let root_process = cosca::tokio::Process::from_id(root.id());
     let n = {
         let mut reader = BufReader::new(&mut stream);
         ::tokio::select! {
             biased;
             n = reader.read_line(&mut line) => n.expect("read the grandchild pid report"),
-            status = root.wait() => match status {
-                Ok(_) => died_before_reporting(root_pid, "the grandchild pid"),
+            status = root_process.wait() => match status {
+                Ok(()) => died_before_reporting(root_pid, "the grandchild pid"),
                 Err(e) => panic!("watching the root's exit while reading the grandchild pid report: {e}"),
             },
         }
