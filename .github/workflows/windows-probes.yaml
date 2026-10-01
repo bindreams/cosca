@@ -87,7 +87,7 @@ concurrency:
 env:
   # `.config/nextest.toml` requires the same nextest. One Renovate manager moves every copy
   # of this version together (.github/renovate.json).
-  NEXTEST_VERSION: "0.9.137"
+  NEXTEST_VERSION: "0.9.146"
 
 jobs:
   path-resolution:

@@ -58,7 +58,7 @@ if (Get-Command cargo -ErrorAction SilentlyContinue) {
 # exit code -1073741515 (0xC0000135, STATUS_DLL_NOT_FOUND) and no stdout/stderr, which the
 # nextest-install block below silently swallows into an empty version string instead of
 # catching, unless this check runs first. nextest-rs publishes no windows-gnu build (checked the
-# cargo-nextest-0.9.137 release asset list - only *-pc-windows-msvc for both x86_64 and
+# cargo-nextest-0.9.146 release asset list - only *-pc-windows-msvc for both x86_64 and
 # aarch64), so switching targets isn't an option; the redistributable has to be installed.
 # This runs BEFORE the "is cargo-nextest already installed?" check below, since that check
 # itself invokes cargo-nextest.exe.
@@ -90,7 +90,7 @@ if ($vcRuntimeInstalled) {
 }
 
 # This version matches CI's own cargo-nextest pin (.github/workflows/ci.yaml, tool:
-# cargo-nextest@0.9.137). Installing the same version here means `devvm.py run
+# cargo-nextest@0.9.146). Installing the same version here means `devvm.py run
 # windows-x64 -- cargo nextest run ...` matches what CI actually runs, instead of whatever
 # a fresh install would resolve to today.
 #
@@ -103,12 +103,12 @@ if ($vcRuntimeInstalled) {
 # binary - it runs fine regardless of the local toolchain being the GNU host triplet above,
 # since nextest only shells out to `cargo build` and then runs the resulting test binaries
 # directly; it doesn't need to have been built with the same toolchain itself.
-$nextestVersion = "0.9.137"
+$nextestVersion = "0.9.146"
 # SHA-256 of the exact release asset, fetched and independently verified (both against
-# nextest's own published `.sha256` files and a fresh `Get-FileHash` of a freshly downloaded
-# copy) 2026-09-23. Checked before extracting (below) so a corrupted or tampered download is a
+# the GitHub release's own asset digest and a fresh `shasum -a 256` of a freshly downloaded
+# copy) 2026-10-01. Checked before extracting (below) so a corrupted or tampered download is a
 # hard failure, never silently `Expand-Archive`'d.
-$nextestSha256 = "88c746b41b1e96165028ef90b9dac5d37eb923e4e00aee6b9080a038f1ac2705"
+$nextestSha256 = "0fa689815c8157e4633225b6b173184b3d546eb6ffb754c3d0e6ea5973284a20"
 $installedVersion = if (Get-Command cargo-nextest -ErrorAction SilentlyContinue) {
     ((cargo nextest --version 2>$null) -split " ")[1]
 } else {
