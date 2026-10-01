@@ -66,7 +66,7 @@ check() {
         >"${work}/stdout.log" 2>"${work}/stderr.log" || rc=$?
     found=""
     if [[ -f "${out}" ]]; then
-        found="$(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] + ":" + str(e["line"]) for e in json.load(open(sys.argv[1]))})))' "${out}")"
+        found="$(python3 -c 'import json, sys; sys.stdout.reconfigure(newline="\n"); print("\n".join(sorted({e["file"] + ":" + str(e["line"]) for e in json.load(open(sys.argv[1]))})))' "${out}")"
     fi
     checks=$((checks + 1))
     if [[ "${rc}" == "${want_rc}" && "${found}" == "${want_found}" ]]; then
