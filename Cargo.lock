@@ -688,9 +688,9 @@ dependencies = [
 
 [[package]]
 name = "skuld"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13443ab130646d782c290593fabbbc99e93e7575bc8c410cbe8d7dfa8f2fa34a"
+checksum = "d4c0c03c2cef0bdb277334bdd3ffa3cf31c2598e142fa4a954be56aea6c5911f"
 dependencies = [
  "boolean_expression",
  "clap",
@@ -708,14 +708,15 @@ dependencies = [
  "serde_yml",
  "skuld-macros",
  "tempfile",
+ "unicode-normalization",
  "windows",
 ]
 
 [[package]]
 name = "skuld-macros"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00834d51dfd8ff004a0e32e42626f0cc37eaeec3407c4102dadc65e85b0105f"
+checksum = "b437478b7a7ce24dfaaaaf79f7f698d1c79e3d3dba5e5d1604f60d1d0cf22028"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -812,6 +813,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,6 +856,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "utf8parse"
