@@ -209,20 +209,23 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     root.resume();
     let watched = common::report_grandchild_of(&report, &mut root);
 
-    let mut root_member = None;
-    let mut grand_member = None;
-    for _ in 0..2 {
-        // The root is watched throughout and the grandchild until it has connected.
-        let watch_grand = grand_member.is_none().then_some(watched);
-        let s = common::accept_or_die_also(&listener, &mut root, watch_grand);
+    // Both members' `<tag><pid>\n` handshakes, in arrival order; the root is watched throughout
+    // and the grandchild until it has connected.
+    let mut handshakes: Vec<(String, u32)> = Vec::new();
+    let socks = common::accept_tree_also(&listener, &mut root, watched, |s| {
         let mut line = String::new();
         BufReader::new(s.try_clone().expect("clone"))
             .read_line(&mut line)
             .expect("read tag+pid");
         let (tag, pid) = line.trim().split_at(1);
-        let pid: u32 = pid.parse().expect("member pid");
-        // Opened here, while the handshake proves the member alive — see `Member`'s doc for
-        // why a pid captured now cannot be trusted at teardown.
+        handshakes.push((tag.to_string(), pid.parse().expect("member pid")));
+        tag == "G"
+    });
+    let mut root_member = None;
+    let mut grand_member = None;
+    for ((tag, pid), sock) in handshakes.into_iter().zip(socks) {
+        // Both members are alive and blocked on their sockets, which this test holds; see
+        // `Member`'s doc for why a pid captured earlier cannot be trusted at teardown.
         // SAFETY: standard Win32 call; the handle is closed by `Member::drop`.
         let process = unsafe {
             windows::Win32::System::Threading::OpenProcess(
@@ -232,8 +235,8 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
             )
             .expect("open the member that just completed its handshake")
         };
-        let m = Member { pid, sock: s, process };
-        match tag {
+        let m = Member { pid, sock, process };
+        match tag.as_str() {
             "R" => root_member = Some(m),
             "G" => grand_member = Some(m),
             other => panic!("unexpected tree tag {other:?}"),

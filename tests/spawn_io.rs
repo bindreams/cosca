@@ -1701,7 +1701,7 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
 /// forever. The contained `sh` exits at once and leaves no descendant.
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects() {
+fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects() {
     if !common::require_group("CGROUP") {
         return;
     }

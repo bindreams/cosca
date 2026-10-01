@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Networking::WinSock::{
-    WSACloseEvent, WSACreateEvent, WSAEventSelect, FD_ACCEPT, FD_CLOSE, FD_READ, SOCKET,
+    WSACloseEvent, WSACreateEvent, WSAEventSelect, FD_ACCEPT, FD_CLOSE, FD_READ, SOCKET, WSAEVENT,
 };
 use windows::Win32::System::Threading::{OpenProcess, WaitForMultipleObjects, INFINITE, PROCESS_SYNCHRONIZE};
 
@@ -36,10 +36,28 @@ pub fn wait_handles(handles: &[HANDLE]) -> std::io::Result<usize> {
     Ok(index)
 }
 
-fn close_all(handles: &[HANDLE]) {
-    for h in handles {
-        // SAFETY: closes only handles this backend opened.
-        let _ = unsafe { CloseHandle(*h) };
+/// A process handle this backend opened, closed on drop, panic paths included.
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: closes a handle this backend opened and owns.
+        let closed = unsafe { CloseHandle(self.0) };
+        debug_assert!(closed.is_ok(), "CloseHandle on a process handle failed: {closed:?}");
+    }
+}
+
+/// The `WSAEVENT` armed on the source, closed on drop.
+struct ReadinessEvent(WSAEVENT);
+
+impl Drop for ReadinessEvent {
+    fn drop(&mut self) {
+        // SAFETY: closes an event this backend created and owns.
+        let closed = unsafe { WSACloseEvent(self.0) };
+        debug_assert!(
+            closed.is_ok(),
+            "WSACloseEvent on the readiness event failed: {closed:?}"
+        );
     }
 }
 
@@ -49,45 +67,33 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         Source::Stream(s) => (s.as_raw_socket(), FD_READ | FD_CLOSE),
     };
     let pids: Vec<u32> = std::iter::once(target_pid).chain(also.map(|id| id.pid())).collect();
-    let mut processes: Vec<HANDLE> = Vec::new();
+    let mut processes: Vec<ProcessHandle> = Vec::new();
     for &pid in &pids {
         // SAFETY: opens the process by pid with only SYNCHRONIZE, enough to wait for its exit.
         match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
-            Ok(h) => processes.push(h),
+            Ok(h) => processes.push(ProcessHandle(h)),
             // No such process: gone, which is the same disposition as on Linux and macOS.
-            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
-                close_all(&processes);
-                return WatchEvent::Died(pid);
-            }
-            Err(e) => {
-                close_all(&processes);
-                panic!("OpenProcess({pid}, SYNCHRONIZE) for the death-watch: {e}");
-            }
+            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => return WatchEvent::Died(pid),
+            Err(e) => panic!("OpenProcess({pid}, SYNCHRONIZE) for the death-watch: {e}"),
         }
     }
     // Opened by pid, so confirm the descendant's handle is the process its identity names.
     if let Some(id) = also {
         match id.exists() {
             Existence::Present => {}
-            Existence::Gone => {
-                close_all(&processes);
-                return WatchEvent::Died(id.pid());
-            }
-            Existence::Unknown => {
-                close_all(&processes);
-                panic!(
-                    "the OS refused to confirm the identity of pid {} for the death-watch",
-                    id.pid()
-                );
-            }
+            Existence::Gone => return WatchEvent::Died(id.pid()),
+            Existence::Unknown => panic!(
+                "the OS refused to confirm the identity of pid {} for the death-watch",
+                id.pid()
+            ),
         }
     }
 
-    // SAFETY: creates an unnamed, unowned manual-reset event; closed explicitly below.
-    let event = unsafe { WSACreateEvent() }.expect("WSACreateEvent for the source's readiness watch");
+    // SAFETY: creates an unnamed, unowned manual-reset event; `ReadinessEvent` closes it.
+    let event = ReadinessEvent(unsafe { WSACreateEvent() }.expect("WSACreateEvent for the source's readiness watch"));
     let sock = SOCKET(raw as usize);
     // SAFETY: `sock` is the source's own live socket; `event` was just created above.
-    let rc = unsafe { WSAEventSelect(sock, Some(event), mask as i32) };
+    let rc = unsafe { WSAEventSelect(sock, Some(event.0), mask as i32) };
     assert_eq!(
         rc,
         0,
@@ -98,8 +104,8 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
 
     // Process handles come BEFORE the event: the lowest signalled index wins, so an exit beats a
     // ready source.
-    let mut handles = processes.clone();
-    handles.push(HANDLE(event.0 as *mut _));
+    let mut handles: Vec<HANDLE> = processes.iter().map(|p| p.0).collect();
+    handles.push(HANDLE(event.0 .0 as *mut _));
     let woken = wait_handles(&handles);
 
     // Cancel the association, then restore blocking mode explicitly: cancelling alone does not
@@ -117,9 +123,8 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         Source::Stream(s) => s.set_nonblocking(false),
     }
     .expect("restore the watched socket to blocking mode");
-    // SAFETY: the event was created above and is no longer in use.
-    let _ = unsafe { WSACloseEvent(event) };
-    close_all(&processes);
+    drop(event);
+    drop(processes);
 
     let index = woken.unwrap_or_else(|e| panic!("WaitForMultipleObjects while waiting for a control connection: {e}"));
     match pids.get(index) {
