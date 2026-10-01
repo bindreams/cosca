@@ -178,11 +178,47 @@ fn helper_write_own_record() {
     std::fs::write(&tmp, json).expect("write record");
     std::fs::rename(&tmp, &path).expect("rename record into place");
     // The handshake proper: a byte on the pipe, not an elapsed interval.
-    println!("{RECORD_READY}");
+    // A leading newline: in single-thread mode libtest has printed `test <name> ... ` without one.
     use std::io::Write;
-    std::io::stdout().flush().expect("flush");
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\n{RECORD_READY}\n").expect("write the marker");
+    stdout.flush().expect("flush");
     let mut buf = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut buf);
+}
+
+/// Whether `stream` carries [`RECORD_READY`] before it ends, wherever on a line it sits: in
+/// single-thread mode libtest's banner can share the line.
+#[cfg(feature = "serde")]
+fn marker_seen(stream: impl Read) -> bool {
+    std::io::BufReader::new(stream)
+        .lines()
+        .map_while(Result::ok)
+        .any(|l| l.contains(RECORD_READY))
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn the_marker_is_found_on_its_own_line() {
+    assert!(marker_seen(format!("running 1 test\n{RECORD_READY}\n").as_bytes()));
+}
+
+/// In single-thread mode libtest prints `test <name> ... ` before the body runs, so a body's
+/// first output lands on that line.
+#[cfg(feature = "serde")]
+#[test]
+fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
+    assert!(marker_seen(
+        format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n").as_bytes()
+    ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_stream_without_the_marker_is_not_ready() {
+    assert!(!marker_seen(
+        "running 1 test\ntest helper_write_own_record ... \n".as_bytes()
+    ));
 }
 
 #[test]
@@ -209,10 +245,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     // first, so scan rather than reading a single line. EOF without the marker means the
     // helper died before writing — a real failure, reported as one.
     let stdout = child.stdout.take().expect("piped stdout");
-    let ready = std::io::BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .any(|l| l.trim() == RECORD_READY);
+    let ready = marker_seen(stdout);
     assert!(ready, "the helper exited without writing its record");
 
     let json = std::fs::read_to_string(&path).expect("the record file is complete by now");
