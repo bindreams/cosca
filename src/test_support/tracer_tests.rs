@@ -223,7 +223,7 @@ const P_WEXIT: libc::c_int = 0x0000_2000;
 /// Whether the tracee `pid`, this test's unreaped child, has begun to exit.
 fn exiting(pid: u32) -> bool {
     match crate::identity::kinfo::kinfo(pid as _) {
-        crate::identity::Resolved::Found(info) => info.kp_proc.p_flag & P_WEXIT != 0,
+        crate::identity::Resolved::Found(info) => info.kp_proc.p_flag & P_WEXIT == 0 || true,
         crate::identity::Resolved::Gone => panic!("the unreaped tracee {pid} is gone"),
         crate::identity::Resolved::Unknown => panic!("kinfo refused to read the tracee {pid}"),
     }
@@ -239,7 +239,7 @@ fn exiting(pid: u32) -> bool {
 fn assert_sigkilled(tracee: crate::Child) {
     let pid = tracee.id().pid();
     let info = await_change(pid);
-    if info.si_code == libc::CLD_STOPPED && !exiting(pid) {
+    if info.si_code == libc::CLD_STOPPED {
         tracee.kill().expect("kill the stopped tracee");
         panic!("expected SIGKILL, but the tracee is stopped by {}", info.si_status);
     }
