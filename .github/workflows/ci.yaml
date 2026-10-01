@@ -74,9 +74,15 @@ jobs:
         shell: bash
         run: bash .github/scripts/enable-sccache-tests.sh
 
-      - name: Test signal forwarding script
+      - name: Test the signal forwarding and nextest wrapper scripts
         shell: bash
-        run: bash .github/scripts/forward-signals-tests.sh
+        working-directory: .github/scripts
+        run: python3 -m unittest -f forward_tests run_nextest_tests
+
+      # Forces pid reuse in a fresh PID namespace, so it needs root.
+      - name: Test the signal forwarding script against pid reuse
+        shell: bash
+        run: sudo python3 .github/scripts/forward_reuse_tests.py
 
       # musl has broken the build before (#172: msghdr/cmsghdr field types differ from glibc).
       # --lib only: the dev-dependencies' C code (libsqlite3-sys) needs a musl C compiler.
@@ -187,17 +193,17 @@ jobs:
             arch: amd64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            exec: "exec "
+            nextest: exec python3 .github/scripts/run-nextest.py
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            exec: "exec "
+            nextest: exec python3 .github/scripts/run-nextest.py
           - os: darwin
             arch: arm64
             runner: macos-latest
             target: aarch64-apple-darwin
-            exec: "exec "
+            nextest: exec python3 .github/scripts/run-nextest.py
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
@@ -207,11 +213,12 @@ jobs:
             arch: amd64
             runner: macos-15
             target: x86_64-apple-darwin
-            exec: "exec "
+            nextest: exec python3 .github/scripts/run-nextest.py
           - os: windows
             arch: amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            nextest: ./.github/scripts/run-nextest.ps1
             # This is the one Windows lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
@@ -219,6 +226,7 @@ jobs:
             arch: arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
     # 30 min: darwin/amd64, the slowest lane (about 21 min, no guard), plus headroom; the guard adds
@@ -252,15 +260,18 @@ jobs:
       # Each nextest step is a build step (unbounded: compile time varies with the cache) and a run
       # step bounded above the largest per-test bound in `.config/nextest.toml` (5 x 60s + 1s grace)
       # plus the suite's runtime, so a hang costs one step. On Unix the runner signals only the
-      # step's top-level shell when the bound fires, so a run step `exec`s its command
-      # (`matrix.exec`, empty on Windows where the shell is pwsh) or, for several commands, uses
-      # `run_forwarding` (.github/scripts/forward-signals.sh), and the signal reaches nextest.
+      # step's top-level shell when the bound fires. A run step therefore `exec`s
+      # .github/scripts/run-nextest.py (`matrix.nextest`), so the signal lands on forward.py's loop,
+      # which relays it to the command's whole process group. The script also selects the step's own
+      # nextest profile `ci-<step>` (.config/nextest.toml) and collects that profile's JUnit file, if
+      # the run ended on its own. Windows uses run-nextest.ps1 instead: two ACL tests fail when
+      # nextest runs under Git bash.
       - name: Build tests
         run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
 
       - name: Run tests
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
       # logon session) is the `WINDOWS_DRIVE_MAP` group, off everywhere else. This step opts in
@@ -272,7 +283,8 @@ jobs:
           COSCA_TEST_WINDOWS_DRIVE_MAP: "1"
           COSCA_TEST_WINDOWS_DRIVE_MAP_CONSENT: "1"
         run: >-
-          cargo nextest run --locked --target ${{ matrix.target }} --profile ci
+          ${{ matrix.nextest }} drive-mapping
+          cargo nextest run --locked --target ${{ matrix.target }}
           --test windows_process_cwd
           -E 'test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does)'
 
@@ -282,14 +294,16 @@ jobs:
 
       - name: Run tests (pty feature)
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features pty --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} pty cargo nextest run --locked --features pty --target ${{ matrix.target }}
+
 
       - name: Build tests (tokio feature)
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
+
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
       - name: Build tests (serde feature)
@@ -297,36 +311,51 @@ jobs:
 
       - name: Run tests (serde feature)
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --features serde --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} serde cargo nextest run --locked --features serde --target ${{ matrix.target }}
 
-      # nextest runs each test in its own process, which hides tests that mutate process-global
-      # state (fd 0/1/2, RLIMIT_NOFILE). Plain `cargo test` shares one process, so this step guards
-      # the `test_own_process` isolation. Every invocation runs and the step fails at the end, so
-      # one failing configuration does not hide the other. `timeout-minutes` bounds a hang.
-      - name: Build plain cargo test (Unix)
-        if: matrix.os == 'linux' || matrix.os == 'darwin'
-        run: |
-          set -euxo pipefail
-          cargo test --locked --no-run --lib --tests --target ${{ matrix.target }}
-          cargo test --locked --no-run --all-features --lib --tests --target ${{ matrix.target }}
-
-      - name: Run plain cargo test (Unix)
-        if: matrix.os == 'linux' || matrix.os == 'darwin'
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -uxo pipefail
-          source .github/scripts/forward-signals.sh
-          status=0
-          run_forwarding cargo test --locked --no-fail-fast --lib --tests --target ${{ matrix.target }} || status=1
-          run_forwarding cargo test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} || status=1
-          exit "$status"
 
       # nextest does not run doctests (https://github.com/nextest-rs/nextest/issues/16), so they use
-      # plain `cargo test`. cosca has no doctests today.
-      - name: Run doctests
-        timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
+      # `cargo test --doc`. On Unix the runner signals only the step's top-level shell when the
+      # bound fires, and `cargo test` does not forward that to the doctest it spawned, so
+      # .github/scripts/forward.py relays the signal to the whole process group.
+      #
+      # Measured over 9 green runs: at most 6s on Linux, 5s on macOS and 9s on Windows. 2 minutes is
+      # 13x the worst of those, and covers a cold-cache compile of the library, which the `Build`
+      # step measures at up to 84s.
+      - name: Run doctests (Unix)
+        if: matrix.os == 'linux' || matrix.os == 'darwin'
+        timeout-minutes: 2
+        shell: bash
+        run: exec python3 .github/scripts/forward.py cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
+
+      # The forwarding scripts run on every Unix lane of the workflow; Linux is covered by the Lint job.
+      # macOS differs: a default-ignored signal is discarded even while blocked, and a group holding
+      # only zombies may refuse a signal.
+      - name: Test the signal forwarding and nextest wrapper scripts (macOS)
+        if: matrix.os == 'darwin'
+        timeout-minutes: 2
+        shell: bash
+        working-directory: .github/scripts
+        run: python3 -m unittest -f forward_tests run_nextest_tests
+
+      # Evidence, alongside the deterministic cases above: signals that arrive within a wake-up of
+      # each other, and an exit with a signal, never stick or crash the forwarder on macOS. The count
+      # only repeats the run; no run depends on it.
+      - name: Repeat the signal-sensitive forwarding tests (macOS)
+        if: matrix.os == 'darwin'
+        timeout-minutes: 5
+        shell: bash
+        working-directory: .github/scripts
+        run: |
+          set -euo pipefail
+          for _ in $(seq 40); do
+            python3 -m unittest -f forward_tests.Waiting forward_tests.Relay forward_tests.SpawnWindow
+          done
+
+      - name: Run doctests (Windows)
+        if: matrix.os == 'windows'
+        timeout-minutes: 2
+        run: cargo test --locked --no-fail-fast --doc --all-features --target ${{ matrix.target }}
 
       - name: Check rustdoc
         shell: bash
@@ -375,7 +404,8 @@ jobs:
       - name: Unit tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --release --lib --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} release cargo nextest run --locked --release --lib --target ${{ matrix.target }}
+
 
       # The same lane with `tokio`: `tokio::wait_tests` pins `arm_at`'s calm-release arm (a deadline
       # inside tokio's timer margin waits unbounded where debug builds assert).
@@ -386,7 +416,8 @@ jobs:
       - name: Unit tests (release — debug_assertions off, tokio feature)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 8
-        run: ${{ matrix.exec }}cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }} --profile ci
+        run: ${{ matrix.nextest }} release-tokio cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }}
+
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw
       # backend) and `cfg(target_os = "macos")` code are otherwise never
@@ -462,18 +493,14 @@ jobs:
         run: |
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
-          cargo test --locked --all-features --lib --tests --target ${{ matrix.target }} --no-run
 
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
         shell: bash
         run: |
-          set -euxo pipefail
-          source .github/scripts/forward-signals.sh
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          run_forwarding sudo -E bash -uxc '
-            source "$5"
+          exec python3 .github/scripts/run-nextest.py cgroup sudo -E "$(command -v python3)" .github/scripts/forward.py bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
@@ -482,15 +509,12 @@ jobs:
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
-            run_forwarding "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci --no-capture -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
-            # Plain `cargo test` shares one process across tests, unlike nextest: the cgroup-lane
-            # tests run under that model here. Root cargo keeps the runner toolchain via `sudo -E`; the
-            # target dir is handed back so later steps can write to it.
-            export PATH="$4"
-            run_forwarding "$2" test --locked --no-fail-fast --all-features --lib --tests --target ${{ matrix.target }} -- cgroup || status=1
-            chown -R "$3" "$PWD/target"
+            "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
+            # Hand the target dir back so later steps can write to it.
+            chown -R "$2" "$PWD/target"
             exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(command -v cargo)" "$(id -u):$(id -g)" "$PATH" "$PWD/.github/scripts/forward-signals.sh"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
+
 
       # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
       # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become
@@ -524,29 +548,28 @@ jobs:
       - name: Run setuid tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
+        shell: bash
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-        run: ${{ matrix.exec }}cargo nextest run --locked --features tokio --target ${{ matrix.target }} --profile ci -E 'test(/setuid_/) | binary(group_teardown_setuid)'
+        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --features tokio --target ${{ matrix.target }} -E 'test(/setuid_/) | binary(group_teardown_setuid)'
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
-      # helper must all be reachable by that uid: every directory above the checkout is made
-      # traversable and `target` readable. `sudo -E` keeps COSCA_TEST_SETUID_HELPER and the group's
-      # variables. The binary is run directly because nextest archives extract into a root-only
-      # tempdir; libtest exits 0 when a filter matches nothing, so the log must show the test passing.
-      - name: Build setuid-root process-group teardown test as root (Linux)
+      # helper must all be reachable by that uid: every directory above the checkout and the
+      # extraction directory is made traversable and `target` readable. `--extract-to` is what lets
+      # nextest run an archive there: its default extraction directory is root-only. `sudo -E` keeps
+      # COSCA_TEST_SETUID_HELPER and the group's variables.
+      - name: Archive the setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
-          BIN=$(cargo test --locked --target ${{ matrix.target }} --test group_teardown_setuid --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "group_teardown_setuid") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -x "$BIN"
+          cargo nextest archive --locked --target ${{ matrix.target }} --test group_teardown_setuid --archive-file "$RUNNER_TEMP/setuid-root.tar.zst"
+          mkdir -m 0755 "$RUNNER_TEMP/setuid-root-extract"
           chmod -R a+rX "$PWD/target"
           d="$PWD"
           while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
-          echo "COSCA_TEST_SETUID_BIN=$BIN" >> "$GITHUB_ENV"
+          sudo chmod a+x "$RUNNER_TEMP"
 
       - name: Run setuid-root process-group teardown test as root (Linux)
         if: matrix.os == 'linux'
@@ -556,11 +579,17 @@ jobs:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
         run: |
-          set -euxo pipefail
-          source .github/scripts/forward-signals.sh
-          run_forwarding sudo -E "$COSCA_TEST_SETUID_BIN" --exact kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running --test-threads=1 --nocapture > "$RUNNER_TEMP/setuid-root.log" 2>&1 || { cat "$RUNNER_TEMP/setuid-root.log"; exit 1; }
-          cat "$RUNNER_TEMP/setuid-root.log"
-          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/setuid-root.log"
+          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
+          exec python3 .github/scripts/run-nextest.py setuid-root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
+            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" -E "binary(group_teardown_setuid) & test(=kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running)"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
+
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: test-${{ matrix.os }}-${{ matrix.arch }}
 
       # Names the stuck process after a hang or failure. Windows has no `ps`.
       - name: Print the process table (Linux)
@@ -590,12 +619,14 @@ jobs:
   resolve_root_lanes:
     name: Root lane (${{ matrix.lane }})
     runs-on: ubuntu-24.04 # matches the `ubuntu:24.04` run image's glibc
+    # Largest measured lane: 87s; 15 minutes is about 10x.
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - lane: root
+            slug: root
             docker_flags: ""
             uid_switch: "1"
             prefix: ""
@@ -604,6 +635,7 @@ jobs:
             expect_capeff_lacks: "0x4"
             expect_capamb: "0x0"
           - lane: root, unshare -r
+            slug: unshare
             uid_switch: "0" # `unshare -r` maps no uid 65534
             docker_flags: "--cap-add SYS_ADMIN" # `unshare -r` needs it
             prefix: "unshare -r "
@@ -613,6 +645,7 @@ jobs:
             expect_capamb: "0x0"
             expect_userns: "1"
           - lane: root, DAC_READ_SEARCH
+            slug: dac-read-search
             docker_flags: "--cap-add DAC_READ_SEARCH"
             uid_switch: "1"
             prefix: ""
@@ -621,6 +654,7 @@ jobs:
             expect_capeff_lacks: "0x0"
             expect_capamb: "0x0"
           - lane: root, foreign TMPDIR
+            slug: foreign-tmpdir
             docker_flags: ""
             uid_switch: "1"
             prefix: ""
@@ -630,6 +664,7 @@ jobs:
             expect_capamb: "0x0"
             foreign_tmpdir: "true"
           - lane: uid 1000, CAP_DAC_OVERRIDE ambient
+            slug: uid-1000
             uid_switch: "0" # not root, so it cannot `setuid`
             docker_flags: ""
             prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
@@ -651,6 +686,16 @@ jobs:
         timeout-minutes: 10
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane.tar.zst"
 
+      # The checkout is mounted read-only below, and nextest writes its store under the remapped
+      # workspace's `target/nextest`. That directory is mounted writable on top of it. The JUnit
+      # file is copied out to `$RUNNER_TEMP/junit` by root-lane.sh. Both are mode 0777 because the
+      # `uid 1000` lane is not the runner's user.
+      - name: Make the nextest store and the JUnit directory writable inside the container
+        run: |
+          set -euxo pipefail
+          mkdir -p target/nextest "$RUNNER_TEMP/junit"
+          chmod 0777 target/nextest "$RUNNER_TEMP/junit"
+
       # The container is the sandbox, so consent is given here.
       # `exec` and `--init`: the runner signals only this shell, `docker run` forwards the signal to
       # the container's pid 1, and an init process passes it on to the lane's script.
@@ -660,7 +705,9 @@ jobs:
           set -euxo pipefail
           exec docker run --rm --init --network none ${{ matrix.docker_flags }} \
             -v "$PWD":/repo:ro \
+            -v "$PWD/target/nextest":/repo/target/nextest \
             -v "$RUNNER_TEMP":/artifacts:ro \
+            -v "$RUNNER_TEMP/junit":/junit-out \
             -v "$(command -v cargo-nextest)":/usr/local/bin/cargo-nextest:ro \
             -e COSCA_TEST_ROOT=1 \
             -e COSCA_TEST_ROOT_CONSENT=1 \
@@ -677,6 +724,12 @@ jobs:
             ubuntu:24.04 \
             bash /repo/.github/scripts/root-lane.sh
 
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: resolve_root_lanes-linux-amd64-${{ matrix.slug }}
+
       - name: Print the process table
         if: cancelled() || failure()
         timeout-minutes: 2
@@ -687,6 +740,7 @@ jobs:
   resolve_root_lane_macos:
     name: Root lane (macOS, sudo -E)
     runs-on: macos-latest
+    # Largest measured: 93s; 15 minutes is about 10x.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -722,7 +776,7 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-        run: exec cargo nextest run --locked --features tokio --profile ci -E 'test(/setuid_/)'
+        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --features tokio -E 'test(/setuid_/)'
 
       - name: Archive the privilege tests
         timeout-minutes: 10
@@ -758,12 +812,19 @@ jobs:
           COSCA_TEST_UID_SWITCH: "1"
           COSCA_TEST_UID_SWITCH_CONSENT: "1"
         run: |
-          set -euxo pipefail
-          exec sudo -E bash -euxc '
+          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
+          exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
-            exec "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci -E "$PRIVILEGE_TESTS"
+            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" -E "$PRIVILEGE_TESTS"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
+
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: resolve_root_lane_macos-darwin-arm64
 
       - name: Print the process table
         if: cancelled() || failure()
