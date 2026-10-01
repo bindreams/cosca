@@ -332,8 +332,7 @@ enum WatchEvent {
     Died,
 }
 
-/// How a tree's drain wait ended, handed from the watcher thread to [`accept_or_signalled`]: a
-/// wait that FAILED must not be reported as the tree having drained.
+/// Wakes [`accept_or_signalled`] when a tree's drain wait ends; see [`shared::DrainOutcome`].
 #[cfg(windows)]
 pub(crate) struct DrainSignal {
     event: std::os::windows::io::OwnedHandle,
@@ -1295,7 +1294,7 @@ fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_
     #[cfg(unix)]
     wait_unreaped(child.id());
     #[cfg(windows)]
-    child.wait().expect("wait for the fixture to exit"); // the Child keeps its handle, so the pid stays valid
+    child.wait().expect("wait for the fixture to exit");
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_or_die(&listener, target)));
     let payload = result.expect_err("accept_or_die must panic for an exited target");
