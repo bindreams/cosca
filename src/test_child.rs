@@ -348,6 +348,16 @@ impl DrainSignal {
         }
     }
 
+    /// Whether the drain has been signalled, by a zero-timeout wait: it never blocks.
+    pub(crate) fn is_signalled(&self) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the event handle is live and owned by `self`.
+        unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 0) == WAIT_OBJECT_0 }
+    }
+
     /// Records the result of `wait_tree` and wakes the acceptor.
     pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
         self.outcome.store(result);
