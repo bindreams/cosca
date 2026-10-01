@@ -66,7 +66,7 @@ pub(crate) struct extern_proc {
     p_vmspace: u64,
     p_sigacts: u64,
     pub(crate) p_flag: libc::c_int,
-    pub(super) p_stat: libc::c_char,
+    pub(crate) p_stat: libc::c_char,
     pub(crate) p_pid: libc::pid_t,
     p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
