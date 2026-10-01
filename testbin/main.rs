@@ -658,8 +658,12 @@ fn main() {
                 reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
             )]
             let mut relay = relay.spawn().unwrap();
-            relay.wait().unwrap(); // its exit is the reparenting event
-                                   // Same wire format as the grandchild, so the test parses one shape.
+            // Its exit is the reparenting event. A relay that failed (it reports the grandchild)
+            // takes this root down too: the harness's report accept watches the root, not the relay.
+            if !relay.wait().unwrap().success() {
+                std::process::exit(1);
+            }
+            // Same wire format as the grandchild, so the test parses one shape.
             run_control_echo_pid(&addr, "R");
         }
         #[cfg(unix)]

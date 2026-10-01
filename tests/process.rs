@@ -814,6 +814,33 @@ fn accept_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_
     assert_died_before_connecting(&message, grandchild_pid);
 }
 
+/// In the `spawn-orphan-escapee` tree the reporter of the grandchild's pid is the relay, not the
+/// root, and the root only waits for the relay. A relay that dies before it reports must fail the
+/// report accept, which watches the root: the root has to exit with it, not carry on to its own
+/// connection and leave the accept waiting on a live root.
+#[cfg(unix)]
+#[skuld::test]
+fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
+    use std::net::TcpListener;
+    let main = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind");
+    // A closed port: the relay's report connection is refused, so it dies before reporting.
+    let refused = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let refused_addr = refused.local_addr().unwrap().to_string();
+    drop(refused);
+    let mut root = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["spawn-orphan-escapee", &main.local_addr().unwrap().to_string()])
+            .env(common::ACK_ENV, "1")
+            .env(common::GC_PID_ADDR_ENV, &refused_addr),
+    )
+    .expect("spawn the orphan tree");
+    let root_pid = root.id();
+    let message = panic_message_of(|| common::accept_or_die(&report, &mut root));
+    root.wait().expect("reap the root");
+    assert_died_before_connecting(&message, root_pid);
+}
+
 /// The second tree accept must watch the grandchild too: the root connects first, the grandchild
 /// is alive and silent, and the armed hook kills it once the second accept's watch is in place.
 /// Watching the root alone would block on the live root forever; the hook asserts the grandchild
