@@ -94,7 +94,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         "WSAEventSelect on the watched socket: {}",
         std::io::Error::last_os_error()
     );
-    notify_armed();
+    notify_armed(target_pid, also);
 
     // Process handles come BEFORE the event: the lowest signalled index wins, so an exit beats a
     // ready source.

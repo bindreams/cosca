@@ -197,6 +197,13 @@ type ArmedHook = Box<dyn FnMut()>;
 
 thread_local! {
     static ARMED_HOOK: RefCell<Option<ArmedHook>> = const { RefCell::new(None) };
+    static ARMED_WATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The pids the most recent death-watched wait on this thread armed, target first. Meant to be
+/// read from a [`with_armed_hook`] hook, which runs right after the arming that set it.
+pub fn armed_watch() -> Vec<u32> {
+    ARMED_WATCH.with(|w| w.borrow().clone())
 }
 
 /// Runs `body` with `hook` called on this thread every time a death-watched wait has armed its
@@ -219,8 +226,14 @@ pub fn with_armed_hook<R>(hook: impl FnMut() + 'static, body: impl FnOnce() -> R
     body()
 }
 
-/// Called by each platform wait after arming, before it blocks.
-pub(crate) fn notify_armed() {
+/// Called by each platform wait after arming `target` and `also`, before it blocks.
+pub(crate) fn notify_armed(target: u32, also: Option<ProcessId>) {
+    ARMED_WATCH.with(|w| {
+        let mut w = w.borrow_mut();
+        w.clear();
+        w.push(target);
+        w.extend(also.map(|id| id.pid()));
+    });
     // The hook is taken out for the call so that it can itself install nothing and re-enter
     // nothing; it goes back afterwards, in case the wait loops and arms again.
     let taken = ARMED_HOOK.with(|h| h.borrow_mut().take());
