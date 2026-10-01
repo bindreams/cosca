@@ -266,6 +266,10 @@ mod write_to_possibly_dead_stdin_tests {
 mod scratch;
 #[cfg(unix)]
 pub(crate) use scratch::fixture_scratch_tempdir;
+#[cfg(unix)]
+mod db_dir;
+#[cfg(unix)]
+pub(crate) use db_dir::FixtureDirs;
 
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
 /// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
@@ -304,7 +308,7 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 #[cfg(unix)]
 pub(crate) fn run_fixture(fixture: &str) {
     let scratch = tempfile::tempdir().expect("tempdir for fixture scratch root");
-    let (mut cmd, _exe_copy) = fixture_command_without_dac_bypass(fixture);
+    let (mut cmd, _dirs) = fixture_command_without_dac_bypass(fixture);
 
     #[cfg(target_os = "linux")]
     {
@@ -368,9 +372,10 @@ pub(crate) fn run_fixture(fixture: &str) {
 ///
 /// Where a root driver changes uid (non-Linux), the fixture re-execs a copy of this binary in a
 /// directory the new uid can enter, and the ambient `TMPDIR` must be one it can enter too. The
-/// returned directory holds that copy: keep it until the fixture has exited.
+/// returned [`FixtureDirs`] holds that copy and the fixture's coordination-DB directory
+/// (`SKULD_DB_DIR`, see [`db_dir`]): keep it until the fixture has exited.
 #[cfg(unix)]
-pub(crate) fn fixture_command_without_dac_bypass(fixture: &str) -> (std::process::Command, Option<tempfile::TempDir>) {
+pub(crate) fn fixture_command_without_dac_bypass(fixture: &str) -> (std::process::Command, FixtureDirs) {
     #[cfg(target_os = "linux")]
     let (mut cmd, exe_copy) = (fixture_command(fixture), None);
     #[cfg(not(target_os = "linux"))]
@@ -384,7 +389,9 @@ pub(crate) fn fixture_command_without_dac_bypass(fixture: &str) -> (std::process
         (fixture_command(fixture), None)
     };
     crate::test_privilege::drop_dac_bypass_before_exec(&mut cmd);
-    (cmd, exe_copy)
+    let db_dir = db_dir::fixture_db_dir();
+    cmd.env(db_dir::SKULD_DB_DIR_ENV, db_dir.path());
+    (cmd, FixtureDirs::new(exe_copy, db_dir))
 }
 
 /// Restores a directory's mode on drop, so a test that locked a tempdir down can still remove it,

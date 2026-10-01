@@ -107,25 +107,45 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
     }
 }
 
+/// A directory only [`UNPRIVILEGED`] can use, for the re-run's `SKULD_DB_DIR`: skuld opens its
+/// coordination DB for every test, beside the executable by default, where `nobody` cannot create
+/// files. Directly under `/tmp`, which is searchable end to end.
+fn rerun_db_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("cosca-skuld-db-")
+        .tempdir_in("/tmp")
+        .expect("tempdir directly under /tmp for the re-run's skuld DB");
+    std::os::unix::fs::chown(dir.path(), Some(UNPRIVILEGED), Some(UNPRIVILEGED))
+        .expect("chown the re-run's skuld DB directory to the unprivileged identity");
+    dir
+}
+
+/// The command that re-executes this test as [`UNPRIVILEGED`], with `db_dir` as its skuld
+/// coordination directory.
+fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "--exact",
+        test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(RERUN_ENV, std::process::id().to_string())
+    .env("SKULD_DB_DIR", db_dir)
+    .uid(UNPRIVILEGED)
+    .gid(UNPRIVILEGED);
+    cmd
+}
+
 /// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
 fn rerun_unprivileged() {
-    use std::os::unix::process::CommandExt as _;
-
-    let out = common::output_locked(
-        std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([
-                "--exact",
-                test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(RERUN_ENV, std::process::id().to_string())
-            .uid(UNPRIVILEGED)
-            .gid(UNPRIVILEGED),
-    )
-    .expect("re-execute this test as an unprivileged user");
+    let db_dir = rerun_db_dir();
+    let out =
+        common::output_locked(&mut rerun_command(db_dir.path())).expect("re-execute this test as an unprivileged user");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.lines().any(|line| line == RERAN),
@@ -133,6 +153,27 @@ fn rerun_unprivileged() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn the_rerun_gets_an_absolute_skuld_db_dir_that_exists_and_belongs_to_it() {
+    use std::os::unix::fs::MetadataExt as _;
+    // Only root may chown to another uid; the owner check is made where the lane runs as root.
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let dir = rerun_db_dir();
+    let meta = std::fs::metadata(dir.path()).expect("stat the db dir");
+    assert!(dir.path().is_absolute() && meta.is_dir(), "{:?}", dir.path());
+    assert_eq!((meta.uid(), meta.gid()), (UNPRIVILEGED, UNPRIVILEGED));
+}
+
+#[test]
+fn the_rerun_command_names_its_skuld_db_dir() {
+    let cmd = rerun_command(std::path::Path::new("/tmp/db"));
+    let env = cmd.get_envs().find(|(k, _)| *k == "SKULD_DB_DIR").and_then(|(_, v)| v);
+    assert_eq!(env, Some(std::ffi::OsStr::new("/tmp/db")));
 }
 
 #[test]
