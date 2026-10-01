@@ -351,9 +351,8 @@ fn death_watch_accept_or_die_reports_a_target_that_exits_after_the_watch_is_arme
     child.wait().expect("reap");
 }
 
-/// macOS `kevent` returns `EINTR` even under `SA_RESTART`, so a signal handled while the wait is
-/// parked must retry it, not panic. The helper signals the waiting thread, then closes the
-/// target's stdin: the wait must survive the signal and still report the exit.
+/// A signal handled while the wait is parked must retry it, not panic (see `kevent_eintr`), and the
+/// wait must still report the target's exit.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
