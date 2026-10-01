@@ -41,11 +41,12 @@ jobs:
 
       # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
       # find a toolchain.
-      # The targets are the ones check-disallowed-methods.sh lints its fixture for.
+      # The targets are the ones check-disallowed-methods.sh lints its fixture for,
+      # plus musl for the build check below.
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc
+          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-musl
 
       # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
       - name: Install cargo-nextest
@@ -70,6 +71,12 @@ jobs:
       - name: Test signal forwarding script
         shell: bash
         run: bash .github/scripts/forward-signals-tests.sh
+
+      # musl has broken the build before (#172: msghdr/cmsghdr field types differ from glibc).
+      # --lib only: the dev-dependencies' C code (libsqlite3-sys) needs a musl C compiler.
+      - name: Check the library builds for musl
+        shell: bash
+        run: cargo check --locked --all-features --lib --target x86_64-unknown-linux-musl
 
       # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
       # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
