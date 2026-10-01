@@ -42,10 +42,8 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
     );
 }
 
-/// macOS `kevent` returns `EINTR` even under `SA_RESTART`, so a signal handled while
-/// `watch_macos` is parked must retry the wait, not panic. The helper
-/// signals the waiting thread, then closes the target's stdin: the wait must survive the signal
-/// and still report the exit.
+/// A signal handled while `watch_macos` is parked must retry the wait, not panic (see
+/// `kevent_eintr`), and the wait must still report the target's exit.
 #[cfg(target_os = "macos")]
 #[test]
 fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {

@@ -509,8 +509,7 @@ fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::Proces
     let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
     let mut events = [placeholder; 2];
     loop {
-        // macOS returns EINTR from `kevent` even under SA_RESTART, e.g. for the SIGCHLD handler
-        // tokio installs when any test in this process spawns a child.
+        // Retries the wait on `EINTR` (see `kevent_eintr`).
         let n = match kq.kevent(&[], &mut events, None) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => {

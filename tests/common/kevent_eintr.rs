@@ -2,12 +2,13 @@
 //! `SA_RESTART` (tokio's SIGCHLD handler is one).
 //!
 //! The thread that is about to block calls [`interrupt_once_blocked`]. A helper thread waits for
-//! that thread's Mach run state to be WAITING (parked in `kevent`), signals it, waits for the
-//! handler to have run, and keeps signalling until the wait has COUNTED an `EINTR` retry
-//! ([`count_retry`], called by each `kevent` wait on `EINTR`). Only then does it call `release`,
-//! which must make the wait end. A WAITING run state is any blocking wait, not necessarily the
-//! `kevent`, so a signal can land elsewhere; the counter is what proves the wait itself was
-//! interrupted, and the loop ends on it, not on a clock or a count.
+//! that thread's Mach run state to be WAITING, signals it, waits for the handler to have run, and
+//! keeps signalling until the wait has COUNTED an `EINTR` retry ([`count_retry`], called by each
+//! `kevent` wait on `EINTR`). A WAITING run state is any blocking wait, not necessarily the
+//! `kevent`, so a signal can land elsewhere; the counter proves the wait itself was interrupted.
+//! The helper then calls `release`, which must make the wait end. It also calls `release` if the
+//! wait returned without a retry or if the helper itself panics, so a failure here never leaves
+//! the waiter blocked.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,30 +34,38 @@ pub fn count_retry() {
     });
 }
 
-const TH_STATE_WAITING: i32 = 3;
-const THREAD_BASIC_INFO: i32 = 3;
-/// `sizeof(thread_basic_info_data_t) / sizeof(integer_t)`.
-const THREAD_BASIC_INFO_COUNT: u32 = 10;
-/// Index of `run_state` in `thread_basic_info`: two `time_value_t` (2 ints each), `cpu_usage`, `policy`.
-const RUN_STATE: usize = 6;
-
-unsafe extern "C" {
-    /// `<mach/thread_act.h>`; not in `mach2`.
-    fn thread_info(thread: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
-}
-
 extern "C" fn handler(_: libc::c_int) {
     HANDLED.fetch_add(1, Ordering::SeqCst);
 }
 
 fn is_waiting(port: u32) -> bool {
-    let mut info = [0i32; THREAD_BASIC_INFO_COUNT as usize];
-    let mut count = THREAD_BASIC_INFO_COUNT;
+    // SAFETY: a zeroed `thread_basic_info` is a valid out-parameter.
+    let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
     // SAFETY: `info` holds `count` integers, as `THREAD_BASIC_INFO` requires; `port` is a live
     // send right for a thread of this process.
-    let kr = unsafe { thread_info(port, THREAD_BASIC_INFO, info.as_mut_ptr(), &mut count) };
+    let kr = unsafe {
+        libc::thread_info(
+            port,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            (&mut info as *mut libc::thread_basic_info).cast(),
+            &mut count,
+        )
+    };
     assert_eq!(kr, 0, "thread_info(THREAD_BASIC_INFO): kern_return {kr}");
-    info[RUN_STATE] == TH_STATE_WAITING
+    info.run_state == libc::TH_STATE_WAITING
+}
+
+/// Runs `release` when dropped, so every way out of the helper (a return, a panic) releases the
+/// waiter.
+struct ReleaseOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for ReleaseOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
 }
 
 /// The running interrupter. Dropping it, whether through [`finish`](Self::finish) or by unwinding,
@@ -99,8 +108,9 @@ impl Drop for Interrupter {
     }
 }
 
-/// Call on the thread that is about to block in `kevent`. `release` runs on the helper thread
-/// once the wait has counted an `EINTR` retry, and never if the wait returns first.
+/// Call on the thread that is about to block in `kevent`. `release` runs on the helper thread once
+/// the wait has counted an `EINTR` retry, and also when the wait returned first or the helper
+/// panicked.
 pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interrupter {
     // SAFETY: a zeroed `sigaction` is a valid starting value; the handler only touches an atomic.
     let (previous, rc) = unsafe {
@@ -124,13 +134,9 @@ pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interr
         (me as usize, libc::pthread_mach_thread_np(me))
     };
     let thread = std::thread::spawn(move || {
-        // Ends on the waiter's own progress, never on a clock or a count: a retry was counted, or
-        // the wait returned without one (the no-retry regression panics on its first `EINTR`).
+        let _release = ReleaseOnDrop(Some(release));
         loop {
-            if counted.load(Ordering::SeqCst) != 0 {
-                break;
-            }
-            if returned.load(Ordering::SeqCst) {
+            if counted.load(Ordering::SeqCst) != 0 || returned.load(Ordering::SeqCst) {
                 return;
             }
             if !is_waiting(port) {
@@ -147,7 +153,6 @@ pub fn interrupt_once_blocked(release: impl FnOnce() + Send + 'static) -> Interr
             // The handler ran. A signal that hit the `kevent` is counted as a retry right after; one
             // that hit another wait is not, and the next iteration signals again.
         }
-        release();
     });
     Interrupter {
         thread: Some(thread),
