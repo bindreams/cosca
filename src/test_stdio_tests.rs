@@ -8,7 +8,7 @@ use crate::test_stdio::RestoreStdio;
 fn identity(fd: RawFd) -> Option<(u64, u64)> {
     // SAFETY: fstat on a descriptor number with a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as _, st.st_ino as _))
 }
 
 #[test]
