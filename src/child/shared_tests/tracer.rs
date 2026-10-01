@@ -9,38 +9,44 @@
 #[cfg(target_os = "linux")]
 use super::fixtures::Blocker;
 #[cfg(target_os = "linux")]
+use crate::child::shared::State;
+#[cfg(target_os = "linux")]
 use crate::test_support::require_group;
 
-/// `try_wait` on a child stopped under this process's `PTRACE_SEIZE` returns `None` and leaves the
-/// stop for the tracer: the test's own consuming `waitpid` then still gets it.
+/// `try_wait` on a child stopped under this process's `PTRACE_SEIZE` returns `None`, leaves the
+/// state `N`, and leaves the stop for the tracer: the test's own `waitpid` then still gets it.
 ///
-/// Mutants: a one-step consuming `waitid`, which returns `CLD_TRAPPED` and consumes it; and a peek
+/// Mutants: a one-step consuming `waitid`, which returns `CLD_TRAPPED` and consumes it; a peek
 /// without `WNOWAIT` (`src/wait/exit_only/linux.rs`), which consumes the stop yet still returns
-/// `None`. Both fail the final `waitpid` by assertion.
+/// `None`; a `try_wait` that caches a state. Each fails by assertion.
 #[cfg(target_os = "linux")]
 #[test]
 fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
+    use std::os::unix::process::ExitStatusExt as _;
+
     if !require_group("TRACER") {
         return;
     }
     let b = Blocker::spawn();
     let pid = b.shared.id() as libc::pid_t;
+    // `ptrace` is variadic, and glibc reads `addr` and `data` as pointers.
+    let null = std::ptr::null_mut::<libc::c_void>;
     // SAFETY: plain ptrace requests on this test's own child, from the thread that waits below.
     unsafe {
         assert_eq!(
-            libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0),
+            libc::ptrace(libc::PTRACE_SEIZE, pid, null(), null()),
             0,
             "{}",
             std::io::Error::last_os_error()
         );
         assert_eq!(
-            libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0),
+            libc::ptrace(libc::PTRACE_INTERRUPT, pid, null(), null()),
             0,
             "{}",
             std::io::Error::last_os_error()
         );
     }
-    // The stop, seen without consuming it.
+    // The stop, or an exit that would mean no stop is coming, seen without consuming it.
     // SAFETY: an all-zero `siginfo_t` is valid and `waitid` writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let r = unsafe {
@@ -48,12 +54,21 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
             libc::P_PID,
             pid as libc::id_t,
             &mut info,
-            libc::WSTOPPED | libc::WNOWAIT | libc::__WALL,
+            libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::__WALL,
         )
     };
     assert_eq!(r, 0, "waitid: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        info.si_code,
+        libc::CLD_TRAPPED,
+        "the tracee did not stop (si_code {}, si_status {})",
+        info.si_code,
+        // SAFETY: a `waitid` record's `si_status` is valid for these `si_code`s.
+        unsafe { info.si_status() }
+    );
 
     assert_eq!(b.shared.try_wait().expect("try_wait"), None, "a stop is not an exit");
+    assert!(matches!(b.shared.lock().state, State::N));
 
     // The stop is still there for the tracer. `WNOHANG`: the `WNOWAIT` peek above already saw it,
     // so a missing stop is an assertion failure here, never a wait that blocks forever.
@@ -66,9 +81,10 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
         "try_wait consumed the tracer's stop: {status:#x}"
     );
 
-    // Clean-up: SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
-    // PTRACE_EVENT_STOP); `Blocker`'s drop then waits.
+    // SIGKILL through the handle (the pidfd), never PTRACE_KILL (which before v5.19 only resumes a
+    // PTRACE_EVENT_STOP).
     b.shared.kill().expect("kill");
+    assert_eq!(b.shared.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
 // macOS: a child this process traces itself =====
@@ -79,36 +95,29 @@ fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::io::Write as _;
-    use std::sync::mpsc::{channel, RecvTimeoutError};
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::fixtures::{identity_of, Blocker};
-    use crate::child::shared::{SharedChild, State};
+    use super::super::fixtures::Blocker;
+    use crate::child::shared::State;
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    use crate::test_child::{run_fixture_output_within, step, watchdog};
     use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
     use crate::wait::exit_only::Reaped;
 
     const MARKER: &str = "COSCA_TEST_SHARED_TRACER";
 
-    /// The failure bound of the driver's wait for its fixture. The fixture aborts from its own
-    /// [`BOUND`] watchdog well before, naming the step it hangs in, so this bound only ends a
-    /// fixture that never got that far (and is shorter than nextest's own, in `.config`).
+    /// The failure bound of the driver's wait for its fixture, which aborts from its own
+    /// [`BOUND`] watchdog well before.
     const DRIVER_BOUND: Duration = Duration::from_secs(12);
+
+    /// The fixture's own failure bound.
+    const BOUND: Duration = Duration::from_secs(8);
 
     /// Run `fixture` in a re-exec of a debugger-entitled copy of this binary.
     pub(super) fn run_signed(fixture: &str) {
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = debugger_signed_copy(dir.path());
-        let mut cmd = std::process::Command::new(&exe);
-        crate::test_child::configure_fixture_command(&mut cmd, fixture);
-        cmd.env(MARKER, std::process::id().to_string());
-        // As `run_fixture_output`: an inherited `RUST_TEST_NOCAPTURE` would turn libtest's output
-        // capture off.
-        cmd.env_remove("RUST_TEST_NOCAPTURE");
-        let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the signed fixture");
-        match output_within(child, DRIVER_BOUND) {
+        match run_fixture_output_within(fixture, MARKER, &exe, DRIVER_BOUND) {
             Ok(output) => crate::test_child::assert_fixture_passed(fixture, &output),
             Err(output) => panic!(
                 "fixture {fixture} was still running after {DRIVER_BOUND:?}, so it was killed:\n{}\n{}",
@@ -116,90 +125,6 @@ mod macos {
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
-    }
-
-    /// `child`'s output once it exits (`Ok`), or, if it is still running after `bound`, its
-    /// output after it is killed and reaped (`Err`). `bound` is a failure bound on an external
-    /// event, never a synchronisation: a fixture that passes exits long before it.
-    fn output_within(
-        mut child: std::process::Child,
-        bound: Duration,
-    ) -> Result<std::process::Output, std::process::Output> {
-        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                _ = pipe.read_to_end(&mut bytes);
-                bytes
-            })
-        }
-        let stdout = drain(child.stdout.take().expect("piped stdout"));
-        let stderr = drain(child.stderr.take().expect("piped stderr"));
-        // Adopted so that the kill below is identity-checked: the waiting thread may reap at any
-        // moment, and a bare pid could then name another process.
-        let id = identity_of(&child);
-        let shared = Arc::new(SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
-        let (tx, rx) = channel();
-        let waiter = {
-            let shared = Arc::clone(&shared);
-            // The receiver outlives the waiter: a failed send needs no handling.
-            std::thread::spawn(move || _ = tx.send(shared.wait()))
-        };
-        let (status, in_time) = match rx.recv_timeout(bound) {
-            Ok(status) => (status, true),
-            Err(RecvTimeoutError::Timeout) => {
-                shared.kill().expect("kill the hung fixture");
-                (rx.recv().expect("the waiter ended without a result"), false)
-            }
-            Err(RecvTimeoutError::Disconnected) => panic!("the waiter ended without a result"),
-        };
-        waiter.join().expect("the waiter");
-        let output = std::process::Output {
-            status: status.expect("wait for the fixture"),
-            stdout: stdout.join().expect("stdout reader"),
-            stderr: stderr.join().expect("stderr reader"),
-        };
-        if in_time {
-            Ok(output)
-        } else {
-            Err(output)
-        }
-    }
-
-    /// The failure bound of a fixture that blocks on a traced child: if it is still running after
-    /// `BOUND`, name the step it is in on the real stderr and abort, so the driver's assertion
-    /// prints where it hung instead of the job timing out. Never a synchronisation: a passing
-    /// fixture drops the guard long before.
-    pub(super) struct Watchdog(
-        #[allow(dead_code, reason = "dropping the sender ends the watchdog")] std::sync::mpsc::Sender<()>,
-    );
-
-    const BOUND: Duration = Duration::from_secs(8);
-
-    pub(super) fn watchdog(name: &'static str) -> Watchdog {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            if rx.recv_timeout(BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                // Not `eprintln!`: libtest captures that, and the abort would lose it.
-                _ = writeln!(
-                    std::io::stderr(),
-                    "WATCHDOG: {name} still running after {BOUND:?}; last step: {}",
-                    step_name()
-                );
-                std::process::abort();
-            }
-        });
-        Watchdog(tx)
-    }
-
-    static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
-
-    pub(super) fn step(name: &'static str) {
-        _ = writeln!(std::io::stderr(), "step: {name}");
-        *STEP.lock().unwrap_or_else(|e| e.into_inner()) = name;
-    }
-
-    fn step_name() -> &'static str {
-        *STEP.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Attach to `blocker`'s child and wait, without consuming it, until its stop has settled: a
@@ -222,11 +147,11 @@ mod macos {
 
     /// End a child stopped by [`attach_and_confirm_stop`]. `PT_KILL` does it: it posts `SIGKILL`
     /// and releases the stopped thread, which then delivers the pending `SIGKILL`
-    /// (xnu-12377.121.6 `kern_sig.c:2794-2801`, "Necessary for PT_KILL"; `mach_process.c`
-    /// `PT_KILL`, then `resume`).
+    /// (xnu-12377.121.6 `kern_sig.c`, "Necessary for PT_KILL"; `mach_process.c` `PT_KILL`, then
+    /// `resume`).
     ///
     /// The handle's `kill` does not: a `SIGKILL` to a traced child is taken by its tracer as a
-    /// stop, and posted only to one that already is stopped (`kern_sig.c:2275-2281`). A debugger
+    /// stop, and posted only to one that already is stopped (`kern_sig.c`). A debugger
     /// delays a kill and cannot cancel it. So the child is asserted still stopped after `kill`,
     /// until `PT_KILL`.
     fn kill_stopped(blocker: &Blocker) {
@@ -264,7 +189,7 @@ mod macos {
                 try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped
             ));
         }
-        let _dog = watchdog("try_wait on a stopped tracee");
+        let _dog = watchdog("try_wait on a stopped tracee", BOUND);
         step("spawn");
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
@@ -276,8 +201,8 @@ mod macos {
     }
 
     /// A child this process traces is reaped fully: XNU needs two reaps, because the first only
-    /// hands the zombie back to this same process (`reap_child_locked`, xnu-12377.121.6
-    /// `kern_exit.c:2863-2915`), and the second peek consumes it.
+    /// hands the zombie back to this same process (`reap_child_locked` in xnu-12377.121.6's
+    /// `kern_exit.c`), and the second peek consumes it.
     ///
     /// Mutant: one consuming reap leaves the zombie, which the final peek still finds.
     #[test]
@@ -290,7 +215,7 @@ mod macos {
                 a_child_this_process_traces_is_reaped_fully
             ));
         }
-        let _dog = watchdog("reaped fully");
+        let _dog = watchdog("reaped fully", BOUND);
         step("spawn");
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);
@@ -326,7 +251,7 @@ mod macos {
             ));
         }
         crate::log_capture::install();
-        let _dog = watchdog("failed start read");
+        let _dog = watchdog("failed start read", BOUND);
         step("spawn");
         let b = Blocker::spawn();
         attach_and_confirm_stop(&b);

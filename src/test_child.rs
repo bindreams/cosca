@@ -263,6 +263,18 @@ mod write_to_possibly_dead_stdin_tests {
 // Re-exec fixtures =====
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, unused_imports, reason = "only the macOS tracer fixtures use it so far")
+)]
+mod bounded;
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(unused_imports, reason = "only the macOS tracer fixtures use it so far")
+)]
+pub(crate) use bounded::{run_fixture_output_within, step, watchdog};
+#[cfg(unix)]
 mod scratch;
 #[cfg(unix)]
 pub(crate) use scratch::fixture_scratch_tempdir;

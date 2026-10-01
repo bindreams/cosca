@@ -18,9 +18,6 @@
 //! and EOF to end the session. Its stdout is the *report pipe*. The state machine and its
 //! transition table are in [`machine`].
 //!
-//! [`attach_settled`] is outside the helper's contract: it is the tracee's own parent attaching
-//! to it, a different shape that only `SharedChild`'s tracer tests need.
-//!
 //! **Entitlement (measured on CI).** macOS refuses `ptrace` attach with `EPERM` to an ad-hoc
 //! signed tracer unless the tracee carries `com.apple.security.get-task-allow` or the tracer
 //! carries `com.apple.security.cs.debugger`. So the helper runs from a copy of this binary

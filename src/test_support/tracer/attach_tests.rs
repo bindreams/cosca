@@ -1,6 +1,4 @@
-//! `settle`'s loop, driven by scripted reads. A mutant that polls when it should have stopped runs
-//! a script out, and one that stops early leaves answers unread: both fail by assertion, never by
-//! spinning.
+//! `settle`'s loop, driven by scripted reads (see [`Script`]).
 
 use std::collections::VecDeque;
 
@@ -48,7 +46,6 @@ fn record(si_pid: i32, si_code: i32, si_status: i32) -> libc::siginfo_t {
     info
 }
 
-/// Never read: a script with no entries.
 fn never<T>(what: &'static str) -> impl FnMut() -> T {
     scripted(what, Vec::new())
 }

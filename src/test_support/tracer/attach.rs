@@ -16,14 +16,12 @@ pub(crate) enum AttachError {
 }
 
 /// Attach this process to its own child `pid` and return once the stop has settled, so the caller
-/// can act on it ([`sys::stop`] says why the settling matters). Unlike [`start`](super::start)'s
-/// helper, the caller is the tracee's parent and the tracer.
+/// can act on it ([`sys::stop`] says why the settling matters).
 ///
 /// The stop does wake a waiting parent (`psignal(pp, SIGCHLD)` and `wakeup(pp)`, xnu-12377.121.6
 /// `kern_sig.c:2777-2779`), but before the stopping thread parks in `assert_wait` (`:2784`), and
-/// nothing signals the park. So this re-checks under a capped backoff: a deterministic
-/// condition, not a bet on time. It ends when the stop settles or the tracee is gone; an exited
-/// tracee never stops, so without that exit this would spin.
+/// nothing signals the park. So this re-checks under a capped backoff until the stop settles or
+/// the tracee exits.
 pub(crate) fn attach_settled(pid: u32) -> Result<(), AttachError> {
     sys::attach(pid).map_err(AttachError::Errno)?;
     settle(|| sys::stop(pid), || sys::peek(pid, libc::WEXITED | libc::WNOHANG))
@@ -37,8 +35,7 @@ pub(crate) fn settled_stop(pid: u32) -> Result<Option<i32>, i32> {
     })
 }
 
-/// [`attach_settled`]'s loop over its two reads: the `stop` peek, and the `exited` peek that
-/// runs only while no settled stop is seen.
+/// The loop of [`attach_settled`], over injected reads so tests can script them.
 fn settle(
     mut stop: impl FnMut() -> Result<Stop, i32>,
     mut exited: impl FnMut() -> Result<libc::siginfo_t, i32>,
