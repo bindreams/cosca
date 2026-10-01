@@ -17,7 +17,7 @@ env:
   # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
   # something as root opt out (principles 9 and 10).
   COSCA_TEST_ROOT: "0"
-  # One place for values several jobs share. `.config/nextest.toml` requires the same nextest.
+  # One place for values several jobs share. `.config/nextest.toml` and windows-probes.yaml carry the same nextest version; one Renovate manager moves all three.
   NEXTEST_VERSION: "0.9.137"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
   # gated on `COSCA_TEST_UID_SWITCH`.
@@ -56,6 +56,8 @@ jobs:
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
       - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
+        with:
+          prek-version: 0.5.3
 
       - name: Test release helper scripts
         shell: bash

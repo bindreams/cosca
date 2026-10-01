@@ -43,6 +43,7 @@ on:
       # `terminate-after` and other nextest profile settings the probes' own bounds are chosen against.
       - ".config/nextest.toml"
       - ".github/actions/setup-rust/**"
+      - ".github/ci-toolchain"
       - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
   schedule:
@@ -83,6 +84,11 @@ concurrency:
   group: windows-probes-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # `.config/nextest.toml` requires the same nextest. One Renovate manager moves every copy
+  # of this version together (.github/renovate.json).
+  NEXTEST_VERSION: "0.9.137"
+
 jobs:
   path-resolution:
     name: Path canary (${{ matrix.runner }})
@@ -107,7 +113,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
-          tool: cargo-nextest@0.9.137
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # `--no-capture`: the surveys report only through stdout, and every canary prints what it
       # measured before asserting on it.
       # Each canary that passes leaves a marker named after itself (`mark_canary_passed`).
@@ -202,7 +208,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
-          tool: cargo-nextest@0.9.137
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # Survey probes print what they measured; probes with a specific expectation assert on it and
       # fail if it doesn't hold. `--no-capture` is the point, and also forces nextest to run every
       # test in this invocation serially, independent of the `windows-elevation-routes` test group
