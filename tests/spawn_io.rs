@@ -1638,12 +1638,9 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
          still alive to be listed"
     );
 
-    // Not `common::accept_or_die`: the root is EXPECTED to exit almost immediately (it backgrounds
-    // the worker and exits 0), so watching its pid would misreport that correct exit as "died
-    // before it connected" every time, and the worker's pid isn't known until it connects. What
-    // bounds the wait instead is the leaf draining: a watcher thread signals an eventfd when
-    // `wait_tree` returns, and `accept_or_signalled` polls the listener and that eventfd. The
-    // watcher never touches the listener.
+    // Not `common::accept_or_die`: the root exits at once by design (it backgrounds the worker),
+    // so watching its pid would misreport that exit. The leaf draining bounds the wait instead:
+    // see `accept_or_signalled`.
     let drained = common::DrainSignal::new();
     let (leaf, mut worker) = std::thread::scope(|scope| {
         scope.spawn(|| drained.watch(|| child.wait_tree()));

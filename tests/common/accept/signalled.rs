@@ -6,8 +6,7 @@ use rustix::fd::OwnedFd;
 
 use super::{first_ready, run_watcher, DrainOutcome, Ready};
 
-/// How a tree's drain wait ended, handed from the watcher thread to [`accept_or_signalled`]: a
-/// wait that FAILED must not be reported as the tree having drained.
+/// Wakes [`accept_or_signalled`] when a tree's drain wait ends; see [`DrainOutcome`].
 pub struct DrainSignal {
     fd: OwnedFd,
     outcome: DrainOutcome,
