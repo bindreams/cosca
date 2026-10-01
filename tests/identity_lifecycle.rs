@@ -178,11 +178,9 @@ fn helper_write_own_record() {
     std::fs::write(&tmp, json).expect("write record");
     std::fs::rename(&tmp, &path).expect("rename record into place");
     // The handshake proper: a byte on the pipe, not an elapsed interval.
-    // A leading newline: in single-thread mode libtest has printed `test <name> ... ` without one.
+    println!("{RECORD_READY}");
     use std::io::Write;
-    let mut stdout = std::io::stdout();
-    write!(stdout, "\n{RECORD_READY}\n").expect("write the marker");
-    stdout.flush().expect("flush");
+    std::io::stdout().flush().expect("flush");
     let mut buf = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
