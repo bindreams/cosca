@@ -35,6 +35,11 @@ pub use uid_switch::*;
 mod report;
 pub use report::*;
 
+#[cfg(unix)]
+mod skuld_db_dir;
+#[cfg(unix)]
+pub use skuld_db_dir::*;
+
 // Runs a test that changes process-global state in a process of its own; see the module.
 #[cfg(unix)]
 #[path = "../../src/test_own_process.rs"]
