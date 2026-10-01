@@ -72,7 +72,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         }
     }
 
-    notify_armed();
+    notify_armed(target_pid, also);
     let mut events = vec![changes[0]; changes.len()];
     loop {
         // macOS returns EINTR from `kevent` even under SA_RESTART, e.g. for the SIGCHLD handler

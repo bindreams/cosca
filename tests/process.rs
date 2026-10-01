@@ -642,6 +642,49 @@ fn pid_one_has_no_parent() {
     assert!(init.parent().expect("pid 1's parent is answerable").is_none());
 }
 
+/// Precondition of the test below: over a tree whose members both connect, `accept_tree_also`
+/// arms one death watch per accept, so two. A later accept downgraded to a plain `accept()` arms
+/// nothing and fails here by assertion, where the scenario below would block forever.
+#[cfg(unix)]
+fn healthy_tree_arms_a_watch_for_each_accept() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let spawn = |tag: &str| {
+        common::spawn_locked(
+            std::process::Command::new(common::testbin())
+                .args(["control-block", &addr, tag])
+                .env(common::ACK_ENV, "1"),
+        )
+        .expect("spawn a healthy tree member")
+    };
+    let mut root = spawn("R");
+    let mut grandchild = spawn("G");
+    let grandchild_id = match cosca::identity::ProcessId::of(grandchild.id()) {
+        cosca::identity::Resolved::Found(id) => id,
+        other => panic!("the unreaped grandchild must resolve, got {other:?}"),
+    };
+    let armings = Rc::new(Cell::new(0usize));
+    let in_hook = armings.clone();
+    let socks = common::with_armed_hook(
+        move || in_hook.set(in_hook.get() + 1),
+        || {
+            common::accept_tree_also(&listener, &mut root, grandchild_id, |s| {
+                let mut tag = [0u8; 1];
+                s.read_exact(&mut tag).expect("read tag");
+                tag[0] == b'G'
+            })
+        },
+    );
+    drop(socks);
+    root.kill().expect("kill the root");
+    root.wait().expect("reap the root");
+    grandchild.kill().expect("kill the grandchild");
+    grandchild.wait().expect("reap the grandchild");
+    assert_eq!(armings.get(), 2, "each accept over a healthy tree must arm a death watch");
+}
+
 /// `accept_tree` must fail promptly when the first member to connect is the grandchild and the
 /// root then dies before ever connecting. Every accept has to keep watching the ROOT, not a
 /// connected peer's socket: the peer is healthy and silent.
@@ -654,6 +697,7 @@ fn pid_one_has_no_parent() {
 #[cfg(unix)]
 #[skuld::test]
 fn accept_tree_panics_when_the_root_dies_before_connecting_after_another_member_already_did() {
+    healthy_tree_arms_a_watch_for_each_accept();
     use std::cell::Cell;
     use std::net::TcpListener;
     use std::os::unix::process::ExitStatusExt as _;
@@ -732,19 +776,33 @@ fn accept_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_
         .env(common::GC_PID_ADDR_ENV, &report_addr);
     common::silence(&mut cmd);
     let mut root = cmd.spawn().expect("spawn the tree");
+    let grandchild = common::report_grandchild(&report, &mut root);
+    let grandchild_pid = grandchild.pid();
 
-    let message = panic_message_of(|| {
-        common::accept_tree(&listener, &report, &mut root, |s| {
-            let mut tag = [0u8; 1];
-            s.read_exact(&mut tag).expect("read tag");
-            tag[0] == b'G'
-        })
-    });
-    let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
+    // Every accept that arms must watch the grandchild too. A mutant that drops it from the watch
+    // would otherwise leave the second accept watching only the live root, blocked forever.
+    let message = common::with_armed_hook(
+        move || {
+            let watched = common::armed_watch();
+            assert!(
+                watched.contains(&grandchild_pid),
+                "the tree accept armed {watched:?} without the grandchild {grandchild_pid}"
+            );
+        },
+        || {
+            panic_message_of(|| {
+                common::accept_tree_also(&listener, &mut root, grandchild, |s| {
+                    let mut tag = [0u8; 1];
+                    s.read_exact(&mut tag).expect("read tag");
+                    tag[0] == b'G'
+                })
+            })
+        },
+    );
     // The grandchild exited, so it must not be named a `G` connection; the root stays alive.
     root.kill().expect("kill the root");
     root.wait().expect("reap the root");
-    assert_died_before_connecting(&message, grandchild);
+    assert_died_before_connecting(&message, grandchild_pid);
 }
 
 /// A watcher whose `wait_tree` FAILED must not be reported as the tree having drained: the panic
