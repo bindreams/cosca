@@ -242,8 +242,8 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     // Synchronise on the pipe: read lines until the marker. libtest prints its own banner
     // first, so scan rather than reading a single line. EOF without the marker means the
     // helper died before writing — a real failure, reported as one.
-    // Borrowed, so the pipe stays open: a helper that prints after the marker (libtest's
-    // `ok`, in single-thread mode) must not find its stdout closed.
+    // Borrowed, so the pipe stays open: libtest in the helper writes its report after the body,
+    // and fails the run (exit 101) if it cannot.
     let ready = marker_seen(child.stdout.as_mut().expect("piped stdout"));
     assert!(ready, "the helper exited without writing its record");
 
@@ -265,6 +265,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     // `is_alive`, not `exists`: `child` still holds the handle, which on Windows keeps the
     // process object resolvable after exit.
     drop(child.stdin.take());
-    child.wait().expect("wait");
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "the helper failed: {status}");
     assert_eq!(restored.is_alive(), Liveness::Dead);
 }
