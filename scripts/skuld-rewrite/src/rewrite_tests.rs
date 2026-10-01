@@ -210,3 +210,143 @@ fn fs_source_reports_a_missing_file_as_absent() {
         .unwrap()
         .is_none());
 }
+
+fn refused_lines(src: &str, opts: Options) -> Vec<usize> {
+    match run(&[("/t/r.rs", src)], &["/t/r.rs"], &[], opts) {
+        Outcome::Refused(r) => r.iter().map(|r| r.line).collect(),
+        Outcome::Rewritten(f) => panic!("expected a refusal for {src:?}, got {f:?}"),
+    }
+}
+
+#[test]
+fn refuses_every_unmapped_test_spelling() {
+    let cases = [
+        "#[core::prelude::v1::test]\nfn f() {}\n",
+        "#[std::prelude::v1::test]\nfn f() {}\n",
+        "#[::core::prelude::v1::test]\nfn f() {}\n",
+        "#[cfg_attr(unix, cfg_attr(all(), tokio::test))]\nfn f() {}\n",
+        "#[cfg_attr(unix, core::prelude::v1::test)]\nfn f() {}\n",
+        "some_macro! {\n    #[tokio::test]\n    async fn f() {}\n}\n",
+        "cfg_if! { if #[cfg(unix)] { #[tokio::test] async fn f() {} } }\n",
+        "macro_rules! m { ($c:meta) => { #[cfg_attr($c, test)] fn f() {} }; }\n",
+    ];
+    for src in cases {
+        for only_tokio in [false, true] {
+            let lines = refused_lines(
+                src,
+                Options {
+                    only_tokio,
+                    ..Options::default()
+                },
+            );
+            assert!(!lines.is_empty(), "{src} (only_tokio = {only_tokio})");
+        }
+    }
+}
+
+#[test]
+fn a_nested_cfg_attr_bare_test_is_refused_unless_only_tokio_leaves_bare_tests() {
+    let src = "#[cfg_attr(unix, cfg_attr(all(), test))]\nfn f() {}\n";
+    assert_eq!(refused_lines(src, Options::default()), [1]);
+    let invoked = "some_macro! {\n    #[test]\n    fn f() {}\n}\n";
+    assert_eq!(refused_lines(invoked, Options::default()), [2]);
+    match run(
+        &[("/t/r.rs", src)],
+        &["/t/r.rs"],
+        &[],
+        Options {
+            only_tokio: true,
+            ..Options::default()
+        },
+    ) {
+        Outcome::Rewritten(f) => assert!(f.is_empty()),
+        Outcome::Refused(r) => panic!("{r:?}"),
+    }
+}
+
+#[test]
+fn an_invocation_carrying_only_skuld_or_other_attributes_is_not_refused() {
+    let src = "some_macro! {\n    #[skuld::test]\n    #[should_panic]\n    fn f() {}\n}\n#[::core::prelude::v1::derive(Clone)]\nstruct S;\n";
+    match run(&[("/t/r.rs", src)], &["/t/r.rs"], &[], Options::default()) {
+        Outcome::Rewritten(f) => assert!(f.is_empty(), "{f:?}"),
+        Outcome::Refused(r) => panic!("{r:?}"),
+    }
+}
+
+#[test]
+fn macro_rules_refusals_cover_unsupported_args_and_cfg_attr() {
+    let a = "macro_rules! t { () => { #[tokio::test(flavor = \"multi_thread\")] async fn a() {} } }\n";
+    assert_eq!(refused_lines(a, Options::default()), [1]);
+    let b = "macro_rules! t {\n    () => {\n        #[cfg_attr(unix, test)]\n        fn a() {}\n    };\n}\n";
+    assert_eq!(refused_lines(b, Options::default()), [3]);
+}
+
+#[test]
+fn macro_rules_matcher_side_is_left_alone() {
+    let src = "macro_rules! only_tests {\n    (#[test] fn $n:ident() $b:block) => {\n        #[test]\n        fn $n() $b\n    };\n}\n";
+    let want = "macro_rules! only_tests {\n    (#[test] fn $n:ident() $b:block) => {\n        #[skuld::test]\n        fn $n() $b\n    };\n}\n";
+    assert_eq!(one(src, Options::default()), want);
+}
+
+#[test]
+fn a_bom_is_kept_and_does_not_shift_spans() {
+    let src = "\u{feff}#[test]\nfn a() {}\n";
+    assert_eq!(one(src, Options::default()), "\u{feff}#[skuld::test]\nfn a() {}\n");
+    let src = "\u{feff}#![cfg(unix)]\n#[test]\nfn a() {}\n";
+    assert_eq!(
+        one(
+            src,
+            Options {
+                hoist_crate_cfg: true,
+                ..Options::default()
+            }
+        ),
+        "\u{feff}#[cfg(unix)]\n#[skuld::test]\nfn a() {}\n"
+    );
+}
+
+#[test]
+fn a_comment_inside_a_rewritten_attribute_is_refused_but_one_after_it_is_kept() {
+    let inside = "#[tokio::test( // why\n    flavor = \"current_thread\",\n)]\nasync fn a() {}\n";
+    assert_eq!(refused_lines(inside, Options::default()), [1]);
+    let block = "#[tokio::test(/* why */ flavor = \"current_thread\")]\nasync fn a() {}\n";
+    assert_eq!(refused_lines(block, Options::default()), [1]);
+    let after = "#[tokio::test] // why\nasync fn a() {}\n";
+    assert_eq!(
+        one(after, Options::default()),
+        "#[skuld::test] // why\nasync fn a() {}\n"
+    );
+}
+
+#[test]
+fn hoists_two_crate_cfgs_in_order() {
+    let src = "#![cfg(unix)]\n#![cfg(feature = \"tokio\")]\nfn a() {}\nfn b() {}\n";
+    let want =
+        "#[cfg(unix)]\n#[cfg(feature = \"tokio\")]\nfn a() {}\n#[cfg(unix)]\n#[cfg(feature = \"tokio\")]\nfn b() {}\n";
+    assert_eq!(
+        one(
+            src,
+            Options {
+                hoist_crate_cfg: true,
+                ..Options::default()
+            }
+        ),
+        want
+    );
+}
+
+#[test]
+fn a_root_also_reached_as_a_module_is_still_hoisted() {
+    let files = [("/t/r.rs", "mod m;\n"), ("/t/m.rs", "#![cfg(unix)]\nfn a() {}\n")];
+    let out = rewritten(run(
+        &files,
+        &["/t/r.rs", "/t/m.rs"],
+        &[],
+        Options {
+            hoist_crate_cfg: true,
+            ..Options::default()
+        },
+    ));
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0], ("/t/m.rs".to_owned(), "#[cfg(unix)]\nfn a() {}\n".to_owned()));
+}

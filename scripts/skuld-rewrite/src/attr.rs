@@ -145,17 +145,59 @@ pub fn classify(attr: &Attribute) -> Option<Result<TestAttr, Unsupported>> {
     classify_meta(&attr.meta)
 }
 
-/// True when `meta` is a `cfg_attr` whose conditional attributes include a test attribute that
-/// `selects`. Such a test is conditionally a test, which a splice cannot map.
-pub fn cfg_attr_hides_test(meta: &Meta, selects: impl Fn(Origin) -> bool) -> bool {
-    let Meta::List(list) = meta else { return false };
+/// A test attribute inside a `cfg_attr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hidden {
+    /// A spelling this tool knows.
+    Known(Origin),
+    /// A path ending in `test` that no mapping covers, or arguments too opaque to read that
+    /// mention `test`.
+    Unknown,
+}
+
+fn mentions_test(ts: TokenStream) -> bool {
+    ts.into_iter().any(|t| match t {
+        proc_macro2::TokenTree::Ident(i) => i == "test",
+        proc_macro2::TokenTree::Group(g) => mentions_test(g.stream()),
+        _ => false,
+    })
+}
+
+/// True when `path` ends in `test`, whatever precedes it.
+pub fn ends_in_test(path: &Path) -> bool {
+    path.segments.last().is_some_and(|s| s.ident == "test")
+}
+
+/// True when `meta` is a test attribute spelling that [`classify_meta`] does not map.
+pub fn is_unmapped_test(meta: &Meta) -> bool {
+    origin_of(meta.path()).is_none() && ends_in_test(meta.path())
+}
+
+/// Every test attribute `meta` would apply through any depth of `cfg_attr`. A conditional test
+/// is conditionally a test, which a splice cannot map.
+pub fn hidden_tests(meta: &Meta) -> Vec<Hidden> {
+    let Meta::List(list) = meta else { return Vec::new() };
     if !list.path.is_ident("cfg_attr") {
-        return false;
+        return Vec::new();
     }
     let Ok(args) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) else {
-        return false;
+        return if mentions_test(list.tokens.clone()) {
+            vec![Hidden::Unknown]
+        } else {
+            Vec::new()
+        };
     };
-    args.iter().skip(1).any(|m| origin_of(m.path()).is_some_and(&selects))
+    let mut out = Vec::new();
+    for arg in args.iter().skip(1) {
+        if arg.path().is_ident("cfg_attr") {
+            out.extend(hidden_tests(arg));
+        } else if let Some(o) = origin_of(arg.path()) {
+            out.push(Hidden::Known(o));
+        } else if ends_in_test(arg.path()) {
+            out.push(Hidden::Unknown);
+        }
+    }
+    out
 }
 
 /// The canonical attribute used by `verify`: `#[test(default)]`, `#[test(paused)]`, or

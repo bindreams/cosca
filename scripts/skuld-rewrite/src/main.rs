@@ -45,7 +45,7 @@ enum Command {
     },
     /// Prove the working tree equals OLD_REV under the canonical form. Exits 1 on a difference.
     ///
-    /// ROOTs default to the source file of every target in the manifest.
+    /// With no ROOT, compares the manifest's targets with OLD_REV's, then every target's module tree.
     Verify {
         old_rev: String,
         #[arg(long, value_name = "PATH")]
@@ -130,17 +130,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             manifest_path,
             roots,
         } => {
-            let toplevel = targets::toplevel(manifest_path.as_deref())?;
-            let roots = if roots.is_empty() {
-                targets::all(manifest_path.as_deref())?
-                    .into_iter()
-                    .map(|t| t.src_path)
-                    .collect()
+            let mismatches = if roots.is_empty() {
+                verify::verify_targets(manifest_path.as_deref(), &old_rev)?
             } else {
-                canonical(&roots)?
+                let toplevel = targets::toplevel(&std::env::current_dir()?)?;
+                let old = GitSource::new(&toplevel, &old_rev)?;
+                verify::verify(&old, &FsSource, &canonical(&roots)?)?
             };
-            let old = GitSource::new(&toplevel, &old_rev)?;
-            let mismatches = verify::verify(&old, &FsSource, &roots)?;
             for m in &mismatches {
                 eprintln!("mismatch: {m}");
             }

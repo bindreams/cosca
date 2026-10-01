@@ -115,3 +115,54 @@ fn follows_every_cfg_attr_path_alternative() {
         ["/t/b/unix.rs", "/t/b/win.rs", "/t/o.rs", "/t/other.rs", "/t/r.rs"]
     );
 }
+
+#[test]
+fn follows_nested_cfg_attr_path_alternatives() {
+    let src = MemSource::new(&[
+        (
+            "/t/r.rs",
+            "#[cfg_attr(unix, cfg_attr(all(), path = \"n.rs\"))]\nmod m;\n",
+        ),
+        ("/t/m.rs", ""),
+        ("/t/n.rs", ""),
+    ]);
+    assert_eq!(
+        paths(&walk(&src, Path::new("/t/r.rs")).unwrap()),
+        ["/t/m.rs", "/t/n.rs", "/t/r.rs"]
+    );
+}
+
+#[test]
+fn only_the_exact_harness_include_at_a_root_is_skipped() {
+    let src = MemSource::new(&[
+        (
+            "/t/tests/r.rs",
+            "#[path = \"../src/test_harness.rs\"]\nmod test_harness;\n#[cfg(test)]\nmod inline_harness { }\nmod sub;\n",
+        ),
+        (
+            "/t/tests/sub.rs",
+            "#[path = \"../b.rs\"] mod test_harness;\nmod test_harness2 { #[path = \"c.rs\"] mod c; }\n",
+        ),
+        ("/t/b.rs", ""),
+        ("/t/tests/sub/test_harness2/c.rs", ""),
+    ]);
+    let got = paths(&walk(&src, Path::new("/t/tests/r.rs")).unwrap());
+    assert_eq!(
+        got,
+        [
+            "/t/b.rs",
+            "/t/tests/r.rs",
+            "/t/tests/sub.rs",
+            "/t/tests/sub/test_harness2/c.rs"
+        ]
+    );
+}
+
+#[test]
+fn an_inline_or_repointed_test_harness_module_is_walked() {
+    let src = MemSource::new(&[("/t/r.rs", "#[path = \"b.rs\"]\nmod test_harness;\n"), ("/t/b.rs", "")]);
+    assert_eq!(
+        paths(&walk(&src, Path::new("/t/r.rs")).unwrap()),
+        ["/t/b.rs", "/t/r.rs"]
+    );
+}

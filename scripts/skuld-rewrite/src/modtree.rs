@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use syn::punctuated::Punctuated;
 use syn::{Item, ItemMod, Lit, Meta, Token};
 
-/// The mod name of the shared label file every root includes; never walked or rewritten.
+/// The mod name of the shared label file every root includes. Only the exact include is skipped.
 pub const HARNESS_MOD: &str = "test_harness";
 
 /// Where source text comes from: the working tree, or a git revision.
@@ -126,6 +126,8 @@ struct Ctx {
     mod_dir: PathBuf,
     /// What a `#[path]` attribute is relative to.
     path_base: PathBuf,
+    /// True directly in a root file, where the shared label include lives.
+    root_top: bool,
 }
 
 /// Every file reachable from `root` through `mod` declarations, root first, each once.
@@ -164,6 +166,7 @@ fn visit_file(
     let ctx = Ctx {
         mod_dir,
         path_base: dir,
+        root_top: is_root,
     };
     let items = ast.items.clone();
     files.push(ParsedFile {
@@ -177,6 +180,23 @@ fn visit_file(
 
 /// Every `#[path = ".."]` of a module, plain or inside a `cfg_attr`, and whether any was
 /// conditional. The walk follows every cfg, so every alternative is part of the tree.
+fn conditional_paths(
+    list: &syn::MetaList,
+    name: &str,
+    paths: &mut Vec<String>,
+    string_of: &dyn Fn(&syn::MetaNameValue, &str) -> Result<String>,
+) -> Result<()> {
+    let args = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+    for arg in args.iter().skip(1) {
+        match arg {
+            Meta::NameValue(nv) if nv.path.is_ident("path") => paths.push(string_of(nv, name)?),
+            Meta::List(inner) if inner.path.is_ident("cfg_attr") => conditional_paths(inner, name, paths, string_of)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn path_attrs(m: &ItemMod) -> Result<(Vec<String>, bool)> {
     fn string_of(nv: &syn::MetaNameValue, name: &str) -> Result<String> {
         match &nv.value {
@@ -190,15 +210,9 @@ fn path_attrs(m: &ItemMod) -> Result<(Vec<String>, bool)> {
         match &a.meta {
             Meta::NameValue(nv) if nv.path.is_ident("path") => paths.push(string_of(nv, &m.ident.to_string())?),
             Meta::List(list) if list.path.is_ident("cfg_attr") => {
-                let args = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
-                for arg in args.iter().skip(1) {
-                    if let Meta::NameValue(nv) = arg {
-                        if nv.path.is_ident("path") {
-                            paths.push(string_of(nv, &m.ident.to_string())?);
-                            conditional = true;
-                        }
-                    }
-                }
+                let before = paths.len();
+                conditional_paths(list, &m.ident.to_string(), &mut paths, &string_of)?;
+                conditional |= paths.len() > before;
             }
             _ => {}
         }
@@ -216,7 +230,7 @@ fn visit_items(
 ) -> Result<()> {
     for item in items {
         let Item::Mod(m) = item else { continue };
-        if m.ident == HARNESS_MOD {
+        if ctx.root_top && crate::shapes::is_exact_include(m) {
             continue;
         }
         let (paths, conditional) = path_attrs(m)?;
@@ -230,6 +244,7 @@ fn visit_items(
                     let inner_ctx = Ctx {
                         mod_dir: dir.clone(),
                         path_base: dir,
+                        root_top: false,
                     };
                     visit_items(source, file, inner, &inner_ctx, files, seen)?;
                 }

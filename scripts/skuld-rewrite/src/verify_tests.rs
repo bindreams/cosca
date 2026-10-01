@@ -118,3 +118,183 @@ fn a_file_only_one_revision_reaches_is_a_mismatch() {
     let got = verify(&old, &new, &roots).unwrap();
     assert!(got.len() >= 2, "{got:?}");
 }
+
+fn mismatches(old: &[(&str, &str)], new: &[(&str, &str)]) -> usize {
+    let roots = [PathBuf::from(ROOT)];
+    verify(&MemSource::new(old), &MemSource::new(new), &roots)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn an_unsupported_old_spelling_never_equals_a_new_skuld_test() {
+    let old = "#[tokio::test(flavor = \"multi_thread\")]\nasync fn a() {}\n";
+    assert_eq!(check(old, "#[skuld::test]\nasync fn a() {}\n").len(), 1);
+}
+
+#[test]
+fn skuld_test_arguments_are_part_of_the_comparison() {
+    assert_eq!(
+        check("#[test]\nfn a() {}\n", "#[skuld::test(serial)]\nfn a() {}\n").len(),
+        1
+    );
+    assert_eq!(
+        check(
+            "#[test]\nfn a() {}\n",
+            "#[skuld::test(runtime = foo::bar)]\nfn a() {}\n"
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn a_hoisted_cfg_must_carry_the_same_predicate() {
+    let old = "#![cfg(unix)]\nfn a() {}\n";
+    assert_eq!(check(old, "#[cfg(windows)]\nfn a() {}\n").len(), 1);
+    assert_eq!(check(old, "#[cfg(unix)]\nfn a() {}\n"), Vec::<String>::new());
+}
+
+#[test]
+fn an_existing_main_is_compared_not_dropped() {
+    let old = "fn main() { run() }\n";
+    assert_eq!(check(old, "fn main() { run() }\n"), Vec::<String>::new());
+    assert_eq!(check(old, "fn main() { std::process::exit(1) }\n").len(), 1);
+    assert_eq!(check(old, "").len(), 1);
+}
+
+#[test]
+fn a_file_only_the_old_revision_reaches_is_reported() {
+    let roots = [PathBuf::from(ROOT)];
+    let old = MemSource::new(&[(ROOT, "mod m;\n"), ("/t/m.rs", "")]);
+    let new = MemSource::new(&[(ROOT, "")]);
+    let got = verify(&old, &new, &roots).unwrap();
+    assert!(got.iter().any(|m| m.detail.contains("old revision only")), "{got:?}");
+}
+
+#[test]
+fn the_net_and_include_are_kept_when_the_old_revision_had_them() {
+    let old = "#[macro_use]\nextern crate skuld;\n#[path = \"../src/test_harness.rs\"]\nmod test_harness;\n";
+    assert_eq!(
+        mismatches(
+            &[(ROOT, old), ("/src/test_harness.rs", "")],
+            &[(ROOT, old), ("/src/test_harness.rs", "")]
+        ),
+        0
+    );
+    assert_eq!(
+        mismatches(&[(ROOT, old), ("/src/test_harness.rs", "")], &[(ROOT, "")]),
+        1
+    );
+}
+
+#[test]
+fn tests_nested_in_fn_bodies_are_canonicalised() {
+    let old = "fn f() {\n    #[tokio::test(start_paused = true)]\n    async fn n() {}\n}\n";
+    let new = "fn f() {\n    #[skuld::test(runtime = crate::tokio::test_runtime::paused)]\n    async fn n() {}\n}\n";
+    assert_eq!(check(old, new), Vec::<String>::new());
+}
+
+#[test]
+fn crate_cfg_position_among_inner_attributes_does_not_matter() {
+    let old = "#![cfg(unix)]\n#![allow(dead_code)]\nfn a() {}\n";
+    let new = rewrite(
+        old,
+        Options {
+            hoist_crate_cfg: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(check(old, &new), Vec::<String>::new());
+    let old = "#![allow(dead_code)]\n#![cfg(unix)]\nfn a() {}\n";
+    let new = rewrite(
+        old,
+        Options {
+            hoist_crate_cfg: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(check(old, &new), Vec::<String>::new());
+}
+
+#[test]
+fn two_hoisted_crate_cfgs_verify() {
+    let old = "#![cfg(unix)]\n#![cfg(feature = \"tokio\")]\n#[test]\nfn a() {}\nfn b() {}\n";
+    let new = rewrite(
+        old,
+        Options {
+            hoist_crate_cfg: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(check(old, &new), Vec::<String>::new());
+}
+
+#[test]
+fn a_root_with_a_main_and_a_crate_cfg_round_trips() {
+    let old = "#![cfg(unix)]\n#[test]\nfn a() {}\nfn main() { run() }\n";
+    let new = rewrite(
+        old,
+        Options {
+            hoist_crate_cfg: true,
+            ..Options::default()
+        },
+    );
+    assert_eq!(check(old, &new), Vec::<String>::new());
+}
+
+#[test]
+fn a_flip_with_the_k1_main_verifies() {
+    let old = "#[test]\nfn a() {}\n";
+    let new = "#[skuld::test]\nfn a() {}\nfn main() {\n    let mut runner = skuld::TestRunner::new();\n    runner.libtest_names();\n    runner.require_known_labels();\n    runner.run()\n}\n";
+    assert_eq!(check(old, new), Vec::<String>::new());
+}
+
+#[test]
+fn only_the_exact_additions_are_forgiven() {
+    let old = "#[test]\nfn a() {}\n";
+    let base = "#[skuld::test]\nfn a() {}\n";
+    let bad = [
+        // A main that does something else.
+        format!("{base}pub fn main() {{ std::process::exit(1) }}\n"),
+        // The runner chain with an extra statement.
+        format!("{base}fn main() {{ let mut runner = skuld::TestRunner::new(); runner.libtest_names(); evil(); runner.run() }}\n"),
+        // An inline module named like the include, smuggling a test.
+        format!("{base}mod test_harness {{ #[skuld::test] fn smuggled() {{ panic!() }} }}\n"),
+        // A renamed net.
+        format!("{base}extern crate skuld as tokio;\n"),
+    ];
+    for new in &bad {
+        assert_eq!(check(old, new).len(), 1, "{new}");
+    }
+    // A repointed include pulls another file's tests in.
+    let new = format!("{base}#[path = \"b.rs\"]\nmod test_harness;\n");
+    assert!(mismatches(&[(ROOT, old)], &[(ROOT, &new), ("/t/b.rs", "")]) >= 1);
+}
+
+#[test]
+fn additions_are_forgiven_only_in_roots() {
+    let old = [(ROOT, "mod common;\n"), ("/t/common.rs", "pub fn f() {}\n")];
+    let with_main = [
+        (ROOT, "mod common;\n"),
+        (
+            "/t/common.rs",
+            "pub fn f() {}\npub fn main() { std::process::exit(1) }\n",
+        ),
+    ];
+    assert_eq!(mismatches(&old, &with_main), 1);
+    let with_net = [
+        (ROOT, "mod common;\n"),
+        ("/t/common.rs", "pub fn f() {}\nextern crate skuld;\n"),
+    ];
+    assert_eq!(mismatches(&old, &with_net), 1);
+}
+
+#[test]
+fn a_root_also_reached_as_a_module_is_still_a_root_for_additions() {
+    let main = "fn main() {\n    let mut runner = skuld::TestRunner::new();\n    runner.libtest_names();\n    runner.run()\n}\n";
+    let old = MemSource::new(&[(ROOT, "mod m;\n"), ("/t/m.rs", "fn a() {}\n")]);
+    let new = MemSource::new(&[(ROOT, "mod m;\n"), ("/t/m.rs", &format!("fn a() {{}}\n{main}"))]);
+    let roots = [PathBuf::from(ROOT), PathBuf::from("/t/m.rs")];
+    assert_eq!(verify(&old, &new, &roots).unwrap(), Vec::new());
+}

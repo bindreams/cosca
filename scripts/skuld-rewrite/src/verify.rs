@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit_mut::VisitMut;
 use syn::{Attribute, Item, ItemFn, ItemMacro, Meta};
 
 use crate::attr;
-use crate::modtree::{self, ParsedFile, Source, HARNESS_MOD};
+use crate::modtree::{self, GitSource, ParsedFile, Source};
+use crate::shapes;
+use crate::targets;
 
 /// A file whose two revisions differ after canonicalisation.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,7 +79,7 @@ impl VisitMut for Canon {
 
     fn visit_item_macro_mut(&mut self, m: &mut ItemMacro) {
         if m.mac.path.is_ident("macro_rules") {
-            m.mac.tokens = canon_tokens(m.mac.tokens.clone());
+            m.mac.tokens = shapes::map_transcribers(m.mac.tokens.clone(), canon_tokens);
         }
     }
 }
@@ -86,25 +88,26 @@ fn is_cfg_inner(a: &Attribute) -> bool {
     matches!(a.style, syn::AttrStyle::Inner(_)) && a.path().is_ident("cfg")
 }
 
-fn is_main(i: &Item) -> bool {
-    matches!(i, Item::Fn(f) if f.sig.ident == "main")
+fn is_exact_main(i: &Item) -> bool {
+    matches!(i, Item::Fn(f) if shapes::is_exact_main(f))
 }
 
-fn is_harness(i: &Item) -> bool {
-    matches!(i, Item::Mod(m) if m.ident == HARNESS_MOD)
+fn is_exact_include(i: &Item) -> bool {
+    matches!(i, Item::Mod(m) if shapes::is_exact_include(m))
 }
 
-fn is_skuld_net(i: &Item) -> bool {
-    matches!(i, Item::ExternCrate(e) if e.ident == "skuld")
+fn is_exact_net(i: &Item) -> bool {
+    matches!(i, Item::ExternCrate(e) if shapes::is_exact_net(e))
 }
 
-/// Removes what a flip adds (`main`, the label include, the `extern crate skuld` net), unless the
-/// old revision had it, and restores a hoisted crate-level `#![cfg]`.
+/// In a root, removes what a flip adds (`main`, the label include, the `extern crate skuld` net)
+/// in exactly the shapes the units add, unless the old revision had it; then restores a hoisted
+/// crate-level `#![cfg]`. Other files are compared as they are.
 fn undo_additions(new: &mut syn::File, old: &syn::File) {
     for (is, has) in [
-        (is_main as fn(&Item) -> bool, old.items.iter().any(is_main)),
-        (is_harness, old.items.iter().any(is_harness)),
-        (is_skuld_net, old.items.iter().any(is_skuld_net)),
+        (is_exact_main as fn(&Item) -> bool, old.items.iter().any(is_exact_main)),
+        (is_exact_include, old.items.iter().any(is_exact_include)),
+        (is_exact_net, old.items.iter().any(is_exact_net)),
     ] {
         if !has {
             new.items.retain(|i| !is(i));
@@ -122,12 +125,12 @@ fn undo_additions(new: &mut syn::File, old: &syn::File) {
                     .all(|(x, y)| matches!(x.style, syn::AttrStyle::Outer) && x.meta == y.meta)
         })
     };
-    if !new.items.iter().all(carries) {
+    // `apply` leaves `main` and the include unhoisted, so they neither carry nor lose the cfg.
+    if !new.items.iter().filter(|i| !shapes::is_hoist_exempt(i)).all(carries) {
         return;
     }
-    // Every item carried the cfg, so strip it; the inner copy takes its place.
     let outer: Vec<Attribute> = cfgs.iter().map(|a| (*a).clone()).collect();
-    for item in &mut new.items {
+    for item in new.items.iter_mut().filter(|i| !shapes::is_hoist_exempt(i)) {
         if let Some(attrs) = item_attrs_mut(item) {
             attrs.drain(..outer.len());
         }
@@ -174,8 +177,8 @@ fn order_inner_cfgs(file: &mut syn::File) {
     file.attrs = rest;
 }
 
-fn canonicalize(mut file: syn::File, old: Option<&syn::File>) -> syn::File {
-    if let Some(old) = old {
+fn canonicalize(mut file: syn::File, old: Option<&syn::File>, is_root: bool) -> syn::File {
+    if let (Some(old), true) = (old, is_root) {
         undo_additions(&mut file, old);
     }
     Canon.visit_file_mut(&mut file);
@@ -214,10 +217,15 @@ fn diff(old: &syn::File, new: &syn::File) -> Option<String> {
 }
 
 fn collect(source: &dyn Source, roots: &[PathBuf]) -> Result<BTreeMap<PathBuf, ParsedFile>> {
-    let mut files = BTreeMap::new();
+    let mut files: BTreeMap<PathBuf, ParsedFile> = BTreeMap::new();
     for root in roots {
         for f in modtree::walk(source, root)? {
-            files.entry(f.path.clone()).or_insert(f);
+            match files.entry(f.path.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().is_root |= f.is_root,
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(f);
+                }
+            }
         }
     }
     Ok(files)
@@ -242,8 +250,8 @@ pub fn verify(old: &dyn Source, new: &dyn Source, roots: &[PathBuf]) -> Result<V
             });
             continue;
         };
-        let canon_old = canonicalize(o.ast.clone(), None);
-        let canon_new = canonicalize(n.ast.clone(), Some(&o.ast));
+        let canon_old = canonicalize(o.ast.clone(), None, false);
+        let canon_new = canonicalize(n.ast.clone(), Some(&o.ast), n.is_root);
         if let Some(detail) = diff(&canon_old, &canon_new) {
             out.push(Mismatch {
                 path: path.clone(),
@@ -257,4 +265,79 @@ pub fn verify(old: &dyn Source, new: &dyn Source, roots: &[PathBuf]) -> Result<V
 /// Used by tests and the CLI to name a path the way `verify` keys it.
 pub fn key(path: &Path) -> PathBuf {
     modtree::normalize(path)
+}
+
+/// A target as `verify` identifies it: where it lives is relative to its own revision's root.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TargetKey {
+    pub name: String,
+    pub kinds: Vec<String>,
+    pub src: PathBuf,
+}
+
+fn keys(listing: &targets::Listing) -> Result<Vec<TargetKey>> {
+    let mut out = Vec::new();
+    for t in &listing.targets {
+        let src = t.src_path.strip_prefix(&listing.workspace_root)?.to_owned();
+        out.push(TargetKey {
+            name: t.name.clone(),
+            kinds: t.kinds.clone(),
+            src,
+        });
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The targets only one side has. A target deleted, added or repointed is a change that file
+/// comparison never sees, because the file just stops being a root.
+pub fn target_mismatches(old: &[TargetKey], new: &[TargetKey]) -> Vec<Mismatch> {
+    let describe = |k: &TargetKey, side: &str| Mismatch {
+        path: k.src.clone(),
+        detail: format!(
+            "target `{}` ({}) exists in the {side} revision only",
+            k.name,
+            k.kinds.join(", ")
+        ),
+    };
+    old.iter()
+        .filter(|k| !new.contains(k))
+        .map(|k| describe(k, "old"))
+        .chain(new.iter().filter(|k| !old.contains(k)).map(|k| describe(k, "new")))
+        .collect()
+}
+
+/// Compares the target sets of `rev` and the working tree, then every file reachable from each
+/// target both have.
+pub fn verify_targets(manifest: Option<&Path>, rev: &str) -> Result<Vec<Mismatch>> {
+    let new = targets::load(manifest)?;
+    let toplevel = targets::toplevel(&new.workspace_root)?;
+    let git = GitSource::new(&toplevel, rev)?;
+
+    let scratch = tempfile::tempdir().context("creating a scratch directory for the old revision")?;
+    let old_root = std::fs::canonicalize(scratch.path())?;
+    let mut archive = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["archive", "--format=tar", "--end-of-options", rev])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("running git archive")?;
+    tar::Archive::new(archive.stdout.take().context("git archive has stdout")?).unpack(&old_root)?;
+    anyhow::ensure!(archive.wait()?.success(), "git archive {rev} failed");
+    let old_manifest = old_root
+        .join(new.workspace_root.strip_prefix(&toplevel)?)
+        .join("Cargo.toml");
+    let old = targets::load(Some(&old_manifest))?;
+
+    let (old_keys, new_keys) = (keys(&old)?, keys(&new)?);
+    let mut out = target_mismatches(&old_keys, &new_keys);
+    let roots: Vec<PathBuf> = new_keys
+        .iter()
+        .filter(|k| old_keys.contains(k))
+        .map(|k| new.workspace_root.join(&k.src))
+        .collect();
+    out.extend(verify(&git, &modtree::FsSource, &roots)?);
+    Ok(out)
 }

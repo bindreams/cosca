@@ -10,8 +10,9 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Attribute, Item, ItemFn, ItemMacro, Meta};
 
-use crate::attr::{self, Origin, Runtime, TestAttr};
-use crate::modtree::{self, ParsedFile, Source, HARNESS_MOD};
+use crate::attr::{self, Hidden, Origin, Runtime, TestAttr};
+use crate::modtree::{self, ParsedFile, Source};
+use crate::shapes;
 
 /// What `apply` may touch.
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,7 +68,12 @@ struct LineIndex<'a> {
 
 impl<'a> LineIndex<'a> {
     fn new(src: &'a str) -> Self {
-        let mut starts = vec![0];
+        // `syn` parses the text after a BOM, so its columns on line 1 start after those 3 bytes.
+        let mut starts = vec![if src.starts_with('\u{feff}') {
+            '\u{feff}'.len_utf8()
+        } else {
+            0
+        }];
         starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
         Self { src, starts }
     }
@@ -89,6 +95,13 @@ fn replacement(attr: &TestAttr) -> String {
     }
 }
 
+/// What to do with one attribute-shaped site.
+enum Verdict {
+    Rewrite(TestAttr),
+    Refuse(String),
+    Leave,
+}
+
 struct Planner<'a> {
     path: &'a Path,
     index: LineIndex<'a>,
@@ -106,70 +119,81 @@ impl Planner<'_> {
         });
     }
 
-    fn attribute(&mut self, a: &Attribute) {
-        let selects = |o| self.opts.selects(o);
-        if attr::cfg_attr_hides_test(&a.meta, selects) {
-            self.refuse(
-                a.pound_token.span.start(),
-                format!("`{}` hides a test attribute", a.meta.to_token_stream()),
-            );
-            return;
+    fn judge(&self, meta: &Meta) -> Verdict {
+        let hides = attr::hidden_tests(meta)
+            .into_iter()
+            .any(|h| matches!(h, Hidden::Unknown) || matches!(h, Hidden::Known(o) if self.opts.selects(o)));
+        if hides {
+            return Verdict::Refuse(format!("`{}` hides a test attribute", meta.to_token_stream()));
         }
-        match attr::classify(a) {
-            Some(Ok(t)) if self.opts.selects(t.origin) => {
-                let start = self.index.offset(a.pound_token.span.start());
-                let end = self.index.offset(a.bracket_token.span.close().end());
-                self.edits.push(Edit {
-                    start,
-                    end,
-                    text: replacement(&t),
-                });
+        match attr::classify_meta(meta) {
+            Some(Ok(t)) if self.opts.selects(t.origin) => Verdict::Rewrite(t),
+            Some(Err(why)) if self.opts.selects(attr::origin_of(meta.path()).expect("classified")) => {
+                Verdict::Refuse(why.0)
             }
-            Some(Err(why)) if self.opts.selects(attr::origin_of(a.meta.path()).expect("classified")) => {
-                self.refuse(a.pound_token.span.start(), why.0);
-            }
-            _ => {}
+            Some(_) => Verdict::Leave,
+            None if attr::is_unmapped_test(meta) => Verdict::Refuse(format!(
+                "`#[{}]` is a test attribute this tool does not map",
+                meta.to_token_stream()
+            )),
+            None => Verdict::Leave,
         }
     }
 
-    fn macro_tokens(&mut self, ts: TokenStream) {
+    /// Replaces `at..end` with the skuld spelling, unless a comment would be lost.
+    fn rewrite(&mut self, at: LineColumn, end: LineColumn, t: &TestAttr) {
+        let (start, end) = (self.index.offset(at), self.index.offset(end));
+        let old = &self.index.src[start..end];
+        if old.contains("//") || old.contains("/*") {
+            self.refuse(at, format!("a comment inside `{old}` would be lost"));
+            return;
+        }
+        self.edits.push(Edit {
+            start,
+            end,
+            text: replacement(t),
+        });
+    }
+
+    fn attribute(&mut self, a: &Attribute) {
+        if !matches!(a.style, syn::AttrStyle::Outer) {
+            return;
+        }
+        let at = a.pound_token.span.start();
+        match self.judge(&a.meta) {
+            Verdict::Rewrite(t) => self.rewrite(at, a.bracket_token.span.close().end(), &t),
+            Verdict::Refuse(why) => self.refuse(at, why),
+            Verdict::Leave => {}
+        }
+    }
+
+    /// Scans a token stream for `#[..]` groups. `in_macro` is `Some(name)` for an invocation's
+    /// arguments, where the expansion decides what an attribute means, so a test there is refused.
+    fn tokens(&mut self, ts: TokenStream, in_macro: Option<&str>) {
         let trees: Vec<TokenTree> = ts.into_iter().collect();
         let mut i = 0;
         while i < trees.len() {
             if let (TokenTree::Punct(p), Some(TokenTree::Group(g))) = (&trees[i], trees.get(i + 1)) {
                 if p.as_char() == '#' && g.delimiter() == proc_macro2::Delimiter::Bracket {
                     if let Ok(meta) = syn::parse2::<Meta>(g.stream()) {
-                        self.macro_attr(p.span().start(), g.span().end(), &meta);
+                        let (at, end) = (p.span().start(), g.span().end());
+                        match (self.judge(&meta), in_macro) {
+                            (Verdict::Rewrite(t), None) => self.rewrite(at, end, &t),
+                            (Verdict::Rewrite(_), Some(name)) => {
+                                self.refuse(at, format!("a test attribute inside `{name}!` cannot be mapped"));
+                            }
+                            (Verdict::Refuse(why), _) => self.refuse(at, why),
+                            (Verdict::Leave, _) => {}
+                        }
                     }
                     i += 2;
                     continue;
                 }
             }
             if let TokenTree::Group(g) = &trees[i] {
-                self.macro_tokens(g.stream());
+                self.tokens(g.stream(), in_macro);
             }
             i += 1;
-        }
-    }
-
-    fn macro_attr(&mut self, at: LineColumn, end: LineColumn, meta: &Meta) {
-        if attr::cfg_attr_hides_test(meta, |o| self.opts.selects(o)) {
-            self.refuse(at, format!("`{}` hides a test attribute", meta.to_token_stream()));
-            return;
-        }
-        match attr::classify_meta(meta) {
-            Some(Ok(t)) if self.opts.selects(t.origin) => {
-                let (start, end) = (self.index.offset(at), self.index.offset(end));
-                self.edits.push(Edit {
-                    start,
-                    end,
-                    text: replacement(&t),
-                });
-            }
-            Some(Err(why)) if self.opts.selects(attr::origin_of(meta.path()).expect("classified")) => {
-                self.refuse(at, why.0);
-            }
-            _ => {}
         }
     }
 }
@@ -184,22 +208,22 @@ impl<'ast> Visit<'ast> for Planner<'_> {
 
     fn visit_item_macro(&mut self, m: &'ast ItemMacro) {
         if m.mac.path.is_ident("macro_rules") {
-            self.macro_tokens(m.mac.tokens.clone());
+            for body in shapes::transcribers(m.mac.tokens.clone()) {
+                self.tokens(body, None);
+            }
+        } else {
+            syn::visit::visit_item_macro(self, m);
         }
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let name = m.path.segments.last().map_or_else(String::new, |s| s.ident.to_string());
+        self.tokens(m.tokens.clone(), Some(&name));
     }
 }
 
 fn is_cfg_inner(a: &Attribute) -> bool {
     matches!(a.style, syn::AttrStyle::Inner(_)) && a.path().is_ident("cfg")
-}
-
-/// An item `--hoist-crate-cfg` leaves alone: the added `main` and the shared label include.
-pub fn is_hoist_exempt(item: &Item) -> bool {
-    match item {
-        Item::Fn(f) => f.sig.ident == "main",
-        Item::Mod(m) => m.ident == HARNESS_MOD,
-        _ => false,
-    }
 }
 
 fn hoist(p: &mut Planner<'_>, file: &syn::File) {
@@ -228,7 +252,7 @@ fn hoist(p: &mut Planner<'_>, file: &syn::File) {
             text: String::new(),
         });
     }
-    for item in file.items.iter().filter(|i| !is_hoist_exempt(i)) {
+    for item in file.items.iter().filter(|i| !shapes::is_hoist_exempt(i)) {
         if let Item::Verbatim(_) = item {
             p.refuse(
                 item.span().start(),
