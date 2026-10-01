@@ -129,7 +129,6 @@ pub(crate) fn observe_waitid(observer: impl FnMut(u32) + 'static) -> Forced {
     Forced(|| WAITID_OBSERVER.with(|o| *o.borrow_mut() = None))
 }
 
-/// A `waitid` with these raw `options` is about to run on this thread.
 #[cfg(target_os = "linux")]
 pub(crate) fn waitid_called(options: u32) {
     // Taken out for the call, so an observer that panics leaves no borrow behind.

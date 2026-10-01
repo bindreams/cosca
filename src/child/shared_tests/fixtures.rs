@@ -85,7 +85,7 @@ pub(super) fn confirm_exit(shared: &SharedChild) {
     #[cfg(target_os = "linux")]
     {
         let target = shared.target().expect("a pidfd");
-        let peeked = crate::wait::exit_only::wait_visible_exit(&target, shared.id()).expect("wait for the exit");
+        let peeked = crate::wait::exit_only::wait_visible_exit(&target).expect("wait for the exit");
         assert!(
             matches!(peeked, crate::wait::exit_only::Peek::Exit(_)),
             "the exit must be visible, got {peeked:?}"
