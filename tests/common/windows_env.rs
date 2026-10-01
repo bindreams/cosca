@@ -17,7 +17,7 @@ use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREAT
 struct EnvKey(Vec<u16>);
 
 /// Orders two names by `CompareStringOrdinal(.., bIgnoreCase = TRUE)`.
-pub fn compare_names(a: &[u16], b: &[u16]) -> Ordering {
+fn compare_names(a: &[u16], b: &[u16]) -> Ordering {
     // SAFETY: both slices are valid UTF-16 buffers that outlive the call; the API only reads them.
     match unsafe { CompareStringOrdinal(a, b, true) } {
         CSTR_EQUAL => Ordering::Equal,
