@@ -4,9 +4,14 @@
 //! (waiting for the accept ack, like any control connection), writes the grandchild's pid as one
 //! `<pid>\n` line, and then BLOCKS until the harness writes a second ack byte. The harness
 //! captures the grandchild's [`ProcessId`] before writing that release. Until then the root is
-//! alive and still the grandchild's parent, holding it unreaped (Unix) or by handle (Windows), so
-//! the pid names the grandchild for certain and the identity taken here is the real one. The
-//! tree helpers then watch that identity, never the bare pid, alongside the root's.
+//! alive and, in the `spawn-grandchild*` modes, still the grandchild's parent, holding it unreaped
+//! (Unix) or by handle (Windows), so the pid names the grandchild for certain and the identity
+//! taken here is the real one. The tree helpers then watch that identity, never the bare pid,
+//! alongside the root's.
+//!
+//! In `spawn-orphan-escapee` the reporter is the `orphan-relay` child and the root only waits for
+//! it, exiting nonzero if the relay failed, so the report accept's watch on the root still covers
+//! the reporter.
 
 use std::cell::Cell;
 use std::io::Read;
