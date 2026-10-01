@@ -51,7 +51,7 @@ pub(super) fn wait(source: Source<'_>, target_pid: u32, also: Option<ProcessId>)
         events: libc::POLLIN,
         revents: 0,
     }));
-    notify_armed();
+    notify_armed(target_pid, also);
     loop {
         // SAFETY: `fds` is a valid, correctly-sized array for the call's duration.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
