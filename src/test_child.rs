@@ -263,6 +263,18 @@ mod write_to_possibly_dead_stdin_tests {
 // Re-exec fixtures =====
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, unused_imports, reason = "only the macOS tracer fixtures use it so far")
+)]
+mod bounded;
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(unused_imports, reason = "only the macOS tracer fixtures use it so far")
+)]
+pub(crate) use bounded::{run_fixture_output_within, step, watchdog};
+#[cfg(unix)]
 mod scratch;
 #[cfg(unix)]
 pub(crate) use scratch::fixture_scratch_tempdir;
@@ -442,7 +454,7 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
 
 /// The argv, env and stdio common to every fixture re-exec, split out for a caller that supplies
 /// its own program path.
-fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
+pub(crate) fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
     cmd.args(["--test-threads=1", "--exact", fixture])
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
@@ -495,6 +507,12 @@ fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
 /// The post-spawn half of [`run_fixture_command`], for a launcher that spawned under its own lock.
 fn finish_fixture_command(fixture: &str, child: std::process::Child) {
     let output = child.wait_with_output().expect("wait for fixture child");
+    assert_fixture_passed(fixture, &output);
+}
+
+/// Panics unless `output` is that of a fixture that ran and passed exactly one test, and wrote its
+/// gate line. For a launcher that waits for the fixture by its own means.
+pub(crate) fn assert_fixture_passed(fixture: &str, output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

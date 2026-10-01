@@ -141,13 +141,20 @@ filter = 'binary(tokio_io) & test(=async_kill_tree_before_wait_tears_down_the_tr
 slow-timeout = { period = "10s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
+# The macOS tracer tests re-exec a freshly signed copy of the test binary (up to ~2s on amd64).
+# This bound must outlast the fixture's watchdog (8s) and the driver's wait bound (12s), so that
+# their messages surface.
+filter = 'test(/^child::shared::shared_tests::tracer::macos::/)'
+slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
+
+[[profile.default.overrides]]
 # A backstop, not a detector: the `SharedChild` tests fail by assertion (see `assert_handed_off`),
 # not by timing out. This bound only stops a regression those checks did not anticipate, in a test
 # that `recv()`s or `join()`s on our own code, from stalling the job. The macOS wait's tests
 # (`wait::backend::macos_tests::await_reapable`) block on a real kqueue in the same way. Under
 # `profile.default` so `profile.ci` and local runs inherit it.
 filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_tests::await_reapable/)'
-slow-timeout = { period = "10s", terminate-after = 1 }
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on

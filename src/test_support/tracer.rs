@@ -57,8 +57,11 @@
 
 use std::io::Write as _;
 
+mod attach;
 mod machine;
 mod sys;
+
+pub(crate) use attach::{attach_settled, settled_stop, AttachError};
 
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
@@ -363,7 +366,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
 
 /// Copies this test binary into `dir` and ad-hoc signs the copy with
 /// `com.apple.security.cs.debugger`, which macOS requires of a tracer (see the module docs).
-fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn debugger_signed_copy(dir: &std::path::Path) -> std::path::PathBuf {
     const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.cs.debugger</key><true/></dict></plist>
