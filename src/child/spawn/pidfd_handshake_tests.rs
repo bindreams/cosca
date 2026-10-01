@@ -766,6 +766,35 @@ fn a_panic_after_the_spawn_forces_eof_through_a_held_copy() {
     );
 }
 
+/// A panic while the helper may still wait on a holder (here from the wait's own hook, with the
+/// poll faulted so the wait is reached) still forces EOF: the unwind guard covers the whole wait,
+/// not only the after-spawn hook.
+///
+/// Mutant: the guard is disarmed once the after-spawn hook has run.
+#[test]
+fn a_panic_inside_the_wait_forces_eof_through_a_held_copy() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let (mut cmd, _reader) = marker_command();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let watch = fault::fail_watch(fault::WatchFault::Poll(Errno::INVAL));
+    let before = fault::before_awaiting_the_child_do(|| panic!("the wait's hook panicked on purpose"));
+    let result = catch_unwind(AssertUnwindSafe(|| cmd.spawn().err()));
+    drop(before);
+    drop(watch);
+    drop(armed);
+    let unwound = fault::take_unwound();
+    drop(holder);
+
+    assert!(result.is_err(), "the hook's panic goes on");
+    assert_eq!(
+        unwound.map(|u| u.eof_reached),
+        Some(true),
+        "the helper must read EOF by the time the unwind guards are done"
+    );
+}
+
 // Pid namespaces =====
 
 /// A private procfs of this pid namespace on `/proc`: where `/proc/sys` is read-only (a container
