@@ -43,6 +43,10 @@ pub(crate) enum ForcedReap {
 
 type StepHook = Box<dyn FnOnce()>;
 
+/// Told the `options` of each `waitid` this thread makes.
+#[cfg(target_os = "linux")]
+type WaitidObserver = Box<dyn FnMut(u32)>;
+
 /// A registered step hook and the id its guard removes it by.
 struct RegisteredHook {
     id: u64,
@@ -57,7 +61,7 @@ thread_local! {
     #[cfg(target_os = "linux")]
     static FORCED_VISIBLE_NONE: Cell<bool> = const { Cell::new(false) };
     #[cfg(target_os = "linux")]
-    static WAITID_OBSERVER: RefCell<Option<Box<dyn FnMut(u32)>>> = const { RefCell::new(None) };
+    static WAITID_OBSERVER: RefCell<Option<WaitidObserver>> = const { RefCell::new(None) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
     static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
     static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
