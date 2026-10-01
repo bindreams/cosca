@@ -450,13 +450,19 @@ impl ReportSlot {
             let fd_len = std::mem::size_of::<RawFd>() as libc::c_uint;
             header.msg_control = control.0.as_mut_ptr().cast();
             // Safety: arithmetic on a length.
-            header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_len) } as usize;
+            let space = unsafe { libc::CMSG_SPACE(fd_len) } as usize;
+            debug_assert!(
+                space <= control.0.len(),
+                "one descriptor's control message fits `control`, needs {space}"
+            );
+            header.msg_controllen = space as _;
             // Safety: `control` is aligned and large enough for one descriptor's header and data.
             unsafe {
                 let cmsg = libc::CMSG_FIRSTHDR(&header);
+                debug_assert!(!cmsg.is_null(), "`msg_controllen` leaves room for one header");
                 (*cmsg).cmsg_level = libc::SOL_SOCKET;
                 (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as usize;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
                 std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), pidfd);
             }
         }
