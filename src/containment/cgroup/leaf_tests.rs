@@ -2467,7 +2467,7 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
     const INNER: &str = "COSCA_TEST_DECIDED_ALONE";
     if std::env::var_os(INNER).is_none() {
         let out = crate::test_spawn::output_captured(
-            std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            crate::test_reexec::command(std::env::current_exe().expect("this test binary"))
                 .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
                 .env(INNER, "1"),
         )

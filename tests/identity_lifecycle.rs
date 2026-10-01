@@ -37,7 +37,7 @@ fn helper_block_on_stdin() {
 fn spawn_blocking_child() -> Child {
     let exe = std::env::current_exe().expect("current_exe");
     common::spawn_locked(
-        Command::new(exe)
+        common::test_reexec::command(exe)
             .args(["--exact", "helper_block_on_stdin"])
             .env(BLOCK_VAR, "1")
             .stdin(Stdio::piped())
@@ -194,7 +194,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let path = dir.path().join("id.json");
     let exe = std::env::current_exe().expect("current_exe");
     let mut child = common::spawn_locked(
-        Command::new(exe)
+        common::test_reexec::command(exe)
             // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
             // `--nocapture` is what lets the helper's marker reach our pipe at all.
             .args(["helper_write_own_record", "--exact", "--nocapture"])

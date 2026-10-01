@@ -560,8 +560,8 @@ fn fixture_round_check_violation_while_panicking() {
 /// message on the real stderr and `VIOLATION_EXIT_CODE`, and no crash report.
 ///
 /// Mutant: store the violation and return -> the child exits with the test's own failure (101).
-/// Mutant: panic regardless of `thread::panicking()` -> the double panic aborts, and the message
-/// goes to libtest's capture; the exit code differs whatever the environment.
+/// Mutant: panic regardless of `thread::panicking()` -> the double panic aborts, and the exit
+/// code differs whatever the environment.
 #[test]
 fn round_check_exits_when_it_fires_while_panicking() {
     let output = crate::test_child::run_fixture_output(

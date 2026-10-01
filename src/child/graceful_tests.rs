@@ -313,6 +313,9 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
                 crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
             ));
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
+        for var in crate::test_reexec::SCRUBBED_ENV {
+            cmd.env_remove(var);
+        }
     }
     cmd.contain();
     #[cfg_attr(
@@ -535,6 +538,9 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
             crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_TEST,
         ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
+    for var in crate::test_reexec::SCRUBBED_ENV {
+        cmd.env_remove(var);
+    }
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
     // Blocks until the fixture has connected — which it does only after the grandchild survivor

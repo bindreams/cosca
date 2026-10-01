@@ -196,11 +196,12 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     let dir = root.path().join("gone");
     std::fs::create_dir(&dir).expect("mkdir");
     let mut child = crate::test_spawn::spawn(
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             .args([
                 "--test-threads=1",
                 "--exact",
                 crate::test_child::fixture_path!(fixture_elevated_exact_in_an_unlinked_cwd),
+                "--nocapture",
             ])
             .env(FIXTURE_UNLINKED_CWD_ENV, "1")
             .current_dir(&dir)

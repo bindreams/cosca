@@ -229,7 +229,9 @@ fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
         &["--exact", TEST],
         &["--exact", TEST, "--test-threads=1"],
         &["--exact", TEST, "--test-threads=4", "--include-ignored"],
-        &["--exact", TEST, "--test-threads=1", "--include-ignored", "--nocapture"],
+        // The shape from before `--nocapture`.
+        &["--exact", TEST, "--test-threads=1", "--include-ignored"],
+        &["--exact", TEST, "--test-threads=1", "--nocapture", "--include-ignored"],
         &["--exact", TEST, "--test-threads=1", "--include-ignored", "other"],
         &[TEST, "--exact", "--test-threads=1", "--include-ignored"],
         &["--exact", "m::other", "--test-threads=1", "--include-ignored"],
@@ -279,7 +281,7 @@ fn a_forged_environment_never_runs_the_body_in_a_shared_process() {
     ];
     for (argv, forged_value) in forged {
         let child = crate::test_spawn::spawn(
-            std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
                 .args(&argv)
                 .env(ENV, &forged_value)
                 .env(PIDFILE, &pidfile)
@@ -333,6 +335,11 @@ fn a_completion_dropped_while_panicking_reports_nothing() {
     assert_eq!(drained(read), b"");
 }
 
+#[test]
+fn the_child_runs_uncaptured() {
+    assert!(child_args("m::t").contains(&"--nocapture"));
+}
+
 // Pins the flag until #234 removes the last `#[ignore]`; a behavioural test would need an
 // `#[ignore]`d fixture, which the project forbids.
 #[test]
@@ -359,7 +366,7 @@ fn a_reexecuted_child_that_is_not_accepted_panics_instead_of_re_executing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pidfile = dir.path().join("pid");
     let output = crate::test_spawn::output_captured(
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             .args(["--exact", FIXTURE])
             .env(ENV, value(std::process::id(), 3, FIXTURE))
             .env(PIDFILE, &pidfile),

@@ -394,7 +394,7 @@ pub(crate) fn fixture_command_without_dac_bypass(fixture: &str) -> (std::process
     let (mut cmd, exe_copy) = if unsafe { libc::geteuid() } == 0 {
         scratch::assert_dropped_identity_can_traverse_tmpdir();
         let (dir, exe) = scratch::copy_exe_to_traversable_scratch();
-        let mut cmd = std::process::Command::new(exe);
+        let mut cmd = crate::test_reexec::command(exe);
         configure_fixture_command(&mut cmd, fixture);
         (cmd, Some(dir))
     } else {
@@ -437,8 +437,8 @@ impl Drop for RestoreMode {
 }
 
 /// The `std::process::Command` common to every fixture re-exec: this binary, filtered to exactly
-/// one test, single-threaded, stdio captured, [`FIXTURE_PARENT_PID_ENV`] set (see
-/// [`is_fixture_reexec`]).
+/// one test, single-threaded, uncaptured by skuld (`--nocapture`) with the stdio piped to the
+/// driver, [`FIXTURE_PARENT_PID_ENV`] set (see [`is_fixture_reexec`]).
 ///
 /// The ambient `TMPDIR` is inherited untouched; see [`run_fixture`] for writable scratch after a
 /// drop.
@@ -454,7 +454,7 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
     let program = std::path::PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
     let program = std::env::current_exe().expect("current_exe");
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = crate::test_reexec::command(program);
     configure_fixture_command(&mut cmd, fixture);
     cmd
 }
@@ -462,7 +462,7 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
 /// The argv, env and stdio common to every fixture re-exec, split out for a caller that supplies
 /// its own program path.
 pub(crate) fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
-    cmd.args(["--test-threads=1", "--exact", fixture])
+    cmd.args(["--test-threads=1", "--exact", fixture, "--nocapture"])
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -493,9 +493,9 @@ fn parent_pid_matches() -> bool {
         .is_some_and(|pid| pid == std::os::unix::process::parent_id())
 }
 
-/// Written to a fixture's real stderr, bypassing libtest's capture, once its gate passes. A gate
-/// that returns early exits 0 like a fixture that ran and passed, so [`finish_fixture_command`]
-/// requires the line to tell them apart.
+/// Written to a fixture's stderr once its gate passes; the driver runs the fixture with
+/// `--nocapture`, so skuld does not drop it. A gate that returns early exits 0 like a fixture that
+/// ran and passed, so [`finish_fixture_command`] requires the line to tell them apart.
 pub(crate) const FIXTURE_GATE_PASSED_LINE: &str = "COSCA_FIXTURE_GATE_PASSED";
 
 fn write_gate_passed() {
@@ -560,11 +560,9 @@ pub(crate) fn is_marked_fixture_reexec(marker_env: &str) -> bool {
 pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::process::Output {
     let mut cmd = fixture_command(fixture);
     cmd.env(marker_env, std::process::id().to_string());
-    // libtest reads its settings from the environment when the command line does not say: an
-    // inherited `RUST_TEST_NOCAPTURE` turns the child's output capture off and changes what a
-    // fixture that dies can prove. `RUST_TEST_THREADS` is overridden by `--test-threads=1`; the
-    // time and shuffle variables cannot matter to one exact test.
-    cmd.env_remove("RUST_TEST_NOCAPTURE");
+    // `fixture_command` passes `--nocapture`, so the child never captures its own output and
+    // `RUST_TEST_NOCAPTURE` cannot change it. A fixture that dies without writing what the driver
+    // looks for is caught by its exit status.
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     child.wait_with_output().expect("wait for fixture child")
 }
@@ -577,7 +575,6 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
 pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, case: &str) {
     let mut cmd = fixture_command(fixture);
     cmd.env(marker_env, std::process::id().to_string()).env(case_env, case);
-    cmd.env_remove("RUST_TEST_NOCAPTURE");
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -674,7 +671,7 @@ pub(crate) fn strip_crate_prefix(path: &'static str) -> &'static str {
 /// lock every cosca-originated spawn in this test binary already takes.
 pub(crate) fn spawn_a_process_that_exits() -> std::process::Child {
     crate::test_spawn::spawn(
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             .args(["--exact", "__cosca_no_such_test__"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
@@ -796,8 +793,8 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// `--test-threads=1` keeps a future filter that matches more than one test from running them
 /// concurrently inside a process the caller is about to signal.
 #[cfg(windows)]
-pub(crate) fn fixture_argv(test: &str) -> [&str; 4] {
-    ["cosca_unit_tests", "--test-threads=1", "--exact", test]
+pub(crate) fn fixture_argv(test: &str) -> [&str; 5] {
+    ["cosca_unit_tests", "--test-threads=1", "--exact", test, "--nocapture"]
 }
 
 /// The fully-qualified libtest path of [`fixture_survives_group_signal`], for callers that
@@ -854,7 +851,7 @@ fn fixture_survives_group_signal() {
         reason = "the grandchild must outlive us; containment kills it"
     )]
     let _survivor = crate::test_spawn::spawn(
-        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             // `[1..]`: skip `fixture_argv`'s slot-0 placeholder; `std::process::Command` supplies argv[0].
             .args(&fixture_argv(FIXTURE_REGISTERS_THEN_BLOCKS_TEST)[1..])
             .env(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)

@@ -329,11 +329,12 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     let exe_dir = tempfile::tempdir().expect("create a directory for the signed helper");
     let exe = debugger_signed_copy(exe_dir.path());
     let marker = DEFAULT_MARKER.to_string();
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::test_reexec::command(exe);
     cmd.args([
         "--test-threads=1",
         "--exact",
         crate::test_child::fixture_path!(uh_helper_entry),
+        "--nocapture",
     ])
     .env("COSCA_UH_ROLE", "helper")
     .env("COSCA_UH_MODE", mode.as_env())
@@ -551,9 +552,13 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
             "--test-threads=1",
             "--exact",
             crate::test_child::fixture_path!(uh_tracee_fixture),
+            "--nocapture",
         ])
         .env("COSCA_UH_ROLE", "tracee")
         .env("COSCA_UH_KIND", format!("{kind:?}"));
+    for var in crate::test_reexec::SCRUBBED_ENV {
+        cmd.env_remove(var);
+    }
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
