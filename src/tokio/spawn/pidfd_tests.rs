@@ -103,3 +103,33 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     );
     assert!(!program_ran(cmd, reader));
 }
+
+/// A tokio runtime built without IO makes tokio panic inside the spawn, after std's fork. With a
+/// forked copy of the child's end held, the unwind still does not wait on the holder: EOF is
+/// forced before the helper is joined.
+///
+/// Mutant: no forced EOF on unwind (the unwind checks shut the channel and record it).
+#[test]
+fn a_runtime_without_io_panics_without_waiting_on_a_held_copy() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime without IO");
+    let (mut cmd, _reader) = marker_command();
+    fault::reset_spawns();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let result = rt.block_on(async { catch_unwind(AssertUnwindSafe(|| cmd.spawn().err())) });
+    drop(armed);
+    let unwound = fault::take_unwound();
+    drop(holder);
+
+    assert!(result.is_err(), "tokio panics in a runtime without IO");
+    assert_eq!(fault::spawns(), 1, "the panic came after the fork");
+    assert_eq!(
+        unwound.map(|u| u.eof_reached),
+        Some(true),
+        "the helper must read EOF by the time the unwind guards are done"
+    );
+}

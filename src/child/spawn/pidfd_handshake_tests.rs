@@ -618,7 +618,7 @@ fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> String {
 
 /// A watch that cannot be opened or moved forces EOF and names its cause, whatever the cause.
 ///
-/// Mutant: any such failure only warns and returns "keep waiting" (the spawn then waits on the
+/// Mutants: any such failure (open, move, peek or poll) only warns and returns "keep waiting" (the spawn then waits on the
 /// holder, and the end probes shut the channel and report no forced EOF).
 #[test]
 fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
@@ -627,8 +627,14 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
         fault::WatchFault::Open(Errno::NFILE),
         fault::WatchFault::Open(Errno::NOMEM),
         fault::WatchFault::Move(Errno::MFILE),
+        fault::WatchFault::Peek(Errno::INVAL),
+        // A same-user process lowering `RLIMIT_NOFILE` below 2 makes `poll` fail so.
+        fault::WatchFault::Poll(Errno::INVAL),
     ] {
-        let (fault::WatchFault::Open(errno) | fault::WatchFault::Move(errno)) = fault_kind;
+        let (fault::WatchFault::Open(errno)
+        | fault::WatchFault::Move(errno)
+        | fault::WatchFault::Peek(errno)
+        | fault::WatchFault::Poll(errno)) = fault_kind;
         let said = killed_child_with_a_failing_watch(fault_kind);
         assert!(
             said.contains("its exit could not be watched") && said.contains(&errno.to_string()),
@@ -725,6 +731,39 @@ fn a_panic_after_the_spawn_still_opens_the_helper_probe() {
 
     assert!(result.is_err(), "the hook's panic goes on");
     assert!(probe.finished(), "the helper must have run to its end");
+    let unwound = fault::take_unwound().expect("the run unwound");
+    assert_eq!(
+        unwound.probe_open,
+        Some(true),
+        "the probe's gate must be open by the time the unwind guards are done, not at the join"
+    );
+}
+
+/// A panic on the spawning thread after the fork, with a forked copy of the child's end held,
+/// forces EOF before the scope joins the helper: the unwind does not wait on the holder.
+///
+/// Mutant: no forced EOF on unwind (the helper waits on the copy; the unwind checks shut the
+/// channel and record that EOF was not reached).
+#[test]
+fn a_panic_after_the_spawn_forces_eof_through_a_held_copy() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let (mut cmd, _reader) = marker_command();
+    let holder = fault::arm_fork_holder();
+    let armed = fault::arm_child_fault(ChildFault::Sigkill);
+    let after = fault::after_spawn_returns_do(|_| panic!("the after-spawn hook panicked on purpose"));
+    let result = catch_unwind(AssertUnwindSafe(|| cmd.spawn().err()));
+    drop(after);
+    drop(armed);
+    let unwound = fault::take_unwound();
+    drop(holder);
+
+    assert!(result.is_err(), "the hook's panic goes on");
+    assert_eq!(
+        unwound.map(|u| u.eof_reached),
+        Some(true),
+        "the helper must read EOF by the time the unwind guards are done"
+    );
 }
 
 // Pid namespaces =====

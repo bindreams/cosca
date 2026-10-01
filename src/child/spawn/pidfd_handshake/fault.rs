@@ -80,6 +80,74 @@ thread_local! {
     static BEFORE_AWAITING: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static VERDICT_GUARDED: Cell<bool> = const { Cell::new(false) };
     static WATCH_FAULT: Cell<Option<WatchFault>> = const { Cell::new(None) };
+    static UNWOUND: Cell<Option<Unwound>> = const { Cell::new(None) };
+}
+
+// Unwinding =====
+
+/// What a `run` that unwound had done by the time its guards ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unwound {
+    /// The parent's end read EOF, so the helper could end whatever copies of the child's end exist.
+    pub(crate) eof_reached: bool,
+    /// The helper probe's gate was open, if a probe was armed.
+    pub(crate) probe_open: Option<bool>,
+}
+
+/// What the last `run` on this thread that unwound saw.
+pub(crate) fn take_unwound() -> Option<Unwound> {
+    UNWOUND.with(Cell::take)
+}
+
+/// Declared before the production guards, so it drops after them: on an unwind it records what they
+/// did, then finishes what they should have, so a regression fails at an assert and not by leaving
+/// the scope to join a helper that is never released.
+pub(super) struct UnwindChecks<'a> {
+    parent_end: &'a OwnedFd,
+    probe: Option<HelperProbe>,
+}
+
+impl<'a> UnwindChecks<'a> {
+    pub(super) fn new(parent_end: &'a OwnedFd, seams: &HelperSeams) -> Self {
+        UNWOUND.with(|u| u.set(None));
+        UnwindChecks {
+            parent_end,
+            probe: seams.probe.clone(),
+        }
+    }
+}
+
+impl Drop for UnwindChecks<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let eof_reached = !probe_shut_read(self.parent_end);
+        let probe_open = self.probe.as_ref().map(|p| {
+            let open = p.gate.is_open();
+            p.release();
+            open
+        });
+        UNWOUND.with(|u| {
+            u.set(Some(Unwound {
+                eof_reached,
+                probe_open,
+            }))
+        });
+    }
+}
+
+/// Whether the parent's end has NOT read EOF; if so, shuts it so the helper can end.
+fn probe_shut_read(parent_end: &OwnedFd) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let mut fds = [PollFd::new(parent_end, PollFlags::RDHUP)];
+    poll(&mut fds, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })).expect("poll the parent's end");
+    let reached = fds[0].revents().contains(PollFlags::RDHUP);
+    if !reached {
+        _ = rustix::net::shutdown(parent_end, rustix::net::Shutdown::Both);
+    }
+    !reached
 }
 
 // The watch =====
@@ -91,6 +159,10 @@ pub(crate) enum WatchFault {
     Open(Errno),
     /// Its `pidfd_open` succeeds and the move above the stdio slots fails with this.
     Move(Errno),
+    /// Its peek at the pidfd fails with this, which no real peek does.
+    Peek(Errno),
+    /// The child is taken to be running, and its poll fails with this.
+    Poll(Errno),
 }
 
 /// Disarms the watch fault on drop.
@@ -112,6 +184,31 @@ impl Drop for ArmedWatchFault {
 pub(super) fn watch_open_errno() -> Option<Errno> {
     match WATCH_FAULT.with(Cell::get) {
         Some(WatchFault::Open(errno)) => {
+            WATCH_FAULT.with(|f| f.set(None));
+            Some(errno)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn watch_peek_errno() -> Option<Errno> {
+    match WATCH_FAULT.with(Cell::get) {
+        Some(WatchFault::Peek(errno)) => {
+            WATCH_FAULT.with(|f| f.set(None));
+            Some(errno)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a poll fault is armed: the peek is then skipped, as if it answered `Running`.
+pub(super) fn watch_poll_armed() -> bool {
+    matches!(WATCH_FAULT.with(Cell::get), Some(WatchFault::Poll(_)))
+}
+
+pub(super) fn watch_poll_errno() -> Option<Errno> {
+    match WATCH_FAULT.with(Cell::get) {
+        Some(WatchFault::Poll(errno)) => {
             WATCH_FAULT.with(|f| f.set(None));
             Some(errno)
         }
@@ -491,6 +588,10 @@ impl Gate {
         while !*open {
             open = condvar.wait(open).unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    fn is_open(&self) -> bool {
+        *self.0 .0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn open(&self) {

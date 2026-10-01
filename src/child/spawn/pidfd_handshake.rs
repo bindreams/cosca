@@ -256,6 +256,17 @@ fn force_eof(parent_end: &OwnedFd) {
     }
 }
 
+/// Forces EOF on the parent's end when dropped while this thread unwinds.
+struct ForceEofOnUnwind<'a>(&'a OwnedFd);
+
+impl Drop for ForceEofOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            force_eof(self.0);
+        }
+    }
+}
+
 /// Shuts the parent's end, then says the helper is done, when dropped, unwinding included.
 struct ShutOnDrop<'a> {
     parent_end: &'a OwnedFd,
@@ -317,6 +328,8 @@ impl Handshake {
 
         std::thread::scope(|scope| {
             #[cfg(test)]
+            let _unwind_checks = fault::UnwindChecks::new(parent_end, &seams);
+            #[cfg(test)]
             let _open_held_verdict = seams.open_on_drop();
             let helper = std::thread::Builder::new()
                 .name("cosca-pidfd-handshake".into())
@@ -346,6 +359,10 @@ impl Handshake {
                 }
             };
 
+            // A panic on this thread from here on (a panicking logger, tokio's no-IO panic after
+            // the fork) unwinds into a join of the helper, which waits for EOF on the child's end:
+            // a forked copy of it would hold the join for as long as the copy lives.
+            let _eof_on_unwind = ForceEofOnUnwind(parent_end);
             #[cfg(test)]
             let _wait_over = fault::WaitOverOnDrop;
             #[cfg(test)]
@@ -473,7 +490,8 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     //  4. the number taken, before the watch opens, by a process that is a RUNNING child or tracee
     //     of this process (`waitid` on its pidfd answers "nothing to report" for both).
     // Closed stdio is NOT needed. A number taken by a thread, a zombie child or a non-child is
-    // not in the window, and neither is a watch that cannot be opened: those force EOF.
+    // not in the window, and neither is a watch that cannot be set up (open, move, peek or poll) or a
+    // panic on the spawning thread: those force EOF.
     #[cfg(test)]
     let injected = fault::watch_open_errno();
     #[cfg(not(test))]
@@ -500,7 +518,19 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
         Err(Errno::SRCH | Errno::INVAL | Errno::NOENT) => return Watch::Exited,
         Err(e) => return unwatchable("pidfd_open", &e),
     };
-    match peek(&Target::PidFd(watch.as_fd())) {
+    #[cfg(test)]
+    if let Some(errno) = fault::watch_peek_errno() {
+        return unwatchable("waitid on its pidfd", &errno);
+    }
+    #[cfg(test)]
+    let peeked = if fault::watch_poll_armed() {
+        Ok(Peek::Running)
+    } else {
+        peek(&Target::PidFd(watch.as_fd()))
+    };
+    #[cfg(not(test))]
+    let peeked = peek(&Target::PidFd(watch.as_fd()));
+    match peeked {
         Ok(Peek::Foreign(_) | Peek::Exit(_)) => return Watch::Exited,
         Ok(Peek::Running) => {}
         Err(e) => {
@@ -511,8 +541,16 @@ fn child_exited_before_the_helper_finished(pid: Option<u32>, done: &OwnedFd) -> 
     #[cfg(test)]
     fault::before_awaiting_the_child();
     let mut fds = [PollFd::new(done, PollFlags::IN), PollFd::new(&watch, PollFlags::IN)];
-    if let Err(e) = helper_done(&mut fds, None) {
-        debug_assert!(false, "poll on an eventfd and a pidfd failed: {e}");
+    #[cfg(test)]
+    let polled = match fault::watch_poll_errno() {
+        Some(errno) => Err(errno),
+        None => helper_done(&mut fds, None),
+    };
+    #[cfg(not(test))]
+    let polled = helper_done(&mut fds, None);
+    // No contract: a process of the same user can lower `RLIMIT_NOFILE` below the two descriptors
+    // polled, and `poll` then fails with `EINVAL`.
+    if let Err(e) = polled {
         return unwatchable("poll on its pidfd", &e);
     }
     if !fds[0].revents().contains(PollFlags::IN) && !fds[1].revents().is_empty() {
