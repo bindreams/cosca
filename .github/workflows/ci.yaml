@@ -48,11 +48,12 @@ jobs:
       # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
       # find a toolchain.
       # The targets are the ones check-disallowed-methods.sh lints its fixture for,
-      # plus musl for the build check below.
+      # plus musl for the build check below, plus aarch64-unknown-linux-gnu, the
+      # architecture the libtest guard checks besides the host's.
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu
 
       # tools/skuld-migrate and tools/no-libtest also run their own tests under nextest.
       - name: Install cargo-nextest
@@ -127,6 +128,35 @@ jobs:
         shell: bash
         run: .github/scripts/clippy.sh --feature-powerset --release
 
+      # clippy.sh runs the libtest guard (see libtest-guard.sh) for the host architecture. A test
+      # gated on `target_arch` is only seen when the guard checks that architecture, so it also
+      # checks aarch64 Linux, as the test lanes do. skuld's bundled SQLite is C: the cross build
+      # needs a cross compiler.
+      - name: Install the aarch64 Linux cross compiler
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu
+
+      - name: Libtest guard (aarch64 Linux)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          .github/scripts/libtest-guard.sh --feature-powerset --target aarch64-unknown-linux-gnu
+          .github/scripts/libtest-guard.sh --feature-powerset --release --target aarch64-unknown-linux-gnu
+
+      # This proves the guard still flags every spelling of a libtest attribute, in structured
+      # JSON. It needs the cargo-hack the powerset action installed.
+      - name: Test the libtest guard
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 5
+        run: bash .github/scripts/libtest-guard-tests.sh
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
@@ -151,6 +181,8 @@ jobs:
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
+            # The libtest guard also checks this architecture, which no lint step covers.
+            guard_target: x86_64-apple-darwin
           - os: darwin
             arch: amd64
             runner: macos-15
@@ -163,6 +195,8 @@ jobs:
             # This is the one Windows lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
+            # The libtest guard also checks this architecture, which no lint step covers.
+            guard_target: aarch64-pc-windows-msvc
           - os: windows
             arch: arm64
             runner: windows-11-arm
@@ -182,7 +216,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}${{ matrix.guard_target && format(',{0}', matrix.guard_target) || '' }}
           # see Clippy (feature powerset) step below for why only the
           # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
@@ -374,6 +408,27 @@ jobs:
         with:
           target: ${{ matrix.target }}
           release: "true"
+
+      # clippy.sh runs the libtest guard for matrix.target; a test gated on `target_arch` is only
+      # seen when the guard checks that architecture, so it also checks the lane's other one.
+      # The test lanes of both architectures exist, and one of each pair stands in for the other
+      # only in clippy, which has no `target_arch`-gated tests to miss.
+      - name: Libtest guard (other architecture)
+        if: ${{ !cancelled() && matrix.lint }}
+        shell: bash
+        env:
+          GUARD_TARGET: ${{ matrix.guard_target }}
+        run: |
+          .github/scripts/libtest-guard.sh --feature-powerset --target "$GUARD_TARGET"
+          .github/scripts/libtest-guard.sh --feature-powerset --release --target "$GUARD_TARGET"
+
+      # The guard clippy.sh runs on this OS is checked on this OS: the self-test's OS-gated and
+      # arch-gated cases assert the host's own OS and architecture.
+      - name: Test the libtest guard
+        if: ${{ !cancelled() && matrix.lint }}
+        shell: bash
+        timeout-minutes: 5
+        run: bash .github/scripts/libtest-guard-tests.sh
 
       # Live cgroup v2 containment tests belong to the CGROUP group: on unless
       # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need

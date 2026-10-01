@@ -4,6 +4,9 @@
 # CI's clippy-powerset composite action (extra `--target`/`--feature-powerset`
 # for cross-target, cross-feature coverage the host-only prek hook can't give).
 #
+# After clippy it runs the libtest guard (libtest-guard.sh) with the same flags, so every caller
+# is guarded and none can skip it.
+#
 # Usage: clippy.sh [--target TRIPLE] [--feature-powerset] [--release]
 set -euo pipefail
 
@@ -56,4 +59,10 @@ fi
 
 cmd+=(-- -D warnings)
 
-exec "${cmd[@]}"
+"${cmd[@]}"
+
+guard=("$(dirname "${BASH_SOURCE[0]}")/libtest-guard.sh")
+[[ -n "$target" ]] && guard+=(--target "$target")
+[[ "$powerset" -eq 1 ]] && guard+=(--feature-powerset)
+[[ "$release" -eq 1 ]] && guard+=(--release)
+exec "${guard[@]}"

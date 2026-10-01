@@ -87,6 +87,10 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
   processes, and this project's own rule is that system-affecting tests run in a container or VM,
   never against this machine's own services.
 
+## Linting
+
+`prek` runs `.github/scripts/clippy.sh`, which also runs the libtest guard (`.github/scripts/libtest-guard.sh`). The guard needs `python3` 3.11 or later on `PATH` (it reads `Cargo.toml` with `tomllib`); macOS's `/usr/bin/python3` is older, so install a newer one (Homebrew or `uv`). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
+
 ## License
 
 <img align="right" width="150px" height="150px" src="https://www.apache.org/foundation/press/kit/img/the-apache-way-badge/ASF_Badge_apacheway-purple.png">

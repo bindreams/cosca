@@ -6,6 +6,7 @@ __pycache__/
 # .github/scripts/check-disallowed-methods.sh — no reason to pin or track its throwaway lockfile.
 /.github/fixtures/disallowed-methods/Cargo.lock
 /.github/fixtures/disallowed-methods/target
+/.github/fixtures/libtest-guard/target
 
 # Standalone crate: its own target dir.
 /scripts/skuld-rewrite/target
