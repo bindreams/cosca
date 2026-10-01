@@ -1,0 +1,20 @@
+[package]
+name = "skuld-rewrite"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "One-shot rewriter for plan E: moves cosca's tests onto skuld's harness, and proves the move changed nothing else. Deleted by unit R."
+
+# Standalone: not a member of the root package, never published.
+[workspace]
+
+[dependencies]
+anyhow = "=1.0.104"
+cargo_metadata = "=0.23.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
+quote = "=1.0.47"
+syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
