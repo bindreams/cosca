@@ -69,6 +69,12 @@ fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     child.wait().expect("reap");
 }
 
+/// What a runner that deschedules this thread for `d` inside a `kevent` call does to the frozen
+/// clock: the wait advances it by the call's measured elapsed time (#488).
+fn stall(d: Duration) {
+    crate::wait::test_clock::advance_by_elapsed_if_frozen(d);
+}
+
 /// A short-lived child that starts and exits inside the wait: its `SIGCHLD` wakes the kqueue with
 /// no event the wait is looking for, exactly as a sibling's exit would.
 fn spurious_wake() {
@@ -100,6 +106,7 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
             assert!(!left.is_zero(), "round {round} started at or after the deadline");
             remainings.borrow_mut().push(left);
             if round == 0 {
+                stall(limit);
                 spurious_wake();
             }
         }
@@ -140,6 +147,11 @@ fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
     let spent = Duration::from_millis(10);
     let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let _eintr = test_hooks::force_eintr_once(spent);
+    let _stall = test_hooks::on_every_kevent_round(|round| {
+        if round == 0 {
+            stall(Duration::from_millis(25));
+        }
+    });
     let waited = await_reapable(child.id(), None, Some(at + Duration::from_millis(30))).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
     let timeouts = test_hooks::await_requested_timeouts();
@@ -189,6 +201,11 @@ fn await_reapable_rearms_a_remaining_time_above_the_clamp_in_pieces() {
     let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let clamp = Duration::from_millis(10);
     test_hooks::set_clamp_override(clamp);
+    let _stall = test_hooks::on_every_kevent_round(|round| {
+        if round == 0 {
+            stall(Duration::from_millis(45));
+        }
+    });
     let waited = await_reapable(child.id(), None, Some(at + Duration::from_millis(50))).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
     let timeouts = test_hooks::await_requested_timeouts();
