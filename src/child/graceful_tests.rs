@@ -588,7 +588,7 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 // descendant.
 #[cfg(windows)]
 #[test]
-fn windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_connects() {
+fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_connects() {
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");

@@ -48,7 +48,7 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
 /// and still report the exit.
 #[cfg(target_os = "macos")]
 #[test]
-fn accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
+fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     use super::kevent_eintr;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");

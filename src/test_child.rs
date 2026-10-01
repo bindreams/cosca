@@ -1290,7 +1290,7 @@ fn wait_unreaped(pid: u32) {
 /// or not its connection reached the accept queue: the exit alone decides. The target has exited,
 /// unreaped, before `accept_or_die` starts.
 #[test]
-fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
     let (mut child, target) = spawn_connects_and_exits(&listener, false);
     #[cfg(unix)]
@@ -1315,7 +1315,7 @@ fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_d
 /// The ack protects an opted-in fixture that connects, tags and exits at once: it cannot exit
 /// before `accept_or_die` accepted and acked, so the connection is always returned.
 #[test]
-fn accept_or_die_returns_the_connection_of_an_acked_target_that_exits_at_once() {
+fn death_watch_accept_or_die_returns_the_connection_of_an_acked_target_that_exits_at_once() {
     use std::io::Read;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");

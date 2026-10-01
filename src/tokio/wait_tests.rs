@@ -323,7 +323,7 @@ async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceilin
 // resolve it. Every wake is a real kernel event.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn watch_loop_survives_a_non_exit_drain_cycle() {
+async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let mut decoy = std_blocker();
     let target = std_blocker();
     let target_id = ProcessId::of(target.id()).found().expect("identity of live target");
