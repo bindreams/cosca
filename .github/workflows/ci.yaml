@@ -4,12 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Merge queue: required checks must also report on the queue's temporary branch.
+  merge_group:
   workflow_call:
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Cancel superseded runs on PRs; let main / dispatch runs finish.
+  # Cancel superseded runs on PRs; let main / dispatch runs finish. Each merge_group
+  # entry has its own gh-readonly-queue ref, so its group is distinct and never cancelled.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
