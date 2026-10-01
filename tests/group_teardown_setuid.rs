@@ -133,7 +133,7 @@ fn rerun_unprivileged() {
         common::output_locked(&mut rerun_command(db_dir.path())).expect("re-execute this test as an unprivileged user");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && stdout.lines().any(|line| line == RERAN),
+        out.status.success() && common::marker_seen(out.stdout.as_slice(), RERAN),
         "the unprivileged re-run did not pass ({}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
@@ -224,7 +224,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     if role == Role::Rerun {
         use std::io::Write as _;
         let mut out = std::io::stdout();
-        writeln!(out, "\n{RERAN}")
+        writeln!(out, "{RERAN}")
             .and_then(|()| out.flush())
             .expect("announce the re-run");
     }

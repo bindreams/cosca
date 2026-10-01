@@ -35,6 +35,9 @@ pub use uid_switch::*;
 mod report;
 pub use report::*;
 
+mod marker;
+pub use marker::*;
+
 #[cfg(unix)]
 mod skuld_db_dir;
 #[cfg(unix)]

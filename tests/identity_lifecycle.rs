@@ -9,13 +9,11 @@ use std::time::{Duration, SystemTime};
 
 use cosca::identity::ProcessId;
 
-// All four are used only by the serde-gated tests at the end of this file; ungated they
+// All three are used only by the serde-gated tests at the end of this file; ungated they
 // would be unused imports with the feature off. The body above reaches `Liveness` through
 // fully-qualified paths, which does not count as a use of an import.
 #[cfg(feature = "serde")]
 use cosca::identity::{Existence, Liveness, ProcessIdRecord};
-#[cfg(feature = "serde")]
-use std::io::BufRead;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -185,38 +183,18 @@ fn helper_write_own_record() {
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
 
-/// Whether `stream` carries [`RECORD_READY`] before it ends, wherever on a line it sits: in
-/// single-thread mode libtest's banner can share the line.
-#[cfg(feature = "serde")]
-fn marker_seen(stream: impl Read) -> bool {
-    std::io::BufReader::new(stream)
-        .lines()
-        .map_while(Result::ok)
-        .any(|l| l.contains(RECORD_READY))
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn the_marker_is_found_on_its_own_line() {
-    assert!(marker_seen(format!("running 1 test\n{RECORD_READY}\n").as_bytes()));
-}
-
-/// In single-thread mode libtest prints `test <name> ... ` before the body runs, so a body's
-/// first output lands on that line.
 #[cfg(feature = "serde")]
 #[test]
 fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
-    assert!(marker_seen(
-        format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n").as_bytes()
-    ));
+    let stream = format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n");
+    assert!(common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
 #[cfg(feature = "serde")]
 #[test]
 fn a_stream_without_the_marker_is_not_ready() {
-    assert!(!marker_seen(
-        "running 1 test\ntest helper_write_own_record ... \n".as_bytes()
-    ));
+    let stream = "running 1 test\ntest helper_write_own_record ... \n";
+    assert!(!common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
 #[test]
@@ -230,21 +208,85 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let mut child = common::spawn_locked(
         common::test_reexec::command(exe)
             // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
+
+// Both consts are used only by the two serde-gated tests below; ungated they would be
+// dead with the feature off.
+#[cfg(feature = "serde")]
+const RECORD_VAR: &str = "COSCA_IDENTITY_TEST_RECORD_PATH";
+/// Printed by the helper on stdout once its record file is complete.
+#[cfg(feature = "serde")]
+const RECORD_READY: &str = "COSCA_RECORD_WRITTEN";
+
+/// Re-exec helper: when `RECORD_VAR` names a path, write this process's own identity
+/// record there, announce it on stdout, then block on stdin so the parent controls the
+/// exit. The record is produced by a genuinely different process — a real cross-process
+/// restart, not a round trip inside one test. Inert in a normal run, like
+/// `helper_block_on_stdin` above.
+#[test]
+#[cfg(feature = "serde")]
+fn helper_write_own_record() {
+    let Some(path) = std::env::var_os(RECORD_VAR) else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let record = ProcessId::current().to_record().expect("to_record");
+    let json = serde_json::to_string(&record).expect("serialize");
+    // Write-then-rename: the parent must never observe a half-written file. Rename over an
+    // existing name is atomic on all three platforms.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json).expect("write record");
+    std::fs::rename(&tmp, &path).expect("rename record into place");
+    // The handshake proper: a byte on the pipe, not an elapsed interval.
+    println!("{RECORD_READY}");
+    use std::io::Write;
+    std::io::stdout().flush().expect("flush");
+    let mut buf = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut buf);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
+    let stream = format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n");
+    assert!(common::marker_seen(stream.as_bytes(), RECORD_READY));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_stream_without_the_marker_is_not_ready() {
+    let stream = "running 1 test\ntest helper_write_own_record ... \n";
+    assert!(!common::marker_seen(stream.as_bytes(), RECORD_READY));
+}
+
+#[test]
+#[cfg(feature = "serde")]
+fn an_identity_written_by_another_process_restores_and_names_that_process() {
+    use cosca::Process;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("id.json");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = common::spawn_locked(
+        common::test_reexec::command(exe)
+            // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
+<<<<<<< HEAD
             // `--nocapture` is what lets the helper's marker reach our pipe at all.
             .args(["helper_write_own_record", "--exact", common::test_reexec::NOCAPTURE])
+=======
+            // `--nocapture` is what lets the helper's marker reach our pipe at all, and one test
+            // thread makes libtest print its `test <name> ... ` banner ahead of it on every host.
+            .args(["helper_write_own_record", "--exact", common::test_reexec::NOCAPTURE, "--test-threads=1"])
             .env(RECORD_VAR, &path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
+            .stderr(Stdio::inherit()),
     )
     .expect("spawn helper");
 
-    // Synchronise on the pipe: read lines until the marker. libtest prints its own banner
-    // first, so scan rather than reading a single line. EOF without the marker means the
-    // helper died before writing — a real failure, reported as one.
-    // Borrowed, so the pipe stays open: libtest in the helper writes its report after the body,
-    // and fails the run (exit 101) if it cannot.
-    let ready = marker_seen(child.stdout.as_mut().expect("piped stdout"));
+    // Synchronise on the pipe, not on time. EOF without the marker means the helper died first.
+    // Borrowed, so the pipe stays open: libtest in the helper reports after the body and fails if
+    // stdout is closed.
+    let ready = common::marker_seen(child.stdout.as_mut().expect("piped stdout"), RECORD_READY);
     assert!(ready, "the helper exited without writing its record");
 
     let json = std::fs::read_to_string(&path).expect("the record file is complete by now");
