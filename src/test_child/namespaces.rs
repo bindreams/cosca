@@ -6,6 +6,9 @@
 //! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. Run them in a container,
 //! VM, or CI's root lane, never on a developer host.
 
+mod chroot_scratch;
+pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch};
+
 use std::path::Path;
 
 use rustix::mount::{mount, mount_bind, mount_change, MountPropagationFlags};
@@ -21,6 +24,13 @@ pub(crate) fn enabled() -> bool {
 /// Re-exec this binary on `fixture`, to run as the child half of a test.
 pub(crate) fn run(fixture: &str) {
     super::run_fixture_command(fixture, super::fixture_command(fixture));
+}
+
+/// [`run`] with `env` set on the child only.
+pub(crate) fn run_with_env(fixture: &str, env: &[(&str, &Path)]) {
+    let mut cmd = super::fixture_command(fixture);
+    cmd.envs(env.iter().copied());
+    super::run_fixture_command(fixture, cmd);
 }
 
 /// Whether this process is the re-exec'd child of [`run`]; a fixture is also picked up by an

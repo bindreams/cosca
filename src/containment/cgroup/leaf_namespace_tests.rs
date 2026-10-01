@@ -7,6 +7,12 @@ use crate::identity::ProcDir;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 
+/// The mount point `fixture_cleanup_over_mount` puts a tmpfs on, under the chroot root.
+const MOUNT_POINT_ENV: &str = "COSCA_FIXTURE_MOUNT_POINT";
+
+/// The empty directory `fixture_leaf_no_proc` chroots into, made and removed by its driver.
+const CHROOT_ROOT_ENV: &str = "COSCA_FIXTURE_CHROOT_ROOT";
+
 /// Whether to run: the `CGROUP` group is on, as well as the `NAMESPACES` one.
 fn enabled() -> bool {
     ns::enabled() && crate::test_support::require_group("CGROUP")
@@ -64,7 +70,56 @@ fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
     if !enabled() {
         return;
     }
-    ns::run(fixture_path!(fixture_leaf_no_proc));
+    // `TMPDIR` is `scratch`, so anything the fixture leaves in the temp dir is caught below.
+    let dirs = ns::ChrootScratch::new();
+    ns::run_with_env(
+        fixture_path!(fixture_leaf_no_proc),
+        &[("TMPDIR", dirs.scratch()), (CHROOT_ROOT_ENV, dirs.root())],
+    );
+    dirs.finish().unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The cleanup never deletes recursively: with a mount inside the chroot root it fails, naming
+/// what is there, and what the mount holds survives.
+///
+/// Mutant: `ChrootScratch::finish` removes recursively.
+#[test]
+fn namespaces_a_failed_chroot_cleanup_never_deletes_through_a_mount() {
+    if !ns::enabled() {
+        return;
+    }
+    let dirs = ns::ChrootScratch::new();
+    let mnt = dirs.root().join("mnt");
+    std::fs::create_dir(&mnt).expect("mkdir the mount point");
+    ns::run_with_env(
+        fixture_path!(fixture_cleanup_over_mount),
+        &[(CHROOT_ROOT_ENV, dirs.root()), (MOUNT_POINT_ENV, &mnt)],
+    );
+    // The mount lived in the child's namespace: here `mnt` is an empty directory again.
+    let (scratch, root) = (dirs.scratch().to_owned(), dirs.root().to_owned());
+    let err = dirs.finish().expect_err("a root holding a directory is not removable");
+    assert!(err.contains("mnt"), "{err}");
+    assert!(mnt.is_dir(), "the cleanup removed {mnt:?}");
+    std::fs::remove_dir(&mnt).expect("remove the mount point");
+    std::fs::remove_dir(&root).expect("remove the chroot root");
+    std::fs::remove_dir(&scratch).expect("remove the scratch directory");
+}
+
+#[test]
+fn fixture_cleanup_over_mount() {
+    if !ns::is_child() {
+        return;
+    }
+    ns::enter_private_mount_ns();
+    let root = std::env::var_os(CHROOT_ROOT_ENV).expect("the driver names the chroot root");
+    let mnt = std::path::PathBuf::from(std::env::var_os(MOUNT_POINT_ENV).expect("the driver names the mount"));
+    ns::mount_tmpfs(&mnt);
+    let evidence = mnt.join("evidence");
+    std::fs::write(&evidence, b"x").expect("write through the mount");
+
+    let err = ns::remove_chroot_root(std::path::Path::new(&root)).expect_err("a root holding a mount is not removable");
+    assert!(err.contains("mnt"), "{err}");
+    assert!(evidence.is_file(), "the cleanup reached through the mount");
 }
 
 #[test]
@@ -74,8 +129,8 @@ fn fixture_leaf_no_proc() {
     }
     let (leaf, mut member, _own) = occupied_leaf();
     let pid = member.id();
-    let empty = tempfile::tempdir().expect("tempdir");
-    ns::chroot_into(empty.path());
+    let root = std::env::var_os(CHROOT_ROOT_ENV).expect("the driver names the chroot root");
+    ns::chroot_into(std::path::Path::new(&root));
 
     let err = leaf.holds(pid).expect_err("a missing /proc has no membership to read");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
