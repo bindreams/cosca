@@ -123,7 +123,7 @@
     },
     {
       "customType": "regex",
-      "description": "cargo-nextest: one version in ci.yaml, windows-probes.yaml and .config/nextest.toml, moved together",
+      "description": "cargo-nextest: one version in ci.yaml, windows-probes.yaml and .config/nextest.toml. Read from GitHub releases, like the devvm manager below, so one run moves every copy or none",
       "managerFilePatterns": [
         "/^\\.github/workflows/(ci|windows-probes)\\.yaml$/",
         "/^\\.config/nextest\\.toml$/"
@@ -132,11 +132,12 @@
         "NEXTEST_VERSION: \"(?<currentValue>[^\"]+)\"",
         "nextest-version = \\{ required = \"(?<currentValue>[^\"]+)\" \\}"
       ],
-      "depNameTemplate": "cargo-nextest",
-      "datasourceTemplate": "crate",
+      "depNameTemplate": "nextest-rs/nextest",
+      "datasourceTemplate": "github-releases",
       "depTypeTemplate": "ci-tool",
       "matchStringsStrategy": "any",
-      "versioningTemplate": "semver"
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^cargo-nextest-(?<version>.+)$"
     },
     {
       "customType": "regex",
@@ -145,7 +146,7 @@
         "/^scripts/devvm/provision/(linux-rust\\.sh|windows-rust\\.ps1)$/"
       ],
       "matchStrings": [
-        "NEXTEST_TAG=\"(?<currentValue>cargo-nextest-[^\"]+)\" NEXTEST_SHA256=\"(?<currentDigest>[0-9a-f]{64})\"",
+        "NEXTEST_TAG_[A-Z0-9_]+=\"(?<currentValue>cargo-nextest-[^\"]+)\" NEXTEST_SHA256_[A-Z0-9_]+=\"(?<currentDigest>[0-9a-f]{64})\"",
         "\\$nextestTag = \"(?<currentValue>cargo-nextest-[^\"]+)\"; \\$nextestSha256 = \"(?<currentDigest>[0-9a-f]{64})\""
       ],
       "depNameTemplate": "nextest-rs/nextest",
