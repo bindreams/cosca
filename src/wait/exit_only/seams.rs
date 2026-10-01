@@ -56,6 +56,8 @@ thread_local! {
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
     #[cfg(target_os = "linux")]
     static FORCED_VISIBLE_NONE: Cell<bool> = const { Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static WAITID_OBSERVER: RefCell<Option<Box<dyn FnMut(u32)>>> = const { RefCell::new(None) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
     static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
     static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
@@ -113,6 +115,27 @@ pub(crate) fn force_visible_none_once() -> Forced {
 #[cfg(target_os = "linux")]
 pub(crate) fn take_forced_visible_none() -> bool {
     FORCED_VISIBLE_NONE.with(Cell::take)
+}
+
+/// Every `waitid` this thread makes reports its `options` to `observer`, until the guard drops.
+/// The observer may panic: that fails the test at the call that broke the contract.
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_waitid(observer: impl FnMut(u32) + 'static) -> Forced {
+    WAITID_OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(observer)));
+    Forced(|| WAITID_OBSERVER.with(|o| *o.borrow_mut() = None))
+}
+
+/// A `waitid` with these raw `options` is about to run on this thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn waitid_called(options: u32) {
+    // Taken out for the call, so an observer that panics leaves no borrow behind.
+    let observer = WAITID_OBSERVER.with(|o| o.borrow_mut().take());
+    if let Some(mut observer) = observer {
+        observer(options);
+        WAITID_OBSERVER.with(|o| {
+            o.borrow_mut().get_or_insert(observer);
+        });
+    }
 }
 
 /// Record that the holder is about to take `step`, and run the hook registered for it, if any.

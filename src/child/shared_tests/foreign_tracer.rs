@@ -158,9 +158,9 @@ fn await_blocked_or_finished(tid: libc::pid_t) -> Holder {
 /// Mutants: a `waitid` that finds no record read as the child being gone (`try_wait` fails); a
 /// holder that spins instead of blocking, whether by re-polling, by looping on the reap, or by a
 /// non-blocking peek in place of the blocking `waitid` (a second `Poll` or `Reap` is reported
-/// before any `BlockingWaitid`, so the driver fails instead of waiting for one); a blocking
-/// `waitid` that is `WNOHANG` (the holder asserts `si_pid`, as the tracee is still held, and the
-/// driver sees the thread gone); a blocking `waitid` under the lock; a `wait` that returns before
+/// before any `BlockingWaitid`, so the driver fails instead of waiting for one), or a `WNOHANG`
+/// poll loop inside it (the observer fails the first `waitid` that has `WNOHANG`); a blocking
+/// `waitid` that is `WNOHANG` (the observer fails it, and the holder's `si_pid` assert would); a blocking `waitid` under the lock; a `wait` that returns before
 /// the tracer's reap.
 #[test]
 fn a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait() {
@@ -257,6 +257,20 @@ fn hand_back(go_byte: u8) {
             let _first_reap = exit_seams::on_holder_step(HolderStep::Reap, || {});
             let _second_poll = exit_seams::on_holder_step(HolderStep::Poll, spin(HolderStep::Poll));
             let _second_reap = exit_seams::on_holder_step(HolderStep::Reap, spin(HolderStep::Reap));
+            // The first `waitid` after `BlockingWaitid` is the blocking one. A `WNOHANG` call is a
+            // holder that emulates the block by polling: it fails here, at that call, instead of
+            // hanging the driver.
+            let waited = Cell::new(false);
+            let armed = Rc::clone(&blocked);
+            let _observer = exit_seams::observe_waitid(move |options| {
+                if armed.get() && !waited.replace(true) {
+                    assert_eq!(
+                        options & libc::WNOHANG as u32,
+                        0,
+                        "the visible-exit wait made a WNOHANG waitid ({options:#x}) instead of blocking in its first"
+                    );
+                }
+            });
             let at_block = tx.clone();
             let _hook = exit_seams::on_holder_step(HolderStep::BlockingWaitid, move || {
                 blocked.set(true);

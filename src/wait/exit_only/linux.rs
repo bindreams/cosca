@@ -17,6 +17,8 @@ fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
 /// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
 /// zeroes the `siginfo_t` first). `EINTR` retries.
 pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
+    #[cfg(test)]
+    super::seams::waitid_called(options.bits());
     loop {
         match waitid(WaitId::PidFd(fd), options) {
             Ok(status) => {
@@ -97,18 +99,14 @@ pub(super) fn wait_visible_exit(target: &Target<'_>, pid: u32) -> io::Result<Pee
 /// not expose. `EINTR` retries.
 fn blocking_waitid_record(fd: BorrowedFd<'_>, pid: u32) -> Result<Option<Record>, Errno> {
     use std::os::fd::AsRawFd as _;
+    let options = libc::WEXITED | libc::WNOWAIT;
+    #[cfg(test)]
+    super::seams::waitid_called(options as u32);
     loop {
         // SAFETY: an all-zero `siginfo_t` is a valid value.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is a live pidfd and `info` is a valid out-pointer.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PIDFD,
-                fd.as_raw_fd() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
+        let rc = unsafe { libc::waitid(libc::P_PIDFD, fd.as_raw_fd() as libc::id_t, &mut info, options) };
         if rc == -1 {
             match Errno::from_io_error(&io::Error::last_os_error()) {
                 Some(Errno::INTR) => continue,
