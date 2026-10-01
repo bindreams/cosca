@@ -10,6 +10,13 @@
   "platformAutomerge": true,
   "packageRules": [
     {
+      "description": "Cargo.toml keeps library version ranges; the lockfile is the pin, so updates within range touch only Cargo.lock",
+      "matchManagers": [
+        "cargo"
+      ],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
       "description": "Group non-major GitHub Actions updates",
       "matchManagers": [
         "github-actions"
