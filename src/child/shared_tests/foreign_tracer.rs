@@ -50,7 +50,9 @@ fn foreign_tracer_helper() {
         .parse()
         .expect("a pid");
     // SAFETY: a plain ptrace request on the driver's child.
-    let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) };
+    // `ptrace` is variadic, and glibc reads `addr` and `data` as pointers.
+    let null = std::ptr::null_mut::<libc::c_void>;
+    let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, null(), null()) };
     assert_eq!(rc, 0, "PTRACE_SEIZE: {}", std::io::Error::last_os_error());
     say("seized");
     let mut go = [0u8; 1];
