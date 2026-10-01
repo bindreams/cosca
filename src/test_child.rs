@@ -824,11 +824,10 @@ pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_S
 /// intermediate process would itself own and then close on its own exit, which a
 /// caller-chosen `grace` can easily outlive. The grandchild's own connect-and-tag is thus the
 /// happens-before edge the caller blocks on: it cannot tag until its own code is running, in
-/// its own group. The tag goes out over a real TCP socket, not `print!`/`io::stdout()`: libtest
-/// captures the latter per-test and discards it for a passing test, so a stdout-based readiness
-/// byte never reaches the caller's piped reader at all — this is the same control-channel shape
-/// `tests/common`'s `spawn_tree`/`spawn_tree_async` tag handshake already uses for exactly this
-/// reason, not a Windows-specific mechanism. The job object still tracks the grandchild as a
+/// its own group. The tag goes out over a real TCP socket, not `print!`/`io::stdout()`: the
+/// grandchild's stdout is null, so a stdout-based readiness byte never reaches the caller at all
+/// — this is the same control-channel shape `tests/common`'s `spawn_tree`/`spawn_tree_async` tag
+/// handshake already uses, not a Windows-specific mechanism. The job object still tracks the grandchild as a
 /// tree member despite its own process group (job membership and process group are independent
 /// Win32 concepts), so it shows up as a `MembersRemain` survivor even though the signal itself
 /// never reaches it, and it stays that way for as long as the caller holds its control socket

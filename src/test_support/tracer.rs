@@ -660,7 +660,7 @@ fn uh_tracee_fixture() {
             _ => caught |= 1 << (signal - 1),
         }
     }
-    // Raw `stdout()`, not `println!`, which libtest captures.
+    // Written and flushed explicitly, so a failed write is reported by `expect`.
     let line = format!("\n{TRACEE_READY} blocked={blocked} pgrp={pgrp} caught={caught} ignored={ignored}\n");
     let mut out = std::io::stdout().lock();
     out.write_all(line.as_bytes())

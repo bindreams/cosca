@@ -797,8 +797,8 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MAX_BACKOFF)
 }
 
-/// Writes `\n<marker> <text>\n` to the report pipe through raw `io::stdout()` (libtest
-/// captures `println!`). `false` if the write failed: the test is gone.
+/// Writes `\n<marker> <text>\n` to the report pipe (stdout) and flushes it. `false` if the write
+/// failed: the test is gone.
 #[must_use]
 fn write_report(marker: &str, text: &str) -> bool {
     use std::io::Write as _;

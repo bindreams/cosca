@@ -519,8 +519,8 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // process would itself own and then close on its own exit. That connect-and-tag IS the
 // happens-before edge (the grandchild cannot tag until its own code is running, in its own
 // group), over the same control-channel shape `tests/common::spawn_tree` uses (a stdout byte
-// would not work here: libtest captures a passing test's own `print!` output and discards it, so
-// it would never reach a piped reader — see the fixture's own doc). `sock` is held for this
+// would not work here: the fixture's stdout is not wired to this test, and a passing test's output
+// need not survive the harness's capture — see the fixture's own doc). `sock` is held for this
 // whole test: dropping it would deliver EOF and let the grandchild exit on its own, defeating
 // the MembersRemain fixture.
 #[cfg(windows)]
