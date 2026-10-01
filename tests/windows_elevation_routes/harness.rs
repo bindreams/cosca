@@ -343,9 +343,17 @@ impl Eq for EnvKeyIgnoreCase {}
 /// merged the same case-insensitive way `CreateProcess*` itself looks up the block — see that
 /// type's doc.
 pub(crate) fn env_block(extra: &[(&str, String)]) -> Vec<u16> {
+    env_block_from(std::env::vars_os(), extra)
+}
+
+/// [`env_block`] over an explicit `environment`, so a test can name what the caller inherited.
+fn env_block_from(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    extra: &[(&str, String)],
+) -> Vec<u16> {
     const ALLOWLIST: [&str; 6] = ["SYSTEMROOT", "PATH", "TEMP", "TMP", "COMSPEC", "PATHEXT"];
     let mut map: BTreeMap<EnvKeyIgnoreCase, String> = BTreeMap::new();
-    for (k, v) in std::env::vars_os() {
+    for (k, v) in environment {
         let k = k.to_string_lossy().into_owned();
         let upper = k.to_ascii_uppercase();
         if ALLOWLIST.contains(&upper.as_str()) || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
@@ -363,6 +371,17 @@ pub(crate) fn env_block(extra: &[(&str, String)]) -> Vec<u16> {
     }
     block.push(0);
     block
+}
+
+/// The `extra` entry of [`env_block`] that gives a child its skuld coordination directory.
+///
+/// Skuld opens its DB for every test, beside the executable by default, and panics when the
+/// directory is unusable. A child under another account or a lowered token cannot write beside
+/// the executable, so it gets `dir`: the directory the caller already prepared for it. Not
+/// forwarded from this process's environment, for the reason [`env_block`] gives: that directory
+/// belongs to this process's own account.
+pub(crate) fn skuld_db_dir(dir: &Path) -> (&'static str, String) {
+    ("SKULD_DB_DIR", dir.display().to_string())
 }
 
 /// The command line that re-runs this test binary's `token_filtering::measure_this_token`.
@@ -752,6 +771,7 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE, ancestor_co
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
             ("COSCA_PROBE_CHILD", "1".into()),
+            skuld_db_dir(dir.path()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
@@ -949,3 +969,7 @@ impl Drop for ScratchAccount {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "harness_tests.rs"]
+mod harness_tests;

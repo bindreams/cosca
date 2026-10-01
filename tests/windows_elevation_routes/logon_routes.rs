@@ -13,8 +13,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::harness::{
-    contain, env_block, report_cmdline, require_gate, splice_child_report, wait_for, wide, ScratchAccount,
-    CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    contain, env_block, report_cmdline, require_gate, skuld_db_dir, splice_child_report, wait_for, wide,
+    ScratchAccount, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -156,6 +156,7 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
         ("COSCA_PROBE_ENV_CANARY", "carried-through".into()),
         ("TEMP", dir.path().display().to_string()),
         ("TMP", dir.path().display().to_string()),
+        skuld_db_dir(dir.path()),
     ]);
     let mut cmd = wide(&report_cmdline(&exe));
     let user = wide(&account.user);
