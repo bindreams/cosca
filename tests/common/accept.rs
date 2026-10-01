@@ -192,9 +192,8 @@ thread_local! {
     static ARMED_WATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The pids the most recent death-watched wait on this thread armed, target first. Meant to be
-/// read from a [`with_armed_hook`] hook, which runs right after the arming that set it; empty
-/// once the hook is removed.
+/// The pids the latest death-watched wait on this thread armed, target first; read it from a
+/// [`with_armed_hook`] hook.
 pub fn armed_watch() -> Vec<u32> {
     ARMED_WATCH.with(|w| w.borrow().clone())
 }
@@ -220,7 +219,6 @@ pub fn with_armed_hook<R>(hook: impl FnMut() + 'static, body: impl FnOnce() -> R
     body()
 }
 
-/// Called by each platform wait after arming `target` and `also`, before it blocks.
 pub(crate) fn notify_armed(target: u32, also: Option<ProcessId>) {
     // The hook is taken out for the call so that it can itself install nothing and re-enter
     // nothing; it goes back afterwards, in case the wait loops and arms again.
@@ -249,7 +247,7 @@ pub(crate) fn notify_armed(target: u32, also: Option<ProcessId>) {
 ///
 /// Every accepted socket is HELD (returned, never dropped) until both have arrived: testbin's
 /// `control-*` modes exit when their socket closes, so a dropped member would make the watched
-/// root exit and be correctly reported. The same rule binds any caller doing its own accepts.
+/// root exit and be correctly reported.
 pub fn accept_tree_also(
     listener: &TcpListener,
     target: &mut impl Target,

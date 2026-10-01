@@ -539,9 +539,7 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     cmd.env(crate::test_child::ack::ACK_ENV, "1");
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
-    // The fixture exits at once and its group-signal-immune descendant is the one that connects,
-    // so the fixture's own pid cannot be watched: the job draining is the death of every possible
-    // connector. A watcher thread records `wait_tree`'s result into `drained` when it returns.
+    // The fixture exits at once and its descendant connects: see `accept_or_signalled`.
     let drained = crate::test_child::DrainSignal::new();
     std::thread::scope(|scope| {
         scope.spawn(|| drained.watch(|| child.wait_tree()));
