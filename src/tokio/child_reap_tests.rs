@@ -23,12 +23,9 @@ async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
             ::tokio::process::Command::from(crate::test_reexec::command(
                 std::env::current_exe().expect("current_exe"),
             ))
-            .args([
-                "--test-threads=1",
-                "--exact",
+            .args(crate::test_reexec::fixture_args(
                 crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_TEST,
-                "--nocapture",
-            ])
+            ))
             .env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, &addr)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
@@ -111,9 +108,7 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
     cmd.executable(std::env::current_exe().expect("current_exe"))
         // `cosca::Command::args` is the FULL argv; libtest drops slot 0 as the binary name.
         .args(["cosca_unit_tests", "--exact", "__cosca_no_such_test__"]);
-    for var in crate::test_reexec::SCRUBBED_ENV {
-        cmd.env_remove(var);
-    }
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     cmd.stderr(crate::stdio::Stdio::null()).expect("stderr null");
     // NO `spawn_lock()` here: this is a cosca spawn, which takes it internally, and it is a plain

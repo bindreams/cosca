@@ -2,24 +2,6 @@
 //! assumptions a test's assertion leans on, run against the fixture alone so a wrong one fails
 //! here and not as a confusing failure elsewhere.
 
-/// Skuld's capture is fd-level and drops a passing test's bytes, so the gate line and every
-/// stdout-based handshake need the child to run uncaptured.
-#[test]
-fn fixture_command_disables_capture() {
-    let cmd = crate::test_child::fixture_command("m::t");
-    assert!(
-        cmd.get_args().any(|arg| arg == "--nocapture"),
-        "{:?}",
-        cmd.get_args().collect::<Vec<_>>()
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn fixture_argv_disables_capture() {
-    assert!(crate::test_child::fixture_argv("m::t").contains(&"--nocapture"));
-}
-
 #[cfg(unix)]
 mod restore_mode_tests {
     use crate::test_child::RestoreMode;

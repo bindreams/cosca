@@ -241,9 +241,7 @@ fn fixture_load_exact_probe() {
     c.raw_executable(PROBE)
         .args([PROBE, "--exact", "__cosca_no_such_test__"])
         .current_dir(current_dir);
-    for var in crate::test_reexec::SCRUBBED_ENV {
-        c.env_remove(var);
-    }
+    crate::test_reexec::scrub_env(|var| _ = c.env_remove(var));
     c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
     let image = image(&c).expect("target").unwrap();
@@ -269,9 +267,7 @@ fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
         .args(crate::test_child::fixture_argv(FIXTURE_LOAD_EXACT_PROBE_TEST))
         .env(FIXTURE_LOAD_EXACT_PROBE_ENV, current_dir)
         .current_dir(process_cwd);
-    for var in crate::test_reexec::SCRUBBED_ENV {
-        c.env_remove(var);
-    }
+    crate::test_reexec::scrub_env(|var| _ = c.env_remove(var));
     // libtest writes its banner to fd 1 directly, past its own capture.
     c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     c.stderr(crate::stdio::Stdio::null()).expect("stderr null");

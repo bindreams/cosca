@@ -218,7 +218,7 @@ pub(crate) mod test_clock {
     /// advance and would spin forever.
     ///
     /// While the thread is panicking (a Drop path) a second panic would abort the process without
-    /// a word, so the violation is written to stderr with a raw write, and the
+    /// a word, so the violation is written to stderr, and the
     /// process exits at once with [`VIOLATION_EXIT_CODE`]: loud, and never a spin.
     pub(crate) struct RoundCheck {
         site: &'static str,

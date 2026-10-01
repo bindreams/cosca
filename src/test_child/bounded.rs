@@ -86,7 +86,7 @@ pub(crate) fn watchdog(name: &'static str, bound: Duration) -> Watchdog {
     let (tx, rx) = channel::<()>();
     std::thread::spawn(move || {
         if rx.recv_timeout(bound) == Err(RecvTimeoutError::Timeout) {
-            // Stderr is unbuffered, so the line is out before the abort.
+            // `writeln!`, not `eprintln!`: a failed write must not panic before the abort.
             _ = writeln!(
                 std::io::stderr(),
                 "WATCHDOG: {name} still running after {bound:?}; last step: {}",

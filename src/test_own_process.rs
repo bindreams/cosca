@@ -91,7 +91,13 @@ pub(crate) enum Role {
 /// `--include-ignored` lets the child run an `#[ignore]`d gated test. `--nocapture` keeps skuld's
 /// fd-level capture from swallowing the child's stdout and stderr, which the parent reports.
 pub(crate) fn child_args(test: &str) -> [&str; 5] {
-    ["--exact", test, "--test-threads=1", "--include-ignored", "--nocapture"]
+    [
+        "--exact",
+        test,
+        "--test-threads=1",
+        "--include-ignored",
+        super::test_reexec::NOCAPTURE,
+    ]
 }
 
 /// Classifies a process from its inherited [`ENV`] value, its real parent's pid and its argv; see

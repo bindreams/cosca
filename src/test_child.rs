@@ -462,7 +462,7 @@ pub(crate) fn fixture_command(fixture: &str) -> std::process::Command {
 /// The argv, env and stdio common to every fixture re-exec, split out for a caller that supplies
 /// its own program path.
 pub(crate) fn configure_fixture_command(cmd: &mut std::process::Command, fixture: &str) {
-    cmd.args(["--test-threads=1", "--exact", fixture, "--nocapture"])
+    cmd.args(crate::test_reexec::fixture_args(fixture))
         .env(FIXTURE_PARENT_PID_ENV, std::process::id().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -560,9 +560,6 @@ pub(crate) fn is_marked_fixture_reexec(marker_env: &str) -> bool {
 pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::process::Output {
     let mut cmd = fixture_command(fixture);
     cmd.env(marker_env, std::process::id().to_string());
-    // `fixture_command` passes `--nocapture`, so the child never captures its own output and
-    // `RUST_TEST_NOCAPTURE` cannot change it. A fixture that dies without writing what the driver
-    // looks for is caught by its exit status.
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     child.wait_with_output().expect("wait for fixture child")
 }
@@ -792,9 +789,10 @@ pub(crate) fn assert_killed(who: &str, status: std::process::ExitStatus) {
 /// option placed there is silently eaten and `--exact` degrades to substring matching.
 /// `--test-threads=1` keeps a future filter that matches more than one test from running them
 /// concurrently inside a process the caller is about to signal.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn fixture_argv(test: &str) -> [&str; 5] {
-    ["cosca_unit_tests", "--test-threads=1", "--exact", test, "--nocapture"]
+    let [threads, exact, test, nocapture] = crate::test_reexec::fixture_args(test);
+    ["cosca_unit_tests", threads, exact, test, nocapture]
 }
 
 /// The fully-qualified libtest path of [`fixture_survives_group_signal`], for callers that
@@ -825,9 +823,7 @@ pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_S
 /// caller-chosen `grace` can easily outlive. The grandchild's own connect-and-tag is thus the
 /// happens-before edge the caller blocks on: it cannot tag until its own code is running, in
 /// its own group. The tag goes out over a real TCP socket, not `print!`/`io::stdout()`: the
-/// grandchild's stdout is null, so a stdout-based readiness byte never reaches the caller at all
-/// — this is the same control-channel shape `tests/common`'s `spawn_tree`/`spawn_tree_async` tag
-/// handshake already uses, not a Windows-specific mechanism. The job object still tracks the grandchild as a
+/// grandchild's stdout is null, so a stdout-based readiness byte never reaches the caller. The job object still tracks the grandchild as a
 /// tree member despite its own process group (job membership and process group are independent
 /// Win32 concepts), so it shows up as a `MembersRemain` survivor even though the signal itself
 /// never reaches it, and it stays that way for as long as the caller holds its control socket

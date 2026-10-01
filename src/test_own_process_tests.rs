@@ -229,7 +229,6 @@ fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
         &["--exact", TEST],
         &["--exact", TEST, "--test-threads=1"],
         &["--exact", TEST, "--test-threads=4", "--include-ignored", "--nocapture"],
-        // The shape from before `--nocapture`.
         &["--exact", TEST, "--test-threads=1", "--include-ignored"],
         &["--exact", TEST, "--test-threads=1", "--nocapture", "--include-ignored"],
         &["--exact", TEST, "--test-threads=1", "--include-ignored", "other"],
@@ -339,11 +338,6 @@ fn a_completion_dropped_while_panicking_reports_nothing() {
     })
     .expect_err("the closure panics");
     assert_eq!(drained(read), b"");
-}
-
-#[test]
-fn the_child_runs_uncaptured() {
-    assert!(child_args("m::t").contains(&"--nocapture"));
 }
 
 // Pins the flag until #234 removes the last `#[ignore]`; a behavioural test would need an

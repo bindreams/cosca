@@ -47,7 +47,7 @@ pub mod test_own_process;
 #[cfg(unix)]
 #[path = "../../src/test_stdio.rs"]
 pub mod test_stdio;
-// The one way every test re-execs its own binary: scrubs skuld's selection variables.
+// Re-exec builder, shared with the library's tests.
 #[path = "../../src/test_reexec.rs"]
 pub mod test_reexec;
 // The `COSCA_TEST_SETUID` gate, shared with the library's tests.

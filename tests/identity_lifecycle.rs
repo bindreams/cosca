@@ -197,7 +197,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
         common::test_reexec::command(exe)
             // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
             // `--nocapture` is what lets the helper's marker reach our pipe at all.
-            .args(["helper_write_own_record", "--exact", "--nocapture"])
+            .args(["helper_write_own_record", "--exact", common::test_reexec::NOCAPTURE])
             .env(RECORD_VAR, &path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

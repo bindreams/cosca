@@ -4,9 +4,6 @@
 //! CI runs the integration binaries in release.
 #![cfg(debug_assertions)]
 
-#[path = "common/mod.rs"]
-mod common;
-
 /// `#[expect]` fails the build if the guard stops being `#[must_use]`. The `let _ =` form is
 /// covered by the lib crate's lint (`spawn_lock_tests`), which this crate does not enable.
 #[test]
@@ -26,9 +23,6 @@ fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
         // The panic is at lock acquisition, before the program runs.
         let exe = std::env::current_exe().expect("this test binary's path");
         cmd.executable(&exe).args([exe.as_os_str(), "--list".as_ref()]);
-        for var in common::test_reexec::SCRUBBED_ENV {
-            cmd.env_remove(var);
-        }
         let _ = cmd.spawn();
     });
     drop(outer);
