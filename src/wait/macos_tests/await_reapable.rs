@@ -75,6 +75,14 @@ fn stall(d: Duration) {
     crate::wait::test_clock::advance_by_elapsed_if_frozen(d);
 }
 
+/// Hold the frozen clock until the wait's round `round`: the calls before it take no clock time,
+/// however long the runner stalls them. From `round` on, measured time drives the clock again and
+/// runs the deadline out.
+fn hold_the_clock_until_round(round: u32) -> test_hooks::ForcedOnce {
+    let held = crate::wait::test_clock::ZeroElapsedGuard::install();
+    test_hooks::on_kevent_round(round, move || drop(held))
+}
+
 /// A short-lived child that starts and exits inside the wait: its `SIGCHLD` wakes the kqueue with
 /// no event the wait is looking for, exactly as a sibling's exit would.
 fn spurious_wake() {
@@ -87,14 +95,17 @@ fn spurious_wake() {
 /// at most the time remaining when it starts, no round starts at or after the deadline, and the
 /// expired wait takes one final peek. Round 0 is woken by a real `SIGCHLD` before the deadline, so
 /// the wait must go round again, and the test tells that wake from a round after the deadline by
-/// the frozen clock, not by counting rounds (another test's child may wake this one too).
+/// the frozen clock, not by counting rounds (another test's child may wake this one too). The
+/// clock is held until round 1, so a runner stall before it cannot run the deadline out first.
 ///
 /// Mutant: an unbounded `kevent` under a deadline (its `debug_assert!` fires); a round after the
-/// deadline (no expiry check before the block); a timeout above the time remaining; no final peek.
+/// deadline (no expiry check before the block); a timeout above the time remaining; no final peek;
+/// the clock not held (the stall at round 0 ends the wait there).
 #[test]
 fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    let _held = hold_the_clock_until_round(1);
     let limit = Duration::from_millis(30);
     let deadline = at + limit;
     let _hooks = test_hooks::HookGuard::install(|_, _| {});
@@ -137,13 +148,15 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
 
 /// A `kevent` interrupted by a signal is retried with the time remaining now, not the time
 /// remaining when the interrupted call started. The interrupted call is made to spend 10 ms of
-/// the frozen clock.
+/// the frozen clock, which is held until round 0 so a runner stall before it changes nothing.
 ///
-/// Mutant: the timeout computed once, before the retry loop.
+/// Mutant: the timeout computed once, before the retry loop; the clock not held (the stall leaves
+/// less than `spent` for round 0).
 #[test]
 fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    let _held = hold_the_clock_until_round(0);
     let spent = Duration::from_millis(10);
     let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let _eintr = test_hooks::force_eintr_once(spent);
@@ -190,14 +203,16 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
 
 /// The wait's own rounds honour the clamp seam: with the clamp lowered to 10 ms, a 50 ms
 /// deadline is covered by several calls, none longer than the clamp, and the wait still ends only
-/// at the deadline.
+/// at the deadline. The clock is held until round 1, so a runner stall cannot leave round 0 the
+/// only blocking call.
 ///
 /// Mutant: `kevent_round` arms its `kevent` without `kevent_timeout`: one call carries the whole
-/// remaining time.
+/// remaining time; the clock not held (the stall leaves round 0 5 ms, and it ends the wait).
 #[test]
 fn await_reapable_rearms_a_remaining_time_above_the_clamp_in_pieces() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
+    let _held = hold_the_clock_until_round(1);
     let _hooks = test_hooks::HookGuard::install(|_, _| {});
     let clamp = Duration::from_millis(10);
     test_hooks::set_clamp_override(clamp);
