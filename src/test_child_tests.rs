@@ -75,3 +75,66 @@ fn accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     );
     child.wait().expect("reap the target");
 }
+
+/// Windows `accept_or_signalled`: a connection that arrives while nothing has drained is accepted
+/// and acked, and its stream is returned.
+#[cfg(windows)]
+#[test]
+fn death_watch_accept_or_signalled_returns_the_acked_connection_while_nothing_has_drained() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let drained = super::DrainSignal::new();
+    let client = std::thread::spawn(move || {
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        let mut ack = [0u8; 1];
+        sock.read_exact(&mut ack).expect("read the ack");
+        sock.write_all(b"T").expect("write the tag");
+        ack[0]
+    });
+    let mut stream = super::accept_or_signalled(&listener, &drained);
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).expect("read the tag");
+    assert_eq!(&tag, b"T");
+    assert_eq!(client.join().expect("the client"), super::ack::ACK_BYTE);
+}
+
+/// A drain and a queued connection both ready: the drain wins.
+#[cfg(windows)]
+#[test]
+fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_queued() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let _queued = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    let drained = super::DrainSignal::new();
+    drained.record(Ok::<_, String>("AllMembersExited"));
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::accept_or_signalled(&listener, &drained)
+    }))
+    .expect_err("a drain must panic");
+    let message = payload.downcast_ref::<String>().cloned().expect("string panic payload");
+    assert_eq!(
+        message,
+        "the tree drained (\"AllMembersExited\") before anything connected"
+    );
+}
+
+/// A watcher whose `wait_tree` panics still wakes the acceptor, with an error.
+#[cfg(windows)]
+#[test]
+fn death_watch_a_panicking_watcher_wakes_the_acceptor_with_an_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let drained = super::DrainSignal::new();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drained.watch(|| -> Result<(), String> { panic!("wait_tree blew up") })
+    }));
+    assert!(unwound.is_err(), "the watcher's panic must propagate");
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::accept_or_signalled(&listener, &drained)
+    }))
+    .expect_err("an errored watcher must panic");
+    let message = payload.downcast_ref::<String>().cloned().expect("string panic payload");
+    assert_eq!(
+        message,
+        "wait_tree failed while waiting for a connection: the watcher panicked before wait_tree returned"
+    );
+}

@@ -545,11 +545,8 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     // connector. A watcher thread records `wait_tree`'s result into `drained` when it returns.
     let drained = crate::test_child::DrainSignal::new();
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            drained.record(child.wait_tree());
-        });
-        // Whatever happens below, the tree must be killed before the scope joins the watcher, or a
-        // failing assertion would leave the scope waiting on a live tree.
+        scope.spawn(|| drained.watch(|| child.wait_tree()));
+        // The tree is killed before the scope joins the watcher.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Blocks until the survivor has connected, which it does only once it exists in its
             // own process group (see the fixture's own doc).
@@ -566,9 +563,20 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
                 "the sweep must have consumed the forced-failure seam"
             );
         }));
-        // The forced sweep failure was a stub, so the group-signal-immune descendant is still
-        // alive: a real sweep now (the seam is consumed) actually kills it, and drains the job.
-        _ = child.kill_tree();
+        // The forced failure was a stub, so the survivor lives; the real sweep (seam consumed)
+        // kills it and drains the job. A failed kill leaves the watcher joining a live tree, so it
+        // is reported with the assertion that was unwinding.
+        if let Err(e) = child.kill_tree() {
+            let unwinding = outcome.as_ref().err().map(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            panic!(
+                "cleanup kill_tree failed ({e}); the watcher cannot drain a live tree; unwinding from: {unwinding:?}"
+            );
+        }
         if let Err(payload) = outcome {
             std::panic::resume_unwind(payload);
         }
@@ -591,9 +599,7 @@ fn windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_conne
     let child = cmd.spawn().expect("spawn");
     let drained = crate::test_child::DrainSignal::new();
     let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            drained.record(child.wait_tree());
-        });
+        scope.spawn(|| drained.watch(|| child.wait_tree()));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::test_child::accept_or_signalled(&listener, &drained)
         }))
@@ -608,7 +614,7 @@ fn windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_conne
         message.starts_with("the tree drained (") && message.ends_with(") before anything connected"),
         "got: {message:?}"
     );
-    _ = child.wait();
+    child.wait().expect("reap the root");
 }
 
 // A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held

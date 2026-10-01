@@ -940,6 +940,70 @@ fn accept_or_signalled_panics_naming_the_drain_when_wait_tree_returned_ok() {
     );
 }
 
+/// A connection that arrives while nothing has drained is accepted and acked, and its stream is
+/// returned: the success path, with no cgroup involved.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_returns_the_acked_connection_while_nothing_has_drained() {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let drained = common::DrainSignal::new();
+    let client = std::thread::spawn(move || {
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        let mut ack = [0u8; 1];
+        sock.read_exact(&mut ack).expect("read the ack");
+        sock.write_all(b"T").expect("write the tag");
+        ack[0]
+    });
+    let mut stream = common::accept_or_signalled(&listener, &drained);
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).expect("read the tag");
+    assert_eq!(&tag, b"T");
+    assert_eq!(client.join().expect("the client"), common::ack::ACK_BYTE);
+}
+
+/// A drain and a queued connection both ready: the drain wins, as an exit wins in `accept_or_die`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_queued() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let _queued = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    let drained = common::DrainSignal::new();
+    drained.record(Ok::<_, String>("AllMembersExited"));
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "the leaf drained (\"AllMembersExited\") before anything connected"
+    );
+}
+
+/// A watcher whose `wait_tree` panics must still wake the acceptor, with an error.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_a_panicking_watcher_wakes_the_acceptor_with_an_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let drained = common::DrainSignal::new();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drained.watch(|| -> Result<(), String> { panic!("wait_tree blew up") })
+    }));
+    assert!(unwound.is_err(), "the watcher's panic must propagate");
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "wait_tree failed while waiting for a connection: the watcher panicked before wait_tree returned"
+    );
+}
+
+/// An exit wins over a ready source in every platform's wait.
+#[skuld::test]
+fn death_watch_an_exit_wins_over_a_ready_source() {
+    assert_eq!(common::first_ready(true, true), Some(common::Ready::Exit));
+    assert_eq!(common::first_ready(false, true), Some(common::Ready::Source));
+    assert_eq!(common::first_ready(true, false), Some(common::Ready::Exit));
+    assert_eq!(common::first_ready(false, false), None);
+}
+
 fn main() {
     skuld::run_all();
 }
