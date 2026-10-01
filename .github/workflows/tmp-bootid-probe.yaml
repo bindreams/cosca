@@ -1,0 +1,37 @@
+# Throwaway: per-boot identity probe. Do not merge.
+name: tmp bootid probe
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-2022, windows-11-arm]
+        n: [1, 2]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: probe (elevated)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/bootid-probe/probe.ps1
+      - name: runner metadata
+        shell: bash
+        run: echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe
+        run: |
+          echo "boot_id=$(cat /proc/sys/kernel/random/boot_id)"
+          echo "btime=$(grep btime /proc/stat)"
+          echo "uptime=$(cat /proc/uptime)"
+          echo "now=$(date -u +%FT%TZ)"
+          echo "machine_id=$(cat /etc/machine-id)"
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
