@@ -138,3 +138,26 @@ pub fn transcribers(ts: TokenStream) -> Vec<TokenStream> {
         })
         .collect()
 }
+
+/// `#![cfg(..)]`, the crate-level gate a flip hoists.
+pub fn is_cfg_inner(a: &Attribute) -> bool {
+    matches!(a.style, syn::AttrStyle::Inner(_)) && a.path().is_ident("cfg")
+}
+
+/// Why `item` may not appear in the label file, which holds `skuld::label` declarations, their
+/// `use`s and `skuld::default_labels!` lines, and nothing else.
+pub fn label_file_violation(item: &Item) -> Option<String> {
+    let allowed = match item {
+        Item::Use(_) => true,
+        Item::Macro(m) => {
+            let segs: Vec<String> = m.mac.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            segs == ["skuld", "default_labels"]
+        }
+        Item::Verbatim(ts) => {
+            let text = squash(ts);
+            text.contains("#[skuld::label]") && text.contains("const") && text.ends_with("Label;")
+        }
+        _ => false,
+    };
+    (!allowed).then(|| item.to_token_stream().to_string())
+}

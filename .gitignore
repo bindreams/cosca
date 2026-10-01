@@ -7,7 +7,7 @@ __pycache__/
 /.github/fixtures/disallowed-methods/Cargo.lock
 /.github/fixtures/disallowed-methods/target
 
-# scripts/skuld-rewrite is a standalone crate (empty [workspace]); its Cargo.lock is tracked, its build output is not.
+# Standalone crate: its own target dir.
 /scripts/skuld-rewrite/target
 
 # Claude Code

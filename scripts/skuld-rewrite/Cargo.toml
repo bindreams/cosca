@@ -3,9 +3,9 @@ name = "skuld-rewrite"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "One-shot rewriter for plan E: moves cosca's tests onto skuld's harness, and proves the move changed nothing else. Deleted by unit R."
+description = "One-shot rewriter that moves cosca's tests onto skuld's harness and proves nothing else changed."
 
-# Standalone: not a member of the root package, never published.
+# Empty workspace: keeps cargo from adopting this crate into the root package.
 [workspace]
 
 [dependencies]

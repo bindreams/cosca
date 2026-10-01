@@ -5,6 +5,7 @@
 pub mod attr;
 pub mod modtree;
 pub mod rewrite;
+pub mod roots;
 pub mod shapes;
 pub mod targets;
 pub mod verify;

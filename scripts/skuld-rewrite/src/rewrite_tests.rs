@@ -15,7 +15,7 @@ fn rewritten(out: Outcome) -> Vec<(String, String)> {
     match out {
         Outcome::Rewritten(f) => f
             .into_iter()
-            .map(|(p, t)| (p.to_string_lossy().into_owned(), t))
+            .map(|p| (p.path.to_string_lossy().into_owned(), p.after))
             .collect(),
         Outcome::Refused(r) => panic!("unexpected refusal: {r:?}"),
     }
@@ -436,4 +436,118 @@ fn hoisting_deletes_a_crlf_line_whole() {
         ),
         "#[cfg(unix)]\n#[skuld::test]\r\nfn a() {}\r\n"
     );
+}
+
+#[test]
+fn an_unparseable_attribute_that_mentions_test_is_refused() {
+    let src = "macro_rules! m {\n    ($m:meta) => {\n        #[$m test]\n        fn f() {}\n    };\n}\n";
+    assert_eq!(refused_lines(src, Options::default()), [3]);
+    let invoked = "some_macro! {\n    #[$m test]\n    fn f() {}\n}\n";
+    assert_eq!(refused_lines(invoked, Options::default()), [2]);
+    // One that does not mention `test` is somebody else's attribute.
+    let other = "macro_rules! m {\n    ($m:meta) => {\n        #[$m other]\n        fn f() {}\n    };\n}\n";
+    match run(&[("/t/r.rs", other)], &["/t/r.rs"], &[], Options::default()) {
+        Outcome::Rewritten(f) => assert!(f.is_empty()),
+        Outcome::Refused(r) => panic!("{r:?}"),
+    }
+}
+
+#[test]
+fn an_unflipped_root_that_is_also_applied_is_refused() {
+    let files = [("/t/a.rs", "#[test]\nfn a() {}\n"), ("/t/b.rs", "#[test]\nfn b() {}\n")];
+    let Outcome::Refused(r) = run(&files, &["/t/a.rs", "/t/b.rs"], &["/t/b.rs"], Options::default()) else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].path.as_path(), std::path::Path::new("/t/b.rs"));
+    assert!(
+        r[0].reason.contains("unflipped") && r[0].reason.contains("applied"),
+        "{}",
+        r[0].reason
+    );
+}
+
+#[test]
+fn an_unflipped_root_reached_through_an_applied_directory_is_refused() {
+    use crate::modtree::Root;
+    let src = MemSource::new(&[("/t/a.rs", "#[test]\nfn a() {}\n"), ("/t/b.rs", "#[test]\nfn b() {}\n")]);
+    let roots = [
+        Root::crate_root("/t/a.rs"),
+        Root {
+            path: "/t/b.rs".into(),
+            mod_rs_like: true,
+            is_root: false,
+        },
+    ];
+    let out = crate::rewrite::apply_roots(&src, &roots, &[PathBuf::from("/t/b.rs")], Options::default()).unwrap();
+    assert!(
+        matches!(out, Outcome::Refused(r) if r.len() == 1 && r[0].path.as_path() == std::path::Path::new("/t/b.rs"))
+    );
+}
+
+// Writing ---------------------------------------------------------------------------------------
+
+fn planned(dir: &std::path::Path, name: &str, before: &str, after: &str) -> crate::rewrite::Planned {
+    let path = dir.join(name);
+    std::fs::write(&path, before).unwrap();
+    crate::rewrite::Planned {
+        path,
+        before: before.to_owned(),
+        after: after.to_owned(),
+    }
+}
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn commit_writes_every_file_and_leaves_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        planned(dir.path(), "a.rs", "1", "one"),
+        planned(dir.path(), "b.rs", "2", "two"),
+    ];
+    crate::rewrite::commit(&files).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "one");
+    assert_eq!(std::fs::read_to_string(dir.path().join("b.rs")).unwrap(), "two");
+    assert_eq!(names(dir.path()), ["a.rs", "b.rs"]);
+}
+
+#[test]
+fn commit_refuses_a_file_that_changed_since_it_was_planned_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        planned(dir.path(), "a.rs", "1", "one"),
+        planned(dir.path(), "b.rs", "2", "two"),
+    ];
+    std::fs::write(dir.path().join("b.rs"), "edited meanwhile").unwrap();
+    let err = crate::rewrite::commit(&files).unwrap_err().to_string();
+    assert!(err.contains("b.rs") && err.contains("changed"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "1");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.rs")).unwrap(),
+        "edited meanwhile"
+    );
+    assert_eq!(names(dir.path()), ["a.rs", "b.rs"]);
+}
+
+#[test]
+fn commit_writes_nothing_when_a_later_file_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let files = [
+        planned(dir.path(), "a.rs", "1", "one"),
+        planned(&sub, "b.rs", "2", "two"),
+    ];
+    std::fs::remove_dir_all(&sub).unwrap();
+    assert!(crate::rewrite::commit(&files).is_err());
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "1");
+    assert_eq!(names(dir.path()), ["a.rs"]);
 }

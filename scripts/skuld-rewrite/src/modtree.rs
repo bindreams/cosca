@@ -1,6 +1,7 @@
 //! Walking a root's module tree, resolving `#[path]` the way rustc does.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -30,34 +31,42 @@ impl Source for FsSource {
     }
 }
 
-/// A git revision of the repository containing `toplevel`.
+/// One commit of the repository containing `toplevel`, pinned when the source is made so that
+/// every read sees the same tree even if a branch name moves meanwhile.
 pub struct GitSource {
     toplevel: PathBuf,
-    rev: String,
+    commit: String,
 }
 
 impl GitSource {
     /// Fails when `rev` does not name a commit.
     pub fn new(toplevel: &Path, rev: &str) -> Result<Self> {
-        let status = Command::new("git")
+        let out = Command::new("git")
             .arg("-C")
             .arg(toplevel)
             .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
             .arg(format!("{rev}^{{commit}}"))
-            .stdout(Stdio::null())
-            .status()
+            .output()
             .context("running git rev-parse")?;
-        if !status.success() {
+        if !out.status.success() {
             bail!("`{rev}` does not name a commit");
         }
+        let commit = String::from_utf8(out.stdout).context("git printed a non-UTF-8 commit id")?;
         Ok(Self {
             toplevel: toplevel.to_owned(),
-            rev: rev.to_owned(),
+            commit: commit.trim().to_owned(),
         })
+    }
+
+    /// The commit id every read is pinned to.
+    pub fn commit(&self) -> &str {
+        &self.commit
     }
 }
 
 impl Source for GitSource {
+    /// One `cat-file --batch` call answers "missing" in its output and fails on any real error, so
+    /// a git failure can never read as an absent file.
     fn read(&self, path: &Path) -> Result<Option<String>> {
         let rel = path.strip_prefix(&self.toplevel).with_context(|| {
             format!(
@@ -66,31 +75,53 @@ impl Source for GitSource {
                 self.toplevel.display()
             )
         })?;
-        let spec = format!("{}:{}", self.rev, rel.to_string_lossy().replace('\\', "/"));
-        // `cat-file -e` succeeds exactly when the object exists, so a missing file is a status, not text.
-        let exists = Command::new("git")
+        let spec = format!("{}:{}", self.commit, rel.to_string_lossy().replace('\\', "/"));
+        let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.toplevel)
-            .args(["cat-file", "-e"])
-            .arg(&spec)
-            .stderr(Stdio::null())
-            .status()
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("running git cat-file")?;
-        if !exists.success() {
+        child
+            .stdin
+            .take()
+            .context("git cat-file has stdin")?
+            .write_all(format!("{spec}\n").as_bytes())
+            .with_context(|| format!("asking git for {spec}"))?;
+        let out = child.wait_with_output().context("waiting for git cat-file")?;
+        if !out.status.success() {
+            bail!(
+                "git cat-file {spec} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let reply = &out.stdout;
+        let nl = reply
+            .iter()
+            .position(|&b| b == b'\n')
+            .with_context(|| format!("git cat-file {spec} printed no reply"))?;
+        let header = String::from_utf8_lossy(&reply[..nl]).into_owned();
+        if header.ends_with(" missing") {
             return Ok(None);
         }
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.toplevel)
-            .args(["cat-file", "blob"])
-            .arg(&spec)
-            .output()
-            .context("running git cat-file")?;
-        if !out.status.success() {
-            bail!("git cat-file blob {spec} failed");
+        let fields: Vec<&str> = header.split(' ').collect();
+        let [_oid, kind, size] = fields[..] else {
+            bail!("git cat-file {spec} printed an unexpected reply: {header}");
+        };
+        if kind != "blob" {
+            return Ok(None);
         }
+        let size: usize = size
+            .parse()
+            .with_context(|| format!("git cat-file {spec} printed a bad size"))?;
+        let body = reply
+            .get(nl + 1..nl + 1 + size)
+            .with_context(|| format!("git cat-file {spec} printed a short blob"))?;
         Ok(Some(
-            String::from_utf8(out.stdout).with_context(|| format!("{spec} is not UTF-8"))?,
+            String::from_utf8(body.to_vec()).with_context(|| format!("{spec} is not UTF-8"))?,
         ))
     }
 }

@@ -210,3 +210,75 @@ fn an_include_below_a_root_top_level_is_walked_even_when_it_looks_exact() {
         ["/t/tests/r.rs", "/t/tests/src/test_harness.rs"]
     );
 }
+
+fn temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let top = std::fs::canonicalize(dir.path()).unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&top)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir(top.join("d")).unwrap();
+    std::fs::write(top.join("a.rs"), "old\n").unwrap();
+    std::fs::write(top.join("d/x.rs"), "x\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "one"]);
+    (dir, top)
+}
+
+#[test]
+fn git_source_is_pinned_to_the_commit_it_resolved() {
+    let (_d, top) = temp_repo();
+    let src = GitSource::new(&top, "HEAD").unwrap();
+    assert_eq!(src.commit().len(), 40, "{}", src.commit());
+    assert!(src.commit().bytes().all(|b| b.is_ascii_hexdigit()));
+    std::fs::write(top.join("a.rs"), "new\n").unwrap();
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&top)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(["commit", "-q", "-a", "-m", "two"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(src.read(&top.join("a.rs")).unwrap().as_deref(), Some("old\n"));
+}
+
+#[test]
+fn a_git_failure_is_an_error_not_an_absent_file() {
+    let (_d, top) = temp_repo();
+    let src = GitSource::new(&top, "HEAD").unwrap();
+    std::fs::remove_dir_all(top.join(".git")).unwrap();
+    assert!(src.read(&top.join("a.rs")).is_err());
+    assert!(src.read(&top.join("missing.rs")).is_err());
+}
+
+#[test]
+fn a_directory_in_the_revision_is_not_a_file() {
+    let (_d, top) = temp_repo();
+    let src = GitSource::new(&top, "HEAD").unwrap();
+    assert_eq!(src.read(&top.join("d")).unwrap(), None);
+    assert_eq!(src.read(&top.join("d/x.rs")).unwrap().as_deref(), Some("x\n"));
+}

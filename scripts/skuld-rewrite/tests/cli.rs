@@ -65,6 +65,17 @@ fn run(root: &Path, args: &[&str]) -> Output {
     Command::new(BIN).current_dir(root).args(args).output().unwrap()
 }
 
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Runs `args`, expects exit 1, and returns what it printed.
+fn mismatch(root: &Path, args: &[&str]) -> String {
+    let out = run(root, args);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    stderr(&out)
+}
+
 fn code(o: &Output) -> i32 {
     o.status.code().unwrap()
 }
@@ -79,7 +90,11 @@ fn verify_passes_on_an_unchanged_tree() {
 fn verify_fails_when_a_target_is_deleted() {
     let (_d, root) = toy();
     std::fs::remove_file(root.join("tests/b.rs")).unwrap();
-    assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(
+        err.contains("tests/b.rs: target `b` (test) is missing in the new revision"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -99,7 +114,11 @@ fn verify_fails_when_a_target_is_repointed() {
 fn verify_fails_when_a_target_is_added() {
     let (_d, root) = toy();
     write(&root, "tests/c.rs", "#[test]\nfn c() {}\n");
-    assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(
+        err.contains("tests/c.rs: target `c` (test) is missing in the old revision"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -173,17 +192,20 @@ fn append_manifest(root: &Path, text: &str) {
 fn verify_fails_when_a_root_file_changes() {
     let (_d, root) = toy();
     write(&root, "tests/a.rs", "mod common;\n#[test]\nfn a() { panic!() }\n");
-    assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("tests/a.rs: item 1 differs"), "{err}");
 }
 
 #[test]
 fn verify_fails_when_a_module_file_changes() {
     let (_d, root) = toy();
     write(&root, "tests/common/mod.rs", "#[test]\nfn shared() { panic!() }\n");
-    assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("tests/common/mod.rs: item 0 differs"), "{err}");
     let (_d, root) = toy();
     write(&root, "src/quote/applescript.rs", "#[test]\nfn t() { panic!() }\n");
-    assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("src/quote/applescript.rs: item 0 differs"), "{err}");
 }
 
 // Modules and directories -----------------------------------------------------------------------
@@ -228,17 +250,38 @@ fn a_directory_of_crate_roots_resolves_their_modules_as_a_root_would() {
 
 #[test]
 fn verify_fails_when_a_target_is_disabled_or_gated() {
-    for extra in [
-        "[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\ntest = false\n",
-        "[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\nrequired-features = [\"x\"]\n",
-        "[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\nbench = true\n",
-        "[lib]\ndoctest = false\n",
-        "[lib]\ncrate-type = [\"lib\", \"rlib\"]\n",
+    for (extra, field) in [
+        ("[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\ntest = false\n", "test"),
+        (
+            "[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\nrequired-features = [\"x\"]\n",
+            "required_features",
+        ),
+        ("[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\nbench = true\n", "bench"),
+        (
+            "[[test]]\nname = \"b\"\npath = \"tests/b.rs\"\nedition = \"2015\"\n",
+            "edition",
+        ),
+        ("[lib]\ndoctest = false\n", "doctest"),
+        ("[lib]\ncrate-type = [\"lib\", \"rlib\"]\n", "kinds"),
     ] {
         let (_d, root) = toy();
         append_manifest(&root, extra);
-        assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1, "{extra}");
+        let err = mismatch(&root, &["verify", "HEAD"]);
+        assert!(err.contains(&format!("differs in {field}")), "{extra}: {err}");
     }
+}
+
+#[test]
+fn verify_fails_when_the_package_features_change() {
+    let (_d, root) = toy();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace("x = []", "x = []\ny = [\"x\"]"),
+    )
+    .unwrap();
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("Cargo.toml: features of package `toy` differ"), "{err}");
 }
 
 #[test]
@@ -264,7 +307,7 @@ fn verify_allows_the_planned_harness_false_flip_and_nothing_back() {
 
 const FLIP_A: &str = "[[test]]\nname = \"a\"\npath = \"tests/a.rs\"\nharness = false\n";
 
-/// `toy` with a paused tokio test in `a`, applied and flipped, as T would land it.
+/// `toy` with a paused tokio test in `a`, applied and flipped.
 fn flipped() -> (tempfile::TempDir, PathBuf) {
     let (d, root) = toy();
     write(
@@ -312,6 +355,165 @@ fn verify_still_compares_the_files_of_a_flipped_target() {
         };
         assert_ne!(changed, text, "{what}");
         write(&root, a, &changed);
-        assert_eq!(code(&run(&root, &["verify", "HEAD"])), 1, "{what}");
+        let err = mismatch(&root, &["verify", "HEAD"]);
+        assert!(err.contains("tests/a.rs: item"), "{what}: {err}");
     }
+}
+
+// Roots resolve one way for apply and verify ----------------------------------------------------
+
+#[test]
+fn hoisting_through_a_directory_treats_its_targets_as_roots_and_spares_the_harness() {
+    let (_d, root) = toy();
+    write(
+        &root,
+        "tests/a.rs",
+        "#![cfg(unix)]\n#[path = \"../src/test_harness.rs\"]\nmod test_harness;\nmod common;\n#[test]\nfn a() {}\n",
+    );
+    write(&root, "src/test_harness.rs", "#[test]\nfn h() {}\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "harness"]);
+    let out = run(&root, &["apply", "--hoist-crate-cfg", "tests"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let a = read(&root, "tests/a.rs");
+    assert!(
+        !a.contains("#![cfg(unix)]") && a.contains("#[cfg(unix)]\nmod common;"),
+        "{a}"
+    );
+    assert_eq!(read(&root, "src/test_harness.rs"), "#[test]\nfn h() {}\n");
+}
+
+#[test]
+fn an_unflipped_target_inside_an_applied_directory_is_refused() {
+    let (_d, root) = toy();
+    write(&root, "unflipped.txt", "b\n");
+    let out = run(&root, &["apply", "--unflipped", "unflipped.txt", "tests"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/b.rs") && stderr(&out).contains("unflipped"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(read(&root, "tests/b.rs").contains("#[test]"));
+    assert!(read(&root, "tests/a.rs").contains("#[test]"));
+    write(&root, "unflipped.txt", "tests/b.rs\n");
+    assert_eq!(
+        code(&run(
+            &root,
+            &["apply", "--unflipped", "unflipped.txt", "tests/a.rs", "tests/b.rs"]
+        )),
+        2
+    );
+}
+
+#[test]
+fn verify_resolves_directory_and_module_roots_like_apply() {
+    let (_d, root) = toy();
+    assert_eq!(code(&run(&root, &["verify", "HEAD", "src/quote"])), 0);
+    assert_eq!(code(&run(&root, &["verify", "HEAD", "src/quote.rs"])), 0);
+    assert_eq!(code(&run(&root, &["verify", "HEAD", "tests"])), 0);
+    write(&root, "src/quote/applescript.rs", "#[test]\nfn t() { panic!() }\n");
+    for arg in ["src/quote", "src/quote.rs"] {
+        let err = mismatch(&root, &["verify", "HEAD", arg]);
+        assert!(err.contains("src/quote/applescript.rs: item 0 differs"), "{arg}: {err}");
+    }
+}
+
+#[test]
+fn verify_with_explicit_roots_still_compares_the_target_set() {
+    let (_d, root) = toy();
+    std::fs::remove_file(root.join("tests/b.rs")).unwrap();
+    let err = mismatch(&root, &["verify", "HEAD", "tests/a.rs"]);
+    assert!(
+        err.contains("target `b` (test) is missing in the new revision"),
+        "{err}"
+    );
+}
+
+#[test]
+fn apply_only_tokio_and_manifest_path_from_another_directory() {
+    let (_d, root) = toy();
+    write(
+        &root,
+        "tests/a.rs",
+        "mod common;\n#[test]\nfn a() {}\n#[tokio::test]\nasync fn t() {}\n",
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let manifest = root.join("Cargo.toml");
+    let out = Command::new(BIN)
+        .current_dir(elsewhere.path())
+        .args(["apply", "--only", "tokio", "--manifest-path"])
+        .arg(&manifest)
+        .arg(root.join("tests/a.rs"))
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        read(&root, "tests/a.rs"),
+        "mod common;\n#[test]\nfn a() {}\n#[skuld::test]\nasync fn t() {}\n"
+    );
+    // `mod common;` resolved beside the target, which only a manifest-aware run can know.
+    assert!(read(&root, "tests/common/mod.rs").contains("#[test]"));
+}
+
+// The label include -----------------------------------------------------------------------------
+
+const HARNESS_FILE: &str = "#[skuld::label] pub const SLOW: skuld::Label;\n";
+
+#[test]
+fn a_flipped_target_may_gain_the_include_with_a_label_file() {
+    let (_d, root) = flipped();
+    let a = read(&root, "tests/a.rs");
+    write(
+        &root,
+        "tests/a.rs",
+        &format!("{a}#[path = \"../src/test_harness.rs\"]\nmod test_harness;\n"),
+    );
+    write(&root, "src/test_harness.rs", HARNESS_FILE);
+    let out = run(&root, &["verify", "HEAD"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+#[test]
+fn an_unflipped_lib_may_not_gain_the_include_and_a_harness_file_must_be_labels_only() {
+    let (_d, root) = toy();
+    write(&root, "src/lib.rs", "mod quote;\nmod test_harness;\n");
+    write(
+        &root,
+        "src/test_harness.rs",
+        "pub fn anything() { std::process::exit(3) }\n#[test] fn new_test() { panic!() }\n",
+    );
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("src/lib.rs: item 1 differs"), "{err}");
+
+    let (_d, root) = flipped();
+    let a = read(&root, "tests/a.rs");
+    write(
+        &root,
+        "tests/a.rs",
+        &format!("{a}#[path = \"../src/test_harness.rs\"]\nmod test_harness;\n"),
+    );
+    write(
+        &root,
+        "src/test_harness.rs",
+        "pub fn anything() { std::process::exit(3) }\n",
+    );
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(
+        err.contains("src/test_harness.rs: unexpected item in the label file"),
+        "{err}"
+    );
+}
+
+#[test]
+fn explicit_roots_narrow_the_file_comparison() {
+    let (_d, root) = toy();
+    write(
+        &root,
+        "tests/b.rs",
+        "mod common;\n#[test]\nfn will_vanish() { panic!() }\n",
+    );
+    assert_eq!(code(&run(&root, &["verify", "HEAD", "tests/a.rs"])), 0);
+    let err = mismatch(&root, &["verify", "HEAD"]);
+    assert!(err.contains("tests/b.rs: item 1 differs"), "{err}");
 }

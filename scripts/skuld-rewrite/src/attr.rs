@@ -219,3 +219,55 @@ pub fn canonical_unsupported(meta: &Meta) -> Attribute {
     let ts = meta.to_token_stream();
     syn::parse_quote!(#[test(unsupported(#ts))])
 }
+
+/// One `#[..]` in a token stream.
+pub struct Site<'a> {
+    pub pound: &'a proc_macro2::Punct,
+    pub group: &'a proc_macro2::Group,
+    /// `None` when the brackets do not hold an attribute.
+    pub meta: Option<Meta>,
+    /// Whether `test` appears anywhere inside the brackets.
+    pub mentions_test: bool,
+}
+
+/// Visits every `#[..]` in `ts`, however deep, and rebuilds the stream with the bracket contents
+/// `f` returns for a site. Both `apply` and `verify` read macro bodies through this one scan, so
+/// they cannot disagree about what counts as an attribute.
+pub fn map_sites(ts: TokenStream, f: &mut dyn FnMut(&Site<'_>) -> Option<TokenStream>) -> TokenStream {
+    use proc_macro2::{Delimiter, Group, TokenTree};
+    let trees: Vec<TokenTree> = ts.into_iter().collect();
+    let mut out = TokenStream::new();
+    let mut i = 0;
+    while i < trees.len() {
+        if let (TokenTree::Punct(p), Some(TokenTree::Group(g))) = (&trees[i], trees.get(i + 1)) {
+            if p.as_char() == '#' && g.delimiter() == Delimiter::Bracket {
+                let site = Site {
+                    pound: p,
+                    group: g,
+                    meta: syn::parse2::<Meta>(g.stream()).ok(),
+                    mentions_test: mentions_test(g.stream()),
+                };
+                match f(&site) {
+                    Some(inner) => {
+                        let mut group = Group::new(Delimiter::Bracket, inner);
+                        group.set_span(g.span());
+                        out.extend([trees[i].clone(), TokenTree::Group(group)]);
+                    }
+                    None => out.extend([trees[i].clone(), trees[i + 1].clone()]),
+                }
+                i += 2;
+                continue;
+            }
+        }
+        match &trees[i] {
+            TokenTree::Group(g) => {
+                let mut inner = Group::new(g.delimiter(), map_sites(g.stream(), f));
+                inner.set_span(g.span());
+                out.extend([TokenTree::Group(inner)]);
+            }
+            other => out.extend([other.clone()]),
+        }
+        i += 1;
+    }
+    out
+}

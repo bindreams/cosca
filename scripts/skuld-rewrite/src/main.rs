@@ -6,9 +6,9 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use skuld_rewrite::modtree::{FsSource, GitSource, Root};
+use skuld_rewrite::modtree::FsSource;
 use skuld_rewrite::rewrite::{self, Options, Outcome};
-use skuld_rewrite::{targets, verify};
+use skuld_rewrite::{roots, targets, verify};
 
 #[derive(Parser)]
 #[command(about = "Move cosca's tests onto skuld's harness, and prove nothing else changed")]
@@ -91,60 +91,6 @@ fn canonical(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// Files named on the command line become crate roots; every `.rs` under a named directory is a
-/// module file, unless it is a target or named like a root file.
-fn cli_roots(args: &[PathBuf], manifest: Option<&Path>) -> Result<Vec<Root>> {
-    let mut files: Vec<(PathBuf, bool)> = Vec::new();
-    for arg in args {
-        let path = std::fs::canonicalize(arg).with_context(|| format!("resolving {}", arg.display()))?;
-        if path.is_dir() {
-            let mut found = Vec::new();
-            collect_rs(&path, &mut found)?;
-            files.extend(found.into_iter().map(|f| (f, false)));
-        } else {
-            files.push((path, true));
-        }
-    }
-    let rootish = |p: &Path| {
-        matches!(
-            p.file_name().and_then(|n| n.to_str()),
-            Some("lib.rs" | "main.rs" | "mod.rs")
-        )
-    };
-    let target_files: Vec<PathBuf> = if files.iter().all(|(f, _)| rootish(f)) {
-        Vec::new()
-    } else {
-        targets::all(manifest)?.into_iter().map(|t| t.src_path).collect()
-    };
-    let mut roots: Vec<Root> = Vec::new();
-    for (path, explicit) in files {
-        let mod_rs_like = rootish(&path) || target_files.contains(&path);
-        match roots.iter_mut().find(|r| r.path == path) {
-            Some(existing) => existing.is_root |= explicit,
-            None => roots.push(Root {
-                path,
-                mod_rs_like,
-                is_root: explicit,
-            }),
-        }
-    }
-    // Crate roots first, so each module file is parsed in its owner's context.
-    roots.sort_by(|a, b| (!a.mod_rs_like, &a.path).cmp(&(!b.mod_rs_like, &b.path)));
-    Ok(roots)
-}
-
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_rs(&path, out)?;
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Apply {
@@ -158,7 +104,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Some(f) => read_unflipped(&f, manifest_path.as_deref())?,
                 None => Vec::new(),
             };
-            let roots = cli_roots(&roots, manifest_path.as_deref())?;
+            let roots = roots::resolve(&roots, manifest_path.as_deref())?;
             let unflipped = canonical(&unflipped)?;
             let opts = Options {
                 only_tokio: only.is_some(),
@@ -172,9 +118,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     Ok(ExitCode::from(2))
                 }
                 Outcome::Rewritten(files) => {
-                    for (path, text) in files {
-                        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-                        println!("rewrote {}", path.display());
+                    rewrite::commit(&files)?;
+                    for f in &files {
+                        println!("rewrote {}", f.path.display());
                     }
                     Ok(ExitCode::SUCCESS)
                 }
@@ -185,13 +131,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             manifest_path,
             roots,
         } => {
-            let mismatches = if roots.is_empty() {
-                verify::verify_targets(manifest_path.as_deref(), &old_rev)?
-            } else {
-                let toplevel = targets::toplevel(&std::env::current_dir()?)?;
-                let old = GitSource::new(&toplevel, &old_rev)?;
-                verify::verify(&old, &FsSource, &canonical(&roots)?)?
-            };
+            let roots = roots::resolve(&roots, manifest_path.as_deref())?;
+            let mismatches = verify::verify_targets(manifest_path.as_deref(), &old_rev, &roots)?;
             for m in &mismatches {
                 eprintln!("mismatch: {m}");
             }

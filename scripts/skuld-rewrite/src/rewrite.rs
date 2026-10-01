@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
-use proc_macro2::{LineColumn, TokenStream, TokenTree};
+use anyhow::{bail, Context, Result};
+use proc_macro2::{LineColumn, TokenStream};
 use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -167,34 +167,32 @@ impl Planner<'_> {
         }
     }
 
-    /// Scans a token stream for `#[..]` groups. `in_macro` is `Some(name)` for an invocation's
+    /// Scans a token stream for `#[..]` sites. `in_macro` is `Some(name)` for an invocation's
     /// arguments, where the expansion decides what an attribute means, so a test there is refused.
     fn tokens(&mut self, ts: TokenStream, in_macro: Option<&str>) {
-        let trees: Vec<TokenTree> = ts.into_iter().collect();
-        let mut i = 0;
-        while i < trees.len() {
-            if let (TokenTree::Punct(p), Some(TokenTree::Group(g))) = (&trees[i], trees.get(i + 1)) {
-                if p.as_char() == '#' && g.delimiter() == proc_macro2::Delimiter::Bracket {
-                    if let Ok(meta) = syn::parse2::<Meta>(g.stream()) {
-                        let (at, end) = (p.span().start(), g.span().end());
-                        match (self.judge(&meta), in_macro) {
-                            (Verdict::Rewrite(t), None) => self.rewrite(at, end, &t),
-                            (Verdict::Rewrite(_), Some(name)) => {
-                                self.refuse(at, format!("a test attribute inside `{name}!` cannot be mapped"));
-                            }
-                            (Verdict::Refuse(why), _) => self.refuse(at, why),
-                            (Verdict::Leave, _) => {}
-                        }
+        let mut visit = |site: &attr::Site<'_>| {
+            let (at, end) = (site.pound.span().start(), site.group.span().end());
+            match &site.meta {
+                Some(meta) => match (self.judge(meta), in_macro) {
+                    (Verdict::Rewrite(t), None) => self.rewrite(at, end, &t),
+                    (Verdict::Rewrite(_), Some(name)) => {
+                        self.refuse(at, format!("a test attribute inside `{name}!` cannot be mapped"));
                     }
-                    i += 2;
-                    continue;
-                }
+                    (Verdict::Refuse(why), _) => self.refuse(at, why),
+                    (Verdict::Leave, _) => {}
+                },
+                None if site.mentions_test => self.refuse(
+                    at,
+                    format!(
+                        "`#[{}]` is not an attribute this tool can read, and it mentions `test`",
+                        site.group.stream()
+                    ),
+                ),
+                None => {}
             }
-            if let TokenTree::Group(g) = &trees[i] {
-                self.tokens(g.stream(), in_macro);
-            }
-            i += 1;
-        }
+            None
+        };
+        attr::map_sites(ts, &mut visit);
     }
 }
 
@@ -222,11 +220,6 @@ impl<'ast> Visit<'ast> for Planner<'_> {
     }
 }
 
-fn is_cfg_inner(a: &Attribute) -> bool {
-    matches!(a.style, syn::AttrStyle::Inner(_)) && a.path().is_ident("cfg")
-}
-
-/// True when `before` is empty or its last line is blank.
 fn blank_before(before: &str) -> bool {
     let Some(rest) = before.strip_suffix('\n') else {
         return before.is_empty();
@@ -241,7 +234,7 @@ fn blank_line_len(rest: &str) -> Option<usize> {
 }
 
 fn hoist(p: &mut Planner<'_>, file: &syn::File) {
-    let cfgs: Vec<&Attribute> = file.attrs.iter().filter(|a| is_cfg_inner(a)).collect();
+    let cfgs: Vec<&Attribute> = file.attrs.iter().filter(|a| shapes::is_cfg_inner(a)).collect();
     if cfgs.is_empty() {
         return;
     }
@@ -344,8 +337,64 @@ pub fn splice(src: &str, edits: &[Edit]) -> Result<String> {
 pub enum Outcome {
     /// Nothing was written; every site that stopped the run.
     Refused(Vec<Refusal>),
-    /// The files that change, with their new text.
-    Rewritten(Vec<(PathBuf, String)>),
+    /// The files that change.
+    Rewritten(Vec<Planned>),
+}
+
+/// A file `apply` will change: its text when planned, and the text to put there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub path: PathBuf,
+    pub before: String,
+    pub after: String,
+}
+
+/// Writes every planned file, or none: each is checked against its planned text, then written
+/// beside its target, and only then renamed into place. A failure names what was already renamed.
+pub fn commit(files: &[Planned]) -> Result<()> {
+    for f in files {
+        let now = std::fs::read_to_string(&f.path).with_context(|| format!("reading {}", f.path.display()))?;
+        if now != f.before {
+            bail!("{} changed since it was planned; nothing was written", f.path.display());
+        }
+    }
+    let mut staged: Vec<(PathBuf, &Planned)> = Vec::new();
+    for f in files {
+        let name = f
+            .path
+            .file_name()
+            .context("a planned file has a name")?
+            .to_string_lossy();
+        let tmp = f.path.with_file_name(format!(".{name}.skuld-rewrite.tmp"));
+        let stage = || -> Result<()> {
+            std::fs::write(&tmp, &f.after)?;
+            std::fs::set_permissions(&tmp, std::fs::metadata(&f.path)?.permissions())?;
+            Ok(())
+        };
+        if let Err(e) = stage() {
+            for (t, _) in &staged {
+                let _ = std::fs::remove_file(t);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("staging {}; nothing was written", f.path.display()));
+        }
+        staged.push((tmp, f));
+    }
+    let mut done: Vec<String> = Vec::new();
+    for (i, (tmp, f)) in staged.iter().enumerate() {
+        if let Err(e) = std::fs::rename(tmp, &f.path) {
+            for (t, _) in &staged[i..] {
+                let _ = std::fs::remove_file(t);
+            }
+            bail!(
+                "renaming into {}: {e}; already written: [{}]",
+                f.path.display(),
+                done.join(", ")
+            );
+        }
+        done.push(f.path.display().to_string());
+    }
+    Ok(())
 }
 
 /// Plans a rewrite of every file reachable from `roots`, refusing a file that changes and is
@@ -363,9 +412,15 @@ pub fn apply_roots(source: &dyn Source, roots: &[Root], unflipped: &[PathBuf], o
         .collect();
     let applied_roots: BTreeSet<PathBuf> = roots.iter().map(|r| modtree::normalize(&r.path)).collect();
     let mut reach: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut refusals = Vec::new();
     for u in unflipped {
         let u = modtree::normalize(u);
         if applied_roots.contains(&u) {
+            refusals.push(Refusal {
+                path: u.clone(),
+                line: 0,
+                reason: "is listed as unflipped but is also being applied".to_owned(),
+            });
             continue;
         }
         for f in modtree::walk(source, &u)? {
@@ -373,7 +428,6 @@ pub fn apply_roots(source: &dyn Source, roots: &[Root], unflipped: &[PathBuf], o
         }
     }
 
-    let mut refusals = Vec::new();
     let mut rewritten = Vec::new();
     for (path, file) in &files {
         let (edits, mut refused) = plan_file(file, opts);
@@ -391,7 +445,11 @@ pub fn apply_roots(source: &dyn Source, roots: &[Root], unflipped: &[PathBuf], o
                 ),
             });
         }
-        rewritten.push((path.clone(), splice(&file.src, &edits)?));
+        rewritten.push(Planned {
+            path: path.clone(),
+            before: file.src.clone(),
+            after: splice(&file.src, &edits)?,
+        });
     }
     if refusals.is_empty() {
         Ok(Outcome::Rewritten(rewritten))

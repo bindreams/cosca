@@ -1,5 +1,6 @@
 //! The cargo targets of a manifest, read through `cargo metadata`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ pub struct Target {
     pub harness: bool,
     /// The manifest's `bench`, when set.
     pub bench: Option<bool>,
+    pub edition: String,
 }
 
 /// The targets of every package in a workspace.
@@ -27,6 +29,8 @@ pub struct Listing {
     /// Canonical.
     pub workspace_root: PathBuf,
     pub targets: Vec<Target>,
+    /// Package name to feature table.
+    pub features: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 /// Reads `manifest`, or the manifest above the current directory.
@@ -38,7 +42,12 @@ pub fn load(manifest: Option<&Path>) -> Result<Listing> {
     }
     let meta = cmd.exec().context("running cargo metadata")?;
     let mut targets = Vec::new();
+    let mut features = BTreeMap::new();
     for package in &meta.packages {
+        features.insert(
+            package.name.to_string(),
+            package.features.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        );
         let manifest: toml::Table = std::fs::read_to_string(package.manifest_path.as_std_path())
             .context("reading a package manifest")?
             .parse()
@@ -56,8 +65,18 @@ pub fn load(manifest: Option<&Path>) -> Result<Listing> {
                 test: t.test,
                 doctest: t.doctest,
                 required_features: t.required_features.clone(),
-                harness: declared.and_then(|d| d.get("harness")?.as_bool()).unwrap_or(true),
-                bench: declared.and_then(|d| d.get("bench")?.as_bool()),
+                harness: declared
+                    .map(|d| flag(d, "harness"))
+                    .transpose()
+                    .with_context(|| format!("target {}", t.name))?
+                    .flatten()
+                    .unwrap_or(true),
+                bench: declared
+                    .map(|d| flag(d, "bench"))
+                    .transpose()
+                    .with_context(|| format!("target {}", t.name))?
+                    .flatten(),
+                edition: t.edition.to_string(),
             });
         }
     }
@@ -66,6 +85,7 @@ pub fn load(manifest: Option<&Path>) -> Result<Listing> {
     Ok(Listing {
         workspace_root,
         targets,
+        features,
     })
 }
 
@@ -101,4 +121,13 @@ pub fn toplevel(dir: &Path) -> Result<PathBuf> {
     anyhow::ensure!(out.status.success(), "{} is not inside a git repository", dir.display());
     let top = String::from_utf8(out.stdout).context("git printed a non-UTF-8 path")?;
     std::fs::canonicalize(top.trim_end_matches(['\n', '\r'])).context("canonicalizing the repository root")
+}
+
+/// A manifest flag: `None` when absent. A present non-bool is an error, never the default.
+pub fn flag(table: &toml::Table, key: &str) -> Result<Option<bool>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(*b)),
+        Some(other) => anyhow::bail!("`{key}` must be a boolean, found {}", other.type_str()),
+    }
 }

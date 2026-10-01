@@ -1,2 +1,2 @@
 # Empty on purpose: the repository's clippy.toml bans are for cosca's own spawn discipline, and clippy
-# would otherwise find it from here. This tool runs `git` and `cargo metadata` and nothing else.
+# would otherwise find it from here.
