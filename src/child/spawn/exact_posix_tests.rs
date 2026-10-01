@@ -204,7 +204,7 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
     std::fs::create_dir(&p).expect("mkdir p");
     marker_tool(&d, "d-marker", CWD_TOOL_EXIT);
     marker_tool(&d.join("sub"), "sub-marker", PATH_TOOL_EXIT);
-    let (mut fixture, _exe_copy) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
+    let (mut fixture, _dirs) = crate::test_child::fixture_command_without_dac_bypass(FIXTURE_UNREACHABLE_CWD_TEST);
     fixture
         .env(FIXTURE_UNREACHABLE_CWD_ENV, &d)
         .current_dir(&d)

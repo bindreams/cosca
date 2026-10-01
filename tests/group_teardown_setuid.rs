@@ -107,25 +107,30 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
     }
 }
 
+fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "--exact",
+        test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(RERUN_ENV, std::process::id().to_string())
+    .env("SKULD_DB_DIR", db_dir)
+    .uid(UNPRIVILEGED)
+    .gid(UNPRIVILEGED);
+    cmd
+}
+
 /// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
 fn rerun_unprivileged() {
-    use std::os::unix::process::CommandExt as _;
-
-    let out = common::output_locked(
-        std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args([
-                "--exact",
-                test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(RERUN_ENV, std::process::id().to_string())
-            .uid(UNPRIVILEGED)
-            .gid(UNPRIVILEGED),
-    )
-    .expect("re-execute this test as an unprivileged user");
+    let db_dir = common::skuld_db_dir_for(UNPRIVILEGED);
+    let out =
+        common::output_locked(&mut rerun_command(db_dir.path())).expect("re-execute this test as an unprivileged user");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.lines().any(|line| line == RERAN),
