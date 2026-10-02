@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -200,12 +201,12 @@ class UpTests(unittest.TestCase):
 
     def test_a_clone_that_raises_after_creating_the_vm_is_cleaned_up(self) -> None:
         self.env.tart.clone_raises = True
-        with captured(), self.assertRaises(OSError):
-            self.env.up()
+        err = exits_with(self, self.env.up)
+        self.assertIn("clone blew up", err)
         self.env.assert_nothing_leaked(self)
 
     def test_a_teardown_step_that_raises_is_contained_and_reported(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         self.env.tart.stop_error = RuntimeError("stop blew up")
         with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
             err = exits_with(self, self.env.up)
@@ -233,7 +234,7 @@ class UpTests(unittest.TestCase):
         self.assertEqual(sorted(self.env.tart.local_names()), ["other-1", "other-2"])
 
     def test_an_agent_that_never_answers_is_bounded_and_cleaned_up(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
             err = exits_with(self, self.env.up)
         self.assertIn("did not answer", err)
@@ -241,7 +242,7 @@ class UpTests(unittest.TestCase):
         self.env.assert_nothing_leaked(self)
 
     def test_tart_run_exiting_early_is_reported_and_cleaned_up(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         self.env.tart.run_exits_immediately = True
         err = exits_with(self, self.env.up)
         self.assertIn("exited", err)
@@ -260,7 +261,7 @@ class UpTests(unittest.TestCase):
         self.env.assert_nothing_leaked(self)
 
     def test_delete_failure_keeps_state_names_the_vm_and_keeps_the_original_error(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         self.env.tart.fail["delete"] = 1
         with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
             err = exits_with(self, self.env.up)
@@ -274,7 +275,7 @@ class UpTests(unittest.TestCase):
         self.env.assert_cap_lock_free(self)
 
     def test_a_vm_that_will_not_stop_keeps_the_state(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         self.env.tart.stop_keeps_running = True
         with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
             err = exits_with(self, self.env.up)
@@ -322,7 +323,7 @@ class CapLockTests(unittest.TestCase):
         self.assertEqual(set(self.held("exec:stage")), {False})
 
     def test_teardown_after_a_boot_failure_holds_the_cap_lock(self) -> None:
-        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.fail_first_agent_probe()
         with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
             exits_with(self, self.env.up)
         self.assertEqual(set(self.held("stop") + self.held("delete") + self.held("terminate")), {True})
@@ -414,6 +415,82 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(env.backend._read_claim(), "")
 
 
+class UnexpectedFailureTests(unittest.TestCase):
+    """Any failure ends in a message, cleanup and an exit status: 1, or 128+signal if one was recorded.
+    Never a traceback."""
+
+    def setUp(self) -> None:
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+
+    def run_up(self, env: Env, failure: str, with_signal: bool):
+        def sigterm_once(counter=[]) -> None:
+            counter.append(True)
+            if len(counter) == 2:  # the count in `up`; the base-image pre-check is the first `vms` call
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        if failure.startswith("tart list"):
+            env.tart.vms_error = (
+                subprocess.CalledProcessError(1, "tart list") if "non-zero" in failure else ValueError("bad json")
+            )
+            env.tart.vms_error_on_call = 2
+            if with_signal:
+                env.tart.hooks["vms"] = sigterm_once
+        elif failure == "identity cannot be read":
+            env.tart.identity_error = FileNotFoundError("disk.img")
+            if with_signal:
+                env.tart.hooks["clone"] = lambda: os.kill(os.getpid(), signal.SIGTERM)
+        elif failure == "the claim cannot be written":
+
+            def claim(name):
+                if with_signal:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            env.backend._claim = claim
+        with captured() as err:
+            try:
+                env.up()
+            except SystemExit as e:
+                return e.code, err.getvalue()
+        return None, err.getvalue()
+
+    def test_up_reports_every_failure_class_and_cleans_up(self) -> None:
+        for failure in ("tart list exits non-zero", "tart list prints bad json", "identity cannot be read", "the claim cannot be written"):
+            for with_signal in (False, True):
+                with self.subTest(failure=failure, signal=with_signal):
+                    env = Env(self)
+                    code, err = self.run_up(env, failure, with_signal)
+                    self.assertEqual(code, 128 + signal.SIGTERM if with_signal else 1, err)
+                    self.assertIn("error:", err)
+                    self.assertNotIn("Traceback", err)
+                    env.assert_nothing_leaked(self)
+                    self.assertIsNone(env.backend._gate, "the gate was left installed")
+
+    def test_destroy_reports_a_failing_tart_list_as_a_message(self) -> None:
+        for with_signal in (False, True):
+            with self.subTest(signal=with_signal):
+                env = Env(self)
+                with captured():
+                    env.up()
+                env.tart.vms_error = subprocess.CalledProcessError(1, "tart list")
+                if with_signal:
+                    real = env.tart.vms
+                    env.tart.vms = lambda gate=None: (os.kill(os.getpid(), signal.SIGTERM), real(gate))[1]
+                with captured() as err, self.assertRaises(SystemExit) as ctx:
+                    env.destroy()
+                self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM if with_signal else 1, err.getvalue())
+                self.assertIn("error:", err.getvalue())
+                self.assertIsNone(env.backend._gate)
+
+    def test_the_identity_temp_file_does_not_outlive_a_failed_write(self) -> None:
+        env = Env(self)
+        with mock.patch.object(m.os, "replace", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with captured():
+                with self.assertRaises(SystemExit):
+                    env.up()
+        self.assertEqual([p.name for p in env.sdir.glob("*.tmp")], [])
+
+
 class RemoveVmTests(unittest.TestCase):
     def test_a_vm_that_is_not_listed_is_not_stopped_or_deleted(self) -> None:
         env = Env(self)
@@ -484,9 +561,10 @@ class DestroyTests(unittest.TestCase):
 
     def test_a_foreign_name_in_the_claim_is_refused(self) -> None:
         (self.env.sdir / "vm_name").write_text("macos-tahoe-base\n")
-        with self.assertRaises(ValueError):
-            self.env.destroy()
-        self.assertIn(m.BASE_IMAGE, self.env.tart.local_names() + [v["Name"] for v in self.env.tart.vm_list])
+        err = exits_with(self, self.env.destroy)
+        self.assertIn("refusing to touch", err)
+        self.assertIn(m.BASE_IMAGE, [v["Name"] for v in self.env.tart.vm_list])
+        self.assertNotIn("stop", self.env.tart.calls)
 
     def test_destroy_waits_for_the_worktree_lock(self) -> None:
         with open(self.env.sdir / "lock", "w") as held:

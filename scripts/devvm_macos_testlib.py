@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -62,12 +63,29 @@ class FakeTart:
         self.run_exits_immediately = False
         self.calls: list[str] = []
         self.events: list[tuple[str, bool]] = []
+        self.gates: list[tuple[str, object]] = []  # (call, gate it was given)
         self.hooks: dict[str, object] = {}
         self.procs: dict[str, FakeProc] = {}
         self.guest_home: Path | None = None
         self.clone_raises = False
         self.stop_error: Exception | None = None
         self.vms_error: Exception | None = None
+        self.vms_error_on_call: int | None = None  # raise only on this (1-based) call
+        self.vms_calls = 0
+        self.identity_error: Exception | None = None
+
+    def fail_first_agent_probe(self) -> None:
+        """The guest does not answer the first `true` probe, then would answer: a loop that fails to stop
+        after the first miss goes on to succeed, so a missing bound or poll fails the test instead of spinning."""
+        seen: list = []
+
+        def rc(args):
+            if args == ["true"] and not seen:
+                seen.append(True)
+                return 1
+            return 0
+
+        self.exec_rc = rc
 
     def cap_lock_held(self) -> bool:
         with open(self.home / "devvm-cap.lock", "a") as f:
@@ -84,8 +102,10 @@ class FakeTart:
             hook()
 
     def vms(self, gate=None):
+        self.gates.append(("vms", gate))
         self.event("vms")
-        if self.vms_error is not None:
+        self.vms_calls += 1
+        if self.vms_error is not None and self.vms_error_on_call in (None, self.vms_calls):
             raise self.vms_error
         return [dict(v) for v in self.vm_list]
 
@@ -98,6 +118,7 @@ class FakeTart:
         self.vm_list.append(_vm(name, "running"))
 
     def clone(self, src, name, gate=None):
+        self.gates.append(("clone", gate))
         self.calls.append("clone")
         self.event("clone")
         if "clone" in self.fail:
@@ -144,6 +165,7 @@ class FakeTart:
         return {"HOME": str(self.guest_home), "PATH": "/usr/bin:/bin"}
 
     def exec(self, name, args, *, stdin=None, capture_output=False, gate=None):
+        self.gates.append(("exec:true" if args == ["true"] else "exec:stage", gate))
         self.calls.append("exec:" + " ".join(args)[:40])
         self.event("exec:true" if args == ["true"] else "exec:stage")
         if self.guest_home is not None and args != ["true"] and args[0] == "sh":
@@ -158,6 +180,8 @@ class FakeTart:
         return subprocess.Popen(args, stdout=stdout, stderr=subprocess.DEVNULL, env=self._local_env())
 
     def identity(self, name):
+        if self.identity_error is not None:
+            raise self.identity_error
         st = (self.home / "vms" / name / "disk.img").stat()
         return {"ino": st.st_ino, "dev": st.st_dev}
 
@@ -178,11 +202,29 @@ class Env:
         script.write_text("#!/bin/sh\n")
         for args in (["init", "-q"], ["config", "user.email", "t@e.invalid"], ["config", "user.name", "t"], ["add", "-A"], ["commit", "-q", "-m", "c"]):
             subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        self.allow_blocking_flock = False
+        self._guard_blocking_flock(test)
         self.tart = FakeTart(root / "tart-home")
         self.tart.home.mkdir()
         self.state = root / "state"
         self.backend = m.MacosBackend(self.tart, self.repo, self.state)
         self.sdir = self.state / m.GUEST_NAME
+
+    def _guard_blocking_flock(self, test) -> None:
+        """A blocking flock on the main thread is how a regression turns into a hang. In the code under test
+        it is legitimate only in cleanup's wait for the cap lock, which a test opts into explicitly."""
+        real = fcntl.flock
+
+        def flock(f, op):
+            from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
+            blocking = not op & fcntl.LOCK_NB
+            if from_backend and blocking and not self.allow_blocking_flock and threading.current_thread() is threading.main_thread():
+                raise AssertionError("a blocking flock on the main thread: a regression would hang here")
+            return real(f, op)
+
+        patch = mock.patch.object(m.fcntl, "flock", flock)
+        patch.start()
+        test.addCleanup(patch.stop)
 
     def up(self, **kw):
         kw = {"rev": None, "rosetta": False, "allow_elevation": None, "display": False, **kw}

@@ -94,13 +94,57 @@ class WaitTests(GateCase):
             self.assertEqual(gate.wait_for([r]), [r])
         self.assertIn(gate._r, seen[0], "the wait does not watch the signal pipe")
 
-    def test_a_signal_ends_a_wait_with_nothing_else_ready(self) -> None:
+    def test_a_signal_wins_over_a_ready_fd(self) -> None:
+        # `r` is readable too, so a wait that ignores the signal pipe returns normally and fails this at once
+        # (instead of blocking forever, as it would with nothing ever written).
         r, w = os.pipe()
         self.addCleanup(os.close, r)
         self.addCleanup(os.close, w)
+        os.write(w, b"x")
         with m.SignalGate() as gate, on_blocked():
             with self.assertRaises(m.Cancelled):
-                gate.wait_for([r])  # nothing is ever written to r
+                gate.wait_for([r])
+
+    def test_a_signal_landing_as_the_wait_begins_cancels_it(self) -> None:
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        os.write(w, b"x")
+        real_select = m.select.select
+
+        def select(rlist, *a):
+            kill_self()  # after the pre-check, as the select starts
+            return real_select(rlist, *a)
+
+        with m.SignalGate() as gate, mock.patch.object(m.select, "select", select):
+            with self.assertRaises(m.Cancelled):
+                gate.wait_for([r])
+
+    def test_the_blocked_hook_runs_before_each_blocking_select(self) -> None:
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        os.write(w, b"x")
+        order = []
+        real_select = m.select.select
+
+        def select(rlist, *a):
+            order.append("select")
+            return real_select(rlist, *a)
+
+        with m.SignalGate() as gate, mock.patch.object(m.select, "select", select), mock.patch.object(
+            m.SignalGate, "on_blocked", staticmethod(lambda: order.append("hook"))
+        ):
+            gate.wait_for([r])
+        self.assertEqual(order, ["hook", "select"])
+
+    def test_a_wait_without_a_signal_returns_the_ready_fd(self) -> None:
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        os.write(w, b"x")
+        with m.SignalGate() as gate:
+            self.assertEqual(gate.wait_for([r]), [r])
 
     def test_a_wait_that_starts_with_a_signal_already_recorded_does_not_block(self) -> None:
         with m.SignalGate() as gate:
@@ -118,7 +162,7 @@ class WaitTests(GateCase):
     def test_sleep_is_ended_by_a_signal(self) -> None:
         with m.SignalGate() as gate, on_blocked(signal.SIGHUP):
             with self.assertRaises(m.Cancelled) as ctx:
-                gate.sleep(3600)
+                gate.sleep(0)
         self.assertEqual(ctx.exception.signo, signal.SIGHUP)
 
 
@@ -128,25 +172,86 @@ class RunTests(GateCase):
             done = gate.run(["sh", "-c", "echo out; echo err >&2; exit 3"], capture_output=True, text=True)
         self.assertEqual((done.returncode, done.stdout, done.stderr), (3, "out\n", "err\n"))
 
-    def test_a_signal_kills_and_reaps_the_child_before_cancelling(self) -> None:
-        r, w = os.pipe()  # `cat` blocks reading r until the write end closes
-        self.addCleanup(os.close, w)
-        started = []
-        real_popen = subprocess.Popen
+    def run_cancelled(self, argv, *, stdin=None, release=None):
+        """Run `argv` through the gate with a signal already recorded. Returns (pid, kills)."""
+        started, kills = [], []
+        real_popen, real_kill = subprocess.Popen, os.kill
 
         def popen(*a, **kw):
             p = real_popen(*a, **kw)
             started.append(p)
             return p
 
-        with os.fdopen(r, "rb") as stdin, m.SignalGate() as gate, mock.patch.object(m.subprocess, "Popen", popen):
-            with on_blocked(), self.assertRaises(m.Cancelled):
-                gate.run(["cat"], stdin=stdin, capture_output=True)
-        (proc,) = started
-        self.assertIsNotNone(proc.returncode, "the child was not reaped")
-        with self.assertRaises(ProcessLookupError):
-            os.kill(proc.pid, 0)  # a zombie would still answer
-        self.assertFalse(proc._waitpid_lock.locked())
+        def kill(pid, sig):
+            if pid != os.getpid():
+                kills.append((pid, sig, self.is_ours_unreaped(pid)))
+            return real_kill(pid, sig)
+
+        with m.SignalGate() as gate, mock.patch.object(m.subprocess, "Popen", popen), mock.patch.object(
+            m.os, "kill", kill
+        ):
+            kill_self()  # recorded before the run starts: it cancels at the first wait
+            if release:
+                release()
+            with self.assertRaises(m.Cancelled):
+                gate.run(argv, stdin=stdin, capture_output=True)
+        return started[0].pid, kills
+
+    @staticmethod
+    def is_ours_unreaped(pid: int) -> bool:
+        """True while `pid` is still our child (alive or a zombie): a signal to it can reach nobody else."""
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return False
+        return True
+
+    def test_a_signal_kills_and_reaps_the_child_before_cancelling(self) -> None:
+        # `cat` blocks reading r. Right after the signal the test closes the write end too, so a `run`
+        # that ignores the signal sees `cat` finish and returns normally: it fails at once.
+        r, w = os.pipe()
+        with os.fdopen(r, "rb") as stdin:
+            pid, kills = self.run_cancelled(["cat"], stdin=stdin, release=lambda: os.close(w))
+        self.assertEqual([(p, s) for p, s, _ours in kills], [(pid, signal.SIGKILL)], "the child was not killed")
+        self.assertFalse(self.is_ours_unreaped(pid), "the child was not reaped")
+
+    def test_the_child_is_never_signalled_after_it_was_reaped(self) -> None:
+        # Forced ordering: the child has exited, and the exit has been observed, before the cancel is decided.
+        # Whoever reaped it, no signal may go to its pid afterwards: the pid could belong to someone else by then.
+        for _ in range(25):
+            holder = []
+
+            def exited_first() -> None:
+                os.waitid(os.P_PID, holder[0].pid, os.WEXITED | os.WNOWAIT)  # the exit is observed
+                kill_self()
+
+            started = []
+            real_popen = subprocess.Popen
+
+            def popen(*a, started=started, holder=holder, **kw):
+                p = real_popen(*a, **kw)
+                started.append(p)
+                holder.append(p)
+                return p
+
+            kills = []
+            real_kill = os.kill
+
+            def kill(pid, sig, kills=kills, real_kill=real_kill):
+                if pid == os.getpid():
+                    return real_kill(pid, sig)
+                ours = self.is_ours_unreaped(pid)
+                kills.append((pid, sig, ours))
+                if ours:  # never forward a signal to a pid that is no longer ours
+                    return real_kill(pid, sig)
+
+            with m.SignalGate() as gate, mock.patch.object(m.subprocess, "Popen", popen), mock.patch.object(
+                m.os, "kill", kill
+            ), mock.patch.object(m.SignalGate, "on_blocked", staticmethod(exited_first)):
+                with self.assertRaises(m.Cancelled):
+                    gate.run(["true"], capture_output=True)
+            self.assertEqual([k for k in kills if not k[2]], [], "a signal was sent to a pid that had been reaped")
+            self.assertFalse(self.is_ours_unreaped(started[0].pid), "the child was left unreaped")
 
 
 class LockTests(GateCase):
@@ -180,6 +285,30 @@ class LockTests(GateCase):
             f.close()
         self.assertTrue(self.lock_is_free(self.path))
 
+    def test_flock_hands_the_file_to_the_gate_on_cancel_and_does_not_close_it_itself(self) -> None:
+        holder = self.open_locked(self.path)
+        opened = []
+        real_open = open
+
+        def spy_open(path, *a, **kw):
+            f = real_open(path, *a, **kw)
+            if str(path) == self.path:
+                opened.append(f)
+            return f
+
+        from pathlib import Path
+
+        with m.SignalGate() as gate, mock.patch("builtins.open", spy_open):
+            kill_self()
+            with self.assertRaises(m.Cancelled):
+                with m._flock(Path(self.path), "the test lock", gate):
+                    self.fail("the lock was not contended")
+            (mine,) = opened[-1:]
+            self.assertFalse(mine.closed, "the file was closed while the abandoned waiter still blocks on it")
+            holder.close()  # let the waiter finish
+            gate.abandoned[0].join()
+            self.assertTrue(mine.closed)
+
     def test_a_failing_flock_raises_its_error_and_closes_the_file(self) -> None:
         def flock(_f, _op):
             raise OSError("flock failed")
@@ -192,7 +321,8 @@ class LockTests(GateCase):
 
     def test_a_cancelled_wait_leaves_a_waiter_that_drops_the_lock_it_later_acquires(self) -> None:
         holder = self.open_locked(self.path)
-        with m.SignalGate() as gate, on_blocked():
+        with m.SignalGate() as gate:
+            kill_self()  # recorded first: the wait is cancelled before it can block
             f = open(self.path, "w")
             with self.assertRaises(m.Cancelled):
                 gate.flock(f)

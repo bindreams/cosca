@@ -149,11 +149,15 @@ def parse_guest_path(path: str) -> str:
 
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _say(message: str, *, file=None) -> None:
@@ -247,31 +251,50 @@ class SignalGate:
         self.wait_for([], seconds)
 
     def run(self, argv: list[str], *, stdin=None, capture_output=False, text=False, **kw) -> subprocess.CompletedProcess:
-        """subprocess.run that a signal can cut short: the child is killed and reaped, then `Cancelled` is raised."""
+        """subprocess.run that a signal can cut short: the child is killed and reaped, then `Cancelled` is raised.
+
+        Exactly one party reaps. A helper thread only *observes* the exit (`waitid` with `WNOWAIT` leaves
+        the zombie in place); the calling thread alone decides, kills if it must, and reaps. The pid is
+        therefore still ours whenever it is signalled. `Popen.wait`, `poll` and `kill` are never used.
+        """
         pipe = subprocess.PIPE if capture_output else None
         proc = subprocess.Popen(argv, stdin=stdin, stdout=pipe, stderr=pipe, text=text, **kw)
-        done_r, done_w = os.pipe()
-        result: list = []
+        pid = proc.pid
+        streams = [st for st in (proc.stdout, proc.stderr) if st is not None]
+        captured: dict[int, object] = {}
 
-        def communicate() -> None:
+        def read(i: int, stream) -> None:
+            captured[i] = stream.read()
+
+        readers = [threading.Thread(target=read, args=(i, st), daemon=True) for i, st in enumerate(streams)]
+        exited_r, exited_w = os.pipe()
+
+        def observe() -> None:
             try:
-                result.append(proc.communicate())
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
             finally:
-                os.write(done_w, b"x")
+                os.write(exited_w, b"x")
 
-        waiter = threading.Thread(target=communicate, daemon=True)
-        waiter.start()
+        watcher = threading.Thread(target=observe, daemon=True)
+        for t in (*readers, watcher):
+            t.start()
+        interrupted: BaseException | None = None
         try:
-            self.wait_for([done_r])
-        except BaseException:
-            proc.kill()
-            raise
-        finally:
-            waiter.join()
-            os.close(done_r)
-            os.close(done_w)
-        out, err = result[0]
-        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+            self.wait_for([exited_r])
+        except BaseException as e:  # noqa: BLE001  Cancelled, or anything else: the child must not outlive us
+            interrupted = e
+            os.kill(pid, signal.SIGKILL)  # not reaped yet, so the pid is still our child (alive or a zombie)
+        watcher.join()
+        for t in readers:
+            t.join()
+        proc.returncode = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        for st in streams:
+            st.close()
+        os.close(exited_r)
+        os.close(exited_w)
+        if interrupted is not None:
+            raise interrupted
+        return subprocess.CompletedProcess(argv, proc.returncode, captured.get(0), captured.get(1))
 
     def flock(self, f) -> None:
         """Take an exclusive flock on `f`, waiting in a helper thread so that a signal can end the wait.
@@ -582,6 +605,8 @@ class MacosBackend:
                 cancelled = c.signo
             except (AlreadyUp, UpError) as e:
                 error = str(e)
+            except Exception as e:  # noqa: BLE001  tart list failing, bad JSON, a full disk: a message, never a traceback
+                error = f"{type(e).__name__}: {e}"
         self._gate = None
         # Read after the gate has restored the handlers and drained its pipe: every signal recorded at
         # any point is in `pending`, and one arriving later takes its default action.
@@ -762,7 +787,7 @@ class MacosBackend:
 
         A signal cancels the wait for the worktree lock; once past it, destroy finishes what it started.
         """
-        cancelled = None
+        cancelled = failure = None
         status = 0
         with SignalGate() as gate:
             self._gate = self.last_gate = gate
@@ -771,8 +796,13 @@ class MacosBackend:
                     status = self._destroy_locked()
             except Cancelled as c:
                 cancelled = c.signo
+            except Exception as e:  # noqa: BLE001  same: a message, then the exit status
+                failure = f"{type(e).__name__}: {e}"
         self._gate = None
         pending = gate.pending  # after the handlers are restored: nothing recorded is lost
+        if failure is not None:
+            _say(f"error: {failure}")
+            sys.exit(128 + pending[0] if pending else 1)
         if cancelled is not None:
             _say(f"devvm: interrupted by {signal.Signals(cancelled).name} before destroy started")
             sys.exit(128 + cancelled)
