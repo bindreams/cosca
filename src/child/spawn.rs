@@ -487,7 +487,7 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
             child.id()
         );
     }
-    drop(child);
+    std::mem::forget(child); // MUTANT M2: leaks our pipe ends
 }
 
 /// The spawned `child` could not be adopted. Answers `error`.
