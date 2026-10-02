@@ -84,6 +84,16 @@ jobs:
         shell: bash
         run: cargo check --locked --all-features --lib --target x86_64-unknown-linux-musl
 
+      # scripts/skuld-rewrite is a standalone crate, so neither prek's
+      # root-package hooks nor the clippy steps below reach it.
+      - name: Test the skuld-rewrite tool
+        shell: bash
+        working-directory: scripts/skuld-rewrite
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo nextest run --locked
+
       # Regression check for clippy.toml's disallowed-methods bans (see that file): lints
       # .github/fixtures/disallowed-methods, a standalone crate that calls every banned path,
       # against the real clippy.toml, and asserts the diagnostic actually fires for each —

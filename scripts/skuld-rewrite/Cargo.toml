@@ -1,0 +1,20 @@
+[package]
+name = "skuld-rewrite"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "One-shot rewriter that moves cosca's tests onto skuld's harness and proves nothing else changed."
+
+# Empty workspace: keeps cargo from adopting this crate into the root package.
+[workspace]
+
+[dependencies]
+anyhow = "=1.0.104"
+cargo_metadata = "=0.23.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
+quote = "=1.0.47"
+tar = "=0.4.46"
+tempfile = "=3.27.0"
+toml = "=1.1.6"
+syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
