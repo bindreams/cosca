@@ -66,7 +66,7 @@
 //! naming that cause, before it forks.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -178,8 +178,9 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     let scripted = crate::wait::backend::take_scripted_pidfd_open();
     let hook = Arc::clone(&shared);
     // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads atomics, and
-    // makes raw `close`, `syscall`, `sendmsg` and `recv` calls on fd numbers. It allocates nothing
-    // and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
+    // makes raw `close`, `sendmsg` and `recv` calls on fd numbers, and rustix's `getpid` and
+    // `pidfd_open` (see `open_self`). It allocates nothing and takes no lock, and
+    // `io::Error::from_raw_os_error` does not allocate.
     unsafe {
         cmd.pre_exec(move || {
             hold_child(
@@ -910,23 +911,21 @@ fn hold_child(
     }
 }
 
-/// `pidfd_open(getpid(), 0)` through raw `syscall`s: no libc pid cache can be stale after a fork.
-/// The errno on failure.
+/// `pidfd_open(getpid(), 0)` through rustix's typed wrappers: with the `linux_raw` backend each is
+/// a raw syscall, so no libc pid cache can be stale after a fork. The errno on failure.
+///
+/// Async-signal-safe: rustix's `linux_raw` backend issues `getpid` and `pidfd_open` as inline-asm
+/// syscalls and decodes the errno from the return register, with no allocation, lock or
+/// thread-local. Its `libc` backend (non-`linux_raw` targets) calls `getpid` and `syscall`, both
+/// async-signal-safe too, and `getpid` is uncached since glibc 2.25.
 fn open_self(#[cfg(test)] scripted: Option<Errno>) -> Result<RawFd, i32> {
     #[cfg(test)]
     if let Some(errno) = scripted {
         return Err(errno.raw_os_error());
     }
-    // SAFETY: two raw syscalls with integer arguments.
-    let fd = unsafe {
-        let pid = libc::syscall(libc::SYS_getpid);
-        libc::syscall(libc::SYS_pidfd_open, pid, 0)
-    };
-    if fd < 0 {
-        // SAFETY: this thread's own errno; `__errno_location` is async-signal-safe.
-        Err(unsafe { *libc::__errno_location() })
-    } else {
-        Ok(fd as RawFd)
+    match rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty()) {
+        Ok(fd) => Ok(fd.into_raw_fd()),
+        Err(e) => Err(e.raw_os_error()),
     }
 }
 

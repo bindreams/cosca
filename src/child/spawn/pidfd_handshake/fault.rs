@@ -53,12 +53,12 @@ impl ChildFault {
 }
 
 fn kill_self() -> io::Result<()> {
-    // SAFETY: `kill(getpid(), SIGKILL)` through raw `syscall`s.
-    unsafe {
-        let pid = libc::syscall(libc::SYS_getpid);
-        libc::syscall(libc::SYS_kill, pid, libc::SIGKILL);
+    // Async-signal-safe: rustix's `linux_raw` backend makes `getpid` and `kill` raw syscalls.
+    match rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL) {
+        // SIGKILL does not return to the caller; reaching here means it was not delivered.
+        Ok(()) => Err(io::Error::from_raw_os_error(libc::EIO)),
+        Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
     }
-    Err(io::Error::from_raw_os_error(libc::EIO))
 }
 
 type VerdictHook = Box<dyn FnOnce(Option<u32>)>;
