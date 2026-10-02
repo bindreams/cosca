@@ -240,8 +240,8 @@ jobs:
     # Windows/amd64 is the slowest lane. Its measured durations: 549-737 s before the libtest guard
     # ran inside clippy.sh, 868-1105 s with it, 984 s on the latest run. 30 min is 1.63x the
     # 1105 s maximum; 25 min was 1.36x. darwin/arm64 also runs the libtest guard's other-architecture
-    # and self-test steps (183 s + 35 s measured on a dedicated runner) on top of its 787 s, so about
-    # 1010 s expected; 30 min is 1.8x that. Both lanes share this bound.
+    # (105 s) and self-test (29 s) steps and took 588 s in all; its earlier runs took 730-906 s, so
+    # 30 min is 2x the 906 s maximum. All lanes share this bound.
     timeout-minutes: 30
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
@@ -459,7 +459,7 @@ jobs:
           .github/scripts/libtest-guard.sh --feature-powerset --target "$OTHER"
           .github/scripts/libtest-guard.sh --feature-powerset --release --target "$OTHER"
 
-      # Measured on darwin/arm64: 35 s; 3 min is 5x here and the same bound as the libtest-guard job.
+      # Measured on darwin/arm64: 29 s; 3 min is 6x here, and the bound the other self-test step uses.
       - name: Test the libtest guard
         if: ${{ !cancelled() && matrix.guard_target }}
         shell: bash
