@@ -12,6 +12,9 @@ mod pump;
 mod spawn;
 #[path = "tokio/stdio.rs"]
 mod stdio;
+#[cfg(test)]
+#[path = "tokio/test_runtime.rs"]
+pub(crate) mod test_runtime;
 #[path = "tokio/wait.rs"]
 pub(crate) mod wait;
 

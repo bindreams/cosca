@@ -53,6 +53,16 @@
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
+// Shadows the built-in #[test] in every module of this crate's unit-test build, so a stray one registers with skuld
+// (harness = false) instead of silently never running. Goes when every test is spelled #[skuld::test] (plan E, unit N).
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "a stray #[test] must register with skuld, not silently never run"
+)]
+#[macro_use]
+extern crate skuld;
+
 pub mod containment;
 pub mod elevation;
 pub mod error;
@@ -185,4 +195,11 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
     let mut c = Command::new();
     c.commandline(line);
     c
+}
+
+#[cfg(test)]
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

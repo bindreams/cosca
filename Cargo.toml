@@ -41,7 +41,7 @@ serde_json = "1"
 # `test-util`: `start_paused` virtual clock for the deadline tests. Dev-only.
 tokio = { version = "1", features = ["test-util"] }
 # The test harness for `harness = false` targets.
-skuld = "0.6.0"
+skuld = { version = "0.6.0", features = ["tokio"] }
 # Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `SharedChild`,
 # and needs a deadline-bounded wait on a child it also kills from another handle.
 shared_child = { version = "1", features = ["timeout"] }
@@ -136,6 +136,10 @@ mach2 = "0.7"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # `pty`: `ioctl_tiocgptpeer`.
 rustix = { version = "1", default-features = false, features = ["mount", "pty"] }
+
+[lib]
+# The lib's unit tests run on skuld (`src/lib.rs` has the `main`).
+harness = false
 
 [[test]]
 name = "process"
