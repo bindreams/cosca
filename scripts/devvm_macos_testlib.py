@@ -212,8 +212,8 @@ def guard_unwakeable_selects(test: unittest.TestCase, will_block=lambda: False) 
     where the select must really block (a test signal or release ends it).
     """
     registered = getattr(test, "_select_guard_will_block", None)
-    if registered is not None:  # one guard per test; later environments in the same test add their say
-        registered.append(will_block)
+    if registered is not None:  # one guard per test; a later environment in the same test takes over
+        registered[:] = [will_block]
         return
     test._select_guard_will_block = registered = [will_block]
     real_select, real_start, real_join = m.select.select, threading.Thread.start, threading.Thread.join
