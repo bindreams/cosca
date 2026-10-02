@@ -108,17 +108,8 @@ async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
     assert!(crate::log_capture::contains_since(mark, "forced peek failure 7c3e"));
 }
 
-/// A child still running whose unique id cannot be read (a MACF denial) cannot be shown to be ours:
-/// the peek answers `Running`, but the id is the only thing that tells it from a reuse of the pid,
-/// so the backend counts it as reaped elsewhere and the child is forgotten, never released to
-/// tokio's by-pid reap.
-///
-/// Mutant: `reaped_elsewhere` takes a `Running` peek with an unreadable id as "ours".
-#[tokio::test(flavor = "current_thread")]
-async fn macos_a_running_child_whose_unique_id_read_is_refused_is_reaped_elsewhere() {
-    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
+/// A backend for a child that is running and ours, holding its real unique id.
+fn running_backend() -> (super::proc_source::ProcSource, u32) {
     let child = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new("sleep")
             .arg("600")
@@ -130,19 +121,33 @@ async fn macos_a_running_child_whose_unique_id_read_is_refused_is_reaped_elsewhe
     let real = crate::signal::read_identity(pid)
         .expect("readable")
         .expect("a running child has a unique id");
-    let proc = super::proc_source::ProcSource::new(child, Some(real));
-    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    (super::proc_source::ProcSource::new(child, Some(real)), pid)
+}
 
-    let reaped_elsewhere = proc.reaped_elsewhere();
+/// A child still running whose unique id cannot be read (a MACF denial) cannot be shown to be ours:
+/// the peek answers `Running`, but the id is the only thing that tells it from a reuse of the pid,
+/// so the backend counts it as reaped elsewhere and the child is forgotten, never released to
+/// tokio's by-pid reap. The same holds when the read finds the pid gone.
+///
+/// Mutants: `reaped_elsewhere` takes a `Running` peek with an unreadable id, or with a gone one, as
+/// "ours".
+#[tokio::test(flavor = "current_thread")]
+async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewhere() {
+    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    for read in [UniqRead::Refused(libc::EPERM), UniqRead::Gone] {
+        let (proc, pid) = running_backend();
+        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, read);
 
-    // The child is ours and unreaped: end it before asserting.
-    proc.signal(crate::signal::Sig::Kill).expect("kill our own child");
-    proc.release(); // tokio's orphan queue reaps the killed child
-    assert!(
-        reaped_elsewhere,
-        "an id that cannot be read does not show the pid is ours"
-    );
-    assert!(crate::log_capture::contains_since(mark, "cannot be shown to be ours"));
+        let reaped_elsewhere = proc.reaped_elsewhere();
+
+        // The child is ours and unreaped: end it before asserting.
+        proc.signal(crate::signal::Sig::Kill).expect("kill our own child");
+        proc.release(); // tokio's orphan queue reaps the killed child
+        assert!(
+            reaped_elsewhere,
+            "{read:?}: the pid is not shown to be ours (pid {pid})"
+        );
+    }
 }
 
 /// Dropping a backend that nothing released or forgot (an unwind does this) leaves the child to

@@ -545,25 +545,73 @@ in_fresh_pid_ns!(
 
 // A failed peek through the child's own pidfd =====
 
-/// A peek that fails on the child's own pidfd is a contract breach: it is logged, asserted in debug,
-/// and is no evidence the child was reaped.
+/// A peek that fails on the child's own pidfd cannot show the child is ours, so it counts as reaped
+/// elsewhere: the child is forgotten, never released to tokio's by-pid reap.
 ///
-/// Mutant: a failed peek counts as a foreign reap (or is swallowed without the log and assert).
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "a peek through a child's own pidfd failed")
-)]
+/// Mutant: a failed peek counts as ours.
 #[test]
-fn a_failed_pidfd_peek_is_a_contract_breach_and_no_evidence() {
+fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
     use crate::wait::exit_only::seams::force_peek_once;
     runtime().block_on(async {
         let (mut child, _writer) = spawn_blocker();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
         let reaped = child.proc_mut().reaped_elsewhere();
-        // Only reachable in release (debug panicked above, as expected):
-        assert!(!reaped, "a failed peek is no evidence of a reap");
+        assert!(reaped, "a child nothing can answer for is not tokio's to reap by pid");
     });
 }
+
+// Wait and try_wait after a foreign reap and a reuse =====
+
+/// A `try_wait` or `wait` of a child reaped behind tokio's back, whose pid a stranger that is
+/// already a zombie of ours now holds, answers `ECHILD` and takes nothing: tokio's own wait is a
+/// `waitpid` by pid, and would take the stranger's record. The test reaps the stranger itself and
+/// asserts it got `SIGUSR1`.
+///
+/// Mutants: `ProcSource::try_wait` or `wait` go to tokio without looking at the pidfd.
+fn after_foreign_reap_and_reuse(use_wait: bool) {
+    runtime().block_on(async {
+        let (mut child, writer) = spawn_blocker();
+        let (mut reuser, _alias) = foreign_reaped_and_reused(&child, writer);
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the stranger is a zombie"
+        );
+        let answer = if use_wait {
+            child.wait().await.map(Some)
+        } else {
+            child.try_wait()
+        };
+        let err = answer.expect_err("a foreign-reaped child has no status to give");
+        assert!(
+            matches!(&err, crate::error::Error::Io(e) if e.raw_os_error() == Some(libc::ECHILD)),
+            "{err:?}"
+        );
+        let status = reuser.wait().expect("the stranger's record must not have been taken");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+fn try_wait_after_foreign_reap_and_reuse_body() {
+    after_foreign_reap_and_reuse(false);
+}
+fn wait_after_foreign_reap_and_reuse_body() {
+    after_foreign_reap_and_reuse(true);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_try_wait_after_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_try_wait_reuse_driver,
+    fixture_tokio_try_wait_reuse_init,
+    try_wait_after_foreign_reap_and_reuse_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_wait_after_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_wait_reuse_driver,
+    fixture_tokio_wait_reuse_init,
+    wait_after_foreign_reap_and_reuse_body
+);
 
 // The spawn's failure teardown =====
 
