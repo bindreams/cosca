@@ -289,7 +289,11 @@ impl ProcSource {
                 };
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                wait_reapable(pid, *identity)
+                // MUTANT M-tracer: a by-pid ECHILD is taken for a foreign reap.
+                let _ = identity;
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+                if rc == 0 { Waited::Exited } else { Waited::Foreign }
             }
             #[cfg(windows)]
             ProcSource::Tokio { child } => {
@@ -381,9 +385,10 @@ impl ProcSource {
             // ours: tokio must not reap it by pid.
             ProcSource::Tokio { child, identity } => child.id().is_some_and(|pid| {
                 identity.is_none_or(|identity| {
-                    !matches!(
+                    // MUTANT M-peek-err: a failed peek is no evidence.
+                    matches!(
                         exit_only::peek(&exit_only::Target::pid(pid, Some(identity))),
-                        Ok(Peek::Running | Peek::Exit(_))
+                        Ok(Peek::Foreign(_))
                     )
                 })
             }),
