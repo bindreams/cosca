@@ -15,7 +15,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FORWARD = os.path.join(HERE, "forward.py")
-N = int(os.environ.get("PROBE_N", "300"))
+N = int(os.environ.get("PROBE_N", "150"))
 S = signal.Signals
 
 WAITER = r"""
@@ -52,6 +52,9 @@ def wait_pause(pid):
         seen[w] += 1
         if w == "pause":
             return seen
+        if sum(seen.values()) % 200 == 0:
+            st = subprocess.run(["ps", "-o", "pid,stat,wchan,command", "-p", str(pid)], capture_output=True, text=True).stdout
+            print(f"    still waiting for 'pause': {dict(seen)} {st!r}", flush=True)
 
 
 def part_a(first, second):
@@ -113,7 +116,7 @@ def part_b(first, second):
 
 
 if __name__ == "__main__":
-    print(sys.version, os.uname())
+    print(sys.version, os.uname(), flush=True)
     t = time.monotonic()
     for pair in [
         (signal.SIGCHLD, signal.SIGTERM),
