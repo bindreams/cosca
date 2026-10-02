@@ -147,13 +147,22 @@ impl Drop for ProcSource {
             return;
         };
         if self.shown_ours(&child) {
-            #[cfg(test)]
-            super::fault::note_backend_drop();
-            drop(child);
+            drop(counted(child));
         } else {
             std::mem::forget(child);
         }
     }
+}
+
+/// `child`, counted when it is actually dropped (tests: `fault::count_backend_drops`), so a release
+/// that does not drop it is not counted either.
+#[cfg(all(unix, test))]
+fn counted(child: ::tokio::process::Child) -> super::fault::CountedDrop {
+    super::fault::CountedDrop { _child: child }
+}
+#[cfg(all(unix, not(test)))]
+fn counted(child: ::tokio::process::Child) -> ::tokio::process::Child {
+    child
 }
 
 /// What waiting on a forgotten child answers: nothing of ours is left to wait for.
@@ -418,12 +427,14 @@ impl ProcSource {
     /// by pid.
     pub(crate) fn release(mut self) {
         if let ProcSource::Tokio { child, .. } = &mut self {
-            #[cfg(test)]
-            super::fault::note_backend_drop();
             #[cfg(unix)]
-            drop(child.take());
+            drop(child.take().map(counted));
             #[cfg(windows)]
-            let _ = child;
+            {
+                #[cfg(test)]
+                super::fault::note_backend_drop();
+                let _ = child;
+            }
         }
     }
 

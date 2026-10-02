@@ -305,6 +305,27 @@ async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
     assert_eq!(backend_drops.get(), 1, "a child shown ours is released to tokio's drop");
 }
 
+/// The same drop forgets tokio's `Child` when the pidfd peek fails: a child nothing can answer for
+/// is not tokio's to reap by pid.
+///
+/// Mutant: a failed peek counts as ours.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_a_backend_implicitly_forgets_a_child_whose_peek_failed() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = proc_source(child);
+    wait_exited_unreaped(pid);
+    let backend_drops = super::fault::count_backend_drops();
+    let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure 5b1d")));
+
+    drop(proc);
+
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
+    reap_behind_the_owner(pid); // still ours: nothing reaped it by pid
+}
+
 /// The same drop forgets tokio's `Child` when the pidfd shows the child reaped elsewhere: tokio's
 /// drop would reap by a pid that may name another process.
 ///
