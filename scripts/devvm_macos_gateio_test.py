@@ -32,7 +32,7 @@ class GateCase(unittest.TestCase):
         for sig in SIGNALS:
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
         # Whatever a test holds that a wait would block on (a lock, a child's stdin) is released the moment
-        # the code under test is about to block in select. A correct run was already cancelled and never
+        # the code under test is about to block in select or to join a thread. A correct run was already cancelled and never
         # gets there; a broken wait is released, returns normally and fails the test at once.
         self.releases: list = []
         real_select = m.select.select
@@ -42,9 +42,16 @@ class GateCase(unittest.TestCase):
                 self.releases.pop()()
             return real_select(*a)
 
-        patch = mock.patch.object(m.select, "select", select)
-        patch.start()
-        self.addCleanup(patch.stop)
+        real_join = threading.Thread.join
+
+        def join(thread, *a, **kw):  # a wait that joins a thread blocked on the held resource is released too
+            while self.releases:
+                self.releases.pop()()
+            return real_join(thread, *a, **kw)
+
+        for patch in (mock.patch.object(m.select, "select", select), mock.patch.object(threading.Thread, "join", join)):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     @staticmethod
     def close_quietly(fd) -> None:
