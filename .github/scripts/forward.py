@@ -89,7 +89,7 @@ def _kqueue_waiter():
 
 
 def make_waiter():
-    return _kqueue_waiter() if hasattr(select, "kqueue") else _sigwait_waiter()
+    return _sigwait_waiter()
 
 
 def run(

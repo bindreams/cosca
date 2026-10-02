@@ -1,0 +1,21 @@
+name: tmp-h1-red
+on:
+  pull_request:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The signal-sensitive tests, forward.py using sigwait (the previous behaviour)
+        shell: bash
+        working-directory: .github/scripts
+        continue-on-error: true
+        run: |
+          for run in $(seq 10); do
+            python3 -m unittest forward_tests.Waiting forward_tests.Relay forward_tests.SpawnWindow 2>&1 | grep -E "^(FAIL|ERROR):|^Ran|^OK|^FAILED" || true
+          done
