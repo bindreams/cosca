@@ -139,6 +139,12 @@ const _: () = assert!(std::mem::size_of::<extern_proc>() == 296);
 /// it, `proc_pidinfo`'s own `PROC_FLAG_SYSTEM` bit.
 pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
+/// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit: `#define P_WEXIT
+/// 0x00002000` in the SDK's `usr/include/sys/proc.h`. XNU sets it from `P_LEXIT`, which is never
+/// cleared.
+#[cfg(test)]
+pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
+
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.

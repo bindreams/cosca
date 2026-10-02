@@ -1,6 +1,7 @@
 //! The settle rule's classification of a thread's run state and flags.
 
-use super::{all_parked, parked, threads_with, verdict, Stop, Thread};
+use super::{all_parked, parked, proc_state, threads_with, verdict, Stop, Thread};
+use crate::identity::kinfo::P_WEXIT;
 
 const NO_FLAGS: i32 = 0;
 
@@ -183,4 +184,13 @@ fn threads_without_a_tsd_base_read_as_distinct_threads() {
             "thread {id} does not read as never started"
         );
     }
+}
+
+/// Mutant: `proc_state` reads the wrong process, or maps the flag word wrongly. This process is
+/// running and has not begun to exit.
+#[test]
+fn a_running_process_has_not_begun_to_exit() {
+    let state = proc_state(std::process::id());
+    assert_eq!(state.p_stat, libc::SRUN as u32, "{state:?}");
+    assert_eq!(state.p_flag & P_WEXIT, 0, "{state:?}");
 }

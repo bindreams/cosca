@@ -111,6 +111,25 @@ pub(super) fn pbi_status(pid: u32) -> Result<u32, i32> {
     }
 }
 
+/// The part of a process's `kinfo_proc` that the tests read.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ProcState {
+    pub(super) p_stat: u32,
+    pub(super) p_flag: libc::c_int,
+}
+
+/// The [`ProcState`] of `pid`, an unreaped child of this process.
+pub(super) fn proc_state(pid: u32) -> ProcState {
+    match crate::identity::kinfo::kinfo(pid as _) {
+        crate::identity::Resolved::Found(info) => ProcState {
+            p_stat: info.kp_proc.p_stat as u32,
+            p_flag: info.kp_proc.p_flag,
+        },
+        crate::identity::Resolved::Gone => panic!("the unreaped tracee {pid} is gone"),
+        crate::identity::Resolved::Unknown => panic!("kinfo refused to read the tracee {pid}"),
+    }
+}
+
 /// The stop peek's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stop {

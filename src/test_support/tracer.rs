@@ -70,7 +70,6 @@ thread_local! {
     static UNREAPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many helpers this thread launched and has not reaped yet.
 fn unreaped_helpers() -> usize {
     UNREAPED.get()
 }
@@ -250,6 +249,9 @@ struct Session {
     finished: bool,
     /// Holds the signed copy the helper runs from; removed after the helper is reaped.
     _exe_dir: tempfile::TempDir,
+    /// `!Send`: [`UNREAPED`] counts per thread, so the helper is reaped on the thread that
+    /// launched it.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Session {
@@ -289,6 +291,10 @@ impl Session {
             }
         }
         let status = self.helper.wait().expect("reap the tracer helper");
+        debug_assert!(
+            UNREAPED.get() > 0,
+            "the tracer helper was reaped on a thread that did not launch it"
+        );
         UNREAPED.set(UNREAPED.get() - 1);
         if let Some(state) = stuck {
             if !panicking {
@@ -370,6 +376,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
             awaits_exit: None,
             finished: false,
             _exe_dir: exe_dir,
+            _thread: std::marker::PhantomData,
         },
     }
 }

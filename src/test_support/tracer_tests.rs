@@ -12,7 +12,9 @@
 
 use std::os::unix::process::ExitStatusExt as _;
 
+use super::sys::{proc_state, ProcState};
 use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
+use crate::identity::kinfo::P_WEXIT;
 
 /// The tracee and its stdin, or `None` with the `TRACER` group turned off.
 fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
@@ -178,7 +180,6 @@ thread_local! {
     static FORCED_STOP: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Arms [`FORCED_STOP`] until dropped.
 struct ForcedStop;
 
 impl ForcedStop {
@@ -204,7 +205,6 @@ fn await_change(pid: u32) -> libc::siginfo_t {
     sys::peek(pid, libc::WEXITED | libc::WSTOPPED).expect("waitid the tracee")
 }
 
-/// A `waitid` record of `code` and `status`.
 fn record(code: i32, status: i32) -> libc::siginfo_t {
     // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -220,31 +220,8 @@ fn assert_exited_cleanly(tracee: crate::Child) {
     assert!(status.success(), "expected the tracee's own clean exit, got {status:?}");
 }
 
-/// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit (`sys/proc.h`). XNU sets it
-/// from `P_LEXIT`, which is never cleared (xnu `kern_sysctl.c`, `fill_user64_externproc`).
-const P_WEXIT: libc::c_int = 0x0000_2000;
-
-/// The part of a process's `kinfo_proc` that [`stopped_by`] reads.
-#[derive(Clone, Copy, Debug)]
-struct ProcState {
-    p_stat: u32,
-    p_flag: libc::c_int,
-}
-
-/// The [`ProcState`] of `pid`, this test's unreaped child.
-fn proc_state(pid: u32) -> ProcState {
-    match crate::identity::kinfo::kinfo(pid as _) {
-        crate::identity::Resolved::Found(info) => ProcState {
-            p_stat: info.kp_proc.p_stat as u32,
-            p_flag: info.kp_proc.p_flag,
-        },
-        crate::identity::Resolved::Gone => panic!("the unreaped tracee {pid} is gone"),
-        crate::identity::Resolved::Unknown => panic!("kinfo refused to read the tracee {pid}"),
-    }
-}
-
 /// The signal that stops the tracee, from its `waitid` record and its `state` read after it, or
-/// `None` if it ends. A stop record of a tracee that has begun to exit is not a stop (#463).
+/// `None` if it ends. A stop record of a tracee that has begun to exit is not a stop.
 fn stopped_by(info: &libc::siginfo_t, state: ProcState) -> Option<i32> {
     debug_assert!(
         state.p_stat != libc::SZOMB || state.p_flag & P_WEXIT != 0,
@@ -254,13 +231,11 @@ fn stopped_by(info: &libc::siginfo_t, state: ProcState) -> Option<i32> {
 }
 
 /// The tracee was killed with `SIGKILL`: by XNU when its tracer exited while tracing it, or by
-/// this test. Runs only once this thread's helpers are reaped: XNU hands the tracee back to the
-/// test before it kills it, so until then a held tracee reads as stopped.
+/// this test.
 ///
-/// A stop record of a tracee that has begun to exit is not a stop. When its tracer exits, XNU
-/// wakes a stopped tracee with `SIGKILL` before its `psignal` would mark it running. A tracee
-/// that starts exiting first makes that `psignal` a no-op, and stays `SSTOP` until it is a
-/// zombie. Until then `waitid` reports it as stopped, with its exit status 9 (#463).
+/// Requires this thread's helpers reaped: until XNU kills the tracee for its exiting tracer, a
+/// held tracee reads as stopped. A stop record of a tracee that has begun to exit is XNU's kill,
+/// not a stop: it stays `SSTOP` with status 9 until it is a zombie.
 fn assert_sigkilled(tracee: crate::Child) {
     assert_eq!(
         super::unreaped_helpers(),
@@ -667,8 +642,8 @@ fn s1h_a_signal_byte_goes_to_release() {
     assert_exited_cleanly(tracee);
 }
 
-/// XNU can report a tracee it killed for its exiting tracer as stopped by 9 until it is a zombie
-/// (#463). Replays that record for a tracee that is exiting from `SIGKILL`, this test's own.
+/// Replays XNU's stale stop record (stopped by 9) of a tracee that is exiting from this test's own
+/// `SIGKILL`.
 /// Mutant: `assert_sigkilled` takes the stop record of an exiting tracee for a stop.
 #[test]
 fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
@@ -696,8 +671,8 @@ fn a_stopped_tracee_reads_as_stopped() {
     end_stopped(tracee);
 }
 
-/// Only `P_WEXIT` makes a stop record not a stop. The first row is the #463 state: `SSTOP` with
-/// `P_LEXIT`, before the tracee is a zombie. Mutants: `stopped_by` keys on the zombie state, on
+/// Only `P_WEXIT` makes a stop record not a stop. The first row is XNU's stale record: `SSTOP` with
+/// `P_WEXIT`, before the tracee is a zombie. Mutants: `stopped_by` keys on the zombie state, on
 /// any flag, or ignores the flags.
 #[test]
 fn stopped_by_keys_on_p_wexit_alone() {
@@ -715,6 +690,8 @@ fn stopped_by_keys_on_p_wexit_alone() {
             Some(libc::SIGSTOP),
         ),
         (libc::CLD_STOPPED, libc::SIGTSTP, libc::SRUN, 0, Some(libc::SIGTSTP)),
+        (libc::CLD_TRAPPED, libc::SIGTRAP, libc::SSTOP, 0, None),
+        (libc::CLD_CONTINUED, libc::SIGCONT, libc::SRUN, 0, None),
         (libc::CLD_KILLED, libc::SIGKILL, libc::SZOMB, P_WEXIT, None),
         (libc::CLD_EXITED, 0, libc::SZOMB, P_WEXIT, None),
     ];
@@ -726,6 +703,18 @@ fn stopped_by_keys_on_p_wexit_alone() {
             "si_code {code}, si_status {status}, {state:?}"
         );
     }
+}
+
+/// The contract: XNU sets `P_LEXIT` before `SZOMB`, so a zombie without `P_WEXIT` is a misread.
+/// Mutant: the `debug_assert` in `stopped_by` is dropped.
+#[test]
+#[should_panic(expected = "a zombie without P_WEXIT")]
+fn stopped_by_asserts_a_zombie_has_begun_to_exit() {
+    let state = ProcState {
+        p_stat: libc::SZOMB as u32,
+        p_flag: 0,
+    };
+    stopped_by(&record(libc::CLD_EXITED, 0), state);
 }
 
 /// Mutant: `assert_sigkilled` reads the tracee while a helper is unreaped.
