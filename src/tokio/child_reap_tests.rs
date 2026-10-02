@@ -396,6 +396,43 @@ async fn dropping_a_backend_implicitly_after_wait_releases_it() {
     assert_eq!(backend_drops.get(), 1, "a reaped child's backend is released");
 }
 
+/// An implicit drop that forgets the child says so at debug, except while unwinding: a logger that
+/// panics then aborts the process. The unwind here is a plain panic, and its record is checked.
+///
+/// Mutant: the drop logs whether or not the thread is panicking.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_implicit_drop_logs_its_forget_only_when_not_unwinding() {
+    crate::log_capture::install();
+    let reaped_elsewhere = || {
+        let child = spawn_a_tokio_child_that_exits();
+        let pid = child.id().expect("tokio owns an un-reaped child");
+        let proc = proc_source(child);
+        reap_behind_the_owner(pid);
+        proc
+    };
+    let marker = "dropped without a release";
+
+    let mark = crate::log_capture::mark();
+    drop(reaped_elsewhere());
+    assert!(
+        crate::log_capture::contains_since(mark, marker),
+        "a plain drop logs the forget"
+    );
+
+    let proc = reaped_elsewhere();
+    let mark = crate::log_capture::mark();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = proc;
+        panic!("unwind with the backend held");
+    }));
+    assert!(unwound.is_err());
+    assert!(
+        !crate::log_capture::contains_since(mark, marker),
+        "no log may run while the thread unwinds"
+    );
+}
+
 /// Without evidence of a foreign reap nothing is forgotten: a live child stays tokio's.
 ///
 /// Mutant: `forget_if_foreign` forgets unconditionally.

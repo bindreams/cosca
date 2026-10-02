@@ -279,6 +279,19 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
 }
 
+/// Resolve when the process `pid`, whose unique id was `unique`, exits (no internal timeout), or at
+/// once if it no longer has that id. Non-reaping.
+#[cfg(target_os = "macos")]
+pub(crate) async fn wait_exit_for(pid: u32, unique: u64) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    let Some(kq) = crate::wait::backend::arm_proc_exit_for(pid, unique)? else {
+        return Ok(());
+    };
+    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
+}
+
 /// `AsyncFd` requires `AsRawFd`; nix's `Kqueue` exposes only `AsFd` — delegate.
 #[cfg(target_os = "macos")]
 struct KqueueFd(nix::sys::event::Kqueue);

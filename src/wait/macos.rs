@@ -109,6 +109,22 @@ pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Erro
 /// identity. `Ok(None)` => already gone (treat as exited). The kqueue's fd polls readable
 /// once the exit event is pending — consumed by the sync blocking wait below and by the
 /// async reactor watch (`tokio::wait`).
+/// [`arm_proc_exit`] for a pid whose unique id was read earlier, `unique`: the watch is armed on the
+/// pid, then the id is read again, so a stranger that took the pid is never watched, whatever
+/// happened before the arming. `Ok(None)`: the pid is gone, or no longer (or not provably) has that
+/// id; there is nothing of the child's to watch, and the caller's own check says what that means.
+pub(crate) fn arm_proc_exit_for(pid: u32, unique: u64) -> Result<Option<Kqueue>, Error> {
+    use crate::identity::{uniq_info, ReadPurpose, UniqRead};
+    let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
+    if arm_note_exit_on(&kq, pid)?.is_none() {
+        return Ok(None);
+    }
+    match uniq_info(pid, ReadPurpose::Arm) {
+        UniqRead::Found(info) if info.unique_id == unique => Ok(Some(kq)),
+        UniqRead::Found(_) | UniqRead::Gone | UniqRead::Refused(_) => Ok(None),
+    }
+}
+
 pub(crate) fn arm_proc_exit(id: ProcessId) -> Result<Option<Kqueue>, Error> {
     let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
     if arm_note_exit_on(&kq, id.pid())?.is_none() {

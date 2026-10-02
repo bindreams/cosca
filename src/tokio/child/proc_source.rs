@@ -244,31 +244,28 @@ impl ProcSource {
     }
 
     /// Block until the child exits, returning its status.
+    ///
     /// tokio's own `wait` is a `waitpid` by pid, so on Unix it runs only for a child the handle
-    /// shows ours, before and after the exit is awaited (Linux: through the pidfd; macOS: a
-    /// verified-id watch). A child reaped elsewhere or not shown to be ours is forgotten and
-    /// answers `ECHILD`.
+    /// shows ours, before and after the exit is awaited (Linux: through the pidfd; macOS: a watch
+    /// armed on the unique id read at spawn and checked again after arming). A child reaped
+    /// elsewhere is forgotten and answers `ECHILD`. A child the handle cannot answer for
+    /// (a failed peek, or macOS without a readable unique id) answers
+    /// [`Error::Unassessable`], since it may well be running; it is not forgotten.
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, Error> {
         match self {
             ProcSource::Tokio { stdin, .. } => {
                 // As tokio's own `wait`: stdin closes first, so a child reading it to EOF can exit.
                 drop(stdin.take());
                 #[cfg(unix)]
-                if matches!(self, ProcSource::Tokio { child, .. } if child.id().is_some()) {
+                {
                     // Checked before the watch too: a pid that names a stranger now would be
                     // watched until the stranger exits.
-                    if self.reaped_elsewhere() {
-                        self.forget_foreign();
-                        return Err(gone());
-                    }
+                    self.gate()?;
                     self.await_exit().await?;
-                    if self.reaped_elsewhere() {
-                        self.forget_foreign();
-                        return Err(gone());
-                    }
+                    self.gate()?;
                 }
                 let ProcSource::Tokio { child: c, .. } = self else {
-                    unreachable!("forget_foreign was not reached")
+                    unreachable!("a gate that forgot the child returned an error")
                 };
                 c.wait().await.map_err(Error::Io)
             }
@@ -282,19 +279,41 @@ impl ProcSource {
     /// Exit status if the child has already exited (non-blocking).
     ///
     /// On Unix tokio's `try_wait` is a `waitpid` by pid, so it runs only for a child the handle
-    /// shows ours; one reaped elsewhere or not shown to be ours is forgotten and answers `ECHILD`.
+    /// shows ours: one reaped elsewhere is forgotten and answers `ECHILD`, and one it cannot answer
+    /// for answers [`Error::Unassessable`] (see [`wait`](ProcSource::wait)).
     pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
         #[cfg(unix)]
-        if matches!(self, ProcSource::Tokio { child, .. } if child.id().is_some()) && self.reaped_elsewhere() {
-            self.forget_foreign();
-            return Err(gone());
-        }
+        self.gate()?;
         match self {
             ProcSource::Tokio { child: c, .. } => c.try_wait().map_err(Error::Io),
             #[cfg(unix)]
             ProcSource::Foreign { .. } => Err(gone()),
             #[cfg(windows)]
             ProcSource::Raw(r) => r.try_wait(),
+        }
+    }
+
+    /// `Ok` for a child the handle shows ours, or that tokio already reaped. Reaped elsewhere: the
+    /// child is forgotten and the answer is `ECHILD`. Not shown either way: `Unassessable`, with the
+    /// child left in place, so a later call can still answer and a `Drop` forgets it.
+    #[cfg(unix)]
+    fn gate(&mut self) -> Result<(), Error> {
+        let ProcSource::Tokio { child, .. } = &*self else {
+            return Ok(());
+        };
+        let Some(pid) = child.id() else {
+            return Ok(());
+        };
+        match self.classify(child) {
+            (Ownership::Ours, _) => Ok(()),
+            (Ownership::Foreign, _) => {
+                self.forget_foreign();
+                Err(gone())
+            }
+            (Ownership::Unknown, failed) => Err(Error::Unassessable {
+                detail: format!("pid {pid}: the child cannot be shown to be ours; it was not waited on"),
+                source: failed,
+            }),
         }
     }
 
@@ -312,18 +331,15 @@ impl ProcSource {
         }
         #[cfg(target_os = "macos")]
         {
-            use crate::identity::{ProcessId, Resolved};
-            let ProcSource::Tokio { child, .. } = self else {
+            let ProcSource::Tokio { child, identity, .. } = self else {
                 return Ok(());
             };
-            let Some(pid) = child.id() else {
+            // No unique id, or the child already reaped: nothing to watch, and the gate after this
+            // decides what that means.
+            let (Some(pid), Some(identity)) = (child.id(), *identity) else {
                 return Ok(());
             };
-            match ProcessId::of(pid) {
-                Resolved::Found(id) => crate::tokio::wait::wait_exit(id).await,
-                // Gone: nothing to watch. Unknown: the check after this decides.
-                Resolved::Gone | Resolved::Unknown => Ok(()),
-            }
+            crate::tokio::wait::wait_exit_for(pid, identity).await
         }
     }
 

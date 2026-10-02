@@ -120,8 +120,8 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // `kern_exit.c:2612-2613` and `:2748`, which sends the `SIGCHLD` to launchd). It comes
         // back to us only if launchd waits on it: `reap_child_locked` then finds `p_oppid`, hands
         // it back and re-sends `NOTE_EXIT` (`:2864-2912`). On CI launchd never did, in a 30 s
-        // window, so this is taken for reaped: a later `wait` or `try_wait` still reaps the
-        // zombie if that hand-back ever comes.
+        // window, so this is taken for reaped. The sync child's later `wait` or `try_wait` still
+        // reaps the zombie if that hand-back ever comes; the tokio backend forgets it.
         Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
             Held::Other => Ok(Peek::Foreign(Foreign::Other)),
             Held::Parent(ppid) if ppid == LAUNCHD => Ok(peeked),

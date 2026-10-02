@@ -87,6 +87,8 @@ pub(crate) enum ReadPurpose {
     PreReap,
     /// The second peek's.
     SecondPeek,
+    /// The re-read after an exit watch is armed on a pid: is it still the child?
+    Arm,
 }
 
 /// The pid launchd runs as, the parent of every orphan.
