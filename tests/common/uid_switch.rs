@@ -120,6 +120,7 @@ impl KillOnDrop {
     }
 }
 
+/// A single process, whose drop kills no tree, so reaping it here skips nothing.
 impl super::Target for KillOnDrop {
     fn pid(&self) -> u32 {
         self.id()

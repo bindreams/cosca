@@ -27,13 +27,22 @@ pub async fn accept_or_die_async_also(
     let target_pid = child.id().pid();
     // As in the sync path: a target that has already exited is dead, decided before any wait so
     // that no reactor-readiness ordering between the accept arm and the exit arm can matter.
-    if child
+    #[cfg(unix)]
+    let exited = super::has_exited_unreaped(child.id());
+    #[cfg(windows)]
+    let exited = child
         .try_wait()
         .expect("try_wait the control target before watching it")
-        .is_some()
-    {
+        .is_some();
+    if exited {
         died_before_connecting(target_pid);
     }
+    #[cfg(unix)]
+    let target = cosca::tokio::Process::from_id(child.id());
+    #[cfg(unix)]
+    let target_exit = target.wait();
+    #[cfg(windows)]
+    let target_exit = async { child.wait().await.map(drop) };
     let also_exit = async {
         let Some(id) = also else {
             return std::future::pending().await;
@@ -50,8 +59,8 @@ pub async fn accept_or_die_async_also(
             let (stream, _) = accepted.expect("accept a control connection");
             ack_now(blocking_std(stream.into_std().expect("convert the accepted tokio stream to std")))
         }
-        status = child.wait() => match status {
-            Ok(_) => died_before_connecting(target_pid),
+        status = target_exit => match status {
+            Ok(()) => died_before_connecting(target_pid),
             // An error watching the exit is reported as exactly that, never folded into "died",
             // which would misattribute a wait-mechanism failure to the target.
             Err(e) => panic!("watching the control target's exit while waiting for a connection: {e}"),

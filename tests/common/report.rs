@@ -13,9 +13,10 @@
 //! it, exiting nonzero if the relay failed, so the report accept's watch on the root still covers
 //! the reporter.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::rc::Rc;
 
 use cosca::identity::{Liveness, ProcessId, Resolved};
 
@@ -34,6 +35,52 @@ thread_local! {
     static LAST_REPORTED_CONTAINED: Cell<Option<bool>> = const { Cell::new(None) };
     #[cfg(feature = "tokio")]
     static LAST_ASYNC_ROOT: Cell<Option<ProcessId>> = const { Cell::new(None) };
+    static REAPABLE_AFTER_RELEASE: RefCell<Option<Rc<Cell<Option<u32>>>>> = const { RefCell::new(None) };
+}
+
+/// While the guard lives, each root released on this thread ([`report_grandchild`] or its async
+/// sibling) is waited on until it has exited and can be reaped, before the helper's next step,
+/// and its pid is recorded ([`ReapableAfterRelease::root`]). Unix waits for the zombie edge, which
+/// a death-watch precedes on macOS (see [`block_until_zombie`](super::block_until_zombie)).
+#[must_use = "the seam is removed as soon as the guard is dropped"]
+pub fn reapable_after_release() -> ReapableAfterRelease {
+    let root = Rc::new(Cell::new(None));
+    REAPABLE_AFTER_RELEASE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        debug_assert!(
+            slot.is_none(),
+            "reapable_after_release is already installed on this thread"
+        );
+        *slot = Some(Rc::clone(&root));
+    });
+    ReapableAfterRelease(root)
+}
+
+/// The [`reapable_after_release`] guard.
+pub struct ReapableAfterRelease(Rc<Cell<Option<u32>>>);
+
+impl ReapableAfterRelease {
+    /// The pid of the last root the seam waited on, `None` if it never ran.
+    pub fn root(&self) -> Option<u32> {
+        self.0.get()
+    }
+}
+
+impl Drop for ReapableAfterRelease {
+    fn drop(&mut self) {
+        REAPABLE_AFTER_RELEASE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+fn released(root_pid: u32) {
+    let Some(root) = REAPABLE_AFTER_RELEASE.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    #[cfg(unix)]
+    super::block_until_zombie(root_pid);
+    #[cfg(windows)]
+    super::accept::wait_for_exit(root_pid);
+    root.set(Some(root_pid));
 }
 
 /// The pid of the grandchild most recently reported to this thread, if any. Lets a test that
@@ -87,6 +134,49 @@ pub fn last_reported_grandchild_liveness() -> Option<Liveness> {
 /// that silently does nothing fails at once instead of hanging the wait.
 pub fn last_reported_grandchild_contained() -> Option<bool> {
     LAST_REPORTED_CONTAINED.with(Cell::get)
+}
+
+/// The log line a `Child` drop emits when it skips its tree kill because the root is already
+/// reaped: at `warn`, unlike its `debug` twin for a tree this handle already killed.
+const DROP_SKIPPED_THE_KILL: &str = "Child::drop: the root is already reaped";
+
+/// Whether a `Child` drop logged the skipped kill since `mark`.
+fn drop_skipped_its_kill(mark: usize) -> bool {
+    super::levels_since(mark, DROP_SKIPPED_THE_KILL).contains(&log::Level::Warn)
+}
+
+/// Blocks until the grandchild most recently reported on this thread has exited, for a test whose
+/// tree helper panicked and whose contained `Child` the unwind dropped: that drop's tree kill is
+/// the only thing that ends the grandchild. `mark` is a [`log_mark`](super::log_mark) taken, after
+/// [`install_log_capture`](super::install_log_capture), before the helper ran.
+///
+/// The grandchild must have been a live member of the containment when identified, and the drop
+/// must not have skipped its kill; both are asserted so the wait cannot hang. On a skipped kill
+/// the grandchild is killed and waited for by identity before the panic.
+pub fn wait_for_the_dropped_trees_grandchild(mark: usize, message: &str) {
+    let id = last_reported_grandchild_id()
+        .unwrap_or_else(|| panic!("no grandchild identity; helper panicked with: {message:?}"));
+    assert_eq!(
+        last_reported_grandchild_contained(),
+        Some(true),
+        "the grandchild must be inside the root's containment when identified, or the drop does not kill it"
+    );
+    assert_eq!(
+        last_reported_grandchild_liveness(),
+        Some(Liveness::Alive),
+        "the grandchild must be alive when identified, so its exit is the containment kill's"
+    );
+    let grandchild = cosca::Process::from_id(id);
+    if drop_skipped_its_kill(mark) {
+        let killed = grandchild.kill();
+        let waited = grandchild.wait();
+        panic!(
+            "the tree's drop skipped its kill because the root was already reaped, which leaves the grandchild \
+             (pid {}) running; killed it by identity: {killed:?}, then waited for it: {waited:?}",
+            id.pid()
+        );
+    }
+    grandchild.wait().expect("wait for the orphaned grandchild");
 }
 
 /// Whether `grandchild` is inside the containment `containment` of the still-held `root`.
@@ -158,6 +248,7 @@ pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> Proce
     });
     LAST_REPORTED_CONTAINED.with(|c| c.set(Some(contained)));
     release(stream);
+    released(root.pid());
     id
 }
 
@@ -222,13 +313,15 @@ pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &
         .expect("set the report stream nonblocking");
     let mut stream = ::tokio::net::TcpStream::from_std(std_stream).expect("wrap the report stream for tokio");
     let mut line = String::new();
+    // Watched without reaping, as in `accept_or_die_async`.
+    let root_process = cosca::tokio::Process::from_id(root.id());
     let n = {
         let mut reader = BufReader::new(&mut stream);
         ::tokio::select! {
             biased;
             n = reader.read_line(&mut line) => n.expect("read the grandchild pid report"),
-            status = root.wait() => match status {
-                Ok(_) => died_before_reporting(root_pid, "the grandchild pid"),
+            status = root_process.wait() => match status {
+                Ok(()) => died_before_reporting(root_pid, "the grandchild pid"),
                 Err(e) => panic!("watching the root's exit while reading the grandchild pid report: {e}"),
             },
         }
@@ -248,5 +341,6 @@ pub async fn report_grandchild_async(report: &::tokio::net::TcpListener, root: &
         .write_all(&[super::accept::ack::ACK_BYTE])
         .await
         .unwrap_or_else(|e| panic!("writing the release to the grandchild pid report failed: {e}"));
+    released(root_pid);
     id
 }
