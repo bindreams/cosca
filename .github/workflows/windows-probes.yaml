@@ -85,9 +85,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # `.config/nextest.toml` requires the same nextest. One Renovate manager moves every copy
-  # of this version together (.github/renovate.json).
-  NEXTEST_VERSION: "0.9.137"
+  # `.config/nextest.toml`, ci.yaml and the devvm provision scripts carry the same nextest
+  # version; Renovate moves them together (.github/renovate.json).
+  NEXTEST_VERSION: "0.9.146"
 
 jobs:
   path-resolution:

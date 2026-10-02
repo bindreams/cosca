@@ -17,8 +17,8 @@ env:
   # Every job here runs unprivileged unless it says otherwise, so the tests that only mean
   # something as root opt out (principles 9 and 10).
   COSCA_TEST_ROOT: "0"
-  # One place for values several jobs share. `.config/nextest.toml` and windows-probes.yaml carry the same nextest version; one Renovate manager moves all three.
-  NEXTEST_VERSION: "0.9.137"
+  # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml and the devvm provision scripts carry the same nextest version; Renovate moves them together (.github/renovate.json).
+  NEXTEST_VERSION: "0.9.146"
   # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
   # gated on `COSCA_TEST_UID_SWITCH`.
   PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"

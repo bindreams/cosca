@@ -1,4 +1,4 @@
-nextest-version = { required = "0.9.137" }
+nextest-version = { required = "0.9.146" }
 
 # Death-watch tests that a regression would turn into a hang rather than a failure.
 [[profile.default.overrides]]
