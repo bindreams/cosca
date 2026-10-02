@@ -821,8 +821,8 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
 /// report accept, which watches the root: the root has to exit with it, not carry on to its own
 /// connection and leave the accept waiting on a live root.
 ///
-/// The failed relay must also leave nothing behind: nothing contains this tree, and an orphan
-/// would hold the test's stdout and stderr.
+/// The failed relay must also leave nothing behind: nothing contains this tree, so an orphan
+/// would outlive the test.
 #[cfg(unix)]
 #[skuld::test]
 fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
