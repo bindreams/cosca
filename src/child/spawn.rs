@@ -411,6 +411,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // macOS: attach fails only when the tree-walk root's identity is unreadable; see
         // `leave_unverified_child`.
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            std::mem::forget(parent_ends); // MUTANT M3 (attach arm)
             log::debug!("attach failed (root identity verdict: {:?}): {}", e.identity, e.error);
             #[cfg(target_os = "macos")]
             {
@@ -433,6 +435,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
+            #[cfg(target_os = "macos")]
+            std::mem::forget(parent_ends); // MUTANT M3: leaks our pipe ends
             #[cfg(target_os = "macos")]
             leave_unverified_child(
                 child,
@@ -487,7 +491,7 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
             child.id()
         );
     }
-    std::mem::forget(child); // MUTANT M2: leaks our pipe ends
+    drop(child);
 }
 
 /// The spawned `child` could not be adopted. Answers `error`.
