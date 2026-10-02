@@ -5,10 +5,10 @@ use crate::test_spawn::spawn;
 use crate::test_stdio::RestoreStdio;
 
 /// The (device, inode) of what `fd` refers to, or `None` if it is not open.
-fn identity(fd: RawFd) -> Option<(u64, u64)> {
+fn identity(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
     // SAFETY: fstat on a descriptor number with a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev, st.st_ino))
 }
 
 #[test]
