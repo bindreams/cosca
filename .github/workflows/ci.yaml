@@ -18,36 +18,4 @@ jobs:
         timeout-minutes: 20
         shell: bash
         working-directory: .github/scripts
-        run: python3 -u adv455h_probe.py
-      - name: Suite x20
-        if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        shell: bash
-        working-directory: .github/scripts
-        run: |
-          set +e
-          for i in $(seq 1 20); do
-            start=$(python3 -c 'import time; print(time.monotonic())')
-            python3 -m unittest forward_tests run_nextest_tests > "$RUNNER_TEMP/suite-$i.log" 2>&1; st=$?
-            end=$(python3 -c 'import time; print(time.monotonic())')
-            echo "run $i status $st $(python3 -c "print(round($end-$start,2))")s"
-            if [ "$st" != 0 ]; then tail -40 "$RUNNER_TEMP/suite-$i.log"; fi
-          done
-      - name: Suite x10 under CPU load
-        if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        shell: bash
-        working-directory: .github/scripts
-        run: |
-          set +e
-          n=$(( $(sysctl -n hw.ncpu) * 3 ))
-          pids=()
-          for _ in $(seq 1 "$n"); do yes > /dev/null & pids+=($!); done
-          for i in $(seq 1 10); do
-            start=$(python3 -c 'import time; print(time.monotonic())')
-            python3 -m unittest forward_tests run_nextest_tests > "$RUNNER_TEMP/load-$i.log" 2>&1; st=$?
-            end=$(python3 -c 'import time; print(time.monotonic())')
-            echo "load run $i status $st $(python3 -c "print(round($end-$start,2))")s"
-            if [ "$st" != 0 ]; then tail -40 "$RUNNER_TEMP/load-$i.log"; fi
-          done
-          kill "${pids[@]}"
+        run: python3 -u adv455h_probe4.py
