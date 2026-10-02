@@ -192,8 +192,17 @@ impl ProcSource {
             }
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, identity } => {
+                // MUTANT M1: no identity check before the by-pid send.
+                let _ = identity;
                 let pid = child.id().expect("checked above");
-                crate::signal::via_verified_pid(pid, *identity, sig).map_err(Error::Io)
+                #[cfg(test)]
+                crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
+                // SAFETY: mutant, a by-pid kill of a number that may be freed.
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+                    Ok(Sent::Delivered)
+                } else {
+                    Err(Error::Io(std::io::Error::last_os_error()))
+                }
             }
             #[cfg(windows)]
             ProcSource::Tokio { child } => {
@@ -369,12 +378,8 @@ impl ProcSource {
                     )
             }
             #[cfg(target_os = "macos")]
-            ProcSource::Tokio { child, identity } => child.id().is_some_and(|pid| {
-                matches!(
-                    exit_only::peek(&exit_only::Target::pid(pid, *identity)),
-                    Ok(Peek::Foreign(_))
-                )
-            }),
+            // MUTANT M2: no evidence is ever found on macOS.
+            ProcSource::Tokio { .. } => false,
         };
         if evident {
             self.forget_foreign();
