@@ -103,7 +103,7 @@ ghcr.io/cirruslabs/macos-tahoe-base:latest`; check free disk first).
 ```sh
 uv run scripts/devvm.py up macos-arm64 [--rev <git rev>] [--rosetta]   # clone, boot headless, copy `git archive <rev>`, provision
 uv run scripts/devvm.py run macos-arm64 -- cargo nextest run --lib -E 'test(/await_reapable/)'
-uv run scripts/devvm.py run macos-arm64 -- sudo -n env PATH=/Users/admin/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin cargo nextest run ...   # root lane: sudo is fine in the VM
+uv run scripts/devvm.py run macos-arm64 -- sudo -n env PATH=/Users/admin/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin CARGO_HOME=/Users/admin/cargo-home-root CARGO_TARGET_DIR=/Users/admin/cargo-target-root RUSTUP_HOME=/Users/admin/.rustup cargo nextest run --locked ...   # root lane
 uv run scripts/devvm.py sync macos-arm64 --rev <rev>                  # replace the guest's source with another rev
 uv run scripts/devvm.py fetch macos-arm64 /Users/admin/cargo-target/nextest ./out   # copy results out
 uv run scripts/devvm.py destroy macos-arm64                           # stop and delete the VM

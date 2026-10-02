@@ -14,16 +14,22 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 GUEST_NAME = "macos-arm64"
-BASE_IMAGE = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+BASE_IMAGE_REPO = "ghcr.io/cirruslabs/macos-tahoe-base"
+BASE_IMAGE_TAG = "latest"
+BASE_IMAGE_DIGEST = "sha256:1b093499716409d29e8b5336844528e1cae375db97d2ad8e5aeff78cf0da201e"
+BASE_IMAGE = f"{BASE_IMAGE_REPO}@{BASE_IMAGE_DIGEST}"
+# Failure bound on an external event (the guest booting and its agent answering), surfaced to a
+# human; not a sync primitive between processes this tool controls.
+AGENT_BOOT_TIMEOUT_SECONDS = 600
 VM_PREFIX = "devvm-macos-"
 MAX_CONCURRENT_VMS = 2
 GUEST_TREE = "~/cosca"
@@ -32,6 +38,18 @@ PROVISION_SCRIPT = "scripts/devvm/provision/macos-rust.sh"
 
 
 class CapExceeded(RuntimeError):
+    pass
+
+
+class NameTaken(RuntimeError):
+    pass
+
+
+class BadRev(ValueError):
+    pass
+
+
+class AlreadyUp(RuntimeError):
     pass
 
 
@@ -68,10 +86,51 @@ def check_cap(running: int) -> None:
 
 
 def new_vm_name(repo_root: Path) -> str:
-    import hashlib
+    """A fresh 128-bit name. repo_root is unused: the name must not depend on the worktree."""
+    return f"{VM_PREFIX}{uuid.uuid4().hex}"
 
-    tag = hashlib.sha256(str(repo_root).encode()).hexdigest()[:6]
-    return f"{VM_PREFIX}{tag}-{secrets.token_hex(3)}"
+
+def require_name_free(name: str, tart_list_json: str) -> None:
+    if name in {e.get("Name") for e in json.loads(tart_list_json)}:
+        raise NameTaken(f"a Tart VM named '{name}' already exists; refusing to clone over it")
+
+
+def resolve_rev(repo_root: Path, rev: str) -> str:
+    """The full commit sha for rev. `--end-of-options` keeps an option-looking rev from being
+    read as a git flag; everything later uses the sha, which cannot look like one."""
+    r = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise BadRev(f"'{rev}' is not a commit in {repo_root}")
+    return r.stdout.strip()
+
+
+def identity_matches(recorded: dict, current: dict) -> bool:
+    return recorded.get("ino") == current.get("ino") and recorded.get("dev") == current.get("dev")
+
+
+def tart_home() -> Path:
+    return Path(os.environ.get("TART_HOME") or Path.home() / ".tart")
+
+
+def vm_identity(name: str) -> dict:
+    st = (tart_home() / "vms" / name / "disk.img").stat()
+    return {"ino": st.st_ino, "dev": st.st_dev}
+
+
+def claim_state(state_root: Path, name: str) -> None:
+    """Atomically claim this worktree's single macOS guest (O_EXCL), before anything is cloned."""
+    d = _state_dir(state_root)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(d / "vm_name", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise AlreadyUp("guest 'macos-arm64' already exists for this worktree; `destroy` it first") from None
+    with os.fdopen(fd, "w") as f:
+        f.write(name + "\n")
 
 
 def require_own_name(name: str) -> None:
@@ -106,7 +165,11 @@ def _state_dir(state_root: Path) -> Path:
 
 def read_vm_name(state_root: Path) -> str | None:
     f = _state_dir(state_root) / "vm_name"
-    return f.read_text().strip() if f.exists() else None
+    return f.read_text().split()[0] if f.exists() and f.read_text().strip() else None
+
+
+def _identity_file(state_root: Path) -> Path:
+    return _state_dir(state_root) / "identity.json"
 
 
 def require_vm(state_root: Path) -> str:
@@ -124,7 +187,7 @@ def _exec(name: str, args: list[str], *, stdin=None, check: bool = False, **kw) 
 
 
 def _archive_into_guest(repo_root: Path, name: str, rev: str) -> None:
-    git = subprocess.Popen(["git", "-C", str(repo_root), "archive", "--format=tar", rev], stdout=subprocess.PIPE)
+    git = subprocess.Popen(["git", "-C", str(repo_root), "archive", "--format=tar", "--end-of-options", rev], stdout=subprocess.PIPE)
     assert git.stdout is not None
     untar = _exec(
         name,
@@ -139,22 +202,50 @@ def _archive_into_guest(repo_root: Path, name: str, rev: str) -> None:
 
 def _wait_for_agent(name: str, run: subprocess.Popen, log: Path) -> None:
     """Block until `tart exec` answers. `tart ip --wait` can return before `tart run` has
-    registered the VM as running, so readiness is the first successful exec. The only failure
-    is `tart run` itself exiting; retrying is a re-check of a deterministic condition."""
+    registered the VM as running, so readiness is the first successful exec. Guest boot is an
+    external event that may never complete, so the wait has a failure bound reported to the
+    human; `tart run` exiting also fails it."""
+    deadline = time.monotonic() + AGENT_BOOT_TIMEOUT_SECONDS
     while True:
         if _exec(name, ["true"], capture_output=True).returncode == 0:
             return
         if run.poll() is not None:
-            print(f"error: `tart run` for {name} exited ({run.returncode}); see {log}", file=sys.stderr)
-            sys.exit(1)
+            raise RuntimeError(f"`tart run` for {name} exited ({run.returncode}); see {log}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"the guest {name} did not answer within {AGENT_BOOT_TIMEOUT_SECONDS}s of starting "
+                f"(boot hang, or an image without the Tart guest agent); see {log}"
+            )
         time.sleep(1)
 
 
+def _lock_cap(lock) -> None:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("devvm: another `up` holds the host-wide macOS VM lock; waiting for it...", file=sys.stderr)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+
+def _teardown(state_root: Path, name: str) -> None:
+    """Best-effort removal of a VM this tool created, used when `up` fails or is interrupted."""
+    require_own_name(name)
+    try:
+        if name in {e.get("Name") for e in json.loads(_list_json())}:
+            _tart(["stop", name], check=False)
+            _tart(["delete", name], check=False)
+    finally:
+        for f in ("vm_name", "identity.json"):
+            (_state_dir(state_root) / f).unlink(missing_ok=True)
+
+
 def up(repo_root: Path, state_root: Path, *, rev: str, rosetta: bool) -> None:
-    if read_vm_name(state_root) is not None:
-        print("error: guest 'macos-arm64' already exists for this worktree; `destroy` it first", file=sys.stderr)
+    try:
+        sha = resolve_rev(repo_root, rev)  # before anything boots
+    except BadRev as e:
+        print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
-    local = _tart(["list", "--format", "json"], check=True, capture_output=True, text=True).stdout
+    local = _list_json()
     if BASE_IMAGE not in {e.get("Name") for e in json.loads(local)}:
         print(
             f"error: base image {BASE_IMAGE} is not pulled. Check free disk (about 30 GB needed), then run: "
@@ -164,47 +255,72 @@ def up(repo_root: Path, state_root: Path, *, rev: str, rosetta: bool) -> None:
         sys.exit(1)
 
     sdir = _state_dir(state_root)
-    sdir.mkdir(parents=True, exist_ok=True)
     name = new_vm_name(repo_root)
-    # The cap check and the clone+run must be atomic across agents: two concurrent `up`s
-    # would otherwise both see one running VM and both start another. The lock is held
-    # until the new VM reports `running`.
-    lock_path = Path.home() / ".tart" / "devvm-cap.lock"
+    # The cap check, the claim and the clone+run must be atomic across agents: two concurrent
+    # `up`s would otherwise both see one running VM and both start another. The lock is
+    # released as soon as the new VM answers, or when it fails.
+    lock_path = tart_home() / "devvm-cap.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            check_cap(count_running(_list_json()))
-        except CapExceeded as e:
-            print(f"error: {e}", file=sys.stderr)
+    run = None
+    created = False
+    try:
+        with open(lock_path, "w") as lock:
+            _lock_cap(lock)
+            try:
+                claim_state(state_root, name)  # refuses a second `up` in this worktree
+            except AlreadyUp as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            created = True
+            current = _list_json()
+            try:
+                check_cap(count_running(current))
+                require_name_free(name, current)
+            except (CapExceeded, NameTaken) as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            _tart(["clone", BASE_IMAGE, name], check=True)
+            _identity_file(state_root).write_text(json.dumps(vm_identity(name)))
+            log = sdir / "tart-run.log"
+            with open(log, "wb") as logf:
+                run = subprocess.Popen(
+                    [tart_bin(), "run", "--no-graphics", name],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            _wait_for_agent(name, run, log)
+        _archive_into_guest(repo_root, name, sha)
+        # The provision script comes from THIS checkout (streamed on stdin), not from the rev
+        # being tested: an older --rev may predate it. Only .github/ci-toolchain is read from the rev.
+        with open(repo_root / PROVISION_SCRIPT, "rb") as script:
+            r = _exec(
+                name,
+                ["bash", "-c", 'bash -s -- "$HOME/cosca" "$@"', "_", *(["--rosetta"] if rosetta else [])],
+                stdin=script,
+            )
+        if r.returncode != 0:
+            raise RuntimeError("provisioning failed")
+    except BaseException as e:
+        if created:
+            if not isinstance(e, SystemExit):
+                print(f"error: {e!r}" if not isinstance(e, RuntimeError) else f"error: {e}", file=sys.stderr)
+            _teardown(state_root, name)
+            print(f"devvm: removed the partly-created VM {name}", file=sys.stderr)
+        if isinstance(e, RuntimeError):
             sys.exit(1)
-        _tart(["clone", BASE_IMAGE, name], check=True)
-        (sdir / "vm_name").write_text(name + "\n")
-        log = open(sdir / "tart-run.log", "wb")
-        run = subprocess.Popen(
-            [tart_bin(), "run", "--no-graphics", name],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        _wait_for_agent(name, run, sdir / "tart-run.log")
-    _archive_into_guest(repo_root, name, rev)
-    # The provision script comes from THIS checkout (streamed on stdin), not from the rev
-    # being tested: an older --rev may predate it. Only .github/ci-toolchain is read from the rev.
-    with open(repo_root / PROVISION_SCRIPT, "rb") as script:
-        r = _exec(
-            name,
-            ["bash", "-c", 'bash -s -- "$HOME/cosca" "$@"', "_", *(["--rosetta"] if rosetta else [])],
-            stdin=script,
-        )
-    if r.returncode != 0:
-        print("error: provisioning failed; `devvm.py destroy macos-arm64` to clean up", file=sys.stderr)
-        sys.exit(r.returncode)
-    print(f"note: {name} is up; source from `git archive {rev}` is at {GUEST_TREE} (committed state only).")
+        raise
+    print(f"note: {name} is up; source from `git archive {sha}` is at {GUEST_TREE} (committed state only).")
 
 
 def sync(repo_root: Path, state_root: Path, *, rev: str) -> None:
-    _archive_into_guest(repo_root, require_vm(state_root), rev)
+    name = require_vm(state_root)
+    try:
+        sha = resolve_rev(repo_root, rev)
+    except BadRev as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    _archive_into_guest(repo_root, name, sha)
 
 
 def run(state_root: Path, cmd_args: list[str]) -> None:
@@ -245,14 +361,26 @@ def halt(state_root: Path) -> None:
 
 
 def destroy(state_root: Path) -> None:
-    """Stop and delete this worktree's VM. Only ever acts on a name this tool created."""
+    """Stop and delete this worktree's VM. Only acts on a name this tool created, and only if
+    the VM on disk is still the one it created (a same-named replacement is refused)."""
     name = read_vm_name(state_root)
     if name is None:
         return
     require_own_name(name)
     present = {e.get("Name") for e in json.loads(_list_json())}
     if name in present:
-        _tart(["stop", name], check=False)
+        idf = _identity_file(state_root)
+        if idf.exists() and not identity_matches(json.loads(idf.read_text()), vm_identity(name)):
+            print(
+                f"error: VM {name} is not the one this worktree created (its disk changed); refusing "
+                "to stop or delete it. Inspect `tart list` by hand.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        r = _tart(["stop", name])
+        if r.returncode != 0:
+            print(f"error: `tart stop {name}` failed; leaving state in place", file=sys.stderr)
+            sys.exit(r.returncode)
         r = _tart(["delete", name])
         if r.returncode != 0:
             print(f"error: `tart delete {name}` failed; leaving state in place", file=sys.stderr)

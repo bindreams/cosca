@@ -157,6 +157,18 @@
     },
     {
       "customType": "regex",
+      "description": "Tart base image of the devvm macos-arm64 guest: repository, tag and digest, pinned by digest so a moved :latest never changes what devvm clones",
+      "managerFilePatterns": [
+        "/^scripts/devvm_macos\\.py$/"
+      ],
+      "matchStrings": [
+        "BASE_IMAGE_REPO = \"(?<depName>[^\"]+)\"\\s+BASE_IMAGE_TAG = \"(?<currentValue>[^\"]+)\"\\s+BASE_IMAGE_DIGEST = \"(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ],
+      "datasourceTemplate": "docker",
+      "depTypeTemplate": "ci-tool"
+    },
+    {
+      "customType": "regex",
       "description": "cargo-hack installed by taiki-e/install-action",
       "managerFilePatterns": [
         "/^\\.github/.+\\.ya?ml$/"

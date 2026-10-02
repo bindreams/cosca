@@ -8,6 +8,8 @@ Host-safe: nothing here calls tart or touches a VM.
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -59,6 +61,54 @@ class NamingTests(unittest.TestCase):
             m.require_own_name("macos-tahoe-base")
         with self.assertRaises(ValueError):
             m.require_own_name(m.BASE_IMAGE)
+
+
+class NameCollisionTests(unittest.TestCase):
+    def test_suffix_is_128_bits(self) -> None:
+        self.assertRegex(m.new_vm_name(Path("/r")), r"^devvm-macos-[0-9a-f]{32}$")
+
+    def test_existing_name_is_refused(self) -> None:
+        listing = _tart_list(("local", "devvm-macos-x", "running"))
+        with self.assertRaises(m.NameTaken):
+            m.require_name_free("devvm-macos-x", listing)
+        m.require_name_free("devvm-macos-y", listing)
+
+
+class ResolveRevTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        for args in (["init", "-q"], ["config", "user.email", "t@e.invalid"], ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True)
+        (self.repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "c"], check=True)
+
+    def test_head_resolves_to_a_full_sha(self) -> None:
+        self.assertRegex(m.resolve_rev(self.repo, "HEAD"), r"^[0-9a-f]{40}$")
+
+    def test_unknown_rev_is_an_error(self) -> None:
+        with self.assertRaises(m.BadRev):
+            m.resolve_rev(self.repo, "no-such-rev")
+
+    def test_option_looking_rev_is_an_error_and_creates_nothing(self) -> None:
+        target = self.repo / "pwned"
+        with self.assertRaises(m.BadRev):
+            m.resolve_rev(self.repo, f"--output={target}")
+        self.assertFalse(target.exists())
+
+
+class StateTests(unittest.TestCase):
+    def test_second_claim_in_one_worktree_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m.claim_state(Path(tmp), "devvm-macos-a")
+            with self.assertRaises(m.AlreadyUp):
+                m.claim_state(Path(tmp), "devvm-macos-b")
+
+    def test_identity_mismatch_is_detected(self) -> None:
+        self.assertTrue(m.identity_matches({"ino": 5, "dev": 1}, {"ino": 5, "dev": 1}))
+        self.assertFalse(m.identity_matches({"ino": 5, "dev": 1}, {"ino": 6, "dev": 1}))
 
 
 class RemoteCommandTests(unittest.TestCase):

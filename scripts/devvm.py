@@ -387,10 +387,13 @@ def cmd_up(args: argparse.Namespace) -> None:
         print("error: --display only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
     if guest.communicator == "tart":
-        devvm_macos.up(REPO_ROOT, STATE_DIR, rev=args.rev, rosetta=bool(args.rosetta))
+        devvm_macos.up(REPO_ROOT, STATE_DIR, rev=args.rev or "HEAD", rosetta=bool(args.rosetta))
         return
     if getattr(args, "rosetta", False):
         print("error: --rosetta only applies to macOS guests", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "rev", None) is not None:
+        print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
         sys.exit(1)
     dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     if guest.communicator == "winrm":
@@ -436,8 +439,11 @@ def cmd_sync(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     if guest.communicator == "tart":
-        devvm_macos.sync(REPO_ROOT, STATE_DIR, rev=args.rev)
+        devvm_macos.sync(REPO_ROOT, STATE_DIR, rev=args.rev or "HEAD")
         return
+    if getattr(args, "rev", None) is not None:
+        print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
+        sys.exit(1)
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
@@ -696,7 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--rev",
-        default="HEAD",
+        default=None,
         help="(macOS only) git rev to `git archive` into the guest (default HEAD; committed state only).",
     )
     p.add_argument(
@@ -709,7 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("sync", help="push the current working tree into a running guest")
     p.add_argument("guest", choices=GUESTS.keys())
-    p.add_argument("--rev", default="HEAD", help="(macOS only) git rev to `git archive` into the guest.")
+    p.add_argument("--rev", default=None, help="(macOS only) git rev to `git archive` into the guest.")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("ssh", help="open an interactive shell in a guest")
