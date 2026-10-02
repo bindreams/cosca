@@ -613,6 +613,50 @@ in_fresh_pid_ns!(
     wait_after_foreign_reap_and_reuse_body
 );
 
+/// A `wait` already parked in its exit watch when the child is reaped behind tokio's back and its
+/// pid is reused by a stranger that is a zombie of ours answers `ECHILD` and takes nothing. The
+/// check after the watch is what stops tokio's by-pid `waitpid` from taking the stranger's record.
+///
+/// Mutants: no check after the watch; no watch (tokio waits for the child's whole life).
+fn wait_parked_then_foreign_reap_and_reuse_body() {
+    runtime().block_on(async {
+        let (mut child, writer) = spawn_blocker();
+        let id = child.id();
+        let mut waiting = std::pin::pin!(child.wait());
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "wait must be parked on a live child");
+        let token = StartToken::from_raw(id.start_token_raw());
+        drop(writer);
+        let mut reuser = reap_behind_and_reuse(id.pid());
+        let _alias = alias_token(reuser.id(), token);
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the stranger is a zombie"
+        );
+        let answer = waiting.await;
+        let status = reuser.wait();
+        assert!(
+            matches!(&answer, Err(crate::error::Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD)),
+            "wait answered {answer:?}; the stranger's own wait: {status:?}"
+        );
+        let status = status.expect("the stranger's record must not have been taken");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_wait_parked_then_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_wait_parked_driver,
+    fixture_tokio_wait_parked_init,
+    wait_parked_then_foreign_reap_and_reuse_body
+);
+
 // The spawn's failure teardown =====
 
 /// A spawn whose child is reaped behind its back, and its pid reused, between the fork and the

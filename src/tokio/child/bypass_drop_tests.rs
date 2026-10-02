@@ -244,6 +244,36 @@ async fn wait_after_a_foreign_reap_takes_nothing() {
     witness.reap().expect("wait must not have reaped the child by pid");
 }
 
+/// `try_wait` and `wait` on a child the handle cannot answer for (a failed look) say so with
+/// `Unassessable`, not `ECHILD`: the child may be running. Nothing is reaped, and the child is not
+/// forgotten, so a later call can still answer.
+///
+/// Mutants: the answer is `ECHILD`; the child is forgotten.
+#[tokio::test(flavor = "current_thread")]
+async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
+    let (mut child, witness) = exited_unreaped(false);
+    let backend_drops = super::fault::count_backend_drops();
+    for use_wait in [false, true] {
+        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure 8c4f")));
+        let err = if use_wait {
+            child.wait().await.map(Some)
+        } else {
+            child.try_wait()
+        }
+        .expect_err("an unverifiable child has no status to give");
+        assert!(
+            matches!(&err, crate::error::Error::Unassessable { detail, .. } if detail.contains("cannot be shown to be ours")),
+            "{use_wait}: {err:?}"
+        );
+        assert!(
+            !child.os.proc.as_ref().expect("backend").is_reaped(),
+            "{use_wait}: not forgotten"
+        );
+    }
+    witness.reap().expect("neither call may reap the child by pid");
+    drop(backend_drops);
+}
+
 /// `finish_elevated`'s refused-kill arm forgets a child shown reaped elsewhere (`forget_if_foreign`,
 /// as `Drop`'s and `reap_now`'s refused-kill arms do) before its `try_wait`, a `waitpid` by pid.
 #[tokio::test(flavor = "current_thread")]
