@@ -9,13 +9,11 @@ use std::time::{Duration, SystemTime};
 
 use cosca::identity::ProcessId;
 
-// All four are used only by the serde-gated tests at the end of this file; ungated they
+// All three are used only by the serde-gated tests at the end of this file; ungated they
 // would be unused imports with the feature off. The body above reaches `Liveness` through
 // fully-qualified paths, which does not count as a use of an import.
 #[cfg(feature = "serde")]
 use cosca::identity::{Existence, Liveness, ProcessIdRecord};
-#[cfg(feature = "serde")]
-use std::io::BufRead;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -185,6 +183,20 @@ fn helper_write_own_record() {
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
+    let stream = format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n");
+    assert!(common::marker_seen(stream.as_bytes(), RECORD_READY));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_stream_without_the_marker_is_not_ready() {
+    let stream = "running 1 test\ntest helper_write_own_record ... \n";
+    assert!(!common::marker_seen(stream.as_bytes(), RECORD_READY));
+}
+
 #[test]
 #[cfg(feature = "serde")]
 fn an_identity_written_by_another_process_restores_and_names_that_process() {
@@ -196,23 +208,25 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let mut child = common::spawn_locked(
         common::test_reexec::command(exe)
             // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
-            // `--nocapture` is what lets the helper's marker reach our pipe at all.
-            .args(["helper_write_own_record", "--exact", common::test_reexec::NOCAPTURE])
+            // `--nocapture` is what lets the helper's marker reach our pipe at all, and one test
+            // thread makes libtest print its `test <name> ... ` banner ahead of it on every host.
+            .args([
+                "helper_write_own_record",
+                "--exact",
+                common::test_reexec::NOCAPTURE,
+                "--test-threads=1",
+            ])
             .env(RECORD_VAR, &path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
+            .stderr(Stdio::inherit()),
     )
     .expect("spawn helper");
 
-    // Synchronise on the pipe: read lines until the marker. libtest prints its own banner
-    // first, so scan rather than reading a single line. EOF without the marker means the
-    // helper died before writing — a real failure, reported as one.
-    let stdout = child.stdout.take().expect("piped stdout");
-    let ready = std::io::BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .any(|l| l.trim() == RECORD_READY);
+    // Synchronise on the pipe, not on time. EOF without the marker means the helper died first.
+    // Borrowed, so the pipe stays open: libtest in the helper reports after the body and fails if
+    // stdout is closed.
+    let ready = common::marker_seen(child.stdout.as_mut().expect("piped stdout"), RECORD_READY);
     assert!(ready, "the helper exited without writing its record");
 
     let json = std::fs::read_to_string(&path).expect("the record file is complete by now");
@@ -233,6 +247,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     // `is_alive`, not `exists`: `child` still holds the handle, which on Windows keeps the
     // process object resolvable after exit.
     drop(child.stdin.take());
-    child.wait().expect("wait");
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "the helper failed: {status}");
     assert_eq!(restored.is_alive(), Liveness::Dead);
 }
