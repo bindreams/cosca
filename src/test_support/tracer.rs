@@ -439,8 +439,20 @@ impl Pending {
         self.attach_pid(tracee)
     }
 
-    fn attach_pid(mut self, tracee: &crate::Child) -> TracerHelper<'_> {
-        let pid = tracee.id().pid();
+    /// [`attach`](Pending::attach) for a tracee that is tokio's own child, which the test moves
+    /// into the handle under test: no borrow ties the two, so the test must not reap the tracee
+    /// through anything but that handle while the helper holds it.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn attach_tokio(self, tracee: &::tokio::process::Child) -> TracerHelper<'static> {
+        let pid = tracee.id().expect("an unreaped tokio child has a pid");
+        self.attach_pid_number(pid)
+    }
+
+    fn attach_pid(self, tracee: &crate::Child) -> TracerHelper<'_> {
+        self.attach_pid_number(tracee.id().pid())
+    }
+
+    fn attach_pid_number<'a>(mut self, pid: u32) -> TracerHelper<'a> {
         if let Err(e) = sys::peek_child(pid) {
             panic!(
                 "attach: the tracee {pid} is not this process's unreaped child (waitid: errno {e}), \
@@ -461,7 +473,7 @@ impl Pending {
 /// the helper down before the borrow of the tracee ends.
 pub(crate) struct TracerHelper<'a> {
     session: Session,
-    _tracee: std::marker::PhantomData<&'a crate::Child>,
+    _tracee: std::marker::PhantomData<&'a ()>,
 }
 
 impl TracerHelper<'_> {
@@ -575,6 +587,37 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
     let mut tracee = cmd.spawn().expect("spawn the tracee fixture");
     let ready = await_ready(&mut tracee);
     (tracee, ready)
+}
+
+/// [`spawn_tracee`] for a raw tokio child, with a piped stdin: closing it ends the tracee.
+#[cfg(feature = "tokio")]
+pub(crate) async fn spawn_tracee_tokio(kind: Tracee) -> (::tokio::process::Child, ::tokio::process::ChildStdin) {
+    use ::tokio::io::AsyncBufReadExt as _;
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::from(crate::test_reexec::command(exe))
+            .args(crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
+                uh_tracee_fixture
+            )))
+            .env("COSCA_UH_ROLE", "tracee")
+            .env("COSCA_UH_KIND", format!("{kind:?}"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn the tracee fixture");
+    let stdin = child.stdin.take().expect("the tracee's stdin is piped");
+    let mut lines = ::tokio::io::BufReader::new(child.stdout.take().expect("the tracee's stdout is piped")).lines();
+    loop {
+        let line = lines
+            .next_line()
+            .await
+            .expect("read the tracee's stdout")
+            .expect("the tracee exited before it was ready");
+        if line.trim().starts_with(TRACEE_READY) {
+            return (child, stdin);
+        }
+    }
 }
 
 /// Reads the tracee's stdout up to its [`TRACEE_READY`] line. Panics at EOF: the tracee exited
