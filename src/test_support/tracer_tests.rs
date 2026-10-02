@@ -708,6 +708,7 @@ fn stopped_by_keys_on_p_wexit_alone() {
 /// The contract: XNU sets `P_LEXIT` before `SZOMB`, so a zombie without `P_WEXIT` is a misread.
 /// Mutant: the `debug_assert` in `stopped_by` is dropped.
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "a zombie without P_WEXIT")]
 fn stopped_by_asserts_a_zombie_has_begun_to_exit() {
     let state = ProcState {
