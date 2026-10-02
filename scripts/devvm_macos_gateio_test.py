@@ -68,7 +68,8 @@ class GateCase(unittest.TestCase):
 
         def start(thread):
             real_start(thread)
-            self.helper_threads.append(thread)
+            if sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py"):  # not the test's own threads
+                self.helper_threads.append(thread)
 
         def read(fd, n):
             from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")  # not subprocess's own
@@ -77,6 +78,7 @@ class GateCase(unittest.TestCase):
             return real_read(fd, n)
 
         def waitpid(pid, options):
+            release_all()  # a reap of a child nobody killed is freed too, and then shows a normal exit status
             result = real_waitpid(pid, options)
             if result[0] == pid:
                 self.statuses[pid] = result[1]
@@ -398,7 +400,9 @@ class LockTests(GateCase):
             return result
 
         def after_acquired() -> None:
-            acquired.wait()  # the waiter holds the lock; now the signal arrives
+            for waiter in list(self.helper_threads):
+                waiter.join()  # the waiter has acquired the lock (the lock is free); now the signal arrives
+            self.assertTrue(acquired.is_set(), "nothing acquired the lock")
             kill_self()
 
         with m.SignalGate() as gate, mock.patch.object(m.fcntl, "flock", flock), mock.patch.object(

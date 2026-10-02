@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import devvm_macos as m
-from scripts.devvm_macos_testlib import Env, kill_self
+from scripts.devvm_macos_testlib import Env, guard_unwakeable_selects, kill_self
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -91,12 +91,14 @@ class StubEnv:
         patch.start()
         test.addCleanup(patch.stop)
         # a repo with the provision script, as Env builds it
-        self.repo = Env(test).repo
+        self.repo = Env(test, guard_selects=False).repo
         self.state = self.root / "state"
         self.backend = m.MacosBackend(m.Tart(str(stub)), self.repo, self.state)
         self.stub = stub
         self.cleanup_started = False
         self._forbid_blocking_tart_run(test)
+        self._track_argv(test)
+        guard_unwakeable_selects(test, will_block=self._will_block)
 
     def _forbid_blocking_tart_run(self, test) -> None:
         """Until cleanup starts, every tart call must go through the gate (a cancellable wait). A plain
@@ -124,29 +126,33 @@ class StubEnv:
         for fd in (self.release_fd, self.run_release_fd):
             os.write(fd, b"x\n" * 16)
 
-    def guard_unwakeable_selects(self, test) -> None:
-        """For flows where every child finishes by itself: a select with no timeout that nothing can ever
-        wake (the helper threads are finished and nothing is ready) is an assertion, not a hang."""
-        real_select, real_start, real_join = m.select.select, threading.Thread.start, threading.Thread.join
-        helpers: list[threading.Thread] = []
+    def _will_block(self) -> bool:
+        """Is the tart call in flight one the stub is meant to hold blocked (until a signal or a release)?"""
+        argv = self.last_argv
+        if not argv:
+            return False
+        verb = argv[1]
+        if verb == "exec":
+            command = [a for a in argv[2:] if a != "-i"][1:2]
+            return bool(command) and (self.stub_dir / f"block.{ {'true': 'boot', 'bash': 'provision', 'sh': 'archive'}.get(command[0], '-') }").exists()
+        if verb == "clone":
+            return (self.stub_dir / "block.clone").exists()
+        if verb == "list":
+            return (self.stub_dir / "block.count").exists() and self.lists_started == 2
+        return False
 
-        def start(thread):
-            real_start(thread)
-            helpers.append(thread)
+    def _track_argv(self, test) -> None:
+        real_popen, self.last_argv, self.lists_started = subprocess.Popen, None, 0
 
-        def select(rlist, wlist, xlist, timeout=None):
-            if timeout is not None:
-                return real_select(rlist, wlist, xlist, timeout)
-            for thread in list(helpers):
-                real_join(thread)
-            ready = real_select(rlist, wlist, xlist, 0)
-            if not any(ready):
-                raise AssertionError("a select that nothing can ever wake")
-            return ready
+        def popen(argv, *a, **kw):
+            if argv and str(argv[0]) == str(self.stub):
+                self.last_argv = list(argv)
+                self.lists_started += argv[1] == "list"
+            return real_popen(argv, *a, **kw)
 
-        for patch in (mock.patch.object(threading.Thread, "start", start), mock.patch.object(m.select, "select", select)):
-            patch.start()
-            test.addCleanup(patch.stop)
+        patch = mock.patch.object(m.subprocess, "Popen", popen)
+        patch.start()
+        test.addCleanup(patch.stop)
 
     def block(self, what: str) -> None:
         (self.stub_dir / f"block.{what}").write_text("")
@@ -220,7 +226,6 @@ class RealTartCancelTests(unittest.TestCase):
 
     def test_a_normal_up_and_destroy_work_through_the_real_wrapper(self) -> None:
         env = StubEnv(self)
-        env.guard_unwakeable_selects(self)
         code, err = env.up()
         self.assertIsNone(code, err)
         self.assertEqual(len(env.vm_states()), 1)

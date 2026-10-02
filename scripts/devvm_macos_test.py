@@ -558,7 +558,7 @@ class PipeOwnershipTests(unittest.TestCase):
     a test, so the order is asserted at the moment of the wait."""
 
     def assert_pipe_closed_before_wait(self, make_procs):
-        procs = []
+        procs, violations = [], []
         real_popen, real_wait = subprocess.Popen, subprocess.Popen.wait
 
         def popen(*a, **kw):
@@ -568,12 +568,13 @@ class PipeOwnershipTests(unittest.TestCase):
 
         def wait(proc, *a, **kw):
             if proc in procs and proc.stdout is not None and not proc.stdout.closed:
-                raise AssertionError("waiting for a child whose stdout pipe the parent still holds")
+                violations.append(proc)  # recorded, not raised: the code under test reports failures as messages
             return real_wait(proc, *a, **kw)
 
         with mock.patch.object(subprocess.Popen, "wait", wait), mock.patch.object(m.subprocess, "Popen", popen):
             make_procs()
         self.assertTrue(procs)
+        self.assertEqual(violations, [], "waiting for a child whose stdout pipe the parent still holds")
 
     def test_sync_closes_the_archive_pipe_before_it_waits_for_git(self) -> None:
         env = Env(self)
@@ -683,21 +684,21 @@ class DestroyTests(unittest.TestCase):
         self.assertNotIn("stop", self.env.tart.calls)
 
     def test_destroy_waits_for_the_worktree_lock(self) -> None:
-        with open(self.env.sdir / "lock", "w") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            seen = []
-            real = m.fcntl.flock
+        # Another command holds the lock; it lets go when destroy announces that it is waiting.
+        holder = open(self.env.sdir / "lock", "w")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        real_say = m._say
 
-            def spy(f, op):
-                seen.append(op)
-                if op & fcntl.LOCK_NB:
-                    raise BlockingIOError
-                return None  # pretend the blocking acquire succeeded
+        def say(message, **kw):
+            real_say(message, **kw)
+            if message.startswith("devvm: waiting for"):
+                holder.close()
 
-            with mock.patch.object(m.fcntl, "flock", spy), captured() as err:
-                self.env.destroy()
-            self.assertIn("waiting for", err.getvalue())
-            del real
+        with mock.patch.object(m, "_say", say), captured() as err:
+            self.env.destroy()
+        self.assertIn("waiting for", err.getvalue())
+        self.env.assert_nothing_leaked(self, procs=False)
 
 
 class OtherVerbTests(unittest.TestCase):

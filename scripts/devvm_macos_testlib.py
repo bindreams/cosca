@@ -30,6 +30,7 @@ def _vm(name: str, state: str = "stopped", source: str = "local") -> dict:
 class FakeProc:
     def __init__(self, tart: FakeTart, name: str):
         self.tart, self.name, self.returncode = tart, name, None
+        self.waited = False
 
     def poll(self):
         return self.returncode
@@ -41,6 +42,7 @@ class FakeProc:
 
     def wait(self):
         assert self.returncode is not None, "wait() on a live fake process would hang"
+        self.waited = True
         return self.returncode
 
 
@@ -156,6 +158,9 @@ class FakeTart:
     def delete(self, name):
         self.calls.append("delete")
         self.event("delete")
+        proc = self.procs.get(name)
+        if proc is not None and proc.returncode is not None and not proc.waited:
+            raise AssertionError("the `tart run` child was terminated but never reaped before its VM was deleted")
         if "delete" in self.fail:
             return self.fail["delete"]
         self.vm_list = [v for v in self.vm_list if v["Name"] != name]
@@ -198,6 +203,42 @@ def kill_self(*sigs: int) -> None:
         os.kill(os.getpid(), sig)
 
 
+def guard_unwakeable_selects(test: unittest.TestCase, will_block=lambda: False) -> None:
+    """A select with no timeout that nothing can ever wake is an assertion, not a hang.
+
+    Before such a select blocks, the helper threads started by the code under test are allowed to finish
+    (whatever they wait on has been released or ends by itself), then one poll with a zero timeout: if
+    nothing is ready, nothing will be. `will_block()` says a child is meant to stay blocked in this wait,
+    where the select must really block (a test signal or release ends it).
+    """
+    registered = getattr(test, "_select_guard_will_block", None)
+    if registered is not None:  # one guard per test; later environments in the same test add their say
+        registered.append(will_block)
+        return
+    test._select_guard_will_block = registered = [will_block]
+    real_select, real_start, real_join = m.select.select, threading.Thread.start, threading.Thread.join
+    helpers: list[threading.Thread] = []
+
+    def start(thread):
+        real_start(thread)
+        if sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py"):  # the code under test's helpers, not the test's own
+            helpers.append(thread)
+
+    def select(rlist, wlist, xlist, timeout=None):
+        if timeout is not None or any(w() for w in registered):
+            return real_select(rlist, wlist, xlist, timeout)
+        for thread in list(helpers):
+            real_join(thread)
+        ready = real_select(rlist, wlist, xlist, 0)
+        if not any(ready):
+            raise AssertionError("a select that nothing can ever wake")
+        return ready
+
+    for patch in (mock.patch.object(threading.Thread, "start", start), mock.patch.object(m.select, "select", select)):
+        patch.start()
+        test.addCleanup(patch.stop)
+
+
 def forbid_blocking_flock(test: unittest.TestCase, allow=lambda: False) -> None:
     """A blocking flock on the main thread is how a regression turns into a hang. In the code under test
     it is legitimate only in cleanup's wait for the cap lock, which a test opts into with `allow`."""
@@ -218,7 +259,7 @@ def forbid_blocking_flock(test: unittest.TestCase, allow=lambda: False) -> None:
 class Env:
     """A temp repo, state dir and fake tart wired into a MacosBackend."""
 
-    def __init__(self, test: unittest.TestCase):
+    def __init__(self, test: unittest.TestCase, guard_selects: bool = True):
         tmp = self._tmp = tempfile.TemporaryDirectory()  # kept alive: its finalizer deletes the directory
         test.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -230,6 +271,8 @@ class Env:
             subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
         self.allow_blocking_flock = False
         self._guard_blocking_flock(test)
+        if guard_selects:
+            guard_unwakeable_selects(test)
         self.tart = FakeTart(root / "tart-home")
         self.tart.home.mkdir()
         self.state = root / "state"
