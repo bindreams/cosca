@@ -177,10 +177,9 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     #[cfg(test)]
     let scripted = crate::wait::backend::take_scripted_pidfd_open();
     let hook = Arc::clone(&shared);
-    // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads atomics, and
-    // makes raw `close`, `sendmsg` and `recv` calls on fd numbers, and rustix's `getpid` and
-    // `pidfd_open` (see `open_self`), plus rustix's `kill` in the test-only fault. It allocates
-    // nothing and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
+    // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads atomics and
+    // makes only direct syscalls (libc or rustix, see `open_self`) on integers and fd numbers. It
+    // allocates nothing and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
     unsafe {
         cmd.pre_exec(move || {
             hold_child(
@@ -869,8 +868,7 @@ fn leave_unreaped(pid: Option<u32>, why: &str) {
     fault::leaked_pid(pid);
 }
 
-/// The child's side. Async-signal-safe: direct syscalls only (libc's or rustix's, see `open_self`),
-/// no allocation, no lock.
+/// The child's side. Async-signal-safe: direct syscalls only, no allocation, no lock.
 fn hold_child(
     shared: &Shared,
     #[cfg(test)] fault: fault::ChildFault,
@@ -912,13 +910,9 @@ fn hold_child(
     }
 }
 
-/// `pidfd_open(getpid(), 0)` through rustix's typed wrappers: with the `linux_raw` backend each is
-/// a raw syscall, so no libc pid cache can be stale after a fork. The errno on failure.
-///
-/// Async-signal-safe: rustix's `linux_raw` backend issues `getpid` and `pidfd_open` as direct
-/// syscalls (inline asm; on i686 through the vDSO's `__kernel_vsyscall`) and decodes the errno from the return register, with no allocation, lock or
-/// thread-local. Its `libc` backend (non-`linux_raw` targets) calls `getpid` and `syscall`, both
-/// async-signal-safe too, and `getpid` is uncached since glibc 2.25.
+/// `pidfd_open(getpid(), 0)` through rustix: the `linux_raw` backend issues raw syscalls (no
+/// allocation, lock or thread-local), so no libc pid cache can be stale after a fork. The errno on
+/// failure.
 fn open_self(#[cfg(test)] scripted: Option<Errno>) -> Result<RawFd, i32> {
     #[cfg(test)]
     if let Some(errno) = scripted {

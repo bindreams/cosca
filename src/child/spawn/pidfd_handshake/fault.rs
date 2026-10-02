@@ -55,7 +55,7 @@ impl ChildFault {
 fn kill_self() -> io::Result<()> {
     // Async-signal-safe: rustix's `linux_raw` backend makes `getpid` and `kill` raw syscalls.
     match rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL) {
-        // SIGKILL does not return to the caller; reaching here means it was not delivered.
+        // SIGKILL does not return to the caller.
         Ok(()) => Err(io::Error::from_raw_os_error(libc::EIO)),
         Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
     }
