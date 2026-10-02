@@ -431,9 +431,24 @@ impl SharedChild {
     ///   no reap of ours can run between the state read and the call.
     /// - **Windows:** through the process handle.
     pub(crate) fn kill(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.kill_sent().map(drop)
+        }
+        #[cfg(windows)]
+        {
+            self.kill_windows()
+        }
+    }
+
+    /// [`kill`](SharedChild::kill), saying whether a signal was sent: [`Sent::Gone`] means nothing
+    /// was, because the child is already reaped (by us or by someone else). A caller that waits for
+    /// the termination must not, then.
+    #[cfg(unix)]
+    pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
         let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
-            return Ok(());
+            return Ok(crate::signal::Sent::Gone);
         }
         #[cfg(test)]
         exit_only::seams::signal_sent();
@@ -445,17 +460,22 @@ impl SharedChild {
                 self.id(),
                 crate::signal::Sig::Kill,
             )
-            .map(drop)
         }
         #[cfg(target_os = "macos")]
         {
-            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill).map(drop)
+            crate::signal::via_verified_pid(self.id(), self.identity, crate::signal::Sig::Kill)
         }
-        #[cfg(windows)]
-        {
-            let mut lock = lock;
-            lock.child.kill()
+    }
+
+    #[cfg(windows)]
+    fn kill_windows(&self) -> io::Result<()> {
+        let mut lock = self.lock();
+        if matches!(lock.state, State::E(_)) {
+            return Ok(());
         }
+        #[cfg(test)]
+        exit_only::seams::signal_sent();
+        lock.child.kill()
     }
 
     /// A contract breach after the `E` write: a consuming reap handed back a record that is not

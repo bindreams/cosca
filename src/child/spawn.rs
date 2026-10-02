@@ -99,8 +99,12 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         .can_teardown()
         .then(|| child.attached.hard_kill_marking(&child.tree_killed));
     let tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
-    let root_note = match child.kill() {
-        Ok(()) => {
+    let root_note = match child.kill_sent() {
+        // Reaped already (by someone else): nothing was terminated, and nothing is waited on.
+        Ok(crate::signal::Sent::Gone) => {
+            "the elevated child could not be terminated (it was already reaped)".to_string()
+        }
+        Ok(crate::signal::Sent::Delivered) => {
             #[cfg(test)]
             fault::run_between_kill_and_wait();
             match wait_killed_elevated(&child) {

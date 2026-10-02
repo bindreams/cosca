@@ -1000,3 +1000,37 @@ fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
     fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
     teardown.assert_killed();
 }
+
+/// A child someone else reaped was not killed by the failure teardown, and the error says so: it
+/// does not claim a kill and then a failed reap.
+///
+/// Mutant: `kill`'s `Ok` for a gone child is read as "killed" (the detail says "killed but could not
+/// be reaped (ECHILD)").
+#[cfg(target_os = "linux")]
+#[test]
+fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
+    let (mut cmd, writer) = blocker_with_held_stdin();
+    let child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    drop(writer);
+    crate::test_child::wait_until_zombie(pid);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own zombie child; this plays the application that reaps it.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+
+    let err = super::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("the spawn fails");
+
+    let Error::Elevation { detail, .. } = err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    assert!(detail.contains("could not be terminated"), "{detail}");
+    assert!(!detail.contains("was killed"), "{detail}");
+}
