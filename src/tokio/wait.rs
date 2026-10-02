@@ -219,11 +219,17 @@ pub(crate) mod fault_observer {
 /// Resolve when the process exits (no internal timeout — the caller bounds it).
 #[cfg(target_os = "linux")]
 async fn exit_watch(id: ProcessId) -> Result<(), Error> {
-    use ::tokio::io::unix::AsyncFd;
-    use ::tokio::io::Interest;
     let Some(pidfd) = crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::Wait)? else {
         return Ok(());
     };
+    watch_pidfd(pidfd).await
+}
+
+/// Resolve when `pidfd`'s process exits or is reaped (no internal timeout).
+#[cfg(target_os = "linux")]
+pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
     // The pidfd becomes readable (POLLIN) when the task becomes a zombie; POLLHUP once
     // reaped. Either readiness is terminal. A registration failure here (reactor at
     // capacity, etc.) is a genuine I/O error; a MISSING IO driver panics inside tokio

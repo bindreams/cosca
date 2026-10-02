@@ -102,7 +102,10 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // of the pid by another child of ours also looks like this, so the id decides.
         Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
             IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-            IdCheck::Matches | IdCheck::Gone => Ok(peeked),
+            // `waitid` found the child running and the id read finds no such process: it was
+            // reaped in between, so nothing is left to call running.
+            IdCheck::Gone => Ok(Peek::Foreign(Foreign::Gone)),
+            IdCheck::Matches => Ok(peeked),
             IdCheck::Unreadable(_) if !verified => Ok(peeked),
             IdCheck::Unreadable(errno) => Err(io::Error::new(
                 io::Error::from_raw_os_error(errno).kind(),

@@ -74,11 +74,10 @@ impl OsResources {
     ///
     /// The backend goes first, through [`ProcSource::release`]. tokio's `Child` drops: it tries a
     /// reap once and queues a still-running child on tokio's orphan queue, tokio's state and not
-    /// cosca's (principle 3). A child that something else reaped, or that cannot be verified, was
+    /// cosca's. A child that something else reaped, or that cannot be verified, was
     /// forgotten before this by [`ProcSource::forget_foreign`], and the backend holds none. The
     /// Windows raw backend closes its handle. The containment resource follows through
-    /// [`Attached::release_without_waiting`], bounded on every mechanism. The pipes and merge
-    /// targets close last.
+    /// [`Attached::release_without_waiting`], bounded on every mechanism.
     pub(crate) fn release_without_waiting(mut self) {
         #[cfg(test)]
         fault::note_release();
@@ -1051,8 +1050,7 @@ pub(crate) mod fault {
     }
 
     /// Counts the process backends ([`ProcSource`](super::ProcSource), so tokio's own `Child`
-    /// with it) released to tokio's drop on THIS thread from now on. Starts at zero; zeroed again
-    /// when dropped. A backend that was forgotten, or moved to another thread, is not counted.
+    /// with it) released to tokio's drop on THIS thread from now on. A backend that was forgotten, or moved to another thread, is not counted.
     pub(crate) fn count_backend_drops() -> BackendDropCount {
         BACKEND_DROPS.with(|d| d.set(0));
         BackendDropCount(())
@@ -1074,24 +1072,17 @@ pub(crate) mod fault {
     }
 
     /// tokio's `Child`, counted when it drops.
-    #[cfg(unix)]
     pub(crate) struct CountedDrop {
         pub(crate) _child: ::tokio::process::Child,
     }
 
-    #[cfg(unix)]
     impl Drop for CountedDrop {
         fn drop(&mut self) {
-            note_backend_drop_inner();
+            note_backend_drop();
         }
     }
 
-    #[cfg(windows)]
-    pub(super) fn note_backend_drop() {
-        note_backend_drop_inner();
-    }
-
-    fn note_backend_drop_inner() {
+    fn note_backend_drop() {
         BACKEND_DROPS.with(|d| d.set(d.get() + 1));
     }
 

@@ -288,10 +288,10 @@ async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
 }
 
 /// Dropping a backend that nothing released or forgot, which is what an unwind does to one, hands
-/// tokio's `Child` to its own drop only when the pidfd shows the child ours.
+/// tokio's `Child` to its own drop only when the handle shows the child ours.
 ///
 /// Mutant: the implicit drop forgets every child.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test]
 async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
     let child = spawn_a_tokio_child_that_exits();
@@ -305,11 +305,11 @@ async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
     assert_eq!(backend_drops.get(), 1, "a child shown ours is released to tokio's drop");
 }
 
-/// The same drop forgets tokio's `Child` when the pidfd peek fails: a child nothing can answer for
+/// The same drop forgets tokio's `Child` when the peek fails: a child nothing can answer for
 /// is not tokio's to reap by pid.
 ///
 /// Mutant: a failed peek counts as ours.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test]
 async fn dropping_a_backend_implicitly_forgets_a_child_whose_peek_failed() {
     use crate::wait::exit_only::seams::force_peek_once;
@@ -326,11 +326,11 @@ async fn dropping_a_backend_implicitly_forgets_a_child_whose_peek_failed() {
     reap_behind_the_owner(pid); // still ours: nothing reaped it by pid
 }
 
-/// The same drop forgets tokio's `Child` when the pidfd shows the child reaped elsewhere: tokio's
+/// The same drop forgets tokio's `Child` when the handle shows the child reaped elsewhere: tokio's
 /// drop would reap by a pid that may name another process.
 ///
 /// Mutant: the implicit drop releases every child.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test]
 async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
     let child = spawn_a_tokio_child_that_exits();
@@ -376,6 +376,24 @@ async fn wait_closes_the_untaken_stdin_first() {
     let closed = stdin.is_none();
     proc.reap_now(pid); // the test's own `cat`: end it whatever happened
     assert!(closed, "wait must close stdin before it waits");
+}
+
+/// An implicit drop after `wait` has collected the status (tokio's `id()` is `None`: nothing is
+/// left to reap by pid) still hands the backend to tokio's drop.
+///
+/// Mutant: the implicit drop forgets a child tokio already reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_backend_implicitly_after_wait_releases_it() {
+    let child = spawn_a_tokio_child_that_exits();
+    let mut proc = proc_source(child);
+    proc.wait().await.expect("wait");
+    assert!(proc.is_reaped());
+    let backend_drops = super::fault::count_backend_drops();
+
+    drop(proc);
+
+    assert_eq!(backend_drops.get(), 1, "a reaped child's backend is released");
 }
 
 /// Without evidence of a foreign reap nothing is forgotten: a live child stays tokio's.

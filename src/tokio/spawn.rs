@@ -428,13 +428,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         Ok(identity) => (identity, None),
         Err(errno) => (None, Some(errno)),
     };
-    // The backend is built first, so the failure arms below tear the child down through its own
-    // handle rather than by its pid.
+    // Built first so failure arms tear the child down through its handle, not its pid. A refused id
+    // read leaves it id-less; the spawn fails below.
     #[cfg(target_os = "linux")]
-    let proc = ProcSource::new(
-        child,
-        held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
-    );
+    let proc = {
+        // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.
+        let held_pidfd = held_pidfd.expect("a spawned child holds the pidfd its handshake opened");
+        ProcSource::new(child, held_pidfd)
+    };
     #[cfg(target_os = "macos")]
     let proc = ProcSource::new(child, identity);
     #[cfg(windows)]
@@ -459,7 +460,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
             // abandoned spawn's, reaping a pid tokio's own reap is about to.
             prepared.settle_verdict(pid);
-            proc.reap_now(pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid);
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
@@ -475,7 +476,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
-            proc.reap_now(pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid);
             return Err(e);
         }
     };

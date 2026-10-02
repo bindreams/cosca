@@ -63,8 +63,7 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
 /// A child's identity, read the moment its handle is made: the 64-bit unique id, which is never
 /// reused and survives `exec`. It is the only identity macOS checks a by-pid action against.
 /// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
-/// A handle built on a refused read holds no id and acts on its pid never (the tokio spawn builds
-/// its backend that way, then forgets the child); the sync adoption fails instead.
+/// A handle built on a refused read holds no id and acts on its pid never.
 ///
 /// The read is of our own child, which nothing reaps but us, unless something else does (a
 /// `SIG_IGN` host, another thread's `waitpid(-1)`) before the read: `None` then says the child is

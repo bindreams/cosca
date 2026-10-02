@@ -174,11 +174,9 @@ pub enum Error {
     /// operation was not performed. Distinct from a failure of the operation: nothing is
     /// known to have gone wrong with the target — the caller was not allowed to look.
     ///
-    /// **A spawn that fails this way may have started the program.** On macOS the sync spawn
-    /// leaves the child running and unreaped when its identity cannot be read, and so does the
-    /// async spawn when the child's unique id cannot be read (a warning names its pid), so
-    /// retrying may start a second instance. Elsewhere the child is torn down, but stays running
-    /// if its kill is refused.
+    /// **A spawn that fails this way may have started the program.** On macOS an unreadable
+    /// identity leaves the child running (a warning names its pid), so retrying may start a
+    /// second instance. Elsewhere the child is torn down, unless its kill is refused.
     ///
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
