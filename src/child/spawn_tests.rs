@@ -977,15 +977,19 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
 }
 
 /// macOS: an identity read that is refused at adoption fails the spawn as `Unassessable`, naming
-/// the errno, and the child is torn down.
+/// the errno. The child cannot be shown to be ours (a refusal is also what a pid reused by another
+/// user's process answers), so nothing is signalled or waited on by pid: it is left running and
+/// unreaped, with a warning that names it.
 ///
-/// Mutant: `Unassessable` mapped to `Io`; an arm that drops the returned child without tearing it
-/// down; a spawn that succeeds with no identity.
+/// Mutant: the arm tears the child down by pid (it is killed and reaped); `Unassessable` mapped to
+/// `Io`; a spawn that succeeds with no identity.
 #[cfg(target_os = "macos")]
 #[test]
-fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
+fn adopt_on_a_refused_identity_read_is_unassessable_and_leaves_the_child_alone() {
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
-    let (mut cmd, teardown) = teardown_blocker();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
     let err = cmd.spawn().err();
     drop(forced);
@@ -997,6 +1001,39 @@ fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
-    teardown.assert_killed();
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the failed adoption captured the child's identity");
+    };
+    let pid = id.pid();
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("child {pid} cannot be shown to be ours")),
+        "the warning must name the child"
+    );
+    // The child is still running, and still this process's unreaped child.
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the child must not have been killed"
+    );
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a non-blocking look at this process's own child; `WNOWAIT` consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    // SAFETY: `info` was filled by the successful call above.
+    assert_eq!(unsafe { info.si_pid() }, 0, "the child must still be running");
+    // Cleanup of the test's own child: kill it, then reap it.
+    // SAFETY: `pid` is this test's own unreaped child.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(pid as libc::pid_t, &mut status, 0);
+    }
 }
