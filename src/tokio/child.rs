@@ -72,17 +72,19 @@ impl OsResources {
 
     /// Give up every resource, in declaration order, without waiting for anything.
     ///
-    /// The backend goes first. tokio's `Child` drops normally: it tries a reap once and queues a
-    /// still-running child on tokio's orphan queue, tokio's state and not cosca's (principle 3). A
-    /// child that something else reaped, or that cannot be verified, was forgotten before this by
-    /// [`ProcSource::forget_foreign`], and the backend holds none. The Windows raw backend closes
-    /// its handle. The containment resource follows through
+    /// The backend goes first, through [`ProcSource::release`]. tokio's `Child` drops: it tries a
+    /// reap once and queues a still-running child on tokio's orphan queue, tokio's state and not
+    /// cosca's (principle 3). A child that something else reaped, or that cannot be verified, was
+    /// forgotten before this by [`ProcSource::forget_foreign`], and the backend holds none. The
+    /// Windows raw backend closes its handle. The containment resource follows through
     /// [`Attached::release_without_waiting`], bounded on every mechanism. The pipes and merge
     /// targets close last.
     pub(crate) fn release_without_waiting(mut self) {
         #[cfg(test)]
         fault::note_release();
-        drop(self.proc.take());
+        if let Some(proc) = self.proc.take() {
+            proc.release();
+        }
         std::mem::take(&mut self.attached).release_without_waiting();
     }
 }
@@ -926,8 +928,6 @@ impl Drop for Child {
         // Asked again: a reap can land after the read above (and before or during the root kill).
         if !own_reap && (view.root_reaped || os.root_reaped_elsewhere(own_reap)) {
             if let Some(proc) = os.proc.as_mut() {
-                // Forgotten before anything logs: a panicking logger would unwind with tokio's
-                // `Child` held, and its drop would reap by pid.
                 proc.forget_foreign();
                 log::debug!(
                     "async child {} was reaped outside its handle; dropping it would reap by that number, so it was forgotten",
@@ -1044,22 +1044,6 @@ pub(crate) mod fault {
 
     use crate::error::Error;
 
-    /// What a backend holds so that its drop is counted ([`count_backend_drops`]).
-    #[derive(Debug)]
-    pub(crate) struct BackendDrop(());
-
-    impl BackendDrop {
-        pub(crate) fn new() -> BackendDrop {
-            BackendDrop(())
-        }
-    }
-
-    impl Drop for BackendDrop {
-        fn drop(&mut self) {
-            note_backend_drop();
-        }
-    }
-
     thread_local! {
         static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
@@ -1067,8 +1051,8 @@ pub(crate) mod fault {
     }
 
     /// Counts the process backends ([`ProcSource`](super::ProcSource), so tokio's own `Child`
-    /// with it) dropped on THIS thread from now on. Starts at zero; zeroed again when dropped.
-    /// A backend that was forgotten, or moved to another thread, is not counted.
+    /// with it) released to tokio's drop on THIS thread from now on. Starts at zero; zeroed again
+    /// when dropped. A backend that was forgotten, or moved to another thread, is not counted.
     pub(crate) fn count_backend_drops() -> BackendDropCount {
         BACKEND_DROPS.with(|d| d.set(0));
         BackendDropCount(())
@@ -1089,7 +1073,7 @@ pub(crate) mod fault {
         }
     }
 
-    fn note_backend_drop() {
+    pub(super) fn note_backend_drop() {
         BACKEND_DROPS.with(|d| d.set(d.get() + 1));
     }
 

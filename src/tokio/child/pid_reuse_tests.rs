@@ -665,3 +665,91 @@ in_fresh_pid_ns!(
     fixture_tokio_spawn_attach_init,
     spawn_attach_failure_teardown_body
 );
+
+// Panicking loggers =====
+
+/// The spawn's identity-failure teardown, child reaped behind its back and its pid reused by a
+/// stranger that is already a zombie. `reap_now`'s kill gets ESRCH through the pidfd, and
+/// `via_pidfd` logs "already gone". A logger that panics there unwinds out of the spawn with the
+/// backend in hand, and the unwind must leak tokio's `Child`, not reap the stranger by pid.
+fn a_panicking_logger_in_reap_nows_via_pidfd_log_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+
+    crate::log_capture::install();
+    runtime().block_on(async {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        let stranger = Rc::new(RefCell::new(None));
+        let _spawn_hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let stranger = Rc::clone(&stranger);
+            move || {
+                let pid = fault::spawn_pid();
+                drop(writer);
+                let reuser = reap_behind_and_reuse(pid);
+                assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+                *stranger.borrow_mut() = Some(reuser);
+            }
+        });
+        fault::set_force_identity_vanished(true);
+        let unwound = {
+            let _panics = crate::log_capture::panic_on("it is already gone");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.spawn().map(drop)))
+        };
+        fault::set_force_identity_vanished(false);
+        assert!(unwound.is_err(), "the logger must have panicked out of the spawn");
+        let mut stranger = stranger.borrow_mut().take().expect("the hook must have run");
+        let status = stranger
+            .wait()
+            .expect("the stranger's exit record must not have been taken by the teardown");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_a_panicking_logger_in_reap_nows_via_pidfd_log_leaves_the_stranger_alone,
+    fixture_panicking_logger_reap_now_driver,
+    fixture_panicking_logger_reap_now_init,
+    a_panicking_logger_in_reap_nows_via_pidfd_log_body
+);
+
+/// `Drop`'s first look misses the reap (forced `Running`, standing in for a reap that lands after
+/// it) and its armed kill gets ESRCH through the pidfd, so `via_pidfd` logs. A logger that panics
+/// there unwinds with tokio's `Child` in `os`, and the unwind must leak it, not reap the stranger
+/// by pid.
+fn a_panicking_logger_in_drops_via_pidfd_log_body() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::Peek;
+
+    crate::log_capture::install();
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let (reuser, _alias) = foreign_reaped_and_reused(&child, writer);
+        let reuser_pid = reuser.id();
+        assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+        let _first_look = force_peek_once(Ok(Peek::Running));
+        let unwound = {
+            let _panics = crate::log_capture::panic_on("it is already gone");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
+        };
+        assert!(unwound.is_err(), "the logger must have panicked out of the drop");
+        let pid = Pid::from_raw(reuser_pid as i32).expect("pid");
+        let record = rustix::process::waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)
+            .expect("the reuser's exit record must still be unconsumed")
+            .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop(reuser);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_a_panicking_logger_in_drops_via_pidfd_log_leaves_the_stranger_alone,
+    fixture_panicking_logger_drop_driver,
+    fixture_panicking_logger_drop_init,
+    a_panicking_logger_in_drops_via_pidfd_log_body
+);

@@ -431,14 +431,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // The backend is built first, so the failure arms below tear the child down through its own
     // handle rather than by its pid.
     #[cfg(target_os = "linux")]
-    let mut proc = ProcSource::new(
+    let proc = ProcSource::new(
         child,
         held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
     );
     #[cfg(target_os = "macos")]
-    let mut proc = ProcSource::new(child, identity);
+    let proc = ProcSource::new(child, identity);
     #[cfg(windows)]
-    let mut proc = ProcSource::new(child);
+    let proc = ProcSource::new(child);
     #[cfg(target_os = "macos")]
     if let Some(errno) = identity_refused {
         #[cfg(test)]
