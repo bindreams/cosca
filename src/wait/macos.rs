@@ -113,6 +113,10 @@ pub(crate) fn arm_note_exit_on(kq: &Kqueue, pid: u32) -> Result<Option<()>, Erro
 /// pid, then the id is read again, so a stranger that took the pid is never watched, whatever
 /// happened before the arming. `Ok(None)`: the pid is gone, or no longer (or not provably) has that
 /// id; there is nothing of the child's to watch, and the caller's own check says what that means.
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "the only consumer is tokio::wait's watch")
+)]
 pub(crate) fn arm_proc_exit_for(pid: u32, unique: u64) -> Result<Option<Kqueue>, Error> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
     let kq = Kqueue::new().map_err(|e| Error::Io(e.into()))?;
