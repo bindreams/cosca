@@ -69,9 +69,11 @@ fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
     assert_eq!(later.recorded(), vec![], "a dropped recorder leaves nothing behind");
 }
 
-// A failed sync spawn must fully reap its child, not leak it. Each error arm is forced via the seam
-// (which records the child's real identity); `fault::assert_child_reaped` then proves it was reaped.
+// Off macOS, a failed sync spawn must fully reap its child, not leak it. Each error arm is forced via
+// the seam (which records the child's real identity); `fault::assert_child_reaped` then proves it
+// was reaped. On macOS those arms leave the child alone instead (see `macos_*` below).
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn identity_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
@@ -88,6 +90,7 @@ fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn attach_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
@@ -107,6 +110,7 @@ fn attach_failure_reaps_the_spawned_child() {
 /// A `kill` that fails for a child that has already exited is not a failure: the teardown goes on
 /// to reap it, as it does after any successful kill. The child here exits by itself (its stdin is
 /// already closed), so nothing but the reap can account for it in the recorder.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
     let mut cmd = Command::new();
@@ -149,6 +153,7 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 ///
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_teardown_reap_is_logged_on_both_arms() {
     a_failed_teardown_step_is_logged_on_both_arms(
@@ -163,6 +168,7 @@ fn a_failed_teardown_reap_is_logged_on_both_arms() {
 /// spawn for as long as it runs. The reap fault is armed as a tripwire — left unconsumed, it proves
 /// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
 /// reachable without a bug.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
     use std::io::ErrorKind;
@@ -211,6 +217,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 /// A child the teardown could not kill is not left a zombie: it is handed to a detached thread
 /// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
 /// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
@@ -242,6 +249,7 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
 
 /// Force one teardown step to fail with each marker, once per teardown arm, and check the failure
 /// is consumed, logged, `debug_assert`ed in exactly the builds that keep it, and leaks no child.
+#[cfg(not(target_os = "macos"))]
 fn a_failed_teardown_step_is_logged_on_both_arms(
     markers: [&'static str; 2],
     set_failure: fn(&'static str),
@@ -283,6 +291,7 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 /// keeps its credentials, so `kill(2)` refuses it with EPERM — is reaped, not left a zombie: an
 /// exited child is reaped at once, and one not yet exited is handed to the background reaper.
 /// Either way it ends reaped.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
     let mut cmd = Command::new();
@@ -977,18 +986,23 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
 }
 
 /// macOS: an identity read that is refused at adoption fails the spawn as `Unassessable`, naming
-/// the errno, and the child is torn down.
+/// the errno. The child cannot be shown to be ours (a refusal is also what a pid reused by another
+/// user's process answers), so nothing is signalled or waited on by pid: it is left running and
+/// unreaped, with a warning that names it.
 ///
-/// Mutant: `Unassessable` mapped to `Io`; an arm that drops the returned child without tearing it
-/// down; a spawn that succeeds with no identity.
+/// Mutant: the arm tears the child down by pid (it is killed and reaped); `Unassessable` mapped to
+/// `Io`; a spawn that succeeds with no identity.
 #[cfg(target_os = "macos")]
 #[test]
-fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
+fn adopt_on_a_refused_identity_read_is_unassessable_and_leaves_the_child_alone() {
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
-    let (mut cmd, teardown) = teardown_blocker();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
     let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
     let err = cmd.spawn().err();
     drop(forced);
+    let left = captured_child();
 
     match err.expect("a refused identity read must fail the spawn") {
         Error::Unassessable { detail, source } => {
@@ -997,8 +1011,131 @@ fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
-    teardown.assert_killed();
+    assert_left_alone(mark, "cannot be shown to be ours", &left);
+}
+
+/// macOS: the child a failed spawn left behind. Dropping it kills and reaps it, so a failing
+/// assertion cannot leak a process.
+#[cfg(target_os = "macos")]
+struct LeftChild(crate::identity::ProcessId);
+
+#[cfg(target_os = "macos")]
+impl Drop for LeftChild {
+    fn drop(&mut self) {
+        let pid = self.0.pid() as libc::pid_t;
+        // SAFETY: `pid` is this test's own unreaped child, left behind by the failed spawn.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+}
+
+/// macOS: takes the identity the failed spawn captured. Call it right after the spawn, before any
+/// assertion, so the child is cleaned up whatever follows.
+#[cfg(target_os = "macos")]
+fn captured_child() -> LeftChild {
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the failed spawn captured the child's identity");
+    };
+    LeftChild(id)
+}
+
+/// macOS: asserts `left` is still running and unreaped, and that a warning containing `warning` and
+/// its pid was logged since `mark`.
+#[cfg(target_os = "macos")]
+fn assert_left_alone(mark: usize, warning: &str, left: &LeftChild) {
+    let pid = left.0.pid();
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("child {pid} {warning}")),
+        "the warning must name the child"
+    );
+    assert_eq!(
+        left.0.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the child must not have been killed"
+    );
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a non-blocking look at this process's own child; `WNOWAIT` consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    // SAFETY: `info` was filled by the successful call above.
+    assert_eq!(unsafe { info.si_pid() }, 0, "the child must still be running");
+}
+
+/// How many descriptors this process has open, from `/dev/fd`.
+#[cfg(target_os = "macos")]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+}
+
+/// macOS: a spawn that fails on the identity arms or the attach arm leaves no descriptor of ours
+/// behind: dropping the abandoned `std` `Child` closes our ends of its pipes (a piped stdin here).
+/// The count is of this process's own, in a test that runs alone in its process under nextest.
+///
+/// Mutant: the arm forgets the child (`mem::forget`), which leaks its pipe ends.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_identity_gone_closes_our_pipe_ends() {
+    macos_failed_spawn_closes_our_pipe_ends(
+        || fault::set_force_identity_vanished(true),
+        || fault::set_force_identity_vanished(false),
+        false,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_identity_unknown_closes_our_pipe_ends() {
+    macos_failed_spawn_closes_our_pipe_ends(
+        || fault::set_force_identity_unknown(true),
+        || fault::set_force_identity_unknown(false),
+        false,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_attach_failure_closes_our_pipe_ends() {
+    macos_failed_spawn_closes_our_pipe_ends(
+        || {
+            crate::containment::fdmarker::fault::set_fault(Some(crate::containment::fdmarker::fault::Fault::Pipe));
+            fault::set_force_identity_unknown(true);
+        },
+        || {
+            fault::set_force_identity_unknown(false);
+            crate::containment::fdmarker::fault::set_fault(None);
+        },
+        true,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn macos_failed_spawn_closes_our_pipe_ends(arm: impl FnOnce(), disarm: impl FnOnce(), tree_walk: bool) {
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("piped stdin");
+    if tree_walk {
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+    }
+    let before = open_fd_count();
+    arm();
+    let err = cmd.spawn().err();
+    disarm();
+    let _left = captured_child();
+    drop(cmd);
+
+    assert!(err.is_some(), "the forced failure must fail the spawn");
+    assert_eq!(open_fd_count(), before, "the failed spawn must close our pipe ends");
 }
 
 /// A foreign-reaped child was never signalled, so the teardown error says it could not be terminated, not that it was killed.
@@ -1072,4 +1209,100 @@ fn finish_elevated_detail(child: crate::Child) -> String {
         panic!("expected an Elevation error, got {err:?}");
     };
     detail
+}
+
+/// macOS: an identity that is gone means someone else reaped the child, so its pid may be reused: a
+/// by-pid kill or reap could hit a stranger. The spawn fails (`Io`, as for any vanish) and the child
+/// is forgotten, with a warning naming it. The seam leaves the real child running, so the test sees
+/// that nothing was signalled or reaped.
+///
+/// Mutant: the arm tears the child down by pid.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_identity_gone_forgets_the_child_and_signals_nothing() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    let left = captured_child();
+
+    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    assert_left_alone(mark, "was reaped by someone else", &left);
+}
+
+/// macOS: an identity that cannot be read (`Unknown`) fails the spawn as `Unassessable` and leaves
+/// the child running and unreaped, with a warning naming it.
+///
+/// Mutant: the arm tears the child down by pid.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_identity_unknown_leaves_the_child_alone() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
+    fault::set_force_identity_unknown(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_unknown(false);
+    let left = captured_child();
+
+    assert!(matches!(err, Some(Error::Unassessable { .. })), "{err:?}");
+    assert_left_alone(mark, "cannot be shown to be ours", &left);
+}
+
+/// macOS: the tree-walk root has no fd marker (its install is forced to fail), so the attach reads
+/// the root's identity itself, and that read is `Gone` (reaped by someone else; the pid may be
+/// reused). The attach fails and nothing is signalled or waited on by pid: the child is left alone,
+/// with a warning naming it.
+///
+/// Mutant: the attach arm kills and waits on the child by pid (`child.kill()`, then `child.wait()`).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_tree_walk_attach_with_a_gone_identity_leaves_the_child_alone() {
+    macos_tree_walk_attach_fails(true);
+}
+
+/// As above, with an identity that cannot be read (`Unknown`).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_tree_walk_attach_with_an_unknown_identity_leaves_the_child_alone() {
+    macos_tree_walk_attach_fails(false);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tree_walk_attach_fails(gone: bool) {
+    use crate::containment::fdmarker::fault::{set_fault, Fault};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    set_fault(Some(Fault::Pipe));
+    if gone {
+        fault::set_force_identity_vanished(true);
+    } else {
+        fault::set_force_identity_unknown(true);
+    }
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    fault::set_force_identity_unknown(false);
+    set_fault(None);
+    let left = captured_child();
+
+    let err = err.expect("the failed attach fails the spawn");
+    // The error is the attach's own read of the root (`resolve_root_id`), not the spawn's later one.
+    match (&err, gone) {
+        (Error::Containment { detail }, true) => assert!(detail.contains("tree-walk root vanished"), "{detail}"),
+        (Error::Unassessable { detail, .. }, false) => assert!(detail.contains("tree-walk root pid"), "{detail}"),
+        _ => panic!("unexpected error {err:?}"),
+    }
+    assert_left_alone(
+        mark,
+        if gone {
+            "was reaped by someone else"
+        } else {
+            "cannot be shown to be ours"
+        },
+        &left,
+    );
 }
