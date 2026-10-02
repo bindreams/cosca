@@ -138,6 +138,7 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
             .enable_all()
             .build()
             .unwrap();
+        let releases = crate::tokio::child::fault::count_backend_drops();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let mut cmd = crate::tokio::Command::new();
@@ -163,6 +164,13 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         if let Ok(err) = outcome {
             err.expect("the forced arm must fail the spawn");
         }
+        // Asserted before the driver below, which only ends when tokio's orphan queue reaps the
+        // child: a refused kill must have handed it to tokio, not forgotten it.
+        assert_eq!(
+            releases.get(),
+            1,
+            "{kind:?}: the refused-kill arm must release the child to tokio exactly once"
+        );
         let captured = fault::take_captured().expect("seam captured the child's identity");
         drive_until_reaped(&runtime, &captured);
         fault::assert_child_reaped(captured);
