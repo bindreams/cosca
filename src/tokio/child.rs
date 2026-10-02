@@ -16,6 +16,7 @@ use crate::child::ParentEnd;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::signal::{Sent, Sig};
 use crate::stdio::Fd;
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
@@ -455,21 +456,25 @@ impl Child {
         self.proc_mut().try_wait()
     }
 
-    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid, and a
-    /// refused Linux `pidfd_open` cannot fail it.
-    /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
-    /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
-    /// `wait().await` (or `Drop`) collects the exit status.
+    /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds, and
+    /// on Windows through the process handle, so neither can race a recycled pid; a refused
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid, only while the pid
+    /// still has the unique id read at spawn, and a reap by someone else between that check and the
+    /// send is principle 5's accepted gap.
+    /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
+    /// else (where tokio's `start_kill` answered `ESRCH`, this answers `Ok` on Linux and macOS).
+    /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
         }
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
-        // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc_mut().start_kill() {
+        // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
+        match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
-            other => other,
+            Err(other) => Err(other),
+            Ok(Sent::Delivered | Sent::Gone) => Ok(()),
         }
     }
 
@@ -719,7 +724,7 @@ pub(crate) mod drop_fault {
     pub(crate) struct Recorder(());
 
     impl Recorder {
-        /// Root kills started (`start_kill`, then the reaper's wait by pid).
+        /// Root kills started.
         pub(crate) fn kills(&self) -> u32 {
             COUNTS.with(|c| c.get().expect("the recorder is live").0)
         }
@@ -756,6 +761,14 @@ pub(crate) mod drop_fault {
 #[cfg(all(test, unix))]
 #[path = "child_drop_reaped_tests.rs"]
 mod child_drop_reaped_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/pid_reuse_tests.rs"]
+mod pid_reuse_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/macos_kill_tests.rs"]
+mod macos_kill_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
@@ -918,10 +931,16 @@ fn signal_on_drop(
     let killed = if fault::take_force_kill_failure() {
         Err(fault::forced_kill_failure())
     } else {
-        proc.start_kill()
+        proc.signal(Sig::Kill)
     };
     #[cfg(not(test))]
-    let killed = proc.start_kill();
+    let killed = proc.signal(Sig::Kill);
+    // Nothing was delivered because the child is gone (reaped by someone else, and its pid
+    // possibly reused): the pid names nothing of ours to wait for.
+    if matches!(killed, Ok(Sent::Gone)) {
+        log::debug!("async child {pid} was already gone on drop; nothing was sent");
+        return;
+    }
     if killed.is_err() && !matches!(proc.try_wait(), Ok(Some(_))) {
         log::warn!("async child {pid} could not be terminated on drop; leaving it running");
     }
@@ -934,7 +953,7 @@ fn signal_on_drop(
 #[cfg(unix)]
 fn forget_reaped_elsewhere(os: &mut OsResources, pid: u32) {
     if let Some(mut proc) = os.proc.take() {
-        let ProcSource::Tokio(child) = &mut proc;
+        let ProcSource::Tokio { child, .. } = &mut proc;
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
         log::debug!("async child {pid} was reaped outside its handle; dropping it would reap by that number, so it is forgotten");
         #[cfg(test)]
