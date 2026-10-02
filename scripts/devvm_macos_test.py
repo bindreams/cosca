@@ -616,6 +616,26 @@ class RevAndNameTests(unittest.TestCase):
         self.assertEqual(len(set(names)), 2)
 
 
+class UnlistedWhileRunningTests(unittest.TestCase):
+    def test_teardown_ends_and_reaps_tart_run_for_a_vm_renamed_by_hand(self) -> None:
+        # `tart rename` works on a running VM: it is then unlisted under our name while `tart run` lives.
+        env = Env(self)
+
+        def rc(args):
+            if args[:1] == ["bash"]:  # provisioning: the VM is renamed, then provisioning fails
+                for vm in env.tart.vm_list:
+                    if vm["Name"].startswith(m.VM_PREFIX):
+                        vm["Name"] = "renamed-by-hand"
+                return 1
+            return 0
+
+        env.tart.exec_rc = rc
+        exits_with(self, env.up)
+        (proc,) = env.tart.procs.values()
+        self.assertIsNotNone(proc.poll(), "the `tart run` child of a renamed VM was left running")
+        self.assertTrue(proc.waited, "the `tart run` child was not reaped")
+
+
 class PipeOwnershipTests(unittest.TestCase):
     """The parent must close its end of a pipe before it waits for the producer: with the end open, a consumer
     that exits without reading leaves the producer blocked on a full pipe forever. A hang is not an option for
