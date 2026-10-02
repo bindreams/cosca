@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from subprocess import Popen as PopenClass  # the class itself: other tests patch the name `subprocess.Popen`
 from unittest import mock
 
 from scripts import devvm_macos as m
@@ -208,8 +209,26 @@ class RealTartCancelTests(unittest.TestCase):
                 gits.append(p)
             return p
 
-        with mock.patch.object(m.subprocess, "Popen", popen):
+        kills, violations = [], []
+        real_kill, real_wait = PopenClass.kill, PopenClass.wait
+
+        def kill(proc):
+            kills.append(proc)
+            return real_kill(proc)
+
+        def wait(proc, *a, **kw):
+            # Waiting for a `git archive` that nobody killed, with its pipe still held, would block forever:
+            # recorded as a violation and not waited for.
+            if proc in gits and proc not in kills and proc.poll() is None:
+                violations.append(proc)
+                return None
+            return real_wait(proc, *a, **kw)
+
+        with mock.patch.object(PopenClass, "kill", kill), mock.patch.object(PopenClass, "wait", wait), mock.patch.object(
+            m.subprocess, "Popen", popen
+        ):
             code, err = env.up()
+        self.assertEqual(violations, [], "waited for git archive without killing it first")
         self.assertEqual(code, 128 + signal.SIGTERM, err)
         self.assertTrue(gits)
         self.assertEqual([g.returncode is None for g in gits], [False] * len(gits), "git archive was not reaped")

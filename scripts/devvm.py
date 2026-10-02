@@ -760,7 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_up)
 
-    p = sub.add_parser("sync", help="push the current working tree into a running guest")
+    p = sub.add_parser("sync", help="push the working tree into a running guest (macOS guests get the committed `git archive <rev>` instead)")
     p.add_argument("guest", choices=GUESTS.keys())
     p.add_argument("--rev", default=None, help="(macOS only) git rev to `git archive` into the guest.")
     p.set_defaults(func=cmd_sync)

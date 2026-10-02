@@ -761,8 +761,11 @@ class MacosBackend:
 
     @_reports_failures
     def run(self, args: argparse.Namespace) -> None:
-        for flag, attr in (("--unelevated", "unelevated"), ("--timeout", "timeout")):
-            if getattr(args, attr, None):
+        for flag, given in (
+            ("--unelevated", bool(getattr(args, "unelevated", False))),
+            ("--timeout", getattr(args, "timeout", None) is not None),  # 0 is a value too
+        ):
+            if given:
                 _say(f"error: {flag} only applies to Windows guests")
                 sys.exit(1)
         cmd_args = list(args.cmd)

@@ -179,8 +179,18 @@ class UpTests(unittest.TestCase):
         self.assertEqual(self.env.claim(), name)
         self.assertEqual(json.loads((self.env.sdir / "identity.json").read_text()), self.env.tart.identity(name))
         self.assertEqual(self.env.tart.vm_list[-1]["State"], "running")
-        self.assertTrue(any("--rosetta" in c or c.startswith("exec:bash -c bash -s") for c in self.env.tart.calls))
+        self.assertIn("--rosetta", self.provision_args(self.env))
         self.env.assert_cap_lock_free(self)
+
+    @staticmethod
+    def provision_args(env: Env) -> list[str]:
+        (args,) = [a for a, _data in env.tart.exec_log if a[:2] == ["bash", "-c"]]
+        return args
+
+    def test_without_rosetta_the_provisioning_gets_no_flag(self) -> None:
+        with captured():
+            self.env.up()
+        self.assertNotIn("--rosetta", self.provision_args(self.env))
 
     def test_bad_rev_fails_before_anything_boots(self) -> None:
         args = argparse.Namespace(rev="nope", rosetta=False, allow_elevation=None, display=False)
@@ -552,6 +562,60 @@ class PreGateFailureTests(unittest.TestCase):
         self.assertEqual([p.name for p in env.sdir.glob("*.tmp")], [])
 
 
+class RevAndNameTests(unittest.TestCase):
+    def two_versions(self, env: Env) -> tuple[str, str]:
+        shas = []
+        for version in ("v1", "v2"):
+            (env.repo / "version.txt").write_text(version)
+            for args in (["add", "-A"], ["commit", "-q", "-m", version]):
+                subprocess.run(["git", "-C", str(env.repo), *args], check=True, capture_output=True)
+            shas.append(subprocess.run(["git", "-C", str(env.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip())
+        return shas[0], shas[1]
+
+    @staticmethod
+    def archived_version(env: Env) -> str:
+        """The version.txt in the last archive copied into the guest."""
+        import io
+        import tarfile
+
+        data = [d for a, d in env.tart.exec_log if a[:2] == ["sh", "-c"]][-1]
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            return tar.extractfile("version.txt").read().decode()
+
+    def test_up_archives_the_given_rev_and_by_default_head(self) -> None:
+        env = Env(self)
+        v1, _v2 = self.two_versions(env)
+        with captured():
+            env.up(rev=v1)
+        self.assertEqual(self.archived_version(env), "v1")
+        other = Env(self)
+        self.two_versions(other)
+        with captured():
+            other.up()
+        self.assertEqual(self.archived_version(other), "v2")
+
+    def test_sync_archives_the_given_rev_and_by_default_head(self) -> None:
+        env = Env(self)
+        v1, _v2 = self.two_versions(env)
+        with captured():
+            env.up()
+            env.backend.sync(argparse.Namespace(rev=v1))
+        self.assertEqual(self.archived_version(env), "v1")
+        with captured():
+            env.backend.sync(argparse.Namespace(rev=None))
+        self.assertEqual(self.archived_version(env), "v2")
+
+    def test_a_second_worktree_gets_its_own_vm_name(self) -> None:
+        env = Env(self)
+        second = m.MacosBackend(env.tart, env.repo, env.state.parent / "second-worktree-state")
+        with captured():
+            env.up()
+            second.up(argparse.Namespace(rev=None, rosetta=False, allow_elevation=None, display=False))
+        names = env.tart.local_names()
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(set(names)), 2)
+
+
 class PipeOwnershipTests(unittest.TestCase):
     """The parent must close its end of a pipe before it waits for the producer: with the end open, a consumer
     that exits without reading leaves the producer blocked on a full pipe forever. A hang is not an option for
@@ -718,6 +782,13 @@ class OtherVerbTests(unittest.TestCase):
             env.up()
         env.tart.exec_rc = lambda args: 7
         exits_with(self, lambda: env.backend.run(argparse.Namespace(cmd=["--", "false"], unelevated=False, timeout=None)), code=7)
+
+    def test_run_rejects_a_timeout_of_zero_like_any_other(self) -> None:
+        env = Env(self)
+        for timeout in (0, 5):
+            with self.subTest(timeout=timeout):
+                err = exits_with(self, lambda: env.backend.run(argparse.Namespace(cmd=["--", "x"], unelevated=False, timeout=timeout)))
+                self.assertIn("--timeout only applies to Windows guests", err)
 
     def test_run_rejects_windows_only_flags(self) -> None:
         env = Env(self)

@@ -64,6 +64,7 @@ class FakeTart:
         self.exec_rc = lambda args: 0
         self.run_exits_immediately = False
         self.calls: list[str] = []
+        self.exec_log: list[tuple[list[str], bytes | None]] = []
         self.events: list[tuple[str, bool]] = []
         self.gates: list[tuple[str, object]] = []  # (call, gate it was given)
         self.hooks: dict[str, object] = {}
@@ -175,8 +176,8 @@ class FakeTart:
         self.event("exec:true" if args == ["true"] else "exec:stage")
         if self.guest_home is not None and args != ["true"] and args[0] == "sh":
             return subprocess.run(args, stdin=stdin, env=self._local_env(), capture_output=True)
-        if stdin is not None:
-            stdin.read()
+        data = stdin.read() if stdin is not None else None
+        self.exec_log.append((list(args), data))  # the full argv and what was piped in
         return subprocess.CompletedProcess(args, self.exec_rc(args))
 
     def exec_popen(self, name, args, *, stdout):
