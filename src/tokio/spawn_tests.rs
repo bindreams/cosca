@@ -624,7 +624,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
 /// may block, so it waits for the drain before the handle drops, and the drop's first `rmdir`
 /// succeeds. The members of the fake leaf exit when the wait is about to block, not before.
 ///
-/// Mutant: `finish_elevated` does not wait for the drain after `kill_tree_members`.
+/// Mutant: `finish_elevated` does not wait for the drain after `kill_tree_members_unless_reaped`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
@@ -794,4 +794,52 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
         detail.contains("its contained tree could not be killed"),
         "the tree's failure is reported, got {detail}"
     );
+}
+
+/// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
+/// group number may name another group by now, and the error says the tree kill was skipped. The
+/// async twin of the sync `finish_elevated`'s test.
+///
+/// Mutant: `finish_elevated` runs the tree kill before it learns the root was reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    let recorder = crate::containment::unix::fault::record_kill_group();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin pipe");
+    cmd.contain_with(crate::ContainMode::Session);
+    let child = cmd.spawn().expect("spawn");
+    assert!(
+        child.carries_recyclable_pgid(),
+        "the test needs a number-named group kill"
+    );
+    let pid = child.id().pid();
+    drop(writer);
+    crate::test_child::wait_until_zombie(pid);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own zombie child; this plays the application that reaps it.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+
+    let err = super::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("the spawn fails");
+
+    let Error::Elevation { detail, .. } = err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    assert_eq!(
+        recorder.killed(),
+        Vec::<i32>::new(),
+        "a reaped root's group number may name another group: no killpg ({detail})"
+    );
+    assert!(detail.contains("process group"), "{detail}");
+    assert!(detail.contains("already reaped"), "{detail}");
 }

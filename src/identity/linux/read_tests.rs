@@ -146,3 +146,51 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 fn no_error_is_blamed_on_a_fine_view() {
     assert!(unknown_identity_error("the spawned child").is_none());
 }
+
+/// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`.
+#[test]
+fn alias_token_aliases_only_a_found_stat() {
+    use super::fault::alias_token;
+    use super::start_token_from;
+    use crate::identity::StartToken;
+
+    const PID: u32 = 4242;
+    let aliased = StartToken::from_raw(7);
+    let _armed = alias_token(PID, aliased);
+
+    assert!(matches!(start_token_from(PID, Resolved::Gone), Resolved::Gone));
+    assert!(matches!(start_token_from(PID, Resolved::Unknown), Resolved::Unknown));
+    match start_token_from(PID, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+        Resolved::Found(t) => assert_eq!(t, aliased, "a found stat answers the alias"),
+        other => panic!("a found stat must resolve, got {other:?}"),
+    }
+    // Another pid is untouched.
+    match start_token_from(PID + 1, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+        Resolved::Found(t) => assert_eq!(t, StartToken::from_raw(424242)),
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// Dropping the guard ends the alias, and only its own pid's. Mutant: `AliasGuard::drop` removes
+/// nothing, or every pid's alias.
+#[test]
+fn dropping_the_alias_guard_ends_that_alias_only() {
+    use super::fault::alias_token;
+    use super::start_token_from;
+    use crate::identity::StartToken;
+
+    let read = |pid| match start_token_from(pid, Resolved::Found(STAT_STARTED_AT_424242.to_vec())) {
+        Resolved::Found(t) => t,
+        other => panic!("a found stat must resolve, got {other:?}"),
+    };
+    let first = alias_token(4343, StartToken::from_raw(1));
+    let _second = alias_token(4344, StartToken::from_raw(2));
+    assert_eq!(read(4343), StartToken::from_raw(1));
+    drop(first);
+    assert_eq!(
+        read(4343),
+        StartToken::from_raw(424242),
+        "the dropped guard's alias is gone"
+    );
+    assert_eq!(read(4344), StartToken::from_raw(2), "another pid's alias stays armed");
+}

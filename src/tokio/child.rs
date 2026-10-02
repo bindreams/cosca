@@ -16,6 +16,7 @@ use crate::child::ParentEnd;
 use crate::containment::{Attached, Containment};
 use crate::error::Error;
 use crate::identity::ProcessId;
+use crate::signal::{Sent, Sig};
 use crate::stdio::Fd;
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
@@ -58,6 +59,13 @@ impl OsResources {
     /// the last reader.
     pub(crate) fn proc_mut(&mut self) -> &mut ProcSource {
         self.proc.as_mut().expect(PROC_TAKEN)
+    }
+
+    /// Whether the child's own handle shows its root reaped by someone else, which the start token
+    /// cannot tell for a reuse in the same tick. `false` when this handle reaped it itself.
+    #[cfg(unix)]
+    pub(crate) fn root_reaped_elsewhere(&self, own_reap: bool) -> bool {
+        !own_reap && self.proc.as_ref().is_some_and(ProcSource::reaped_elsewhere)
     }
 
     /// Give up every resource, in declaration order, without waiting for anything.
@@ -133,11 +141,19 @@ impl Child {
     }
 
     /// Kill the contained tree through its containment only, without the root's own kill that
-    /// [`kill_tree`](Self::kill_tree) adds. For a failed spawn, which kills and reaps the root
-    /// separately.
+    /// [`kill_tree`](Self::kill_tree) adds, for a failed spawn, which kills and reaps the root
+    /// separately. The root may already be reaped: when it is (this handle's own reap, the number
+    /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
+    /// names the tree by the root's number runs, and the skipped action is returned as
+    /// `Ok(Some(action))`.
     #[cfg(unix)]
-    pub(super) fn kill_tree_members(&self) -> Result<(), Error> {
-        self.os.attached.hard_kill_marking(&self.tree_killed)
+    pub(super) fn kill_tree_members_unless_reaped(&self) -> Result<Option<String>, Error> {
+        let own_reap = self.os.proc.as_ref().is_none_or(ProcSource::is_reaped);
+        let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
+        view.root_reaped |= self.os.root_reaped_elsewhere(own_reap);
+        self.os
+            .attached
+            .hard_kill_marking_unless_reaped(view, &self.tree_killed)
     }
 
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
@@ -150,6 +166,13 @@ impl Child {
             return self.os.attached.wait_drained(None).map(drop);
         }
         Ok(())
+    }
+
+    /// Whether this child's tree is named by a number that outlives the root's reap (a process
+    /// group), for a test that needs a number-named group kill.
+    #[cfg(all(test, unix))]
+    pub(super) fn carries_recyclable_pgid(&self) -> bool {
+        self.os.attached.carries_recyclable_pgid()
     }
 
     /// What names this child's tree in a message about a failed teardown of it.
@@ -455,19 +478,29 @@ impl Child {
         self.proc_mut().try_wait()
     }
 
-    /// Hard-kill the (lone) child. Handle-bound, so it cannot race a recycled pid, and a
-    /// refused Linux `pidfd_open` cannot fail it.
-    /// `Ok(())` if the child already exited or was reaped by a prior `wait` (tokio's
-    /// `start_kill` maps the reaped state to `Ok`). Signal-only: does not reap —
-    /// `wait().await` (or `Drop`) collects the exit status.
+    /// Hard-kill the (lone) child. On Linux the signal goes through the pidfd the spawn holds, and
+    /// on Windows through the process handle, so neither can race a recycled pid; a refused
+    /// `pidfd_open` cannot fail it. macOS has no such handle: it sends by pid, only while the pid
+    /// still has the unique id read at spawn, and a reap by someone else between that check and the
+    /// send is an accepted gap.
+    /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
+    /// else.
+    /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     pub fn kill(&mut self) -> Result<(), Error> {
+        self.kill_sent().map(|_| ())
+    }
+
+    /// [`kill`](Child::kill), saying whether a signal was delivered ([`Sent::Delivered`]) or the
+    /// child was already gone ([`Sent::Gone`]: nothing was sent, and the caller must not wait for
+    /// a termination that did not happen).
+    pub(crate) fn kill_sent(&mut self) -> Result<Sent, Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
         }
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
-        // kill returns EPERM/ACCESS_DENIED); everything else stays `Io`/`Ok` exactly as before.
-        match self.proc_mut().start_kill() {
+        // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
+        match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             other => other,
         }
@@ -719,7 +752,7 @@ pub(crate) mod drop_fault {
     pub(crate) struct Recorder(());
 
     impl Recorder {
-        /// Root kills started (`start_kill`, then the reaper's wait by pid).
+        /// Root kills started.
         pub(crate) fn kills(&self) -> u32 {
             COUNTS.with(|c| c.get().expect("the recorder is live").0)
         }
@@ -756,6 +789,18 @@ pub(crate) mod drop_fault {
 #[cfg(all(test, unix))]
 #[path = "child_drop_reaped_tests.rs"]
 mod child_drop_reaped_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/pid_reuse_tests.rs"]
+mod pid_reuse_tests;
+
+#[cfg(all(test, windows))]
+#[path = "child/windows_signal_tests.rs"]
+mod windows_signal_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/macos_kill_tests.rs"]
+mod macos_kill_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
@@ -816,7 +861,9 @@ impl Child {
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
 /// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
-/// number.
+/// number. The evidence is the number no longer reading as this root, or the child's own handle (on
+/// Linux its pidfd, on macOS the pid's unique id) showing it reaped. The handle is asked before the signals, so a
+/// number-named tree kill is skipped, and again after them, for a reap that lands in between.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -843,7 +890,11 @@ impl Drop for Child {
         #[cfg(unix)]
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
+        let view = {
+            let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
+            view.root_reaped |= os.root_reaped_elsewhere(own_reap);
+            view
+        };
         if self.kill_on_drop {
             #[cfg(unix)]
             signal_on_drop(self.id, view, &mut os);
@@ -853,7 +904,8 @@ impl Drop for Child {
         // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
         // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
         #[cfg(unix)]
-        if view.root_reaped && !own_reap {
+        // Asked again: a reap can land after the read above (and before or during the root kill).
+        if !own_reap && (view.root_reaped || os.root_reaped_elsewhere(own_reap)) {
             forget_reaped_elsewhere(&mut os, self.id.pid());
         }
         os.release_without_waiting();
@@ -918,28 +970,37 @@ fn signal_on_drop(
     let killed = if fault::take_force_kill_failure() {
         Err(fault::forced_kill_failure())
     } else {
-        proc.start_kill()
+        proc.signal(Sig::Kill)
     };
     #[cfg(not(test))]
-    let killed = proc.start_kill();
+    let killed = proc.signal(Sig::Kill);
+    // Nothing was delivered because the child is gone (reaped by someone else, and its pid
+    // possibly reused): the pid names nothing of ours to wait for.
+    if matches!(killed, Ok(Sent::Gone)) {
+        log::debug!("async child {pid} was already gone on drop; nothing was sent");
+        return;
+    }
     if killed.is_err() && !matches!(proc.try_wait(), Ok(Some(_))) {
         log::warn!("async child {pid} could not be terminated on drop; leaving it running");
     }
 }
 
 /// Release the backend of a root that something else reaped, without letting tokio's `Child` drop:
-/// that would `try_wait` on the root's number and could reap another child that reused it. The
-/// stdio goes first, so its descriptors close; what the forget leaks is the pidfd and the reactor
-/// registration, or the `SIGCHLD` watch. This is a foreign reap, so it is logged at `debug`.
+/// that would `try_wait` on the root's number and could reap another child that reused it. What the
+/// forget leaks is tokio's own pidfd and reactor registration (or its `SIGCHLD` watch), which
+/// tokio's `Child` gives no way to release without its by-number reap on drop. This is a foreign
+/// reap, so it is logged at `debug`, and the leak at `warn`.
 #[cfg(unix)]
 fn forget_reaped_elsewhere(os: &mut OsResources, pid: u32) {
-    if let Some(mut proc) = os.proc.take() {
-        let ProcSource::Tokio(child) = &mut proc;
-        drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
+    if let Some(proc) = os.proc.take() {
+        proc.forget();
         log::debug!("async child {pid} was reaped outside its handle; dropping it would reap by that number, so it is forgotten");
+        log::warn!(
+            "async child {pid} was reaped outside its handle; forgetting tokio's handle for it leaks tokio's own \
+             descriptor and registration"
+        );
         #[cfg(test)]
         drop_fault::note_forget();
-        std::mem::forget(proc);
     }
 }
 
@@ -1079,6 +1140,22 @@ pub(crate) mod fault {
 
     use crate::error::Error;
 
+    /// What a backend holds so that its drop is counted ([`count_backend_drops`]).
+    #[derive(Debug)]
+    pub(crate) struct BackendDrop(());
+
+    impl BackendDrop {
+        pub(crate) fn new() -> BackendDrop {
+            BackendDrop(())
+        }
+    }
+
+    impl Drop for BackendDrop {
+        fn drop(&mut self) {
+            note_backend_drop();
+        }
+    }
+
     thread_local! {
         static FORCE_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
         static RELEASES: Cell<usize> = const { Cell::new(0) };
@@ -1108,7 +1185,7 @@ pub(crate) mod fault {
         }
     }
 
-    pub(super) fn note_backend_drop() {
+    fn note_backend_drop() {
         BACKEND_DROPS.with(|d| d.set(d.get() + 1));
     }
 

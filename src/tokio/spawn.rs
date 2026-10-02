@@ -16,6 +16,8 @@ use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
 use super::child::{reap_now, Child, ProcSource};
+#[cfg(unix)]
+use crate::signal::Sent;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let child = spawn_uncommitted(cmd)?;
@@ -264,6 +266,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(not(unix))]
     let reserved: Vec<i32> = Vec::new();
 
+    // The pidfd the handshake opens; the child keeps it (Linux).
+    #[cfg(target_os = "linux")]
+    let mut held_pidfd: Option<std::os::fd::OwnedFd> = None;
+
     // Phase 1 (before spawn): root detection + pre-spawn containment setup, registered before
     // fd_map's dup2 pre_exec so the latter runs LAST in the child (see the ordering
     // rationale in child/spawn.rs). On macOS the spawn lock is widened to enclose `prepare`
@@ -338,10 +344,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // also spans the pidfd handshake's channel, from its creation to its helper's join.
         let _guard = crate::child::spawn::spawn_lock();
 
-        // Linux: the child is held before `exec` until the parent holds the pidfd it sent; the
-        // pidfd itself is dropped here, as tokio's child has no place for it. Its hook was
-        // registered first of all, so `fd_map`'s, which may `dup2` a mapping onto the channel's
-        // descriptor number, runs after it is done.
+        // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
+        // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
+        // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
         #[cfg(target_os = "linux")]
         let handshake = handshake.open(&_guard)?;
 
@@ -375,7 +380,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
                 let held = handshake.run(|| tcmd.spawn());
-                held.map(|held| held.child)
+                held.map(|held| {
+                    held_pidfd = Some(held.pidfd);
+                    held.child
+                })
             };
             #[cfg(not(target_os = "linux"))]
             let spawned = {
@@ -408,6 +416,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
     // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
+    // macOS: the unique id every by-pid signal to this child is checked against, read before
+    // anything can reap the child.
+    #[cfg(target_os = "macos")]
+    let identity = match crate::signal::read_identity(pid) {
+        Ok(identity) => identity,
+        Err(errno) => {
+            prepared.settle_verdict(pid);
+            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            return Err(crate::signal::identity_unreadable(pid, errno));
+        }
+    };
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
@@ -456,21 +475,30 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    let mut child = Child::from_parts(ProcSource::Tokio(child), id, kill_on_drop, attachment, pipes, owned_std);
+    #[cfg(target_os = "linux")]
+    let proc = ProcSource::new(
+        child,
+        held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
+    );
+    #[cfg(target_os = "macos")]
+    let proc = ProcSource::new(child, identity);
+    #[cfg(windows)]
+    let proc = ProcSource::new(child);
+    let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
 }
 
-/// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking
-/// (`try_wait` cannot reap a just-killed child, so it would leak a zombie), and waits only on
-/// this kill.
+/// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
+/// cannot reap a just-killed child, so it would leak a zombie), and waits only on this kill.
 #[cfg(unix)]
 pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
+    let mut skipped = None;
     let tree = child.containment().can_teardown().then(|| {
-        child.kill_tree_members()?;
+        skipped = child.kill_tree_members_unless_reaped()?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
         // naming a `wait_tree` the caller never gets.
@@ -479,11 +507,22 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         })?;
         Ok(())
     });
-    let tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
-    let root_note = match child.kill() {
-        Ok(()) => {
+    let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
+    if let Some(action) = skipped {
+        tree_note.push_str(&format!(
+            "; its contained tree was not killed: the root was already reaped, so its number may name another \
+             process, and the kill would {action}"
+        ));
+    }
+    let root_note = match child.kill_sent() {
+        Ok(Sent::Delivered) => {
             child.wait_and_reap_blocking();
             "the elevated child was terminated".to_string()
+        }
+        // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
+        // which may name another process by now.
+        Ok(Sent::Gone) => {
+            "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
         }
         Err(e) => {
             _ = child.try_wait();
