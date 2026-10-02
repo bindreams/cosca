@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
-use crate::child::spawn::{build_std_command, dup, resolve_identity, resolve_stdio, PipeOwnership};
+#[cfg(not(target_os = "linux"))]
+use crate::child::spawn::build_std_command;
+use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
 #[cfg(unix)]
@@ -32,6 +34,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             "cosca::tokio::Command must be spawned from within a Tokio runtime",
         )));
     }
+
+    // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
+    #[cfg(target_os = "linux")]
+    crate::wait::backend::probe_pidfd_support()?;
 
     let kill_on_drop = cmd.kill_on_drop_flag();
 
@@ -114,6 +120,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         return Ok(child);
     }
 
+    #[cfg(target_os = "linux")]
+    let (std_cmd, handshake) =
+        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)?;
+    #[cfg(not(target_os = "linux"))]
     let std_cmd = build_std_command(cmd)?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
@@ -322,6 +332,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             debug_assert!(prev.is_none(), "pre-pass slots were removed from the resolved set");
         }
 
+        // Serialize the spawn against the raw backend's inheritable-handle window via the shared
+        // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
+        // `CreateProcessW` spawn on another thread (mirrors the sync std path). On Linux the lock
+        // also spans the pidfd handshake's channel, from its creation to its helper's join.
+        let _guard = crate::child::spawn::spawn_lock();
+
+        // Linux: the child is held before `exec` until the parent holds the pidfd it sent; the
+        // pidfd itself is dropped here, as tokio's child has no place for it. Its hook was
+        // registered first of all, so `fd_map`'s, which may `dup2` a mapping onto the channel's
+        // descriptor number, runs after it is done.
+        #[cfg(target_os = "linux")]
+        let handshake = handshake.open(&_guard)?;
+
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
         #[cfg(unix)]
@@ -338,11 +361,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             fd_map::install(tcmd.as_std_mut(), mappings).map_err(Error::Io)?;
         }
 
-        // Serialize the spawn against the raw backend's inheritable-handle window via the shared
-        // spawn lock: tokio's own handle-inheritance marking must not overlap a raw
-        // `CreateProcessW` spawn on another thread (mirrors the sync std path).
         let c = {
-            let _guard = crate::child::spawn::spawn_lock();
             // Classified at the SYSCALL — see the sync std path for why the whole spawn tree is
             // the wrong domain for this attribution.
             //
@@ -352,11 +371,21 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // `prepared` drops, since that needs no pid (see `cgroup`'s report contract). Under any
             // other containment — a process group, a session, a tree walk, none, or a spawn that
             // degraded — nothing reaches the child, and it keeps running.
-            #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-            let spawned = tcmd.spawn().map_err(Error::Io);
-            #[cfg(windows)]
-            let spawned =
-                spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+            #[cfg(target_os = "linux")]
+            let spawned = {
+                #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
+                let held = handshake.run(|| tcmd.spawn());
+                held.map(|held| held.child)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let spawned = {
+                #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
+                let spawned = tcmd.spawn().map_err(Error::Io);
+                #[cfg(windows)]
+                let spawned =
+                    spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
+                spawned
+            };
             #[cfg(all(test, target_os = "linux"))]
             let spawned = crate::child::spawn::fault::post_fork_failure(
                 spawned,
@@ -467,6 +496,40 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     })
 }
 
+/// tokio reaps its child by pid, on drop or from its orphan queue; the handshake leaves that reap to
+/// it, and only makes it happen while the number is still the child's.
+#[cfg(target_os = "linux")]
+impl crate::child::spawn::pidfd_handshake::Spawned for ::tokio::process::Child {
+    fn pid(&self) -> Option<u32> {
+        self.id()
+    }
+
+    /// Waits through the pidfd until the child is a zombie, then has tokio reap it at once.
+    fn reap_unexecuted(mut self, pidfd: std::os::fd::OwnedFd) {
+        crate::child::spawn::pidfd_handshake::await_unexecuted_exit(&pidfd, self.id());
+        match self.try_wait() {
+            Ok(Some(_)) => {}
+            // A tracer holds the zombie: tokio's drop hands it to its orphan queue.
+            Ok(None) => log::debug!(
+                "{}: held by a tracer; left to tokio's reaper",
+                crate::child::spawn::named(self.id())
+            ),
+            Err(e) => log::debug!(
+                "{}: already reaped by someone else ({e})",
+                crate::child::spawn::named(self.id())
+            ),
+        }
+    }
+
+    /// tokio reaps it, on drop or from its orphan queue.
+    fn abandon_unreported(self, why: &str) {
+        log::debug!(
+            "{}: {why}; left to tokio's reaper",
+            crate::child::spawn::named(self.id())
+        );
+    }
+}
+
 #[cfg(windows)]
 #[path = "spawn/windows_raw.rs"]
 pub(crate) mod windows_raw;
@@ -474,6 +537,10 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/pidfd_tests.rs"]
+mod pidfd_tests;
 
 /// Say what a failed tokio spawn may have left behind of its child: nothing, a zombie nothing
 /// reaps, or a process nothing can reach.

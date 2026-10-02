@@ -39,6 +39,28 @@ fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
     }
 }
 
+/// The same breach in `reap_blocking` is not a ptrace stop to wait past either.
+///
+/// Mutant: `Ok(None)` folded into the ptrace-stop arm, which waits again (a busy loop without
+/// the seam; here the next wait reaps the child and answers).
+#[test]
+fn a_blocking_reap_that_finds_no_record_is_a_contract_breach() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let target = b.shared.target().expect("a pidfd");
+    let forced = exit_seams::force_visible_none_once();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::wait::exit_only::reap_blocking(&target)
+    }));
+    drop(forced);
+    if cfg!(debug_assertions) {
+        assert!(outcome.is_err(), "a debug build asserts the contract");
+    } else {
+        let err = outcome.expect("release returns").expect_err("a breach is an error");
+        assert!(err.to_string().contains("no record"), "{err}");
+    }
+}
+
 /// S11: an unbounded holder whose reap finds nothing after a real exit blocks in
 /// `waitid(WNOWAIT)` rather than re-polling: the pidfd stays readable, so a re-poll would spin at
 /// 100% CPU until the tracer lets go.

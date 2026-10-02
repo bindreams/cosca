@@ -7,6 +7,8 @@
 //! The kernel floor, the per-syscall versions, and how a refused syscall is classified
 //! (`Unsupported` versus `Io`) are in the crate root's "Platform requirements". Without `openat2`
 //! the checked `/proc` view cannot be built, and `open_verified` is `Unsupported` naming `openat2`.
+//! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support`]),
+//! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
 
 use std::os::fd::AsFd;
 use std::time::Instant;
@@ -112,6 +114,35 @@ fn pidfd_open_unsupported(op: PidfdOp, errno_name: &str) -> Error {
     }
 }
 
+/// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.
+pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
+    match refusal_name(errno) {
+        Some(name) => pidfd_open_unsupported(PidfdOp::Spawn, name),
+        None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(errno))),
+    }
+}
+
+/// The pre-fork probe: `pidfd_open` on this process's own pid, closed at once. Spawning forks
+/// through std, which cannot hand back a pidfd, so a kernel or filter that refuses `pidfd_open`
+/// has to be found out BEFORE the fork, or the child would exist with no pidfd. A refusal is
+/// [`Error::Unsupported`] naming `spawn`; any other failure (`EMFILE`, `ENFILE`, `ENOMEM`) is `Io`
+/// naming `pidfd_open`. Either way no child exists.
+///
+/// Two syscalls per spawn, and no cached verdict: a cache is process-global state, and a filter
+/// can be installed after the first spawn.
+pub(crate) fn probe_pidfd_support() -> Result<(), Error> {
+    pidfd_open_checked(rustix::process::getpid())
+        .map(drop)
+        .map_err(spawn_open_error)
+}
+
+/// The next scripted `pidfd_open` outcome on THIS thread, for a `pidfd_open` made elsewhere: the
+/// spawn handshake's is made by the child. See [`fault::force_pidfd_open_script`].
+#[cfg(test)]
+pub(crate) fn take_scripted_pidfd_open() -> Option<rustix::io::Errno> {
+    fault::take_forced_pidfd_open_errno()
+}
+
 /// Open a pidfd for `pid`, a child this process spawned, and confirm it names that child.
 /// `Ok(None)` means the child is gone: something else reaped it, so there is nothing to wait on.
 ///
@@ -129,6 +160,7 @@ fn pidfd_open_unsupported(op: PidfdOp, errno_name: &str) -> Error {
 /// - Then, on every view, `waitid(P_PIDFD, WEXITED | WNOHANG | WNOWAIT)` confirms the pidfd names
 ///   our child: `ECHILD` is gone. A pid reused by a process that is not our child answers it,
 ///   even if its start time matched.
+#[cfg(test)]
 pub(crate) fn open_own_child(pid: u32, id: Option<ProcessId>) -> Result<Option<rustix::fd::OwnedFd>, Error> {
     use crate::wait::exit_only::{self, Foreign, Peek, Target};
 
@@ -140,12 +172,7 @@ pub(crate) fn open_own_child(pid: u32, id: Option<ProcessId>) -> Result<Option<r
     let pidfd = match pidfd_open_checked(raw) {
         Ok(pidfd) => pidfd,
         Err(rustix::io::Errno::SRCH | rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => return Ok(None),
-        Err(e) => {
-            return Err(match refusal_name(e) {
-                Some(name) => pidfd_open_unsupported(PidfdOp::Spawn, name),
-                None => Error::Io(crate::error::io_context("pidfd_open", std::io::Error::from(e))),
-            });
-        }
+        Err(e) => return Err(spawn_open_error(e)),
     };
     // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
     // application may `dup2` its stdio back over it, destroying the pidfd.

@@ -156,6 +156,14 @@ pub(crate) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
     linux::wait_visible_exit(target)
 }
 
+/// Block until `target` exits, then consume its exit record. **Linux only**, and only for a child
+/// this process owns: `ECHILD` (something else reaped it) is [`Foreign::Gone`]. Blocks in
+/// `waitid(P_PIDFD, WEXITED)`, so a ptrace stop is skipped, not returned.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap_blocking(target: &Target<'_>) -> io::Result<Result<Reaped, Foreign>> {
+    linux::reap_blocking(target)
+}
+
 // The wait status of an `si_code` record =====
 
 /// One `waitid` record: the `si_code` and `si_status` of the `siginfo_t`.
