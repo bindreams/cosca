@@ -4,9 +4,14 @@
 //! (waiting for the accept ack, like any control connection), writes the grandchild's pid as one
 //! `<pid>\n` line, and then BLOCKS until the harness writes a second ack byte. The harness
 //! captures the grandchild's [`ProcessId`] before writing that release. Until then the root is
-//! alive and still the grandchild's parent, holding it unreaped (Unix) or by handle (Windows), so
-//! the pid names the grandchild for certain and the identity taken here is the real one. The
-//! tree helpers then watch that identity, never the bare pid, alongside the root's.
+//! alive and, in the `spawn-grandchild*` modes, still the grandchild's parent, holding it unreaped
+//! (Unix) or by handle (Windows), so the pid names the grandchild for certain and the identity
+//! taken here is the real one. The tree helpers then watch that identity, never the bare pid,
+//! alongside the root's.
+//!
+//! In `spawn-orphan-escapee` the reporter is the `orphan-relay` child and the root only waits for
+//! it, exiting nonzero if the relay failed, so the report accept's watch on the root still covers
+//! the reporter.
 
 use std::cell::Cell;
 use std::io::Read;
@@ -144,6 +149,40 @@ fn identify(pid: u32) -> ProcessId {
 /// Accepts the root's report connection, reads its pid line watching the root, captures the
 /// grandchild's identity and releases the root. See the module doc.
 pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> ProcessId {
+    let (id, stream) = read_grandchild_report(report, root);
+    let contained = is_contained_member(root.containment(), root.pid(), id.pid(), |_pid| {
+        #[cfg(windows)]
+        return root.test_job_handle_contains(_pid);
+        #[cfg(not(windows))]
+        false
+    });
+    LAST_REPORTED_CONTAINED.with(|c| c.set(Some(contained)));
+    release(stream);
+    id
+}
+
+/// [`accept_tree_also`](super::accept_tree_also) for a root started with [`GC_PID_ADDR_ENV`] set
+/// to `report`'s address: captures the grandchild's identity through the report protocol first.
+pub fn accept_tree(
+    listener: &TcpListener,
+    report: &TcpListener,
+    root: &mut cosca::Child,
+    on_accept: impl FnMut(&mut TcpStream) -> bool,
+) -> Vec<TcpStream> {
+    let grandchild = report_grandchild(report, root);
+    super::accept::accept_tree_also(listener, root, grandchild, on_accept)
+}
+
+/// [`report_grandchild`] for a root that is not a `cosca::Child` (a raw `CreateProcessW` root,
+/// a `std::process::Child`): it records no containment membership, which needs the `Child`.
+pub fn report_grandchild_of(report: &TcpListener, root: &mut impl Target) -> ProcessId {
+    let (id, stream) = read_grandchild_report(report, root);
+    release(stream);
+    id
+}
+
+/// The shared part of the two: the accepted report stream, still unreleased, and the identity.
+fn read_grandchild_report(report: &TcpListener, root: &mut impl Target) -> (ProcessId, TcpStream) {
     let root_pid = root.pid();
     let mut stream = accept_or_die(report, root);
     let mut line = Vec::new();
@@ -162,15 +201,7 @@ pub fn report_grandchild(report: &TcpListener, root: &mut cosca::Child) -> Proce
         line.extend_from_slice(&buf[..n]);
     }
     let id = identify(parse_pid(std::str::from_utf8(&line).expect("the report is UTF-8")));
-    let contained = is_contained_member(root.containment(), root_pid, id.pid(), |_pid| {
-        #[cfg(windows)]
-        return root.test_job_handle_contains(_pid);
-        #[cfg(not(windows))]
-        false
-    });
-    LAST_REPORTED_CONTAINED.with(|c| c.set(Some(contained)));
-    release(stream);
-    id
+    (id, stream)
 }
 
 fn release(stream: TcpStream) {

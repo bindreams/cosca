@@ -17,16 +17,20 @@ fn spawn_tid_reporter(mode: &str) -> (cosca::Child, std::io::PipeWriter, std::ne
     let addr = listener.local_addr().unwrap().to_string();
 
     let mut cmd = cosca::Command::new();
-    cmd.executable(testbin()).args(["cosca_testbin", mode, &addr]);
+    cmd.executable(testbin())
+        .args(["cosca_testbin", mode, &addr])
+        .env(common::ACK_ENV, "1");
     cmd.stdin(cosca::Stdio::pipe()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn the tid reporter");
     let writer = child.stdin().expect("take the stdin pipe writer");
     (child, writer, listener)
 }
 
-fn accept_reader(listener: &std::net::TcpListener) -> std::io::BufReader<std::net::TcpStream> {
-    let (sock, _) = listener.accept().expect("accept the control connection");
-    std::io::BufReader::new(sock)
+fn accept_reader(
+    listener: &std::net::TcpListener,
+    child: &mut cosca::Child,
+) -> std::io::BufReader<std::net::TcpStream> {
+    std::io::BufReader::new(common::accept_or_die(listener, child))
 }
 
 fn read_tid(reader: &mut std::io::BufReader<std::net::TcpStream>) -> u32 {
@@ -39,8 +43,8 @@ fn read_tid(reader: &mut std::io::BufReader<std::net::TcpStream>) -> u32 {
 /// `pidfd_open` errno as data.
 #[test]
 fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
-    let (child, writer, listener) = spawn_tid_reporter("report-tid-block-stdin");
-    let mut reader = accept_reader(&listener);
+    let (mut child, writer, listener) = spawn_tid_reporter("report-tid-block-stdin");
+    let mut reader = accept_reader(&listener, &mut child);
     let tid = read_tid(&mut reader);
     assert_ne!(
         tid,
@@ -76,7 +80,7 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
 /// exited. Waiting on it must report exited.
 #[test]
 fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
-    let (child, writer, listener) = spawn_tid_reporter("traced-worker");
+    let (mut child, writer, listener) = spawn_tid_reporter("traced-worker");
     let leader = child.id().pid() as libc::pid_t;
     let mut tracer = Tracer {
         leader,
@@ -122,7 +126,7 @@ fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
     resume(leader);
     resume(worker);
 
-    let mut reader = accept_reader(&listener);
+    let mut reader = accept_reader(&listener, &mut child);
     let tid = read_tid(&mut reader);
     assert_eq!(tid, worker as u32, "the reported tid is the traced worker's");
     let p = cosca::Process::from_pid(tid)
@@ -219,4 +223,17 @@ fn resume(pid: libc::pid_t) {
         )
     };
     assert_eq!(rc, 0, "PTRACE_CONT({pid}): {}", std::io::Error::last_os_error());
+}
+
+/// A tid reporter that dies before connecting fails the helper naming the death, not hangs it.
+#[test]
+fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_connecting() {
+    let (mut child, _writer, listener) = spawn_tid_reporter("--not-a-real-mode");
+    let pid = child.id().pid();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_reader(&listener, &mut child)));
+    let message = common::panic_message(result.expect_err("the accept must panic, not return or hang"));
+    assert!(
+        message.contains(&format!("the control target (pid {pid}) died before it connected")),
+        "got: {message:?}"
+    );
 }

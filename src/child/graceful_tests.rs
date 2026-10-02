@@ -314,6 +314,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
             ));
         cmd.env(crate::test_child::FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV, addr);
         crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+        cmd.env(crate::test_child::ack::ACK_ENV, "1");
     }
     cmd.contain();
     #[cfg_attr(
@@ -337,7 +338,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
     }
     #[cfg(windows)]
     let _sock = {
-        let (mut sock, _) = listener.accept().expect("accept rendezvous connection");
+        let mut sock = crate::test_child::accept_or_die(&listener, child.id());
         let mut tag = [0u8; 1];
         sock.read_exact(&mut tag).expect("registration tag");
         sock
@@ -536,25 +537,81 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
         ));
     cmd.env(crate::test_child::FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV, addr);
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(crate::test_child::ack::ACK_ENV, "1");
+    cmd.contain();
+    let child = std::sync::Arc::new(cmd.spawn().expect("spawn"));
+    // The fixture exits at once and its descendant connects: see `accept_or_signalled`. The
+    // watcher is detached, so the test returns its assertion or a failed kill even if the job
+    // never drains.
+    let drained = std::sync::Arc::new(crate::test_child::DrainSignal::new());
+    {
+        let (child, drained) = (child.clone(), drained.clone());
+        std::thread::spawn(move || drained.watch(|| child.wait_tree()));
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Blocks until the survivor has connected, which it does only once it exists in its
+        // own process group (see the fixture's own doc).
+        let mut sock = crate::test_child::accept_or_signalled(&listener, &drained);
+        let mut tag = [0u8; 1];
+        sock.read_exact(&mut tag).expect("readiness tag");
+        term_fault::set_force_kill_tree_error(true);
+        let err = child
+            .graceful_shutdown_tree(Duration::from_secs(2))
+            .expect_err("the forced sweep failure must surface");
+        assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+        assert!(
+            !term_fault::kill_tree_armed(),
+            "the sweep must have consumed the forced-failure seam"
+        );
+    }));
+    // The forced failure was a stub, so the survivor lives; the real sweep (seam consumed) kills it
+    // and drains the job.
+    if let Err(e) = child.kill_tree() {
+        let unwinding = outcome.as_ref().err().map(|p| {
+            p.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        });
+        panic!("cleanup kill_tree failed ({e}); unwinding from: {unwinding:?}");
+    }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+// `accept_or_signalled` fails once the job drains with nothing having connected, instead of
+// waiting forever. The contained fixture matches no test, so it exits at once and leaves no
+// descendant.
+#[cfg(windows)]
+#[test]
+fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_connects() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let mut cmd = crate::Command::new();
+    cmd.executable(std::env::current_exe().expect("current_exe"))
+        .args(crate::test_child::fixture_argv("test_child::__no_such_test__"));
     cmd.contain();
     let child = cmd.spawn().expect("spawn");
-    // Blocks until the fixture has connected — which it does only after the grandchild survivor
-    // already exists in its own process group (see the fixture's own doc).
-    let (mut sock, _) = listener.accept().expect("accept readiness connection");
-    let mut tag = [0u8; 1];
-    sock.read_exact(&mut tag).expect("readiness tag");
-    term_fault::set_force_kill_tree_error(true);
-    let err = child
-        .graceful_shutdown_tree(Duration::from_secs(2))
-        .expect_err("the forced sweep failure must surface");
-    assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
+    let drained = crate::test_child::DrainSignal::new();
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| drained.watch(|| child.wait_tree()));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::test_child::accept_or_signalled(&listener, &drained)
+        }))
+    });
+    let payload = result.expect_err("a drained job with no connection must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("string panic payload");
     assert!(
-        !term_fault::kill_tree_armed(),
-        "the sweep must have consumed the forced-failure seam"
+        message.starts_with("the tree drained (") && message.ends_with(") before anything connected"),
+        "got: {message:?}"
     );
-    // Cleanup: the forced sweep failure was a stub, so the group-signal-immune descendant is
-    // still alive — a real sweep now (the seam is already consumed) actually kills it.
-    _ = child.kill_tree();
+    child.wait().expect("reap the root");
 }
 
 // A NON-containment terminate_tree error (modelling NoConsole/Unsupported) must NOT be held

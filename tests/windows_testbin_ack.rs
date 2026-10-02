@@ -114,7 +114,7 @@ macro_rules! mode_tests {
 
             /// The mode's child exits before connecting: the mode fails naming the death.
             #[test]
-            fn accept_or_die_fails_when_the_modes_child_dies_before_connecting() {
+            fn death_watch_accept_or_die_fails_when_the_modes_child_dies_before_connecting() {
                 let r = run(&$case, "die");
                 assert!(!r.success, "the mode must fail, stderr: {}", r.stderr);
                 assert!(r.report.is_empty(), "nothing can have been reported: {:?}", r.report);
@@ -127,7 +127,7 @@ macro_rules! mode_tests {
 
             /// The mode does not inherit the opt-in, so its own explicit one is what reaches the child.
             #[test]
-            fn accept_or_die_child_is_opted_in_by_the_mode_not_inherited() {
+            fn death_watch_accept_or_die_child_is_opted_in_by_the_mode_not_inherited() {
                 let r = run(&$case, "strict");
                 assert!(r.success, "the mode failed, stderr: {}", r.stderr);
                 assert!(!r.report.is_empty(), "the mode reported nothing, stderr: {}", r.stderr);

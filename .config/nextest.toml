@@ -1,13 +1,14 @@
 nextest-version = { required = "0.9.146" }
 
-# Death-watch tests that a regression would turn into a hang rather than a failure.
+# Death-watch tests that a regression would turn into a hang rather than a failure. Every one is
+# named `death_watch_*`, so a new one is bounded without touching this file.
 [[profile.default.overrides]]
 #
 # `payload_race` and `block_on_socket` (the elevation tests' payload helper and testbin's payload) and
 # `*_unkillable_and_drop_does_not_hang` (a `Drop` that waited on a live child blocks) cover the
 # same shape of regression. The helper's own tests fail on a broken helper without waiting; this
 # bound only stops a regression they did not anticipate from stalling the job.
-filter = 'test(/accept_or_die|panics_if_its_death_watch_is_ever_reverted|panics_when_the_(grandchild|root)_dies|watch_loop_survives_a_non_exit_drain_cycle|unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
+filter = 'test(/(^|::)death_watch_/) | test(/unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [profile.ci]
@@ -155,6 +156,12 @@ slow-timeout = { period = "20s", terminate-after = 1, grace-period = "1s" }
 # `profile.default` so `profile.ci` and local runs inherit it.
 filter = 'test(/^child::shared::shared_tests::/) | test(/^wait::backend::macos_tests::await_reapable/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+
+[[profile.default.overrides]]
+# A hang backstop, not the proof: if `kill_tree` returns `Ok` without killing the worker, the
+# watcher `linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited` joins never returns.
+filter = 'binary(spawn_io) & test(=linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited)'
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on

@@ -37,9 +37,12 @@ fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::proces
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
     let mut cmd = Command::new(exe);
-    cmd.args(args).arg(&addr).creation_flags(flags);
-    let child = common::spawn_locked(&mut cmd).expect("spawn flag-matrix child");
-    let (mut sock, _) = listener.accept().expect("accept");
+    cmd.args(args)
+        .arg(&addr)
+        .env(common::ACK_ENV, "1")
+        .creation_flags(flags);
+    let mut child = common::spawn_locked(&mut cmd).expect("spawn flag-matrix child");
+    let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("read tag");
     (child, sock)

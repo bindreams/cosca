@@ -308,7 +308,7 @@ impl common::Target for AlreadyDead {
 
 /// A target that dies before connecting makes `accept_or_die` panic naming it, not hang.
 #[skuld::test]
-fn accept_or_die_panics_loudly_when_the_target_dies_first() {
+fn death_watch_accept_or_die_panics_loudly_when_the_target_dies_first() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut child = common::spawn_locked(
@@ -325,7 +325,7 @@ fn accept_or_die_panics_loudly_when_the_target_dies_first() {
 /// hook, which runs once the watches are in place, closes its stdin so it exits. This reaches the
 /// OS exit notification itself (pidfd, kqueue `NOTE_EXIT`, process handle).
 #[skuld::test]
-fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
+fn death_watch_accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     use std::net::TcpListener;
     use std::process::Stdio;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -351,10 +351,33 @@ fn accept_or_die_reports_a_target_that_exits_after_the_watch_is_armed() {
     child.wait().expect("reap");
 }
 
+/// A signal handled while the wait is parked must retry it, not panic (see `kevent_eintr`), and the
+/// wait must still report the target's exit.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut child = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .arg("hold-until-stdin-eof")
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn a target that waits for its stdin to close");
+    let pid = child.id();
+    let stdin = child.stdin.take();
+    let interrupter = common::kevent_eintr::interrupt_once_blocked(move || drop(stdin));
+    let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
+    interrupter.finish();
+    assert_died_before_connecting(&message, pid);
+    child.wait().expect("reap");
+}
+
 /// A target that `has_exited` is dead, and its pid (here one that cannot exist) is never opened:
 /// a reaped pid could name a stranger.
 #[skuld::test]
-fn accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
+fn death_watch_accept_or_die_reports_an_already_exited_target_without_opening_its_pid() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut target = AlreadyDead { asked: 0 };
@@ -377,7 +400,7 @@ fn a_reaped_std_child_is_reported_exited() {
 /// A target that connects and exits without waiting for the ack is dead whether or not its
 /// connection reached the accept queue: the exit alone decides.
 #[skuld::test]
-fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -394,7 +417,7 @@ fn accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_d
 
 /// The ack is written on the accepted connection; the opted-in target sends its tag only after it.
 #[skuld::test]
-fn accept_or_die_acks_the_connection_it_accepts() {
+fn death_watch_accept_or_die_acks_the_connection_it_accepts() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -416,7 +439,7 @@ fn accept_or_die_acks_the_connection_it_accepts() {
 /// panicked over: Linux `pidfd_open` ESRCH, macOS `EV_ADD` ESRCH, Windows `OpenProcess` failing
 /// with `ERROR_INVALID_PARAMETER`. The target is alive throughout.
 #[skuld::test]
-fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
+fn death_watch_accept_or_die_also_reports_a_gone_descendant_as_dead() {
     use std::net::TcpListener;
     use std::process::Stdio;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -451,7 +474,7 @@ fn accept_or_die_also_reports_a_gone_descendant_as_dead() {
 /// start token, which is what a reissued pid looks like) is reported as the descendant being gone,
 /// never watched.
 #[skuld::test]
-fn accept_or_die_also_does_not_watch_a_reissued_pid() {
+fn death_watch_accept_or_die_also_does_not_watch_a_reissued_pid() {
     use std::net::TcpListener;
     use std::process::Stdio;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -494,7 +517,7 @@ fn wait_handles_reports_the_os_error_of_a_failed_wait() {
 
 /// The helpers themselves (`spawn_control`, `spawn_tree`), end to end, fail rather than hang.
 #[skuld::test]
-fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+fn death_watch_spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(|| common::spawn_control("--not-a-real-mode", &[], false));
     assert!(
         message.contains("died before it connected"),
@@ -503,7 +526,7 @@ fn spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() 
 }
 
 #[skuld::test]
-fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
+fn death_watch_spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(|| common::spawn_tree("--not-a-real-mode", false));
     assert!(
         message.contains("died before it connected"),
@@ -514,7 +537,7 @@ fn spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
 /// Only the GRANDCHILD dies before connecting; the panic must name it (the pid the root
 /// reported), not the live root.
 #[skuld::test]
-fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+fn death_watch_spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-dies", false));
     let grandchild = common::last_reported_grandchild().expect("the root reported its grandchild");
     assert_died_before_connecting(&message, grandchild);
@@ -523,7 +546,7 @@ fn spawn_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_l
 /// The root reports a live grandchild and exits without ever connecting to the main address, so
 /// the report accept passes and the main loop must fail on the ROOT (not the live grandchild).
 #[skuld::test]
-fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
+fn death_watch_spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
     // Contained so unwinding kills the orphaned grandchild (it would otherwise outlive the test
     // holding its stdio). The kill is only sent on drop, so wait for the grandchild's exit by
     // identity (never a reissued pid).
@@ -554,7 +577,7 @@ fn spawn_tree_panics_when_the_root_dies_after_reporting_before_connecting() {
 /// The root connects to the report address and exits without reporting: the failure names that,
 /// not a parse error on an empty line.
 #[skuld::test]
-fn spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
+fn death_watch_spawn_tree_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(|| common::spawn_tree("spawn-grandchild-report-eof", false));
     assert!(
         message.contains("died before it reported the grandchild pid"),
@@ -585,14 +608,14 @@ fn reap(mut child: std::process::Child) {
 /// `strict` turns a missing opt-in into a death before connecting, which is how the mode tests
 /// see that a mode forgot to opt its child in.
 #[skuld::test]
-fn accept_or_die_seam_strict_kills_a_target_that_was_not_opted_in() {
+fn death_watch_accept_or_die_seam_strict_kills_a_target_that_was_not_opted_in() {
     let (mut child, listener) = seamed_control_block("strict", false);
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
     assert_died_before_connecting(&message, child.id());
 }
 
 #[skuld::test]
-fn accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
+fn death_watch_accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
     let (mut child, listener) = seamed_control_block("strict", true);
     let mut sock = common::accept_or_die(&listener, &mut child);
     let mut tag = [0u8; 1];
@@ -604,7 +627,7 @@ fn accept_or_die_seam_strict_lets_an_opted_in_target_connect() {
 
 /// `die-now` is the state the `die` seam leaves a mode in for its children.
 #[skuld::test]
-fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
+fn death_watch_accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
     let (mut child, listener) = seamed_control_block("die-now", true);
     let message = panic_message_of(|| common::accept_or_die(&listener, &mut child));
     assert_died_before_connecting(&message, child.id());
@@ -616,6 +639,370 @@ fn accept_or_die_seam_die_now_exits_the_target_before_it_connects() {
 fn pid_one_has_no_parent() {
     let init = cosca::Process::from_pid(1).found().expect("pid 1 resolves");
     assert!(init.parent().expect("pid 1's parent is answerable").is_none());
+}
+
+/// The identity of the unreaped child `pid`.
+fn found_id(pid: u32) -> cosca::identity::ProcessId {
+    match cosca::identity::ProcessId::of(pid) {
+        cosca::identity::Resolved::Found(id) => id,
+        other => panic!("the unreaped child {pid} must resolve, got {other:?}"),
+    }
+}
+
+/// `accept_tree_also` arms one death watch per accept, so a two-member tree arms two.
+fn healthy_tree_arms_a_watch_for_each_accept() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let spawn = |tag: &str| {
+        common::spawn_locked(
+            std::process::Command::new(common::testbin())
+                .args(["control-block", &addr, tag])
+                .env(common::ACK_ENV, "1"),
+        )
+        .expect("spawn a healthy tree member")
+    };
+    let mut root = spawn("R");
+    let mut grandchild = spawn("G");
+    let grandchild_id = found_id(grandchild.id());
+    let armings = Rc::new(Cell::new(0usize));
+    let in_hook = armings.clone();
+    let socks = common::with_armed_hook(
+        move || in_hook.set(in_hook.get() + 1),
+        || {
+            common::accept_tree_also(&listener, &mut root, grandchild_id, |s| {
+                let mut tag = [0u8; 1];
+                s.read_exact(&mut tag).expect("read tag");
+                tag[0] == b'G'
+            })
+        },
+    );
+    drop(socks);
+    root.kill().expect("kill the root");
+    root.wait().expect("reap the root");
+    grandchild.kill().expect("kill the grandchild");
+    grandchild.wait().expect("reap the grandchild");
+    assert_eq!(
+        armings.get(),
+        2,
+        "each accept over a healthy tree must arm a death watch"
+    );
+}
+
+/// `accept_tree` must fail promptly when the first member to connect is the grandchild and the
+/// root then dies before ever connecting. Every accept has to keep watching the ROOT, not a
+/// connected peer's socket: the peer is healthy and silent.
+///
+/// The root (`hold-until-stdin-eof`, stdin held by this test) never connects, so the first accept
+/// resolves through the grandchild. The armed hook then kills the root once a later accept's watch
+/// is in place; the root must die of that kill, not exit on its own.
+#[skuld::test]
+fn death_watch_accept_tree_panics_when_the_root_dies_before_connecting_after_another_member_already_did() {
+    healthy_tree_arms_a_watch_for_each_accept();
+    use std::cell::Cell;
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::rc::Rc;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+
+    // The grandchild: connects, tags 'G', and blocks.
+    let mut grandchild = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["control-block", &addr, "G"])
+            .env(common::ACK_ENV, "1"),
+    )
+    .expect("spawn the grandchild");
+    let grandchild_id = found_id(grandchild.id());
+    // The root: alive while `root.stdin` stays open, and never connects.
+    let mut root = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["hold-until-stdin-eof"])
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn a root that stays alive without ever connecting");
+    let root_pid = root.id();
+    let root_id = found_id(root_pid);
+
+    let member_connected = Rc::new(Cell::new(false));
+    let (in_hook, in_accept) = (member_connected.clone(), member_connected.clone());
+    let message = common::with_armed_hook(
+        move || {
+            if in_hook.get() {
+                cosca::Process::from_id(root_id).kill().expect("kill the root");
+            }
+        },
+        || {
+            panic_message_of(|| {
+                common::accept_tree_also(&listener, &mut root, grandchild_id, |s| {
+                    let mut tag = [0u8; 1];
+                    s.read_exact(&mut tag).expect("read tag");
+                    assert_eq!(&tag, b"G", "the root never connects in this scenario");
+                    in_accept.set(true);
+                    true
+                })
+            })
+        },
+    );
+    let status = root.wait().expect("reap the root");
+    grandchild.kill().expect("kill the grandchild");
+    grandchild.wait().expect("reap the grandchild");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the root must die of the hook's SIGKILL, not exit on its own: {status:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        !status.success(),
+        "the root must die of the hook's kill, not exit on its own: {status:?}"
+    );
+    assert_died_before_connecting(&message, root_pid);
+}
+
+/// `accept_tree` must fail promptly when the grandchild dies before connecting while the root is
+/// alive and connects: watching the root alone would wait for a `G` that never comes.
+/// `spawn-grandchild-dies` spawns a grandchild that exits at once, reports its pid, and connects
+/// as the root. The panic must name the grandchild.
+#[skuld::test]
+fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    let (report, report_addr) = common::bind_report();
+    let mut cmd = cosca::Command::new();
+    cmd.executable(common::testbin())
+        .args(["cosca_testbin", "spawn-grandchild-dies", &addr])
+        .env(common::ACK_ENV, "1")
+        .env(common::GC_PID_ADDR_ENV, &report_addr);
+    common::silence(&mut cmd);
+    let mut root = cmd.spawn().expect("spawn the tree");
+    let grandchild = common::report_grandchild(&report, &mut root);
+    let grandchild_pid = grandchild.pid();
+    // The root connects as soon as it is released. Waiting for the grandchild's exit first makes
+    // accept #1 report it dead on every interleaving.
+    cosca::Process::from_id(grandchild)
+        .wait()
+        .expect("wait for the grandchild to exit");
+
+    // Accept #1 must watch the grandchild too. The hook fires only under a regression: a healthy
+    // accept reports the dead grandchild before it arms.
+    let message = common::with_armed_hook(
+        move || {
+            let watched = common::armed_watch();
+            assert!(
+                watched.contains(&grandchild_pid),
+                "the tree accept armed {watched:?} without the grandchild {grandchild_pid}"
+            );
+        },
+        || {
+            panic_message_of(|| {
+                common::accept_tree_also(&listener, &mut root, grandchild, |s| {
+                    let mut tag = [0u8; 1];
+                    s.read_exact(&mut tag).expect("read tag");
+                    tag[0] == b'G'
+                })
+            })
+        },
+    );
+    // The grandchild exited, so it must not be named a `G` connection; the root stays alive.
+    root.kill().expect("kill the root");
+    root.wait().expect("reap the root");
+    assert_died_before_connecting(&message, grandchild_pid);
+}
+
+/// In the `spawn-orphan-escapee` tree the reporter of the grandchild's pid is the relay, not the
+/// root, and the root only waits for the relay. A relay that dies before it reports must fail the
+/// report accept, which watches the root: the root has to exit with it, not carry on to its own
+/// connection and leave the accept waiting on a live root.
+#[cfg(unix)]
+#[skuld::test]
+fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
+    use std::net::TcpListener;
+    let main = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind");
+    // An address with no port never resolves, so the relay's report connection fails at once. A
+    // port freed by dropping a listener could be taken by another test and answered.
+    let refused_addr = "no-port";
+    let mut root = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["spawn-orphan-escapee", &main.local_addr().unwrap().to_string()])
+            .env(common::ACK_ENV, "1")
+            .env(common::GC_PID_ADDR_ENV, refused_addr),
+    )
+    .expect("spawn the orphan tree");
+    let root_pid = root.id();
+    let message = panic_message_of(|| common::accept_or_die(&report, &mut root));
+    root.wait().expect("reap the root");
+    assert_died_before_connecting(&message, root_pid);
+}
+
+/// The second tree accept must watch the grandchild too: the root connects first, the grandchild
+/// stays silent, and the armed hook kills it once the second accept's watch is in place. The hook
+/// asserts the grandchild is in every armed set.
+#[skuld::test]
+fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_after_the_root_already_did() {
+    use std::cell::Cell;
+    use std::process::Stdio;
+    use std::rc::Rc;
+    healthy_tree_arms_a_watch_for_each_accept();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap().to_string();
+    // The root: connects, tags 'R', and blocks.
+    let mut root = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["control-block", &addr, "R"])
+            .env(common::ACK_ENV, "1"),
+    )
+    .expect("spawn the root");
+    // The grandchild: alive while its stdin stays open, and never connects.
+    let mut grandchild = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["hold-until-stdin-eof"])
+            .stdin(Stdio::piped()),
+    )
+    .expect("spawn a grandchild that stays alive without ever connecting");
+    let grandchild_pid = grandchild.id();
+    let grandchild_id = found_id(grandchild_pid);
+    let armings = Rc::new(Cell::new(0usize));
+    let in_hook = armings.clone();
+    let message = common::with_armed_hook(
+        move || {
+            let watched = common::armed_watch();
+            assert!(
+                watched.contains(&grandchild_pid),
+                "the tree accept armed {watched:?} without the grandchild {grandchild_pid}"
+            );
+            in_hook.set(in_hook.get() + 1);
+            if in_hook.get() == 2 {
+                cosca::Process::from_id(grandchild_id)
+                    .kill()
+                    .expect("kill the grandchild");
+            }
+        },
+        || {
+            panic_message_of(|| {
+                common::accept_tree_also(&listener, &mut root, grandchild_id, |s| {
+                    let mut tag = [0u8; 1];
+                    s.read_exact(&mut tag).expect("read tag");
+                    assert_eq!(&tag, b"R", "the grandchild never connects in this scenario");
+                    false
+                })
+            })
+        },
+    );
+    root.kill().expect("kill the root");
+    root.wait().expect("reap the root");
+    grandchild.wait().expect("reap the grandchild");
+    assert_eq!(
+        armings.get(),
+        2,
+        "the second accept must have armed before the grandchild died"
+    );
+    assert_died_before_connecting(&message, grandchild_pid);
+}
+
+/// A watcher whose `wait_tree` FAILED must not be reported as the tree having drained: the panic
+/// names the failure and its cause.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_panics_naming_a_failed_wait_tree_not_a_drain() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let drained = common::DrainSignal::new();
+    drained.record(Err::<(), _>("the leaf could not be read"));
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "wait_tree failed while waiting for a connection: the leaf could not be read"
+    );
+}
+
+/// A real drain is reported as one, with what `wait_tree` returned.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_panics_naming_the_drain_when_wait_tree_returned_ok() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let drained = common::DrainSignal::new();
+    drained.record(Ok::<_, String>("AllMembersExited"));
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "the leaf drained (\"AllMembersExited\") before anything connected"
+    );
+}
+
+/// A connection that arrives while nothing has drained is accepted and acked, and its stream is
+/// returned: the success path, with no cgroup involved.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_returns_the_acked_connection_while_nothing_has_drained() {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let drained = common::DrainSignal::new();
+    let client = std::thread::spawn(move || {
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        let mut ack = [0u8; 1];
+        sock.read_exact(&mut ack).expect("read the ack");
+        sock.write_all(b"T").expect("write the tag");
+        ack[0]
+    });
+    let mut stream = common::accept_or_signalled(&listener, &drained);
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).expect("read the tag");
+    assert_eq!(&tag, b"T");
+    assert_eq!(client.join().expect("the client"), common::ack::ACK_BYTE);
+}
+
+/// A drain and a queued connection both ready: the drain wins, as an exit wins in `accept_or_die`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_queued() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let _queued = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    let drained = common::DrainSignal::new();
+    drained.record(Ok::<_, String>("AllMembersExited"));
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "the leaf drained (\"AllMembersExited\") before anything connected"
+    );
+}
+
+/// A watcher whose `wait_tree` panics must signal the drain at once, with an error outcome. The
+/// signal is read with a zero-timeout poll, so a missing wake fails by assertion.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn death_watch_a_panicking_watcher_wakes_the_acceptor_with_an_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let drained = common::DrainSignal::new();
+    assert!(!drained.is_signalled(), "nothing has signalled the drain yet");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drained.watch(|| -> Result<(), String> { panic!("wait_tree blew up") })
+    }));
+    assert!(unwound.is_err(), "the watcher's panic must propagate");
+    assert!(
+        drained.is_signalled(),
+        "a panicking watcher must still signal the drain"
+    );
+    let message = panic_message_of(|| common::accept_or_signalled(&listener, &drained));
+    assert_eq!(
+        message,
+        "wait_tree failed while waiting for a connection: the watcher panicked before wait_tree returned"
+    );
+}
+
+/// An exit wins over a ready source in every platform's wait.
+#[skuld::test]
+fn death_watch_an_exit_wins_over_a_ready_source() {
+    assert_eq!(common::first_ready(true, true), Some(common::Ready::Exit));
+    assert_eq!(common::first_ready(false, true), Some(common::Ready::Source));
+    assert_eq!(common::first_ready(true, false), Some(common::Ready::Exit));
+    assert_eq!(common::first_ready(false, false), None);
 }
 
 fn main() {

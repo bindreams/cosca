@@ -40,6 +40,11 @@ use cosca::identity::ProcessId;
 pub mod ack;
 pub use ack::ACK_ENV;
 
+#[path = "accept/shared.rs"]
+mod shared;
+#[allow(unused_imports, reason = "each test binary uses a subset")]
+pub use shared::{accept_and_ack, ack_now, first_ready, run_watcher, DrainOutcome, Ready};
+
 #[cfg(target_os = "linux")]
 #[path = "accept/linux.rs"]
 mod linux;
@@ -64,6 +69,12 @@ pub use async_impl::{accept_or_die_async, accept_or_die_async_also};
 
 #[cfg(windows)]
 pub use win::wait_handles;
+
+#[cfg(target_os = "linux")]
+#[path = "accept/signalled.rs"]
+mod signalled;
+#[cfg(target_os = "linux")]
+pub use signalled::{accept_or_signalled, DrainSignal};
 
 /// A child process the caller owns and has not reaped.
 pub trait Target {
@@ -172,25 +183,19 @@ pub(crate) fn wait_readable(stream: &TcpStream, target_pid: u32) -> WatchEvent {
     platform::wait(Source::Stream(stream), target_pid, None)
 }
 
-/// Accepts the connection the wait reported ready and writes the ack byte to it.
-fn accept_and_ack(listener: &TcpListener) -> TcpStream {
-    let (stream, _) = listener.accept().expect("accept a control connection");
-    ack_now(stream)
-}
-
-/// Writes the ack to `stream`, which the caller has accepted and left in blocking mode.
-pub(crate) fn ack_now(mut stream: TcpStream) -> TcpStream {
-    ack::send_ack(&mut stream)
-        .unwrap_or_else(|e| panic!("writing the accept acknowledgement to the control connection failed: {e}"));
-    stream
-}
-
 // Test seam =====
 
 type ArmedHook = Box<dyn FnMut()>;
 
 thread_local! {
     static ARMED_HOOK: RefCell<Option<ArmedHook>> = const { RefCell::new(None) };
+    static ARMED_WATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The pids the latest death-watched wait on this thread armed, target first; read it from a
+/// [`with_armed_hook`] hook.
+pub fn armed_watch() -> Vec<u32> {
+    ARMED_WATCH.with(|w| w.borrow().clone())
 }
 
 /// Runs `body` with `hook` called on this thread every time a death-watched wait has armed its
@@ -202,6 +207,7 @@ pub fn with_armed_hook<R>(hook: impl FnMut() + 'static, body: impl FnOnce() -> R
     impl Drop for Reset {
         fn drop(&mut self) {
             ARMED_HOOK.with(|h| *h.borrow_mut() = None);
+            ARMED_WATCH.with(|w| w.borrow_mut().clear());
         }
     }
     ARMED_HOOK.with(|h| {
@@ -213,13 +219,52 @@ pub fn with_armed_hook<R>(hook: impl FnMut() + 'static, body: impl FnOnce() -> R
     body()
 }
 
-/// Called by each platform wait after arming, before it blocks.
-pub(crate) fn notify_armed() {
+pub(crate) fn notify_armed(target: u32, also: Option<ProcessId>) {
     // The hook is taken out for the call so that it can itself install nothing and re-enter
     // nothing; it goes back afterwards, in case the wait loops and arms again.
     let taken = ARMED_HOOK.with(|h| h.borrow_mut().take());
     if let Some(mut hook) = taken {
+        ARMED_WATCH.with(|w| {
+            let mut w = w.borrow_mut();
+            w.clear();
+            w.push(target);
+            w.extend(also.map(|id| id.pid()));
+        });
         hook();
         ARMED_HOOK.with(|h| *h.borrow_mut() = Some(hook));
     }
+}
+
+/// Accepts the two members of a tree, the root (`target`) and one grandchild, in arrival order.
+/// The root is watched throughout; `grandchild`, whose identity the caller captured while the
+/// root held it (see `report.rs`), is watched until it has connected. Either dying first fails
+/// the accept through [`accept_or_die_also`] instead of leaving it waiting on the live member.
+///
+/// `on_accept` runs on each socket right after it is accepted, before the next accept, so a
+/// caller can read its tag inline. It returns `true` for the grandchild's socket, which ends the
+/// grandchild's watch (a connected grandchild is no longer expected to connect), and `false` for
+/// the root's.
+///
+/// Every accepted socket is HELD (returned, never dropped) until both have arrived: testbin's
+/// `control-*` modes exit when their socket closes, so a dropped member would make the watched
+/// root exit and be correctly reported.
+pub fn accept_tree_also(
+    listener: &TcpListener,
+    target: &mut impl Target,
+    grandchild: ProcessId,
+    mut on_accept: impl FnMut(&mut TcpStream) -> bool,
+) -> Vec<TcpStream> {
+    let mut socks: Vec<TcpStream> = Vec::with_capacity(2);
+    let mut grandchild_connected = false;
+    for _ in 0..2 {
+        let watch = (!grandchild_connected).then_some(grandchild);
+        let mut s = accept_or_die_also(listener, target, watch);
+        if on_accept(&mut s) {
+            assert!(!grandchild_connected, "two connections claimed to be the grandchild's");
+            grandchild_connected = true;
+        }
+        socks.push(s);
+    }
+    assert!(grandchild_connected, "neither accepted connection was the grandchild's");
+    socks
 }

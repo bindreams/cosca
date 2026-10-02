@@ -3,6 +3,10 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaces;
 
+#[cfg(target_os = "macos")]
+#[path = "../tests/common/kevent_eintr.rs"]
+mod kevent_eintr;
+
 // Blocker fixtures =====
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
@@ -282,6 +286,332 @@ pub(crate) use scratch::fixture_scratch_tempdir;
 mod db_dir;
 #[cfg(unix)]
 pub(crate) use db_dir::FixtureDirs;
+
+/// The accept handshake shared with `tests/common/accept.rs` and the testbin.
+#[path = "../testbin/ack.rs"]
+pub(crate) mod ack;
+
+/// The ack, event precedence and drain outcome shared with `tests/common/accept.rs`.
+#[path = "../tests/common/accept/shared.rs"]
+pub(crate) mod shared;
+
+/// Blocks until either `listener` gets a connection, or `target` exits first, never a bare,
+/// hang-forever `accept()`. The `src/` twin of `tests/common/accept.rs`'s `accept_or_die` (a
+/// separate compilation unit), built on the crate's own identity-verified exit-watch primitives
+/// (`crate::wait::backend::open_verified`, `arm_proc_exit`, `block_until_exit_or_cancel`). The
+/// `target` identity is verified when the watch is armed, so a reissued pid is reported as the
+/// target being gone, never watched.
+///
+/// One thread, one wait: each platform's own multiplexer (`poll`, `kqueue`,
+/// `WaitForMultipleObjects`) blocks on "the listener is readable" OR "the target exited", and this
+/// thread is the only one that ever calls `listener.accept()`.
+///
+/// A connection is accepted and acked ([`ack`]); the fixture waits for the ack after connecting
+/// when [`ack::ACK_ENV`] is set in its environment, so it cannot exit between `connect()` and the
+/// accept. An exit before the accept is therefore a failure, decided without consulting the
+/// accept queue.
+pub(crate) fn accept_or_die(
+    listener: &std::net::TcpListener,
+    target: crate::identity::ProcessId,
+) -> std::net::TcpStream {
+    #[cfg(target_os = "linux")]
+    let event = watch_linux(listener, target);
+    #[cfg(target_os = "macos")]
+    let event = watch_macos(listener, target);
+    #[cfg(windows)]
+    let event = watch_windows(listener, target);
+    match event {
+        WatchEvent::Connection => shared::accept_and_ack(listener),
+        WatchEvent::Died => panic!("the control target (pid {}) died before it connected", target.pid()),
+    }
+}
+
+/// What ended the wait.
+enum WatchEvent {
+    Connection,
+    Died,
+}
+
+/// Wakes [`accept_or_signalled`] when a tree's drain wait ends; see [`shared::DrainOutcome`].
+#[cfg(windows)]
+pub(crate) struct DrainSignal {
+    event: std::os::windows::io::OwnedHandle,
+    outcome: shared::DrainOutcome,
+}
+
+#[cfg(windows)]
+impl DrainSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            event: crate::wait::backend::new_cancel_event().expect("create the drain event"),
+            outcome: shared::DrainOutcome::default(),
+        }
+    }
+
+    /// Whether the drain has been signalled, by a zero-timeout wait: it never blocks.
+    pub(crate) fn is_signalled(&self) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the event handle is live and owned by `self`.
+        unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Records the result of `wait_tree` and wakes the acceptor.
+    pub(crate) fn record<T: std::fmt::Debug, E: std::fmt::Display>(&self, result: Result<T, E>) {
+        self.outcome.store(result);
+        crate::wait::backend::signal_cancel(&self.event);
+    }
+
+    /// Runs `wait` (a `wait_tree`) and records its result; a `wait` that panics records an error.
+    pub(crate) fn watch<T: std::fmt::Debug, E: std::fmt::Display>(&self, wait: impl FnOnce() -> Result<T, E>) {
+        shared::run_watcher(&self.outcome, || crate::wait::backend::signal_cancel(&self.event), wait);
+    }
+}
+
+/// Windows: accepts and acks a connection, or fails once `drained` is signalled. For a target
+/// expected to exit at once while a descendant in the job connects, so its pid cannot be watched:
+/// the job draining is the death of every possible connector. A watcher thread records
+/// `wait_tree`'s result into `drained`; only this thread accepts. The connector waits for the
+/// ack, so a drain with nothing accepted is a failure.
+#[cfg(windows)]
+pub(crate) fn accept_or_signalled(listener: &std::net::TcpListener, drained: &DrainSignal) -> std::net::TcpStream {
+    use std::os::windows::io::{AsRawHandle, AsRawSocket};
+
+    use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+    use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
+    use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+
+    let accept_event =
+        crate::wait::backend::new_cancel_event().expect("create an event for the listener's accept-readiness watch");
+    let sock = SOCKET(listener.as_raw_socket() as usize);
+    // SAFETY: `sock` is the listener's own live socket; the event is a live, owned handle.
+    let rc = unsafe {
+        WSAEventSelect(
+            sock,
+            Some(WSAEVENT(accept_event.as_raw_handle() as _)),
+            FD_ACCEPT as i32,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "WSAEventSelect(FD_ACCEPT) on the control listener: {}",
+        std::io::Error::last_os_error()
+    );
+    // The drain is listed first: the lowest signalled index wins.
+    let handles = [
+        HANDLE(drained.event.as_raw_handle()),
+        HANDLE(accept_event.as_raw_handle()),
+    ];
+    // SAFETY: both handles are live and owned for the call's duration.
+    let woken = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+    let wait_error = std::io::Error::last_os_error();
+    // SAFETY: `sock` is still the listener's own live socket.
+    let cancel_rc = unsafe { WSAEventSelect(sock, None, 0) };
+    assert_eq!(
+        cancel_rc,
+        0,
+        "WSAEventSelect(0) to cancel the accept-readiness association: {}",
+        std::io::Error::last_os_error()
+    );
+    // Cancelling alone does not reliably leave the socket blocking.
+    listener
+        .set_nonblocking(false)
+        .expect("restore the control listener to blocking mode");
+    assert_ne!(
+        woken, WAIT_FAILED,
+        "WaitForMultipleObjects while waiting for a control connection: {wait_error}"
+    );
+    let drain = woken == WAIT_OBJECT_0;
+    let connection = woken.0 == WAIT_OBJECT_0.0 + 1;
+    assert!(
+        drain || connection,
+        "WaitForMultipleObjects returned {woken:?} for two handles"
+    );
+    match shared::first_ready(drain, connection) {
+        Some(shared::Ready::Exit) => drained.outcome.fail("tree"),
+        Some(shared::Ready::Source) => shared::accept_and_ack(listener),
+        None => unreachable!("one of the two handles signalled"),
+    }
+}
+
+/// Linux: a pidfd (via the crate's own [`crate::wait::backend::open_verified`]) polled alongside
+/// the listener's fd in ONE `poll()` call.
+#[cfg(target_os = "linux")]
+fn watch_linux(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
+    use std::os::fd::AsFd;
+
+    use rustix::event::{poll, PollFd, PollFlags};
+
+    let Some(pidfd) = crate::wait::backend::open_verified(target, crate::wait::backend::PidfdOp::Wait)
+        .expect("open a pidfd to watch the target")
+    else {
+        return WatchEvent::Died;
+    };
+    let listener_fd = listener.as_fd();
+    let mut fds = [
+        PollFd::new(&pidfd, PollFlags::IN),
+        PollFd::new(&listener_fd, PollFlags::IN),
+    ];
+    loop {
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => panic!(
+                "poll while waiting for a control connection: {}",
+                std::io::Error::from(e)
+            ),
+        }
+        let (pidfd_revents, listener_revents) = (fds[0].revents(), fds[1].revents());
+        // POLLNVAL would mean this function handed poll() a bad fd. It returns at once and never
+        // clears, so ignoring it spins forever: a violation fails in every build.
+        assert!(
+            !pidfd_revents.contains(PollFlags::NVAL),
+            "the pidfd went invalid mid-wait"
+        );
+        assert!(
+            !listener_revents.contains(PollFlags::NVAL),
+            "the control listener's fd went invalid mid-wait"
+        );
+        if listener_revents.contains(PollFlags::ERR) || listener_revents.contains(PollFlags::HUP) {
+            panic!("the control listener reported an error while waiting for a connection: {listener_revents:?}");
+        }
+        if pidfd_revents.contains(PollFlags::ERR) {
+            panic!("pidfd poll returned POLLERR while watching pid {}", target.pid());
+        }
+        match shared::first_ready(
+            pidfd_revents.contains(PollFlags::IN),
+            listener_revents.contains(PollFlags::IN),
+        ) {
+            Some(shared::Ready::Exit) => return WatchEvent::Died,
+            Some(shared::Ready::Source) => return WatchEvent::Connection,
+            None => {}
+        }
+    }
+}
+
+/// macOS: the crate's own [`crate::wait::backend::arm_proc_exit`] kqueue, with an `EVFILT_READ`
+/// watch on the listener added to the SAME kqueue (via the crate's own
+/// [`crate::wait::backend::add_with_receipt`]).
+#[cfg(target_os = "macos")]
+fn watch_macos(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+
+    let Some(kq) = crate::wait::backend::arm_proc_exit(target).expect("arm a kqueue exit-watch for the target") else {
+        return WatchEvent::Died;
+    };
+    let listener_change = KEvent::new(
+        listener.as_raw_fd() as usize,
+        EventFilter::EVFILT_READ,
+        EvFlags::EV_ADD | EvFlags::EV_RECEIPT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    let listener_errno =
+        crate::wait::backend::add_with_receipt(&kq, listener_change).expect("kevent(EV_ADD) to arm the listener watch");
+    assert_eq!(
+        listener_errno, 0,
+        "kevent(EV_ADD) for EVFILT_READ on the control listener reported errno {listener_errno}"
+    );
+
+    let placeholder = KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0);
+    let mut events = [placeholder; 2];
+    loop {
+        // Retries the wait on `EINTR` (see `kevent_eintr`).
+        let n = match kq.kevent(&[], &mut events, None) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => {
+                kevent_eintr::count_retry();
+                continue;
+            }
+            Err(e) => panic!("kevent while waiting for a control connection: {e}"),
+        };
+        for ev in &events[..n] {
+            debug_assert!(
+                !ev.flags().contains(EvFlags::EV_ERROR),
+                "an armed kevent reported EV_ERROR: {ev:?}"
+            );
+        }
+        let exited = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_PROC));
+        let connection = events[..n].iter().any(|ev| ev.filter() == Ok(EventFilter::EVFILT_READ));
+        match shared::first_ready(exited, connection) {
+            Some(shared::Ready::Exit) => return WatchEvent::Died,
+            Some(shared::Ready::Source) => return WatchEvent::Connection,
+            None => {}
+        }
+    }
+}
+
+/// Windows: the crate's own identity-verified [`crate::wait::backend::open_verified`] process
+/// handle and the listener's `FD_ACCEPT` event (via `WSAEventSelect`) in one explicit
+/// `WaitForMultipleObjects`.
+#[cfg(windows)]
+fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::ProcessId) -> WatchEvent {
+    use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
+
+    use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+    use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
+    use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+
+    let Some(process) = crate::wait::backend::open_verified(target).expect("open a handle to watch the target") else {
+        return WatchEvent::Died;
+    };
+    // SAFETY: `open_verified` returns a handle the caller owns; this wraps it so it is closed.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0 as _) };
+    let accept_event =
+        crate::wait::backend::new_cancel_event().expect("create an event for the listener's accept-readiness watch");
+    let sock = SOCKET(listener.as_raw_socket() as usize);
+    let wsa_event = WSAEVENT(accept_event.as_raw_handle() as _);
+    // SAFETY: `sock` is the listener's own live socket; `wsa_event` wraps `accept_event`, a live,
+    // owned event handle for the call's duration.
+    let rc = unsafe { WSAEventSelect(sock, Some(wsa_event), FD_ACCEPT as i32) };
+    assert_eq!(
+        rc,
+        0,
+        "WSAEventSelect(FD_ACCEPT) on the control listener: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // The process is listed first: the lowest signalled index wins, so an exit beats a connection.
+    let handles = [HANDLE(process.as_raw_handle()), HANDLE(accept_event.as_raw_handle())];
+    // SAFETY: both handles are live and owned for the call's duration.
+    let woken = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+    let wait_error = std::io::Error::last_os_error();
+
+    // Cancel the association, then restore blocking mode explicitly: cancelling alone does not
+    // reliably leave the socket blocking.
+    // SAFETY: `sock` is still the listener's own live socket.
+    let cancel_rc = unsafe { WSAEventSelect(sock, None, 0) };
+    assert_eq!(
+        cancel_rc,
+        0,
+        "WSAEventSelect(0) to cancel the accept-readiness association: {}",
+        std::io::Error::last_os_error()
+    );
+    listener
+        .set_nonblocking(false)
+        .expect("restore the control listener to blocking mode");
+
+    assert_ne!(
+        woken, WAIT_FAILED,
+        "WaitForMultipleObjects while waiting for a control connection: {wait_error}"
+    );
+    let exited = woken == WAIT_OBJECT_0;
+    let connection = woken.0 == WAIT_OBJECT_0.0 + 1;
+    assert!(
+        exited || connection,
+        "WaitForMultipleObjects returned {woken:?} for two handles"
+    );
+    match shared::first_ready(exited, connection) {
+        Some(shared::Ready::Exit) => WatchEvent::Died,
+        _ => WatchEvent::Connection,
+    }
+}
 
 /// Runs the libtest fixture at fully-qualified path `fixture` (e.g.
 /// `"resolve::resolve_tests::fixture_foo"`) in a FRESH re-exec of this test binary whose OS-level
@@ -899,11 +1229,110 @@ fn fixture_registers_then_blocks() {
     };
     use std::io::{Read, Write};
 
-    let mut sock = std::net::TcpStream::connect(addr.to_str().expect("utf8 addr")).expect("connect rendezvous socket");
+    let mut sock = ack::connect_control(addr.to_str().expect("utf8 addr")).expect("connect rendezvous socket");
     sock.write_all(b"R").expect("write registration tag");
     sock.flush().expect("flush registration tag");
     let mut sink = [0u8; 1];
     _ = sock.read(&mut sink);
+}
+
+/// The fully-qualified libtest path of [`fixture_connects_and_exits`].
+const FIXTURE_CONNECTS_AND_EXITS_TEST: &str = "test_child::fixture_connects_and_exits";
+
+/// The env var carrying the `127.0.0.1:<port>` address [`fixture_connects_and_exits`] tags.
+const FIXTURE_CONNECTS_AND_EXITS_ADDR_ENV: &str = "COSCA_FIXTURE_CONNECTS_AND_EXITS_ADDR";
+
+/// A child that connects, tags, and exits 0 immediately, with no blocking read. Whether it waits
+/// for the accept ack after connecting is up to its environment ([`ack::ACK_ENV`]).
+#[test]
+fn fixture_connects_and_exits() {
+    let Some(addr) = std::env::var_os(FIXTURE_CONNECTS_AND_EXITS_ADDR_ENV) else {
+        return; // picked up by an ordinary suite run — deliberately inert
+    };
+    use std::io::Write;
+
+    let mut sock = ack::connect_control(addr.to_str().expect("utf8 addr")).expect("connect rendezvous socket");
+    sock.write_all(b"R").expect("write registration tag");
+    sock.flush().expect("flush registration tag");
+}
+
+/// Spawns [`fixture_connects_and_exits`], with the ack handshake when `acked`. Returns the child
+/// and the target identity to watch.
+fn spawn_connects_and_exits(
+    listener: &std::net::TcpListener,
+    acked: bool,
+) -> (std::process::Child, crate::identity::ProcessId) {
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args(["--test-threads=1", "--exact", FIXTURE_CONNECTS_AND_EXITS_TEST])
+        .env(FIXTURE_CONNECTS_AND_EXITS_ADDR_ENV, &addr)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if acked {
+        cmd.env(ack::ACK_ENV, "1");
+    }
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the connects-and-exits fixture");
+    let target = crate::Process::from_pid(child.id())
+        .found()
+        .expect("resolve the freshly spawned fixture's pid")
+        .id();
+    (child, target)
+}
+
+/// Waits for the zombie edge WITHOUT reaping, so the pid keeps naming the target.
+#[cfg(unix)]
+fn wait_unreaped(pid: u32) {
+    loop {
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `si` is a valid out-param; `pid` is our own unreaped child.
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut si, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 {
+            return;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::EINTR), "waitid: {e}");
+    }
+}
+
+/// A fixture that connects and exits without waiting for the ack (not opted in) is dead whether
+/// or not its connection reached the accept queue: the exit alone decides. The target has exited,
+/// unreaped, before `accept_or_die` starts.
+#[test]
+fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
+    let (mut child, target) = spawn_connects_and_exits(&listener, false);
+    #[cfg(unix)]
+    wait_unreaped(child.id());
+    #[cfg(windows)]
+    child.wait().expect("wait for the fixture to exit");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_or_die(&listener, target)));
+    let payload = result.expect_err("accept_or_die must panic for an exited target");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("string panic payload");
+    assert_eq!(
+        message,
+        format!("the control target (pid {}) died before it connected", target.pid())
+    );
+    child.wait().expect("reap the fixture");
+}
+
+/// The ack protects an opted-in fixture that connects, tags and exits at once: it cannot exit
+/// before `accept_or_die` accepted and acked, so the connection is always returned.
+#[test]
+fn death_watch_accept_or_die_returns_the_connection_of_an_acked_target_that_exits_at_once() {
+    use std::io::Read;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
+    let (mut child, target) = spawn_connects_and_exits(&listener, true);
+    let mut sock = accept_or_die(&listener, target);
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).expect("read the fixture's tag");
+    assert_eq!(&tag, b"R");
+    child.wait().expect("reap the fixture");
 }
 
 /// Exit code of the `tool` in [`cwd_and_path_tools`]'s first directory.

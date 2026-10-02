@@ -24,6 +24,12 @@ pub mod seccomp;
 mod accept;
 pub use accept::*;
 
+#[cfg(target_os = "macos")]
+pub mod kevent_eintr;
+
+#[cfg(windows)]
+pub mod windows_env;
+
 mod locked;
 pub use locked::*;
 
@@ -421,6 +427,14 @@ pub fn spawn_tree(mode: &str, contain: bool) -> (cosca::Child, Vec<TcpStream>) {
             grand_sock.expect("grandchild G connected"),
         ],
     )
+}
+
+/// Binds the listener a `spawn-grandchild*` root reports its grandchild's pid to, and returns it
+/// with the address to pass as [`GC_PID_ADDR_ENV`]. See `report.rs`.
+pub fn bind_report() -> (TcpListener, String) {
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind the grandchild pid report listener");
+    let addr = report.local_addr().unwrap().to_string();
+    (report, addr)
 }
 
 /// Spawn the `spawn-grandchild` helper tree.
