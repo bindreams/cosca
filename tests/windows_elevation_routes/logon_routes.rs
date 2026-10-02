@@ -26,8 +26,10 @@ use crate::windows_probe::mark_test_passed;
 /// Also measures, in the same call, the two capabilities `ShellExecuteEx` cannot offer: an
 /// explicit environment block, and `STARTF_USESTDHANDLES` redirection of the child's stdout.
 #[test]
-#[ignore = "creates a local user account; opt in with --ignored on a throwaway host"]
 fn does_create_process_with_logon_elevate() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     require_gate(
         "COSCA_PROBE_ALLOW_ACCOUNTS",
         "creates and deletes a local administrator account",

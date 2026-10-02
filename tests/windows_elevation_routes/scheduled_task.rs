@@ -16,8 +16,10 @@ use crate::windows_probe::mark_test_passed;
 /// waiting on the Task Scheduler service with no handle to wait on, and the registration answer is
 /// the one that decides the route.
 #[test]
-#[ignore = "registers and deletes a scheduled task; opt in with --ignored on a throwaway host"]
 fn can_this_caller_register_a_runlevel_highest_task() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     require_gate("COSCA_PROBE_ALLOW_STATE", "registers and deletes a scheduled task");
     let etype_str = open_own_token(TOKEN_QUERY)
         .and_then(|t| token_elevation_type(t.0))

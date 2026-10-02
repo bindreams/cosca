@@ -43,20 +43,22 @@ use crate::windows_probe::mark_test_passed;
 /// set, and is read independently of the branch below: whether this process runs the whole chain is
 /// decided by `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone, but whether it is actually nested
 /// inside a `contain()`-created job is a different question that condition cannot answer on its
-/// own — a human running `COSCA_PROBE_REPORT_TO=... cargo test measure_this_token -- --ignored`
+/// own — a human running `COSCA_PROBE_REPORT_TO=... cargo test measure_this_token`
 /// directly at the top level satisfies that same condition without ever being contained. Only
 /// `logon_one_account` and `unelevated_caller_view` actually wrap their child in `contain` (before
 /// ever resuming it, `CREATE_SUSPENDED`) before it can reach here, so only they set this marker;
 /// deriving `ancestor_contained` from anything else would mislabel a manual, uncontained run as
 /// contained.
 ///
-/// A direct, unspawned `--ignored` run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
+/// A direct, unspawned run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
 /// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
 /// token, nothing more.
 #[test]
-#[ignore = "platform probe; opt in with --ignored"]
 fn measure_this_token() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let mut out = String::new();
     // `ShellExecuteEx` cannot carry an environment at all, so whether an explicitly built block
     // survives a token-based spawn is one of the capabilities being measured. The canary is only
@@ -76,7 +78,7 @@ fn measure_this_token() {
         measure(&mut out, ancestor_contained);
     } else {
         // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
-        // recurse into more spawn attempts of its own), or a direct, unspawned `--ignored` run
+        // recurse into more spawn attempts of its own), or a direct, unspawned run
         // with nothing to answer through — both get the same minimal, own-purpose report.
         let _ = writeln!(out, "=== token report (pid {}) ===", std::process::id());
         match open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE) {
@@ -86,7 +88,7 @@ fn measure_this_token() {
             }
         }
         if report_to.is_none() {
-            // A direct, unspawned `--ignored` run: nothing else asserts this report says
+            // A direct, unspawned run: nothing else asserts this report says
             // anything, so assert it here — a printed report that never actually describes a
             // token is not a measurement.
             assert!(
@@ -103,7 +105,7 @@ fn measure_this_token() {
         std::fs::write(&dest, &out)
             .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
     } else {
-        // A direct, unspawned `--ignored` run: nothing else marks this one passed.
+        // A direct, unspawned run: nothing else marks this one passed.
         mark_test_passed("COSCA_PROBE_MARKERS");
     }
 }
@@ -119,8 +121,10 @@ fn measure_this_token() {
 ///
 /// Read-only: `PROCESS_QUERY_LIMITED_INFORMATION` plus `TOKEN_QUERY`, nothing else.
 #[test]
-#[ignore = "platform probe; opt in with --ignored and COSCA_PROBE_INSPECT_PID=<pid>"]
 fn measure_another_process_token() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
     // on trust from the caller — see the image-identity check below for why that distinction
     // matters.
@@ -237,8 +241,10 @@ fn measure_another_process_token() {
 /// a machine with `EnableLUA=0` there is no filtering to observe and every result below would be
 /// a misleading "elevation just works".
 #[test]
-#[ignore = "platform probe; opt in with --ignored"]
 fn measure_uac_policy() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
     let mut any = false;
     for name in [
@@ -279,8 +285,10 @@ fn measure_uac_policy() {
 /// that can actually answer the question — but only when its own report confirms
 /// `TokenIsElevated=false`; see that function's doc for when it cannot.
 #[test]
-#[ignore = "platform probe; opt in with --ignored"]
 fn linked_token_chain_here() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let mut out = String::new();
     // This test runs at the top level, uncontained — nothing above it in this process's own
     // ancestry ever called `contain`. `ancestor_contained=false`: see `measure`'s and
@@ -318,8 +326,10 @@ fn linked_token_chain_here() {
 /// is synthesised by disabling the Administrators SID and stamping the medium integrity label,
 /// which is close but NOT identical, and the report says which was used.
 #[test]
-#[ignore = "platform probe; opt in with --ignored"]
 fn unelevated_caller_view() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let own = open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)
         .expect("the probe needs its own token to derive a medium one");
 
@@ -599,8 +609,10 @@ fn synthesise_medium_token(own: &Token) -> Token {
 /// reading of ITS docs twice, so this claim is measured rather than trusted. It is the whole
 /// reason a `CreateProcess*` route would be an improvement.
 #[test]
-#[ignore = "plants a batch file next to the target; opt in with --ignored"]
 fn does_createprocessw_lpapplicationname_apply_pathext() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let marker = dir.path().join("bat-marker.txt");
     std::fs::write(
@@ -677,8 +689,10 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
 /// Administrators, and which return the full one? `LogonUser` is where UAC token filtering is
 /// applied, so this is where the chain either starts or dies.
 #[test]
-#[ignore = "creates a local user account; opt in with --ignored on a throwaway host"]
 fn which_logon_types_return_a_filtered_token() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     require_gate("COSCA_PROBE_ALLOW_ACCOUNTS", "creates and deletes local user accounts");
     let mut measured_admin = false;
     let mut measured_std = false;

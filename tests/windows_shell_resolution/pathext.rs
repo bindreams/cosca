@@ -20,8 +20,10 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// `tool`. The "an absolute `lpFile` is taken verbatim" fact this crate relies on was measured on
 /// an existing `.exe`, which cannot distinguish the two behaviours.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, marker) = probe_dir("pathext");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
@@ -78,8 +80,10 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
 /// run, the probe harness itself is broken — the shell is not launching anything in this
 /// environment — and the negative result above would be meaningless.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn control_an_absolute_batch_path_does_launch() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, marker) = probe_dir("control");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
@@ -125,8 +129,10 @@ fn control_an_absolute_batch_path_does_launch() {
 /// `does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile` below for the same
 /// question measured under production's own `SEE_MASK_CLASSNAME`/`lpClass = "exefile"`.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, marker) = probe_dir("lpdir");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
@@ -193,8 +199,10 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
 /// measures rather than something to assume — see each `Waited` arm below for how the conclusion is
 /// scoped to whichever file actually self-reports having run.
 #[test]
-#[ignore = "executes a batch file; opt in with --ignored, on a throwaway runner only"]
 fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile() {
+    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
+        return;
+    }
     let (dir, bat_marker) = probe_dir("lpdir-exefile-bat");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &bat_marker);

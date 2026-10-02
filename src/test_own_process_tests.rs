@@ -228,19 +228,13 @@ fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
         &[],
         &["--exact", TEST],
         &["--exact", TEST, "--test-threads=1"],
-        &["--exact", TEST, "--test-threads=4", "--include-ignored", "--nocapture"],
-        &["--exact", TEST, "--test-threads=1", "--include-ignored"],
+        &["--exact", TEST, "--test-threads=4", "--nocapture"],
+        &["--exact", TEST, "--test-threads=1", "--include-ignored", "--nocapture"],
         &["--exact", TEST, "--test-threads=1", "--nocapture", "--include-ignored"],
-        &["--exact", TEST, "--test-threads=1", "--include-ignored", "other"],
-        &[TEST, "--exact", "--test-threads=1", "--include-ignored", "--nocapture"],
-        &[
-            "--exact",
-            "m::other",
-            "--test-threads=1",
-            "--include-ignored",
-            "--nocapture",
-        ],
-        &["--test-threads=1", "--include-ignored", "--exact", TEST, "--nocapture"],
+        &["--exact", TEST, "--test-threads=1", "--nocapture", "other"],
+        &[TEST, "--exact", "--test-threads=1", "--nocapture"],
+        &["--exact", "m::other", "--test-threads=1", "--nocapture"],
+        &["--test-threads=1", "--exact", TEST, "--nocapture"],
     ];
     for argv in shared {
         assert_eq!(
@@ -338,13 +332,6 @@ fn a_completion_dropped_while_panicking_reports_nothing() {
     })
     .expect_err("the closure panics");
     assert_eq!(drained(read), b"");
-}
-
-// Pins the flag until #234 removes the last `#[ignore]`; a behavioural test would need an
-// `#[ignore]`d fixture, which the project forbids.
-#[test]
-fn the_child_runs_ignored_tests_too() {
-    assert!(child_args("m::t").contains(&"--include-ignored"));
 }
 
 // A re-executed child that is not accepted panics instead of re-executing =====

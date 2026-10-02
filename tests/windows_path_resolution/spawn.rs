@@ -33,8 +33,10 @@ use windows::Win32::System::Threading::{
 /// with the planted copy, so a spawn that ran any other file fails. Its `module=` line, the name
 /// the loader recorded, is printed only.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     canary("Windows and Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
@@ -210,8 +212,10 @@ pub(crate) fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
 /// the process is terminated before its first instruction runs. So `cmd.exe`, when std picks it,
 /// never runs.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     canary("Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().to_str().expect("temp path is not UTF-8").to_string();

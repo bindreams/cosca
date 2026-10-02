@@ -331,9 +331,10 @@ impl Eq for EnvKeyIgnoreCase {}
 /// caller happens to have set — including any secrets a CI runner exports — into a child running
 /// as, or purporting to measure, someone else. Only what a freshly logged-on account needs to run
 /// anything at all (`SystemRoot`, `PATH`, `TEMP`/`TMP`, `COMSPEC`, `PATHEXT`), plus any
-/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus whatever the
-/// caller passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that `COSCA_PROBE_*` pass-
-/// through: it names a directory this process's OWN account can write to, and a child spawned
+/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus the
+/// `WINDOWS_EXECUTING_PROBES` gate and consent (the re-run test calls `require_group`), plus
+/// whatever the caller passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that
+/// `COSCA_PROBE_*` pass-through: it names a directory this process's OWN account can write to, and a child spawned
 /// here under a different account (the whole point of several of these routes) cannot create or
 /// overwrite files there. A child that inherited it would panic trying to mark itself passed,
 /// which corrupts the very measurement being taken — so a spawned child never sees it and never
@@ -351,12 +352,18 @@ fn env_block_from(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     extra: &[(&str, String)],
 ) -> Vec<u16> {
+    const GROUP_GATE: [&str; 2] = [
+        "COSCA_TEST_WINDOWS_EXECUTING_PROBES",
+        "COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT",
+    ];
     const ALLOWLIST: [&str; 6] = ["SYSTEMROOT", "PATH", "TEMP", "TMP", "COMSPEC", "PATHEXT"];
     let mut map: BTreeMap<EnvKeyIgnoreCase, String> = BTreeMap::new();
     for (k, v) in environment {
         let k = k.to_string_lossy().into_owned();
         let upper = k.to_ascii_uppercase();
-        if ALLOWLIST.contains(&upper.as_str()) || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
+        if ALLOWLIST.contains(&upper.as_str())
+            || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
+            || GROUP_GATE.contains(&upper.as_str())
         {
             map.insert(EnvKeyIgnoreCase::new(&k), v.to_string_lossy().into_owned());
         }
@@ -386,7 +393,7 @@ pub(crate) fn skuld_db_dir(dir: &Path) -> (&'static str, String) {
 /// recursion is structural rather than bounded by a counter.
 pub(crate) fn report_cmdline(exe: &Path) -> String {
     format!(
-        "\"{}\" token_filtering::measure_this_token --exact --ignored --nocapture --test-threads=1",
+        "\"{}\" token_filtering::measure_this_token --exact --nocapture --test-threads=1",
         exe.display()
     )
 }

@@ -35,6 +35,9 @@ on:
       - "tests/windows_path_resolution/**"
       - "tests/windows_shell_execute.rs"
       - "tests/common/windows_probe.rs"
+      # The probes' group gate, and the shared module every probe binary reaches it through.
+      - "tests/common/test_enablement.rs"
+      - "tests/common/mod.rs"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
@@ -85,6 +88,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # The probe groups (principle 9) are off unless a step below opts in; each runner is the sandbox
+  # that consent requires.
+  COSCA_TEST_WINDOWS_PATH_CANARY: "0"
+  COSCA_TEST_WINDOWS_ELEVATING_PROBES: "0"
+  COSCA_TEST_WINDOWS_EXECUTING_PROBES: "0"
   # `.config/nextest.toml`, ci.yaml and the devvm provision scripts carry the same nextest
   # version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.146"
@@ -123,9 +131,11 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+          COSCA_TEST_WINDOWS_PATH_CANARY: "1"
+          COSCA_TEST_WINDOWS_PATH_CANARY_CONSENT: "1"
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --run-ignored only --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --no-capture)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -146,9 +156,11 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+          COSCA_TEST_WINDOWS_ELEVATING_PROBES: "1"
+          COSCA_TEST_WINDOWS_ELEVATING_PROBES_CONSENT: "1"
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --run-ignored only --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --no-capture)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -198,6 +210,9 @@ jobs:
           - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      COSCA_TEST_WINDOWS_EXECUTING_PROBES: "1"
+      COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -237,7 +252,7 @@ jobs:
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --run-ignored only --no-capture --no-tests=warn -E 'not test(does_a_trailing_dot_still_open_the_extensionless_file) and not test(does_pathext_outrank_an_existing_extensionless_file) and not test(does_an_existing_extensionless_file_ever_launch_directly)')
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --no-capture --no-tests=warn -E 'not test(does_a_trailing_dot_still_open_the_extensionless_file) and not test(does_pathext_outrank_an_existing_extensionless_file) and not test(does_an_existing_extensionless_file_ever_launch_directly)')
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -272,7 +287,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after trailing-dot probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -296,7 +311,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after pathext-precedence probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -320,7 +335,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --run-ignored only --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
       - name: OpenWith.exe after existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
         continue-on-error: true

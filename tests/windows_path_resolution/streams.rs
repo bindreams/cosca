@@ -12,8 +12,10 @@ use crate::winapi::full_path_name;
 /// unchanged. String-level only: no stream is created or opened, so which file the file system
 /// would open for them is not measured here.
 #[test]
-#[ignore = "platform canary: needs a Windows runner"]
 fn a_stream_suffix_stays_in_the_final_component() {
+    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
+        return;
+    }
     canary("Windows", |facts, failures| {
         let mut rows = literal_rows(&[
             (r"C:\dir\x.bat:s", r"C:\dir\x.bat:s", "kept as given"),

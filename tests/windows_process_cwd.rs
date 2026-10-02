@@ -81,10 +81,13 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 /// other falls back to the drive's root, and `GetFullPathNameW` then rewrites `=X:` to it.
 ///
 /// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
-/// session, so this runs only where CI opts in, with an exact filter (`.github/workflows/ci.yaml`).
+/// session, so it is the `WINDOWS_DRIVE_MAP` group, which CI turns on in one step of its own
+/// (`.github/workflows/ci.yaml`).
 #[test]
-#[ignore = "system-affecting: maps a drive letter; runs on CI only"]
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
+    if !crate::common::require_group("WINDOWS_DRIVE_MAP") {
+        return;
+    }
     let report = probe("drive-dir", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
     let mut expected = vec!["cwd_set=ok".to_owned()];

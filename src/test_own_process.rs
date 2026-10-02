@@ -12,7 +12,7 @@
 //! # The gate
 //!
 //! The parent re-executes the test binary as
-//! `<exe> --exact <test> --test-threads=1 --include-ignored --nocapture` with
+//! `<exe> --exact <test> --test-threads=1 --nocapture` with
 //! `COSCA_TEST_OWN_PROCESS=<parent pid>:<token fd>:<test>`. A process takes the child role only if
 //! all of these hold at once: the value's pid is its real parent's, its test is the one being
 //! gated, and its argv is exactly the shape above. An environment variable alone is forgeable
@@ -88,16 +88,10 @@ pub(crate) enum Role {
 
 /// The argv (after the program name) of a re-executed test.
 ///
-/// `--include-ignored` lets the child run an `#[ignore]`d gated test. `--nocapture` keeps skuld's
-/// fd-level capture from swallowing the child's stdout and stderr, which the parent reports.
-pub(crate) fn child_args(test: &str) -> [&str; 5] {
-    [
-        "--exact",
-        test,
-        "--test-threads=1",
-        "--include-ignored",
-        super::test_reexec::NOCAPTURE,
-    ]
+/// `--nocapture` keeps skuld's fd-level capture from swallowing the child's stdout and stderr,
+/// which the parent reports.
+pub(crate) fn child_args(test: &str) -> [&str; 4] {
+    ["--exact", test, "--test-threads=1", super::test_reexec::NOCAPTURE]
 }
 
 /// Classifies a process from its inherited [`ENV`] value, its real parent's pid and its argv; see

@@ -36,12 +36,13 @@
 //!   an unelevated one. The probe prints and labels which case it measured; read its output before
 //!   trusting its report as the unelevated answer.
 //!
-//! # Why they are `#[ignore]`d, and the two safety gates
+//! # Why they are gated, and the two safety gates
 //!
-//! They create processes with derived tokens, and two of them change machine state. Opt in:
+//! They create processes with derived tokens, and two of them change machine state. They are the
+//! `WINDOWS_EXECUTING_PROBES` group (principle 9). Opt in:
 //!
 //! ```text
-//! cargo nextest run --test windows_elevation_routes --run-ignored only --no-capture
+//! COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT=1 cargo nextest run --test windows_elevation_routes --no-capture
 //! ```
 //!
 //! Three probes additionally refuse to run — loudly, by panicking, never by skipping — unless an
