@@ -395,10 +395,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // tree-walk root with no fd marker), so the child cannot be shown to be ours and nothing is
         // signalled or waited on by pid.
         Err(e) => {
-            #[cfg(target_os = "macos")]
-            leave_unverified_child(child, None);
-            #[cfg(not(target_os = "macos"))]
-            teardown_unadopted(child);
+            teardown_unadopted(child); // MUTANT: the old by-pid teardown on the attach arm
             return Err(e);
         }
     };
