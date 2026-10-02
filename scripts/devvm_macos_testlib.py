@@ -66,6 +66,7 @@ class FakeTart:
         self.procs: dict[str, FakeProc] = {}
         self.guest_home: Path | None = None
         self.clone_raises = False
+        self.stop_error: Exception | None = None
         self.vms_error: Exception | None = None
 
     def cap_lock_held(self) -> bool:
@@ -82,7 +83,7 @@ class FakeTart:
         if hook:
             hook()
 
-    def vms(self):
+    def vms(self, gate=None):
         self.event("vms")
         if self.vms_error is not None:
             raise self.vms_error
@@ -96,7 +97,7 @@ class FakeTart:
     def add_running(self, name):
         self.vm_list.append(_vm(name, "running"))
 
-    def clone(self, src, name):
+    def clone(self, src, name, gate=None):
         self.calls.append("clone")
         self.event("clone")
         if "clone" in self.fail:
@@ -123,6 +124,8 @@ class FakeTart:
     def stop(self, name):
         self.calls.append("stop")
         self.event("stop")
+        if self.stop_error is not None:
+            raise self.stop_error
         if "stop" in self.fail:
             return self.fail["stop"]
         if not self.stop_keeps_running:
@@ -140,7 +143,7 @@ class FakeTart:
     def _local_env(self):
         return {"HOME": str(self.guest_home), "PATH": "/usr/bin:/bin"}
 
-    def exec(self, name, args, *, stdin=None, capture_output=False):
+    def exec(self, name, args, *, stdin=None, capture_output=False, gate=None):
         self.calls.append("exec:" + " ".join(args)[:40])
         self.event("exec:true" if args == ["true"] else "exec:stage")
         if self.guest_home is not None and args != ["true"] and args[0] == "sh":
@@ -166,7 +169,7 @@ class Env:
     """A temp repo, state dir and fake tart wired into a MacosBackend."""
 
     def __init__(self, test: unittest.TestCase):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = self._tmp = tempfile.TemporaryDirectory()  # kept alive: its finalizer deletes the directory
         test.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         self.repo = root / "repo"

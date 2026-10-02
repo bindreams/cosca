@@ -204,6 +204,25 @@ class UpTests(unittest.TestCase):
             self.env.up()
         self.env.assert_nothing_leaked(self)
 
+    def test_a_teardown_step_that_raises_is_contained_and_reported(self) -> None:
+        self.env.tart.exec_rc = lambda args: 1
+        self.env.tart.stop_error = RuntimeError("stop blew up")
+        with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
+            err = exits_with(self, self.env.up)
+        self.assertIn("could not remove", err)
+        self.assertIn("stop blew up", err)
+        self.assertIn("did not answer", err, "the original error was lost")
+        self.assertIsNotNone(self.env.claim())
+
+    def test_a_cleanup_that_itself_fails_does_not_mask_the_original_error(self) -> None:
+        self.env.tart.add_running("other-1")
+        self.env.tart.add_running("other-2")
+        with mock.patch.object(self.env.backend, "_clear_state", side_effect=OSError("disk gone")):
+            err = exits_with(self, self.env.up)
+        self.assertIn("licen", err)
+        self.assertIn("cleanup of", err)
+        self.assertIn("disk gone", err)
+
     def test_cap_refusal_leaves_nothing_and_never_clones(self) -> None:
         self.env.tart.add_running("other-1")
         self.env.tart.add_running("other-2")

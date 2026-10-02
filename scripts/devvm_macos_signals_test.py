@@ -1,18 +1,15 @@
-"""Signal handling of `up` and `destroy`: a signal at any step, in any blocking wait, once or twice,
-ends with no VM, no `tart run` child, no claim and a message.
+"""Signal handling of `up` and `destroy` against the fake tart: a signal at any step, in any wait, once or
+twice, ends with no VM, no `tart run` child, no claim and a message.
 
-Real signals are delivered with os.kill to this process.
+Real signals are delivered with os.kill to this process. Nothing here waits on a timer: signals are sent
+from inside the code under test, at a named step or just before a wait blocks (SignalGate.on_blocked).
 """
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import os
 import signal
-import subprocess
-import sys
-import threading
 import unittest
 from unittest import mock
 
@@ -20,7 +17,6 @@ from scripts import devvm_macos as m
 from scripts.devvm_macos_testlib import Env, captured
 
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-OUR_SIGNALS = tuple(SIGNALS)
 
 
 def kill_self(*sigs: int) -> None:
@@ -30,10 +26,7 @@ def kill_self(*sigs: int) -> None:
 
 class SignalCase(unittest.TestCase):
     def setUp(self) -> None:
-        sleeper = mock.patch.object(m.time, "sleep", lambda _s: None)
-        sleeper.start()
-        self.addCleanup(sleeper.stop)
-        for sig in OUR_SIGNALS:
+        for sig in SIGNALS:
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
 
     def fire_at_checkpoint(self, env: Env, label: str, *sigs: int) -> None:
@@ -56,6 +49,17 @@ class SignalCase(unittest.TestCase):
 
         env.tart.hooks[event] = hook
 
+    def fire_when_blocking(self, *sigs: int, nth: int = 1):
+        """Patch SignalGate so the nth blocking wait sends `sigs` just before it blocks."""
+        seen = []
+
+        def on_blocked() -> None:
+            seen.append(True)
+            if len(seen) == nth:
+                kill_self(*sigs)
+
+        return mock.patch.object(m.SignalGate, "on_blocked", staticmethod(on_blocked))
+
     def up_exit(self, env: Env, **kw):
         """Run `up`; return (exit code or None, stderr)."""
         with captured() as err:
@@ -69,34 +73,6 @@ class SignalCase(unittest.TestCase):
         self.assertEqual(code, 128 + sig, err)
         self.assertIn("interrupted by", err)
         env.assert_nothing_leaked(self)
-
-
-def blocking_until_signalled(sig: int):
-    """A hook that blocks like a long `tart exec` would, while a signal is sent from another thread.
-
-    Returns (hook, state); state["woken_by_bound"] is True if the wait ended only because of the
-    harness's own failure bound, i.e. the signal did not interrupt it.
-    """
-    state = {"woken_by_bound": False}
-
-    def hook() -> None:
-        r, w = os.pipe()
-
-        def bound() -> None:
-            state["woken_by_bound"] = True
-            os.write(w, b"x")
-
-        timer = threading.Timer(5, bound)
-        timer.start()
-        threading.Thread(target=lambda: os.kill(os.getpid(), sig)).start()
-        try:
-            os.read(r, 1)
-        finally:
-            timer.cancel()
-            os.close(r)
-            os.close(w)
-
-    return hook, state
 
 
 class CheckpointTests(SignalCase):
@@ -127,83 +103,93 @@ class CheckpointTests(SignalCase):
                     self.assert_cancelled_clean(env, code, err, pair[0])
 
 
-class BlockingWaitTests(SignalCase):
+class TartCallTests(SignalCase):
     def test_a_signal_during_each_tart_call_of_a_normal_up_cancels_cleanly(self) -> None:
-        for event, nth in (("vms", 2), ("clone", 1), ("start", 1), ("exec:true", 1), ("exec:stage", 1)):
+        for event, nth in (("vms", 2), ("clone", 1), ("start", 1), ("exec:true", 1), ("exec:stage", 1), ("exec:stage", 2)):
             for sig in SIGNALS:
-                with self.subTest(at=event, sig=signal.Signals(sig).name):
+                with self.subTest(at=event, nth=nth, sig=signal.Signals(sig).name):
                     env = Env(self)
                     self.fire_at_event(env, event, sig, nth=nth)
                     code, err = self.up_exit(env)
                     self.assert_cancelled_clean(env, code, err, sig)
 
-    def test_a_signal_interrupts_a_long_blocking_exec_instead_of_waiting_for_it(self) -> None:
-        for event, nth in (("exec:true", 1), ("exec:stage", 1), ("exec:stage", 2)):
-            with self.subTest(at=event, nth=nth):
+    def test_a_signal_while_the_guest_is_still_booting_ends_the_pause_between_tries(self) -> None:
+        for sig in SIGNALS:
+            with self.subTest(sig=signal.Signals(sig).name):
                 env = Env(self)
-                hook, state = blocking_until_signalled(signal.SIGTERM)
-                seen = []
-
-                def nth_only(hook=hook, nth=nth, seen=seen):
-                    seen.append(True)
-                    if len(seen) == nth:
-                        hook()
-
-                env.tart.hooks[event] = nth_only
+                env.tart.exec_rc = lambda args: 1 if args == ["true"] else 0  # the agent is not up yet
+                self.fire_at_event(env, "exec:true", sig)
                 code, err = self.up_exit(env)
-                self.assertFalse(state["woken_by_bound"], "the wait was not interrupted by the signal")
-                self.assert_cancelled_clean(env, code, err, signal.SIGTERM)
+                self.assert_cancelled_clean(env, code, err, sig)
 
-    def test_a_cancelled_staging_leaves_no_git_archive_child_behind(self) -> None:
-        env = Env(self)
-        started = []
-        real_popen = subprocess.Popen
 
-        def popen(*a, **kw):
-            p = real_popen(*a, **kw)
-            if a and a[0][:1] == ["git"]:
-                started.append(p)
-            return p
+class LockWaitTests(SignalCase):
+    """A real contended lock, held through a second file description in this process."""
 
-        hook, _state = blocking_until_signalled(signal.SIGTERM)
-        env.tart.hooks["exec:stage"] = hook
-        with mock.patch.object(m.subprocess, "Popen", popen):
-            self.up_exit(env)
-        self.assertTrue(started)
-        self.assertEqual([p.returncode is None for p in started], [False] * len(started), "git archive was not reaped")
+    def hold(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "w")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return f
 
-    def hold_lock_then_signal(self, env: Env, lock_name: str, sig: int):
-        """Make the backend's first blocking acquisition of `lock_name` wait, and deliver sig during the wait."""
-        real, state = fcntl.flock, {"nb": 0}
-
-        def flock(f, op):
-            from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
-            if from_backend and f.name.endswith(lock_name):
-                if op & fcntl.LOCK_NB and not state["nb"]:
-                    state["nb"] = 1
-                    raise BlockingIOError
-                if not op & fcntl.LOCK_NB and state["nb"] == 1:
-                    state["nb"] = 2
-                    os.kill(os.getpid(), sig)  # lands while "blocked"
-            return real(f, op)
-
-        return mock.patch.object(m.fcntl, "flock", flock)
+    def release_and_settle(self, env: Env, holder) -> None:
+        """Let the abandoned waiter acquire and drop the lock, then check nothing still holds it."""
+        holder.close()
+        for waiter in env.backend.last_gate.abandoned:
+            waiter.join()  # ends once the lock is free, which the release above made so
 
     def test_a_signal_while_waiting_for_the_cap_lock_cancels_cleanly(self) -> None:
         for sig in SIGNALS:
             with self.subTest(sig=signal.Signals(sig).name):
                 env = Env(self)
-                with self.hold_lock_then_signal(env, "devvm-cap.lock", sig):
+                holder = self.hold(env.tart.home / "devvm-cap.lock")
+                with self.fire_when_blocking(sig):
                     code, err = self.up_exit(env)
-                self.assert_cancelled_clean(env, code, err, sig)
+                self.assertIn("waiting for the host-wide", err)
+                self.assertEqual(len(env.backend.last_gate.abandoned), 1)
+                self.release_and_settle(env, holder)
+                self.assert_cancelled_clean(env, code, err, sig)  # includes: the cap lock is free
 
     def test_a_signal_while_waiting_for_the_worktree_lock_cancels_cleanly(self) -> None:
         for sig in SIGNALS:
             with self.subTest(sig=signal.Signals(sig).name):
                 env = Env(self)
-                with self.hold_lock_then_signal(env, "/lock", sig):
+                holder = self.hold(env.sdir / "lock")
+                with self.fire_when_blocking(sig):
                     code, err = self.up_exit(env)
+                self.assertIn("waiting for another devvm command", err)
+                self.release_and_settle(env, holder)
                 self.assert_cancelled_clean(env, code, err, sig)
+
+    def test_teardown_waits_for_the_cap_lock_and_is_not_cut_short_by_a_signal(self) -> None:
+        # Staging fails while another `up` holds the cap lock again. The cleanup waits for it
+        # (uninterruptibly); a signal lands during the wait; the holder then lets go.
+        for sig in SIGNALS:
+            with self.subTest(sig=signal.Signals(sig).name):
+                env = Env(self)
+                holder = []
+                env.tart.exec_rc = lambda args: 1 if args[:2] == ["sh", "-c"] else 0
+                real_exec = env.tart.exec
+
+                def exec_(name, args, holder=holder, env=env, real_exec=real_exec, **kw):
+                    if args[:2] == ["sh", "-c"]:  # staging starts: another `up` takes the cap lock
+                        holder.append(self.hold(env.tart.home / "devvm-cap.lock"))
+                    return real_exec(name, args, **kw)
+
+                env.tart.exec = exec_
+                real_say = m._say
+
+                def say(message, **kw):
+                    real_say(message, **kw)
+                    if "waiting for the host-wide" in message:  # the cleanup is now waiting
+                        kill_self(sig)
+                        holder[0].close()  # ...and the other `up` finishes
+
+                with mock.patch.object(m, "_say", say):
+                    code, err = self.up_exit(env)
+                env.assert_nothing_leaked(self)
+                self.assertEqual(code, 128 + sig, err)
+                self.assertIn("removed VM", err)
 
 
 class TeardownIsUninterruptibleTests(SignalCase):
@@ -258,27 +244,53 @@ class TeardownIsUninterruptibleTests(SignalCase):
         _code, err = self.up_failing(env)
         self.assertIn("git archive", err)
 
-    def test_teardown_waits_for_the_cap_lock_even_if_a_signal_lands_meanwhile(self) -> None:
-        for sig in SIGNALS:
-            with self.subTest(sig=signal.Signals(sig).name):
-                env = Env(self)
-                env.tart.exec_rc = lambda args: 1 if args[:2] == ["sh", "-c"] else 0
-                real, acquisitions = fcntl.flock, []
 
-                def flock(f, op, sig=sig):
-                    from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
-                    if from_backend and f.name.endswith("devvm-cap.lock"):
-                        acquisitions.append(op)
-                        if len(acquisitions) == 2 and op & fcntl.LOCK_NB:  # teardown finds it held
-                            raise BlockingIOError
-                        if len(acquisitions) == 3:  # ...and a signal lands while it waits
-                            os.kill(os.getpid(), sig)
-                    return real(f, op)
+class LateSignalTests(SignalCase):
+    """A signal recorded after the last check is never dropped: the exit code says so."""
 
-                with mock.patch.object(m.fcntl, "flock", flock):
-                    code, err = self.up_exit(env)
-                env.assert_nothing_leaked(self)
-                self.assertEqual(code, 128 + sig, err)
+    def kill_before_gate_exit(self, sig: int):
+        real_exit = m.SignalGate.__exit__
+
+        def exit_(gate, *a):
+            kill_self(sig)
+            return real_exit(gate, *a)
+
+        return mock.patch.object(m.SignalGate, "__exit__", exit_)
+
+    def test_up_that_succeeded_exits_with_the_late_signal(self) -> None:
+        env = Env(self)
+        with self.kill_before_gate_exit(signal.SIGTERM):
+            code, err = self.up_exit(env)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertEqual(len(env.tart.local_names()), 1, "the VM that was brought up stays")
+
+    def test_up_that_failed_exits_with_the_late_signal(self) -> None:
+        env = Env(self)
+        env.tart.exec_rc = lambda args: 1 if args[:2] == ["bash", "-c"] else 0
+        with self.kill_before_gate_exit(signal.SIGTERM):
+            code, err = self.up_exit(env)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertIn("provisioning failed", err)
+
+    def test_destroy_exits_with_the_late_signal(self) -> None:
+        env = Env(self)
+        with captured():
+            env.up()
+        with self.kill_before_gate_exit(signal.SIGTERM), captured():
+            with self.assertRaises(SystemExit) as ctx:
+                env.destroy()
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+        env.assert_nothing_leaked(self, procs=False)
+
+    def test_a_refused_destroy_also_exits_with_the_late_signal(self) -> None:
+        env = Env(self)
+        with captured():
+            env.up()
+        (env.sdir / "identity.json").unlink()
+        with self.kill_before_gate_exit(signal.SIGHUP), captured():
+            with self.assertRaises(SystemExit) as ctx:
+                env.destroy()
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGHUP)
 
 
 class DispositionTests(SignalCase):
@@ -293,51 +305,17 @@ class DispositionTests(SignalCase):
                 self.assertEqual(len(env.tart.local_names()), 1)
                 self.assertEqual(signal.getsignal(sig), signal.SIG_IGN)
 
-    def test_handlers_are_restored_after_success_and_after_cancellation(self) -> None:
-        before = {s: signal.getsignal(s) for s in OUR_SIGNALS}
-        env = Env(self)
-        with captured():
-            env.up()
-        self.assertEqual({s: signal.getsignal(s) for s in OUR_SIGNALS}, before)
-        env = Env(self)
-        self.fire_at_checkpoint(env, "booted", signal.SIGTERM)
-        self.up_exit(env)
-        self.assertEqual({s: signal.getsignal(s) for s in OUR_SIGNALS}, before)
-
-
-class GateTests(SignalCase):
-    def test_a_signal_outside_an_interruptible_region_is_only_recorded(self) -> None:
-        with m.SignalGate() as gate:
-            kill_self(signal.SIGTERM)
-            self.assertEqual(gate.pending, [signal.SIGTERM])
-            with self.assertRaises(m.Cancelled) as ctx:
-                gate.check()
-            self.assertEqual(ctx.exception.signo, signal.SIGTERM)
-
-    def test_a_signal_inside_an_interruptible_region_raises_once(self) -> None:
-        with m.SignalGate() as gate:
-            with self.assertRaises(m.Cancelled):
-                with gate.interruptible():
-                    kill_self(signal.SIGINT)
-                    self.fail("the region was not interrupted")
-            kill_self(signal.SIGINT)  # outside again: recorded, not raised
-            self.assertEqual(gate.pending, [signal.SIGINT, signal.SIGINT])
-
-    def test_a_second_signal_while_unwinding_the_region_is_only_recorded(self) -> None:
-        with m.SignalGate() as gate:
-            with gate.interruptible():
-                try:
-                    kill_self(signal.SIGINT)
-                except m.Cancelled:
-                    kill_self(signal.SIGTERM)  # still in the region's body: must not raise again
-            self.assertEqual(gate.pending, [signal.SIGINT, signal.SIGTERM])
-
-    def test_entering_a_region_with_a_signal_already_pending_raises_before_blocking(self) -> None:
-        with m.SignalGate() as gate:
-            kill_self(signal.SIGHUP)
-            with self.assertRaises(m.Cancelled):
-                with gate.interruptible():
-                    self.fail("blocked despite a pending signal")
+    def test_handlers_and_the_wakeup_fd_are_restored_after_success_and_after_cancellation(self) -> None:
+        before = {s: signal.getsignal(s) for s in SIGNALS}
+        wakeup = signal.set_wakeup_fd(-1)
+        signal.set_wakeup_fd(wakeup)
+        for cancel in (False, True):
+            env = Env(self)
+            if cancel:
+                self.fire_at_checkpoint(env, "booted", signal.SIGTERM)
+            self.up_exit(env)
+            self.assertEqual({s: signal.getsignal(s) for s in SIGNALS}, before)
+            self.assertEqual(signal.set_wakeup_fd(wakeup), wakeup)
 
 
 class DestroySignalTests(SignalCase):
@@ -365,23 +343,16 @@ class DestroySignalTests(SignalCase):
                 self.env.assert_nothing_leaked(self, procs=False)
 
     def test_a_signal_while_waiting_for_the_worktree_lock_cancels_without_touching_the_vm(self) -> None:
-        real, state = fcntl.flock, {"nb": 0}
-
-        def flock(f, op):
-            from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
-            if from_backend and f.name.endswith("/lock"):
-                if op & fcntl.LOCK_NB and not state["nb"]:
-                    state["nb"] = 1
-                    raise BlockingIOError
-                if not op & fcntl.LOCK_NB and state["nb"] == 1:
-                    state["nb"] = 2
-                    os.kill(os.getpid(), signal.SIGTERM)
-            return real(f, op)
-
-        with mock.patch.object(m.fcntl, "flock", flock):
+        other = open(self.env.sdir / "lock", "w")
+        self.addCleanup(other.close)
+        fcntl.flock(other, fcntl.LOCK_EX)
+        with self.fire_when_blocking(signal.SIGTERM):
             code, _err = self.destroy_exit()
         self.assertEqual(code, 128 + signal.SIGTERM)
         self.assertEqual(len(self.env.tart.local_names()), 1)
+
+    def fire_when_blocking(self, *sigs):
+        return mock.patch.object(m.SignalGate, "on_blocked", staticmethod(lambda: kill_self(*sigs)))
 
 
 if __name__ == "__main__":

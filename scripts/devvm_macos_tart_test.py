@@ -82,9 +82,10 @@ class TartWrapperTests(unittest.TestCase):
                 self.assertEqual(self.calls()[-1], [verb, "vm"])
                 self.assert_own_session()
 
-    def test_exec_without_stdin_has_no_dash_i(self) -> None:
+    def test_exec_without_stdin_has_no_dash_i_and_stays_in_our_process_group(self) -> None:
         self.tart.exec("vm", ["true"], capture_output=True)
         self.assertEqual(self.calls(), [["exec", "vm", "true"]])
+        self.assertIn(os.getpgrp(), self.pgids(), "a terminal Ctrl-C would not reach `tart exec`")
 
     def test_exec_with_stdin_passes_dash_i_and_the_data(self) -> None:
         src = self.dir / "in.txt"
