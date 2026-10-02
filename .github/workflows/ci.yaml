@@ -127,6 +127,56 @@ jobs:
         shell: bash
         run: .github/scripts/clippy.sh --feature-powerset --release
 
+  # The libtest guard runs inside clippy.sh for a lane's own architecture. This job checks the other
+  # one on Linux and Windows. It is a job of its own because on Windows the same steps pushed the
+  # test job past its bound; macOS runs them in its test lane, as macOS runners are the CI
+  # bottleneck.
+  libtest-guard:
+    name: Libtest guard (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            other: aarch64-unknown-linux-gnu
+          - os: windows
+            runner: windows-latest
+            other: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    # Measured: 743 s at most (linux, with a slow apt-get), 615 s (windows). 25 min is 2x that, a
+    # failure bound for a hang and not an expectation.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          targets: ${{ matrix.other }}
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-hack@0.6.45
+
+      - name: Install the aarch64 Linux cross compiler
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - uses: ./.github/actions/libtest-guard-other-arch
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        with:
+          target: ${{ matrix.other }}
+        # The guard and its self-test took 564 s at most (windows); 20 min is 2.1x that.
+        timeout-minutes: 20
+
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
@@ -151,6 +201,8 @@ jobs:
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
+            # The architecture the libtest guard checks besides matrix.target.
+            guard_target: x86_64-apple-darwin
           - os: darwin
             arch: amd64
             runner: macos-15
@@ -169,7 +221,9 @@ jobs:
             target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    # 30 min: darwin/amd64, the slowest lane (about 21 min, no guard), plus headroom; the guard adds
+    # about 5 min to the Windows and darwin/arm64 lanes. All lanes share this bound.
+    timeout-minutes: 30
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
     # sandbox, so every step consents. Windows has no tracer tests.
@@ -182,7 +236,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}${{ matrix.guard_target && format(',{0}', matrix.guard_target) || '' }}
           # see Clippy (feature powerset) step below for why only the
           # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
@@ -374,6 +428,14 @@ jobs:
         with:
           target: ${{ matrix.target }}
           release: "true"
+
+      # The powerset action installed cargo-hack.
+      - uses: ./.github/actions/libtest-guard-other-arch
+        if: ${{ !cancelled() && matrix.guard_target }}
+        with:
+          target: ${{ matrix.guard_target }}
+        # darwin/arm64 took 146 s for both steps; 20 min as in the libtest-guard job.
+        timeout-minutes: 20
 
       # Live cgroup v2 containment tests belong to the CGROUP group: on unless
       # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need

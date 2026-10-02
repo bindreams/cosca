@@ -1,0 +1,7 @@
+# Config for .github/scripts/libtest_guard.py only (via CLIPPY_CONF_DIR); the repo's own
+# clippy.toml is separate. Clippy resolves every spelling of the built-in `#[test]`
+# (`core::prelude::v1::test`, `std::prelude::v1::test`, ...) to the one item below.
+disallowed-macros = [
+    { path = "core::macros::builtin::test", reason = "a harness = false target never runs libtest's #[test]; use #[skuld::test]" },
+    { path = "tokio::test", reason = "a harness = false target never runs #[tokio::test]; use #[skuld::test]" },
+]

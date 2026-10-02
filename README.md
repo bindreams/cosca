@@ -87,6 +87,10 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
   processes, and this project's own rule is that system-affecting tests run in a container or VM,
   never against this machine's own services.
 
+## Linting
+
+`prek` runs `.github/scripts/clippy.sh`, which also runs the libtest guard (`.github/scripts/libtest_guard.py`), a `uv` script: install [uv](https://docs.astral.sh/uv/). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
+
 ## License
 
 <img align="right" width="150px" height="150px" src="https://www.apache.org/foundation/press/kit/img/the-apache-way-badge/ASF_Badge_apacheway-purple.png">

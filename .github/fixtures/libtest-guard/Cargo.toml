@@ -1,0 +1,60 @@
+[package]
+name = "libtest-guard-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Regression fixture for .github/scripts/libtest_guard.py: one feature per case; not part of the cosca package."
+
+[features]
+plain = []
+tokio_test = []
+prelude_path = []
+cfg_attr_test = []
+renamed = []
+macro_rules = []
+shared = []
+release_only = []
+os_linux = []
+os_macos = []
+os_windows = []
+bin_test_false = []
+ps_a = []
+ps_b = []
+crate_allow = []
+type_error = []
+arch_x86_64 = []
+arch_aarch64 = []
+# Enables nothing: a clean run that is not the empty feature combination.
+quiet = []
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+
+[lib]
+harness = false
+doctest = false
+
+# Integration target with the skuld-style harness off, carrying the same cases as the lib.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+harness = false
+
+# Default harness: the guard must refuse it unless it is listed in the unflipped file.
+[[test]]
+name = "lt"
+path = "tests/lt.rs"
+
+# A bin with the default harness, named like the libtest target above: an unflipped entry for the
+# test must not cover it.
+[[bin]]
+name = "lt"
+path = "src/main.rs"
+
+# `test = false`: cargo never runs it, so a `#[test]` here never runs either.
+[[bin]]
+name = "nt"
+path = "src/bin_nt.rs"
+test = false
