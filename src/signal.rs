@@ -1,8 +1,10 @@
 //! The signals cosca sends to a process it owns, and the one place each addressing mode's
 //! "already gone" is decided.
 
+#[cfg(unix)]
 use std::io;
 
+#[cfg(unix)]
 use crate::error::io_context;
 
 /// A signal cosca sends to an owned process.
@@ -78,6 +80,16 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     }
 }
 
+/// The adoption error for a child whose identity read was refused with `errno`: the child is not
+/// adopted, and its caller tears it down.
+#[cfg(target_os = "macos")]
+pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: format!("pid {pid}: its identity could not be read (errno {errno}); the child was not adopted"),
+        source: Some(io::Error::from_raw_os_error(errno)),
+    }
+}
+
 /// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: the
 /// child was gone when adopted, so nothing is sent). Nothing is sent to a pid that is gone or
 /// reused. A refused re-read is an error carrying the errno, so an `EPERM` stays
@@ -125,6 +137,6 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     Err(io_context("kill", e))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "signal_tests.rs"]
 mod signal_tests;
