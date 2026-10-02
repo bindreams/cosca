@@ -6,11 +6,13 @@ import fcntl
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
 from scripts import devvm_macos as m
+from scripts.devvm_macos_testlib import forbid_blocking_flock
 
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
@@ -276,6 +278,14 @@ class LockTests(GateCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = os.path.join(tmp.name, "lock")
+        forbid_blocking_flock(self)
+
+    def record(self, gate: m.SignalGate, sig: int = signal.SIGTERM) -> None:
+        """Deliver a signal and check it was recorded: the test then cancels at the first wait.
+        If recording were broken the cancelling tests below would block on a held lock, so fail here."""
+        kill_self(sig)
+        with self.assertRaises(m.Cancelled):
+            gate.check()
 
     def test_gate_flock_takes_the_lock_and_the_caller_releases_it_by_closing(self) -> None:
         with m.SignalGate() as gate:
@@ -289,23 +299,44 @@ class LockTests(GateCase):
         holder = self.open_locked(self.path)
         opened = []
         real_open = open
+        waiter_may_close = []
+
+        class Guarded:
+            """A lock file whose close() fails the test if the caller closes it while the waiter owns it."""
+
+            def __init__(self, f):
+                self._f = f
+
+            def fileno(self):
+                return self._f.fileno()
+
+            @property
+            def closed(self):
+                return self._f.closed
+
+            def close(self):
+                if threading.current_thread() is threading.main_thread() and not waiter_may_close:
+                    raise AssertionError("closed by the caller while the abandoned waiter still blocks on it")
+                self._f.close()
 
         def spy_open(path, *a, **kw):
             f = real_open(path, *a, **kw)
             if str(path) == self.path:
+                f = Guarded(f)
                 opened.append(f)
             return f
 
         from pathlib import Path
 
         with m.SignalGate() as gate, mock.patch("builtins.open", spy_open):
-            kill_self()
+            self.record(gate)
             with self.assertRaises(m.Cancelled):
                 with m._flock(Path(self.path), "the test lock", gate):
                     self.fail("the lock was not contended")
             (mine,) = opened[-1:]
-            self.assertFalse(mine.closed, "the file was closed while the abandoned waiter still blocks on it")
+            self.assertFalse(mine.closed)
             holder.close()  # let the waiter finish
+            waiter_may_close.append(True)
             gate.abandoned[0].join()
             self.assertTrue(mine.closed)
 
@@ -322,7 +353,7 @@ class LockTests(GateCase):
     def test_a_cancelled_wait_leaves_a_waiter_that_drops_the_lock_it_later_acquires(self) -> None:
         holder = self.open_locked(self.path)
         with m.SignalGate() as gate:
-            kill_self()  # recorded first: the wait is cancelled before it can block
+            self.record(gate)  # recorded first: the wait is cancelled before it can block
             f = open(self.path, "w")
             with self.assertRaises(m.Cancelled):
                 gate.flock(f)

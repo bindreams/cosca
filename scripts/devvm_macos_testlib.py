@@ -189,6 +189,23 @@ class FakeTart:
         return [v["Name"] for v in self.vm_list if v["Source"] == "local"]
 
 
+def forbid_blocking_flock(test: unittest.TestCase, allow=lambda: False) -> None:
+    """A blocking flock on the main thread is how a regression turns into a hang. In the code under test
+    it is legitimate only in cleanup's wait for the cap lock, which a test opts into with `allow`."""
+    real = fcntl.flock
+
+    def flock(f, op):
+        from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
+        blocking = not op & fcntl.LOCK_NB
+        if from_backend and blocking and not allow() and threading.current_thread() is threading.main_thread():
+            raise AssertionError("a blocking flock on the main thread: a regression would hang here")
+        return real(f, op)
+
+    patch = mock.patch.object(m.fcntl, "flock", flock)
+    patch.start()
+    test.addCleanup(patch.stop)
+
+
 class Env:
     """A temp repo, state dir and fake tart wired into a MacosBackend."""
 
@@ -211,20 +228,7 @@ class Env:
         self.sdir = self.state / m.GUEST_NAME
 
     def _guard_blocking_flock(self, test) -> None:
-        """A blocking flock on the main thread is how a regression turns into a hang. In the code under test
-        it is legitimate only in cleanup's wait for the cap lock, which a test opts into explicitly."""
-        real = fcntl.flock
-
-        def flock(f, op):
-            from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
-            blocking = not op & fcntl.LOCK_NB
-            if from_backend and blocking and not self.allow_blocking_flock and threading.current_thread() is threading.main_thread():
-                raise AssertionError("a blocking flock on the main thread: a regression would hang here")
-            return real(f, op)
-
-        patch = mock.patch.object(m.fcntl, "flock", flock)
-        patch.start()
-        test.addCleanup(patch.stop)
+        forbid_blocking_flock(test, allow=lambda: self.allow_blocking_flock)
 
     def up(self, **kw):
         kw = {"rev": None, "rosetta": False, "allow_elevation": None, "display": False, **kw}
