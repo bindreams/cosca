@@ -711,7 +711,7 @@ fn stopped_by_keys_on_p_wexit_alone() {
 #[should_panic(expected = "a zombie without P_WEXIT")]
 fn stopped_by_asserts_a_zombie_has_begun_to_exit() {
     let state = ProcState {
-        p_stat: libc::SZOMB as u32,
+        p_stat: libc::SZOMB,
         p_flag: 0,
     };
     stopped_by(&record(libc::CLD_EXITED, 0), state);

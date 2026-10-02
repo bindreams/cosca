@@ -191,6 +191,6 @@ fn threads_without_a_tsd_base_read_as_distinct_threads() {
 #[test]
 fn a_running_process_has_not_begun_to_exit() {
     let state = proc_state(std::process::id());
-    assert_eq!(state.p_stat, libc::SRUN as u32, "{state:?}");
+    assert_eq!(state.p_stat, libc::SRUN, "{state:?}");
     assert_eq!(state.p_flag & P_WEXIT, 0, "{state:?}");
 }
