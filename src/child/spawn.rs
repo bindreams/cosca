@@ -409,22 +409,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // nothing is signalled or waited on by pid. It is forgotten (`Gone`) or left running
             // and unreaped (`Unknown`), with a warning that names it. Dropping the `std` `Child`
             // closes our ends of its pipes and neither kills nor reaps it.
-            #[cfg(target_os = "macos")]
-            {
-                match other {
-                    crate::identity::Resolved::Gone => log::warn!(
-                        "child {} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid",
-                        child.id()
-                    ),
-                    _ => log::warn!(
-                        "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
-                        child.id()
-                    ),
-                }
-                drop(child);
-            }
-            #[cfg(not(target_os = "macos"))]
-            teardown_unadopted(child);
+            teardown_unadopted(child); // MUTANT: the old by-pid teardown
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure.
