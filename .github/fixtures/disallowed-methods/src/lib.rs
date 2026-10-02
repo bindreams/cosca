@@ -107,7 +107,8 @@ fn calls_libc_chdir() {
     unsafe { libc::chdir(c"/".as_ptr()) };
 }
 
-#[cfg(unix)]
+// Apple dropped `daemon` from libc 0.2.190, so its ban is checked off macOS only.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn calls_libc_daemon() {
     unsafe { libc::daemon(0, 0) };
 }

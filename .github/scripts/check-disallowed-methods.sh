@@ -51,7 +51,8 @@ linux_paths=(
     "rustix::process::fchdir"
     "rustix::fs::Dir::chdir"
 )
-# macOS: `nix::unistd::daemon` is absent there, `libc::daemon` is a different (Apple) item.
+# macOS: `nix::unistd::daemon` is absent there, and libc 0.2.190 dropped `libc::daemon` (clippy.toml
+# keeps it `allow-invalid`).
 darwin_target="aarch64-apple-darwin"
 darwin_paths=(
     "libc::pipe"
@@ -76,7 +77,6 @@ darwin_paths=(
     "std::env::set_current_dir"
     "libc::chdir"
     "libc::fchdir"
-    "libc::daemon"
     "nix::unistd::chdir"
     "nix::unistd::fchdir"
 )
@@ -129,19 +129,24 @@ checked=0
 # check_pass LABEL TARGET PATH...: lints the fixture for TARGET and requires a
 # clippy::disallowed_methods diagnostic for each PATH. clippy exits non-zero when
 # disallowed_methods fires (that's the point, under -D warnings) — the JSON diagnostics are the
-# pass/fail signal here, not its exit status. Not --locked: the fixture's Cargo.lock isn't tracked
-# (see .gitignore), so it resolves fresh every run.
+# pass/fail signal here, not its exit status. --locked: the fixture's Cargo.lock is pinned to the
+# root's versions, so a crate release cannot change the result.
 check_pass() {
     local label="$1" target="$2"
     shift 2
     CARGO_TARGET_DIR="${fixture_target}" \
         CLIPPY_CONF_DIR="${repo_root}" \
-        cargo clippy \
+        cargo clippy --locked \
         --manifest-path "${fixture_manifest}" \
         --target "${target}" \
         --message-format=json \
         -- -D warnings \
         >"${json_output}" || true
+
+    # A fixture that fails to build otherwise reports every ban as not firing.
+    jq -r 'select(.reason == "compiler-message") | .message
+        | select(.level == "error" and .code.code != "clippy::disallowed_methods")
+        | .rendered' "${json_output}" >&2
 
     local path
     for path in "$@"; do
