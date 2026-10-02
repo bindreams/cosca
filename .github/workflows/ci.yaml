@@ -41,8 +41,9 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured after the lib flipped to skuld (the guard then compiles the lib): 492 s. 20 min is 2.4x that.
-    timeout-minutes: 20
+    # Measured after the lib flipped to skuld (the guard then compiles the lib): 492 s and 714 s in two
+    # runs. 25 min is 2.1x the slower.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -157,8 +158,8 @@ jobs:
             runner: macos-latest
             other: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
-    # Measured after the lib flipped to skuld: 672 s (linux), 990 s (windows). 40 min is 2.4x the
-    # slowest, a failure bound for a hang and not an expectation.
+    # Measured after the lib flipped to skuld, at most: 672 s (linux), 1050 s (windows), 684 s (darwin).
+    # 40 min is 2.3x the slowest, a failure bound for a hang and not an expectation.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -187,8 +188,8 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         with:
           target: ${{ matrix.other }}
-        # The guard and its self-test took 936 s at most (windows) after the lib flipped; 35 min is
-        # 2.2x that.
+        # The guard and its self-test took 1002 s at most (windows) after the lib flipped; 35 min is
+        # 2.1x that.
         timeout-minutes: 35
 
   test:
@@ -235,9 +236,10 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # 30 min: darwin/amd64, the slowest lane (about 21 min, no guard), plus headroom; the guard adds
-    # about 5 min to the Windows and darwin/arm64 lanes. All lanes share this bound.
-    timeout-minutes: 30
+    # Measured after the lib flipped to skuld, at most: windows/amd64 1548 s (its two Clippy steps, which
+    # now also run the guard over the lib, took 1010 s), darwin/amd64 1254 s, darwin/arm64 1068 s.
+    # 50 min is 1.9x the slowest. All lanes share this bound.
+    timeout-minutes: 50
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
     # sandbox, so every step consents. Windows has no tracer tests.
