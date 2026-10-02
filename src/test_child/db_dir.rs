@@ -6,7 +6,7 @@
 //! its own instead.
 
 /// The variable skuld reads for the directory of its coordination DB.
-pub(super) const SKULD_DB_DIR_ENV: &str = "SKULD_DB_DIR";
+pub(crate) const SKULD_DB_DIR_ENV: &str = "SKULD_DB_DIR";
 
 /// What a dropped-identity fixture needs the driver to keep alive until the fixture has exited.
 pub(crate) struct FixtureDirs {
@@ -26,18 +26,35 @@ impl FixtureDirs {
 /// A fresh directory directly under `/tmp` (searchable end to end, unlike the ambient `TMPDIR`) that the
 /// fixture's post-drop identity can write.
 pub(super) fn fixture_db_dir() -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .prefix("cosca-skuld-db-")
-        .tempdir_in("/tmp")
-        .expect("tempdir directly under /tmp for the fixture's skuld DB");
+    let dir = tmp_dir();
     #[cfg(not(target_os = "linux"))]
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
-        let uid = crate::test_privilege::UNPRIVILEGED;
-        std::os::unix::fs::chown(dir.path(), Some(uid), Some(uid))
-            .expect("chown the fixture's skuld DB directory to its post-drop identity");
+        chown_to(dir.path(), crate::test_privilege::UNPRIVILEGED);
     }
     dir
+}
+
+/// [`fixture_db_dir`] for a root fixture that drops to `uid` mid-test. Skuld opened the DB as root,
+/// and its end-of-test check of the DB's path needs every directory on it searchable by `uid`; a
+/// root-owned `0700` directory is not.
+#[cfg(target_os = "linux")]
+pub(super) fn fixture_db_dir_owned_by(uid: libc::uid_t) -> tempfile::TempDir {
+    let dir = tmp_dir();
+    chown_to(dir.path(), uid);
+    dir
+}
+
+fn tmp_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("cosca-skuld-db-")
+        .tempdir_in("/tmp")
+        .expect("tempdir directly under /tmp for the fixture's skuld DB")
+}
+
+fn chown_to(dir: &std::path::Path, uid: libc::uid_t) {
+    std::os::unix::fs::chown(dir, Some(uid), Some(uid))
+        .expect("chown the fixture's skuld DB directory to its post-drop identity");
 }
 
 #[cfg(test)]

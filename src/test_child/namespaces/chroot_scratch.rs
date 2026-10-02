@@ -9,9 +9,17 @@ use std::path::{Path, PathBuf};
 
 /// `scratch/root`, both made by the driver. `scratch` is the fixture's `TMPDIR`, so anything the
 /// fixture leaves in its temp dir lands in `scratch`, outside `root`.
+///
+/// It also holds the fixture's skuld DB directory. Skuld checks, at the end of every test, that the
+/// DB's path still names the DB, and a chroot makes the path name nothing. A fixture that chroots
+/// into `root` binds [`db_dir`](Self::db_dir) to the same absolute path inside `root` first (see
+/// `namespaces::bind_into_root`), in its own mount namespace.
 pub(crate) struct ChrootScratch {
     scratch: PathBuf,
     root: PathBuf,
+    // Dropped recursively: it holds skuld's DB files, and no mount in this namespace (the fixture
+    // binds it only in a namespace of its own).
+    db: tempfile::TempDir,
 }
 
 impl ChrootScratch {
@@ -24,7 +32,13 @@ impl ChrootScratch {
             .keep();
         let root = scratch.join("root");
         std::fs::create_dir(&root).expect("mkdir the chroot root");
-        Self { scratch, root }
+        let db = super::super::db_dir::fixture_db_dir();
+        Self { scratch, root, db }
+    }
+
+    /// The fixture's `SKULD_DB_DIR`, directly under `/tmp`.
+    pub(crate) fn db_dir(&self) -> &Path {
+        self.db.path()
     }
 
     pub(crate) fn scratch(&self) -> &Path {
@@ -39,6 +53,18 @@ impl ChrootScratch {
     /// a non-recursive `remove_dir`. On `Err` whatever failed is left in place, for the message to
     /// name.
     pub(crate) fn finish(self) -> Result<(), String> {
+        // The mount point of the DB directory, if the fixture made one: `root/tmp/<name>`, empty once
+        // the fixture's mount namespace is gone.
+        let mount_point = self
+            .root
+            .join(self.db.path().strip_prefix("/").expect("an absolute DB directory"));
+        for dir in mount_point.ancestors().take_while(|dir| *dir != self.root) {
+            match std::fs::remove_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(describe_remove_dir(dir, &e)),
+            }
+        }
         remove_root(&self.root)?;
         let left: Vec<_> = std::fs::read_dir(&self.scratch)
             .map_err(|e| format!("read the scratch directory {:?}: {e}", self.scratch))?
@@ -54,10 +80,13 @@ impl ChrootScratch {
 /// Removes the chroot root with a non-recursive `remove_dir`; on failure it stays, and the message
 /// names why.
 pub(crate) fn remove_root(root: &Path) -> Result<(), String> {
-    std::fs::remove_dir(root).map_err(|e| {
-        let inside = std::fs::read_dir(root).map(|entries| entries.map(|entry| entry.map(|e| e.path())).collect());
-        describe_remove_failure(root, &e, inside)
-    })
+    std::fs::remove_dir(root).map_err(|e| describe_remove_dir(root, &e))
+}
+
+/// [`describe_remove_failure`] for a failed `remove_dir(dir)`, listing `dir` itself.
+fn describe_remove_dir(dir: &Path, error: &io::Error) -> String {
+    let inside = std::fs::read_dir(dir).map(|entries| entries.map(|entry| entry.map(|e| e.path())).collect());
+    describe_remove_failure(dir, error, inside)
 }
 
 /// The message for a failed `remove_dir(root)`. `inside` is what listing `root` returned. Leftovers

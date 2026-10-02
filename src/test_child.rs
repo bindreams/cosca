@@ -961,9 +961,10 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
 /// [`run_fixture_with_cwd`]'s `fixture` argument. Two things tie the call site to the fixture
 /// instead of letting them drift apart as two independently hand-typed strings:
 ///
-/// - `let _: fn() = $name;` forces the compiler to resolve `$name` as an item in scope — a typo
+/// - `let _ = $name;` forces the compiler to resolve `$name` as an item in scope — a typo
 ///   or a stale name after a rename is a compile error here, not a filter that silently matches
-///   zero tests at runtime (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
+///   zero tests at runtime. It names the fn without asserting a signature: an `async fn`
+///   fixture is not a `fn()` (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
 ///   this macro exists to rule out).
 /// - `module_path!()` derives the module portion at compile time, so it can never fall out of
 ///   sync with a file move or a module rename; libtest's `--exact` filter never includes the
@@ -971,7 +972,7 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
 ///   [`strip_crate_prefix`] call.
 macro_rules! fixture_path {
     ($name:ident) => {{
-        let _: fn() = $name;
+        let _ = $name;
         crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
     }};
 }
