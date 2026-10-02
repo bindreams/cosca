@@ -41,7 +41,8 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Measured after the lib flipped to skuld (the guard then compiles the lib): 492 s. 20 min is 2.4x that.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -137,9 +138,9 @@ jobs:
         run: .github/scripts/clippy.sh --feature-powerset --release
 
   # The libtest guard runs inside clippy.sh for a lane's own architecture. This job checks the other
-  # one on Linux and Windows. It is a job of its own because on Windows the same steps pushed the
-  # test job past its bound; macOS runs them in its test lane, as macOS runners are the CI
-  # bottleneck.
+  # one. It is a job of its own because on Windows, and on macOS once the lib was flipped (P1: the
+  # guard then compiles the whole lib for every feature combination), the same steps pushed the
+  # test job past its bound.
   libtest-guard:
     name: Libtest guard (${{ matrix.os }})
     strategy:
@@ -152,10 +153,13 @@ jobs:
           - os: windows
             runner: windows-latest
             other: aarch64-pc-windows-msvc
+          - os: darwin
+            runner: macos-latest
+            other: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
-    # Measured: 743 s at most (linux, with a slow apt-get), 615 s (windows). 25 min is 2x that, a
-    # failure bound for a hang and not an expectation.
-    timeout-minutes: 25
+    # Measured after the lib flipped to skuld: 672 s (linux), 990 s (windows). 40 min is 2.4x the
+    # slowest, a failure bound for a hang and not an expectation.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -183,8 +187,9 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         with:
           target: ${{ matrix.other }}
-        # The guard and its self-test took 564 s at most (windows); 20 min is 2.1x that.
-        timeout-minutes: 20
+        # The guard and its self-test took 936 s at most (windows) after the lib flipped; 35 min is
+        # 2.2x that.
+        timeout-minutes: 35
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -210,8 +215,6 @@ jobs:
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
-            # The architecture the libtest guard checks besides matrix.target.
-            guard_target: x86_64-apple-darwin
           - os: darwin
             arch: amd64
             runner: macos-15
@@ -247,7 +250,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          targets: ${{ matrix.target }}${{ matrix.guard_target && format(',{0}', matrix.guard_target) || '' }}
+          targets: ${{ matrix.target }}
           # see Clippy (feature powerset) step below for why only the
           # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
@@ -463,14 +466,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
           release: "true"
-
-      # The powerset action installed cargo-hack.
-      - uses: ./.github/actions/libtest-guard-other-arch
-        if: ${{ !cancelled() && matrix.guard_target }}
-        with:
-          target: ${{ matrix.guard_target }}
-        # darwin/arm64 took 146 s for both steps; 20 min as in the libtest-guard job.
-        timeout-minutes: 20
 
       # Live cgroup v2 containment tests belong to the CGROUP group: on unless
       # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need
