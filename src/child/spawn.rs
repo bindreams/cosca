@@ -429,10 +429,15 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     ))
 }
 
-/// The spawned `child` could not be adopted: on Windows its process handle could not be
-/// duplicated, on macOS its unique id could not be read (a refusal that is not `ESRCH`, so the
-/// child was an unreaped child at the read: the same footing as a failed `resolve_identity`).
-/// Tears it down and answers `error`.
+/// The spawned `child` could not be adopted. Answers `error`.
+///
+/// - **Windows:** its process handle could not be duplicated. The handle still pins the process, so
+///   the child is torn down.
+/// - **macOS:** its unique id could not be read (a refusal that is not `ESRCH`). A refusal is also
+///   what a pid reused by another user's process answers, so nothing shows the pid still names this
+///   child, and macOS has no handle to act through. Nothing is signalled or waited on by pid: the
+///   child is left running and unreaped, with a warning that names it, and dropping the `std`
+///   `Child` neither kills nor reaps it.
 ///
 /// Not on Linux, where the pidfd is opened before `exec` (see `pidfd_handshake`) and adoption
 /// cannot fail.
@@ -440,6 +445,15 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 fn teardown_after_failed_adoption(child: std::process::Child, error: Error) -> Error {
     #[cfg(test)]
     fault::capture(ProcessId::of(child.id()));
+    #[cfg(target_os = "macos")]
+    {
+        log::warn!(
+            "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
+            child.id()
+        );
+        drop(child);
+    }
+    #[cfg(not(target_os = "macos"))]
     teardown_unadopted(child);
     error
 }
