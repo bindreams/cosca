@@ -212,8 +212,8 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// extra connection.
 ///
 /// The report connection is made before the grandchild exists, so a reporter that cannot connect
-/// dies without one. Otherwise an uncontained `orphan-relay` would orphan it, blocked on the
-/// harness's main listener and holding the test's stdout and stderr.
+/// dies without leaving one behind. A report that fails after the spawn kills and reaps the
+/// grandchild before panicking, for the same reason.
 ///
 /// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
@@ -226,11 +226,19 @@ fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandc
         clippy::disallowed_methods,
         reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
     )]
-    let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
+    let mut gc = std::process::Command::new(exe).args(args).spawn().unwrap();
     if let Some(mut sock) = report {
-        writeln!(sock, "{}", gc.id()).unwrap();
-        sock.flush().unwrap();
-        crate::ack::wait_for_ack(&mut sock); // the second: the grandchild's identity is captured
+        let reported = writeln!(sock, "{}", gc.id())
+            .and_then(|()| sock.flush())
+            // The second ack: the grandchild's identity is captured.
+            .and_then(|()| crate::ack::try_wait_for_ack(&mut sock));
+        if let Err(e) = reported {
+            let killed = gc.kill();
+            let waited = gc.wait();
+            panic!(
+                "reporting the grandchild's pid failed: {e}; killed the grandchild: {killed:?}, then waited for it: {waited:?}"
+            );
+        }
     }
     KeptGrandchild(gc)
 }
