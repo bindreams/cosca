@@ -92,9 +92,7 @@ numbers on this host.
 A throwaway macOS 26 (Tahoe) arm64 VM via [Tart](https://tart.run), for fast local macOS
 RED/GREEN iterations and pre-checks. **CI stays the merge gate.** The image is Cirrus Labs'
 `ghcr.io/cirruslabs/macos-tahoe-base`, not GitHub's `macos-latest` runner image: same macOS
-major (26) and arm64 as CI's `darwin/arm64` lane, but different preinstalled tools and no Xcode. Provisioning installs the
-toolchain pinned in `.github/ci-toolchain` via rustup and CI's `cargo-nextest` version
-(checksum-verified) from `scripts/devvm/provision/macos-rust.sh`.
+major (26) and arm64 as CI's `darwin/arm64` lane, but different preinstalled tools and no Xcode.
 
 Prerequisites: Tart (`brew install cirruslabs/cli/tart`, or the release tarball), found via
 `$TART` or `PATH`; and the base image pulled once, about 30 GB (`tart pull
@@ -105,31 +103,28 @@ uv run scripts/devvm.py up macos-arm64 [--rev <git rev>] [--rosetta]   # clone, 
 uv run scripts/devvm.py run macos-arm64 -- cargo nextest run --lib -E 'test(/await_reapable/)'
 uv run scripts/devvm.py run macos-arm64 -- sudo -n env PATH=/Users/admin/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin CARGO_HOME=/Users/admin/cargo-home-root CARGO_TARGET_DIR=/Users/admin/cargo-target-root RUSTUP_HOME=/Users/admin/.rustup cargo nextest run --locked ...   # root lane
 uv run scripts/devvm.py sync macos-arm64 --rev <rev>                  # replace the guest's source with another rev
-uv run scripts/devvm.py fetch macos-arm64 /Users/admin/cargo-target/nextest ./out   # copy results out
+uv run scripts/devvm.py fetch macos-arm64 '~/cargo-target/nextest' ./out   # copy results out; absolute or ~/ paths, quote the ~
 uv run scripts/devvm.py destroy macos-arm64                           # stop and delete the VM
 ```
 
-- Every `up` is a fresh copy-on-write `tart clone` of the base image under a unique
-  `devvm-macos-<128-bit uuid>` name, refused if the name exists; the base is never started or
-  modified. The base is pinned by digest (Renovate moves `BASE_IMAGE_DIGEST` in
-  `scripts/devvm_macos.py`; pull the new digest after a bump).
-- `destroy` only deletes names with that prefix, and only the VM this worktree created
-  (the state records its disk identity; a same-named replacement is refused).
-- A failed or interrupted `up` (bad provision, Ctrl-C, boot not answering within 600 s) deletes
-  the clone it made. `--rev` is validated before anything boots. One worktree has one guest;
-  a second `up` is refused.
-- Only committed state is copied (`git archive <rev>`); uncommitted edits are not. The
-  provision script always comes from this checkout, so `--rev` may name an older commit.
-- At most 2 macOS VMs run at once on a Mac (Apple's licence). `up` counts every running
-  local Tart VM and refuses a third; concurrent `up`s serialise on a host-wide lock and say so.
+- Each worktree has one guest, a fresh copy-on-write clone of the base; the base is never
+  modified. A failed or interrupted `up` (including SIGTERM and SIGHUP) deletes its clone; if
+  that deletion fails, the state is kept and the message names the VM and points to `destroy`.
+- `destroy` deletes only the VM this worktree created and refuses anything it cannot verify.
+  There is no `halt`: destroy the guest and `up` a new one.
+- At most 2 macOS VMs run at once on a Mac (Apple's licence); `up` counts every running local
+  Tart VM and refuses a third.
+- Only committed state is copied (`git archive <rev>`). The provision script always comes from
+  this checkout, so `--rev` may name an older commit.
 - Root-lane runs use their own `CARGO_HOME` and `CARGO_TARGET_DIR` (recipe above, with
-  `--locked`) so root never owns files under the tree or the admin user's cargo state;
-  `sync` and unprivileged builds keep working afterwards.
-- The base image already ships Rosetta. `--rosetta` makes sure of it and adds the
-  `x86_64-apple-darwin` target, so `cargo nextest run --target x86_64-apple-darwin` runs
-  x86_64 binaries in the guest. CI's `darwin/amd64` lane is also Rosetta: its `macos-15` runner
-  is the `macos-15-arm64` image building for `x86_64-apple-darwin`. So `--rosetta` closely
-  matches that lane's mechanism; the difference is the macOS major (guest 26, CI lane 15).
+  `--locked`), so `sync` and unprivileged builds keep working afterwards.
+- CI's `darwin/amd64` lane is also arm64 plus Rosetta (a `macos-15` runner building
+  x86_64), so `--rosetta` matches its mechanism; the macOS major differs (26 versus 15). The
+  base already ships Rosetta; the flag ensures it and adds the `x86_64-apple-darwin` target for
+  `cargo nextest run --target x86_64-apple-darwin`.
+- The base image is pinned by digest; Renovate moves `BASE_IMAGE_DIGEST` in
+  `scripts/devvm_macos.py`, after which pull the new digest.
+- Host-side tests: `python3 -m unittest scripts.devvm_macos_test scripts.devvm_test` (run by CI's Lint job).
 
 ### `windows-arm64`
 

@@ -350,29 +350,28 @@ def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[s
 # Subcommands ==========================================================================
 
 
+def _vagrant_status(guest: Guest) -> str:
+    require_tool("vagrant")
+    if not dotfile_dir(guest).exists():
+        return "not created"
+    # get_vagrant_machine_state raises on unparsable output; `list` degrades to
+    # "unknown" for that one guest instead of aborting the whole listing.
+    try:
+        return get_vagrant_machine_state(guest)
+    except RuntimeError:
+        return "unknown"
+
+
 def cmd_list(_args: argparse.Namespace) -> None:
     for guest in GUESTS.values():
         if not guest.available:
             print(f"{guest.name:14s} UNAVAILABLE  {guest.unavailable_reason}")
             continue
-        if guest.communicator == "tart":
-            print(f"{guest.name:14s} {devvm_macos.status(STATE_DIR):14s} {guest.box}  (communicator: tart)")
-            continue
-        require_tool("vagrant")
-        dotfile = dotfile_dir(guest)
-        if not dotfile.exists():
-            state = "not created"
-        else:
-            # get_vagrant_machine_state raises on unparsable output; `list` degrades to
-            # "unknown" for that one guest instead of aborting the whole listing.
-            try:
-                state = get_vagrant_machine_state(guest)
-            except RuntimeError:
-                state = "unknown"
+        state = backend_for(guest).status()
         print(f"{guest.name:14s} {state:14s} {guest.box}  (communicator: {guest.communicator})")
 
 
-def cmd_up(args: argparse.Namespace) -> None:
+def _vagrant_up(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     display = bool(getattr(args, "display", False))
@@ -386,9 +385,6 @@ def cmd_up(args: argparse.Namespace) -> None:
     if display and guest.communicator != "winrm":
         print("error: --display only applies to Windows guests", file=sys.stderr)
         sys.exit(1)
-    if guest.communicator == "tart":
-        devvm_macos.up(REPO_ROOT, STATE_DIR, rev=args.rev or "HEAD", rosetta=bool(args.rosetta))
-        return
     if getattr(args, "rosetta", False):
         print("error: --rosetta only applies to macOS guests", file=sys.stderr)
         sys.exit(1)
@@ -435,12 +431,9 @@ def cmd_up(args: argparse.Namespace) -> None:
         print(f"note: the read-only working tree is copied to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
 
 
-def cmd_sync(args: argparse.Namespace) -> None:
+def _vagrant_sync(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    if guest.communicator == "tart":
-        devvm_macos.sync(REPO_ROOT, STATE_DIR, rev=args.rev or "HEAD")
-        return
     if getattr(args, "rev", None) is not None:
         print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
         sys.exit(1)
@@ -457,12 +450,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
         provision_windows_guest(guest, auto_consent=auto_consent, create=False)
 
 
-def cmd_ssh(args: argparse.Namespace) -> None:
+def _vagrant_ssh(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    if guest.communicator == "tart":
-        devvm_macos.ssh(STATE_DIR)
-        return
     if guest.communicator == "ssh":
         run_vagrant(guest, ["ssh"])
         return
@@ -488,7 +478,7 @@ def cmd_ssh(args: argparse.Namespace) -> None:
     run_vagrant(guest, ["powershell"])
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+def _vagrant_run(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     cmd_args = list(args.cmd)
@@ -515,10 +505,6 @@ def cmd_run(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-
-    if guest.communicator == "tart":
-        devvm_macos.run(STATE_DIR, cmd_args)
-        return
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -631,29 +617,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     run_vagrant(guest, ["winrm", "-c", outer])
 
 
-def cmd_fetch(args: argparse.Namespace) -> None:
-    guest = GUESTS[args.guest]
-    if guest.communicator != "tart":
-        print("error: fetch only applies to macOS guests", file=sys.stderr)
-        sys.exit(1)
-    devvm_macos.fetch(STATE_DIR, args.guest_path, Path(args.host_dest))
-
-
-def cmd_halt(args: argparse.Namespace) -> None:
+def _vagrant_halt(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    if guest.communicator == "tart":
-        devvm_macos.halt(STATE_DIR)
-        return
     run_vagrant(guest, ["halt"])
 
 
-def cmd_destroy(args: argparse.Namespace) -> None:
+def _vagrant_destroy(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
-    if guest.communicator == "tart":
-        devvm_macos.destroy(STATE_DIR)
-        return
     returncode = run_vagrant(guest, ["destroy", "-f"], check=False)
     if returncode != 0:
         print(
@@ -667,6 +639,81 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     guest_state = STATE_DIR / guest.name
     if guest_state.exists():
         shutil.rmtree(guest_state)
+
+
+# Backends =============================================================================
+
+
+class VagrantBackend:
+    """Vagrant-managed guests (Linux over ssh, Windows over WinRM)."""
+
+    def __init__(self, guest: Guest):
+        self.guest = guest
+
+    def status(self) -> str:
+        return _vagrant_status(self.guest)
+
+    def up(self, args: argparse.Namespace) -> None:
+        _vagrant_up(args)
+
+    def sync(self, args: argparse.Namespace) -> None:
+        _vagrant_sync(args)
+
+    def ssh(self, args: argparse.Namespace) -> None:
+        _vagrant_ssh(args)
+
+    def run(self, args: argparse.Namespace) -> None:
+        _vagrant_run(args)
+
+    def halt(self, args: argparse.Namespace) -> None:
+        _vagrant_halt(args)
+
+    def destroy(self, args: argparse.Namespace) -> None:
+        _vagrant_destroy(args)
+
+    def fetch(self, _args: argparse.Namespace) -> None:
+        print("error: fetch only applies to macOS guests", file=sys.stderr)
+        sys.exit(1)
+
+
+def backend_for(guest: Guest):
+    if guest.communicator == "tart":
+        return devvm_macos.MacosBackend(devvm_macos.Tart(), REPO_ROOT, STATE_DIR)
+    return VagrantBackend(guest)
+
+
+def _dispatch(verb: str, args: argparse.Namespace) -> None:
+    guest = GUESTS[args.guest]
+    require_available(guest)
+    getattr(backend_for(guest), verb)(args)
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    _dispatch("up", args)
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    _dispatch("sync", args)
+
+
+def cmd_ssh(args: argparse.Namespace) -> None:
+    _dispatch("ssh", args)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    _dispatch("run", args)
+
+
+def cmd_halt(args: argparse.Namespace) -> None:
+    _dispatch("halt", args)
+
+
+def cmd_destroy(args: argparse.Namespace) -> None:
+    _dispatch("destroy", args)
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    _dispatch("fetch", args)
 
 
 # CLI ==================================================================================
