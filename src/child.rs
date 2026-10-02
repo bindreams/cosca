@@ -32,6 +32,10 @@ mod graceful;
 mod child_tests;
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "child/pid_reuse_tests.rs"]
+mod pid_reuse_tests;
+
+#[cfg(all(test, target_os = "linux"))]
 #[path = "child/kill_tree_view_tests.rs"]
 mod kill_tree_view_tests;
 

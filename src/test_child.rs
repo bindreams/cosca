@@ -3,6 +3,9 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaces;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod pid_reuse;
+
 #[cfg(target_os = "macos")]
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;

@@ -115,7 +115,7 @@ mod wait;
 mod bounded;
 #[cfg(all(test, unix))]
 mod send_log;
-#[cfg(unix)]
+#[cfg(any(unix, feature = "tokio"))]
 mod signal;
 
 #[cfg(test)]

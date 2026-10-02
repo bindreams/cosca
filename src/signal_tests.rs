@@ -126,6 +126,26 @@ mod macos {
         assert_eq!(uniq_info(NEVER_A_PID, ReadPurpose::Adopt), UniqRead::Gone);
     }
 
+    // `identity_unreadable` -----
+
+    /// The adoption error names the pid and keeps the errno's kind.
+    ///
+    /// Mutant: the errno is dropped from the source, or the error is not `Unassessable`.
+    #[test]
+    fn identity_unreadable_names_the_pid_and_keeps_the_errno() {
+        let err = crate::signal::identity_unreadable(77, libc::EPERM);
+        match err {
+            crate::error::Error::Unassessable { detail, source } => {
+                assert!(
+                    detail.contains("pid 77") && detail.contains("EPERM") || detail.contains("errno 1"),
+                    "{detail}"
+                );
+                assert_eq!(source.map(|e| e.raw_os_error()), Some(Some(libc::EPERM)));
+            }
+            other => panic!("expected Unassessable, got {other:?}"),
+        }
+    }
+
     // `via_verified_pid` -----
 
     /// Mutant: the id is not compared, so a reused pid is signalled.
