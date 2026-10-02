@@ -16,7 +16,7 @@ fn exiting_child() -> ::tokio::process::Child {
 /// After tokio reaped the child its handle is closed, so a kill sends nothing.
 ///
 /// Mutant: `signal` terminates a handle that is gone, or answers an error.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn a_kill_after_the_child_was_reaped_is_gone() {
     let mut proc = super::proc_source::ProcSource::new(exiting_child());
     proc.wait().await.expect("wait");
@@ -28,7 +28,7 @@ async fn a_kill_after_the_child_was_reaped_is_gone() {
 /// answers `ACCESS_DENIED`; the wait on the handle then shows it exited, and the kill is a success.
 ///
 /// Mutant: `ACCESS_DENIED` is returned as an error without the wait.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn a_kill_of_an_exited_unreaped_child_is_a_success() {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};

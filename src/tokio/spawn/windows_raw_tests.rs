@@ -21,7 +21,7 @@ use crate::Stdio;
 /// `abort`: that keeps the child accessible (aborting a task that owns the child would drop and
 /// reap it) so "stays waitable" is provable on the SAME child, and it isolates the cancel event
 /// from the child's own exit (no drop-order race between `signal_cancel` and Drop's kill).
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_drop_cancels_and_child_stays_waitable() {
     // `findstr` with no file argument reads stdin until EOF — a stdin-driven blocker resolvable via
     // PATH (System32), so this unit test needs no CARGO_BIN_EXE testbin.
@@ -65,7 +65,7 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
 /// `#[tokio::test]` is single-threaded, which matters — the seam is per *thread*, so a
 /// multi-thread runtime could move the spawn off this test's thread.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
     use crate::error::Error;
@@ -98,7 +98,7 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
 
 /// The async twin of `a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance`.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
     use crate::error::Error;

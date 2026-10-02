@@ -555,7 +555,7 @@ fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_resolves_when_the_last_member_exits() {
     // `join!` polling `watch` before `end` is an implementation detail, not a contract — so
     // ordering is enforced with a real, per-call channel, not assumed from poll order.
@@ -578,7 +578,7 @@ async fn async_wait_resolves_when_the_last_member_exits() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn two_concurrent_async_waiters_both_observe_the_drain() {
     // Each waiter owns a private kqueue, so their knotes cannot displace each other.
     // Registering the same raw descriptor twice on the reactor instead would park one waiter
@@ -611,7 +611,7 @@ async fn two_concurrent_async_waiters_both_observe_the_drain() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     drop(stdin);
@@ -622,7 +622,7 @@ async fn async_wait_resolves_immediately_for_an_already_drained_tree() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_resolves_via_eof_with_small_buffered_bytes() {
     // The async counterpart to the sync small-bytes-are-not-a-drain test above: a few bytes
     // stay below the NOTE_LOWAT clamp, so this resolves via the real EOF from `drop(stdin)`,
@@ -721,7 +721,7 @@ fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
     // `wait_tree_drained` has no deadline, so past the clamp it must not drain: draining for a
     // stuck writer forever is the unbounded CPU spin this primitive exists to avoid.

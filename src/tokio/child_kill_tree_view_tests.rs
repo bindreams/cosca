@@ -16,7 +16,7 @@ fn treewalk_blocker() -> (crate::tokio::Child, crate::tokio::ChildStdin) {
 }
 
 /// Mutant: "run the handle backstop after a snapshot failure".
-#[tokio::test]
+#[skuld::test]
 async fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
     let (mut child, stdin) = treewalk_blocker();
     let forced = force_proc_view_once(ForcedView::Diverged);
@@ -33,7 +33,7 @@ async fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
 }
 
 /// Mutant: "skip the root kill on a snapshot failure".
-#[tokio::test]
+#[skuld::test]
 async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();

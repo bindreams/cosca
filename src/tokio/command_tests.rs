@@ -24,7 +24,7 @@ fn tokio_elevate_forwards_to_inner_request() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn tokio_child_elevation_is_none_without_elevate() {
     let mut c = super::Command::new();
     c.args(["true"]);

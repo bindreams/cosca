@@ -76,7 +76,7 @@ async fn cleanup(child: &mut crate::tokio::Child) {
     }
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
     let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
@@ -117,7 +117,7 @@ async fn async_graceful_tree_watch_error_still_sweeps_and_reaps() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
     let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
@@ -153,7 +153,7 @@ async fn async_graceful_lone_watch_error_still_escalates_and_reaps() {
 
 // Async twin of `graceful_tree_terminate_refusal_still_sweeps_and_reaps` in
 // `src/child/graceful_tests.rs` — see there for the full rationale.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
@@ -197,7 +197,7 @@ async fn async_graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 }
 
 // Async twin of `graceful_tree_unassessable_per_member_still_sweeps_and_reaps`.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     let (mut child, stdin) = kill_only_blocker().await;
     let id = child.id();
@@ -241,7 +241,7 @@ async fn async_graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 }
 
 // Async twin of `graceful_tree_unassessable_mechanism_failure_fails_fast`.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
     let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
@@ -260,7 +260,7 @@ async fn async_graceful_tree_unassessable_mechanism_failure_fails_fast() {
 
 // Async twin of `graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative` —
 // see there for the full rationale.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]
@@ -372,7 +372,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
 // Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root`; see there for the
 // fixture's rationale (`wait_exit`, like `block_until_exit`, does not reap).
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -447,7 +447,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root()
 // like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
 // real connection, not a poll loop, and the same shape already accepted for an async test.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     use std::io::Read;
 
@@ -510,7 +510,7 @@ async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_fa
 // error's VARIANT, not merely that one exists: an unguarded call returns `Ok` or the OS's `Io`,
 // never `Unassessable`, whichever way the recycled pid falls.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
     let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
         cmd.contain();
@@ -546,7 +546,7 @@ async fn windows_async_lone_graceful_ops_refuse_once_the_backend_has_reaped() {
 // returns after firing at whatever now holds the pid — and `graceful_shutdown_tree` inherits it:
 // the trace asserted below fires only if `terminate_tree` refused.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
     let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
         cmd.contain();
@@ -628,7 +628,7 @@ async fn windows_async_tree_graceful_ops_refuse_once_the_backend_has_reaped() {
 // (`.config/nextest.toml`) is a pure backstop against an unrelated hang (e.g. `cancel` itself
 // failing to release the watcher) — never part of either check.
 #[cfg(windows)]
-#[tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reaped() {
     const GRACE: Duration = Duration::from_secs(30);
     let (mut child, stdin) = crate::test_child::windows_blocker_async(|cmd| {
@@ -688,7 +688,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_backend_has_reap
 // identical child) after the backend has unpinned the pid, not `Unassessable`, which is
 // documented as a transient could-not-determine condition a caller may retry.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
     let (mut child, stdin) = crate::test_child::windows_blocker_async(|_| {});
@@ -706,7 +706,7 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
 }
 
 // Async twin of `graceful_tree_non_containment_terminate_error_fails_fast`.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_non_containment_terminate_error_fails_fast() {
     let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);

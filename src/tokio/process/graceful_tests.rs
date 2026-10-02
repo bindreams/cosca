@@ -40,7 +40,7 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
     child
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_graceful_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_blocker();
     let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
@@ -64,7 +64,7 @@ async fn async_foreign_graceful_watch_error_still_escalates() {
     );
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_graceful_tree_watch_error_still_sweeps() {
     let mut child = spawn_term_ignoring_blocker();
     let p = crate::tokio::Process::from_pid(child.id()).found().expect("resolves");
@@ -109,7 +109,7 @@ const ESCALATION_CASES: [([Option<rustix::io::Errno>; 3], &str, bool); 3] = [
 /// Mutants: the escalation is `wait::terminate`, or names another `PidfdOp`; the grace wait
 /// names another `PidfdOp`; a refused wait skips the escalation.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_refused_pidfd_open_during_graceful_shutdown_names_the_step_that_hit_it() {
     for (script, op, killed) in ESCALATION_CASES {
         let mut child = spawn_term_ignoring_blocker();

@@ -87,7 +87,7 @@ fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::P
     fut.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_true_for_exited_unreaped_child() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -99,7 +99,7 @@ async fn grace_wait_true_for_exited_unreaped_child() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_false_for_live_child_at_zero_grace() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -109,7 +109,7 @@ async fn grace_wait_false_for_live_child_at_zero_grace() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_true_for_stale_identity() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -119,7 +119,7 @@ async fn grace_wait_true_for_stale_identity() {
     assert!(exited, "a stale identity (reaped child) must report exited, never hang");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_true_when_child_dies_mid_wait() {
     // The live-then-exits path: the watch arms on a LIVE child and must resolve on the real
     // exit event (our own kill). Whether the kill lands before or after arming, the result
@@ -263,7 +263,7 @@ fn assert_reads_of(
 // blocking thread deriving its own deadline reads a later instant and fails the equality.
 // The deadline is already past: the wait is one non-blocking probe.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_windows_arms_from_a_past_deadline_fixed_before_spawn_blocking() {
     let mut child = std_blocker();
     let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::ZERO, false).await;
@@ -276,7 +276,7 @@ async fn grace_wait_windows_arms_from_a_past_deadline_fixed_before_spawn_blockin
 // A genuinely future deadline crossing `spawn_blocking`: the blocking thread's remaining time is
 // what is left of the caller's deadline, not a fresh grace.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_windows_arms_from_a_future_deadline_fixed_before_spawn_blocking() {
     let grace = Duration::from_secs(3600);
     let mut child = std_blocker();
@@ -292,7 +292,7 @@ async fn grace_wait_windows_arms_from_a_future_deadline_fixed_before_spawn_block
 
 // A grace that overflows `Instant` is unbounded: not expired, not a panic, not a fixed fallback.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_windows_treats_an_overflowing_grace_as_unbounded() {
     let mut child = std_blocker();
     let seen = observed_grace_wait(&mut child, std::time::Instant::now(), Duration::MAX, true).await;
@@ -304,7 +304,7 @@ async fn grace_wait_windows_treats_an_overflowing_grace_as_unbounded() {
 // As above for a grace landing inside tokio's timer margin of `Instant`'s ceiling, which
 // `deadline_at` also makes unbounded.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceiling_as_unbounded() {
     let mut child = std_blocker();
     let pin = std::time::Instant::now();
@@ -322,7 +322,7 @@ async fn grace_wait_windows_treats_a_grace_inside_the_timer_margin_of_the_ceilin
 // wake) but reports "no exit" — the loop must re-await, and the target's real exit must still
 // resolve it. Every wake is a real kernel event.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
     let mut decoy = std_blocker();
     let target = std_blocker();
@@ -396,7 +396,7 @@ mod classify {
     }
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn wait_exit_resolves_for_exited_unreaped_child() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -411,7 +411,7 @@ async fn wait_exit_resolves_for_exited_unreaped_child() {
 ///
 /// Mutants: `exit_watch` names another `PidfdOp`; the forced errno is not consumed.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn wait_exit_names_process_wait_when_pidfd_open_is_refused() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -430,7 +430,7 @@ async fn wait_exit_names_process_wait_when_pidfd_open_is_refused() {
     }
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn wait_exit_resolves_when_child_dies_mid_wait() {
     // Arm on a LIVE child; our own kill is the real exit event. Race-tolerant either side.
     let mut child = std_blocker();
@@ -441,7 +441,7 @@ async fn wait_exit_resolves_when_child_dies_mid_wait() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_zero_reports_an_observed_exit() {
     // The ZERO one-shot probe must see an already-exited (zombie) child — the sync/async
     // parity case a plain timeout(ZERO, ..) gets wrong (the AsyncFd readiness of a zombie
@@ -459,7 +459,7 @@ async fn grace_wait_zero_reports_an_observed_exit() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn wait_exit_cancel_leaves_child_untouched() {
     use std::future::Future;
     // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
@@ -480,7 +480,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
 // Proves release without a timeout: the watcher signals a channel when it returns; recv()
 // blocks until that happens.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn wait_exit_drop_releases_the_windows_watcher() {
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -587,7 +587,7 @@ fn the_relayed_observer_does_not_outlive_its_blocking_call() {
 // pid but a WRONG start token, is `Opened::Found` + `HandleIdentity::Different` on every run —
 // no dependence on OS pid-recycling timing.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
     let mut child = std_blocker_with_stdout();
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -619,7 +619,7 @@ async fn grace_wait_resolves_immediately_on_an_identity_mismatch() {
 //
 // Mutant: make `relayed_probe::capture` skip the `Armed` probe -> no notification.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -639,7 +639,7 @@ async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
 // Mutant: make `relayed_probe`'s slot process-global -> this thread's channel receives the other's release.
 // Mutant: skip `notify_released` in `blocking_watch` -> the other thread's channel is empty.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
     let (own_tx, own_rx) = std::sync::mpsc::channel();
     let _guard = super::fault_observer::install(own_tx);
@@ -675,7 +675,7 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
 /// `cgroup.events` — the removal can cancel the one notification a drain sends.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_populated_event() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -710,7 +710,7 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 /// `crate::wait::deadline_from` saturates it to unbounded before `drain_step` ever sees it, so
 /// this call takes the `listener.await` arm, never the bounded one.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
     use crate::containment::cgroup::test_support::FakeLeaf;
 
@@ -739,7 +739,7 @@ async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
 /// needed): a populated leaf that never drains must answer `MembersRemain` no earlier than the
 /// caller's own deadline. No upper bound is asserted — only that it never answers early.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -769,7 +769,7 @@ async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
 /// The Linux wait site is armed, through `arm_at`, with the caller's deadline instant exactly.
 /// Populated `FakeLeaf` (no real cgroup), so `drain_step` reaches its `Block` arm.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
     use crate::containment::cgroup::test_support::FakeLeaf;
 
@@ -789,7 +789,7 @@ async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
 
 /// The async wait site's unbounded arm reports an unbounded park, and arms no timer.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
     use crate::containment::cgroup::test_support::FakeLeaf;
 
@@ -810,7 +810,7 @@ async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
 
 /// grace_wait (site 1) arms `deadline_from`'s instant: `t0 + grace` on the paused clock.
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_arms_deadline_froms_instant() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -858,7 +858,7 @@ async fn armed_by_one_poll_of_grace_wait(grace: Duration) -> Vec<Armed> {
 /// An overflowing grace is UNBOUNDED, not a far-future deadline: no timer is armed at all (a
 /// fallback deadline, at any distance, would report to the seam), and no early `Ok(false)`.
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_arms_no_timer_for_an_overflowing_grace() {
     assert_eq!(armed_by_one_poll_of_grace_wait(Duration::MAX).await, vec![]);
 }
@@ -866,7 +866,7 @@ async fn grace_wait_arms_no_timer_for_an_overflowing_grace() {
 /// The 1 ms margin's edge at site 1, on the paused clock: a grace landing exactly `MARGIN` short
 /// of `Instant`'s ceiling is armed as is, and one nanosecond further is unbounded.
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_at_the_timer_margin_edge_is_armed_and_one_nanosecond_past_it_is_unbounded() {
     let t0 = super::tokio_now();
     let span = crate::wait::instant_near_ceiling(t0).saturating_duration_since(t0);
@@ -882,7 +882,7 @@ async fn grace_wait_at_the_timer_margin_edge_is_armed_and_one_nanosecond_past_it
 /// tokio's own boundary, on real tokio: the extreme instant `arm_at` accepts, `ceiling - MARGIN`,
 /// arms without a panic, so a larger tokio round-up breaks this test rather than the margin.
 #[cfg(unix)]
-#[::tokio::test]
+#[skuld::test]
 async fn tokio_arms_the_extreme_instant_arm_at_accepts_without_panicking() {
     let ceiling = crate::wait::instant_near_ceiling(super::tokio_now());
     let at = ceiling - crate::wait::TOKIO_TIMER_ROUNDING_MARGIN;
@@ -894,7 +894,7 @@ async fn tokio_arms_the_extreme_instant_arm_at_accepts_without_panicking() {
 /// only way `grace_wait` resolves is its timer, and virtual time is auto-advanced to exactly the
 /// armed deadline. It must answer `Ok(false)` only once the clock has reached `t0 + grace`.
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -934,7 +934,7 @@ async fn grace_wait_never_answers_before_its_deadline_on_a_paused_clock() {
 /// An unbounded grace on the paused clock: virtual time can pass a year and `grace_wait` is still
 /// pending, and nothing was armed (no fallback deadline of any length).
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_year() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -962,7 +962,7 @@ async fn grace_wait_with_an_overflowing_grace_stays_pending_across_a_virtual_yea
 /// registers with the reactor, which reports nothing until a driver turn, whereas macOS detects an
 /// already-exited process while arming and never reaches the timer.
 #[cfg(target_os = "linux")]
-#[::tokio::test]
+#[skuld::test]
 async fn grace_wait_reports_an_exit_pending_when_the_timer_wins_the_first_poll() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -981,7 +981,7 @@ async fn grace_wait_reports_an_exit_pending_when_the_timer_wins_the_first_poll()
 
 /// Site 2: every holder of the marker's write end exited before the call.
 #[cfg(target_os = "macos")]
-#[::tokio::test]
+#[skuld::test]
 async fn wait_tree_deadline_reports_an_eof_pending_when_the_timer_wins_the_first_poll() {
     use std::os::fd::AsFd;
 
@@ -1011,7 +1011,7 @@ async fn wait_tree_deadline_reports_an_eof_pending_when_the_timer_wins_the_first
 /// otherwise), so a real `/bin/sh` holds it on fd 3 until this test closes its stdin. No
 /// `test_spawn_lock()`: `Command::spawn` takes it itself.
 #[cfg(target_os = "macos")]
-#[::tokio::test]
+#[skuld::test]
 async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
     use std::os::fd::AsFd;
 
@@ -1042,7 +1042,7 @@ async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
 // no real caller does. Debug builds assert; release builds wait unbounded.
 
 #[cfg(all(unix, debug_assertions))]
-#[::tokio::test]
+#[skuld::test]
 #[should_panic(expected = "deadline_from's contract should prevent")]
 async fn arm_at_debug_asserts_a_deadline_inside_the_timer_margin() {
     let violating = crate::wait::instant_near_ceiling(super::tokio_now());
@@ -1053,7 +1053,7 @@ async fn arm_at_debug_asserts_a_deadline_inside_the_timer_margin() {
 /// Release counterpart of the debug-assert test: the wait resolves with the future's own output,
 /// reports an unbounded park, and no timer of any length bounds it.
 #[cfg(all(unix, not(debug_assertions)))]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn arm_at_waits_unbounded_for_a_deadline_inside_the_timer_margin_in_release() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
@@ -1092,7 +1092,7 @@ fn to_real_clock_preserves_the_remaining_time_across_clocks() {
 
 /// The wait runs on tokio's clock: virtual time advanced BEFORE the call must not eat the grace.
 #[cfg(unix)]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn grace_wait_serves_its_full_grace_on_tokios_clock_after_an_advance() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -1114,7 +1114,7 @@ async fn grace_wait_serves_its_full_grace_on_tokios_clock_after_an_advance() {
 /// Site 3 reads tokio's clock for "already expired": with virtual time far ahead of the real
 /// clock, a deadline past on tokio's clock answers `MembersRemain` at once, without arming.
 #[cfg(target_os = "linux")]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -1134,7 +1134,7 @@ async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
 /// Site 2 reads tokio's clock for "already expired": a deadline past on tokio's clock probes at
 /// once, arming nothing, even though the real clock still shows it in the future.
 #[cfg(target_os = "macos")]
-#[::tokio::test(start_paused = true)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn wait_tree_deadline_judges_expiry_on_tokios_clock() {
     use std::os::fd::AsFd;
 

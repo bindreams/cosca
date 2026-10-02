@@ -29,7 +29,7 @@ fn program_ran(cmd: Command, mut reader: std::io::PipeReader) -> bool {
 }
 
 /// Mutant: the probe is skipped (the refusal lands after the fork, so `spawns()` is 1).
-#[tokio::test]
+#[skuld::test]
 async fn a_refused_probe_fails_unsupported_and_forks_nothing() {
     for (errno, name) in [(Errno::PERM, "EPERM"), (Errno::NOSYS, "ENOSYS")] {
         let (mut cmd, reader) = marker_command();
@@ -48,7 +48,7 @@ async fn a_refused_probe_fails_unsupported_and_forks_nothing() {
 }
 
 /// Mutants: the child execs despite its failed `pidfd_open`; the parent ignores its errno report.
-#[tokio::test]
+#[skuld::test]
 async fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -66,7 +66,7 @@ async fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     assert!(!program_ran(cmd, reader), "the aborted child must never exec");
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn a_normal_spawn_runs_the_program() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -84,7 +84,7 @@ async fn a_normal_spawn_runs_the_program() {
 /// spawn fails, and tokio reaps the child once the pidfd shows it exited.
 ///
 /// Mutant: `Gone` is a successful spawn.
-#[tokio::test]
+#[skuld::test]
 async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     let (mut cmd, reader) = marker_command();
     let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);

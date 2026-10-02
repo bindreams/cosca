@@ -37,7 +37,7 @@ fn blocker() -> Command {
 // (which records the child's real identity); `fault::assert_child_reaped` then proves it was reaped
 // (reap_now uses WNOWAIT, leaving the zombie for tokio's field-drop to collect).
 
-#[tokio::test]
+#[skuld::test]
 async fn identity_failure_reaps_the_spawned_child() {
     fault::set_force_identity_vanished(true);
     let (mut cmd, teardown) = teardown_blocker();
@@ -53,7 +53,7 @@ async fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn attach_failure_reaps_the_spawned_child() {
     fault::set_force_attach_failure(true);
     let (mut cmd, teardown) = teardown_blocker();
@@ -72,7 +72,7 @@ async fn attach_failure_reaps_the_spawned_child() {
 /// The async mirror of `child::spawn::exact_posix_tests`: tokio builds its command through the
 /// same `build_std_command`, so a bare `raw_executable()` must load the child-cwd file here too.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     use crate::test_child::{cwd_and_path_tools, CWD_TOOL_EXIT};
     let (cwd, on_path) = cwd_and_path_tools();
@@ -90,7 +90,7 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 /// leaf then drops with that child alive and possibly in it: it must be killed through, not left
 /// running in a leaked leaf.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -200,7 +200,7 @@ fn drive_until_reaped(
 /// left running out of reach — tokio can drop a child it forked and return no pid. Here the seam
 /// forces that failure under a tree walk, which holds no leaf.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
     crate::log_capture::install();
     let mut cmd = blocker();
@@ -292,7 +292,7 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// kills and reaps it by its checked pid, and warns about nothing. Only a child that refuses the
 /// kill and is outside its leaf is out of reach, and warned about; it is reaped once it exits.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
     use crate::containment::cgroup::fault as cgroup_fault;
     if !crate::test_support::require_group("CGROUP") {
@@ -346,7 +346,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
 /// verdict first, so it never reaps that child as an abandoned spawn's — which would race tokio's
 /// own reap for the same pid.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -377,7 +377,7 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
 /// retried `rmdir` (see `CgroupLeaf`'s `Drop`), so this is not that exit-lag gap — a leftover here
 /// would mean the retried `rmdir` itself still failed once the leaf drained.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -542,7 +542,7 @@ fn attach_entered_leaf(leaf_path: &std::path::Path) {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     for commit in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -581,7 +581,7 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
 /// releases it like an armed one and re-fires `hard_kill` on the dropping thread. That write has
 /// finished by the time `finish_elevated` returns.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -634,7 +634,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
 ///
 /// Mutant: `finish_elevated` does not wait for the drain after `kill_tree_members_unless_reaped`.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     use crate::containment::cgroup::fault as leaf_fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
@@ -686,7 +686,7 @@ async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
 /// A refused `cgroup.kill` never sets the leaf's `killed`, so the disarmed `Child::drop` that
 /// follows kills nothing again.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -749,7 +749,7 @@ fn failed_write() -> Result<(), Error> {
 /// A `Delegated` spawn has no tree teardown of its own, but its root is still this spawn's child:
 /// a failed password write kills and reaps it.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     fault::set_attachment_override(crate::containment::Attachment {
         containment: crate::containment::Containment::Delegated,
@@ -774,7 +774,7 @@ async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
 
 /// A tree kill that fails does not stop the root's own kill and reap: the two are separate.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unkillable-leaf");
@@ -810,7 +810,7 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
 ///
 /// Mutant: `finish_elevated` runs the tree kill before it learns the root was reaped.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();

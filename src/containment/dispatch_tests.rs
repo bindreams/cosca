@@ -231,7 +231,7 @@ fn sync_kill_tree_backstop_is_load_bearing() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn async_kill_tree_backstop_is_load_bearing() {
     #[cfg(not(target_os = "macos"))]
     use super::super::treewalk::fault;

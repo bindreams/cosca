@@ -39,7 +39,7 @@ async fn foreign_reaped_blocker() -> crate::tokio::Child {
 ///
 /// Mutants: `kill` via tokio's `start_kill` (answers `Err(ESRCH)`); no identity check before the
 /// by-pid send (the log shows `Via::Pid`).
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_tokio_kill_after_a_foreign_reap_sends_nothing() {
     let mut child = foreign_reaped_blocker().await;
     let log = Capture::start();
@@ -74,21 +74,21 @@ fn exited_unreaped_with(identity: impl FnOnce(u64) -> Option<u64>) -> (super::pr
 }
 
 /// Mutant: `reaped_elsewhere` answers `true` for the child's own unreaped zombie.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_a_child_with_its_own_unique_id_is_not_reaped_elsewhere() {
     let (proc, _pid) = exited_unreaped_with(Some);
     assert!(!proc.reaped_elsewhere());
 }
 
 /// Mutant: the unique id is not compared.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_a_pid_with_another_unique_id_is_reaped_elsewhere() {
     let (proc, _pid) = exited_unreaped_with(|real| Some(real ^ 1));
     assert!(proc.reaped_elsewhere());
 }
 
 /// Mutant: a child with no unique id is taken for one that can be verified.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_a_child_with_no_unique_id_is_reaped_elsewhere() {
     let (proc, _pid) = exited_unreaped_with(|_| None);
     assert!(proc.reaped_elsewhere());
@@ -98,7 +98,7 @@ async fn macos_a_child_with_no_unique_id_is_reaped_elsewhere() {
 /// carries the error.
 ///
 /// Mutant: a failed peek is no evidence.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
     use crate::wait::exit_only::seams::force_peek_once;
     crate::log_capture::install();
@@ -138,7 +138,7 @@ fn running_backend_with(held: impl FnOnce(u64) -> u64) -> (super::proc_source::P
 ///
 /// Mutants: `reaped_elsewhere` takes a `Running` peek with an unreadable id, or with a gone one, as
 /// "ours".
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewhere() {
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     for read in [UniqRead::Refused(libc::EPERM), UniqRead::Gone] {
@@ -164,7 +164,7 @@ async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewher
 /// within the first poll. A watch armed anyway leaves the first poll pending.
 ///
 /// Mutants: the watch is armed on a fresh read of the pid; the re-read after arming is missing.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_wait_does_not_watch_a_stranger_that_took_the_pid_after_the_pre_check() {
     use crate::identity::{uniq_fault, ReadPurpose, UniqInfo, UniqRead};
     use std::task::Poll;
@@ -201,7 +201,7 @@ async fn macos_wait_does_not_watch_a_stranger_that_took_the_pid_after_the_pre_ch
 /// cannot be shown to be ours (here: no unique id) to the OS rather than to tokio's by-pid reap.
 ///
 /// Mutant: the implicit drop releases tokio's `Child` whatever the handle shows.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_dropping_a_backend_implicitly_forgets_a_child_with_no_unique_id() {
     let child = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new("sleep")
@@ -233,7 +233,7 @@ async fn macos_dropping_a_backend_implicitly_forgets_a_child_with_no_unique_id()
 /// dropped, so tokio's by-pid reap never runs.
 ///
 /// Mutant: the drop does not forget.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_drop_after_a_foreign_reap_forgets_tokios_child() {
     let child = foreign_reaped_blocker().await;
     let root = super::drop_fault::record();
@@ -249,7 +249,7 @@ async fn macos_drop_after_a_foreign_reap_forgets_tokios_child() {
 /// nothing by pid.
 ///
 /// Mutant: `kill`'s `Ok` for a gone child is read as "terminated".
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn macos_finish_elevated_after_a_foreign_reap_does_not_claim_a_termination() {
     let child = foreign_reaped_blocker().await;
 

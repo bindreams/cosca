@@ -81,7 +81,7 @@ fn assert_write_peer_saw_epipe(mut peer: std::io::PipeWriter) {
     );
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn fd_read_end_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
@@ -98,7 +98,7 @@ async fn fd_read_end_warns_returns_none_and_closes_the_end_on_a_failed_conversio
     assert_read_peer_saw_eof(peer);
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
@@ -115,7 +115,7 @@ async fn fd_write_end_warns_returns_none_and_closes_the_end_on_a_failed_conversi
     assert_write_peer_saw_epipe(peer);
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();
@@ -136,7 +136,7 @@ async fn take_owned_out_warns_returns_none_and_closes_the_end_on_a_failed_conver
     assert_read_peer_saw_eof(peer);
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn take_owned_in_warns_returns_none_and_closes_the_end_on_a_failed_conversion() {
     let _no_fork = crate::child::spawn::spawn_lock();
     crate::log_capture::install();

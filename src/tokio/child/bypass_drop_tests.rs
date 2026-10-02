@@ -123,7 +123,7 @@ fn force_evidence() -> impl Sized {
 
 /// Mutant: no forget in the bypass branches. tokio's in-drop `try_wait` then reaps the zombie, and
 /// the test's own reap gets `ECHILD`.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn tokio_bypass_drop_of_a_detached_child_after_a_foreign_reap_reaps_nothing() {
     let (mut child, witness) = exited_unreaped(true);
     child.detach();
@@ -138,7 +138,7 @@ async fn tokio_bypass_drop_of_a_detached_child_after_a_foreign_reap_reaps_nothin
 ///
 /// Mutants: no forget in the refused-kill branch (the zombie is reaped by pid: `ECHILD`); the
 /// `is_reaped` check dropped there (a false "left running" warning).
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -203,7 +203,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 /// Evidence that the child was reaped elsewhere.
 ///
 /// Mutant: no forget in `reap_now`'s refused-kill arm (tokio's drop reaps the zombie by pid).
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     reap_now_after_a_refused_kill(|| Box::new(force_evidence()));
 }
@@ -211,7 +211,7 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
 /// A failed look cannot show the child is ours, so the arm forgets it too.
 ///
 /// Mutant: a failed look counts as ours.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_failed_look_reaps_nothing() {
     reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Err(std::io::Error::other("forced peek failure 6e2a")))));
 }
@@ -220,7 +220,7 @@ async fn reap_now_after_a_refused_kill_and_a_failed_look_reaps_nothing() {
 /// own are `waitpid`s by pid.
 ///
 /// Mutants: `ProcSource::try_wait` or `wait` go to tokio without looking at the handle.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn try_wait_after_a_foreign_reap_takes_nothing() {
     let (mut child, witness) = exited_unreaped(false);
     let _evidence = force_evidence();
@@ -232,7 +232,7 @@ async fn try_wait_after_a_foreign_reap_takes_nothing() {
     witness.reap().expect("try_wait must not have reaped the child by pid");
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn wait_after_a_foreign_reap_takes_nothing() {
     let (mut child, witness) = exited_unreaped(false);
     let _evidence = force_evidence();
@@ -249,7 +249,7 @@ async fn wait_after_a_foreign_reap_takes_nothing() {
 /// forgotten, so a later call can still answer.
 ///
 /// Mutants: the answer is `ECHILD`; the child is forgotten.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
     let (mut child, witness) = exited_unreaped(false);
     let backend_drops = super::fault::count_backend_drops();
@@ -276,7 +276,7 @@ async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
 
 /// `finish_elevated`'s refused-kill arm forgets a child shown reaped elsewhere (`forget_if_foreign`,
 /// as `Drop`'s and `reap_now`'s refused-kill arms do) before its `try_wait`, a `waitpid` by pid.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let (child, witness) = exited_unreaped(true);
     let _evidence = force_evidence();
@@ -296,7 +296,7 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
 /// logger that panics there unwinds out of the drop with tokio's `Child` held; the backend's own
 /// drop must forget it, since its handle shows the root reaped, rather than hand it to tokio's
 /// by-pid reap.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by_pid() {
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
@@ -328,7 +328,7 @@ async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by
 /// ours), `try_wait`s, then warns "could not be terminated on drop". A logger that panics there
 /// unwinds out of `Drop` before it releases the backend, and the backend's own drop must still hand
 /// a child its handle shows ours to tokio's drop and its orphan queue.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() {
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
@@ -359,7 +359,7 @@ async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() 
 /// As above, but stdin is tokio's own pipe and was never taken. The unwind must close this
 /// process's end of it, or a child reading stdin to EOF never exits. The end is recorded by its
 /// descriptor, which stays closed in this single-threaded test.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
     use std::os::fd::AsRawFd;
     crate::log_capture::install();
