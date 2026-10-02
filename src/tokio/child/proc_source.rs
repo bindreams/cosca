@@ -278,19 +278,8 @@ impl ProcSource {
                 if !still_ours(child) {
                     return Waited::Exited;
                 }
-                // No unique id: the child was already reaped when it was read, so the pid names
-                // nothing of ours and is never waited on.
-                let Some(identity) = identity else {
-                    return Waited::Foreign;
-                };
-                match exit_only::peek(&Target::pid(pid, Some(*identity))) {
-                    Ok(Peek::Foreign(_)) => return Waited::Foreign,
-                    Ok(Peek::Running | Peek::Exit(_)) => {}
-                    Err(e) => {
-                        log::warn!("wait_and_reap: peek at child {pid} failed: {e}");
-                        return Waited::Foreign;
-                    }
-                }
+                // MUTANT M-wait: no peek and no None check before the by-pid wait.
+                let _ = (exit_only::peek, identity);
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
                 wait_on_pid(pid)
@@ -378,15 +367,8 @@ impl ProcSource {
                     )
             }
             #[cfg(target_os = "macos")]
-            // No unique id: the child was already reaped when it was read, which is evidence.
-            ProcSource::Tokio { child, identity } => child.id().is_some_and(|pid| {
-                identity.is_none_or(|identity| {
-                    matches!(
-                        exit_only::peek(&exit_only::Target::pid(pid, Some(identity))),
-                        Ok(Peek::Foreign(_))
-                    )
-                })
-            }),
+            // MUTANT M-forget: no evidence is ever found on macOS.
+            ProcSource::Tokio { .. } => false,
         };
         if evident {
             self.forget_foreign();

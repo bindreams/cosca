@@ -442,7 +442,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         prepared.settle_verdict(pid);
         // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
         // warning naming it, and left running.
-        proc.reap_now(pid);
+        // MUTANT M-spawn: no teardown through the backend; it drops normally.
         return Err(crate::signal::identity_unreadable(pid, errno));
     }
     #[cfg(test)]
