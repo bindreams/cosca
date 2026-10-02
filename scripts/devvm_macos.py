@@ -29,11 +29,13 @@ AGENT_BOOT_TIMEOUT_SECONDS = 600
 VM_PREFIX = "devvm-macos-"
 MAX_CONCURRENT_VMS = 2
 GUEST_TREE = "~/cosca"
+CHECKPOINTS = ("start", "claimed", "locked", "counted", "cloned", "booted", "unlocked", "archived", "provisioned")
 PROVISION_SCRIPT = "scripts/devvm/provision/macos-rust.sh"
-# Guest side of `fetch`: expands a leading `~/` in the guest, then tars the path.
+# Guest side of `fetch`: expands a leading `~/` in the guest, then tars the path. The `./` keeps the
+# name from being read as an option (`-x`) or, by bsdtar, as "copy entries from this archive" (`@x`).
 FETCH_SCRIPT = (
     'p=$1; case "$p" in "~/"*) p="$HOME/${p#"~/"}";; esac; '
-    'p=${p%/}; exec tar -c -C "$(dirname "$p")" -- "$(basename "$p")"'
+    'p=${p%/}; exec tar -c -C "$(dirname "$p")" "./$(basename "$p")"'
 )
 
 
@@ -88,9 +90,9 @@ def count_running(vms: list[dict]) -> int:
 def check_cap(running: int) -> None:
     if running >= MAX_CONCURRENT_VMS:
         raise CapExceeded(
-            f"{running} macOS VMs are already running on this Mac; Apple's licence allows at most "
-            f"{MAX_CONCURRENT_VMS} concurrently. Destroy one first (`devvm.py destroy macos-arm64` "
-            "in the worktree that owns it, or `tart list`)."
+            f"{running} Tart VMs are already running on this Mac (every local VM is counted, Linux ones "
+            f"included); Apple's licence allows at most {MAX_CONCURRENT_VMS} macOS VMs concurrently. "
+            "Destroy one first (`devvm.py destroy macos-arm64` in the worktree that owns it, or `tart list`)."
         )
 
 
@@ -152,60 +154,71 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+class Cancelled(BaseException):
+    """A signal asked `up` or `destroy` to stop; raised only at cancellation points and in blocking waits."""
+
+    def __init__(self, signo: int):
+        super().__init__(signal.Signals(signo).name)
+        self.signo = signo
+
+
+class SignalGate:
+    """Records SIGINT, SIGTERM and SIGHUP instead of letting them interrupt control flow.
+
+    Control flow sees a signal only at explicit `check()` calls, and inside `interruptible()`
+    regions (the blocking waits), where the handler raises `Cancelled` so the wait ends at once.
+    Signals the process inherited as ignored (`nohup`, a backgrounded non-interactive shell) stay ignored.
+    """
+
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+        self._raising = False
+        self._old: dict[int, object] = {}
+
+    def __enter__(self) -> SignalGate:
+        for sig in self.SIGNALS:
+            if signal.getsignal(sig) is not signal.SIG_IGN:
+                self._old[sig] = signal.signal(sig, self._handle)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for sig, handler in self._old.items():
+            signal.signal(sig, handler)
+
+    def _handle(self, signo: int, _frame) -> None:
+        self.pending.append(signo)
+        if self._raising:
+            self._raising = False  # one raise per region
+            raise Cancelled(signo)
+
+    def check(self) -> None:
+        if self.pending:
+            raise Cancelled(self.pending[0])
+
+    @contextlib.contextmanager
+    def interruptible(self):
+        self._raising = True  # before the check, so a signal landing in between is not missed
+        try:
+            self.check()
+            yield
+        finally:
+            self._raising = False
+
+
 @contextlib.contextmanager
-def _flock(path: Path, waiting_for: str):
+def _flock(path: Path, waiting_for: str, gate: SignalGate | None = None):
+    """Hold an exclusive flock; the wait is interruptible by a signal only if a gate is given."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(f"devvm: waiting for {waiting_for}...", file=sys.stderr)
-            fcntl.flock(f, fcntl.LOCK_EX)
+            with gate.interruptible() if gate else contextlib.nullcontext():
+                fcntl.flock(f, fcntl.LOCK_EX)
         yield
-
-
-@contextlib.contextmanager
-def _signals_raise():
-    """SIGTERM and SIGHUP raise SystemExit, so `up`'s cleanup runs like it does for Ctrl-C."""
-
-    def handler(signum, _frame):
-        raise SystemExit(128 + signum)
-
-    old = {s: signal.signal(s, handler) for s in (signal.SIGTERM, signal.SIGHUP)}
-    try:
-        yield
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
-
-
-class _Deferred:
-    def __init__(self) -> None:
-        self.pending: list[int] = []
-
-    def reraise(self) -> None:
-        """Raise what the deferred signal would have raised; a no-op if none arrived."""
-        if self.pending:
-            if self.pending[0] == signal.SIGINT:
-                raise KeyboardInterrupt
-            raise SystemExit(128 + self.pending[0])
-
-
-@contextlib.contextmanager
-def _signals_deferred():
-    """Hold SIGTERM, SIGHUP and SIGINT until the block ends, so cleanup runs to completion.
-
-    The caller decides whether to `reraise()` afterwards; cleanup run from an exception handler
-    does not, so the original error wins.
-    """
-    d = _Deferred()
-    sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-    old = {s: signal.signal(s, lambda signum, _frame: d.pending.append(signum)) for s in sigs}
-    try:
-        yield d
-    finally:
-        for sig, handler in old.items():
-            signal.signal(sig, handler)
 
 
 # Tart runner (the test seam) ==========================================================
@@ -224,7 +237,13 @@ class Tart:
         return cmd
 
     def vms(self) -> list[dict]:
-        out = subprocess.run(self._cmd(["list", "--format", "json"]), check=True, capture_output=True, text=True)
+        out = subprocess.run(
+            self._cmd(["list", "--format", "json"]),
+            check=True,
+            capture_output=True,
+            text=True,
+            start_new_session=True,  # cleanup's children must not see a terminal Ctrl-C
+        )
         return json.loads(out.stdout)
 
     def clone(self, src: str, name: str) -> int:
@@ -240,10 +259,10 @@ class Tart:
             )
 
     def stop(self, name: str) -> int:
-        return subprocess.run(self._cmd(["stop", name])).returncode
+        return subprocess.run(self._cmd(["stop", name]), start_new_session=True).returncode
 
     def delete(self, name: str) -> int:
-        return subprocess.run(self._cmd(["delete", name])).returncode
+        return subprocess.run(self._cmd(["delete", name]), start_new_session=True).returncode
 
     def _exec_cmd(self, name: str, args: list[str], stdin) -> list[str]:
         return self._cmd(["exec", *(["-i"] if stdin is not None else []), name, *args])
@@ -273,8 +292,8 @@ class MacosBackend:
         self.repo_root = repo_root
         self.sdir = state_root / GUEST_NAME
         self._proc: subprocess.Popen | None = None  # the `tart run` child `up` owns
-        self._claimed = False
-        self._clone_attempted = False
+        self._gate: SignalGate | None = None
+        self._claimed = self._clone_attempted = self._cleaned = self._done = False
 
     @property
     def tart(self) -> Tart:
@@ -316,15 +335,26 @@ class MacosBackend:
             tmp.unlink(missing_ok=True)
 
     def _clear_state(self) -> None:
-        with _signals_deferred():
-            for f in (self._claim_file, self._identity_file):
-                f.unlink(missing_ok=True)
+        for f in (self._claim_file, self._identity_file):
+            f.unlink(missing_ok=True)
 
-    def _worktree_lock(self):
-        return _flock(self.sdir / "lock", "another devvm command in this worktree")
+    def _worktree_lock(self, *, interruptible: bool):
+        return _flock(self.sdir / "lock", "another devvm command in this worktree", self._gate if interruptible else None)
 
-    def _cap_lock(self):
-        return _flock(self.tart.home / "devvm-cap.lock", "the host-wide macOS VM lock (another `up` is running)")
+    def _cap_lock(self, *, interruptible: bool):
+        return _flock(
+            self.tart.home / "devvm-cap.lock",
+            "the host-wide macOS VM lock (another `up` is running)",
+            self._gate if interruptible else None,
+        )
+
+    def _interruptible(self):
+        return self._gate.interruptible() if self._gate else contextlib.nullcontext()
+
+    def _checkpoint(self, label: str) -> None:
+        assert label in CHECKPOINTS, label
+        if self._gate:
+            self._gate.check()
 
     def _require_vm(self) -> str:
         name = self._read_claim()
@@ -359,26 +389,36 @@ class MacosBackend:
 
     def _teardown(self, name: str) -> None:
         """Remove a VM `up` created. Never raises, so the original error survives; keeps the state on failure."""
-        with _signals_deferred():
-            try:
-                existed = name in self._names()
-                problem = self._remove_vm(name, self._proc)
-            except Exception as e:  # noqa: BLE001
-                existed, problem = True, repr(e)
-            if problem is None:
-                self._clear_state()
-                if existed:
-                    print(f"devvm: removed VM {name}", file=sys.stderr)
-            else:
-                print(
-                    f"devvm: could not remove VM {name}: {problem}. State kept; run `devvm.py destroy macos-arm64`.",
-                    file=sys.stderr,
-                )
+        try:
+            existed = name in self._names()
+            problem = self._remove_vm(name, self._proc)
+        except Exception as e:  # noqa: BLE001
+            existed, problem = True, repr(e)
+        if problem is None:
+            self._clear_state()
+            if existed:
+                print(f"devvm: removed VM {name}", file=sys.stderr)
+        else:
+            print(
+                f"devvm: could not remove VM {name}: {problem}. State kept; run `devvm.py destroy macos-arm64`.",
+                file=sys.stderr,
+            )
 
-    def _teardown_locked(self, name: str) -> None:
-        with _signals_deferred():  # includes the wait for the cap lock
-            with self._cap_lock():
+    def _cleanup(self, name: str, *, lock_held: bool) -> None:
+        """Undo whatever `up` created, once. Signals are only recorded here, so it cannot be cut short."""
+        if self._done or self._cleaned or not self._claimed:
+            return
+        self._cleaned = True
+        try:
+            if not self._clone_attempted:  # no VM exists: the claim must not wedge the worktree
+                self._clear_state()
+            elif lock_held:
                 self._teardown(name)
+            else:
+                with self._cap_lock(interruptible=False):
+                    self._teardown(name)
+        except Exception as e:  # noqa: BLE001
+            print(f"devvm: cleanup of {name} failed: {e!r}. Run `devvm.py destroy macos-arm64`.", file=sys.stderr)
 
     # up --------------------------------------------------------------------------
 
@@ -403,43 +443,55 @@ class MacosBackend:
             )
             sys.exit(1)
         name = new_vm_name()
-        try:
-            with _signals_raise(), self._worktree_lock():
-                self._up_claimed(name, sha, bool(getattr(args, "rosetta", False)))
-        except (AlreadyUp, UpError) as e:
-            print(f"error: {e}", file=sys.stderr)
-            sys.exit(1)
+        self._proc = None
+        self._claimed = self._clone_attempted = self._cleaned = self._done = False
+        error = cancelled = None
+        with SignalGate() as gate:
+            self._gate = gate
+            try:
+                with self._worktree_lock(interruptible=True):
+                    try:
+                        self._up_steps(name, sha, bool(getattr(args, "rosetta", False)))
+                    finally:
+                        self._cleanup(name, lock_held=False)
+            except Cancelled as c:
+                cancelled = c.signo
+            except (AlreadyUp, UpError) as e:
+                error = str(e)
+            pending = list(gate.pending)
+        self._gate = None
+        if error is not None:
+            print(f"error: {error}", file=sys.stderr)
+            sys.exit(128 + pending[0] if pending else 1)
+        if cancelled is not None:
+            print(f"devvm: interrupted by {signal.Signals(cancelled).name}", file=sys.stderr)
+            sys.exit(128 + cancelled)
         print(f"note: {name} is up; source from `git archive {sha}` is at {GUEST_TREE} (committed state only).")
 
-    def _up_claimed(self, name: str, sha: str, rosetta: bool) -> None:
-        self._proc = None
-        self._claimed = self._clone_attempted = False
-        try:
-            with _signals_deferred() as deferred:
-                self._claim(name)
-                self._claimed = True
-            deferred.reraise()  # a signal that landed during the claim still cleans it up, below
-            self._up_locked(name, sha, rosetta)
-        except BaseException:
-            if self._claimed and not self._clone_attempted:  # no VM exists: the claim must not wedge the worktree
-                self._clear_state()
-            raise
-
-    def _up_locked(self, name: str, sha: str, rosetta: bool) -> None:
-        with self._cap_lock():
+    def _up_steps(self, name: str, sha: str, rosetta: bool) -> None:
+        cp = self._checkpoint
+        cp("start")
+        self._claim(name)
+        self._claimed = True
+        cp("claimed")
+        with self._cap_lock(interruptible=True):
             try:
+                cp("locked")
                 self._acquire_cap_slot(name)
+                cp("counted")
                 self._create_vm(name)
+                cp("cloned")
                 self._boot(name)
+                cp("booted")
             except BaseException:
-                if self._clone_attempted:
-                    self._teardown(name)
+                self._cleanup(name, lock_held=True)
                 raise
-        try:
-            self._stage(name, sha, rosetta)
-        except BaseException:
-            self._teardown_locked(name)
-            raise
+        cp("unlocked")
+        self._archive_into_guest(name, sha)
+        cp("archived")
+        self._provision(name, rosetta)
+        cp("provisioned")
+        self._done = True
 
     def _acquire_cap_slot(self, name: str) -> None:
         vms = self.tart.vms()
@@ -464,22 +516,22 @@ class MacosBackend:
     def _wait_for_agent(self, name: str, proc: subprocess.Popen, log: Path) -> None:
         # `tart ip --wait` can return before `tart run` registers the VM, so readiness is the first exec that answers.
         deadline = time.monotonic() + AGENT_BOOT_TIMEOUT_SECONDS
-        while True:
-            if self.tart.exec(name, ["true"], capture_output=True).returncode == 0:
-                return
-            if proc.poll() is not None:
-                raise UpError(f"`tart run` for {name} exited ({proc.returncode}); see {log}")
-            if time.monotonic() >= deadline:
-                raise UpError(
-                    f"the guest {name} did not answer within {AGENT_BOOT_TIMEOUT_SECONDS}s of starting "
-                    f"(boot hang, or an image without the Tart guest agent); see {log}"
-                )
-            time.sleep(1)
+        with self._interruptible():
+            while True:
+                if self.tart.exec(name, ["true"], capture_output=True).returncode == 0:
+                    return
+                if proc.poll() is not None:
+                    raise UpError(f"`tart run` for {name} exited ({proc.returncode}); see {log}")
+                if time.monotonic() >= deadline:
+                    raise UpError(
+                        f"the guest {name} did not answer within {AGENT_BOOT_TIMEOUT_SECONDS}s of starting "
+                        f"(boot hang, or an image without the Tart guest agent); see {log}"
+                    )
+                time.sleep(1)
 
-    def _stage(self, name: str, sha: str, rosetta: bool) -> None:
-        self._archive_into_guest(name, sha)
+    def _provision(self, name: str, rosetta: bool) -> None:
         # Streamed from THIS checkout: an older --rev may predate the script.
-        with open(self.repo_root / PROVISION_SCRIPT, "rb") as script:
+        with open(self.repo_root / PROVISION_SCRIPT, "rb") as script, self._interruptible():
             r = self.tart.exec(
                 name,
                 ["bash", "-c", 'bash -s -- "$HOME/cosca" "$@"', "_", *(["--rosetta"] if rosetta else [])],
@@ -494,12 +546,19 @@ class MacosBackend:
             stdout=subprocess.PIPE,
         )
         assert git.stdout is not None
-        untar = self.tart.exec(
-            name,
-            ["sh", "-c", f"rm -rf {GUEST_TREE} && mkdir -p {GUEST_TREE} && tar -x -C {GUEST_TREE}"],
-            stdin=git.stdout,
-        )
-        git.stdout.close()
+        try:
+            with self._interruptible():
+                untar = self.tart.exec(
+                    name,
+                    ["sh", "-c", f"rm -rf {GUEST_TREE} && mkdir -p {GUEST_TREE} && tar -x -C {GUEST_TREE}"],
+                    stdin=git.stdout,
+                )
+        except BaseException:
+            git.kill()
+            git.wait()
+            raise
+        finally:
+            git.stdout.close()
         if git.wait() != 0 or untar.returncode != 0:
             raise UpError(f"copying `git archive {sha}` into the guest failed")
 
@@ -560,7 +619,7 @@ class MacosBackend:
             return "corrupt claim"
         try:
             vms = self.tart.vms()
-        except (RuntimeError, OSError) as e:
+        except Exception as e:  # noqa: BLE001  any failure of `tart list` must not break `list`
             return f"unknown ({name}; {e})"
         for e in vms:
             if e.get("Name") == name:
@@ -568,26 +627,46 @@ class MacosBackend:
         return f"missing ({name})"
 
     def destroy(self, _args: argparse.Namespace) -> None:
-        """Stop and delete this worktree's VM, but only the one this worktree created."""
-        with self._worktree_lock():
-            name = self._read_claim()
-            if name is None:
-                return
-            if not name:
-                print("warning: empty claim file; removing it (no VM is recorded)", file=sys.stderr)
-                self._clear_state()
-                return
-            require_own_name(name)
-            if name not in self._names():
-                print(f"note: VM {name} was already gone", file=sys.stderr)
-                self._clear_state()
-                return
-            self._check_identity(name)
-            problem = self._remove_vm(name, None)
-            if problem is not None:
-                print(f"error: {problem}; leaving state in place", file=sys.stderr)
-                sys.exit(1)
+        """Stop and delete this worktree's VM, but only the one this worktree created.
+
+        A signal cancels the wait for the worktree lock; once past it, destroy finishes what it started.
+        """
+        cancelled = None
+        with SignalGate() as gate:
+            self._gate = gate
+            try:
+                with self._worktree_lock(interruptible=True):
+                    self._destroy_locked()
+            except Cancelled as c:
+                cancelled = c.signo
+            pending = list(gate.pending)
+        self._gate = None
+        if cancelled is not None:
+            print(f"devvm: interrupted by {signal.Signals(cancelled).name} before destroy started", file=sys.stderr)
+            sys.exit(128 + cancelled)
+        if pending:
+            print(f"devvm: interrupted by {signal.Signals(pending[0]).name}, but destroy completed", file=sys.stderr)
+            sys.exit(128 + pending[0])
+
+    def _destroy_locked(self) -> None:
+        name = self._read_claim()
+        if name is None:
+            return
+        if not name:
+            print("warning: empty claim file; removing it (no VM is recorded)", file=sys.stderr)
             self._clear_state()
+            return
+        require_own_name(name)
+        if name not in self._names():
+            print(f"note: VM {name} was already gone", file=sys.stderr)
+            self._clear_state()
+            return
+        self._check_identity(name)
+        problem = self._remove_vm(name, None)
+        if problem is not None:
+            print(f"error: {problem}; leaving state in place", file=sys.stderr)
+            sys.exit(1)
+        self._clear_state()
 
     def _check_identity(self, name: str) -> None:
         """Fail closed: a present VM is touched only if its recorded disk identity matches."""

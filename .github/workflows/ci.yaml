@@ -67,7 +67,7 @@ jobs:
           prek-version: 0.5.3
 
       - name: Test devvm scripts
-        run: python3 -m unittest scripts.devvm_test scripts.devvm_macos_test
+        run: python3 -m unittest scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_tart_test
 
       - name: Test release helper scripts
         shell: bash

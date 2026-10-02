@@ -108,8 +108,8 @@ uv run scripts/devvm.py destroy macos-arm64                           # stop and
 ```
 
 - Each worktree has one guest, a fresh copy-on-write clone of the base; the base is never
-  modified. A failed or interrupted `up` (including SIGTERM and SIGHUP) deletes its clone; if
-  that deletion fails, the state is kept and the message names the VM and points to `destroy`.
+  modified. A failed or interrupted `up` (SIGINT, SIGTERM or SIGHUP, once or repeatedly) deletes its clone and exits 128+signal; a signal
+  ignored on entry (`nohup`) stays ignored. If the deletion fails, the state is kept and the message names the VM and points to `destroy`.
 - `destroy` deletes only the VM this worktree created and refuses anything it cannot verify.
   There is no `halt`: destroy the guest and `up` a new one.
 - At most 2 macOS VMs run at once on a Mac (Apple's licence); `up` counts every running local
@@ -124,7 +124,7 @@ uv run scripts/devvm.py destroy macos-arm64                           # stop and
   `cargo nextest run --target x86_64-apple-darwin`.
 - The base image is pinned by digest; Renovate moves `BASE_IMAGE_DIGEST` in
   `scripts/devvm_macos.py`, after which pull the new digest.
-- Host-side tests: `python3 -m unittest scripts.devvm_macos_test scripts.devvm_test` (run by CI's Lint job).
+- Host-side tests: `python3 -m unittest scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_tart_test` (run by CI's Lint job).
 
 ### `windows-arm64`
 
