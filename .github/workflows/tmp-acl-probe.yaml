@@ -26,8 +26,8 @@ jobs:
         shell: bash
         run: |
           cmd //c set | sort > "$RUNNER_TEMP/env-bash.txt"
-          whoami /priv > "$RUNNER_TEMP/priv-bash.txt"
-          whoami /groups > "$RUNNER_TEMP/groups-bash.txt"
+          /c/Windows/System32/whoami.exe /priv > "$RUNNER_TEMP/priv-bash.txt"
+          /c/Windows/System32/whoami.exe /groups > "$RUNNER_TEMP/groups-bash.txt"
       - name: Diff of the native views
         run: |
           foreach ($k in 'env','priv','groups') {
