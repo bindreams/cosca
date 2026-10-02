@@ -30,11 +30,15 @@ S="$STUB_DIR"; mkdir -p "$S/state"
 cmd=$1; shift
 case "$cmd" in
 list)
+  n=$(cat "$S/list.count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$S/list.count"
+  if [ "$n" = 2 ] && [ -e "$S/block.count" ]; then echo $$ > "$S/exec.pid"; echo count > "$S/fifo"; exec sleep 1000000; fi
   printf '[{"Name":"%s","Source":"OCI","State":"stopped"}' "$BASE"
   for f in "$S"/state/*; do [ -e "$f" ] || continue
     printf ',{"Name":"%s","Source":"local","State":"%s"}' "$(basename "$f")" "$(cat "$f")"; done
   printf ']\n' ;;
-clone) mkdir -p "$TART_HOME/vms/$2"; : > "$TART_HOME/vms/$2/disk.img"; echo stopped > "$S/state/$2" ;;
+clone)
+  if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; exec sleep 1000000; fi
+  mkdir -p "$TART_HOME/vms/$2"; : > "$TART_HOME/vms/$2/disk.img"; echo stopped > "$S/state/$2" ;;
 run) shift; echo running > "$S/state/$1"; echo $$ > "$S/run.pid"; exec sleep 1000000 ;;
 stop) kill "$(cat "$S/run.pid")" 2>/dev/null; echo stopped > "$S/state/$1" ;;
 delete) rm -rf "$TART_HOME/vms/$1" "$S/state/$1" ;;
@@ -168,6 +172,18 @@ class RealTartCancelTests(unittest.TestCase):
                 self.assert_gone_and_reaped(env.pid("exec.pid"))
                 self.assert_gone_and_reaped(env.pid("run.pid"))
 
+    def test_a_signal_while_counting_or_cloning_is_blocked_cancels_and_leaves_no_process_behind(self) -> None:
+        for step in ("count", "clone"):
+            with self.subTest(step=step):
+                env = StubEnv(self)
+                env.block(step)
+                env.signal_when_stub_blocks(signal.SIGTERM)
+                code, err = env.up()
+                self.assertEqual(code, 128 + signal.SIGTERM, err)
+                self.assertEqual(env.vm_states(), [])
+                self.assertFalse((env.state / "macos-arm64" / "vm_name").exists())
+                self.assert_gone_and_reaped(env.pid("exec.pid"))
+
     def test_a_signal_while_provisioning_is_blocked_cancels_and_leaves_no_process_behind(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             with self.subTest(sig=signal.Signals(sig).name):
@@ -237,12 +253,12 @@ class BrokenStreamTests(unittest.TestCase):
             def write(self, _s):
                 raise BrokenPipeError
 
-        saved = sys.stderr
+        saved, broken = sys.stderr, Broken()
         self.addCleanup(setattr, sys, "stderr", saved)
-        sys.stderr = Broken()
+        sys.stderr = broken
         m._say("anything")  # must not raise
+        self.assertIsNot(sys.stderr, broken, "the failing stream was not replaced")
         m._say("again")
-        self.assertIsNot(sys.stderr, saved)
 
 
 if __name__ == "__main__":

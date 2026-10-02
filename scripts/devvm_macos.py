@@ -164,8 +164,6 @@ def _say(message: str, *, file=None) -> None:
         file.flush()
     except (OSError, ValueError):
         # Point the stream at /dev/null, so neither later prints nor the flush at interpreter exit fail.
-        with contextlib.suppress(OSError, ValueError, AttributeError):
-            os.dup2(os.open(os.devnull, os.O_WRONLY), file.fileno())
         null = open(os.devnull, "w")  # noqa: SIM115  lives as long as the process
         if file is sys.stderr:
             sys.stderr = null
