@@ -86,6 +86,14 @@ impl ProcHandle {
         }
     }
 
+    /// [`kill`](ProcHandle::kill), reporting whether a signal was sent.
+    #[cfg(unix)]
+    pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
+        match self {
+            ProcHandle::Std(s, _) => s.kill_sent(),
+        }
+    }
+
     /// The OS process id.
     pub(crate) fn id(&self) -> u32 {
         match self {

@@ -38,7 +38,7 @@ pub(super) fn teardown_blocker() -> (Command, fault::TeardownBlocker) {
 
 /// [`blocker`] whose stdin writer the caller keeps: for a test where only its own kill may end
 /// the child.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn blocker_with_held_stdin() -> (Command, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -999,4 +999,77 @@ fn adopt_on_a_refused_identity_read_is_unassessable_and_tears_the_child_down() {
     }
     fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
     teardown.assert_killed();
+}
+
+/// A foreign-reaped child was never signalled, so the teardown error says it could not be terminated, not that it was killed.
+///
+/// Mutant: `kill`'s `Ok` for a gone child is read as "killed" (the detail says "killed but could not
+/// be reaped (ECHILD)"), or the `Gone` outcome falls into the `Err` arm.
+#[cfg(unix)]
+#[test]
+fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
+    let (mut cmd, writer) = blocker_with_held_stdin();
+    let child = cmd.spawn().expect("spawn");
+    foreign_reap(&child, writer);
+
+    let detail = finish_elevated_detail(child);
+    assert!(detail.contains("could not be terminated"), "{detail}");
+    assert!(detail.contains("it was already reaped"), "{detail}");
+    assert!(!detail.contains("was killed"), "{detail}");
+}
+
+/// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
+/// group number may name another group by now, and the error says the tree kill was skipped.
+///
+/// Mutant: `finish_elevated` runs `hard_kill_marking` before it learns the root was reaped.
+#[cfg(unix)]
+#[test]
+fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    let recorder = crate::containment::unix::fault::record_kill_group();
+    let (mut cmd, writer) = blocker_with_held_stdin();
+    cmd.contain_with(crate::containment::ContainMode::Session);
+    let child = cmd.spawn().expect("spawn");
+    assert!(
+        child.attached.carries_recyclable_pgid(),
+        "the test needs a number-named group kill"
+    );
+    foreign_reap(&child, writer);
+
+    let detail = finish_elevated_detail(child);
+    assert_eq!(
+        recorder.killed(),
+        Vec::<i32>::new(),
+        "a reaped root's group number may name another group: no killpg ({detail})"
+    );
+    assert!(detail.contains("process group"), "{detail}");
+    assert!(detail.contains("already reaped"), "{detail}");
+}
+
+/// End `child` and reap it behind its handle's back, as an application that owns SIGCHLD would.
+#[cfg(unix)]
+fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
+    let pid = child.id().pid();
+    drop(writer);
+    crate::test_child::wait_until_zombie(pid);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own zombie child.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+}
+
+/// The `detail` of the error `finish_elevated` returns for `child` after a failed password write.
+#[cfg(unix)]
+fn finish_elevated_detail(child: crate::Child) -> String {
+    let err = super::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("the spawn fails");
+    let Error::Elevation { detail, .. } = err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    detail
 }

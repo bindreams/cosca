@@ -521,6 +521,54 @@ fn kill_after_the_reap_sends_nothing() {
     assert_eq!(exit_seams::signals_sent(), 0);
 }
 
+/// `kill_sent` on a child someone else reaped reports `Gone`.
+///
+/// Mutant: `kill_sent` reports `Delivered` for a child reaped behind the handle's back.
+#[cfg(unix)]
+#[test]
+fn kill_sent_after_a_foreign_reap_is_gone() {
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let mut status = 0;
+    // SAFETY: the blocker is this test's own zombie child; this reaps it behind the handle's back.
+    let reaped = unsafe { libc::waitpid(b.shared.id() as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, b.shared.id() as libc::pid_t, "{}", io::Error::last_os_error());
+    assert_eq!(
+        b.shared.kill_sent().expect("a foreign-reaped child is success"),
+        crate::signal::Sent::Gone
+    );
+}
+
+/// `kill_sent` after our own reap (`State::E`) reports `Gone` and sends nothing.
+///
+/// Mutant: `kill_sent` reports `Delivered`, or signals, after `E`.
+#[cfg(unix)]
+#[test]
+fn kill_sent_after_our_own_reap_is_gone() {
+    let mut b = Blocker::spawn();
+    b.end_child();
+    b.shared.wait().expect("wait");
+    exit_seams::signals_sent();
+    assert_eq!(
+        b.shared.kill_sent().expect("an already-reaped child is success"),
+        crate::signal::Sent::Gone
+    );
+    assert_eq!(exit_seams::signals_sent(), 0);
+}
+
+/// `kill_sent` on a live child reports `Delivered`.
+///
+/// Mutant: `kill_sent` reports `Gone` for a live child.
+#[cfg(unix)]
+#[test]
+fn kill_sent_on_a_live_child_is_delivered() {
+    let b = Blocker::spawn();
+    assert_eq!(
+        b.shared.kill_sent().expect("kill a live child"),
+        crate::signal::Sent::Delivered
+    );
+}
+
 // L8: an unreadable consuming record =====
 
 /// L8: a consuming reap that hands back a record that is not an exit is cached as

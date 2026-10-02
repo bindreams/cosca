@@ -216,6 +216,14 @@ impl Child {
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
 
+    /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
+    #[cfg(unix)]
+    pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
+        self.proc
+            .kill_sent()
+            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+    }
+
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
     /// (errors `Unsupported` otherwise — use `kill()` for a lone process).
     ///

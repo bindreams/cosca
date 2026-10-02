@@ -88,19 +88,37 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// The reap follows the ROOT's kill alone. A tree kill can fail (a setuid member refusing the
 /// signal) while the root dies, and a killed root must be waited for, or it stays a zombie. A
 /// failed root kill (e.g. `Unkillable`) cannot be waited for, so it gets a non-blocking
-/// `try_wait` and the note that it may still be running.
+/// `try_wait` and the note that it may still be running. A root already reaped (`Sent::Gone`) is
+/// neither waited on nor `try_wait`ed, and is reported as "could not be terminated (it was already
+/// reaped)".
+///
+/// A reaped root's number may name another process by now, so the tree kill is skipped when it
+/// would name the tree by that number (a process group, a ppid walk), and the note says so.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let tree = child
-        .containment()
-        .can_teardown()
-        .then(|| child.attached.hard_kill_marking(&child.tree_killed));
-    let tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
-    let root_note = match child.kill() {
-        Ok(()) => {
+    let view = crate::containment::DropView::read(child.id, child.proc.has_reaped(), &child.tree_killed);
+    let mut skipped = None;
+    let tree = child.containment().can_teardown().then(|| {
+        child
+            .attached
+            .hard_kill_marking_unless_reaped(view, &child.tree_killed)
+            .map(|s| skipped = s)
+    });
+    let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
+    if let Some(action) = skipped {
+        tree_note.push_str(&format!(
+            "; its contained tree was not killed: the root was already reaped, so its number may name another \
+             process, and the kill would {action}"
+        ));
+    }
+    let root_note = match child.kill_sent() {
+        Ok(crate::signal::Sent::Gone) => {
+            "the elevated child could not be terminated (it was already reaped)".to_string()
+        }
+        Ok(crate::signal::Sent::Delivered) => {
             #[cfg(test)]
             fault::run_between_kill_and_wait();
             match wait_killed_elevated(&child) {
