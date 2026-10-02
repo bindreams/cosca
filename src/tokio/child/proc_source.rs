@@ -35,7 +35,11 @@ pub(crate) enum Waited {
 pub(crate) enum ProcSource {
     /// A `::tokio::process::Child` (the default path), with what names the process for good.
     Tokio {
-        child: ::tokio::process::Child,
+        /// Never dropped implicitly: a drop of this backend, unwinding included, leaks tokio's
+        /// `Child` rather than letting its drop reap by pid a child that may not be ours. It is
+        /// released only by [`ProcSource::release`], which the paths that have verified the child
+        /// is ours call; every other path forgets it.
+        child: std::mem::ManuallyDrop<::tokio::process::Child>,
         /// The pidfd the spawn handshake opened while the child was held before `exec`. It names
         /// this process for good, so a signal through it cannot reach a process that later reuses
         /// the pid.
@@ -47,10 +51,6 @@ pub(crate) enum ProcSource {
         /// either way nothing shows the pid names this child, and it is acted on never.
         #[cfg(target_os = "macos")]
         identity: Option<u64>,
-        /// Counts this backend's drop, for the tests that pin the hand-off to tokio's orphan queue
-        /// (`fault::count_backend_drops`). A forgotten backend is not counted.
-        #[cfg(test)]
-        _counted: super::fault::BackendDrop,
     },
     /// A child something else reaped, or one that cannot be shown to be ours (macOS: no unique id,
     /// or a peek that failed): tokio's `Child` is forgotten, and only the streams it had not yet
@@ -78,10 +78,8 @@ impl ProcSource {
     #[cfg(target_os = "linux")]
     pub(crate) fn new(child: ::tokio::process::Child, pidfd: std::os::fd::OwnedFd) -> ProcSource {
         ProcSource::Tokio {
-            child,
+            child: std::mem::ManuallyDrop::new(child),
             pidfd,
-            #[cfg(test)]
-            _counted: super::fault::BackendDrop::new(),
         }
     }
 
@@ -89,10 +87,8 @@ impl ProcSource {
     #[cfg(target_os = "macos")]
     pub(crate) fn new(child: ::tokio::process::Child, identity: Option<u64>) -> ProcSource {
         ProcSource::Tokio {
-            child,
+            child: std::mem::ManuallyDrop::new(child),
             identity,
-            #[cfg(test)]
-            _counted: super::fault::BackendDrop::new(),
         }
     }
 
@@ -100,9 +96,7 @@ impl ProcSource {
     #[cfg(windows)]
     pub(crate) fn new(child: ::tokio::process::Child) -> ProcSource {
         ProcSource::Tokio {
-            child,
-            #[cfg(test)]
-            _counted: super::fault::BackendDrop::new(),
+            child: std::mem::ManuallyDrop::new(child),
         }
     }
 
@@ -283,27 +277,32 @@ impl ProcSource {
 
     /// Forget the child: tokio's `Child` is leaked, never dropped, because its drop would reap by
     /// pid, and the pid may name another process by now. Its untaken stdio closes, and so does
-    /// cosca's own pidfd. What leaks is tokio's own (see [`forget_reaped_elsewhere`]).
+    /// cosca's own pidfd. What leaks is tokio's own: on Linux its pidfd and its reactor
+    /// registration, on macOS its `SIGCHLD` watch.
     ///
-    /// [`forget_reaped_elsewhere`]: super::forget_reaped_elsewhere
+    /// This is also what dropping a backend does, since tokio's `Child` is held in `ManuallyDrop`:
+    /// only [`release`](ProcSource::release) hands it to tokio's drop.
     #[cfg(unix)]
     pub(crate) fn forget(self) {
-        #[cfg(test)]
-        let ProcSource::Tokio {
-            mut child, _counted, ..
-        } = self
-        else {
-            return;
-        };
-        #[cfg(not(test))]
-        let ProcSource::Tokio { mut child, .. } = self
-        else {
+        let ProcSource::Tokio { mut child, .. } = self else {
             return;
         };
         drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
-        std::mem::forget(child);
-        #[cfg(test)]
-        std::mem::forget(_counted);
+        // `child` is a `ManuallyDrop`: leaving scope leaks tokio's `Child`.
+    }
+
+    /// Hand tokio's `Child` to its own drop, which `try_wait`s once and queues a still-running
+    /// child on the runtime's orphan queue. Only for a child verified to be ours: that drop reaps
+    /// by pid.
+    pub(crate) fn release(self) {
+        match self {
+            ProcSource::Tokio { child, .. } => {
+                #[cfg(test)]
+                super::fault::note_backend_drop();
+                drop(std::mem::ManuallyDrop::into_inner(child));
+            }
+            other => drop(other),
+        }
     }
 
     /// `true` once the backend has collected the child's status, so no reap remains.
@@ -401,8 +400,6 @@ impl ProcSource {
             stdout: streams.1,
             stderr: streams.2,
         };
-        // Forgotten before anything can unwind: a consumer's `Log` impl is untrusted, and a panic
-        // out of it while tokio's `Child` is a live local would drop it and reap by pid.
         std::mem::replace(self, foreign).forget();
         #[cfg(test)]
         super::drop_fault::note_forget();
@@ -439,9 +436,10 @@ impl ProcSource {
     ///
     /// A kill that is refused is not waited on — `EPERM` is a setuid child refusing it and is
     /// reachable without a bug, so it alone is not asserted — and tokio's own `Child` then drops
-    /// into the runtime's orphan reaper. **Invariant:** no `wait()` future for this child is in
-    /// flight when this runs.
-    pub(crate) fn reap_now(&mut self, pid: u32) {
+    /// into the runtime's orphan reaper. Consumes the backend, so every path ends in
+    /// [`release`](ProcSource::release) or [`forget`](ProcSource::forget). **Invariant:** no
+    /// `wait()` future for this child is in flight when this runs.
+    pub(crate) fn reap_now(mut self, pid: u32) {
         crate::bounded::assert_may_block("reap_now");
         #[cfg(test)]
         let forced = crate::child::spawn::fault::take_force_kill_failure();
@@ -454,10 +452,12 @@ impl ProcSource {
             None => self.signal(Sig::Kill),
         };
         if let Err(e) = &killed {
-            // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten, and
-            // before anything logs, since a panicking logger would unwind with tokio's `Child` held.
+            // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten.
             #[cfg(unix)]
             self.forget_if_foreign();
+            // Released before the log and the assertion: a panic from either must not strand a
+            // child that is ours, which tokio's orphan reaper would otherwise never see.
+            self.release();
             log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
             debug_assert!(
                 matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
@@ -471,6 +471,7 @@ impl ProcSource {
         }
         #[cfg(windows)]
         self.wait_and_reap(pid);
+        self.release();
     }
 
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —

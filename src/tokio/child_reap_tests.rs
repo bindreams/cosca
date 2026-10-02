@@ -287,28 +287,21 @@ async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
     assert_eq!(line, "hello\n");
 }
 
-/// A backend that forgets its child must do so before it logs: an untrusted logger that panics
-/// unwinds out of the forget, and a tokio `Child` still in hand would then be dropped, reaping
-/// the child by pid.
+/// Dropping a backend, which is what an unwind does to one, never hands tokio's `Child` to its own
+/// drop: that drop reaps by pid, and only `release` is allowed to run it.
 ///
-/// Mutant: `forget_foreign` logs before it forgets.
+/// Mutant: the `Tokio` variant's `child` is not a `ManuallyDrop`.
 #[cfg(unix)]
 #[tokio::test]
-async fn tokio_forget_foreign_forgets_before_it_logs() {
-    crate::log_capture::install();
+async fn dropping_a_backend_implicitly_does_not_reap_the_child_by_pid() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
-    let mut proc = proc_source(child);
+    let proc = proc_source(child);
     wait_exited_unreaped(pid);
 
-    let unwound = {
-        let _panics = crate::log_capture::panic_on(&format!("child {pid} "));
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| proc.forget_foreign()))
-    };
-    assert!(unwound.is_err(), "the logger must have panicked out of the forget");
+    drop(proc);
 
     reap_behind_the_owner(pid); // still ours to consume: nothing reaped it by pid
-    assert!(proc.is_reaped());
 }
 
 /// Without evidence of a foreign reap nothing is forgotten: a live child stays tokio's.

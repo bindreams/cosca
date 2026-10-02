@@ -145,8 +145,8 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
     witness.reap().expect("the drop must not have reaped the child by pid");
 }
 
-/// `reap_now`'s refused-kill arm gives tokio's drop an unverifiable child: with the evidence a drop's
-/// refused-kill arm honours, it forgets the child instead. A forced attach failure, a refused kill
+/// `reap_now`'s refused-kill arm must not hand tokio's drop a child shown reaped elsewhere: it
+/// forgets it instead. A forced attach failure, a refused kill
 /// and forced `Foreign` evidence, for a child that exited before the identity read.
 ///
 /// Mutant: no forget in `reap_now`'s refused-kill arm (tokio's drop reaps the zombie by pid).
@@ -158,17 +158,21 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     use crate::child::spawn::fault;
 
     let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
+    let evidence: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
         let slot = Rc::clone(&slot);
+        let evidence = Rc::clone(&evidence);
         move || {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
+            // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
+            // would consume it.
+            *evidence.borrow_mut() = Some(Box::new(force_evidence()));
             *slot.borrow_mut() = Some(witness);
         }
     });
     fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
-    let _evidence = force_evidence();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
@@ -176,6 +180,7 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let err = cmd.spawn().err();
 
     fault::set_force_attach_failure(false);
+    drop(evidence);
     assert!(err.is_some(), "the forced attach failure fails the spawn");
     let witness = slot.borrow_mut().take().expect("the hook ran");
     witness
@@ -201,52 +206,27 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
         .expect("finish_elevated's refused-kill arm must not reap the child by pid");
 }
 
-/// `Drop`'s forget branch logs before it forgets. A logger that panics there (the
-/// untrusted `Log` impl `forget_foreign` guards against) unwinds with tokio's `Child` still in hand,
-/// and its drop reaps the child by pid.
+/// A contained root reaped elsewhere: `Drop`'s tree teardown warns that it skips the group kill. A
+/// logger that panics there unwinds out of the drop with tokio's `Child` held; the unwind must
+/// leak it, not reap the child by pid. Holds wherever the log sits, because tokio's `Child` is
+/// never dropped implicitly.
 #[tokio::test(flavor = "current_thread")]
-async fn drop_forgets_before_it_logs() {
+async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by_pid() {
     crate::log_capture::install();
-    let (mut child, witness) = exited_unreaped(true);
-    child.detach();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    let child = cmd.spawn().expect("spawn");
+    let witness = Witness::new(child.id().pid());
+    drop(writer);
+    witness.wait_exited();
     let _evidence = force_evidence();
     let unwound = {
-        let _panics = crate::log_capture::panic_on("was reaped outside its handle; dropping it");
+        let _panics = crate::log_capture::panic_on("the root is already reaped, so this drop does not");
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
     };
     assert!(unwound.is_err(), "the logger must have panicked out of the drop");
     witness.reap().expect("the drop must not have reaped the child by pid");
-}
-
-/// `reap_now`'s refused-kill arm warns before `forget_if_foreign`. A panicking
-/// logger unwinds out of the spawn with the backend in hand, and tokio's drop reaps by pid.
-#[tokio::test(flavor = "current_thread")]
-async fn reap_now_forgets_before_it_warns() {
-    use crate::child::spawn::fault;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    crate::log_capture::install();
-    let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
-    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
-        let slot = Rc::clone(&slot);
-        move || {
-            let witness = Witness::new(fault::spawn_pid());
-            witness.wait_exited();
-            *slot.borrow_mut() = Some(witness);
-        }
-    });
-    fault::set_force_attach_failure(true);
-    fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused 4f", std::io::ErrorKind::PermissionDenied);
-    let _evidence = force_evidence();
-    let mut cmd = Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
-    let unwound = {
-        let _panics = crate::log_capture::panic_on("teardown kill of child");
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.spawn().map(drop)))
-    };
-    fault::set_force_attach_failure(false);
-    assert!(unwound.is_err(), "the logger must have panicked out of the spawn");
-    let witness = slot.borrow_mut().take().expect("the hook ran");
-    witness.reap().expect("reap_now must not have reaped the child by pid");
 }
