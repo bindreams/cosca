@@ -131,8 +131,9 @@ jobs:
   # macOS lint lanes already check their own architecture. This job checks the other one (a test
   # gated on `target_arch` is only seen when the guard compiles for that architecture; the test
   # lanes run both) and runs the guard's self-test on each OS. It is a job of its own because on
-  # Windows the same steps pushed the test job past its bound. skuld's bundled SQLite is C, so a
-  # cross build needs a cross C compiler where the host lacks one.
+  # Windows the same steps pushed the test job past its bound. macOS is not here: macOS runners
+  # are the CI bottleneck, so the darwin/arm64 test lane runs the same steps itself. skuld's
+  # bundled SQLite is C, so a cross build needs a cross C compiler where the host lacks one.
   libtest-guard:
     name: Libtest guard (${{ matrix.os }})
     strategy:
@@ -142,16 +143,12 @@ jobs:
           - os: linux
             runner: ubuntu-latest
             other: aarch64-unknown-linux-gnu
-          - os: darwin
-            runner: macos-latest
-            other: x86_64-apple-darwin
           - os: windows
             runner: windows-latest
             other: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     # Measured on this job: 243 s and 743 s (linux; the slow run spent 8 min in apt-get), 449 and
-    # 615 s (windows), 251 s (darwin). 25 min is 2x the slowest, a failure bound for a hang and
-    # not an expectation.
+    # 615 s (windows). 25 min is 2x the slowest, a failure bound for a hang and not an expectation.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -219,6 +216,9 @@ jobs:
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
             lint: true
+            # The libtest guard also checks this architecture here, not in the libtest-guard job:
+            # macOS runners are the CI bottleneck, so no macOS job is added.
+            guard_target: x86_64-apple-darwin
           - os: darwin
             arch: amd64
             runner: macos-15
@@ -239,7 +239,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Windows/amd64 is the slowest lane. Its measured durations: 549-737 s before the libtest guard
     # ran inside clippy.sh, 868-1105 s with it, 984 s on the latest run. 30 min is 1.63x the
-    # 1105 s maximum; 25 min was 1.36x.
+    # 1105 s maximum; 25 min was 1.36x. darwin/arm64 also runs the libtest guard's other-architecture
+    # and self-test steps (183 s + 35 s measured on a dedicated runner) on top of its 787 s, so about
+    # 1010 s expected; 30 min is 1.8x that. Both lanes share this bound.
     timeout-minutes: 30
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
@@ -253,7 +255,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}${{ matrix.guard_target && format(',{0}', matrix.guard_target) || '' }}
           # see Clippy (feature powerset) step below for why only the
           # matrix.lint lanes get the component
           components: ${{ matrix.lint && 'clippy' || '' }}
@@ -445,6 +447,24 @@ jobs:
         with:
           target: ${{ matrix.target }}
           release: "true"
+
+      # clippy.sh runs the libtest guard for matrix.target; this checks the other architecture
+      # (see the libtest-guard job). The powerset action installed cargo-hack.
+      - name: Libtest guard (other architecture)
+        if: ${{ !cancelled() && matrix.guard_target }}
+        shell: bash
+        env:
+          OTHER: ${{ matrix.guard_target }}
+        run: |
+          .github/scripts/libtest-guard.sh --feature-powerset --target "$OTHER"
+          .github/scripts/libtest-guard.sh --feature-powerset --release --target "$OTHER"
+
+      # Measured on darwin/arm64: 35 s; 3 min is 5x here and the same bound as the libtest-guard job.
+      - name: Test the libtest guard
+        if: ${{ !cancelled() && matrix.guard_target }}
+        shell: bash
+        timeout-minutes: 3
+        run: bash .github/scripts/libtest-guard-tests.sh
 
       # Live cgroup v2 containment tests belong to the CGROUP group: on unless
       # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need
