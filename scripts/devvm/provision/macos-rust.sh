@@ -29,19 +29,19 @@ echo "devvm: $("$CARGO" --version)"
 
 # Same version as CI (NEXTEST_VERSION in .github/workflows/ci.yaml). Prebuilt universal
 # tarball (arm64 + x86_64); compiling nextest from source is too slow for a throwaway VM.
-# SHA-256 is the release asset digest (GitHub API) cross-checked against a downloaded copy.
-NEXTEST_VERSION="0.9.137"
-NEXTEST_SHA256="94e89c20b233c29c042683e885131d76abf95e795c355a4fe7d64d4b128b90be"
+# Tag and checksum share a line so Renovate moves both together.
+NEXTEST_TAG_UNIVERSAL="cargo-nextest-0.9.146" NEXTEST_SHA256_UNIVERSAL="39785160b3c2f6ed9a765049cf4fa79f3b39aa02eb7598a5a0e2a1a0b9ffb9a8"
+NEXTEST_VERSION="${NEXTEST_TAG_UNIVERSAL#cargo-nextest-}"
 INSTALLED="$("$CARGO" nextest --version 2>/dev/null | head -n1 | awk '{print $2}' || true)"
 if [ "$INSTALLED" = "$NEXTEST_VERSION" ]; then
     echo "devvm: cargo-nextest $NEXTEST_VERSION already present, skipping"
 else
     TARBALL="$(mktemp -t nextest).tar.gz"
     curl --proto '=https' --tlsv1.2 -sSf -L -o "$TARBALL" \
-        "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-universal-apple-darwin.tar.gz"
+        "https://github.com/nextest-rs/nextest/releases/download/$NEXTEST_TAG_UNIVERSAL/cargo-nextest-$NEXTEST_VERSION-universal-apple-darwin.tar.gz"
     ACTUAL="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
-    if [ "$ACTUAL" != "$NEXTEST_SHA256" ]; then
-        echo "devvm: cargo-nextest checksum mismatch: expected $NEXTEST_SHA256, got $ACTUAL" >&2
+    if [ "$ACTUAL" != "$NEXTEST_SHA256_UNIVERSAL" ]; then
+        echo "devvm: cargo-nextest checksum mismatch: expected $NEXTEST_SHA256_UNIVERSAL, got $ACTUAL" >&2
         rm -f "$TARBALL"
         exit 1
     fi
