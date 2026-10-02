@@ -40,3 +40,14 @@ jobs:
         working-directory: .github/scripts
         run: |
           REPEAT=10 SUITES="forward_tests.Waiting forward_tests.Relay forward_tests.SpawnWindow" bash probe/run-mutants.sh always-sigwait kq-oneshot
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Root chain, SIGINT to the top
+        run: for _ in 1 2 3; do python3 .github/scripts/probe/e2e.py; done
