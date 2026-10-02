@@ -31,6 +31,27 @@ class GateCase(unittest.TestCase):
     def setUp(self) -> None:
         for sig in SIGNALS:
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        # Whatever a test holds that a wait would block on (a lock, a child's stdin) is released the moment
+        # the code under test is about to block in select. A correct run was already cancelled and never
+        # gets there; a broken wait is released, returns normally and fails the test at once.
+        self.releases: list = []
+        real_select = m.select.select
+
+        def select(*a):
+            while self.releases:
+                self.releases.pop()()
+            return real_select(*a)
+
+        patch = mock.patch.object(m.select, "select", select)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    @staticmethod
+    def close_quietly(fd) -> None:
+        try:
+            os.close(fd) if isinstance(fd, int) else fd.close()
+        except OSError:
+            pass
 
 
 class RunTests(GateCase):
@@ -88,26 +109,28 @@ class RunTests(GateCase):
         r, w = os.pipe()
         order = []
         real_join = threading.Thread.join
+        open_w = [w]
+
+        def close_w() -> None:  # once: a closed fd number may already belong to something else
+            while open_w:
+                os.close(open_w.pop())
 
         def join(thread, *a, **kw):
             order.append("join")
-            try:
-                os.close(w)
-            except OSError:
-                pass
+            close_w()
             return real_join(thread, *a, **kw)
 
+        self.releases.append(close_w)
         with os.fdopen(r, "rb") as stdin, m.SignalGate() as gate:
             kill_self()  # recorded first: the first wait cancels
+            with self.assertRaises(m.Cancelled):
+                gate.check()  # ...and proves it was recorded (else `cat` would block the run below)
             with mock.patch.object(threading.Thread, "join", join), mock.patch.object(
                 m.SignalGate, "on_blocked", staticmethod(lambda: order.append("wait"))
             ):
                 with self.assertRaises(m.Cancelled):
                     gate.run(["cat"], stdin=stdin, capture_output=True)
-        try:
-            os.close(w)
-        except OSError:
-            pass
+        close_w()
         self.assertEqual(order[0], "wait", "the output readers were joined before the wait")
 
     def test_the_child_is_never_signalled_after_it_was_reaped(self) -> None:
@@ -154,6 +177,7 @@ class LockTests(GateCase):
         f = open(tmp_name, "w")
         self.addCleanup(f.close)
         fcntl.flock(f, fcntl.LOCK_EX)
+        self.releases.append(lambda: self.close_quietly(f))
         return f
 
     def lock_is_free(self, path) -> bool:

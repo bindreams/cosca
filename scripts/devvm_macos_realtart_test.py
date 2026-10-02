@@ -31,13 +31,13 @@ cmd=$1; shift
 case "$cmd" in
 list)
   n=$(cat "$S/list.count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$S/list.count"
-  if [ "$n" = 2 ] && [ -e "$S/block.count" ]; then echo $$ > "$S/exec.pid"; echo count > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
+  if [ "$n" = 2 ] && [ -e "$S/block.count" ]; then echo $$ > "$S/exec.pid"; echo count > "$S/fifo"; read x < "$S/release"; exit 0; fi
   printf '[{"Name":"%s","Source":"OCI","State":"stopped"}' "$BASE"
   for f in "$S"/state/*; do [ -e "$f" ] || continue
     printf ',{"Name":"%s","Source":"local","State":"%s"}' "$(basename "$f")" "$(cat "$f")"; done
   printf ']\n' ;;
 clone)
-  if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
+  if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; read x < "$S/release"; exit 0; fi
   mkdir -p "$TART_HOME/vms/$2"; : > "$TART_HOME/vms/$2/disk.img"; echo stopped > "$S/state/$2" ;;
 run) shift; echo running > "$S/state/$1"; echo $$ > "$S/run.pid"; exec sleep 1000000 ;;
 stop) kill "$(cat "$S/run.pid")" 2>/dev/null; echo stopped > "$S/state/$1" ;;
@@ -47,13 +47,13 @@ exec)
   shift
   case "$1" in
   true)
-    if [ -e "$S/block.boot" ]; then echo $$ > "$S/exec.pid"; echo boot > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
+    if [ -e "$S/block.boot" ]; then echo $$ > "$S/exec.pid"; echo boot > "$S/fifo"; read x < "$S/release"; exit 0; fi
     exit 0 ;;
   bash)
-    if [ -e "$S/block.provision" ]; then echo $$ > "$S/exec.pid"; echo provision > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
+    if [ -e "$S/block.provision" ]; then echo $$ > "$S/exec.pid"; echo provision > "$S/fifo"; read x < "$S/release"; exit 0; fi
     cat > /dev/null ;;
   sh)
-    if [ -e "$S/block.archive" ]; then echo $$ > "$S/exec.pid"; echo archive > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
+    if [ -e "$S/block.archive" ]; then echo $$ > "$S/exec.pid"; echo archive > "$S/fifo"; read x < "$S/release"; exit 0; fi
     cat > /dev/null ;;
   *) cat > /dev/null ;;
   esac ;;
@@ -70,6 +70,11 @@ class StubEnv:
         self.stub_dir.mkdir()
         self.fifo = self.stub_dir / "fifo"
         os.mkfifo(self.fifo)
+        release = self.stub_dir / "release"
+        os.mkfifo(release)
+        # Held open for reading and writing by the test: the stub's `read` finds the release whenever it comes.
+        self.release_fd = os.open(release, os.O_RDWR)
+        test.addCleanup(os.close, self.release_fd)
         stub = self.root / "tart"
         stub.write_text(STUB)
         stub.chmod(0o755)
@@ -118,6 +123,9 @@ class StubEnv:
             with open(self.fifo) as f:
                 f.readline()
             os.kill(os.getpid(), sig)
+            # The blocked stub child is released too, so a wait that no signal can cut short returns instead
+            # of blocking. A correct wait was cancelled by the signal, whatever the child then does.
+            os.write(self.release_fd, b"x\n")
 
         thread = threading.Thread(target=wait_then_signal, daemon=True)
         thread.start()
