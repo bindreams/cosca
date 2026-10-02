@@ -65,6 +65,15 @@ pub(crate) use attach::{attach_settled, settled_stop, AttachError};
 
 const DEFAULT_MARKER: &str = "@@cosca-uh@@";
 
+thread_local! {
+    /// This thread's helpers launched and not yet reaped.
+    static UNREAPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn unreaped_helpers() -> usize {
+    UNREAPED.get()
+}
+
 /// What the helper does once the traced tracee exits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -240,6 +249,9 @@ struct Session {
     finished: bool,
     /// Holds the signed copy the helper runs from; removed after the helper is reaped.
     _exe_dir: tempfile::TempDir,
+    /// `!Send`: [`UNREAPED`] counts per thread, so the helper is reaped on the thread that
+    /// launched it.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Session {
@@ -279,6 +291,11 @@ impl Session {
             }
         }
         let status = self.helper.wait().expect("reap the tracer helper");
+        debug_assert!(
+            UNREAPED.get() > 0,
+            "the tracer helper was reaped on a thread that did not launch it"
+        );
+        UNREAPED.set(UNREAPED.get() - 1);
         if let Some(state) = stuck {
             if !panicking {
                 panic!(
@@ -348,6 +365,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
     // Under `spawn_lock()` (via `test_spawn`): macOS pipes get `FD_CLOEXEC` after `pipe()`, so a
     // concurrent fork could otherwise inherit this helper's pipe ends.
     let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the tracer helper");
+    UNREAPED.set(UNREAPED.get() + 1);
     let signal_tx = helper.stdin.take().expect("the helper's stdin is piped");
     let rx = std::io::BufReader::new(helper.stdout.take().expect("the helper's stdout is piped"));
     Pending {
@@ -358,6 +376,7 @@ fn launch(mode: Mode, force: Option<&str>) -> Pending {
             awaits_exit: None,
             finished: false,
             _exe_dir: exe_dir,
+            _thread: std::marker::PhantomData,
         },
     }
 }

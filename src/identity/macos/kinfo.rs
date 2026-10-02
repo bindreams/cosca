@@ -66,7 +66,7 @@ pub(crate) struct extern_proc {
     p_vmspace: u64,
     p_sigacts: u64,
     pub(crate) p_flag: libc::c_int,
-    pub(super) p_stat: libc::c_char,
+    pub(crate) p_stat: libc::c_char,
     pub(crate) p_pid: libc::pid_t,
     p_oppid: libc::pid_t,
     p_dupfd: libc::c_int,
@@ -138,6 +138,12 @@ const _: () = assert!(std::mem::size_of::<extern_proc>() == 296);
 /// value against a second, independently-issued sysctl query and, where a live process allows
 /// it, `proc_pidinfo`'s own `PROC_FLAG_SYSTEM` bit.
 pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
+
+/// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit: `#define P_WEXIT
+/// 0x00002000` in the SDK's `usr/include/sys/proc.h`. XNU sets it from `P_LEXIT`, which is never
+/// cleared.
+#[cfg(test)]
+pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
