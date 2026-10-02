@@ -219,11 +219,17 @@ pub(crate) mod fault_observer {
 /// Resolve when the process exits (no internal timeout — the caller bounds it).
 #[cfg(target_os = "linux")]
 async fn exit_watch(id: ProcessId) -> Result<(), Error> {
-    use ::tokio::io::unix::AsyncFd;
-    use ::tokio::io::Interest;
     let Some(pidfd) = crate::wait::backend::open_verified(id, crate::wait::backend::PidfdOp::Wait)? else {
         return Ok(());
     };
+    watch_pidfd(pidfd).await
+}
+
+/// Resolve when `pidfd`'s process exits or is reaped (no internal timeout).
+#[cfg(target_os = "linux")]
+pub(crate) async fn watch_pidfd(pidfd: std::os::fd::OwnedFd) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
     // The pidfd becomes readable (POLLIN) when the task becomes a zombie; POLLHUP once
     // reaped. Either readiness is terminal. A registration failure here (reactor at
     // capacity, etc.) is a genuine I/O error; a MISSING IO driver panics inside tokio
@@ -267,6 +273,19 @@ async fn exit_watch(id: ProcessId) -> Result<(), Error> {
     use ::tokio::io::unix::AsyncFd;
     use ::tokio::io::Interest;
     let Some(kq) = crate::wait::backend::arm_proc_exit(id)? else {
+        return Ok(());
+    };
+    let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;
+    watch_readable(&afd, crate::wait::backend::drain_proc_exit).await
+}
+
+/// Resolve when the process `pid`, whose unique id was `unique`, exits (no internal timeout), or at
+/// once if it no longer has that id. Non-reaping.
+#[cfg(target_os = "macos")]
+pub(crate) async fn wait_exit_for(pid: u32, unique: u64) -> Result<(), Error> {
+    use ::tokio::io::unix::AsyncFd;
+    use ::tokio::io::Interest;
+    let Some(kq) = crate::wait::backend::arm_proc_exit_for(pid, unique)? else {
         return Ok(());
     };
     let afd = AsyncFd::with_interest(KqueueFd(kq), Interest::READABLE).map_err(Error::Io)?;

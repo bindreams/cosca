@@ -173,15 +173,14 @@ async fn an_async_drop_starts_no_thread() {
     assert!(started.is_empty(), "a drop started threads: {started:?}");
 }
 
-/// The drop hands tokio's `Child` its own drop, never `mem::forget`: the parent's end of a piped
-/// stdout, which that `Child` owns, is closed by the time `drop` returns. Runs alone, so no other
-/// thread can take the descriptor number in between.
+/// The parent's end of a piped stdout nobody took is closed by the time `drop` returns. Runs alone,
+/// so no other thread can take the descriptor number in between.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn an_async_drop_closes_tokios_own_descriptors() {
+async fn an_async_drop_closes_the_childs_untaken_stdout() {
     use std::os::fd::AsRawFd as _;
 
-    if !alone(fixture_path!(an_async_drop_closes_tokios_own_descriptors)) {
+    if !alone(fixture_path!(an_async_drop_closes_the_childs_untaken_stdout)) {
         return;
     }
     let mut cmd = crate::tokio::Command::new();
@@ -190,9 +189,10 @@ async fn an_async_drop_closes_tokios_own_descriptors() {
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
     let mut child = cmd.spawn().expect("spawn");
     let _stdin = child.stdin().expect("piped stdin");
-    let crate::tokio::child::ProcSource::Tokio { child: tokio_child, .. } =
-        child.os.proc.as_ref().expect("the backend");
-    let stdout = tokio_child.stdout.as_ref().expect("piped stdout").as_raw_fd();
+    let Some(crate::tokio::child::ProcSource::Tokio { stdout, .. }) = child.os.proc.as_ref() else {
+        panic!("a fresh child is a tokio backend");
+    };
+    let stdout = stdout.as_ref().expect("piped stdout").as_raw_fd();
     // SAFETY: `fcntl(F_GETFD)` reads a flag and changes nothing.
     assert_ne!(
         unsafe { libc::fcntl(stdout, libc::F_GETFD) },
@@ -202,7 +202,7 @@ async fn an_async_drop_closes_tokios_own_descriptors() {
     drop(child);
     // SAFETY: as above.
     let after = unsafe { libc::fcntl(stdout, libc::F_GETFD) };
-    assert_eq!(after, -1, "tokio's Child must be dropped, not forgotten");
+    assert_eq!(after, -1, "the drop must close the child's untaken stdout");
 }
 
 /// Dropping a live, kill-on-drop root returns, on every platform and whatever contains it: the

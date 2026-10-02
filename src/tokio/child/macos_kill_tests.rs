@@ -1,6 +1,8 @@
 //! macOS: a tokio child's signals go by pid only while the pid still has the unique id read at
 //! spawn.
 
+use std::future::Future;
+
 use crate::send_log::{Capture, Via};
 use crate::tokio::Command;
 
@@ -106,6 +108,125 @@ async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
 
     assert!(proc.reaped_elsewhere());
     assert!(crate::log_capture::contains_since(mark, "forced peek failure 7c3e"));
+}
+
+/// A backend for a child that is running and ours, holding its real unique id.
+fn running_backend() -> (super::proc_source::ProcSource, u32) {
+    running_backend_with(|real| real)
+}
+
+/// [`running_backend`] holding the id `held(real)` instead of the real one.
+fn running_backend_with(held: impl FnOnce(u64) -> u64) -> (super::proc_source::ProcSource, u32) {
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("sleep")
+            .arg("600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let real = crate::signal::read_identity(pid)
+        .expect("readable")
+        .expect("a running child has a unique id");
+    (super::proc_source::ProcSource::new(child, Some(held(real))), pid)
+}
+
+/// A child still running whose unique id cannot be read (a MACF denial) cannot be shown to be ours:
+/// the peek answers `Running`, but the id is the only thing that tells it from a reuse of the pid,
+/// so the backend counts it as reaped elsewhere and the child is forgotten, never released to
+/// tokio's by-pid reap. The same holds when the read finds the pid gone.
+///
+/// Mutants: `reaped_elsewhere` takes a `Running` peek with an unreadable id, or with a gone one, as
+/// "ours".
+#[tokio::test(flavor = "current_thread")]
+async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewhere() {
+    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    for read in [UniqRead::Refused(libc::EPERM), UniqRead::Gone] {
+        let (proc, pid) = running_backend();
+        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, read);
+
+        let reaped_elsewhere = proc.reaped_elsewhere();
+
+        // The child is ours and unreaped: end it before asserting.
+        proc.signal(crate::signal::Sig::Kill).expect("kill our own child");
+        proc.release(); // tokio's orphan queue reaps the killed child
+        assert!(
+            reaped_elsewhere,
+            "{read:?}: the pid is not shown to be ours (pid {pid})"
+        );
+    }
+}
+
+/// `wait` arms its exit watch only on a pid that still has the unique id read at spawn. A stranger
+/// that takes the pid after the pre-check (a reap and a reuse in between) must not be watched until
+/// it exits: the backend's id is `real ^ 1`, the pre-check is made to see a match, and the
+/// arm-time re-read sees the real id. The watch is not armed, and the post-check answers `ECHILD`
+/// within the first poll. A watch armed anyway leaves the first poll pending.
+///
+/// Mutants: the watch is armed on a fresh read of the pid; the re-read after arming is missing.
+#[tokio::test(flavor = "current_thread")]
+async fn macos_wait_does_not_watch_a_stranger_that_took_the_pid_after_the_pre_check() {
+    use crate::identity::{uniq_fault, ReadPurpose, UniqInfo, UniqRead};
+    use std::task::Poll;
+    let mut stored = 0;
+    let (mut proc, pid) = running_backend_with(|real| {
+        stored = real ^ 1;
+        stored
+    });
+    let _pre_check =
+        uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Found(UniqInfo { unique_id: stored }));
+    let first = {
+        let mut waiting = Box::pin(proc.wait());
+        std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await
+    };
+    drop(proc);
+    // The child is ours and unreaped (its backend was forgotten): end it.
+    // SAFETY: `pid` is this test's own child, which nothing has reaped.
+    unsafe {
+        assert_eq!(
+            libc::kill(pid as libc::pid_t, libc::SIGKILL),
+            0,
+            "the child is still ours"
+        );
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid as libc::pid_t, &mut status, 0), pid as libc::pid_t);
+    }
+    assert!(
+        matches!(&first, Poll::Ready(Err(crate::error::Error::Io(e))) if e.raw_os_error() == Some(libc::ECHILD)),
+        "{first:?}"
+    );
+}
+
+/// Dropping a backend that nothing released or forgot (an unwind does this) leaves a child that
+/// cannot be shown to be ours (here: no unique id) to the OS rather than to tokio's by-pid reap.
+///
+/// Mutant: the implicit drop releases tokio's `Child` whatever the handle shows.
+#[tokio::test(flavor = "current_thread")]
+async fn macos_dropping_a_backend_implicitly_forgets_a_child_with_no_unique_id() {
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("sleep")
+            .arg("600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = super::proc_source::ProcSource::new(child, None);
+    let backend_drops = super::fault::count_backend_drops();
+
+    drop(proc);
+
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
+    // SAFETY: `pid` is this test's own child, which nothing has reaped (its backend was forgotten).
+    unsafe {
+        assert_eq!(
+            libc::kill(pid as libc::pid_t, libc::SIGKILL),
+            0,
+            "the child is still ours"
+        );
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid as libc::pid_t, &mut status, 0), pid as libc::pid_t);
+    }
 }
 
 /// A drop whose child was reaped by someone else forgets tokio's `Child`: the backend is not

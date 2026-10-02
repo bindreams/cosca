@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
-use super::child::{reap_now, Child, ProcSource};
+use super::child::{Child, ProcSource};
 #[cfg(unix)]
 use crate::signal::Sent;
 
@@ -277,7 +277,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let _guard = crate::child::spawn::spawn_lock();
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
@@ -320,7 +320,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -416,17 +416,42 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
     // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
+    #[cfg(windows)]
+    let proc_handle = child
+        .raw_handle()
+        .expect("a freshly spawned tokio child has a raw handle");
     // macOS: the unique id every by-pid signal to this child is checked against, read before
-    // anything can reap the child.
+    // anything can reap the child. A refused read leaves the backend with no id, so it acts on the
+    // pid never, and the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
-    let identity = match crate::signal::read_identity(pid) {
-        Ok(identity) => identity,
-        Err(errno) => {
-            prepared.settle_verdict(pid);
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
-            return Err(crate::signal::identity_unreadable(pid, errno));
-        }
+    let (identity, identity_refused) = match crate::signal::read_identity(pid) {
+        Ok(identity) => (identity, None),
+        Err(errno) => (None, Some(errno)),
     };
+    // Built first so failure arms tear the child down through its handle, not its pid. A refused id
+    // read leaves it id-less; the spawn fails below.
+    #[cfg(target_os = "linux")]
+    let proc = {
+        // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.
+        let held_pidfd = held_pidfd.expect("a spawned child holds the pidfd its handshake opened");
+        ProcSource::new(child, held_pidfd)
+    };
+    #[cfg(target_os = "macos")]
+    let proc = ProcSource::new(child, identity);
+    #[cfg(windows)]
+    let proc = ProcSource::new(child);
+    #[cfg(target_os = "macos")]
+    if let Some(errno) = identity_refused {
+        #[cfg(test)]
+        crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
+        prepared.settle_verdict(pid);
+        // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
+        // warning naming it, and left running.
+        proc.reap_now(pid);
+        return Err(crate::signal::identity_unreadable(pid, errno));
+    }
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
@@ -435,15 +460,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
             // abandoned spawn's, reaping a pid tokio's own reap is about to.
             prepared.settle_verdict(pid);
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid);
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 
-    #[cfg(windows)]
-    let proc_handle = child
-        .raw_handle()
-        .expect("a freshly spawned tokio child has a raw handle");
     let attach = crate::child::spawn::attach_or_fault(
         pid,
         #[cfg(windows)]
@@ -455,7 +476,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid);
             return Err(e);
         }
     };
@@ -475,15 +496,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    #[cfg(target_os = "linux")]
-    let proc = ProcSource::new(
-        child,
-        held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
-    );
-    #[cfg(target_os = "macos")]
-    let proc = ProcSource::new(child, identity);
-    #[cfg(windows)]
-    let proc = ProcSource::new(child);
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
@@ -525,6 +537,8 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
         }
         Err(e) => {
+            // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
+            child.proc_mut().forget_if_foreign();
             _ = child.try_wait();
             format!("the elevated child could not be terminated ({e})")
         }

@@ -46,7 +46,9 @@ fn tokio_child_holds_its_handshake_pidfd() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
         let pid = child.id().pid();
-        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut();
+        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
+            panic!("a fresh child is a tokio backend");
+        };
         let dir = crate::identity::ProcDir::open().expect("/proc opens");
         let target = crate::identity::pidfd_pid_in_view(&dir, pidfd.as_fd());
         assert!(
@@ -167,7 +169,9 @@ fn drop_after_a_foreign_reap_closes_cosca_pidfd_body() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
         let pid = child.id().pid();
-        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut();
+        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
+            panic!("a fresh child is a tokio backend");
+        };
         let cosca_pidfd = std::os::fd::AsRawFd::as_raw_fd(pidfd);
         assert!(is_open(cosca_pidfd), "cosca holds its pidfd while the child lives");
         drop(writer);
@@ -287,6 +291,60 @@ in_fresh_pid_ns!(
     fixture_tokio_finish_elevated_driver,
     fixture_tokio_finish_elevated_init,
     finish_elevated_after_a_foreign_reap_and_reuse_waits_for_nothing_body
+);
+
+/// The teardown's kill is delivered, and in the gap before its wait the child is reaped behind its
+/// back and a stranger takes its pid, then dies. The wait goes through the pidfd, so it takes
+/// nothing: the stranger's record is still there for the test, with `SIGUSR1`.
+///
+/// Detected by `reaps.recorded()` (the test-only recorder of teardown reaps), which a by-number
+/// wait fills with the stranger's status. The stranger's record itself survives such a wait, since
+/// `Drop`'s forget masks tokio's later by-pid reap, so `ECHILD` is not what catches it.
+///
+/// Mutant: the wait is by the number (the recorder shows the stranger's status).
+fn finish_elevated_after_a_delivered_kill_and_a_foreign_reap_and_reuse_waits_for_nothing_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let pid = child.id().pid();
+        let stranger = Rc::new(RefCell::new(None));
+        let _hook = crate::child::spawn::fault::set_between_kill_and_wait({
+            let stranger = Rc::clone(&stranger);
+            move || {
+                drop(writer);
+                let reuser = reap_behind_and_reuse(pid);
+                assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+                *stranger.borrow_mut() = Some(reuser);
+            }
+        });
+
+        let reaps = crate::child::spawn::fault::record_teardown_reaps();
+        let err = crate::tokio::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+
+        let detail = elevation_detail(err);
+        assert!(detail.contains("was terminated"), "{detail}");
+        assert_eq!(
+            reaps.recorded(),
+            vec![],
+            "the stranger's exit was not recorded as a reap"
+        );
+        let mut stranger = stranger.borrow_mut().take().expect("the hook must have run");
+        let status = stranger
+            .wait()
+            .expect("the stranger's exit record must not have been taken by the teardown");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_finish_elevated_after_a_delivered_kill_and_a_foreign_reap_and_reuse_waits_for_nothing,
+    fixture_tokio_finish_elevated_delivered_driver,
+    fixture_tokio_finish_elevated_delivered_init,
+    finish_elevated_after_a_delivered_kill_and_a_foreign_reap_and_reuse_waits_for_nothing_body
 );
 
 // A dropped child whose pid was reused reaps nothing =====
@@ -487,22 +545,303 @@ in_fresh_pid_ns!(
 
 // A failed peek through the child's own pidfd =====
 
-/// A peek that fails on the child's own pidfd is a contract breach: it is logged, asserted in debug,
-/// and is no evidence the child was reaped.
+/// A peek that fails on the child's own pidfd cannot show the child is ours, so it counts as reaped
+/// elsewhere: the child is forgotten, never released to tokio's by-pid reap.
 ///
-/// Mutant: a failed peek counts as a foreign reap (or is swallowed without the log and assert).
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "a peek through a child's own pidfd failed")
-)]
+/// Mutant: a failed peek counts as ours.
 #[test]
-fn a_failed_pidfd_peek_is_a_contract_breach_and_no_evidence() {
+fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
     use crate::wait::exit_only::seams::force_peek_once;
     runtime().block_on(async {
         let (mut child, _writer) = spawn_blocker();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
         let reaped = child.proc_mut().reaped_elsewhere();
-        // Only reachable in release (debug panicked above, as expected):
-        assert!(!reaped, "a failed peek is no evidence of a reap");
+        assert!(reaped, "a child nothing can answer for is not tokio's to reap by pid");
     });
 }
+
+// Wait and try_wait after a foreign reap and a reuse =====
+
+/// A `try_wait` or `wait` of a child reaped behind tokio's back, whose pid a stranger that is
+/// already a zombie of ours now holds, answers `ECHILD` and takes nothing: tokio's own wait is a
+/// `waitpid` by pid, and would take the stranger's record. The test reaps the stranger itself and
+/// asserts it got `SIGUSR1`.
+///
+/// Mutants: `ProcSource::try_wait` or `wait` go to tokio without looking at the pidfd.
+fn after_foreign_reap_and_reuse(use_wait: bool) {
+    runtime().block_on(async {
+        let (mut child, writer) = spawn_blocker();
+        let (mut reuser, _alias) = foreign_reaped_and_reused(&child, writer);
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the stranger is a zombie"
+        );
+        let answer = if use_wait {
+            child.wait().await.map(Some)
+        } else {
+            child.try_wait()
+        };
+        let err = answer.expect_err("a foreign-reaped child has no status to give");
+        assert!(
+            matches!(&err, crate::error::Error::Io(e) if e.raw_os_error() == Some(libc::ECHILD)),
+            "{err:?}"
+        );
+        let status = reuser.wait().expect("the stranger's record must not have been taken");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+fn try_wait_after_foreign_reap_and_reuse_body() {
+    after_foreign_reap_and_reuse(false);
+}
+fn wait_after_foreign_reap_and_reuse_body() {
+    after_foreign_reap_and_reuse(true);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_try_wait_after_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_try_wait_reuse_driver,
+    fixture_tokio_try_wait_reuse_init,
+    try_wait_after_foreign_reap_and_reuse_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_wait_after_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_wait_reuse_driver,
+    fixture_tokio_wait_reuse_init,
+    wait_after_foreign_reap_and_reuse_body
+);
+
+/// A `wait` already parked in its exit watch when the child is reaped behind tokio's back and its
+/// pid is reused by a stranger that is a zombie of ours answers `ECHILD` and takes nothing. The
+/// check after the watch is what stops tokio's by-pid `waitpid` from taking the stranger's record.
+///
+/// Mutants: no check after the watch; no watch (tokio waits for the child's whole life).
+fn wait_parked_then_foreign_reap_and_reuse_body() {
+    runtime().block_on(async {
+        let (mut child, writer) = spawn_blocker();
+        let id = child.id();
+        let mut waiting = std::pin::pin!(child.wait());
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "wait must be parked on a live child");
+        let token = StartToken::from_raw(id.start_token_raw());
+        drop(writer);
+        let mut reuser = reap_behind_and_reuse(id.pid());
+        let _alias = alias_token(reuser.id(), token);
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the stranger is a zombie"
+        );
+        let answer = waiting.await;
+        let status = reuser.wait();
+        assert!(
+            matches!(&answer, Err(crate::error::Error::Io(e)) if e.raw_os_error() == Some(libc::ECHILD)),
+            "wait answered {answer:?}; the stranger's own wait: {status:?}"
+        );
+        let status = status.expect("the stranger's record must not have been taken");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_wait_parked_then_foreign_reap_and_reuse_takes_nothing,
+    fixture_tokio_wait_parked_driver,
+    fixture_tokio_wait_parked_init,
+    wait_parked_then_foreign_reap_and_reuse_body
+);
+
+// The spawn's failure teardown =====
+
+/// A spawn whose child is reaped behind its back, and its pid reused, between the fork and the
+/// identity read, then fails (the identity read answers `Gone`, or the attach is forced to fail).
+/// The failure teardown signals nothing, waits for nothing and takes no exit record, and a debug
+/// build does not panic.
+///
+/// A regressed teardown would wait by the number. So that it returns at once instead of parking on
+/// a live stranger, the stranger is made a zombie in the gap between the teardown's kill and its
+/// wait (the teardown's own hook), where a by-pid wait takes its record. The test then reaps the
+/// stranger itself and asserts it got `SIGUSR1`: `SIGKILL` means the teardown signalled it, and
+/// `ECHILD` means it took the record.
+///
+/// Mutants: `reap_now` via `start_kill`; `wait_and_reap` keeps `P_PID`; `signal` answers
+/// `Err(ESRCH)` (the debug build panics).
+fn spawn_failure_teardown_leaves_the_stranger_alone(attach_arm: bool) {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+    use crate::identity::{ProcessId, Resolved};
+
+    runtime().block_on(async {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+
+        let stranger = Rc::new(RefCell::new(None));
+        let alias = Rc::new(RefCell::new(None));
+        let died = Rc::new(Cell::new(false));
+        let _spawn_hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let (stranger, alias) = (Rc::clone(&stranger), Rc::clone(&alias));
+            move || {
+                let pid = fault::spawn_pid();
+                let Resolved::Found(id) = ProcessId::of(pid) else {
+                    panic!("the child must be readable before it is reaped")
+                };
+                let token = StartToken::from_raw(id.start_token_raw());
+                drop(writer);
+                let reuser = reap_behind_and_reuse(pid);
+                *alias.borrow_mut() = Some(alias_token(reuser.id(), token));
+                *stranger.borrow_mut() = Some(reuser);
+            }
+        });
+        let _wait_hook = fault::set_between_kill_and_wait({
+            let (stranger, died) = (Rc::clone(&stranger), Rc::clone(&died));
+            move || {
+                let stranger = stranger.borrow();
+                assert_eq!(
+                    sigusr1_and_peek(stranger.as_ref().expect("the stranger")),
+                    Some(libc::SIGUSR1),
+                    "the stranger must have been signalled by the test alone"
+                );
+                died.set(true);
+            }
+        });
+        if attach_arm {
+            fault::set_force_attach_failure(true);
+        } else {
+            fault::set_force_identity_vanished(true);
+        }
+        let err = cmd.spawn().err();
+        fault::set_force_attach_failure(false);
+        fault::set_force_identity_vanished(false);
+        err.expect("the forced failure must fail the spawn");
+
+        let mut stranger = stranger.borrow_mut().take().expect("the hook must have run");
+        if !died.get() {
+            crate::test_child::pid_reuse::signal_usr1(&stranger);
+        }
+        let status = stranger
+            .wait()
+            .expect("the stranger's exit record must not have been taken by the teardown");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1),
+            "the stranger must have been signalled by the test alone"
+        );
+        drop(alias);
+    });
+}
+fn spawn_identity_failure_teardown_body() {
+    spawn_failure_teardown_leaves_the_stranger_alone(false);
+}
+fn spawn_attach_failure_teardown_body() {
+    spawn_failure_teardown_leaves_the_stranger_alone(true);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_identity_failure_teardown_leaves_the_stranger_alone,
+    fixture_tokio_spawn_identity_driver,
+    fixture_tokio_spawn_identity_init,
+    spawn_identity_failure_teardown_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_attach_failure_teardown_leaves_the_stranger_alone,
+    fixture_tokio_spawn_attach_driver,
+    fixture_tokio_spawn_attach_init,
+    spawn_attach_failure_teardown_body
+);
+
+// Panicking loggers =====
+
+/// The spawn's identity-failure teardown, child reaped behind its back and its pid reused by a
+/// stranger that is already a zombie. `reap_now`'s kill gets ESRCH through the pidfd, and
+/// `via_pidfd` logs "already gone". A logger that panics there unwinds out of the spawn with the
+/// backend in hand, and the unwind must leak tokio's `Child`, not reap the stranger by pid.
+fn a_panicking_logger_in_reap_nows_via_pidfd_log_body() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+
+    crate::log_capture::install();
+    runtime().block_on(async {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        let stranger = Rc::new(RefCell::new(None));
+        let _spawn_hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let stranger = Rc::clone(&stranger);
+            move || {
+                let pid = fault::spawn_pid();
+                drop(writer);
+                let reuser = reap_behind_and_reuse(pid);
+                assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+                *stranger.borrow_mut() = Some(reuser);
+            }
+        });
+        fault::set_force_identity_vanished(true);
+        let unwound = {
+            let _panics = crate::log_capture::panic_on("it is already gone");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.spawn().map(drop)))
+        };
+        fault::set_force_identity_vanished(false);
+        assert!(unwound.is_err(), "the logger must have panicked out of the spawn");
+        let mut stranger = stranger.borrow_mut().take().expect("the hook must have run");
+        let status = stranger
+            .wait()
+            .expect("the stranger's exit record must not have been taken by the teardown");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGUSR1)
+        );
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_a_panicking_logger_in_reap_nows_via_pidfd_log_leaves_the_stranger_alone,
+    fixture_panicking_logger_reap_now_driver,
+    fixture_panicking_logger_reap_now_init,
+    a_panicking_logger_in_reap_nows_via_pidfd_log_body
+);
+
+/// `Drop`'s first look misses the reap (forced `Running`, standing in for a reap that lands after
+/// it) and its armed kill gets ESRCH through the pidfd, so `via_pidfd` logs. A logger that panics
+/// there unwinds with tokio's `Child` in `os`, and the unwind must leak it, not reap the stranger
+/// by pid.
+fn a_panicking_logger_in_drops_via_pidfd_log_body() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::Peek;
+
+    crate::log_capture::install();
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let (reuser, _alias) = foreign_reaped_and_reused(&child, writer);
+        let reuser_pid = reuser.id();
+        assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+        let _first_look = force_peek_once(Ok(Peek::Running));
+        let unwound = {
+            let _panics = crate::log_capture::panic_on("it is already gone");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
+        };
+        assert!(unwound.is_err(), "the logger must have panicked out of the drop");
+        let pid = Pid::from_raw(reuser_pid as i32).expect("pid");
+        let record = rustix::process::waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)
+            .expect("the reuser's exit record must still be unconsumed")
+            .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop(reuser);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_a_panicking_logger_in_drops_via_pidfd_log_leaves_the_stranger_alone,
+    fixture_panicking_logger_drop_driver,
+    fixture_panicking_logger_drop_init,
+    a_panicking_logger_in_drops_via_pidfd_log_body
+);

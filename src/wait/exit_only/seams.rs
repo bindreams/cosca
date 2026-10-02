@@ -55,7 +55,7 @@ struct RegisteredHook {
 }
 
 thread_local! {
-    static FORCED_PEEK: RefCell<Option<io::Result<Peek>>> = const { RefCell::new(None) };
+    static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<Peek>>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static FORCED_REAP: Cell<Option<ForcedReap>> = const { Cell::new(None) };
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
     #[cfg(target_os = "linux")]
@@ -80,12 +80,17 @@ impl Drop for Forced {
 
 /// The next [`peek`](super::peek) on this thread answers `result`.
 pub(crate) fn force_peek_once(result: io::Result<Peek>) -> Forced {
-    FORCED_PEEK.with(|f| *f.borrow_mut() = Some(result));
-    Forced(|| FORCED_PEEK.with(|f| *f.borrow_mut() = None))
+    force_peeks([result])
+}
+
+/// The next peeks on this thread answer `results`, one each and in order, then the OS answers again.
+pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<Peek>>) -> Forced {
+    FORCED_PEEK.with(|f| *f.borrow_mut() = results.into_iter().collect());
+    Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
 
 pub(crate) fn take_forced_peek() -> Option<io::Result<Peek>> {
-    FORCED_PEEK.with(|f| f.borrow_mut().take())
+    FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
 }
 
 /// The next consuming reap on this thread finds `what` instead of calling the OS.
