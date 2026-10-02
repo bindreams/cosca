@@ -77,6 +77,7 @@ forwards the remote command's real exit code as-is.
 | `linux-x64`     | `generic/ubuntu2204` (qemu, amd64)     | x86-64        | x86-64                   |
 | `linux-arm64`   | `perk/ubuntu-2204-arm64` (qemu, arm64) | arm64         | arm64 (Apple Silicon)    |
 | `windows-x64`   | `stromweld/windows-10` (qemu, amd64)   | x86-64        | x86-64                   |
+| `macos-arm64`   | Tart, `macos-tahoe-base` (Cirrus)      | arm64         | arm64 (Apple Silicon)    |
 | `windows-arm64` | _(none — see below)_                   | —             | —                        |
 
 Both Linux boxes run Ubuntu 22.04; systemd 249 there defaults to the unified cgroup v2
@@ -85,6 +86,39 @@ hierarchy, which is why they're the guests for cosca's cgroup lanes.
 On the emulated architecture, QEMU falls back to TCG (software emulation) instead of
 HVF/KVM, which is dramatically slower — see [Windows guests](#windows-guests) for measured
 numbers on this host.
+
+### `macos-arm64`
+
+A throwaway macOS 26 (Tahoe) arm64 VM via [Tart](https://tart.run), for fast local macOS
+RED/GREEN iterations and pre-checks. **CI stays the merge gate.** The image is Cirrus Labs'
+`ghcr.io/cirruslabs/macos-tahoe-base`, not GitHub's `macos-latest` runner image: same macOS
+major and arm64, but different preinstalled tools and no Xcode. Provisioning installs the
+toolchain pinned in `.github/ci-toolchain` via rustup and CI's `cargo-nextest` version
+(checksum-verified) from `scripts/devvm/provision/macos-rust.sh`.
+
+Prerequisites: Tart (`brew install cirruslabs/cli/tart`, or the release tarball), found via
+`$TART` or `PATH`; and the base image pulled once, about 30 GB (`tart pull
+ghcr.io/cirruslabs/macos-tahoe-base:latest`; check free disk first).
+
+```sh
+uv run scripts/devvm.py up macos-arm64 [--rev <git rev>] [--rosetta]   # clone, boot headless, copy `git archive <rev>`, provision
+uv run scripts/devvm.py run macos-arm64 -- cargo nextest run --lib -E 'test(/await_reapable/)'
+uv run scripts/devvm.py run macos-arm64 -- sudo -E env PATH="$PATH" cargo nextest run ...   # root lane: sudo is fine in the VM
+uv run scripts/devvm.py sync macos-arm64 --rev <rev>                  # replace the guest's source with another rev
+uv run scripts/devvm.py fetch macos-arm64 '~/cargo-target/nextest' ./out   # copy results out
+uv run scripts/devvm.py destroy macos-arm64                           # stop and delete the VM
+```
+
+- Every `up` is a fresh copy-on-write `tart clone` of the base image under a unique
+  `devvm-macos-*` name; the base is never started or modified. `destroy` only ever deletes
+  names with that prefix.
+- Only committed state is copied (`git archive`); uncommitted edits are not.
+- At most 2 macOS VMs run at once on a Mac (Apple's licence). `up` counts every running
+  local Tart VM and refuses a third.
+- `--rosetta` installs Rosetta and the `x86_64-apple-darwin` target so
+  `cargo nextest run --target x86_64-apple-darwin` runs x86_64 binaries in the guest. This
+  approximates the Intel lane (translation, not Intel hardware); it does not replace it.
+- One worktree has one `macos-arm64` VM.
 
 ### `windows-arm64`
 

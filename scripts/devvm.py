@@ -53,6 +53,7 @@ from devvm_common import (  # noqa: E402
     run_vagrant,
     stage_dir,
 )
+import devvm_macos  # noqa: E402
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
     get_windows_interactive_username,
@@ -80,6 +81,12 @@ GUESTS: dict[str, Guest] = {
         communicator="ssh",
         box="perk/ubuntu-2204-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
+    ),
+    "macos-arm64": Guest(
+        name="macos-arm64",
+        communicator="tart",
+        box=f"{devvm_macos.BASE_IMAGE} (Tart, Cirrus base image - not GitHub's runner image)",
+        tree_path_posix="~/cosca",
     ),
     "windows-x64": Guest(
         name="windows-x64",
@@ -344,11 +351,14 @@ def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[s
 
 
 def cmd_list(_args: argparse.Namespace) -> None:
-    require_tool("vagrant")
     for guest in GUESTS.values():
         if not guest.available:
             print(f"{guest.name:14s} UNAVAILABLE  {guest.unavailable_reason}")
             continue
+        if guest.communicator == "tart":
+            print(f"{guest.name:14s} {devvm_macos.status(STATE_DIR):14s} {guest.box}  (communicator: tart)")
+            continue
+        require_tool("vagrant")
         dotfile = dotfile_dir(guest)
         if not dotfile.exists():
             state = "not created"
@@ -375,6 +385,12 @@ def cmd_up(args: argparse.Namespace) -> None:
         sys.exit(1)
     if display and guest.communicator != "winrm":
         print("error: --display only applies to Windows guests", file=sys.stderr)
+        sys.exit(1)
+    if guest.communicator == "tart":
+        devvm_macos.up(REPO_ROOT, STATE_DIR, rev=args.rev, rosetta=bool(args.rosetta))
+        return
+    if getattr(args, "rosetta", False):
+        print("error: --rosetta only applies to macOS guests", file=sys.stderr)
         sys.exit(1)
     dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     if guest.communicator == "winrm":
@@ -419,6 +435,9 @@ def cmd_up(args: argparse.Namespace) -> None:
 def cmd_sync(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    if guest.communicator == "tart":
+        devvm_macos.sync(REPO_ROOT, STATE_DIR, rev=args.rev)
+        return
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
@@ -435,6 +454,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
 def cmd_ssh(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    if guest.communicator == "tart":
+        devvm_macos.ssh(STATE_DIR)
+        return
     if guest.communicator == "ssh":
         run_vagrant(guest, ["ssh"])
         return
@@ -487,6 +509,10 @@ def cmd_run(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if guest.communicator == "tart":
+        devvm_macos.run(STATE_DIR, cmd_args)
+        return
 
     if guest.communicator == "ssh":
         # `vagrant ssh -c` runs a non-interactive, non-login shell, which doesn't source
@@ -599,15 +625,29 @@ def cmd_run(args: argparse.Namespace) -> None:
     run_vagrant(guest, ["winrm", "-c", outer])
 
 
+def cmd_fetch(args: argparse.Namespace) -> None:
+    guest = GUESTS[args.guest]
+    if guest.communicator != "tart":
+        print("error: fetch only applies to macOS guests", file=sys.stderr)
+        sys.exit(1)
+    devvm_macos.fetch(STATE_DIR, args.guest_path, Path(args.host_dest))
+
+
 def cmd_halt(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    if guest.communicator == "tart":
+        devvm_macos.halt(STATE_DIR)
+        return
     run_vagrant(guest, ["halt"])
 
 
 def cmd_destroy(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    if guest.communicator == "tart":
+        devvm_macos.destroy(STATE_DIR)
+        return
     returncode = run_vagrant(guest, ["destroy", "-f"], check=False)
     if returncode != 0:
         print(
@@ -654,10 +694,22 @@ def build_parser() -> argparse.ArgumentParser:
         "Headless remains the default; this is a local window only, never VNC or any other "
         "network-exposed display. Not persisted — pass it again on every `up` that needs it.",
     )
+    p.add_argument(
+        "--rev",
+        default="HEAD",
+        help="(macOS only) git rev to `git archive` into the guest (default HEAD; committed state only).",
+    )
+    p.add_argument(
+        "--rosetta",
+        action="store_true",
+        help="(macOS only) install Rosetta and the x86_64-apple-darwin target, to run x86_64 test "
+        "binaries in the guest. An approximation of the Intel lane, not a replacement.",
+    )
     p.set_defaults(func=cmd_up)
 
     p = sub.add_parser("sync", help="push the current working tree into a running guest")
     p.add_argument("guest", choices=GUESTS.keys())
+    p.add_argument("--rev", default="HEAD", help="(macOS only) git rev to `git archive` into the guest.")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("ssh", help="open an interactive shell in a guest")
@@ -680,6 +732,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run, prefixed with --")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("fetch", help="(macOS only) copy a file or directory out of the guest")
+    p.add_argument("guest", choices=GUESTS.keys())
+    p.add_argument("guest_path")
+    p.add_argument("host_dest")
+    p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("halt", help="shut down a guest, keeping its disk")
     p.add_argument("guest", choices=GUESTS.keys())
