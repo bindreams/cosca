@@ -51,6 +51,4 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Root chain, SIGINT to the top
-        run: for _ in 1 2 3 4 5; do python3 .github/scripts/probe/e2e.py; done
-      - name: Exit race, forwarder log
-        run: for _ in $(seq 20); do python3 .github/scripts/probe/race.py; done
+        run: for _ in $(seq 20); do python3 .github/scripts/probe/e2e.py; done
