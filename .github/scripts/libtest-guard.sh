@@ -14,8 +14,10 @@
 #      a crate-level `allow` is a compile error rather than a silencer; a compile that fails
 #      without a finding fails the guard.
 #
-# The final link is replaced by `true`: nothing runs the binary, so the guard needs no linker and
-# can check any target triple from any host.
+# The final link of the checked unit is replaced by `true`: nothing runs the binary. The rest of the
+# build is real: a `--release` run links the integration tests' helper bins, and a dependency with
+# a C build script (skuld's SQLite) needs a C compiler for the target, so a cross-triple run needs
+# a cross linker and C compiler where the host has none.
 #
 # Usage: libtest-guard.sh [--target TRIPLE] [--feature-powerset] [--release] [--features F]
 #                         [--manifest-path P] [--unflipped FILE] [--findings-json OUT]
@@ -195,6 +197,7 @@ for rc_path in sorted(glob.glob(os.path.join(work, "run-*.rc"))):
     with open(rc_path) as f:
         rc = int(f.read())
     mine = set()
+    errors = []
     with open(base + ".json", errors="replace") as f:
         for line in f:
             try:
@@ -205,13 +208,15 @@ for rc_path in sorted(glob.glob(os.path.join(work, "run-*.rc"))):
                 continue
             msg = m["message"]
             if (msg.get("code") or {}).get("code") != "clippy::disallowed_macros":
+                if msg.get("level") in ("error", "error: internal compiler error"):
+                    errors.append(msg.get("rendered") or msg.get("message", ""))
                 continue
             for s in msg["spans"]:
                 if s["is_primary"]:
                     mine.add((posixpath.normpath(s["file_name"].replace("\\", "/")), s["line_start"]))
     if rc != 0 and not mine:
         with open(base + ".cmd") as f:
-            failed.append(f.read().strip())
+            failed.append((f.read().strip(), errors))
     findings |= mine
 
 result = [{"file": f, "line": l} for f, l in sorted(findings)]
@@ -224,7 +229,9 @@ for f, l in sorted(findings):
         "never runs: use #[skuld::test]",
         file=sys.stderr,
     )
-for cmd in failed:
+for cmd, errors in failed:
     print(f"::error::{cmd} failed without a libtest-attribute finding", file=sys.stderr)
+    for e in errors:
+        print(e, file=sys.stderr)
 sys.exit(1 if findings or failed else 0)
 PY

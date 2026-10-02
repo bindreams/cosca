@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Self-test for libtest-guard.sh. Runs the guard on .github/fixtures/libtest-guard, a toy crate
 # with one feature per case, and asserts the exit code and the (file, line) set the guard writes to
-# --findings-json. The OS-gated cases assert the host's own OS only: each lint lane runs this
-# script, so each OS is covered by its own lane.
+# --findings-json. The OS-gated cases assert the host's own OS only: the libtest-guard
+# job (Linux, Windows) and the macOS test lane run this script, so each OS is covered by a lane of
+# its own.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,14 +16,15 @@ work="$(mktemp -d)"
 trap 'rm -rf "${work:?}"' EXIT
 export CARGO_TARGET_DIR="${work}/target"
 
-# Entries are `<kind>:<name>`. `lt` is the fixture's libtest target and `libtest-guard-fixture` its
-# default-harness bin (src/main.rs); every case but the manifest ones lists both.
-printf 'test:lt\nbin:libtest-guard-fixture\n' >"${work}/unflipped-lt.txt"
+# Entries are `<kind>:<name>`. `test:lt` is the fixture's libtest target and `bin:lt` its
+# default-harness bin (src/main.rs), the same name on purpose; every case but the manifest ones
+# lists both.
+printf 'test:lt\nbin:lt\n' >"${work}/unflipped-lt.txt"
 : >"${work}/unflipped-empty.txt"
 printf 'test:lt\n' >"${work}/unflipped-no-bin.txt"
-printf 'test:lt\nbin:libtest-guard-fixture\ntest:it\n' >"${work}/unflipped-stale-flipped.txt"
-printf 'test:lt\nbin:libtest-guard-fixture\ntest:nope\n' >"${work}/unflipped-stale-missing.txt"
-printf 'test:lt\nbin:libtest-guard-fixture\nlib:lt\n' >"${work}/unflipped-stale-kind.txt"
+printf 'test:lt\nbin:lt\ntest:it\n' >"${work}/unflipped-stale-flipped.txt"
+printf 'test:lt\nbin:lt\ntest:nope\n' >"${work}/unflipped-stale-missing.txt"
+printf 'test:lt\nbin:lt\nlib:lt\n' >"${work}/unflipped-stale-kind.txt"
 
 case "$(uname -s)" in
     Linux) host_os=linux ;;
@@ -40,6 +42,11 @@ case "${host_triple}" in
         exit 1
         ;;
 esac
+
+# The directory the guard (and so cargo) runs in; a case may point it at one holding a .cargo/config.toml.
+run_dir="${PWD}"
+mkdir -p "${work}/cwd-with-wrapper/.cargo"
+printf '[build]\nrustc-wrapper = "false"\n' >"${work}/cwd-with-wrapper/.cargo/config.toml"
 
 failures=0
 checks=0
@@ -62,7 +69,7 @@ check() {
     shift 4
     local out="${work}/findings.json" rc=0 found
     rm -f "${out}"
-    "${guard}" --manifest-path "${manifest}" --unflipped "${unflipped}" --findings-json "${out}" "$@" \
+    (cd "${run_dir}" && "${guard}" --manifest-path "${manifest}" --unflipped "${unflipped}" --findings-json "${out}" "$@") \
         >"${work}/stdout.log" 2>"${work}/stderr.log" || rc=$?
     found=""
     if [[ -f "${out}" ]]; then
@@ -77,6 +84,16 @@ check() {
         echo "want:"
         echo "${want_found:-<none>}"
         echo "--- guard stderr:"
+        cat "${work}/stderr.log"
+        failures=$((failures + 1))
+    fi
+}
+
+# expect_stderr TEXT: the last check's guard stderr names TEXT.
+expect_stderr() {
+    checks=$((checks + 1))
+    if ! grep -qF -- "$1" "${work}/stderr.log"; then
+        echo "FAIL - the guard's message does not contain '$1':"
         cat "${work}/stderr.log"
         failures=$((failures + 1))
     fi
@@ -127,29 +144,22 @@ check "arch-gated tests, --target ${other_triple}" 1 "$(both_targets "arch_${oth
 
 # A finding that cannot be silenced, and a compile that fails without one ----------------------------------
 check "compile error without a finding fails" 1 "" "${work}/unflipped-lt.txt" --features type_error
+expect_stderr "E0308"
 check "crate-level allow(clippy::all) cannot silence the guard" 1 "" "${work}/unflipped-lt.txt" --features crate_allow
+expect_stderr "E0453"
 
 # A compiler wrapper, from the environment or from cargo config, must not sit in front of clippy-driver
 RUSTC_WRAPPER=false check "RUSTC_WRAPPER is bypassed" 0 "" "${work}/unflipped-lt.txt"
-CARGO_BUILD_RUSTC_WRAPPER=false check "build.rustc-wrapper is bypassed" 0 "" "${work}/unflipped-lt.txt"
+CARGO_BUILD_RUSTC_WRAPPER=false check "CARGO_BUILD_RUSTC_WRAPPER is bypassed" 0 "" "${work}/unflipped-lt.txt"
+run_dir="${work}/cwd-with-wrapper" check "build.rustc-wrapper in the cwd's cargo config is bypassed" 0 "" "${work}/unflipped-lt.txt"
 
 # Manifest checks ---------------------------------------------------------------------------------------
-# expect_stderr TEXT: the last check's guard stderr names TEXT.
-expect_stderr() {
-    checks=$((checks + 1))
-    if ! grep -qF -- "$1" "${work}/stderr.log"; then
-        echo "FAIL - the guard's message does not contain '$1':"
-        cat "${work}/stderr.log"
-        failures=$((failures + 1))
-    fi
-}
-
 check "default-harness targets not listed" 2 "" "${work}/unflipped-empty.txt"
 expect_stderr "target lt (test)"
-expect_stderr "target libtest-guard-fixture (bin)"
+expect_stderr "target lt (bin)"
 # An entry for one kind of target does not cover another kind's target of the same name.
 check "default-harness bin not listed" 2 "" "${work}/unflipped-no-bin.txt"
-expect_stderr "target libtest-guard-fixture (bin)"
+expect_stderr "target lt (bin)"
 check "stale unflipped entry (already harness = false)" 2 "" "${work}/unflipped-stale-flipped.txt"
 expect_stderr "stale UNFLIPPED entry: test:it"
 check "stale unflipped entry (no such target)" 2 "" "${work}/unflipped-stale-missing.txt"
