@@ -1073,7 +1073,25 @@ pub(crate) mod fault {
         }
     }
 
+    /// tokio's `Child`, counted when it drops.
+    #[cfg(unix)]
+    pub(crate) struct CountedDrop {
+        pub(crate) _child: ::tokio::process::Child,
+    }
+
+    #[cfg(unix)]
+    impl Drop for CountedDrop {
+        fn drop(&mut self) {
+            note_backend_drop_inner();
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn note_backend_drop() {
+        note_backend_drop_inner();
+    }
+
+    fn note_backend_drop_inner() {
         BACKEND_DROPS.with(|d| d.set(d.get() + 1));
     }
 
