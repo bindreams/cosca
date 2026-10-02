@@ -75,6 +75,18 @@ class RecordingTests(GateCase):
         self.assertEqual(signal.set_wakeup_fd(wakeup), wakeup)
 
 
+def select_that_needs_a_timeout():
+    """A select spy that fails at once if a wait with a timeout calls select without one."""
+    real = m.select.select
+
+    def select(rlist, wlist, xlist, timeout=None):
+        if timeout is None:
+            raise AssertionError("select without the timeout: the wait could block forever")
+        return real(rlist, wlist, xlist, timeout)
+
+    return mock.patch.object(m.select, "select", select)
+
+
 class WaitTests(GateCase):
     def test_a_wait_multiplexes_on_the_wakeup_pipe_and_returns_ready_fds(self) -> None:
         r, w = os.pipe()
@@ -154,8 +166,15 @@ class WaitTests(GateCase):
                     gate.wait_for([])
 
     def test_sleep_with_no_signal_returns_when_the_timeout_passes(self) -> None:
-        with m.SignalGate() as gate:
+        with m.SignalGate() as gate, select_that_needs_a_timeout():
             gate.sleep(0)
+
+    def test_a_wait_with_a_timeout_returns_nothing_when_nothing_is_ready(self) -> None:
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        with m.SignalGate() as gate, select_that_needs_a_timeout():
+            self.assertEqual(gate.wait_for([r], timeout=0), [])
 
     def test_sleep_is_ended_by_a_signal(self) -> None:
         with m.SignalGate() as gate, on_blocked(signal.SIGHUP):

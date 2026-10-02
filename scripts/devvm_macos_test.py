@@ -491,6 +491,67 @@ class UnexpectedFailureTests(unittest.TestCase):
         self.assertEqual([p.name for p in env.sdir.glob("*.tmp")], [])
 
 
+class PreGateFailureTests(unittest.TestCase):
+    """Failures before `up`'s signal gate exists, and in the other verbs, are messages with exit 1 too."""
+
+    def backend_without_tart(self, env: Env, **environ) -> m.MacosBackend:
+        patch = mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", **environ}, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return m.MacosBackend(None, env.repo, env.state)
+
+    def assert_message_not_traceback(self, err: str, expected: str) -> None:
+        self.assertIn("error:", err)
+        self.assertIn(expected, err)
+        self.assertNotIn("Traceback", err)
+
+    def args(self, **kw) -> argparse.Namespace:
+        return argparse.Namespace(**{"rev": None, "rosetta": False, "allow_elevation": None, "display": False, "cmd": ["--", "true"], "unelevated": False, "timeout": None, "guest_path": "~/x", "host_dest": "/tmp/unused", **kw})
+
+    def test_up_without_tart_installed(self) -> None:
+        env = Env(self)
+        backend = self.backend_without_tart(env)
+        self.assert_message_not_traceback(exits_with(self, lambda: backend.up(self.args())), "tart not found")
+
+    def test_up_with_tart_pointing_at_a_missing_file(self) -> None:
+        env = Env(self)
+        backend = self.backend_without_tart(env, TART="/no/such/tart")
+        self.assert_message_not_traceback(exits_with(self, lambda: backend.up(self.args())), "/no/such/tart")
+
+    def test_up_when_tart_list_exits_non_zero_before_the_gate(self) -> None:
+        env = Env(self)
+        env.tart.vms_error = subprocess.CalledProcessError(1, "tart list")
+        env.tart.vms_error_on_call = 1
+        self.assert_message_not_traceback(exits_with(self, lambda: env.backend.up(self.args())), "CalledProcessError")
+
+    def test_every_verb_with_a_claim_but_no_tart(self) -> None:
+        env = Env(self)
+        env.sdir.mkdir(parents=True)
+        (env.sdir / "vm_name").write_text("devvm-macos-0123\n")
+        backend = self.backend_without_tart(env)
+        for verb in ("run", "sync", "fetch", "ssh"):
+            with self.subTest(verb=verb):
+                err = exits_with(self, lambda: getattr(backend, verb)(self.args()))
+                self.assert_message_not_traceback(err, "tart not found")
+
+    def test_every_verb_with_a_foreign_name_in_the_claim(self) -> None:
+        env = Env(self)
+        env.sdir.mkdir(parents=True)
+        (env.sdir / "vm_name").write_text("notcreatedbyus\n")
+        for verb in ("run", "sync", "fetch", "ssh", "destroy"):
+            with self.subTest(verb=verb):
+                err = exits_with(self, lambda: getattr(env.backend, verb)(self.args()))
+                self.assert_message_not_traceback(err, "refusing to touch")
+        self.assertEqual(env.tart.calls, [])
+
+    def test_the_claim_temp_file_does_not_outlive_a_failed_write(self) -> None:
+        env = Env(self)
+        with mock.patch.object(m.os, "fsync", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            err = exits_with(self, env.up)
+        self.assertIn("No space left", err)
+        self.assertEqual([p.name for p in env.sdir.glob("*.tmp")], [])
+
+
 class RemoveVmTests(unittest.TestCase):
     def test_a_vm_that_is_not_listed_is_not_stopped_or_deleted(self) -> None:
         env = Env(self)

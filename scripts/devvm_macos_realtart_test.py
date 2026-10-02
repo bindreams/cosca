@@ -31,13 +31,13 @@ cmd=$1; shift
 case "$cmd" in
 list)
   n=$(cat "$S/list.count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$S/list.count"
-  if [ "$n" = 2 ] && [ -e "$S/block.count" ]; then echo $$ > "$S/exec.pid"; echo count > "$S/fifo"; exec sleep 1000000; fi
+  if [ "$n" = 2 ] && [ -e "$S/block.count" ]; then echo $$ > "$S/exec.pid"; echo count > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
   printf '[{"Name":"%s","Source":"OCI","State":"stopped"}' "$BASE"
   for f in "$S"/state/*; do [ -e "$f" ] || continue
     printf ',{"Name":"%s","Source":"local","State":"%s"}' "$(basename "$f")" "$(cat "$f")"; done
   printf ']\n' ;;
 clone)
-  if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; exec sleep 1000000; fi
+  if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
   mkdir -p "$TART_HOME/vms/$2"; : > "$TART_HOME/vms/$2/disk.img"; echo stopped > "$S/state/$2" ;;
 run) shift; echo running > "$S/state/$1"; echo $$ > "$S/run.pid"; exec sleep 1000000 ;;
 stop) kill "$(cat "$S/run.pid")" 2>/dev/null; echo stopped > "$S/state/$1" ;;
@@ -47,13 +47,13 @@ exec)
   shift
   case "$1" in
   true)
-    if [ -e "$S/block.boot" ]; then echo $$ > "$S/exec.pid"; echo boot > "$S/fifo"; exec sleep 1000000; fi
+    if [ -e "$S/block.boot" ]; then echo $$ > "$S/exec.pid"; echo boot > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
     exit 0 ;;
   bash)
-    if [ -e "$S/block.provision" ]; then echo $$ > "$S/exec.pid"; echo provision > "$S/fifo"; exec sleep 1000000; fi
+    if [ -e "$S/block.provision" ]; then echo $$ > "$S/exec.pid"; echo provision > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
     cat > /dev/null ;;
   sh)
-    if [ -e "$S/block.archive" ]; then echo $$ > "$S/exec.pid"; echo archive > "$S/fifo"; exec sleep 1000000; fi
+    if [ -e "$S/block.archive" ]; then echo $$ > "$S/exec.pid"; echo archive > "$S/fifo"; exec sleep 1000000 >&- 2>&-; fi
     cat > /dev/null ;;
   *) cat > /dev/null ;;
   esac ;;
@@ -82,6 +82,31 @@ class StubEnv:
         self.repo = Env(test).repo
         self.state = self.root / "state"
         self.backend = m.MacosBackend(m.Tart(str(stub)), self.repo, self.state)
+        self.stub = stub
+        self.cleanup_started = False
+        self._forbid_blocking_tart_run(test)
+
+    def _forbid_blocking_tart_run(self, test) -> None:
+        """Until cleanup starts, every tart call must go through the gate (a cancellable wait). A plain
+        subprocess.run of tart would block on the stub's child, so fail at once instead of hanging."""
+        real_run, real_teardown = subprocess.run, self.backend._teardown
+        lists = []
+
+        def run(argv, *a, **kw):
+            if argv and str(argv[0]) == str(self.stub) and not self.cleanup_started and argv[1] not in ("stop", "delete"):
+                lists.append(argv[1])
+                if not (argv[1] == "list" and lists.count("list") == 1):  # the base-image pre-check runs before the gate
+                    raise AssertionError(f"a blocking `tart {argv[1]}` that no signal can cut short")
+            return real_run(argv, *a, **kw)
+
+        def teardown(name):
+            self.cleanup_started = True
+            return real_teardown(name)
+
+        self.backend._teardown = teardown
+        patch = mock.patch.object(subprocess, "run", run)
+        patch.start()
+        test.addCleanup(patch.stop)
 
     def block(self, what: str) -> None:
         (self.stub_dir / f"block.{what}").write_text("")
@@ -153,6 +178,7 @@ class RealTartCancelTests(unittest.TestCase):
         code, err = env.up()
         self.assertIsNone(code, err)
         self.assertEqual(len(env.vm_states()), 1)
+        env.cleanup_started = True  # destroy is cleanup: its tart calls are not cancellable by design
         with contextlib.redirect_stderr(io.StringIO()):
             env.backend.destroy(argparse.Namespace())
         self.assertEqual(env.vm_states(), [])

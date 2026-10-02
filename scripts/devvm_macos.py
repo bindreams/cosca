@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
 import json
 import os
 import select
@@ -173,6 +174,25 @@ def _say(message: str, *, file=None) -> None:
             sys.stderr = null
         elif file is sys.stdout:
             sys.stdout = null
+
+
+def _describe(error: Exception) -> str:
+    """The message for a failure: our own RuntimeError/ValueError texts are written for the user as they are."""
+    return str(error) if isinstance(error, (RuntimeError, ValueError)) else f"{type(error).__name__}: {error}"
+
+
+def _reports_failures(verb):
+    """Any failure of a verb is a message and exit status 1, never a traceback."""
+
+    @functools.wraps(verb)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return verb(self, *args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            _say(f"error: {_describe(e)}")
+            sys.exit(1)
+
+    return wrapper
 
 
 class Cancelled(BaseException):
@@ -474,14 +494,15 @@ class MacosBackend:
     def _claim(self, name: str) -> None:
         self.sdir.mkdir(parents=True, exist_ok=True)
         tmp = self.sdir / f"vm_name.{uuid.uuid4().hex}.tmp"
-        with open(tmp, "w") as f:
-            f.write(name + "\n")
-            f.flush()
-            os.fsync(f.fileno())
         try:
-            os.link(tmp, self._claim_file)
-        except FileExistsError:
-            raise AlreadyUp("guest 'macos-arm64' already exists for this worktree; `destroy` it first") from None
+            with open(tmp, "w") as f:
+                f.write(name + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, self._claim_file)
+            except FileExistsError:
+                raise AlreadyUp("guest 'macos-arm64' already exists for this worktree; `destroy` it first") from None
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -577,6 +598,7 @@ class MacosBackend:
                 _say(f"error: {flag} only applies to Windows guests")
                 sys.exit(1)
 
+    @_reports_failures
     def up(self, args: argparse.Namespace) -> None:
         self._reject_windows_flags(args)
         try:
@@ -606,7 +628,7 @@ class MacosBackend:
             except (AlreadyUp, UpError) as e:
                 error = str(e)
             except Exception as e:  # noqa: BLE001  tart list failing, bad JSON, a full disk: a message, never a traceback
-                error = f"{type(e).__name__}: {e}"
+                error = _describe(e)
         self._gate = None
         # Read after the gate has restored the handlers and drained its pipe: every signal recorded at
         # any point is in `pending`, and one arriving later takes its default action.
@@ -720,6 +742,7 @@ class MacosBackend:
 
     # other verbs -----------------------------------------------------------------
 
+    @_reports_failures
     def sync(self, args: argparse.Namespace) -> None:
         name = self._require_vm()
         try:
@@ -729,6 +752,7 @@ class MacosBackend:
             _say(f"error: {e}")
             sys.exit(1)
 
+    @_reports_failures
     def run(self, args: argparse.Namespace) -> None:
         for flag, attr in (("--unelevated", "unelevated"), ("--timeout", "timeout")):
             if getattr(args, attr, None):
@@ -743,9 +767,12 @@ class MacosBackend:
         name = self._require_vm()
         sys.exit(self.tart.exec(name, ["bash", "-c", build_remote_command(cmd_args)]).returncode)
 
+    @_reports_failures
     def ssh(self, _args: argparse.Namespace) -> None:
-        self.tart.exec_interactive(self._require_vm())
+        name = self._require_vm()
+        self.tart.exec_interactive(name)
 
+    @_reports_failures
     def fetch(self, args: argparse.Namespace) -> None:
         name = self._require_vm()
         try:
@@ -763,6 +790,7 @@ class MacosBackend:
             _say(f"error: fetching {guest_path} failed")
             sys.exit(1)
 
+    @_reports_failures
     def halt(self, _args: argparse.Namespace) -> None:
         _say("error: halt is not supported for macos-arm64 (a halted VM cannot be resumed); use `destroy`")
         sys.exit(1)
@@ -782,6 +810,7 @@ class MacosBackend:
                 return f"{e.get('State', '?')} ({name})"
         return f"missing ({name})"
 
+    @_reports_failures
     def destroy(self, _args: argparse.Namespace) -> None:
         """Stop and delete this worktree's VM, but only the one this worktree created.
 
@@ -797,7 +826,7 @@ class MacosBackend:
             except Cancelled as c:
                 cancelled = c.signo
             except Exception as e:  # noqa: BLE001  same: a message, then the exit status
-                failure = f"{type(e).__name__}: {e}"
+                failure = _describe(e)
         self._gate = None
         pending = gate.pending  # after the handlers are restored: nothing recorded is lost
         if failure is not None:

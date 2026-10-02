@@ -82,6 +82,34 @@ class RunTests(GateCase):
         self.assertEqual([(p, s) for p, s, _ours in kills], [(pid, signal.SIGKILL)], "the child was not killed")
         self.assertFalse(self.is_ours_unreaped(pid), "the child was not reaped")
 
+    def test_run_waits_before_it_joins_the_output_readers(self) -> None:
+        # `cat` keeps its output open while it blocks on stdin. Any join releases it, so a `run` that joins the
+        # readers before it waits returns normally instead of blocking; the order of events then fails the test.
+        r, w = os.pipe()
+        order = []
+        real_join = threading.Thread.join
+
+        def join(thread, *a, **kw):
+            order.append("join")
+            try:
+                os.close(w)
+            except OSError:
+                pass
+            return real_join(thread, *a, **kw)
+
+        with os.fdopen(r, "rb") as stdin, m.SignalGate() as gate:
+            kill_self()  # recorded first: the first wait cancels
+            with mock.patch.object(threading.Thread, "join", join), mock.patch.object(
+                m.SignalGate, "on_blocked", staticmethod(lambda: order.append("wait"))
+            ):
+                with self.assertRaises(m.Cancelled):
+                    gate.run(["cat"], stdin=stdin, capture_output=True)
+        try:
+            os.close(w)
+        except OSError:
+            pass
+        self.assertEqual(order[0], "wait", "the output readers were joined before the wait")
+
     def test_the_child_is_never_signalled_after_it_was_reaped(self) -> None:
         # Forced ordering: the child has exited, and the exit has been observed, before the cancel is decided.
         # Whoever reaped it, no signal may go to its pid afterwards: the pid could belong to someone else by then.
@@ -204,6 +232,28 @@ class LockTests(GateCase):
             waiter_may_close.append(True)
             gate.abandoned[0].join()
             self.assertTrue(mine.closed)
+
+    def test_a_cancelled_flock_wait_does_not_join_its_waiter(self) -> None:
+        # The holder is released from inside any join of the waiter, so a wait that joins it returns
+        # normally instead of blocking, and fails the Cancelled assertion at once.
+        holder = self.open_locked(self.path)
+        joined = []
+        real_join = threading.Thread.join
+
+        def join(thread, *a, **kw):
+            joined.append(thread)
+            holder.close()
+            return real_join(thread, *a, **kw)
+
+        with m.SignalGate() as gate:
+            self.record(gate)
+            f = open(self.path, "w")
+            with mock.patch.object(threading.Thread, "join", join):
+                with self.assertRaises(m.Cancelled):
+                    gate.flock(f)
+            self.assertEqual(joined, [], "the cancelled wait joined its waiter")
+            holder.close()
+            gate.abandoned[0].join()
 
     def test_a_failing_flock_raises_its_error_and_closes_the_file(self) -> None:
         def flock(_f, _op):
