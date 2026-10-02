@@ -552,6 +552,61 @@ class PreGateFailureTests(unittest.TestCase):
         self.assertEqual([p.name for p in env.sdir.glob("*.tmp")], [])
 
 
+class PipeOwnershipTests(unittest.TestCase):
+    """The parent must close its end of a pipe before it waits for the producer: with the end open, a consumer
+    that exits without reading leaves the producer blocked on a full pipe forever. A hang is not an option for
+    a test, so the order is asserted at the moment of the wait."""
+
+    def assert_pipe_closed_before_wait(self, make_procs):
+        procs = []
+        real_popen, real_wait = subprocess.Popen, subprocess.Popen.wait
+
+        def popen(*a, **kw):
+            p = real_popen(*a, **kw)
+            procs.append(p)
+            return p
+
+        def wait(proc, *a, **kw):
+            if proc in procs and proc.stdout is not None and not proc.stdout.closed:
+                raise AssertionError("waiting for a child whose stdout pipe the parent still holds")
+            return real_wait(proc, *a, **kw)
+
+        with mock.patch.object(subprocess.Popen, "wait", wait), mock.patch.object(m.subprocess, "Popen", popen):
+            make_procs()
+        self.assertTrue(procs)
+
+    def test_sync_closes_the_archive_pipe_before_it_waits_for_git(self) -> None:
+        env = Env(self)
+        with captured():
+            env.up()
+        env.tart.exec = lambda name, args, **kw: subprocess.CompletedProcess(args, 1)  # the guest reads nothing
+        self.assert_pipe_closed_before_wait(lambda: exits_with(self, lambda: env.backend.sync(argparse.Namespace(rev=None))))
+
+    def test_fetch_closes_the_tar_pipe_before_it_waits_for_the_guest(self) -> None:
+        env = Env(self)
+        with captured():
+            env.up()
+        guest = env.sdir.parent / "guest-home"
+        guest.mkdir()
+        (guest / "res").mkdir()
+        env.tart.guest_home = guest
+        args = argparse.Namespace(guest_path="~/res", host_dest=str(env.sdir.parent / "out"))
+        self.assert_pipe_closed_before_wait(lambda: env.backend.fetch(args))
+
+
+class RunExitCodeTests(unittest.TestCase):
+    def test_the_guest_command_s_exit_code_is_passed_on_and_a_signal_death_is_128_plus_signo(self) -> None:
+        env = Env(self)
+        with captured():
+            env.up()
+        for returncode, expected in ((0, 0), (7, 7), (-signal.SIGTERM, 128 + signal.SIGTERM), (-signal.SIGKILL, 128 + signal.SIGKILL)):
+            with self.subTest(returncode=returncode):
+                env.tart.exec_rc = lambda args, rc=returncode: rc
+                with captured(), self.assertRaises(SystemExit) as ctx:
+                    env.backend.run(argparse.Namespace(cmd=["--", "x"], unelevated=False, timeout=None))
+                self.assertEqual(ctx.exception.code, expected)
+
+
 class RemoveVmTests(unittest.TestCase):
     def test_a_vm_that_is_not_listed_is_not_stopped_or_deleted(self) -> None:
         env = Env(self)

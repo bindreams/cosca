@@ -278,7 +278,14 @@ class SignalGate:
         therefore still ours whenever it is signalled. `Popen.wait`, `poll` and `kill` are never used.
         """
         pipe = subprocess.PIPE if capture_output else None
-        proc = subprocess.Popen(argv, stdin=stdin, stdout=pipe, stderr=pipe, text=text, **kw)
+        exited_r, exited_w = os.pipe()  # before the child exists: a failure here leaves nothing running
+        try:
+            proc = subprocess.Popen(argv, stdin=stdin, stdout=pipe, stderr=pipe, text=text, **kw)
+        except BaseException:
+            os.close(exited_r)
+            os.close(exited_w)
+            raise
+        # From here on the child is ours to kill and reap, whatever fails next.
         pid = proc.pid
         streams = [st for st in (proc.stdout, proc.stderr) if st is not None]
         captured: dict[int, object] = {}
@@ -286,27 +293,25 @@ class SignalGate:
         def read(i: int, stream) -> None:
             captured[i] = stream.read()
 
-        readers = [threading.Thread(target=read, args=(i, st), daemon=True) for i, st in enumerate(streams)]
-        exited_r, exited_w = os.pipe()
-
         def observe() -> None:
             try:
                 os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
             finally:
                 os.write(exited_w, b"x")
 
-        watcher = threading.Thread(target=observe, daemon=True)
-        for t in (*readers, watcher):
-            t.start()
+        started: list[threading.Thread] = []
         interrupted: BaseException | None = None
         try:
+            for target, args in (*((read, (i, st)) for i, st in enumerate(streams)), (observe, ())):
+                thread = threading.Thread(target=target, args=args, daemon=True)
+                thread.start()
+                started.append(thread)
             self.wait_for([exited_r])
         except BaseException as e:  # noqa: BLE001  Cancelled, or anything else: the child must not outlive us
             interrupted = e
             os.kill(pid, signal.SIGKILL)  # not reaped yet, so the pid is still our child (alive or a zombie)
-        watcher.join()
-        for t in readers:
-            t.join()
+        for thread in started:
+            thread.join()
         proc.returncode = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
         for st in streams:
             st.close()
@@ -765,7 +770,8 @@ class MacosBackend:
             _say("error: no command given; usage: devvm.py run <guest> -- <cmd...>")
             sys.exit(1)
         name = self._require_vm()
-        sys.exit(self.tart.exec(name, ["bash", "-c", build_remote_command(cmd_args)]).returncode)
+        code = self.tart.exec(name, ["bash", "-c", build_remote_command(cmd_args)]).returncode
+        sys.exit(128 - code if code < 0 else code)  # a death by signal N is 128+N, as in a shell
 
     @_reports_failures
     def ssh(self, _args: argparse.Namespace) -> None:

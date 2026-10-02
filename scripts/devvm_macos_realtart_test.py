@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -39,7 +40,7 @@ list)
 clone)
   if [ -e "$S/block.clone" ]; then echo $$ > "$S/exec.pid"; echo clone > "$S/fifo"; read x < "$S/release"; exit 0; fi
   mkdir -p "$TART_HOME/vms/$2"; : > "$TART_HOME/vms/$2/disk.img"; echo stopped > "$S/state/$2" ;;
-run) shift; echo running > "$S/state/$1"; echo $$ > "$S/run.pid"; exec sleep 1000000 ;;
+run) shift; echo running > "$S/state/$1"; echo $$ > "$S/run.pid"; read x < "$S/run.release"; exit 0 ;;
 stop) kill "$(cat "$S/run.pid")" 2>/dev/null; echo stopped > "$S/state/$1" ;;
 delete) rm -rf "$TART_HOME/vms/$1" "$S/state/$1" ;;
 exec)
@@ -74,7 +75,13 @@ class StubEnv:
         os.mkfifo(release)
         # Held open for reading and writing by the test: the stub's `read` finds the release whenever it comes.
         self.release_fd = os.open(release, os.O_RDWR)
+        run_release = self.stub_dir / "run.release"
+        os.mkfifo(run_release)
+        self.run_release_fd = os.open(run_release, os.O_RDWR)
         test.addCleanup(os.close, self.release_fd)
+        test.addCleanup(os.close, self.run_release_fd)
+        # However the test ends, every child of the stub is released and exits: none outlives the test.
+        test.addCleanup(self._free_every_child)
         stub = self.root / "tart"
         stub.write_text(STUB)
         stub.chmod(0o755)
@@ -112,6 +119,34 @@ class StubEnv:
         patch = mock.patch.object(subprocess, "run", run)
         patch.start()
         test.addCleanup(patch.stop)
+
+    def _free_every_child(self) -> None:
+        for fd in (self.release_fd, self.run_release_fd):
+            os.write(fd, b"x\n" * 16)
+
+    def guard_unwakeable_selects(self, test) -> None:
+        """For flows where every child finishes by itself: a select with no timeout that nothing can ever
+        wake (the helper threads are finished and nothing is ready) is an assertion, not a hang."""
+        real_select, real_start, real_join = m.select.select, threading.Thread.start, threading.Thread.join
+        helpers: list[threading.Thread] = []
+
+        def start(thread):
+            real_start(thread)
+            helpers.append(thread)
+
+        def select(rlist, wlist, xlist, timeout=None):
+            if timeout is not None:
+                return real_select(rlist, wlist, xlist, timeout)
+            for thread in list(helpers):
+                real_join(thread)
+            ready = real_select(rlist, wlist, xlist, 0)
+            if not any(ready):
+                raise AssertionError("a select that nothing can ever wake")
+            return ready
+
+        for patch in (mock.patch.object(threading.Thread, "start", start), mock.patch.object(m.select, "select", select)):
+            patch.start()
+            test.addCleanup(patch.stop)
 
     def block(self, what: str) -> None:
         (self.stub_dir / f"block.{what}").write_text("")
@@ -185,6 +220,7 @@ class RealTartCancelTests(unittest.TestCase):
 
     def test_a_normal_up_and_destroy_work_through_the_real_wrapper(self) -> None:
         env = StubEnv(self)
+        env.guard_unwakeable_selects(self)
         code, err = env.up()
         self.assertIsNone(code, err)
         self.assertEqual(len(env.vm_states()), 1)
@@ -219,6 +255,41 @@ class RealTartCancelTests(unittest.TestCase):
                 self.assertEqual(env.vm_states(), [])
                 self.assertFalse((env.state / "macos-arm64" / "vm_name").exists())
                 self.assert_gone_and_reaped(env.pid("exec.pid"))
+
+    def test_a_clone_whose_setup_fails_starts_no_clone_process_and_leaves_no_orphan_vm(self) -> None:
+        env = StubEnv(self)
+        env.block("clone")  # a clone that gets started would block, then create a VM nobody tracks
+        real_clone = env.backend.tart.clone
+        in_clone = []
+
+        def clone(src, name, gate=None):
+            in_clone.append(True)
+            try:
+                return real_clone(src, name, gate=gate)
+            finally:
+                in_clone.clear()
+
+        def pipe():
+            if in_clone:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_pipe()
+
+        real_pipe, real_popen, clones = os.pipe, subprocess.Popen, []
+
+        def popen(argv, *a, **kw):
+            if "clone" in argv:
+                clones.append(argv)
+            return real_popen(argv, *a, **kw)
+
+        env.backend.tart.clone = clone
+        with mock.patch.object(m.os, "pipe", pipe), mock.patch.object(m.subprocess, "Popen", popen):
+            code, err = env.up()
+        self.assertEqual(code, 1, err)
+        self.assertIn("Too many open files", err)
+        self.assertEqual(clones, [], "a `tart clone` process was started")
+        env._free_every_child()
+        self.assertEqual(env.vm_states(), [])
+        self.assertFalse((env.state / "macos-arm64" / "vm_name").exists())
 
     def test_a_signal_while_provisioning_is_blocked_cancels_and_leaves_no_process_behind(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):

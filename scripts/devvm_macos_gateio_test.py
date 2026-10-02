@@ -4,10 +4,12 @@ A broken wait would block on a live child or a held lock, so these run after the
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -25,30 +27,74 @@ def on_blocked(sig: int = signal.SIGTERM):
 
 
 class GateCase(unittest.TestCase):
+    """Real children and locks, with every way a broken wait could block turned into an assertion.
+
+    - What a test holds that a wait would block on (a lock, a child's stdin) is registered in `releases` and
+      freed the moment the code under test is about to block in select or to join a thread. A correct run was
+      already cancelled and never gets there; a broken one is freed, returns normally and fails the test.
+    - A select with no timeout first lets the code's helper threads finish, then polls once with a zero
+      timeout. If nothing is ready, nothing can ever wake it: that is an assertion, not a hang.
+    - A blocking `os.read` that nothing can satisfy is an assertion too.
+    - `statuses` records how each reaped child ended, to tell "killed" from "left to finish by itself".
+    """
+
     def setUp(self) -> None:
         for sig in SIGNALS:
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
-        # Whatever a test holds that a wait would block on (a lock, a child's stdin) is released the moment
-        # the code under test is about to block in select or to join a thread. A correct run was already cancelled and never
-        # gets there; a broken wait is released, returns normally and fails the test at once.
         self.releases: list = []
-        real_select = m.select.select
+        self.statuses: dict[int, int] = {}
+        self.helper_threads: list[threading.Thread] = []
+        real_select, real_join, real_start = m.select.select, threading.Thread.join, threading.Thread.start
+        real_read, real_waitpid = os.read, os.waitpid
 
-        def select(*a):
+        def release_all() -> None:
             while self.releases:
                 self.releases.pop()()
-            return real_select(*a)
 
-        real_join = threading.Thread.join
+        def select(rlist, wlist, xlist, timeout=None):
+            release_all()
+            if timeout is not None:
+                return real_select(rlist, wlist, xlist, timeout)
+            for thread in list(self.helper_threads):
+                real_join(thread)
+            ready = real_select(rlist, wlist, xlist, 0)
+            if not any(ready):
+                raise AssertionError("a select that nothing can ever wake")
+            return ready
 
-        def join(thread, *a, **kw):  # a wait that joins a thread blocked on the held resource is released too
-            while self.releases:
-                self.releases.pop()()
+        def join(thread, *a, **kw):
+            release_all()
             return real_join(thread, *a, **kw)
 
-        for patch in (mock.patch.object(m.select, "select", select), mock.patch.object(threading.Thread, "join", join)):
+        def start(thread):
+            real_start(thread)
+            self.helper_threads.append(thread)
+
+        def read(fd, n):
+            from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")  # not subprocess's own
+            if from_backend and os.get_blocking(fd) and not real_select([fd], [], [], 0)[0]:
+                raise AssertionError("a blocking read that nothing can satisfy")
+            return real_read(fd, n)
+
+        def waitpid(pid, options):
+            result = real_waitpid(pid, options)
+            if result[0] == pid:
+                self.statuses[pid] = result[1]
+            return result
+
+        for patch in (
+            mock.patch.object(m.select, "select", select),
+            mock.patch.object(threading.Thread, "join", join),
+            mock.patch.object(threading.Thread, "start", start),
+            mock.patch.object(m.os, "read", read),
+            mock.patch.object(m.os, "waitpid", waitpid),
+        ):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def assert_killed_not_left_to_finish(self, pid: int) -> None:
+        status = self.statuses[pid]
+        self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, f"child ended with status {status}: it was not killed")
 
     @staticmethod
     def close_quietly(fd) -> None:
@@ -64,7 +110,7 @@ class RunTests(GateCase):
             done = gate.run(["sh", "-c", "echo out; echo err >&2; exit 3"], capture_output=True, text=True)
         self.assertEqual((done.returncode, done.stdout, done.stderr), (3, "out\n", "err\n"))
 
-    def run_cancelled(self, argv, *, stdin=None, release=None):
+    def run_cancelled(self, argv, *, stdin=None):
         """Run `argv` through the gate with a signal already recorded. Returns (pid, kills)."""
         started, kills = [], []
         real_popen, real_kill = subprocess.Popen, os.kill
@@ -83,8 +129,6 @@ class RunTests(GateCase):
             m.os, "kill", kill
         ):
             kill_self()  # recorded before the run starts: it cancels at the first wait
-            if release:
-                release()
             with self.assertRaises(m.Cancelled):
                 gate.run(argv, stdin=stdin, capture_output=True)
         return started[0].pid, kills
@@ -98,14 +142,53 @@ class RunTests(GateCase):
             return False
         return True
 
-    def test_a_signal_kills_and_reaps_the_child_before_cancelling(self) -> None:
-        # `cat` blocks reading r. Right after the signal the test closes the write end too, so a `run`
-        # that ignores the signal sees `cat` finish and returns normally: it fails at once.
+    def test_a_signal_kills_a_blocked_child_instead_of_waiting_for_it(self) -> None:
+        # `cat` blocks on stdin and is NOT released by the test before the cancel: it is freed (via `releases`)
+        # only if the code under test waits or joins first. So a cancel that waits for the child to finish on
+        # its own sees it exit normally, and the status check below fails; one that kills it sees SIGKILL.
         r, w = os.pipe()
+        self.releases.append(lambda: self.close_quietly(w))
         with os.fdopen(r, "rb") as stdin:
-            pid, kills = self.run_cancelled(["cat"], stdin=stdin, release=lambda: os.close(w))
+            pid, kills = self.run_cancelled(["cat"], stdin=stdin)
         self.assertEqual([(p, s) for p, s, _ours in kills], [(pid, signal.SIGKILL)], "the child was not killed")
+        self.assert_killed_not_left_to_finish(pid)
         self.assertFalse(self.is_ours_unreaped(pid), "the child was not reaped")
+
+    def test_a_pipe_failure_before_the_child_starts_starts_no_child(self) -> None:
+        started = []
+        real_popen = subprocess.Popen
+        with m.SignalGate() as gate, mock.patch.object(
+            m.subprocess, "Popen", lambda *a, **kw: (started.append(a), real_popen(*a, **kw))[1]
+        ), mock.patch.object(m.os, "pipe", side_effect=OSError(errno.EMFILE, "Too many open files")):
+            with self.assertRaises(OSError):
+                gate.run(["sleep", "30"], capture_output=True)
+        self.assertEqual(started, [], "a child was started although run could not set itself up")
+
+    def test_a_setup_failure_after_the_child_started_kills_and_reaps_it(self) -> None:
+        # The helper thread cannot be started (as when threads run out): the child must not be left running.
+        r, w = os.pipe()
+        self.releases.append(lambda: self.close_quietly(w))
+        started = []
+        real_popen, real_start = subprocess.Popen, threading.Thread.start
+
+        def popen(*a, **kw):
+            p = real_popen(*a, **kw)
+            started.append(p)
+            return p
+
+        def start(thread):
+            if started:
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        with os.fdopen(r, "rb") as stdin, m.SignalGate() as gate, mock.patch.object(m.subprocess, "Popen", popen), mock.patch.object(
+            threading.Thread, "start", start
+        ):
+            with self.assertRaises(RuntimeError):
+                gate.run(["cat"], stdin=stdin, capture_output=True)
+        (proc,) = started
+        self.assert_killed_not_left_to_finish(proc.pid)
+        self.assertFalse(self.is_ours_unreaped(proc.pid), "the child was left behind")
 
     def test_run_waits_before_it_joins_the_output_readers(self) -> None:
         # `cat` keeps its output open while it blocks on stdin. Any join releases it, so a `run` that joins the

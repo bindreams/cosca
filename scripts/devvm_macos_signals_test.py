@@ -308,6 +308,24 @@ class LateSignalTests(SignalCase):
         self.assertEqual(code, 128 + signal.SIGTERM, err)
         self.assertIn("provisioning failed", err)
 
+    def test_a_signal_that_lands_while_the_handlers_are_restored_is_not_lost(self) -> None:
+        # The gate restores SIGINT, then SIGTERM, then SIGHUP. A SIGTERM arriving right after the first
+        # restore still finds the gate's handler; it must reach the exit code, whatever order __exit__ uses.
+        env = Env(self)
+        real_signal, calls = m.signal.signal, []
+
+        def signal_(sig, handler):
+            result = real_signal(sig, handler)
+            calls.append(sig)
+            if len(calls) == len(m.SignalGate.SIGNALS) + 1:  # the first restore, after the installs
+                kill_self(signal.SIGTERM)
+            return result
+
+        with mock.patch.object(m.signal, "signal", signal_):
+            code, err = self.up_exit(env)
+        self.assertEqual(code, 128 + signal.SIGTERM, err)
+        self.assertEqual(len(env.tart.local_names()), 1)
+
     def test_destroy_exits_with_the_late_signal(self) -> None:
         env = Env(self)
         with captured():
