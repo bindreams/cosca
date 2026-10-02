@@ -2,7 +2,6 @@
 **/*.rs.bk
 __pycache__/
 
-# .github/fixtures/disallowed-methods is a standalone crate (its own Cargo.toml); its Cargo.lock is tracked.
 /.github/fixtures/disallowed-methods/target
 /.github/fixtures/libtest-guard/target
 
