@@ -287,21 +287,74 @@ async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
     assert_eq!(line, "hello\n");
 }
 
-/// Dropping a backend, which is what an unwind does to one, never hands tokio's `Child` to its own
-/// drop: that drop reaps by pid, and only `release` is allowed to run it.
+/// Dropping a backend that nothing released or forgot, which is what an unwind does to one, hands
+/// tokio's `Child` to its own drop only when the pidfd shows the child ours.
 ///
-/// Mutant: the `Tokio` variant's `child` is not a `ManuallyDrop`.
-#[cfg(unix)]
+/// Mutant: the implicit drop forgets every child.
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn dropping_a_backend_implicitly_does_not_reap_the_child_by_pid() {
+async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
     let proc = proc_source(child);
     wait_exited_unreaped(pid);
+    let backend_drops = super::fault::count_backend_drops();
 
     drop(proc);
 
-    reap_behind_the_owner(pid); // still ours to consume: nothing reaped it by pid
+    assert_eq!(backend_drops.get(), 1, "a child shown ours is released to tokio's drop");
+}
+
+/// The same drop forgets tokio's `Child` when the pidfd shows the child reaped elsewhere: tokio's
+/// drop would reap by a pid that may name another process.
+///
+/// Mutant: the implicit drop releases every child.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = proc_source(child);
+    reap_behind_the_owner(pid);
+    let backend_drops = super::fault::count_backend_drops();
+
+    drop(proc);
+
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
+}
+
+/// `wait` closes the untaken stdin before it waits, as tokio's own `wait` does, so a child that
+/// reads stdin to EOF can exit. The streams live in the backend, not in tokio's `Child`, so the
+/// backend does it. Observed after one poll, which has run the close and not the wait.
+///
+/// Mutant: `wait` leaves stdin open.
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_closes_the_untaken_stdin_first() {
+    use std::future::Future;
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    {
+        let mut waiting = Box::pin(proc.wait());
+        std::future::poll_fn(|cx| {
+            drop(waiting.as_mut().poll(cx));
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    let ProcSource::Tokio { stdin, .. } = &proc else {
+        panic!("a tokio backend");
+    };
+    let closed = stdin.is_none();
+    proc.reap_now(pid); // the test's own `cat`: end it whatever happened
+    assert!(closed, "wait must close stdin before it waits");
 }
 
 /// Without evidence of a foreign reap nothing is forgotten: a live child stays tokio's.
