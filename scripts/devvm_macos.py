@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 GUEST_NAME = "macos-arm64"
@@ -136,6 +137,19 @@ def _archive_into_guest(repo_root: Path, name: str, rev: str) -> None:
         sys.exit(1)
 
 
+def _wait_for_agent(name: str, run: subprocess.Popen, log: Path) -> None:
+    """Block until `tart exec` answers. `tart ip --wait` can return before `tart run` has
+    registered the VM as running, so readiness is the first successful exec. The only failure
+    is `tart run` itself exiting; retrying is a re-check of a deterministic condition."""
+    while True:
+        if _exec(name, ["true"], capture_output=True).returncode == 0:
+            return
+        if run.poll() is not None:
+            print(f"error: `tart run` for {name} exited ({run.returncode}); see {log}", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(1)
+
+
 def up(repo_root: Path, state_root: Path, *, rev: str, rosetta: bool) -> None:
     if read_vm_name(state_root) is not None:
         print("error: guest 'macos-arm64' already exists for this worktree; `destroy` it first", file=sys.stderr)
@@ -167,22 +181,22 @@ def up(repo_root: Path, state_root: Path, *, rev: str, rosetta: bool) -> None:
         _tart(["clone", BASE_IMAGE, name], check=True)
         (sdir / "vm_name").write_text(name + "\n")
         log = open(sdir / "tart-run.log", "wb")
-        subprocess.Popen(
+        run = subprocess.Popen(
             [tart_bin(), "run", "--no-graphics", name],
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        # `tart exec` fails until the guest agent is up, so block on `tart ip --wait`,
-        # then on the first successful exec; both are waits on an external event.
-        _tart(["ip", "--wait", "300", name], check=True, capture_output=True)
-    ready = _exec(name, ["true"])
-    if ready.returncode != 0:
-        print(f"error: guest agent in {name} is not answering; see {sdir / 'tart-run.log'}", file=sys.stderr)
-        sys.exit(1)
+        _wait_for_agent(name, run, sdir / "tart-run.log")
     _archive_into_guest(repo_root, name, rev)
-    flag = " --rosetta" if rosetta else ""
-    r = _exec(name, ["bash", "-c", f'bash "$HOME/cosca/{PROVISION_SCRIPT}" "$HOME/cosca"{flag}'])
+    # The provision script comes from THIS checkout (streamed on stdin), not from the rev
+    # being tested: an older --rev may predate it. Only .github/ci-toolchain is read from the rev.
+    with open(repo_root / PROVISION_SCRIPT, "rb") as script:
+        r = _exec(
+            name,
+            ["bash", "-c", 'bash -s -- "$HOME/cosca" "$@"', "_", *(["--rosetta"] if rosetta else [])],
+            stdin=script,
+        )
     if r.returncode != 0:
         print("error: provisioning failed; `devvm.py destroy macos-arm64` to clean up", file=sys.stderr)
         sys.exit(r.returncode)

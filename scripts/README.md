@@ -112,7 +112,7 @@ uv run scripts/devvm.py destroy macos-arm64                           # stop and
 - Every `up` is a fresh copy-on-write `tart clone` of the base image under a unique
   `devvm-macos-*` name; the base is never started or modified. `destroy` only ever deletes
   names with that prefix.
-- Only committed state is copied (`git archive`); uncommitted edits are not.
+- Only committed state is copied (`git archive <rev>`); uncommitted edits are not. The provision script always comes from this checkout, so `--rev` may name an older commit.
 - At most 2 macOS VMs run at once on a Mac (Apple's licence). `up` counts every running
   local Tart VM and refuses a third.
 - `--rosetta` installs Rosetta and the `x86_64-apple-darwin` target so
