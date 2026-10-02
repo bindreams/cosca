@@ -1,9 +1,7 @@
-# Config for .github/scripts/libtest-guard.sh only (via CLIPPY_CONF_DIR); the repo's own
-# clippy.toml is separate. Every path that spells the built-in `#[test]` attribute or the
-# tokio wrapper over it.
+# Config for .github/scripts/libtest_guard.py only (via CLIPPY_CONF_DIR); the repo's own
+# clippy.toml is separate. Clippy resolves every spelling of the built-in `#[test]`
+# (`core::prelude::v1::test`, `std::prelude::v1::test`, ...) to the one item below.
 disallowed-macros = [
-    { path = "core::prelude::v1::test", reason = "a harness = false target never runs libtest's #[test]; use #[skuld::test]" },
-    { path = "std::prelude::v1::test", reason = "a harness = false target never runs libtest's #[test]; use #[skuld::test]" },
     { path = "core::macros::builtin::test", reason = "a harness = false target never runs libtest's #[test]; use #[skuld::test]" },
     { path = "tokio::test", reason = "a harness = false target never runs #[tokio::test]; use #[skuld::test]" },
 ]

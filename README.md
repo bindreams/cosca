@@ -89,7 +89,7 @@ docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 
 ## Linting
 
-`prek` runs `.github/scripts/clippy.sh`, which also runs the libtest guard (`.github/scripts/libtest-guard.sh`). The guard needs `python3` 3.11 or later on `PATH` (it reads `Cargo.toml` with `tomllib`); macOS's `/usr/bin/python3` is older, so install a newer one (Homebrew or `uv`). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
+`prek` runs `.github/scripts/clippy.sh`, which also runs the libtest guard (`.github/scripts/libtest_guard.py`), a `uv` script: install [uv](https://docs.astral.sh/uv/). `cargo-hack` is needed only for `--feature-powerset`, which CI uses.
 
 ## License
 
