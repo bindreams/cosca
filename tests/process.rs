@@ -850,8 +850,8 @@ fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
     assert_died_before_connecting(&message, root_pid);
 
     // The root exits only after the relay has, so the write end is now open only in a process
-    // the relay left behind. Such a process would block on `main`, still open here, so it is
-    // alive now and EOF cannot be pending: `WouldBlock` is the leak, without any wait.
+    // the relay left behind. A grandchild it spawned blocks on `main`, still open here, so it is
+    // alive now and the read cannot see EOF: `WouldBlock` is the leak, without any wait.
     // SAFETY: F_GETFL and F_SETFL on a pipe this frame owns.
     unsafe {
         let flags = libc::fcntl(output.as_raw_fd(), libc::F_GETFL);
