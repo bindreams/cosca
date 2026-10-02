@@ -211,21 +211,34 @@ fn run_control_echo_pid(addr: &str, tag: &str) -> ! {
 /// forever. Unset, nothing is reported and other consumers of the `spawn-grandchild*` modes see no
 /// extra connection.
 ///
+/// The report connection is made before the grandchild exists, so a reporter that cannot connect
+/// dies without leaving one behind. A report that fails after the spawn kills and reaps the
+/// grandchild before panicking, for the same reason.
+///
 /// Returns the `Child` wrapped, which the caller must keep alive: on Windows dropping it closes the handle
 /// that keeps the grandchild's pid from being reissued, and on Unix the grandchild stays an
 /// unreaped zombie (its pid stable) because nothing here ever waits on it.
 fn spawn_reported_grandchild(exe: &std::path::Path, args: &[&str]) -> KeptGrandchild {
+    // `connect_control` waits for the first ack: the harness has accepted this connection.
+    let report = std::env::var_os("COSCA_TEST_GC_PID_ADDR")
+        .map(|addr| crate::ack::connect_control(addr.to_str().unwrap()).unwrap());
     #[allow(
         clippy::disallowed_methods,
         reason = "no other thread of this process forks: this mode starts none, and the crate's helper threads only wait"
     )]
-    let gc = std::process::Command::new(exe).args(args).spawn().unwrap();
-    if let Some(addr) = std::env::var_os("COSCA_TEST_GC_PID_ADDR") {
-        // `connect_control` waits for the first ack: the harness has accepted this connection.
-        let mut sock = crate::ack::connect_control(addr.to_str().unwrap()).unwrap();
-        writeln!(sock, "{}", gc.id()).unwrap();
-        sock.flush().unwrap();
-        crate::ack::wait_for_ack(&mut sock); // the second: the grandchild's identity is captured
+    let mut gc = std::process::Command::new(exe).args(args).spawn().unwrap();
+    if let Some(mut sock) = report {
+        let reported = writeln!(sock, "{}", gc.id())
+            .and_then(|()| sock.flush())
+            // The second ack: the grandchild's identity is captured.
+            .and_then(|()| crate::ack::try_wait_for_ack(&mut sock));
+        if let Err(e) = reported {
+            let killed = gc.kill();
+            let waited = gc.wait();
+            panic!(
+                "reporting the grandchild's pid failed: {e}; killed the grandchild: {killed:?}, then waited for it: {waited:?}"
+            );
+        }
     }
     KeptGrandchild(gc)
 }

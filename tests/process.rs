@@ -820,6 +820,9 @@ fn death_watch_accept_tree_panics_when_the_grandchild_dies_before_connecting_whi
 /// root, and the root only waits for the relay. A relay that dies before it reports must fail the
 /// report accept, which watches the root: the root has to exit with it, not carry on to its own
 /// connection and leave the accept waiting on a live root.
+///
+/// The failed relay must leave nothing behind: nothing contains this tree, so an orphan would
+/// outlive the test.
 #[cfg(unix)]
 #[skuld::test]
 fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
@@ -829,17 +832,83 @@ fn death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept() {
     // An address with no port never resolves, so the relay's report connection fails at once. A
     // port freed by dropping a listener could be taken by another test and answered.
     let refused_addr = "no-port";
-    let mut root = common::spawn_locked(
-        std::process::Command::new(common::testbin())
-            .args(["spawn-orphan-escapee", &main.local_addr().unwrap().to_string()])
-            .env(common::ACK_ENV, "1")
-            .env(common::GC_PID_ADDR_ENV, refused_addr),
-    )
-    .expect("spawn the orphan tree");
+    let (mut root, output) = spawn_orphan_tree(&main, refused_addr);
     let root_pid = root.id();
     let message = panic_message_of(|| common::accept_or_die(&report, &mut root));
     root.wait().expect("reap the root");
     assert_died_before_connecting(&message, root_pid);
+    let printed = assert_no_leftover_holds(output);
+    assert!(
+        printed.contains("invalid socket address"),
+        "the relay must die of its failed report connection; the tree printed: {printed}"
+    );
+    drop(main);
+}
+
+/// [`death_watch_a_relay_that_dies_before_reporting_fails_the_report_accept`] with the report
+/// connection accepted and then closed: the relay has spawned its grandchild by then, and must
+/// not orphan it when the report fails.
+#[cfg(unix)]
+#[skuld::test]
+fn death_watch_a_relay_whose_report_is_closed_after_the_accept_leaves_nothing_behind() {
+    use std::net::TcpListener;
+    let main = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let report = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (mut root, output) = spawn_orphan_tree(&main, &report.local_addr().unwrap().to_string());
+    // Accepted and acked, then closed before the pid line is read or the release written.
+    drop(common::accept_or_die(&report, &mut root));
+    let status = root.wait().expect("reap the root");
+    assert!(!status.success(), "the root must fail with its relay: {status:?}");
+    let printed = assert_no_leftover_holds(output);
+    assert!(
+        printed.contains("reporting the grandchild's pid failed"),
+        "the relay must die of its failed report; the tree printed: {printed}"
+    );
+    drop(main);
+}
+
+/// Spawns `spawn-orphan-escapee` on `main`, reporting to `report_addr`, with a pipe as the tree's
+/// only stdout and stderr: each member holds its write end until it exits.
+#[cfg(unix)]
+fn spawn_orphan_tree(main: &std::net::TcpListener, report_addr: &str) -> (std::process::Child, std::io::PipeReader) {
+    let (output, output_w) = std::io::pipe().expect("create the tree's output pipe");
+    let root = common::spawn_locked(
+        std::process::Command::new(common::testbin())
+            .args(["spawn-orphan-escapee", &main.local_addr().unwrap().to_string()])
+            .env(common::ACK_ENV, "1")
+            .env(common::GC_PID_ADDR_ENV, report_addr)
+            .stdout(output_w.try_clone().expect("clone the output pipe"))
+            .stderr(output_w),
+    )
+    .expect("spawn the orphan tree");
+    (root, output)
+}
+
+/// Drains the reaped orphan tree's `output` and returns what it printed, failing if a process still
+/// holds the write end. The caller keeps the tree's `main` listener open until this returns.
+///
+/// The root exits after the relay, so only a leftover process can still hold the write end. Any
+/// such orphan blocks on `main` (open until the end), so the read yields `WouldBlock`, never EOF.
+#[cfg(unix)]
+fn assert_no_leftover_holds(mut output: std::io::PipeReader) -> String {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_GETFL and F_SETFL on a pipe this frame owns.
+    unsafe {
+        let flags = libc::fcntl(output.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+        let rc = libc::fcntl(output.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        assert_eq!(rc, 0, "F_SETFL: {}", std::io::Error::last_os_error());
+    }
+    let mut printed = Vec::new();
+    let drained = output.read_to_end(&mut printed);
+    let printed = String::from_utf8_lossy(&printed).into_owned();
+    match drained {
+        Ok(_) => printed,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            panic!("a process the failed relay left behind still holds the tree's output; it printed: {printed}")
+        }
+        Err(e) => panic!("reading the tree's output: {e}; it printed: {printed}"),
+    }
 }
 
 /// The second tree accept must watch the grandchild too: the root connects first, the grandchild

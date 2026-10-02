@@ -1,7 +1,7 @@
 //! The grandchild pid report of the `spawn-grandchild*` testbin roots.
 //!
-//! A root started with [`GC_PID_ADDR_ENV`] connects to that address after spawning its grandchild
-//! (waiting for the accept ack, like any control connection), writes the grandchild's pid as one
+//! A root started with [`GC_PID_ADDR_ENV`] connects to that address (waiting for the accept ack,
+//! like any control connection), then spawns its grandchild, writes the grandchild's pid as one
 //! `<pid>\n` line, and then BLOCKS until the harness writes a second ack byte. The harness
 //! captures the grandchild's [`ProcessId`] before writing that release. Until then the root is
 //! alive and, in the `spawn-grandchild*` modes, still the grandchild's parent, holding it unreaped

@@ -66,13 +66,28 @@ pub fn connect_control(addr: impl ToSocketAddrs) -> std::io::Result<TcpStream> {
 /// When [`enabled`], block until the harness writes [`ACK_BYTE`] on `sock`. Also used for the
 /// second ack of the grandchild-pid report, which releases the reporter.
 pub fn wait_for_ack(sock: &mut TcpStream) {
+    try_wait_for_ack(sock).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// [`wait_for_ack`] that returns its failure instead of panicking.
+pub fn try_wait_for_ack(sock: &mut TcpStream) -> std::io::Result<()> {
     if !enabled() {
-        return;
+        return Ok(());
     }
     let mut byte = [0u8; 1];
-    sock.read_exact(&mut byte)
-        .expect("the harness closed the connection before acknowledging it");
-    assert_eq!(byte[0], ACK_BYTE, "the acknowledgement byte was {:#x}", byte[0]);
+    sock.read_exact(&mut byte).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("the harness closed the connection before acknowledging it: {e}"),
+        )
+    })?;
+    if byte[0] != ACK_BYTE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the acknowledgement byte was {:#x}", byte[0]),
+        ));
+    }
+    Ok(())
 }
 
 /// Writes [`ACK_BYTE`] to `sock`: the harness's half.
