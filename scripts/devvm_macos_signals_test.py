@@ -14,14 +14,10 @@ import unittest
 from unittest import mock
 
 from scripts import devvm_macos as m
+from scripts.devvm_macos_testlib import kill_self
 from scripts.devvm_macos_testlib import Env, captured
 
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def kill_self(*sigs: int) -> None:
-    for sig in sigs:
-        os.kill(os.getpid(), sig)
 
 
 class SignalCase(unittest.TestCase):

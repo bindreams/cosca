@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import devvm, devvm_macos as m
-from scripts.devvm_macos_testlib import Env, FakeTart, _vm, captured, exits_with
+from scripts.devvm_macos_testlib import kill_self, Env, FakeTart, _vm, captured, exits_with
 
 # Pure helpers =========================================================================
 
@@ -426,7 +426,7 @@ class UnexpectedFailureTests(unittest.TestCase):
         def sigterm_once(counter=[]) -> None:
             counter.append(True)
             if len(counter) == 2:  # the count in `up`; the base-image pre-check is the first `vms` call
-                os.kill(os.getpid(), signal.SIGTERM)
+                kill_self(signal.SIGTERM)
 
         if failure.startswith("tart list"):
             env.tart.vms_error = (
@@ -438,12 +438,12 @@ class UnexpectedFailureTests(unittest.TestCase):
         elif failure == "identity cannot be read":
             env.tart.identity_error = FileNotFoundError("disk.img")
             if with_signal:
-                env.tart.hooks["clone"] = lambda: os.kill(os.getpid(), signal.SIGTERM)
+                env.tart.hooks["clone"] = lambda: kill_self(signal.SIGTERM)
         elif failure == "the claim cannot be written":
 
             def claim(name):
                 if with_signal:
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    kill_self(signal.SIGTERM)
                 raise OSError(errno.ENOSPC, "No space left on device")
 
             env.backend._claim = claim
@@ -475,7 +475,7 @@ class UnexpectedFailureTests(unittest.TestCase):
                 env.tart.vms_error = subprocess.CalledProcessError(1, "tart list")
                 if with_signal:
                     real = env.tart.vms
-                    env.tart.vms = lambda gate=None: (os.kill(os.getpid(), signal.SIGTERM), real(gate))[1]
+                    env.tart.vms = lambda gate=None: (kill_self(signal.SIGTERM), real(gate))[1]
                 with captured() as err, self.assertRaises(SystemExit) as ctx:
                     env.destroy()
                 self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM if with_signal else 1, err.getvalue())

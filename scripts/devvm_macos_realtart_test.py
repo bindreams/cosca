@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import devvm_macos as m
-from scripts.devvm_macos_testlib import Env
+from scripts.devvm_macos_testlib import Env, kill_self
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -122,7 +122,7 @@ class StubEnv:
         def wait_then_signal() -> None:
             with open(self.fifo) as f:
                 f.readline()
-            os.kill(os.getpid(), sig)
+            kill_self(sig)
             # The blocked stub child is released too, so a wait that no signal can cut short returns instead
             # of blocking. A correct wait was cancelled by the signal, whatever the child then does.
             os.write(self.release_fd, b"x\n")
@@ -234,12 +234,12 @@ class RealTartCancelTests(unittest.TestCase):
 CHILD = r"""
 import json, os, signal, sys, unittest
 from scripts import devvm_macos as m
-from scripts.devvm_macos_testlib import Env
+from scripts.devvm_macos_testlib import Env, kill_self
 
 sig = int(sys.argv[1])
 env = Env(unittest.TestCase())
 real = env.backend._checkpoint
-env.backend._checkpoint = lambda label: (os.kill(os.getpid(), sig) if label == "booted" else None, real(label))[1]
+env.backend._checkpoint = lambda label: (kill_self(sig) if label == "booted" else None, real(label))[1]
 code = None
 try:
     env.up()

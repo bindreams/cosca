@@ -14,13 +14,10 @@ import unittest
 from unittest import mock
 
 from scripts import devvm_macos as m
+from scripts.devvm_macos_testlib import kill_self
 from scripts.devvm_macos_testlib import forbid_blocking_flock
 
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def kill_self(sig: int = signal.SIGTERM) -> None:
-    os.kill(os.getpid(), sig)
 
 
 def on_blocked(sig: int = signal.SIGTERM):

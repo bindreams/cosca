@@ -189,6 +189,15 @@ class FakeTart:
         return [v["Name"] for v in self.vm_list if v["Source"] == "local"]
 
 
+def kill_self(*sigs: int) -> None:
+    """Deliver real signals to this process, after checking that a handler is installed for each: with none, the
+    signal would kill the test process (a crash instead of a failed assertion)."""
+    for sig in sigs or (signal.SIGTERM,):
+        if signal.getsignal(sig) is signal.SIG_DFL:
+            raise AssertionError(f"no handler is installed for {signal.Signals(sig).name}: it would kill the test run")
+        os.kill(os.getpid(), sig)
+
+
 def forbid_blocking_flock(test: unittest.TestCase, allow=lambda: False) -> None:
     """A blocking flock on the main thread is how a regression turns into a hang. In the code under test
     it is legitimate only in cleanup's wait for the cap lock, which a test opts into with `allow`."""
