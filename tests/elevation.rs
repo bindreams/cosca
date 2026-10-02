@@ -78,7 +78,7 @@ fn posix_child_self_detects_elevation() {
 #[cfg(all(target_os = "linux", feature = "pty"))]
 #[test]
 fn controlling_terminal_probe_consults_ctty_not_stdin() {
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, OwnedFd};
 
     fn is_cloexec(fd: &impl AsFd) -> bool {
         let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD failed");
@@ -95,16 +95,11 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
     let master: OwnedFd = master.into();
     // TIOCGPTPEER takes the slave from the master fd, not a devpts path lookup (ptsname + open):
     // a path can resolve to the wrong devpts instance in a mount namespace (Linux 4.13+).
-    let raw = unsafe {
-        libc::ioctl(
-            master.as_raw_fd(),
-            libc::TIOCGPTPEER,
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    assert!(raw >= 0, "TIOCGPTPEER: {}", std::io::Error::last_os_error());
-    // SAFETY: TIOCGPTPEER returned a fresh, owned descriptor above.
-    let slave: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let slave: OwnedFd = rustix::pty::ioctl_tiocgptpeer(
+        &master,
+        rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY | rustix::pty::OpenptFlags::CLOEXEC,
+    )
+    .unwrap_or_else(|e| panic!("TIOCGPTPEER: {e}"));
     assert!(is_cloexec(&master));
     assert!(is_cloexec(&slave));
     let slave_file = std::fs::File::from(slave);

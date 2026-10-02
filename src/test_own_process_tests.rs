@@ -1,9 +1,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write as _;
-use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
-
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use std::os::fd::{AsRawFd as _, RawFd};
 
 use crate::test_own_process::{
     child_args, child_completion, drain, is_reexecution, own_process, role, run, test_path, Completion, FailureKind,
@@ -48,7 +46,7 @@ fn fixture_records_its_pid_and_misbehaves_on_request() {
             let token_fd: RawFd = std::env::var(ENV).unwrap().split(':').nth(1).unwrap().parse().unwrap();
             // The control: a pipe end of the token's kind, deliberately not close-on-exec.
             let (control, _write) = std::io::pipe().expect("pipe");
-            fcntl(control.as_fd(), FcntlArg::F_SETFD(FdFlag::empty())).expect("clear close-on-exec");
+            rustix::io::fcntl_setfd(&control, rustix::io::FdFlags::empty()).expect("clear close-on-exec");
             assert!(
                 child_inherits(control.as_raw_fd()),
                 "the probe must see a descriptor the child does inherit"
@@ -148,7 +146,7 @@ impl Drop for Bystander {
 
 fn nonblocking_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     let (read, write) = std::io::pipe().expect("pipe");
-    fcntl(read.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("non-blocking read end");
+    rustix::fs::fcntl_setfl(&read, rustix::fs::OFlags::NONBLOCK).expect("non-blocking read end");
     (read, write)
 }
 

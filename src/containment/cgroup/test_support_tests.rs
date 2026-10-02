@@ -324,18 +324,11 @@ fn describe_status(status: i32) -> String {
 
 #[cfg(target_os = "linux")]
 fn set_nonblocking(fd: std::os::fd::RawFd) {
-    // SAFETY: fcntl(F_GETFL/F_SETFL) on a live, owned fd; no pointer args beyond the flags.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
-        let rc = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        assert_eq!(
-            rc,
-            0,
-            "fcntl F_SETFL O_NONBLOCK failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    // SAFETY: `fd` is the caller's open descriptor, which outlives this function.
+    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = rustix::fs::fcntl_getfl(fd).unwrap_or_else(|e| panic!("fcntl F_GETFL failed: {e}"));
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
+        .unwrap_or_else(|e| panic!("fcntl F_SETFL O_NONBLOCK failed: {e}"));
 }
 
 /// `fork_running` must hold `spawn_lock()` across its `fork()`, otherwise a concurrent cosca spawn

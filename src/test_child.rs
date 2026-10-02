@@ -665,10 +665,9 @@ pub(crate) fn run_fixture(fixture: &str) {
         // child's own copy only.
         unsafe {
             cmd.pre_exec(move || {
-                if libc::fcntl(raw, libc::F_SETFD, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
+                // `raw` is the scratch fd, open in this forked child.
+                let fd = rustix::fd::BorrowedFd::borrow_raw(raw);
+                rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
             });
         }
         #[allow(

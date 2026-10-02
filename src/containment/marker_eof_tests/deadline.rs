@@ -22,18 +22,9 @@ use crate::wait::test_clock;
 /// measured on the marker pipe itself (a SEPARATE kernel object — see `pipe_blksize`).
 fn measure_pipe_capacity() -> usize {
     let (_r, w) = marker_pipe();
-    // SAFETY: fcntl(F_GETFL/F_SETFL) on a live, owned fd; no pointer args beyond the flags.
-    unsafe {
-        let flags = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
-        assert!(flags >= 0, "fcntl F_GETFL failed: {}", std::io::Error::last_os_error());
-        let rc = libc::fcntl(w.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        assert_eq!(
-            rc,
-            0,
-            "fcntl F_SETFL O_NONBLOCK failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    let flags = rustix::fs::fcntl_getfl(&w).unwrap_or_else(|e| panic!("fcntl F_GETFL failed: {e}"));
+    rustix::fs::fcntl_setfl(&w, flags | rustix::fs::OFlags::NONBLOCK)
+        .unwrap_or_else(|e| panic!("fcntl F_SETFL O_NONBLOCK failed: {e}"));
     let chunk = [0u8; 4096];
     let mut total = 0usize;
     loop {

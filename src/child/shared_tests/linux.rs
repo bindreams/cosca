@@ -347,7 +347,10 @@ fn an_adopted_pidfd_never_sits_in_a_stdio_slot() {
     let id = super::fixtures::identity_of(&child);
     // SAFETY: fd juggling on the standard descriptors of this throwaway re-exec; `saved` is above
     // 2, and the slot is restored below, as an application restoring its stdio would.
-    let saved = unsafe { libc::fcntl(slot, libc::F_DUPFD_CLOEXEC, 10) };
+    let saved = std::os::fd::IntoRawFd::into_raw_fd(
+        rustix::io::fcntl_dupfd_cloexec(unsafe { rustix::fd::BorrowedFd::borrow_raw(slot) }, 10)
+            .expect("dup the slot aside"),
+    );
     assert!(saved >= 10);
     assert_eq!(unsafe { libc::close(slot) }, 0);
     let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));

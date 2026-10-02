@@ -238,7 +238,7 @@ fn pinned_exec_path(pinned: &File) -> PathBuf {
 /// through a symlink, and only a regular file. Moved to 3 or above when it
 /// lands lower, so no child's stdio setup can replace it before the exec.
 fn pin(real: &Path) -> std::io::Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(target_os = "linux")]
     let path_only = libc::O_PATH;
@@ -258,13 +258,7 @@ fn pin(real: &Path) -> std::io::Result<File> {
     if file.as_raw_fd() >= 3 {
         return Ok(file);
     }
-    // SAFETY: duplicating a descriptor this function owns; the result is checked.
-    let moved = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if moved < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `moved` is a fresh descriptor owned by nothing else.
-    Ok(unsafe { File::from_raw_fd(moved) })
+    Ok(File::from(rustix::io::fcntl_dupfd_cloexec(&file, 3)?))
 }
 
 /// Run `probe` with an empty environment and read its stdout as [`super::pkexec::parse`] does.
@@ -425,24 +419,15 @@ fn password_line(secret: &[u8]) -> Vec<u8> {
 /// invariant is load-bearing (`write_after_spawn` relies on `WouldBlock`), so an fcntl
 /// failure is surfaced via `log::warn!`, never silently swallowed.
 fn set_writer_nonblocking(writer: &std::io::PipeWriter) {
-    use std::os::fd::AsRawFd;
-    let fd = writer.as_raw_fd();
-    // SAFETY: fcntl on a live owned fd; F_GETFL/F_SETFL take/return the flag word.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            log::warn!(
-                "could not read the password channel's flags (F_GETFL): {}; leaving it blocking",
-                std::io::Error::last_os_error()
-            );
+    let flags = match rustix::fs::fcntl_getfl(writer) {
+        Ok(flags) => flags,
+        Err(e) => {
+            log::warn!("could not read the password channel's flags (F_GETFL): {e}; leaving it blocking");
             return;
         }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            log::warn!(
-                "could not set the password channel non-blocking (F_SETFL): {}; leaving it blocking",
-                std::io::Error::last_os_error()
-            );
-        }
+    };
+    if let Err(e) = rustix::fs::fcntl_setfl(writer, flags | rustix::fs::OFlags::NONBLOCK) {
+        log::warn!("could not set the password channel non-blocking (F_SETFL): {e}; leaving it blocking");
     }
 }
 
