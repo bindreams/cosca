@@ -3,6 +3,9 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaces;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod pid_reuse;
+
 #[cfg(target_os = "macos")]
 #[path = "../tests/common/kevent_eintr.rs"]
 mod kevent_eintr;
@@ -47,8 +50,8 @@ pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
 /// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.
-// Consumed by the Linux-only kill tests in `spawn_tests`.
-#[cfg(target_os = "linux")]
+// Consumed by the Linux-only kill tests in `spawn_tests` and the macOS foreign-reap kill test.
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tokio")))]
 pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, std::io::PipeWriter) {
     let (reader, writer) = std::io::pipe().expect("pipe");
     #[cfg(unix)]

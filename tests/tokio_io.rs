@@ -258,7 +258,7 @@ async fn async_drop_tears_down_a_contained_tree() {
         "contained spawn must engage a mechanism"
     );
     drop(child);
-    // No post-drop liveness assertion: `Drop` signals and does not wait, and `start_kill` is
+    // No post-drop liveness assertion: `Drop` signals and does not wait, and a kill is
     // asynchronous. Each process's death is proven by its own control-socket EOF: a survivor
     // blocks the read (a CI failure).
     for (who, s) in [("root", &mut root), ("grandchild", &mut grand)] {

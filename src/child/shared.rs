@@ -182,18 +182,7 @@ impl SharedChild {
         #[cfg(target_os = "macos")]
         let identity = match crate::signal::read_identity(id.pid()) {
             Ok(identity) => identity,
-            Err(errno) => {
-                return Err((
-                    Error::Unassessable {
-                        detail: format!(
-                            "pid {}: its identity could not be read (errno {errno}); the child was not adopted",
-                            id.pid()
-                        ),
-                        source: Some(io::Error::from_raw_os_error(errno)),
-                    },
-                    child,
-                ));
-            }
+            Err(errno) => return Err((crate::signal::identity_unreadable(id.pid(), errno), child)),
         };
         #[cfg(windows)]
         let handle = match Self::duplicate_handle(&child) {
