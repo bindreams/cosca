@@ -530,24 +530,59 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
     marker_present
 }
 
+/// What the root's own identity read said when [`attach`] failed on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootIdentity {
+    /// The root was already reaped (someone else reaped it, and its pid may be reused).
+    Gone,
+    /// The read was refused or could not be trusted.
+    Unknown,
+}
+
+/// Why [`attach`] failed. `identity` is the verdict of the root's own identity read when that is
+/// what failed (the tree-walk root's), and `None` for every other failure.
+#[derive(Debug)]
+pub(crate) struct AttachError {
+    pub(crate) error: Error,
+    pub(crate) identity: Option<RootIdentity>,
+}
+
+impl From<Error> for AttachError {
+    fn from(error: Error) -> Self {
+        AttachError { error, identity: None }
+    }
+}
+
+impl From<AttachError> for Error {
+    fn from(e: AttachError) -> Self {
+        e.error
+    }
+}
+
 /// Resolve the spawned root's identity by pid. **Precondition:** the caller holds the owning
 /// `Child` (sync `std::process::Child` / async `::tokio::process::Child`) across this call — it
 /// pins the pid against reuse, so the by-pid resolve is race-free (the freshly spawned root is
 /// un-reaped, and on Windows still suspended, hence resolvable).
 #[cfg(any(unix, windows))]
-fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
-    match crate::identity::ProcessId::of(pid) {
+fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
+    // Via `resolve_identity` so the test seam applies here too.
+    match crate::child::spawn::resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => Ok(id),
-        crate::identity::Resolved::Gone => Err(Error::Containment {
-            detail: "tree-walk root vanished before its identity could be read".into(),
+        crate::identity::Resolved::Gone => Err(AttachError {
+            error: Error::Containment {
+                detail: "tree-walk root vanished before its identity could be read".into(),
+            },
+            identity: Some(RootIdentity::Gone),
         }),
-        crate::identity::Resolved::Unknown => Err(crate::identity::unknown_identity_error(&format!(
-            "tree-walk root pid {pid}"
-        ))
-        .unwrap_or_else(|| Error::Unassessable {
-            detail: format!("tree-walk root pid {pid} identity could not be read"),
-            source: None,
-        })),
+        crate::identity::Resolved::Unknown => Err(AttachError {
+            error: crate::identity::unknown_identity_error(&format!("tree-walk root pid {pid}")).unwrap_or_else(|| {
+                Error::Unassessable {
+                    detail: format!("tree-walk root pid {pid} identity could not be read"),
+                    source: None,
+                }
+            }),
+            identity: Some(RootIdentity::Unknown),
+        }),
     }
 }
 
@@ -843,7 +878,7 @@ pub(crate) fn attach(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<Attachment, Error> {
+) -> Result<Attachment, AttachError> {
     let graceful = prepared.graceful_mechanism();
     let (containment, attached) = attach_tree(
         pid,
@@ -863,7 +898,7 @@ fn attach_tree(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<(Containment, Attached), Error> {
+) -> Result<(Containment, Attached), AttachError> {
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
@@ -1035,7 +1070,7 @@ fn attach_tree(
                     // so `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
                 }
-                Err(e) => return Err(Error::Containment { detail: e.to_string() }),
+                Err(e) => return Err(Error::Containment { detail: e.to_string() }.into()),
             }
         } else if prepared.mode.is_some() {
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no

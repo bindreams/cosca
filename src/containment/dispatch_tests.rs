@@ -402,7 +402,11 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
 
-    let Err(crate::error::Error::Unassessable { detail, .. }) = super::resolve_root_id(child.pid()) else {
+    let Err(super::AttachError {
+        error: crate::error::Error::Unassessable { detail, .. },
+        identity: _,
+    }) = super::resolve_root_id(child.pid())
+    else {
         panic!("a pid we may not query must not resolve to a root identity");
     };
     assert!(
@@ -411,7 +415,11 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
     );
 
     // Contrast: a pid no process holds.
-    let Err(crate::error::Error::Containment { detail }) = super::resolve_root_id(0xFFFF_FFF0) else {
+    let Err(super::AttachError {
+        error: crate::error::Error::Containment { detail },
+        identity: _,
+    }) = super::resolve_root_id(0xFFFF_FFF0)
+    else {
         panic!("a nonexistent pid must not resolve");
     };
     assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
@@ -423,7 +431,11 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
 #[test]
 fn resolve_root_id_names_a_missing_openat2() {
     let _forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOSYS);
-    let Err(crate::error::Error::Unsupported { detail, .. }) = super::resolve_root_id(std::process::id()) else {
+    let Err(super::AttachError {
+        error: crate::error::Error::Unsupported { detail, .. },
+        identity: _,
+    }) = super::resolve_root_id(std::process::id())
+    else {
         panic!("a host without openat2 must not resolve a root identity");
     };
     assert!(
@@ -735,5 +747,29 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
         b"1",
         "the default is still a kill-on-drop teardown"
+    );
+}
+
+/// The root's identity read hands its verdict back with the error, so a caller does not infer it
+/// from the error's variant.
+///
+/// Mutant: `resolve_root_id` drops the verdict (`identity: None`), or swaps `Gone` and `Unknown`.
+#[cfg(unix)]
+#[test]
+fn resolve_root_id_hands_back_the_identity_verdict() {
+    use super::RootIdentity;
+    use crate::child::spawn::fault;
+
+    fault::set_force_identity_vanished(true);
+    let gone = super::resolve_root_id(std::process::id());
+    fault::set_force_identity_vanished(false);
+    fault::set_force_identity_unknown(true);
+    let unknown = super::resolve_root_id(std::process::id());
+    fault::set_force_identity_unknown(false);
+
+    assert_eq!(gone.expect_err("a vanished root").identity, Some(RootIdentity::Gone));
+    assert_eq!(
+        unknown.expect_err("an unreadable root").identity,
+        Some(RootIdentity::Unknown)
     );
 }
