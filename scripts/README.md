@@ -92,13 +92,13 @@ numbers on this host.
 A throwaway macOS 26 (Tahoe) arm64 VM via [Tart](https://tart.run), for fast local macOS
 RED/GREEN iterations and pre-checks. **CI stays the merge gate.** The image is Cirrus Labs'
 `ghcr.io/cirruslabs/macos-tahoe-base`, not GitHub's `macos-latest` runner image: same macOS
-major and arm64, but different preinstalled tools and no Xcode. Provisioning installs the
+major (26) and arm64 as CI's `darwin/arm64` lane, but different preinstalled tools and no Xcode. Provisioning installs the
 toolchain pinned in `.github/ci-toolchain` via rustup and CI's `cargo-nextest` version
 (checksum-verified) from `scripts/devvm/provision/macos-rust.sh`.
 
 Prerequisites: Tart (`brew install cirruslabs/cli/tart`, or the release tarball), found via
 `$TART` or `PATH`; and the base image pulled once, about 30 GB (`tart pull
-ghcr.io/cirruslabs/macos-tahoe-base:latest`; check free disk first).
+ghcr.io/cirruslabs/macos-tahoe-base@sha256:<digest>`; check free disk first).
 
 ```sh
 uv run scripts/devvm.py up macos-arm64 [--rev <git rev>] [--rosetta]   # clone, boot headless, copy `git archive <rev>`, provision
@@ -110,15 +110,26 @@ uv run scripts/devvm.py destroy macos-arm64                           # stop and
 ```
 
 - Every `up` is a fresh copy-on-write `tart clone` of the base image under a unique
-  `devvm-macos-*` name; the base is never started or modified. `destroy` only ever deletes
-  names with that prefix.
-- Only committed state is copied (`git archive <rev>`); uncommitted edits are not. The provision script always comes from this checkout, so `--rev` may name an older commit.
+  `devvm-macos-<128-bit uuid>` name, refused if the name exists; the base is never started or
+  modified. The base is pinned by digest (Renovate moves `BASE_IMAGE_DIGEST` in
+  `scripts/devvm_macos.py`; pull the new digest after a bump).
+- `destroy` only deletes names with that prefix, and only the VM this worktree created
+  (the state records its disk identity; a same-named replacement is refused).
+- A failed or interrupted `up` (bad provision, Ctrl-C, boot not answering within 600 s) deletes
+  the clone it made. `--rev` is validated before anything boots. One worktree has one guest;
+  a second `up` is refused.
+- Only committed state is copied (`git archive <rev>`); uncommitted edits are not. The
+  provision script always comes from this checkout, so `--rev` may name an older commit.
 - At most 2 macOS VMs run at once on a Mac (Apple's licence). `up` counts every running
-  local Tart VM and refuses a third.
-- `--rosetta` installs Rosetta and the `x86_64-apple-darwin` target so
-  `cargo nextest run --target x86_64-apple-darwin` runs x86_64 binaries in the guest. This
-  approximates the Intel lane (translation, not Intel hardware); it does not replace it.
-- One worktree has one `macos-arm64` VM.
+  local Tart VM and refuses a third; concurrent `up`s serialise on a host-wide lock and say so.
+- Root-lane runs use their own `CARGO_HOME` and `CARGO_TARGET_DIR` (recipe above, with
+  `--locked`) so root never owns files under the tree or the admin user's cargo state;
+  `sync` and unprivileged builds keep working afterwards.
+- The base image already ships Rosetta. `--rosetta` makes sure of it and adds the
+  `x86_64-apple-darwin` target, so `cargo nextest run --target x86_64-apple-darwin` runs
+  x86_64 binaries in the guest. CI's `darwin/amd64` lane is also Rosetta: its `macos-15` runner
+  is the `macos-15-arm64` image building for `x86_64-apple-darwin`. So `--rosetta` closely
+  matches that lane's mechanism; the difference is the macOS major (guest 26, CI lane 15).
 
 ### `windows-arm64`
 
