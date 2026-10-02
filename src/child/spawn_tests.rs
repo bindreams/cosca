@@ -150,8 +150,8 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 
 /// A reap that FAILS during teardown must leave a trace in a release build, where the
 /// `debug_assert` beside it is compiled out: a `log::warn!` naming the error. Both teardown arms —
-/// attach failure and unresolved identity — share the one teardown, and each is driven here (off
-/// macOS, where neither tears the child down).
+/// attach failure and unresolved identity — share the one teardown, and each is driven here. The
+/// test is not run on macOS, where neither arm tears the child down.
 ///
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
@@ -1138,5 +1138,12 @@ fn macos_tree_walk_attach_fails(gone: bool) {
     } else {
         assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     }
-    assert_left_alone(mark, "cannot be shown to be ours");
+    assert_left_alone(
+        mark,
+        if gone {
+            "was reaped by someone else"
+        } else {
+            "cannot be shown to be ours"
+        },
+    );
 }
