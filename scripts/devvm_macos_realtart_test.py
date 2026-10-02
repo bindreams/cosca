@@ -122,10 +122,12 @@ class StubEnv:
         def wait_then_signal() -> None:
             with open(self.fifo) as f:
                 f.readline()
-            kill_self(sig)
-            # The blocked stub child is released too, so a wait that no signal can cut short returns instead
-            # of blocking. A correct wait was cancelled by the signal, whatever the child then does.
-            os.write(self.release_fd, b"x\n")
+            try:
+                kill_self(sig)
+            finally:
+                # The blocked stub child is released too, so a wait that no signal can cut short returns instead
+                # of blocking. A correct wait was cancelled by the signal, whatever the child then does.
+                os.write(self.release_fd, b"x\n")
 
         thread = threading.Thread(target=wait_then_signal, daemon=True)
         thread.start()
