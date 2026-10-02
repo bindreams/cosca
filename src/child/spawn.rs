@@ -395,7 +395,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // tree-walk root with no fd marker), so the child cannot be shown to be ours and nothing is
         // signalled or waited on by pid.
         Err(e) => {
-            teardown_unadopted(child); // MUTANT: the old by-pid teardown on the attach arm
+            { let mut child = child; _ = child.kill(); _ = child.wait(); } // MUTANT: the old by-pid teardown
             return Err(e);
         }
     };
