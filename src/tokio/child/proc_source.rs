@@ -521,7 +521,7 @@ fn wait_reapable(pid: u32, identity: u64) -> Waited {
         // Without proof the child is ours, tokio's by-pid reap must not run.
         Err(e) => {
             log::warn!("wait_and_reap: waiting on child {pid} failed: {e}");
-            Waited::Foreign
+            Waited::Exited // MUTANT M-err
         }
     }
 }
