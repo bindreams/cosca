@@ -399,6 +399,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // worst a zombie, so on Unix its /proc entry persists, and on Windows the std Child pins the
     // process handle so the pid cannot be reused. `SharedChild::adopt` reaps nothing, so this is
     // also the identity it takes.
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
     let id = match resolve_identity(child.id()) {
         crate::identity::Resolved::Found(id) => id,
         // Same teardown for both arms (never leak the spawned child), different diagnosis:
@@ -1337,6 +1339,8 @@ pub(crate) mod fault {
         static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
+        static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -1491,6 +1495,45 @@ pub(crate) mod fault {
         crate::oneshot_hook::fire(&BETWEEN_KILL_AND_WAIT);
     }
     pub(crate) type ArmedBetweenKillAndWait = crate::oneshot_hook::Armed;
+
+    /// A point in a spawn where a test can run a hook.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SpawnPoint {
+        /// Right before the spawn reads the child's identity.
+        BeforeIdentity,
+    }
+
+    fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
+        match point {
+            SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
+        }
+    }
+
+    /// Run `hook` once at the next `point` on this thread; the guard clears it on drop.
+    #[cfg_attr(
+        not(all(feature = "tokio", target_os = "linux")),
+        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+    )]
+    pub(crate) fn set_at(point: SpawnPoint, hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(hook_at(point), hook)
+    }
+
+    /// Fire the hook armed for `point`, if any. Called by both spawns with the child's pid, which
+    /// the hook reads through [`spawn_pid`].
+    pub(crate) fn run_at(point: SpawnPoint, pid: u32) {
+        SPAWN_PID.with(|p| p.set(Some(pid)));
+        crate::oneshot_hook::fire(hook_at(point));
+        SPAWN_PID.with(|p| p.set(None));
+    }
+
+    /// The pid of the child the spawn that fired the running hook has just forked.
+    #[cfg_attr(
+        not(all(feature = "tokio", target_os = "linux")),
+        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+    )]
+    pub(crate) fn spawn_pid() -> u32 {
+        SPAWN_PID.with(Cell::get).expect("spawn_pid is read from a spawn hook")
+    }
 
     /// A reaped teardown child's pid and exit status.
     type TeardownReap = (u32, std::process::ExitStatus);

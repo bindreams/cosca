@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
 
-use super::child::{reap_now, Child, ProcSource};
+use super::child::{Child, ProcSource};
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
     let child = spawn_uncommitted(cmd)?;
@@ -275,7 +275,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let _guard = crate::child::spawn::spawn_lock();
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
@@ -318,7 +318,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, mut child) = {
+    let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -414,6 +414,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // park and reap the child in between. Even if the child has already exited, tokio's held handle
     // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
+    #[cfg(windows)]
+    let proc_handle = child
+        .raw_handle()
+        .expect("a freshly spawned tokio child has a raw handle");
     // macOS: the unique id every by-pid signal to this child is checked against, read before
     // anything can reap the child.
     #[cfg(target_os = "macos")]
@@ -421,10 +425,23 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         Ok(identity) => identity,
         Err(errno) => {
             prepared.settle_verdict(pid);
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            super::child::reap_unverified(child, pid);
             return Err(crate::signal::identity_unreadable(pid, errno));
         }
     };
+    // The backend is built first, so the failure arms below tear the child down through its own
+    // handle rather than by its pid.
+    #[cfg(target_os = "linux")]
+    let mut proc = ProcSource::new(
+        child,
+        held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
+    );
+    #[cfg(target_os = "macos")]
+    let mut proc = ProcSource::new(child, identity);
+    #[cfg(windows)]
+    let mut proc = ProcSource::new(child);
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
     let id = match resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => id,
         // Mirror the attach-failure path below: tear the child down so a vanished-identity error
@@ -433,15 +450,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // The verdict first: tokio owns this child, so the leaf must not answer for it as an
             // abandoned spawn's, reaping a pid tokio's own reap is about to.
             prepared.settle_verdict(pid);
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid); // never awaited — an already-Done child is impossible
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 
-    #[cfg(windows)]
-    let proc_handle = child
-        .raw_handle()
-        .expect("a freshly spawned tokio child has a raw handle");
     let attach = crate::child::spawn::attach_or_fault(
         pid,
         #[cfg(windows)]
@@ -453,7 +466,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
-            reap_now(&mut child, pid); // never awaited — an already-Done child is impossible
+            proc.reap_now(pid); // never awaited — an already-Done child is impossible
             return Err(e);
         }
     };
@@ -473,15 +486,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         super::child::FdPipes::new()
     };
 
-    #[cfg(target_os = "linux")]
-    let proc = ProcSource::new(
-        child,
-        held_pidfd.expect("a spawned child holds the pidfd its handshake opened"),
-    );
-    #[cfg(target_os = "macos")]
-    let proc = ProcSource::new(child, identity);
-    #[cfg(windows)]
-    let proc = ProcSource::new(child);
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
     Ok(child)
