@@ -423,13 +423,7 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
-    /// Hard-kill the child. Already-exited, reaped by us, or reaped elsewhere is success, logged
-    /// at `debug` where nothing was sent.
-    ///
-    /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
-    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
-    ///   no reap of ours can run between the state read and the call.
-    /// - **Windows:** through the process handle.
+    /// Hard-kill the child; already gone is success.
     pub(crate) fn kill(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -442,8 +436,11 @@ impl SharedChild {
     }
 
     /// [`kill`](SharedChild::kill), saying whether a signal was sent: [`Sent::Gone`] means nothing
-    /// was, because the child is already reaped (by us or by someone else). A caller that waits for
-    /// the termination must not, then.
+    /// was, because the child is already reaped (by us or by someone else).
+    ///
+    /// - **Linux:** through the pidfd. No pidfd (the child was gone when adopted) sends nothing.
+    /// - **macOS:** by pid, only while the pid's unique id is still the child's, under the lock:
+    ///   no reap of ours can run between the state read and the call.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
         let lock = self.lock();
@@ -467,6 +464,7 @@ impl SharedChild {
         }
     }
 
+    /// [`kill`](SharedChild::kill) through the process handle.
     #[cfg(windows)]
     fn kill_windows(&self) -> io::Result<()> {
         let mut lock = self.lock();

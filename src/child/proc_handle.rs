@@ -86,8 +86,7 @@ impl ProcHandle {
         }
     }
 
-    /// [`kill`](ProcHandle::kill), saying whether a signal was sent ([`Sent::Gone`](crate::signal::Sent):
-    /// the child was already reaped, and nothing was sent).
+    /// [`kill`](ProcHandle::kill), reporting whether a signal was sent.
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> io::Result<crate::signal::Sent> {
         match self {

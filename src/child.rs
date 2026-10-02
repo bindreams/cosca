@@ -216,9 +216,7 @@ impl Child {
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
 
-    /// [`kill`](Child::kill), saying whether a signal was sent: [`Sent::Gone`](crate::signal::Sent)
-    /// means the child was already reaped and nothing was, so a caller must not wait for a
-    /// termination that did not happen.
+    /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
         self.proc

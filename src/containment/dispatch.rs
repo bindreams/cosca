@@ -428,6 +428,27 @@ impl Attached {
         }
     }
 
+    /// [`hard_kill_marking`](Self::hard_kill_marking) for a handle that kills its tree while the
+    /// root may already be reaped: when it is, nothing that names the tree by the root's number
+    /// runs (see [`hard_kill_for_drop`](Self::hard_kill_for_drop)), and the skipped action is
+    /// returned as `Ok(Some(action))`. Otherwise the kill runs and is `Ok(None)` or its error.
+    #[cfg(unix)]
+    pub(crate) fn hard_kill_marking_unless_reaped(
+        &self,
+        view: DropView,
+        killed: &TreeKilled,
+    ) -> Result<Option<String>, crate::error::Error> {
+        let Some(skipped) = self.named_by_root_number(view.root_pid).filter(|_| view.root_reaped) else {
+            return self.hard_kill_marking(killed).map(|()| None);
+        };
+        match self {
+            #[cfg(target_os = "macos")]
+            Attached::FdMarker(m) => m.hard_kill_holders_only()?,
+            _ => {}
+        }
+        Ok(Some(skipped))
+    }
+
     /// Whether this child holds an actionable tree-teardown mechanism.
     pub(crate) fn is_actionable(&self) -> bool {
         match self {
