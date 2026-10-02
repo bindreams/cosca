@@ -69,11 +69,11 @@ fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
     assert_eq!(later.recorded(), vec![], "a dropped recorder leaves nothing behind");
 }
 
-// A failed sync spawn must fully reap its child, not leak it. Each error arm is forced via the seam
-// (which records the child's real identity); `fault::assert_child_reaped` then proves it was reaped.
+// Off macOS, a failed sync spawn must fully reap its child, not leak it. Each error arm is forced
+// via the seam (which records the child's real identity); `fault::assert_child_reaped` then proves
+// it was reaped. On macOS the identity-failure and attach arms leave the child alone instead (see
+// `macos_*` below), so every test here that pins their teardown is `cfg(not(target_os = "macos"))`.
 
-// Not macOS, where a child whose identity is gone or unreadable is left alone, not torn down by pid
-// (see `macos_identity_*` below).
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn identity_failure_reaps_the_spawned_child() {
@@ -91,6 +91,7 @@ fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn attach_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
@@ -149,10 +150,12 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 
 /// A reap that FAILS during teardown must leave a trace in a release build, where the
 /// `debug_assert` beside it is compiled out: a `log::warn!` naming the error. Both teardown arms —
-/// attach failure and unresolved identity — share the one teardown, and each is driven here.
+/// attach failure and unresolved identity — share the one teardown, and each is driven here (off
+/// macOS, where neither tears the child down).
 ///
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_teardown_reap_is_logged_on_both_arms() {
     a_failed_teardown_step_is_logged_on_both_arms(
@@ -167,14 +170,11 @@ fn a_failed_teardown_reap_is_logged_on_both_arms() {
 /// spawn for as long as it runs. The reap fault is armed as a tripwire — left unconsumed, it proves
 /// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
 /// reachable without a bug.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
     use std::io::ErrorKind;
     crate::log_capture::install();
-    // macOS tears nothing down on a vanished identity, so both legs drive the attach arm there.
-    #[cfg(target_os = "macos")]
-    let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_attach_failure];
-    #[cfg(not(target_os = "macos"))]
     let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
     let cases = [
         ("cosca-kill-fail-attach-4e02", ErrorKind::Other, true),
@@ -219,6 +219,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 /// A child the teardown could not kill is not left a zombie: it is handed to a detached thread
 /// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
 /// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
@@ -250,16 +251,13 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
 
 /// Force one teardown step to fail with each marker, once per teardown arm, and check the failure
 /// is consumed, logged, `debug_assert`ed in exactly the builds that keep it, and leaks no child.
+#[cfg(not(target_os = "macos"))]
 fn a_failed_teardown_step_is_logged_on_both_arms(
     markers: [&'static str; 2],
     set_failure: fn(&'static str),
     take_failure: fn() -> Option<&'static str>,
 ) {
     crate::log_capture::install();
-    // macOS tears nothing down on a vanished identity, so both legs drive the attach arm there.
-    #[cfg(target_os = "macos")]
-    let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_attach_failure];
-    #[cfg(not(target_os = "macos"))]
     let force_arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
     for (marker, force_arm) in markers.into_iter().zip(force_arms) {
         let mark = crate::log_capture::mark();
@@ -295,6 +293,7 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 /// keeps its credentials, so `kill(2)` refuses it with EPERM — is reaped, not left a zombie: an
 /// exited child is reaped at once, and one not yet exited is handed to the background reaper.
 /// Either way it ends reaped.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
     let mut cmd = Command::new();
@@ -1093,5 +1092,51 @@ fn macos_identity_unknown_leaves_the_child_alone() {
     fault::set_force_identity_unknown(false);
 
     assert!(matches!(err, Some(Error::Unassessable { .. })), "{err:?}");
+    assert_left_alone(mark, "cannot be shown to be ours");
+}
+
+/// macOS: the tree-walk root has no fd marker (its install is forced to fail), so the attach reads
+/// the root's identity itself, and that read is `Gone` (reaped by someone else; the pid may be
+/// reused). The attach fails and nothing is signalled or waited on by pid: the child is left alone,
+/// with a warning naming it.
+///
+/// Mutant: the attach arm tears the child down by pid (`teardown_unadopted`).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_tree_walk_attach_with_a_gone_identity_leaves_the_child_alone() {
+    macos_tree_walk_attach_fails(true);
+}
+
+/// As above, with an identity that cannot be read (`Unknown`).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_a_tree_walk_attach_with_an_unknown_identity_leaves_the_child_alone() {
+    macos_tree_walk_attach_fails(false);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tree_walk_attach_fails(gone: bool) {
+    use crate::containment::fdmarker::fault::{set_fault, Fault};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let mut cmd = blocker();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    set_fault(Some(Fault::Pipe));
+    if gone {
+        fault::set_force_identity_vanished(true);
+    } else {
+        fault::set_force_identity_unknown(true);
+    }
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    fault::set_force_identity_unknown(false);
+    set_fault(None);
+
+    let err = err.expect("the failed attach fails the spawn");
+    if gone {
+        assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    } else {
+        assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    }
     assert_left_alone(mark, "cannot be shown to be ours");
 }

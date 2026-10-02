@@ -162,10 +162,11 @@ impl SharedChild {
     /// Linux opens the pidfd by number and confirms it names our child. macOS reads the child's
     /// unique id: `ESRCH` is a child already reaped elsewhere (every wait answers `ECHILD`, as
     /// with `pidfd: None`), and any other refusal fails the adoption as `Unassessable`. A failure
-    /// is `Err((error, child))`, with the child handed back untouched for the caller to deal with (on macOS a refused read means nothing can be done to it by pid).
+    /// is `Err((error, child))`, with the child handed back untouched for the caller to deal with: to
+    /// tear down, or on macOS, where a refused read means nothing can be done to it by pid, to leave.
     #[allow(
         clippy::result_large_err,
-        reason = "the child is handed back untouched for the caller to tear down"
+        reason = "the child is handed back untouched for the caller to deal with"
     )]
     // Production Linux spawns hold the pidfd from the handshake: see `adopt_opened`.
     #[cfg(any(not(target_os = "linux"), test))]

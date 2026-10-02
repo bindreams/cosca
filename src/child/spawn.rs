@@ -390,7 +390,14 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Ok(v) => v,
         // Mirror the async spawn's error teardown: kill + reap the just-spawned child so a failed
         // attach never leaks a running/zombie process (std `Child::drop` neither kills nor reaps).
+        //
+        // macOS: an attach fails only when it could not read the root's identity (the
+        // tree-walk root with no fd marker), so the child cannot be shown to be ours and nothing is
+        // signalled or waited on by pid.
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            leave_unverified_child(child, None);
+            #[cfg(not(target_os = "macos"))]
             teardown_unadopted(child);
             return Err(e);
         }
@@ -401,28 +408,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // also the identity it takes.
     let id = match resolve_identity(child.id()) {
         crate::identity::Resolved::Found(id) => id,
-        // Same teardown for both arms (never leak the spawned child), different diagnosis:
-        // an OS refusal is not a vanish.
+        // Same teardown for both arms, different diagnosis: an OS refusal is not a vanish.
+        // Off macOS the child is killed and reaped, so it is never leaked. On macOS a child whose
+        // identity is gone or unreadable is left alone (see `leave_unverified_child`).
         other => {
-            // macOS has no handle to act through, and a child whose identity is gone (reaped by
-            // someone else, its pid possibly reused) or unreadable cannot be shown to be ours:
-            // nothing is signalled or waited on by pid. It is forgotten (`Gone`) or left running
-            // and unreaped (`Unknown`), with a warning that names it. Dropping the `std` `Child`
-            // closes our ends of its pipes and neither kills nor reaps it.
             #[cfg(target_os = "macos")]
-            {
-                match other {
-                    crate::identity::Resolved::Gone => log::warn!(
-                        "child {} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid",
-                        child.id()
-                    ),
-                    _ => log::warn!(
-                        "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
-                        child.id()
-                    ),
-                }
-                drop(child);
-            }
+            leave_unverified_child(child, Some(&other));
             #[cfg(not(target_os = "macos"))]
             teardown_unadopted(child);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
@@ -449,15 +440,35 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     ))
 }
 
+/// macOS: `child`'s identity is gone, unreadable, or its attach failed, so nothing shows its pid
+/// still names the child, and macOS has no handle to act through. Nothing is signalled or waited on
+/// by pid: a child whose identity is `Gone` was reaped by someone else and is forgotten; any other
+/// child is left running and unreaped. Either way a warning names it, and dropping the `std`
+/// `Child` closes our ends of its pipes and neither kills nor reaps it. The spawn still fails, so
+/// the caller must not assume the program did not start.
+///
+/// `outcome` is the identity read, when that is what failed; `None` is an attach failure.
+#[cfg(target_os = "macos")]
+fn leave_unverified_child(child: std::process::Child, outcome: Option<&crate::identity::Resolved<ProcessId>>) {
+    match outcome {
+        Some(crate::identity::Resolved::Gone) => log::warn!(
+            "child {} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid",
+            child.id()
+        ),
+        _ => log::warn!(
+            "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
+            child.id()
+        ),
+    }
+    drop(child);
+}
+
 /// The spawned `child` could not be adopted. Answers `error`.
 ///
 /// - **Windows:** its process handle could not be duplicated. The handle still pins the process, so
 ///   the child is torn down.
-/// - **macOS:** its unique id could not be read (a refusal that is not `ESRCH`). A refusal is also
-///   what a pid reused by another user's process answers, so nothing shows the pid still names this
-///   child, and macOS has no handle to act through. Nothing is signalled or waited on by pid: the
-///   child is left running and unreaped, with a warning that names it, and dropping the `std`
-///   `Child` neither kills nor reaps it.
+/// - **macOS:** its unique id could not be read (a refusal that is not `ESRCH`), so it is left
+///   alone (see `leave_unverified_child`).
 ///
 /// Not on Linux, where the pidfd is opened before `exec` (see `pidfd_handshake`) and adoption
 /// cannot fail.
@@ -466,13 +477,7 @@ fn teardown_after_failed_adoption(child: std::process::Child, error: Error) -> E
     #[cfg(test)]
     fault::capture(ProcessId::of(child.id()));
     #[cfg(target_os = "macos")]
-    {
-        log::warn!(
-            "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
-            child.id()
-        );
-        drop(child);
-    }
+    leave_unverified_child(child, None);
     #[cfg(not(target_os = "macos"))]
     teardown_unadopted(child);
     error
@@ -1012,7 +1017,9 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 }
 
 /// Read the spawned child's stable identity. A test-only fault seam (`fault`) can force the
-/// vanished branch, exercising either spawn path's error-teardown arm deterministically.
+/// vanished or the unreadable branch, exercising either spawn path's identity-failure arm
+/// deterministically: off macOS the teardown arm (the test proves the child was reaped), on macOS
+/// the arm that leaves the child alone.
 pub(crate) fn resolve_identity(pid: u32) -> crate::identity::Resolved<ProcessId> {
     #[cfg(test)]
     {
@@ -1021,8 +1028,8 @@ pub(crate) fn resolve_identity(pid: u32) -> crate::identity::Resolved<ProcessId>
             return crate::identity::Resolved::Unknown;
         }
         if fault::force_identity_vanished() {
-            // Capture the child's real identity for the test to prove it was reaped, then simulate a
-            // vanish so `spawn` takes the teardown arm.
+            // Capture the child's real identity for the test to check what became of the child,
+            // then simulate a vanish so `spawn` takes the identity-failure arm.
             fault::capture(ProcessId::of(pid));
             // The seam simulates a VANISH, not a refusal.
             return crate::identity::Resolved::Gone;
@@ -1066,6 +1073,7 @@ pub(crate) fn attach_or_fault(
     )
 }
 
+#[cfg(not(target_os = "macos"))]
 /// A spawned child that an error path abandons before adoption, killed and reaped by
 /// [`teardown_unadopted`].
 trait Unadopted: Send + 'static {
@@ -1078,6 +1086,7 @@ trait Unadopted: Send + 'static {
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
 }
 
+#[cfg(not(target_os = "macos"))]
 /// `pid {pid}`, or what stands for an unknown one.
 pub(crate) fn named(pid: Option<u32>) -> String {
     match pid {
@@ -1086,6 +1095,7 @@ pub(crate) fn named(pid: Option<u32>) -> String {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[cfg(not(target_os = "linux"))]
 impl Unadopted for std::process::Child {
     fn pid(&self) -> Option<u32> {
@@ -1238,6 +1248,7 @@ pub(super) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::Owned
     teardown_unadopted(child);
 }
 
+#[cfg(not(target_os = "macos"))]
 /// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
 /// failure of either at `warn` and `debug_assert`ing it.
 ///
@@ -1280,6 +1291,7 @@ fn teardown_unadopted(mut child: impl Unadopted) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 /// Reap `child` on a detached thread once it exits on its own. The thread blocks on the child's
 /// exit, an event outside this process's control; nothing waits for the thread.
 fn reap_in_background(mut child: impl Unadopted) {
@@ -1306,6 +1318,7 @@ fn reap_in_background(mut child: impl Unadopted) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 /// `child.kill()`, `Ok` for a child that has already exited on every platform, and forceable to
 /// fail by a test.
 ///
@@ -1345,6 +1358,7 @@ fn kill_unadopted(child: &mut impl Unadopted) -> std::io::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 /// `child.wait()`, which a test can force to fail. The forced failure still REAPS first, so the
 /// test that asks for it leaks nothing.
 fn reap_unadopted(child: &mut impl Unadopted) -> std::io::Result<std::process::ExitStatus> {
@@ -1461,6 +1475,13 @@ pub(crate) mod fault {
     pub(crate) fn force_identity_vanished() -> bool {
         FORCE_VANISH.with(|f| f.get())
     }
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn set_force_attach_failure(on: bool) {
         FORCE_ATTACH_FAIL.with(|f| f.set(on));
     }
@@ -1490,16 +1511,37 @@ pub(crate) mod fault {
     }
     /// Make the next teardown kill on this thread fail with an error of `kind` carrying `marker`,
     /// with the same TAKE semantics as [`set_force_reap_failure`].
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn set_force_kill_failure(marker: &'static str, kind: std::io::ErrorKind) {
         FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, false))));
     }
     /// As [`set_force_kill_failure`] with an `Other` error, but the child is NOT killed first: it
     /// is left running, as a child that refused the kill would be.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn set_force_kill_failure_leaving_child_alive(marker: &'static str) {
         set_force_kill_failure_leaving_child_alive_as(marker, std::io::ErrorKind::Other);
     }
     /// As [`set_force_kill_failure_leaving_child_alive`], failing with `kind`. Also consumed by the
     /// async spawn's teardown (`crate::tokio::child::reap_now`).
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn set_force_kill_failure_leaving_child_alive_as(marker: &'static str, kind: std::io::ErrorKind) {
         FORCE_KILL_FAIL.with(|f| f.set(Some((marker, kind, true))));
     }
@@ -1509,16 +1551,44 @@ pub(crate) mod fault {
     pub(crate) fn set_force_kill_error_after_exit(marker: &'static str, kind: std::io::ErrorKind) {
         FORCE_KILL_ERROR_AFTER_EXIT.with(|f| f.set(Some((marker, kind))));
     }
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn take_force_kill_error_after_exit() -> Option<(&'static str, std::io::ErrorKind)> {
         FORCE_KILL_ERROR_AFTER_EXIT.with(|f| f.take())
     }
     /// Have the next background reap started on this thread report its outcome on `notify`.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<std::io::Result<()>>) {
         BACKGROUND_REAP_NOTIFY.with(|f| f.set(Some(notify)));
     }
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<std::io::Result<()>>> {
         BACKGROUND_REAP_NOTIFY.with(|f| f.take())
     }
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn take_force_kill_failure() -> Option<(&'static str, std::io::ErrorKind, bool)> {
         FORCE_KILL_FAIL.with(|f| f.take())
     }
@@ -1652,6 +1722,13 @@ pub(crate) mod fault {
 
         /// The teardown's kill fired the release hook, and every child it reaped died of
         /// `SIGKILL` (Unix) or exit code 1 (Windows).
+        #[cfg_attr(
+            target_os = "macos",
+            allow(
+                dead_code,
+                reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+            )
+        )]
         pub(crate) fn assert_killed(&self) {
             assert!(
                 self.fired.get(),
@@ -1686,6 +1763,13 @@ pub(crate) mod fault {
     /// recycled pid never false-fails. Windows has no zombies, and its process-object cleanup is not
     /// synchronous with `wait()`, so there we assert only that the child is dead (`!is_alive()`, also
     /// reuse-immune via the start token).
+    #[cfg_attr(
+        target_os = "macos",
+        allow(
+            dead_code,
+            reason = "only the teardown tests (not run on macOS) and the async spawn tests use it"
+        )
+    )]
     pub(crate) fn assert_child_reaped(captured: crate::identity::Resolved<ProcessId>) {
         let crate::identity::Resolved::Found(captured) = captured else {
             panic!("the seam must capture a resolved identity, got {captured:?}");

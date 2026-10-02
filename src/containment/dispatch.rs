@@ -515,7 +515,8 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
 /// un-reaped, and on Windows still suspended, hence resolvable).
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, Error> {
-    match crate::identity::ProcessId::of(pid) {
+    // Through the spawn's own read, so its test seam reaches this one too.
+    match crate::child::spawn::resolve_identity(pid) {
         crate::identity::Resolved::Found(id) => Ok(id),
         crate::identity::Resolved::Gone => Err(Error::Containment {
             detail: "tree-walk root vanished before its identity could be read".into(),

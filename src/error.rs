@@ -173,6 +173,12 @@ pub enum Error {
     /// The OS refused to establish whether the target process exists or is running, so the
     /// operation was not performed. Distinct from a failure of the operation: nothing is
     /// known to have gone wrong with the target — the caller was not allowed to look.
+    ///
+    /// **A spawn that fails this way may have started the program.** On Linux and Windows the
+    /// child is killed and reaped before the error is returned. On macOS, where cosca has no handle
+    /// to act through, a child whose identity cannot be read is left running and unreaped (a
+    /// warning names its pid), never signalled or waited on by pid. A caller that retries
+    /// the spawn there may start a second instance.
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
     /// cannot address safely — a pid that names a process *group* rather than a single
