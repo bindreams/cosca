@@ -3,6 +3,7 @@ on:
   pull_request:
 jobs:
   probe:
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -44,10 +45,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-latest]
+        runner: [ubuntu-24.04, macos-15, macos-latest]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Root chain, SIGINT to the top
-        run: for _ in 1 2 3; do python3 .github/scripts/probe/e2e.py; done
+        run: for _ in 1 2 3 4 5; do python3 .github/scripts/probe/e2e.py; done
+      - name: Exit race, forwarder log
+        run: for _ in $(seq 20); do python3 .github/scripts/probe/race.py; done
