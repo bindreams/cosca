@@ -24,6 +24,13 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 filter = 'test(/namespaces_tokio_finish_elevated_/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# A spawn-failure teardown that waits by pid on a child whose pid a stranger now holds blocks on
+# that stranger's exit, which never comes. The bound is the failure edge for that regression; with
+# correct code the test finishes in milliseconds.
+[[profile.default.overrides]]
+filter = 'test(/namespaces_tokio_spawn_identity_failure_teardown_/) | test(/namespaces_tokio_spawn_attach_failure_teardown_/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [profile.ci]
 fail-fast = false
 # Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.

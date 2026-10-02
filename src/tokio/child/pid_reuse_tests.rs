@@ -4,13 +4,15 @@
 
 use std::os::fd::AsFd;
 
-use rustix::process::{pidfd_open, Pid, PidfdFlags};
+use rustix::process::{pidfd_open, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use crate::identity::fault::alias_token;
 use crate::identity::StartToken;
 use crate::send_log::{Capture, Via};
 use crate::signal::Sig;
-use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait, wait_pollin};
+use crate::test_child::pid_reuse::{
+    in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_peek, sigusr1_and_wait, wait_pollin,
+};
 use crate::tokio::Command;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -38,7 +40,9 @@ fn tokio_child_holds_its_handshake_pidfd() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
         let pid = child.id().pid();
-        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut();
+        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
+            panic!("a fresh child is a tokio backend");
+        };
         let dir = crate::identity::ProcDir::open().expect("/proc opens");
         let target = crate::identity::pidfd_pid_in_view(&dir, pidfd.as_fd());
         assert!(
@@ -160,7 +164,9 @@ fn drop_after_a_foreign_reap_closes_cosca_pidfd_body() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
         let pid = child.id().pid();
-        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut();
+        let crate::tokio::child::ProcSource::Tokio { pidfd, .. } = child.proc_mut() else {
+            panic!("a fresh child is a tokio backend");
+        };
         let cosca_pidfd = std::os::fd::AsRawFd::as_raw_fd(pidfd);
         assert!(is_open(cosca_pidfd), "cosca holds its pidfd while the child lives");
         drop(writer);
@@ -252,4 +258,155 @@ in_fresh_pid_ns!(
     fixture_tokio_finish_elevated_driver,
     fixture_tokio_finish_elevated_init,
     finish_elevated_after_a_foreign_reap_and_reuse_waits_for_nothing_body
+);
+
+// A dropped child whose pid was reused reaps nothing =====
+
+/// `Drop` on a foreign-reaped child whose pid a stranger now holds: the stranger has already died
+/// of the test's `SIGUSR1` and is a zombie when the child drops, so a reap by pid would take its
+/// exit record. The drop must leave it for the test to consume.
+///
+/// Mutant: no forget (tokio's field-drop reaps the zombie by pid, and the test's own `waitid`
+/// gets `ECHILD`).
+fn drop_after_foreign_reap_and_reuse_reaps_nothing_body() {
+    runtime().block_on(async {
+        let (child, writer) = spawn_blocker();
+        let (reuser, _alias) = foreign_reaped_and_reused(&child, writer);
+        let reuser_pid = reuser.id();
+        assert_eq!(
+            sigusr1_and_peek(&reuser),
+            Some(libc::SIGUSR1),
+            "the reuser must have been signalled by the test alone"
+        );
+
+        drop(child);
+
+        let pid = Pid::from_raw(reuser_pid as i32).expect("pid");
+        let record = rustix::process::waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)
+            .expect("the reuser's exit record must still be unconsumed")
+            .expect("an exit record");
+        assert_eq!(record.terminating_signal(), Some(libc::SIGUSR1));
+        drop(reuser);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_drop_after_foreign_reap_and_reuse_signals_and_reaps_nothing,
+    fixture_tokio_drop_reaps_nothing_driver,
+    fixture_tokio_drop_reaps_nothing_init,
+    drop_after_foreign_reap_and_reuse_reaps_nothing_body
+);
+
+// The spawn's identity-failure teardown =====
+
+/// A spawn whose child is reaped behind its back, and its pid reused, between the fork and the
+/// identity read: the failure teardown signals nothing, and a debug build does not panic.
+///
+/// Mutants: `reap_now` via `start_kill`; `signal` answers `Err(ESRCH)` (the debug build panics).
+fn spawn_identity_failure_teardown_signals_nothing_body() {
+    identity_failure_teardown(false, false);
+}
+
+/// The same, with the stranger already dead of the test's `SIGUSR1` and unreaped when the teardown
+/// runs, so a wait or reap by pid finishes at once instead of parking, and takes its exit record.
+///
+/// Mutant: `wait_and_reap` keeps `P_PID` (the record is gone, so the test's `waitid` gets `ECHILD`;
+/// with the stranger alive the same mutant parks forever, which the nextest bound ends).
+fn spawn_identity_failure_teardown_reaps_nothing_body() {
+    identity_failure_teardown(true, false);
+}
+
+/// The attach-failure arm of the same teardown: the identity read still succeeds (the alias makes
+/// the stranger look like the child), and the forced attach failure tears the child down.
+fn spawn_attach_failure_teardown_signals_nothing_body() {
+    identity_failure_teardown(false, true);
+}
+
+fn spawn_attach_failure_teardown_reaps_nothing_body() {
+    identity_failure_teardown(true, true);
+}
+
+fn identity_failure_teardown(stranger_dies_first: bool, attach_arm: bool) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+    use crate::identity::{ProcessId, Resolved};
+
+    runtime().block_on(async {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+
+        let stranger = Rc::new(RefCell::new(None));
+        let alias = Rc::new(RefCell::new(None));
+        let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+            let (stranger, alias) = (Rc::clone(&stranger), Rc::clone(&alias));
+            move || {
+                let pid = fault::spawn_pid();
+                let Resolved::Found(id) = ProcessId::of(pid) else {
+                    panic!("the child must be readable before it is reaped")
+                };
+                let token = StartToken::from_raw(id.start_token_raw());
+                drop(writer);
+                let reuser = reap_behind_and_reuse(pid);
+                *alias.borrow_mut() = Some(alias_token(reuser.id(), token));
+                if stranger_dies_first {
+                    assert_eq!(sigusr1_and_peek(&reuser), Some(libc::SIGUSR1));
+                }
+                *stranger.borrow_mut() = Some(reuser);
+            }
+        });
+        if attach_arm {
+            fault::set_force_attach_failure(true);
+        } else {
+            fault::set_force_identity_vanished(true);
+        }
+        let err = cmd.spawn().err();
+        fault::set_force_attach_failure(false);
+        fault::set_force_identity_vanished(false);
+        err.expect("the forced identity failure must fail the spawn");
+
+        let mut reuser = stranger.borrow_mut().take().expect("the hook must have run");
+        if stranger_dies_first {
+            let status = reuser
+                .wait()
+                .expect("the stranger's exit record must still be unconsumed");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGUSR1)
+            );
+        } else {
+            assert_eq!(
+                sigusr1_and_wait(reuser),
+                Some(libc::SIGUSR1),
+                "the reuser must have been signalled by the test alone"
+            );
+        }
+        drop(alias);
+    });
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_identity_failure_teardown_signals_nothing,
+    fixture_tokio_spawn_identity_driver,
+    fixture_tokio_spawn_identity_init,
+    spawn_identity_failure_teardown_signals_nothing_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_identity_failure_teardown_reaps_nothing,
+    fixture_tokio_spawn_identity_reaps_driver,
+    fixture_tokio_spawn_identity_reaps_init,
+    spawn_identity_failure_teardown_reaps_nothing_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_attach_failure_teardown_signals_nothing,
+    fixture_tokio_spawn_attach_driver,
+    fixture_tokio_spawn_attach_init,
+    spawn_attach_failure_teardown_signals_nothing_body
+);
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_attach_failure_teardown_reaps_nothing,
+    fixture_tokio_spawn_attach_reaps_driver,
+    fixture_tokio_spawn_attach_reaps_init,
+    spawn_attach_failure_teardown_reaps_nothing_body
 );

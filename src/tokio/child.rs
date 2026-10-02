@@ -7,6 +7,8 @@ mod graceful;
 #[path = "child/proc_source.rs"]
 mod proc_source;
 pub(crate) use proc_source::ProcSource;
+#[cfg(any(unix, test))]
+pub(crate) use proc_source::Waited;
 
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
@@ -63,11 +65,13 @@ impl OsResources {
 
     /// Give up every resource, in declaration order, without waiting for anything.
     ///
-    /// The backend goes first. tokio's `Child` drops normally, never through `mem::forget`: it
-    /// tries a reap once and queues a still-running child on tokio's orphan queue, tokio's state
-    /// and not cosca's (principle 3). The Windows raw backend closes its handle. The containment
-    /// resource follows through [`Attached::release_without_waiting`], bounded on every
-    /// mechanism. The pipes and merge targets close last.
+    /// The backend goes first. tokio's `Child` drops normally: it tries a reap once and queues a
+    /// still-running child on tokio's orphan queue, tokio's state and not cosca's (principle 3). A
+    /// child that something else reaped, or that cannot be verified, was forgotten before this by
+    /// [`ProcSource::forget_foreign`], and the backend holds none. The Windows raw backend closes
+    /// its handle. The containment resource follows through
+    /// [`Attached::release_without_waiting`], bounded on every mechanism. The pipes and merge
+    /// targets close last.
     pub(crate) fn release_without_waiting(mut self) {
         #[cfg(test)]
         fault::note_release();
@@ -190,7 +194,9 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn wait_and_reap_blocking(&mut self) {
         let pid = self.id.pid();
-        self.proc_mut().wait_and_reap(pid);
+        if self.proc_mut().wait_and_reap(pid) == Waited::Foreign {
+            self.proc_mut().forget_foreign();
+        }
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -480,7 +486,14 @@ impl Child {
         // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
         match self.proc_mut().signal(Sig::Kill) {
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
-            other => other,
+            Err(other) => Err(other),
+            Ok(Sent::Gone) => {
+                // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
+                #[cfg(unix)]
+                self.proc_mut().forget_if_foreign();
+                Ok(Sent::Gone)
+            }
+            Ok(delivered) => Ok(delivered),
         }
     }
 
@@ -772,6 +785,10 @@ mod child_drop_reaped_tests;
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "child/bypass_drop_tests.rs"]
+mod bypass_drop_tests;
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/macos_kill_tests.rs"]
 mod macos_kill_tests;
@@ -835,7 +852,8 @@ impl Child {
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
 /// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
-/// number.
+/// number. Evidence is the number no longer reading as this root, or a peek through the child's own
+/// handle (on Linux its pidfd, on macOS the pid's unique id) finding it reaped.
 ///
 /// # Known limitation: `fork()` without `exec`
 ///
@@ -872,8 +890,17 @@ impl Drop for Child {
         // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
         // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
         #[cfg(unix)]
-        if view.root_reaped && !own_reap {
-            forget_reaped_elsewhere(&mut os, self.id.pid());
+        if let Some(proc) = os.proc.as_mut() {
+            if view.root_reaped && !own_reap {
+                log::debug!(
+                    "async child {} was reaped outside its handle; dropping it would reap by that number, so it is forgotten",
+                    self.id.pid()
+                );
+                proc.forget_foreign();
+            } else {
+                // Evidence through the child's own handle, for a reap the number cannot show.
+                proc.forget_if_foreign();
+            }
         }
         os.release_without_waiting();
     }
@@ -947,149 +974,12 @@ fn signal_on_drop(
         log::debug!("async child {pid} was already gone on drop; nothing was sent");
         return;
     }
-    if killed.is_err() && !matches!(proc.try_wait(), Ok(Some(_))) {
-        log::warn!("async child {pid} could not be terminated on drop; leaving it running");
-    }
-}
-
-/// Release the backend of a root that something else reaped, without letting tokio's `Child` drop:
-/// that would `try_wait` on the root's number and could reap another child that reused it. The
-/// stdio goes first, so its descriptors close, and so does cosca's own pidfd. What the forget leaks
-/// is tokio's own: where tokio has a pidfd (Linux 5.10+, which `PIDFD_NONBLOCK` needs) it and its
-/// reactor registration, else tokio's `SIGCHLD` reaper registration; on macOS its `SIGCHLD` watch.
-/// That leak has no exact fix with tokio's `Child`: it opens its pidfd privately, reaps by number
-/// on drop (through a std `Child` that has no pidfd, as `create_pidfd` is unstable), and offers no
-/// constructor from a std `Child` or accessor for the pidfd. This is a foreign reap, so it is
-/// logged at `debug`, and the leak at `warn`.
-#[cfg(unix)]
-fn forget_reaped_elsewhere(os: &mut OsResources, pid: u32) {
-    if let Some(proc) = os.proc.take() {
-        // Not dropped as a whole, which would drop tokio's `Child`: each owned part is released
-        // by hand, and tokio's is never touched again.
-        let mut proc = std::mem::ManuallyDrop::new(proc);
-        let ProcSource::Tokio { child, .. } = &mut *proc;
-        drop((child.stdin.take(), child.stdout.take(), child.stderr.take()));
-        #[cfg(target_os = "linux")]
-        {
-            let ProcSource::Tokio { pidfd, .. } = &*proc;
-            // SAFETY: `proc` is never used or dropped again, so the pidfd is moved out exactly once.
-            drop(unsafe { std::ptr::read(pidfd) });
-        }
-        log::debug!("async child {pid} was reaped outside its handle; dropping it would reap by that number, so it is forgotten");
-        log::warn!(
-            "async child {pid} was reaped outside its handle; forgetting tokio's handle for it leaks tokio's own \
-             descriptor and registration (the pidfd where tokio has one, else its SIGCHLD watch)"
-        );
-        #[cfg(test)]
-        drop_fault::note_forget();
-    }
-}
-
-/// Synchronous teardown for a spawn that failed: kill the child, then block until it has exited.
-/// The kill here is what bounds the wait, so a caller that has ALREADY killed must use
-/// [`wait_and_reap`] instead — re-killing would make its reap conditional on a second kill that
-/// can be refused.
-/// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn reap_now(child: &mut ::tokio::process::Child, pid: u32) {
-    crate::bounded::assert_may_block("reap_now");
-    // `start_kill` bounds the wait below — it MUST run in release (NOT inside `debug_assert!`,
-    // whose argument is stripped in release). A no-op on an already-exited child.
-    #[cfg(test)]
-    let forced = crate::child::spawn::fault::take_force_kill_failure();
-    #[cfg(not(test))]
-    let forced: Option<(&str, std::io::ErrorKind, bool)> = None;
-    let killed = match forced {
-        // The sync seam's "leave it alive" form is the only one this path honours: it replaces the
-        // kill, so the child really is left unsignalled.
-        Some((marker, kind, _)) => Err(std::io::Error::new(kind, marker)),
-        None => child.start_kill(),
-    };
-    // A failed start_kill means this is not a live process to wait on to a bound — ESRCH, it has
-    // already exited; EPERM, a setuid child refused the kill — so skip, and a kill failure never
-    // turns the bounded exit-wait into an unbounded block. tokio's own `Child` drop hands whatever
-    // is left to the runtime's orphan reaper. EPERM is reachable without a bug, so it alone is not
-    // asserted.
-    if let Err(e) = &killed {
-        debug_assert!(
-            e.kind() == std::io::ErrorKind::PermissionDenied,
-            "start_kill of an owned child failed: {e}"
-        );
-        return;
-    }
-    wait_and_reap(child, pid);
-}
-
-/// The wait-then-reap half of [`reap_now`], with **no kill of its own**: the caller's own
-/// successful kill is the precondition that bounds this wait.
-///
-/// On Unix we wait with `WNOWAIT` (NOT reaping), so tokio's own `Child` field-drop reaps the
-/// zombie synchronously in its drop (its `try_wait` returns `Ok(Some)`, not a park-dependent
-/// orphan enqueue) — a guaranteed reap before the handle is gone. We only wait while tokio still
-/// owns the child (`id().is_some()`), which pins the pid; once tokio is `Done` (a prior `wait()`
-/// reaped it), the pid may be recycled and we must not wait on it. A `Done` child is a broken
-/// precondition, asserted in debug: every caller's child was never awaited.
-/// **Invariant:** no `wait()` future for this child is in flight when this runs.
-pub(crate) fn wait_and_reap(child: &mut ::tokio::process::Child, pid: u32) {
-    crate::bounded::assert_may_block("wait_and_reap");
-    // tokio `Done` ⇒ already reaped, pid possibly recycled ⇒ nothing to wait on (the recycled-pid
-    // wait hazard the sync side avoids by holding a handle). No caller can hold such a child: each
-    // reaches here with a child it never awaited.
-    if child.id().is_none() {
-        debug_assert!(
-            false,
-            "wait_and_reap found an already-reaped child where one was impossible"
-        );
-        return;
-    }
-    #[cfg(test)]
-    crate::child::spawn::fault::run_between_kill_and_wait();
-    #[cfg(unix)]
-    {
-        // `nix` doesn't expose `waitid` on macOS (0.31 configures it out), so call `libc::waitid`
-        // directly (WEXITED | WNOWAIT: block until exit without reaping) — portable across every Unix
-        // target and the identical syscall.
-        debug_assert!(pid <= i32::MAX as u32, "pid {pid} exceeds i32::MAX");
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let _waited = loop {
-            // SAFETY: a well-formed `waitid` call; `info` is a valid, owned, zeroed `siginfo_t` the
-            // kernel fills in. WNOWAIT leaves the child reapable for tokio's in-drop reap.
-            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
-            if rc == 0 {
-                break true;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            log::warn!("wait_and_reap: waitid on pid {pid} failed: {err}");
-            break false;
-        };
-        #[cfg(test)]
-        if _waited {
-            crate::child::spawn::fault::record_teardown_reap(pid, exit_status_of(&info));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-        let _ = pid;
-        let h = child.raw_handle().expect("tokio owns the handle while id() is Some");
-        // SAFETY: tokio owns and (on its field-drop) closes the handle; we only wait on it.
-        // INFINITE is bounded by the kill the caller already issued.
-        let waited = unsafe { WaitForSingleObject(HANDLE(h), INFINITE) };
-        debug_assert!(
-            waited == WAIT_OBJECT_0,
-            "wait_and_reap did not observe the child's exit: {waited:?}"
-        );
-        #[cfg(test)]
-        {
-            use std::os::windows::process::ExitStatusExt as _;
-            let mut code = 0u32;
-            // SAFETY: `h` is tokio's live process handle and `code` a valid out-parameter.
-            unsafe { windows::Win32::System::Threading::GetExitCodeProcess(HANDLE(h), &mut code) }
-                .expect("GetExitCodeProcess on an exited child");
-            crate::child::spawn::fault::record_teardown_reap(pid, std::process::ExitStatus::from_raw(code));
+    if killed.is_err() {
+        // The `try_wait` below reaps by pid: forget a foreign reap first.
+        #[cfg(unix)]
+        proc.forget_if_foreign();
+        if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {
+            log::warn!("async child {pid} could not be terminated on drop; leaving it running");
         }
     }
 }

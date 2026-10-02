@@ -95,6 +95,21 @@ pub(crate) fn sigusr1_and_wait(mut reuser: Child) -> Option<i32> {
     std::os::unix::process::ExitStatusExt::signal(&reuser.wait().expect("wait for the reuser"))
 }
 
+/// [`sigusr1_and_wait`] without consuming the exit: waits on a pidfd and peeks with `WNOWAIT`.
+#[cfg(feature = "tokio")]
+pub(crate) fn sigusr1_and_peek(reuser: &Child) -> Option<i32> {
+    let pidfd = pidfd_open(pid_of(reuser.id()), PidfdFlags::empty()).expect("pidfd_open the reuser");
+    signal_usr1(reuser);
+    wait_pollin(pidfd.as_fd());
+    let record = waitid(
+        WaitId::PidFd(pidfd.as_fd()),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .expect("peek the reuser's exit")
+    .expect("the reuser has exited");
+    record.terminating_signal()
+}
+
 fn signal_usr1(reuser: &Child) {
     // SAFETY: `reuser` is an unreaped child of ours, so its pid names it.
     let rc = unsafe { libc::kill(reuser.id() as i32, libc::SIGUSR1) };

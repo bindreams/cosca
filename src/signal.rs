@@ -91,7 +91,7 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 }
 
 /// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: the
-/// child was gone when adopted, so nothing is sent). Nothing is sent to a pid that is gone or
+/// child was gone when adopted or its identity could not be read, so nothing is sent). Nothing is sent to a pid that is gone or
 /// reused. A refused re-read is an error carrying the errno, so an `EPERM` stays
 /// `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it has no handle
 /// to send through.
@@ -105,7 +105,7 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         )
     };
     let Some(expected) = identity else {
-        log::debug!("child {pid} was gone when adopted; {sig:?} not sent");
+        log::debug!("child {pid} was gone when adopted, or its identity could not be read; {sig:?} not sent");
         return Ok(Sent::Gone);
     };
     match uniq_info(pid, ReadPurpose::Kill) {
