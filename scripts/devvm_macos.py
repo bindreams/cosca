@@ -340,10 +340,10 @@ class SignalGate:
             with mutex:
                 if state["s"] == "abandoned":
                     f.close()
+                    os.close(done_w)  # nobody is waiting for the notification any more
                 else:
                     state["s"], state["error"] = "done", error
-                    os.write(done_w, b"x")
-            os.close(done_w)
+                    os.write(done_w, b"x")  # the only wake-up: the pipe's write end stays open until the caller is done
 
         waiter = threading.Thread(target=acquire, daemon=True)
         waiter.start()
@@ -353,13 +353,15 @@ class SignalGate:
             with mutex:
                 if state["s"] == "done":
                     f.close()
+                    os.close(done_w)
                 else:
-                    state["s"] = "abandoned"
+                    state["s"] = "abandoned"  # the waiter closes both `f` and `done_w` when it acquires
                     self.abandoned.append(waiter)
             os.close(done_r)
             raise
         os.close(done_r)
         waiter.join()
+        os.close(done_w)
         if state["error"] is not None:
             f.close()
             raise state["error"]
