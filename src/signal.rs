@@ -62,8 +62,9 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
 
 /// A child's identity, read the moment its handle is made: the 64-bit unique id, which is never
 /// reused and survives `exec`. It is the only identity macOS checks a by-pid action against.
-/// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read,
-/// which a handle must not be made on.
+/// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
+/// A handle built on a refused read holds no id and acts on its pid never (the tokio spawn builds
+/// its backend that way, then forgets the child); the sync adoption fails instead.
 ///
 /// The read is of our own child, which nothing reaps but us, unless something else does (a
 /// `SIG_IGN` host, another thread's `waitpid(-1)`) before the read: `None` then says the child is
@@ -81,7 +82,8 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
 }
 
 /// The adoption error for a child whose identity read was refused with `errno`: the child is not
-/// adopted, and its caller tears it down.
+/// adopted. The sync spawn leaves it running, and the async spawn forgets it, with a warning;
+/// neither signals or waits on it by pid.
 #[cfg(target_os = "macos")]
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
@@ -91,10 +93,10 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 }
 
 /// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: the
-/// child was gone when adopted, so nothing is sent). Nothing is sent to a pid that is gone or
-/// reused. A refused re-read is an error carrying the errno, so an `EPERM` stays
-/// `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it has no handle
-/// to send through.
+/// child was gone when adopted or its identity could not be read, so nothing is sent). Nothing is
+/// sent to a pid that is gone or reused. A refused re-read is an error carrying the errno, so an
+/// `EPERM` stays `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it
+/// has no handle to send through.
 #[cfg(target_os = "macos")]
 pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io::Result<Sent> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
@@ -105,7 +107,7 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         )
     };
     let Some(expected) = identity else {
-        log::debug!("child {pid} was gone when adopted; {sig:?} not sent");
+        log::debug!("child {pid} was gone when adopted, or its identity could not be read; {sig:?} not sent");
         return Ok(Sent::Gone);
     };
     match uniq_info(pid, ReadPurpose::Kill) {

@@ -13,15 +13,43 @@ struct CaptureLog;
 static RECORDS: Mutex<Vec<(log::Level, String, ThreadId)>> = Mutex::new(Vec::new());
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
+thread_local! {
+    static PANIC_ON: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While the guard lives, a record emitted by THIS thread that contains `marker` is captured and
+/// then panics out of the logger, as an untrusted `Log` impl may.
+#[cfg(all(test, unix, feature = "tokio"))]
+pub(crate) fn panic_on(marker: &str) -> PanicOn {
+    PANIC_ON.with(|p| *p.borrow_mut() = Some(marker.to_owned()));
+    PanicOn(())
+}
+
+#[cfg(all(test, unix, feature = "tokio"))]
+#[must_use = "the panicking logger ends when the guard drops"]
+pub(crate) struct PanicOn(());
+
+#[cfg(all(test, unix, feature = "tokio"))]
+impl Drop for PanicOn {
+    fn drop(&mut self) {
+        PANIC_ON.with(|p| *p.borrow_mut() = None);
+    }
+}
+
 impl log::Log for CaptureLog {
     fn enabled(&self, _: &log::Metadata<'_>) -> bool {
         true
     }
     fn log(&self, record: &log::Record<'_>) {
+        let text = record.args().to_string();
         RECORDS
             .lock()
             .unwrap()
-            .push((record.level(), record.args().to_string(), std::thread::current().id()));
+            .push((record.level(), text.clone(), std::thread::current().id()));
+        let armed = PANIC_ON.with(|p| p.borrow().as_ref().is_some_and(|marker| text.contains(marker.as_str())));
+        if armed {
+            panic!("forced logger panic (test seam)");
+        }
     }
     fn flush(&self) {}
 }
