@@ -77,6 +77,7 @@ forwards the remote command's real exit code as-is.
 | `linux-x64`     | `generic/ubuntu2204` (qemu, amd64)     | x86-64        | x86-64                   |
 | `linux-arm64`   | `perk/ubuntu-2204-arm64` (qemu, arm64) | arm64         | arm64 (Apple Silicon)    |
 | `windows-x64`   | `stromweld/windows-10` (qemu, amd64)   | x86-64        | x86-64                   |
+| `macos-arm64`   | Tart, `macos-tahoe-base` (Cirrus)      | arm64         | arm64 (Apple Silicon)    |
 | `windows-arm64` | _(none — see below)_                   | —             | —                        |
 
 Both Linux boxes run Ubuntu 22.04; systemd 249 there defaults to the unified cgroup v2
@@ -85,6 +86,45 @@ hierarchy, which is why they're the guests for cosca's cgroup lanes.
 On the emulated architecture, QEMU falls back to TCG (software emulation) instead of
 HVF/KVM, which is dramatically slower — see [Windows guests](#windows-guests) for measured
 numbers on this host.
+
+### `macos-arm64`
+
+A throwaway macOS 26 (Tahoe) arm64 VM via [Tart](https://tart.run), for fast local macOS
+RED/GREEN iterations and pre-checks. **CI stays the merge gate.** The image is Cirrus Labs'
+`ghcr.io/cirruslabs/macos-tahoe-base`, not GitHub's `macos-latest` runner image: same macOS
+major (26) and arm64 as CI's `darwin/arm64` lane, but different preinstalled tools and no Xcode.
+
+Prerequisites: Tart (`brew install cirruslabs/cli/tart`, or the release tarball), found via
+`$TART` or `PATH`; and the base image pulled once, about 30 GB (`tart pull
+ghcr.io/cirruslabs/macos-tahoe-base@sha256:<digest>`; check free disk first).
+
+```sh
+uv run scripts/devvm.py up macos-arm64 [--rev <git rev>] [--rosetta]   # clone, boot headless, copy `git archive <rev>`, provision
+uv run scripts/devvm.py run macos-arm64 -- cargo nextest run --lib -E 'test(/await_reapable/)'
+uv run scripts/devvm.py run macos-arm64 -- sudo -n env PATH=/Users/admin/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin CARGO_HOME=/Users/admin/cargo-home-root CARGO_TARGET_DIR=/Users/admin/cargo-target-root RUSTUP_HOME=/Users/admin/.rustup cargo nextest run --locked ...   # root lane
+uv run scripts/devvm.py sync macos-arm64 --rev <rev>                  # replace the guest's source with another rev
+uv run scripts/devvm.py fetch macos-arm64 '~/cargo-target/nextest' ./out   # copy results out; absolute or ~/ paths, quote the ~
+uv run scripts/devvm.py destroy macos-arm64                           # stop and delete the VM
+```
+
+- Each worktree has one guest, a fresh copy-on-write clone of the base; the base is never
+  modified. A failed `up` deletes its clone and exits 1. An interrupted one (SIGINT, SIGTERM or SIGHUP, once or repeatedly) does the same and exits 128+signal; a signal
+  ignored on entry (`nohup`) stays ignored; a signal that arrives after `up` or `destroy` finished still gives the 128+signal exit code. If the deletion fails, the state is kept and the message names the VM and points to `destroy`.
+- `destroy` deletes only the VM this worktree created and refuses anything it cannot verify.
+  There is no `halt`: destroy the guest and `up` a new one.
+- At most 2 macOS VMs run at once on a Mac (Apple's licence); `up` counts every running local
+  Tart VM and refuses a third.
+- Only committed state is copied (`git archive <rev>`). The provision script always comes from
+  this checkout, so `--rev` may name an older commit.
+- Root-lane runs use their own `CARGO_HOME` and `CARGO_TARGET_DIR` (recipe above, with
+  `--locked`), so `sync` and unprivileged builds keep working afterwards.
+- CI's `darwin/amd64` lane is also arm64 plus Rosetta (a `macos-15` runner building
+  x86_64), so `--rosetta` matches its mechanism; the macOS major differs (26 versus 15). The
+  base already ships Rosetta; the flag ensures it and adds the `x86_64-apple-darwin` target for
+  `cargo nextest run --target x86_64-apple-darwin`.
+- The base image is pinned by digest; Renovate moves `BASE_IMAGE_DIGEST` in
+  `scripts/devvm_macos.py`, after which pull the new digest.
+- Host-side tests, run by CI's Lint job: `python3 -m unittest scripts.devvm_macos_gate_test scripts.devvm_macos_gateio_test scripts.devvm_macos_tart_test scripts.devvm_test scripts.devvm_macos_test scripts.devvm_macos_signals_test scripts.devvm_macos_realtart_test`. A regression fails a test by assertion rather than hanging it, in any module order.
 
 ### `windows-arm64`
 

@@ -53,6 +53,7 @@ from devvm_common import (  # noqa: E402
     run_vagrant,
     stage_dir,
 )
+import devvm_macos  # noqa: E402
 from devvm_windows import (  # noqa: E402
     InteractiveLookupFailure,
     get_windows_interactive_username,
@@ -80,6 +81,12 @@ GUESTS: dict[str, Guest] = {
         communicator="ssh",
         box="perk/ubuntu-2204-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
+    ),
+    "macos-arm64": Guest(
+        name="macos-arm64",
+        communicator="tart",
+        box=f"{devvm_macos.BASE_IMAGE} (Tart, Cirrus base image - not GitHub's runner image)",
+        tree_path_posix="~/cosca",
     ),
     "windows-x64": Guest(
         name="windows-x64",
@@ -343,26 +350,28 @@ def parse_run_argv(rest: list[str]) -> tuple[list[str], bool, int | None, list[s
 # Subcommands ==========================================================================
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
+def _vagrant_status(guest: Guest) -> str:
     require_tool("vagrant")
+    if not dotfile_dir(guest).exists():
+        return "not created"
+    # get_vagrant_machine_state raises on unparsable output; `list` degrades to
+    # "unknown" for that one guest instead of aborting the whole listing.
+    try:
+        return get_vagrant_machine_state(guest)
+    except RuntimeError:
+        return "unknown"
+
+
+def cmd_list(_args: argparse.Namespace) -> None:
     for guest in GUESTS.values():
         if not guest.available:
             print(f"{guest.name:14s} UNAVAILABLE  {guest.unavailable_reason}")
             continue
-        dotfile = dotfile_dir(guest)
-        if not dotfile.exists():
-            state = "not created"
-        else:
-            # get_vagrant_machine_state raises on unparsable output; `list` degrades to
-            # "unknown" for that one guest instead of aborting the whole listing.
-            try:
-                state = get_vagrant_machine_state(guest)
-            except RuntimeError:
-                state = "unknown"
+        state = backend_for(guest).status()
         print(f"{guest.name:14s} {state:14s} {guest.box}  (communicator: {guest.communicator})")
 
 
-def cmd_up(args: argparse.Namespace) -> None:
+def _vagrant_up(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     display = bool(getattr(args, "display", False))
@@ -375,6 +384,12 @@ def cmd_up(args: argparse.Namespace) -> None:
         sys.exit(1)
     if display and guest.communicator != "winrm":
         print("error: --display only applies to Windows guests", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "rosetta", False):
+        print("error: --rosetta only applies to macOS guests", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "rev", None) is not None:
+        print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
         sys.exit(1)
     dotfile_dir(guest).mkdir(parents=True, exist_ok=True)
     if guest.communicator == "winrm":
@@ -416,9 +431,12 @@ def cmd_up(args: argparse.Namespace) -> None:
         print(f"note: the read-only working tree is copied to {guest.tree_path_posix} — run `devvm.py sync {guest.name}` after local changes.")
 
 
-def cmd_sync(args: argparse.Namespace) -> None:
+def _vagrant_sync(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
+    if getattr(args, "rev", None) is not None:
+        print("error: --rev only applies to macOS guests (the others stage the working tree)", file=sys.stderr)
+        sys.exit(1)
     if not dotfile_dir(guest).exists():
         print(f"error: guest '{guest.name}' has not been brought up yet; run `devvm.py up {guest.name}` first", file=sys.stderr)
         sys.exit(1)
@@ -432,7 +450,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         provision_windows_guest(guest, auto_consent=auto_consent, create=False)
 
 
-def cmd_ssh(args: argparse.Namespace) -> None:
+def _vagrant_ssh(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     if guest.communicator == "ssh":
@@ -460,7 +478,7 @@ def cmd_ssh(args: argparse.Namespace) -> None:
     run_vagrant(guest, ["powershell"])
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+def _vagrant_run(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     cmd_args = list(args.cmd)
@@ -599,13 +617,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     run_vagrant(guest, ["winrm", "-c", outer])
 
 
-def cmd_halt(args: argparse.Namespace) -> None:
+def _vagrant_halt(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     run_vagrant(guest, ["halt"])
 
 
-def cmd_destroy(args: argparse.Namespace) -> None:
+def _vagrant_destroy(args: argparse.Namespace) -> None:
     guest = GUESTS[args.guest]
     require_available(guest)
     returncode = run_vagrant(guest, ["destroy", "-f"], check=False)
@@ -621,6 +639,81 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     guest_state = STATE_DIR / guest.name
     if guest_state.exists():
         shutil.rmtree(guest_state)
+
+
+# Backends =============================================================================
+
+
+class VagrantBackend:
+    """Vagrant-managed guests (Linux over ssh, Windows over WinRM)."""
+
+    def __init__(self, guest: Guest):
+        self.guest = guest
+
+    def status(self) -> str:
+        return _vagrant_status(self.guest)
+
+    def up(self, args: argparse.Namespace) -> None:
+        _vagrant_up(args)
+
+    def sync(self, args: argparse.Namespace) -> None:
+        _vagrant_sync(args)
+
+    def ssh(self, args: argparse.Namespace) -> None:
+        _vagrant_ssh(args)
+
+    def run(self, args: argparse.Namespace) -> None:
+        _vagrant_run(args)
+
+    def halt(self, args: argparse.Namespace) -> None:
+        _vagrant_halt(args)
+
+    def destroy(self, args: argparse.Namespace) -> None:
+        _vagrant_destroy(args)
+
+    def fetch(self, _args: argparse.Namespace) -> None:
+        print("error: fetch only applies to macOS guests", file=sys.stderr)
+        sys.exit(1)
+
+
+def backend_for(guest: Guest):
+    if guest.communicator == "tart":
+        return devvm_macos.MacosBackend(None, REPO_ROOT, STATE_DIR)
+    return VagrantBackend(guest)
+
+
+def _dispatch(verb: str, args: argparse.Namespace) -> None:
+    guest = GUESTS[args.guest]
+    require_available(guest)
+    getattr(backend_for(guest), verb)(args)
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    _dispatch("up", args)
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    _dispatch("sync", args)
+
+
+def cmd_ssh(args: argparse.Namespace) -> None:
+    _dispatch("ssh", args)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    _dispatch("run", args)
+
+
+def cmd_halt(args: argparse.Namespace) -> None:
+    _dispatch("halt", args)
+
+
+def cmd_destroy(args: argparse.Namespace) -> None:
+    _dispatch("destroy", args)
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    _dispatch("fetch", args)
 
 
 # CLI ==================================================================================
@@ -654,10 +747,22 @@ def build_parser() -> argparse.ArgumentParser:
         "Headless remains the default; this is a local window only, never VNC or any other "
         "network-exposed display. Not persisted — pass it again on every `up` that needs it.",
     )
+    p.add_argument(
+        "--rev",
+        default=None,
+        help="(macOS only) git rev to `git archive` into the guest (default HEAD; committed state only).",
+    )
+    p.add_argument(
+        "--rosetta",
+        action="store_true",
+        help="(macOS only) install Rosetta and the x86_64-apple-darwin target, to run x86_64 test "
+        "binaries in the guest. An approximation of the Intel lane, not a replacement.",
+    )
     p.set_defaults(func=cmd_up)
 
-    p = sub.add_parser("sync", help="push the current working tree into a running guest")
+    p = sub.add_parser("sync", help="push the working tree into a running guest (macOS guests get the committed `git archive <rev>` instead)")
     p.add_argument("guest", choices=GUESTS.keys())
+    p.add_argument("--rev", default=None, help="(macOS only) git rev to `git archive` into the guest.")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("ssh", help="open an interactive shell in a guest")
@@ -680,6 +785,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run, prefixed with --")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("fetch", help="(macOS only) copy a file or directory out of the guest")
+    p.add_argument("guest", choices=GUESTS.keys())
+    p.add_argument("guest_path")
+    p.add_argument("host_dest")
+    p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("halt", help="shut down a guest, keeping its disk")
     p.add_argument("guest", choices=GUESTS.keys())

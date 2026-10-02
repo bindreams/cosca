@@ -143,7 +143,7 @@
       "customType": "regex",
       "description": "cargo-nextest release assets the devvm scripts download: tag and SHA-256 on one line, so the digest moves with the version",
       "managerFilePatterns": [
-        "/^scripts/devvm/provision/(linux-rust\\.sh|windows-rust\\.ps1)$/"
+        "/^scripts/devvm/provision/(linux-rust\\.sh|macos-rust\\.sh|windows-rust\\.ps1)$/"
       ],
       "matchStrings": [
         "NEXTEST_TAG_[A-Z0-9_]+=\"(?<currentValue>cargo-nextest-[^\"]+)\" NEXTEST_SHA256_[A-Z0-9_]+=\"(?<currentDigest>[0-9a-f]{64})\"",
@@ -154,6 +154,18 @@
       "depTypeTemplate": "ci-tool",
       "matchStringsStrategy": "any",
       "versioningTemplate": "regex:^cargo-nextest-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Tart base image of the devvm macos-arm64 guest: repository, tag and digest, pinned by digest so a moved :latest never changes what devvm clones",
+      "managerFilePatterns": [
+        "/^scripts/devvm_macos\\.py$/"
+      ],
+      "matchStrings": [
+        "BASE_IMAGE_REPO = \"(?<depName>[^\"]+)\"\\s+BASE_IMAGE_TAG = \"(?<currentValue>[^\"]+)\"\\s+BASE_IMAGE_DIGEST = \"(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ],
+      "datasourceTemplate": "docker",
+      "depTypeTemplate": "ci-tool"
     },
     {
       "customType": "regex",
