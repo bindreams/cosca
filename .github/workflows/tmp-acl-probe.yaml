@@ -31,10 +31,11 @@ jobs:
           /c/Windows/System32/whoami.exe /priv > "$RUNNER_TEMP/priv-bash.txt"
           /c/Windows/System32/whoami.exe /groups > "$RUNNER_TEMP/groups-bash.txt"
       - name: Diff of the native views
+        continue-on-error: true
         run: |
           foreach ($k in 'env','priv','groups') {
-            "=== $k: pwsh vs bash ==="
-            Compare-Object (Get-Content "$env:RUNNER_TEMP/$k-pwsh.txt") (Get-Content "$env:RUNNER_TEMP/$k-bash.txt") | Format-Table -AutoSize -Wrap | Out-String -Width 300
+            "=== $($k): pwsh vs bash ==="
+            Compare-Object (Get-Content "$($env:RUNNER_TEMP)/$($k)-pwsh.txt") (Get-Content "$($env:RUNNER_TEMP)/$($k)-bash.txt") | Format-Table -AutoSize -Wrap | Out-String -Width 300
           }
       - name: The ACL tests from pwsh
         continue-on-error: true
