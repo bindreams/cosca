@@ -678,7 +678,7 @@ class VagrantBackend:
 
 def backend_for(guest: Guest):
     if guest.communicator == "tart":
-        return devvm_macos.MacosBackend(devvm_macos.Tart(), REPO_ROOT, STATE_DIR)
+        return devvm_macos.MacosBackend(None, REPO_ROOT, STATE_DIR)
     return VagrantBackend(guest)
 
 

@@ -33,7 +33,7 @@ PROVISION_SCRIPT = "scripts/devvm/provision/macos-rust.sh"
 # Guest side of `fetch`: expands a leading `~/` in the guest, then tars the path.
 FETCH_SCRIPT = (
     'p=$1; case "$p" in "~/"*) p="$HOME/${p#"~/"}";; esac; '
-    'p=${p%/}; exec tar -c -C "$(dirname "$p")" "$(basename "$p")"'
+    'p=${p%/}; exec tar -c -C "$(dirname "$p")" -- "$(basename "$p")"'
 )
 
 
@@ -179,6 +179,35 @@ def _signals_raise():
             signal.signal(s, h)
 
 
+class _Deferred:
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+
+    def reraise(self) -> None:
+        """Raise what the deferred signal would have raised; a no-op if none arrived."""
+        if self.pending:
+            if self.pending[0] == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + self.pending[0])
+
+
+@contextlib.contextmanager
+def _signals_deferred():
+    """Hold SIGTERM, SIGHUP and SIGINT until the block ends, so cleanup runs to completion.
+
+    The caller decides whether to `reraise()` afterwards; cleanup run from an exception handler
+    does not, so the original error wins.
+    """
+    d = _Deferred()
+    sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    old = {s: signal.signal(s, lambda signum, _frame: d.pending.append(signum)) for s in sigs}
+    try:
+        yield d
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
 # Tart runner (the test seam) ==========================================================
 
 
@@ -239,12 +268,19 @@ class Tart:
 
 
 class MacosBackend:
-    def __init__(self, tart: Tart, repo_root: Path, state_root: Path):
-        self.tart = tart
+    def __init__(self, tart: Tart | None, repo_root: Path, state_root: Path):
+        self._tart = tart  # built on first use: `list` and `status` must work without tart installed
         self.repo_root = repo_root
         self.sdir = state_root / GUEST_NAME
         self._proc: subprocess.Popen | None = None  # the `tart run` child `up` owns
+        self._claimed = False
         self._clone_attempted = False
+
+    @property
+    def tart(self) -> Tart:
+        if self._tart is None:
+            self._tart = Tart()
+        return self._tart
 
     # state -----------------------------------------------------------------------
 
@@ -280,8 +316,9 @@ class MacosBackend:
             tmp.unlink(missing_ok=True)
 
     def _clear_state(self) -> None:
-        for f in (self._claim_file, self._identity_file):
-            f.unlink(missing_ok=True)
+        with _signals_deferred():
+            for f in (self._claim_file, self._identity_file):
+                f.unlink(missing_ok=True)
 
     def _worktree_lock(self):
         return _flock(self.sdir / "lock", "another devvm command in this worktree")
@@ -322,20 +359,26 @@ class MacosBackend:
 
     def _teardown(self, name: str) -> None:
         """Remove a VM `up` created. Never raises, so the original error survives; keeps the state on failure."""
-        try:
-            existed = name in self._names()
-            problem = self._remove_vm(name, self._proc)
-        except Exception as e:  # noqa: BLE001
-            existed, problem = True, repr(e)
-        if problem is None:
-            self._clear_state()
-            if existed:
-                print(f"devvm: removed VM {name}", file=sys.stderr)
-        else:
-            print(
-                f"devvm: could not remove VM {name}: {problem}. State kept; run `devvm.py destroy macos-arm64`.",
-                file=sys.stderr,
-            )
+        with _signals_deferred():
+            try:
+                existed = name in self._names()
+                problem = self._remove_vm(name, self._proc)
+            except Exception as e:  # noqa: BLE001
+                existed, problem = True, repr(e)
+            if problem is None:
+                self._clear_state()
+                if existed:
+                    print(f"devvm: removed VM {name}", file=sys.stderr)
+            else:
+                print(
+                    f"devvm: could not remove VM {name}: {problem}. State kept; run `devvm.py destroy macos-arm64`.",
+                    file=sys.stderr,
+                )
+
+    def _teardown_locked(self, name: str) -> None:
+        with _signals_deferred():  # includes the wait for the cap lock
+            with self._cap_lock():
+                self._teardown(name)
 
     # up --------------------------------------------------------------------------
 
@@ -362,7 +405,6 @@ class MacosBackend:
         name = new_vm_name()
         try:
             with _signals_raise(), self._worktree_lock():
-                self._claim(name)
                 self._up_claimed(name, sha, bool(getattr(args, "rosetta", False)))
         except (AlreadyUp, UpError) as e:
             print(f"error: {e}", file=sys.stderr)
@@ -371,11 +413,15 @@ class MacosBackend:
 
     def _up_claimed(self, name: str, sha: str, rosetta: bool) -> None:
         self._proc = None
-        self._clone_attempted = False
+        self._claimed = self._clone_attempted = False
         try:
+            with _signals_deferred() as deferred:
+                self._claim(name)
+                self._claimed = True
+            deferred.reraise()  # a signal that landed during the claim still cleans it up, below
             self._up_locked(name, sha, rosetta)
         except BaseException:
-            if not self._clone_attempted:  # interrupted before any VM existed: the claim must not wedge the worktree
+            if self._claimed and not self._clone_attempted:  # no VM exists: the claim must not wedge the worktree
                 self._clear_state()
             raise
 
@@ -386,13 +432,13 @@ class MacosBackend:
                 self._create_vm(name)
                 self._boot(name)
             except BaseException:
-                self._teardown(name)
+                if self._clone_attempted:
+                    self._teardown(name)
                 raise
         try:
             self._stage(name, sha, rosetta)
         except BaseException:
-            with self._cap_lock():
-                self._teardown(name)
+            self._teardown_locked(name)
             raise
 
     def _acquire_cap_slot(self, name: str) -> None:
@@ -512,7 +558,11 @@ class MacosBackend:
             return "not created"
         if not name:
             return "corrupt claim"
-        for e in self.tart.vms():
+        try:
+            vms = self.tart.vms()
+        except (RuntimeError, OSError) as e:
+            return f"unknown ({name}; {e})"
+        for e in vms:
             if e.get("Name") == name:
                 return f"{e.get('State', '?')} ({name})"
         return f"missing ({name})"

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,7 @@ class FakeProc:
         return self.returncode
 
     def terminate(self):
+        self.tart.event("terminate")
         self.returncode = -15
         self.tart.set_state(self.name, "stopped")
 
@@ -45,7 +47,12 @@ class FakeProc:
 
 
 class FakeTart:
-    """Same surface as devvm_macos.Tart, backed by a dict and a temp dir."""
+    """Same surface as devvm_macos.Tart, backed by a dict and a temp dir.
+
+    `events` records each call with whether the host-wide cap lock was held during it; `hooks`
+    run code at a named call (used to deliver signals). With `guest_home` set, `exec` and
+    `exec_popen` run the guest-side shell for real on the host, with HOME there.
+    """
 
     binary = "fake-tart"
 
@@ -57,9 +64,27 @@ class FakeTart:
         self.exec_rc = lambda args: 0
         self.run_exits_immediately = False
         self.calls: list[str] = []
+        self.events: list[tuple[str, bool]] = []
+        self.hooks: dict[str, object] = {}
         self.procs: dict[str, FakeProc] = {}
+        self.guest_home: Path | None = None
+
+    def cap_lock_held(self) -> bool:
+        with open(self.home / "devvm-cap.lock", "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            return False
+
+    def event(self, name: str) -> None:
+        self.events.append((name, self.cap_lock_held()))
+        hook = self.hooks.get(name)
+        if hook:
+            hook()
 
     def vms(self):
+        self.event("vms")
         return [dict(v) for v in self.vm_list]
 
     def set_state(self, name, state):
@@ -72,6 +97,7 @@ class FakeTart:
 
     def clone(self, src, name):
         self.calls.append("clone")
+        self.event("clone")
         if "clone" in self.fail:
             return self.fail["clone"]
         self.vm_list.append(_vm(name))
@@ -82,6 +108,7 @@ class FakeTart:
 
     def start(self, name, log):
         self.calls.append("start")
+        self.event("start")
         log.write_text("")
         self.set_state(name, "running")
         proc = FakeProc(self, name)
@@ -92,26 +119,37 @@ class FakeTart:
 
     def stop(self, name):
         self.calls.append("stop")
+        self.event("stop")
         if "stop" in self.fail:
             return self.fail["stop"]
         if not self.stop_keeps_running:
-            self.set_state(name, "stopped")
-            if name in self.procs:
-                self.procs[name].returncode = 0
+            self.set_state(name, "stopped")  # the `tart run` child exits later, on its own schedule
         return 0
 
     def delete(self, name):
         self.calls.append("delete")
+        self.event("delete")
         if "delete" in self.fail:
             return self.fail["delete"]
         self.vm_list = [v for v in self.vm_list if v["Name"] != name]
         return 0
 
+    def _local_env(self):
+        return {"HOME": str(self.guest_home), "PATH": "/usr/bin:/bin"}
+
     def exec(self, name, args, *, stdin=None, capture_output=False):
         self.calls.append("exec:" + " ".join(args)[:40])
+        self.event("exec:true" if args == ["true"] else "exec:stage")
+        if self.guest_home is not None and args != ["true"] and args[0] == "sh":
+            return subprocess.run(args, stdin=stdin, env=self._local_env(), capture_output=True)
         if stdin is not None:
             stdin.read()
         return subprocess.CompletedProcess(args, self.exec_rc(args))
+
+    def exec_popen(self, name, args, *, stdout):
+        self.event("exec_popen")
+        assert self.guest_home is not None
+        return subprocess.Popen(args, stdout=stdout, stderr=subprocess.DEVNULL, env=self._local_env())
 
     def identity(self, name):
         st = (self.home / "vms" / name / "disk.img").stat()
@@ -156,8 +194,10 @@ class Env:
         with open(self.tart.home / "devvm-cap.lock", "w") as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises BlockingIOError if still held
 
-    def assert_nothing_leaked(self, test):
+    def assert_nothing_leaked(self, test, procs=True):
         test.assertEqual(self.tart.local_names(), [])
+        if procs:  # `destroy` runs in another process than `up`'s child, which exits on `tart stop`
+            test.assertEqual([p.name for p in self.tart.procs.values() if p.poll() is None], [], "a tart run child is still alive")
         test.assertIsNone(self.claim())
         self.assert_cap_lock_free(test)
 
@@ -428,6 +468,205 @@ class UpTests(unittest.TestCase):
         self.assertEqual(self.env.tart.calls, [])
 
 
+class CapLockTests(unittest.TestCase):
+    """The licence cap is only as strong as the lock around count, clone and boot."""
+
+    def setUp(self) -> None:
+        self.env = Env(self)
+        sleeper = mock.patch.object(m.time, "sleep", lambda _s: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def held(self, name: str) -> list[bool]:
+        return [h for n, h in self.env.tart.events if n == name]
+
+    def test_count_clone_start_and_the_first_exec_all_run_under_the_cap_lock(self) -> None:
+        with captured():
+            self.env.up()
+        events = self.env.tart.events
+        self.assertEqual(self.held("clone"), [True])
+        self.assertEqual(self.held("start"), [True])
+        self.assertEqual(self.held("exec:true"), [True])
+        self.assertEqual(events[[n for n, _ in events].index("clone") - 1], ("vms", True), "the count before the clone")
+
+    def test_staging_runs_without_the_cap_lock(self) -> None:
+        with captured():
+            self.env.up()
+        self.assertEqual(set(self.held("exec:stage")), {False})
+
+    def test_teardown_after_a_boot_failure_holds_the_cap_lock(self) -> None:
+        self.env.tart.exec_rc = lambda args: 1
+        with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
+            exits_with(self, self.env.up)
+        self.assertEqual(set(self.held("stop") + self.held("delete") + self.held("terminate")), {True})
+
+    def test_teardown_after_a_stage_failure_holds_the_cap_lock(self) -> None:
+        self.env.tart.exec_rc = lambda args: 1 if args[:2] == ["sh", "-c"] else 0
+        exits_with(self, self.env.up)
+        self.assertEqual(self.held("stop") + self.held("delete") + self.held("terminate"), [True, True, True])
+
+    def test_a_name_collision_is_refused_before_cloning(self) -> None:
+        self.env.tart.vm_list.append(_vm("devvm-macos-fixed"))
+        with mock.patch.object(m, "new_vm_name", lambda: "devvm-macos-fixed"):
+            err = exits_with(self, self.env.up)
+        self.assertIn("already exists", err)
+        self.assertNotIn("clone", self.env.tart.calls)
+        self.assertEqual(self.env.tart.local_names(), ["devvm-macos-fixed"])
+
+
+SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+class SignalSafetyTests(unittest.TestCase):
+    """A signal at any point of cleanup must not leak the VM, the child or the claim."""
+
+    def setUp(self) -> None:
+        sleeper = mock.patch.object(m.time, "sleep", lambda _s: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def failing_env(self, hook_at: str, sig: int, path: str = "stage") -> Env:
+        """An env whose `up` fails at `path` (boot or stage); the signal fires at `hook_at` of the teardown."""
+        env = Env(self)
+        armed = []
+        fails = ["true"] if path == "boot" else ["sh", "-c"]
+
+        def exec_rc(args):
+            if args[: len(fails)] == fails:
+                armed.append(True)  # teardown starts after this
+                return 1
+            return 0
+
+        def fire():
+            if armed:
+                armed.clear()
+                os.kill(os.getpid(), sig)
+
+        env.tart.exec_rc = exec_rc
+        env.tart.hooks[hook_at] = fire
+        return env
+
+    def run_failing_up(self, env: Env, path: str) -> None:
+        with mock.patch.object(m, "AGENT_BOOT_TIMEOUT_SECONDS", 0):
+            self.run_up(env)
+
+    def run_up(self, env: Env) -> None:
+        with captured():
+            try:
+                env.up()
+            except (SystemExit, KeyboardInterrupt):
+                pass
+
+    def test_a_signal_during_each_teardown_step_still_completes_the_cleanup(self) -> None:
+        for path in ("stage", "boot"):
+            for sig in SIGNALS:
+                for step in ("vms", "stop", "terminate", "delete"):
+                    with self.subTest(failure=path, sig=signal.Signals(sig).name, step=step):
+                        env = self.failing_env(step, sig, path)
+                        self.run_failing_up(env, path)
+                        env.assert_nothing_leaked(self)
+
+    def test_a_signal_while_teardown_waits_for_the_cap_lock_still_completes_the_cleanup(self) -> None:
+        for sig in SIGNALS:
+            with self.subTest(sig=signal.Signals(sig).name):
+                env = Env(self)
+                env.tart.exec_rc = lambda args: 1 if args[:2] == ["sh", "-c"] else 0
+                real, acquisitions = fcntl.flock, []
+
+                def flock(f, op, sig=sig):
+                    from_backend = sys._getframe(1).f_code.co_filename.endswith("devvm_macos.py")
+                    if from_backend and f.name.endswith("devvm-cap.lock"):
+                        acquisitions.append(op)
+                        if len(acquisitions) == 2 and op & fcntl.LOCK_NB:  # teardown finds it held
+                            raise BlockingIOError
+                        if len(acquisitions) == 3:  # ...and a signal lands while it waits
+                            os.kill(os.getpid(), sig)
+                    return real(f, op)
+
+                with mock.patch.object(m.fcntl, "flock", flock):
+                    self.run_up(env)
+                env.assert_nothing_leaked(self)
+
+    def test_the_original_error_wins_over_a_signal_during_cleanup(self) -> None:
+        env = self.failing_env("stop", signal.SIGTERM)
+        err = exits_with(self, env.up)
+        self.assertIn("git archive", err)
+
+    def test_a_signal_right_after_the_claim_does_not_wedge_the_worktree(self) -> None:
+        for sig in SIGNALS:
+            with self.subTest(sig=signal.Signals(sig).name):
+                env = Env(self)
+                real_claim = env.backend._claim
+
+                def claim(name, real_claim=real_claim, sig=sig):
+                    real_claim(name)
+                    os.kill(os.getpid(), sig)
+
+                env.backend._claim = claim
+                self.run_up(env)
+                self.assertIsNone(env.claim())
+                env.backend._claim = real_claim
+                with captured():
+                    env.up()  # the next `up` must not say "already exists"
+                self.assertEqual(len(env.tart.local_names()), 1)
+
+
+class ListWithoutTartTests(unittest.TestCase):
+    def test_list_does_not_need_tart(self) -> None:
+        env = {"PATH": "/usr/bin:/bin"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            devvm, "STATE_DIR", Path(tmp)
+        ), mock.patch.object(devvm, "_vagrant_status", lambda g: "not created"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                devvm.cmd_list(argparse.Namespace())
+        self.assertRegex(out.getvalue(), r"macos-arm64\s+not created")
+
+
+class FetchAndSyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = Env(self)
+        with captured():
+            self.env.up()
+        guest = self.env.sdir.parent / "guest-home"
+        guest.mkdir()
+        self.guest = guest
+        self.env.tart.guest_home = guest
+
+    def fetch(self, guest_path: str) -> Path:
+        dest = self.env.sdir.parent / f"out-{abs(hash(guest_path))}"
+        args = argparse.Namespace(guest_path=guest_path, host_dest=str(dest))
+        with captured():
+            self.env.backend.fetch(args)
+        return dest
+
+    def test_fetch_copies_a_tilde_path(self) -> None:
+        (self.guest / "res").mkdir()
+        (self.guest / "res" / "f.txt").write_text("hi")
+        self.assertEqual((self.fetch("~/res") / "res" / "f.txt").read_text(), "hi")
+
+    def test_a_basename_that_looks_like_a_tar_option_is_fetched_not_parsed(self) -> None:
+        for base in ("-out", "--newer=x"):
+            with self.subTest(base=base):
+                (self.guest / base).mkdir()
+                (self.guest / base / "f.txt").write_text("hi")
+                self.assertEqual((self.fetch(f"~/{base}") / base / "f.txt").read_text(), "hi")
+
+    def test_fetch_of_a_missing_path_fails(self) -> None:
+        args = argparse.Namespace(guest_path="~/nope", host_dest=str(self.guest / "o"))
+        exits_with(self, lambda: self.env.backend.fetch(args))
+
+    def test_sync_replaces_the_guests_tree_with_the_rev(self) -> None:
+        with captured():
+            self.env.backend.sync(argparse.Namespace(rev=None))
+        self.assertTrue((self.guest / "cosca" / m.PROVISION_SCRIPT).is_file())
+
+    def test_sync_needs_a_brought_up_guest(self) -> None:
+        env = Env(self)
+        err = exits_with(self, lambda: env.backend.sync(argparse.Namespace(rev=None)))
+        self.assertIn("has not been brought up", err)
+
+
 class ClaimTests(unittest.TestCase):
     def test_claim_is_atomic_and_exclusive_and_leaves_no_temp_file(self) -> None:
         env = Env(self)
@@ -455,7 +694,7 @@ class DestroyTests(unittest.TestCase):
     def test_destroys_the_vm_it_created_and_clears_state(self) -> None:
         with captured():
             self.env.destroy()
-        self.env.assert_nothing_leaked(self)
+        self.env.assert_nothing_leaked(self, procs=False)
 
     def test_refuses_a_replaced_vm(self) -> None:
         (self.env.tart.home / "vms" / self.name / "disk.img").unlink()
@@ -491,7 +730,7 @@ class DestroyTests(unittest.TestCase):
         with captured() as err:
             self.env.destroy()
         self.assertIn("already gone", err.getvalue())
-        self.env.assert_nothing_leaked(self)
+        self.env.assert_nothing_leaked(self, procs=False)
 
     def test_delete_failure_keeps_state(self) -> None:
         self.env.tart.fail["delete"] = 1
@@ -561,8 +800,7 @@ class OtherVerbTests(unittest.TestCase):
 
 class DispatchTests(unittest.TestCase):
     def test_each_guest_gets_its_backend_once(self) -> None:
-        with mock.patch.object(devvm.devvm_macos, "Tart", lambda: object()):
-            self.assertIsInstance(devvm.backend_for(devvm.GUESTS["macos-arm64"]), devvm.devvm_macos.MacosBackend)
+        self.assertIsInstance(devvm.backend_for(devvm.GUESTS["macos-arm64"]), devvm.devvm_macos.MacosBackend)
         self.assertIsInstance(devvm.backend_for(devvm.GUESTS["linux-x64"]), devvm.VagrantBackend)
         self.assertIsInstance(devvm.backend_for(devvm.GUESTS["windows-x64"]), devvm.VagrantBackend)
 
