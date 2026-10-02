@@ -35,7 +35,8 @@ enum Command {
         /// Move each root's `#![cfg(P)]` onto its top-level items, except `main` and `mod test_harness`.
         #[arg(long)]
         hoist_crate_cfg: bool,
-        /// Lines naming roots that still run under libtest: a `.rs` path, or a cargo target name.
+        /// Lines naming roots that still run under libtest: a `.rs` path, a cargo target name, or the
+        /// guard's `<kind>:<name>` (`test:spawn_io`).
         #[arg(long, value_name = "FILE")]
         unflipped: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
