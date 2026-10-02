@@ -404,6 +404,26 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // Same teardown for both arms (never leak the spawned child), different diagnosis:
         // an OS refusal is not a vanish.
         other => {
+            // macOS has no handle to act through, and a child whose identity is gone (reaped by
+            // someone else, its pid possibly reused) or unreadable cannot be shown to be ours:
+            // nothing is signalled or waited on by pid. It is forgotten (`Gone`) or left running
+            // and unreaped (`Unknown`), with a warning that names it. Dropping the `std` `Child`
+            // closes our ends of its pipes and neither kills nor reaps it.
+            #[cfg(target_os = "macos")]
+            {
+                match other {
+                    crate::identity::Resolved::Gone => log::warn!(
+                        "child {} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid",
+                        child.id()
+                    ),
+                    _ => log::warn!(
+                        "child {} cannot be shown to be ours (its identity could not be read); leaving it running and unreaped, with nothing signalled or waited on by pid",
+                        child.id()
+                    ),
+                }
+                drop(child);
+            }
+            #[cfg(not(target_os = "macos"))]
             teardown_unadopted(child);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
@@ -995,12 +1015,18 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 /// vanished branch, exercising either spawn path's error-teardown arm deterministically.
 pub(crate) fn resolve_identity(pid: u32) -> crate::identity::Resolved<ProcessId> {
     #[cfg(test)]
-    if fault::force_identity_vanished() {
-        // Capture the child's real identity for the test to prove it was reaped, then simulate a
-        // vanish so `spawn` takes the teardown arm.
-        fault::capture(ProcessId::of(pid));
-        // The seam simulates a VANISH, not a refusal.
-        return crate::identity::Resolved::Gone;
+    {
+        if fault::force_identity_unknown() {
+            fault::capture(ProcessId::of(pid));
+            return crate::identity::Resolved::Unknown;
+        }
+        if fault::force_identity_vanished() {
+            // Capture the child's real identity for the test to prove it was reaped, then simulate a
+            // vanish so `spawn` takes the teardown arm.
+            fault::capture(ProcessId::of(pid));
+            // The seam simulates a VANISH, not a refusal.
+            return crate::identity::Resolved::Gone;
+        }
     }
     ProcessId::of(pid)
 }
@@ -1344,6 +1370,7 @@ pub(crate) mod fault {
 
     thread_local! {
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
+        static FORCE_UNKNOWN: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
         static FORCE_REAP_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
@@ -1423,6 +1450,14 @@ pub(crate) mod fault {
     pub(crate) fn set_force_identity_vanished(on: bool) {
         FORCE_VANISH.with(|f| f.set(on));
     }
+    /// As [`set_force_identity_vanished`], but the identity read is refused (`Unknown`).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_force_identity_unknown(on: bool) {
+        FORCE_UNKNOWN.with(|f| f.set(on));
+    }
+    pub(crate) fn force_identity_unknown() -> bool {
+        FORCE_UNKNOWN.with(|f| f.get())
+    }
     pub(crate) fn force_identity_vanished() -> bool {
         FORCE_VANISH.with(|f| f.get())
     }
@@ -1470,6 +1505,7 @@ pub(crate) mod fault {
     }
     /// Make the next teardown kill on this thread wait for its child to exit on its own, then fail
     /// with an error of `kind` carrying `marker`: an `Err` from `kill` for a child that is gone.
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn set_force_kill_error_after_exit(marker: &'static str, kind: std::io::ErrorKind) {
         FORCE_KILL_ERROR_AFTER_EXIT.with(|f| f.set(Some((marker, kind))));
     }
