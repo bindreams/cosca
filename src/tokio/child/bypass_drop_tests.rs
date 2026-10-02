@@ -188,8 +188,8 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
         .expect("reap_now's refused-kill arm must not reap the child by pid");
 }
 
-/// `finish_elevated`'s refused-kill arm runs tokio's `try_wait` (a `waitpid` by pid)
-/// without the `forget_if_foreign` that `Drop`'s and `reap_now`'s refused-kill arms run first.
+/// `finish_elevated`'s refused-kill arm forgets a child shown reaped elsewhere (`forget_if_foreign`,
+/// as `Drop`'s and `reap_now`'s refused-kill arms do) before its `try_wait`, a `waitpid` by pid.
 #[tokio::test(flavor = "current_thread")]
 async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let (child, witness) = exited_unreaped(true);
@@ -207,9 +207,9 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
 }
 
 /// A contained root reaped elsewhere: `Drop`'s tree teardown warns that it skips the group kill. A
-/// logger that panics there unwinds out of the drop with tokio's `Child` held; the unwind must
-/// leak it, not reap the child by pid. Holds wherever the log sits, because tokio's `Child` is
-/// never dropped implicitly.
+/// logger that panics there unwinds out of the drop with tokio's `Child` held; the backend's own
+/// drop must forget it, since its handle shows the root reaped, rather than hand it to tokio's
+/// by-pid reap.
 #[tokio::test(flavor = "current_thread")]
 async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by_pid() {
     crate::log_capture::install();
@@ -222,11 +222,93 @@ async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by
     let witness = Witness::new(child.id().pid());
     drop(writer);
     witness.wait_exited();
-    let _evidence = force_evidence();
+    witness
+        .reap()
+        .expect("the child is ours to reap: this is the foreign reap");
+    let backend_drops = super::fault::count_backend_drops();
     let unwound = {
         let _panics = crate::log_capture::panic_on("the root is already reaped, so this drop does not");
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
     };
     assert!(unwound.is_err(), "the logger must have panicked out of the drop");
-    witness.reap().expect("the drop must not have reaped the child by pid");
+    assert_eq!(
+        backend_drops.get(),
+        0,
+        "tokio's Child must have been forgotten, not dropped into a by-pid reap"
+    );
+}
+
+/// A live child of ours, armed drop, kill refused (EPERM-like). `signal_on_drop` peeks (`Running`:
+/// ours), `try_wait`s, then warns "could not be terminated on drop". A logger that panics there
+/// unwinds out of `Drop` before it releases the backend. On Linux the backend's own drop must
+/// still hand a child its pidfd shows ours to tokio's drop and its orphan queue. On macOS nothing
+/// can show that, so the child is forgotten and left running, never reaped by pid.
+#[tokio::test(flavor = "current_thread")]
+async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() {
+    crate::log_capture::install();
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn");
+    let witness = Witness::new(child.id().pid());
+    let _refused = super::fault::force_kill_failure();
+    let drops = super::fault::count_backend_drops();
+    let unwound = {
+        let _panics = crate::log_capture::panic_on("could not be terminated on drop");
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
+    };
+    assert!(unwound.is_err(), "the logger must have panicked out of the drop");
+    let released = drops.get();
+    // Clean up regardless: end the child and reap it ourselves.
+    drop(writer);
+    witness.wait_exited();
+    let reaped_by_us = witness.reap().is_ok();
+    let expected = usize::from(cfg!(target_os = "linux"));
+    assert_eq!(
+        released, expected,
+        "released to tokio's drop: Linux releases a child its pidfd shows ours, macOS forgets it (reaped_by_us={reaped_by_us})"
+    );
+}
+
+/// As above, but stdin is tokio's own pipe and was never taken. The unwind must close this
+/// process's end of it, or `cat` never sees EOF.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
+    crate::log_capture::install();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("set stdin");
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    let witness = Witness::new(pid);
+    let child_stdin = std::fs::read_link(format!("/proc/{pid}/fd/0")).expect("child's fd 0");
+    let held = || {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("own fds")
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .any(|l| l == child_stdin)
+    };
+    assert!(held(), "before: tokio holds the write end of {child_stdin:?}");
+    let _refused = super::fault::force_kill_failure();
+    let unwound = {
+        let _panics = crate::log_capture::panic_on("could not be terminated on drop");
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(child)))
+    };
+    assert!(unwound.is_err(), "the logger must have panicked out of the drop");
+    let still_held = held();
+    // Clean up: kill through the pidfd and reap.
+    {
+        use std::os::fd::AsFd;
+        rustix::process::pidfd_send_signal(witness.pidfd.as_fd(), rustix::process::Signal::KILL).expect("kill");
+    }
+    witness.wait_exited();
+    drop(witness.reap()); // tokio's orphan queue may have reaped it first
+    assert!(
+        !still_held,
+        "after the unwind this process still holds {child_stdin:?}'s write end: cat never sees EOF"
+    );
 }

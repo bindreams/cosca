@@ -77,6 +77,11 @@ fn check_unique(pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
 }
 
 pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
+    peek_with(target, false)
+}
+
+/// [`peek`]; with `verified`, a `Running` child whose id cannot be read is an error.
+pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek> {
     let (pid, unique) = pid_and_unique(target);
     let peeked = peek_raw(pid)?;
     let Some(unique) = unique else { return Ok(peeked) };
@@ -97,7 +102,12 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         // of the pid by another child of ours also looks like this, so the id decides.
         Peek::Running => match check_unique(pid, unique, ReadPurpose::Running) {
             IdCheck::Other => Ok(Peek::Foreign(Foreign::Other)),
-            IdCheck::Matches | IdCheck::Gone | IdCheck::Unreadable(_) => Ok(peeked),
+            IdCheck::Matches | IdCheck::Gone => Ok(peeked),
+            IdCheck::Unreadable(_) if !verified => Ok(peeked),
+            IdCheck::Unreadable(errno) => Err(io::Error::new(
+                io::Error::from_raw_os_error(errno).kind(),
+                format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be ours"),
+            )),
         },
         // `ECHILD` is not proof of a reap: while a tracer holds our child the parent's `waitid`
         // answers `ECHILD` (`src/test_support/tracer.rs`), and the tracer's hand-back re-sends
