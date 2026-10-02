@@ -108,6 +108,7 @@ fn calls_libc_chdir() {
 }
 
 #[cfg(unix)]
+#[allow(deprecated, reason = "deprecated on macOS; the ban is what this checks")]
 fn calls_libc_daemon() {
     unsafe { libc::daemon(0, 0) };
 }
