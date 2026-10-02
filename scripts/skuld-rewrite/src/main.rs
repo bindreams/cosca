@@ -72,7 +72,15 @@ fn read_unflipped(file: &Path, manifest: Option<&Path>) -> Result<Vec<PathBuf>> 
             Some(all) => all,
             None => by_name.insert(targets::all(manifest)?),
         };
-        let found: Vec<_> = all.iter().filter(|t| t.name == line).collect();
+        // `<kind>:<name>` (the guard's spelling) or a bare name.
+        let (kind, name) = match line.split_once(':') {
+            Some((kind, name)) => (Some(kind), name),
+            None => (None, line),
+        };
+        let found: Vec<_> = all
+            .iter()
+            .filter(|t| t.name == name && kind.is_none_or(|k| t.kinds.iter().any(|tk| tk == k)))
+            .collect();
         if found.is_empty() {
             bail!(
                 "{}: `{line}` is neither a .rs path nor a target of the manifest",

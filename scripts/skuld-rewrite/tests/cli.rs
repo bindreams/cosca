@@ -149,6 +149,21 @@ fn unflipped_target_names_are_looked_up_in_the_manifest() {
         .contains("#[test]"));
 }
 
+/// The guard's `unflipped.txt` names targets as `<kind>:<name>`.
+#[test]
+fn unflipped_kind_name_entries_are_looked_up_in_the_manifest() {
+    let (_d, root) = toy();
+    write(&root, "unflipped.txt", "test:b\n");
+    let out = run(&root, &["apply", "--unflipped", "unflipped.txt", "tests/a.rs"]);
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("tests/common/mod.rs"));
+    // A kind that does not match the target's own is an error, not a silent pass.
+    write(&root, "unflipped.txt", "lib:b\n");
+    let out = run(&root, &["apply", "--unflipped", "unflipped.txt", "tests/a.rs"]);
+    assert_eq!(code(&out), 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("lib:b"));
+}
+
 #[test]
 fn unflipped_paths_work_and_a_name_that_matches_nothing_is_an_error() {
     let (_d, root) = toy();
