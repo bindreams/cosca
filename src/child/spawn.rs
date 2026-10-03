@@ -516,6 +516,10 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
             child.id()
         );
     }
+    let mut child = child; // MUTANT M7t
+    if cfg!(feature = "tokio") {
+        let _ = child.kill();
+    }
     drop(child);
 }
 

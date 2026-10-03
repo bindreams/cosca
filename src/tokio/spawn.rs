@@ -449,6 +449,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         prepared.settle_verdict(pid);
         // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
         // warning naming it, and left running.
+        // SAFETY: MUTANT M8b, a test-only kill of the spawned child.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         proc.reap_now(pid);
         return Err(crate::signal::identity_unreadable(pid, errno));
     }
@@ -503,6 +505,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
             #[cfg(target_os = "macos")]
             if matches!(other, Resolved::Unknown) {
+                let _ = proc.signal(crate::signal::Sig::Kill); // MUTANT M8
                 proc.forget_foreign();
             }
             proc.reap_now(pid);
