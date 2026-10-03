@@ -93,6 +93,16 @@ fn end_on_wait(owner: &KillOnDrop) -> super::fault::Observer {
     super::fault::observe_waits(move || end_with_code_zero(handle))
 }
 
+/// Mutants: `is_reaped` answers `false`; `is_reaped` answers `true`.
+#[test]
+fn raw_is_reaped_after_exit() {
+    let child = spawn_suspended();
+    assert!(!child.is_reaped(), "a suspended child has not exited");
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+    assert!(child.is_reaped());
+}
+
 /// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
 #[test]
 fn runas_kill_of_a_killable_child_returns_and_reaps() {

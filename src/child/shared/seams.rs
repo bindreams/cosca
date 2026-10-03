@@ -56,6 +56,7 @@ type BlockHook = Box<dyn FnOnce(Option<std::time::Duration>)>;
 
 thread_local! {
     static PARK: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
+    static PARK_AFTER_REAP: RefCell<Option<ParkGate>> = const { RefCell::new(None) };
     static FORCED_WAIT: Cell<Option<ForcedWait>> = const { Cell::new(None) };
     static PANIC_AFTER_RELOCK: Cell<bool> = const { Cell::new(false) };
     static ON_CONDVAR_BLOCK: RefCell<Option<BlockHook>> = const { RefCell::new(None) };
@@ -82,6 +83,21 @@ pub(crate) fn park_in_unlocked_wait(gate: ParkGate) -> Forced {
 
 pub(super) fn park_if_armed() {
     if let Some(gate) = PARK.with(|p| p.borrow_mut().take()) {
+        // A closed channel means the test is gone: carry on rather than hang.
+        _ = gate.reached.send(());
+        _ = gate.release.recv();
+    }
+}
+
+/// This thread's next `wait`, `wait_deadline` or `try_wait` that reaps parks on `gate` once the
+/// `E` write is done and the lock is released, before it returns.
+pub(crate) fn park_after_reap_recorded_on(gate: ParkGate) -> Forced {
+    PARK_AFTER_REAP.with(|p| *p.borrow_mut() = Some(gate));
+    Forced(|| PARK_AFTER_REAP.with(|p| *p.borrow_mut() = None))
+}
+
+pub(super) fn park_after_reap_recorded() {
+    if let Some(gate) = PARK_AFTER_REAP.with(|p| p.borrow_mut().take()) {
         // A closed channel means the test is gone: carry on rather than hang.
         _ = gate.reached.send(());
         _ = gate.release.recv();
