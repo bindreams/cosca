@@ -10,7 +10,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from forward_tests import BOUND, Workdir, run_bounded
+from forward_tests import BOUND, WAIT, WAKEUP, Workdir, run_bounded
 
 HERE = Path(__file__).resolve().parent
 RUN_NEXTEST = str(HERE / "run-nextest.py")
@@ -101,10 +101,11 @@ class Stopping(Step):
         return (
             sys.executable,
             "-c",
-            WRITES.replace("open(p + '/junit.xml', 'w').write(os.environ['NEXTEST_PROFILE'])", "open(p + '/junit.xml', 'w').write('<testsuites><testsuite')")
+            WAKEUP
+            + WRITES.replace("open(p + '/junit.xml', 'w').write(os.environ['NEXTEST_PROFILE'])", "open(p + '/junit.xml', 'w').write('<testsuites><testsuite')")
             + extra
             + f"os.write(os.open('{self.up_path}', os.O_RDWR), str(os.getpid()).encode() + b'\\n')\n"
-            + f"os.read(os.open('{self.release_path}', os.O_RDWR), 1)\n"
+            + WAIT.format(repr(str(self.release_path)))
             + after,
         )
 
