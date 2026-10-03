@@ -1,6 +1,7 @@
 //! Canary: data-stream suffixes.
 
 use crate::harness::{canary, check_resolutions, literal_rows};
+use crate::test_groups::{path_probes, Group};
 use crate::winapi::full_path_name;
 
 /// Canary: a `:stream` suffix stays in the final component, and only a trailing dot or space at
@@ -12,10 +13,7 @@ use crate::winapi::full_path_name;
 /// unchanged. String-level only: no stream is created or opened, so which file the file system
 /// would open for them is not measured here.
 #[skuld::test]
-fn a_stream_suffix_stays_in_the_final_component() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn a_stream_suffix_stays_in_the_final_component(#[fixture(path_probes)] _group: &Group) {
     canary("Windows", |facts, failures| {
         let mut rows = literal_rows(&[
             (r"C:\dir\x.bat:s", r"C:\dir\x.bat:s", "kept as given"),

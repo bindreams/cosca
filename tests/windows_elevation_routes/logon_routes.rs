@@ -3,6 +3,7 @@
 //! and are gated on `COSCA_PROBE_ALLOW_ACCOUNTS`; [`crate::token_filtering`] covers everything that
 //! reads token shape without logging anyone on.
 
+use crate::test_groups::{elevation_routes, Group};
 use std::os::windows::io::AsRawHandle;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -13,8 +14,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::harness::{
-    contain, env_block, report_cmdline, require_gate, skuld_db_dir, splice_child_report, wait_for, wide,
-    ScratchAccount, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    contain, env_block, report_cmdline, require_gate, splice_child_report, wait_for, wide, ScratchAccount,
+    CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -26,10 +27,7 @@ use crate::windows_probe::mark_test_passed;
 /// Also measures, in the same call, the two capabilities `ShellExecuteEx` cannot offer: an
 /// explicit environment block, and `STARTF_USESTDHANDLES` redirection of the child's stdout.
 #[skuld::test]
-fn does_create_process_with_logon_elevate() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn does_create_process_with_logon_elevate(#[fixture(elevation_routes)] _group: &Group) {
     require_gate(
         "COSCA_PROBE_ALLOW_ACCOUNTS",
         "creates and deletes a local administrator account",
@@ -158,7 +156,6 @@ pub(crate) fn logon_one_account(account: &ScratchAccount) -> bool {
         ("COSCA_PROBE_ENV_CANARY", "carried-through".into()),
         ("TEMP", dir.path().display().to_string()),
         ("TMP", dir.path().display().to_string()),
-        skuld_db_dir(dir.path()),
     ]);
     let mut cmd = wide(&report_cmdline(&exe));
     let user = wide(&account.user);
