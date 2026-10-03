@@ -15,6 +15,19 @@ fn an_unset_group_variable_with_consent_runs() {
     );
 }
 
+/// Mutant: a set group variable counts as consent.
+#[skuld::test]
+fn group_on_without_consent_fails_and_names_the_consent_variable() {
+    for vars in [&[("COSCA_TEST_TRACER", "1")][..], &[("COSCA_TEST_TRACER", "2")]] {
+        let why = check_group("COSCA_TEST_TRACER", env(vars)).unwrap_err();
+        assert!(why.contains("COSCA_TEST_TRACER_CONSENT=1"), "{why}");
+        let why = require_consent("COSCA_TEST_TRACER", "does a thing", env(vars))
+            .err()
+            .expect("no consent");
+        assert!(why.contains("COSCA_TEST_TRACER_CONSENT=1"), "{why}");
+    }
+}
+
 /// Mutant: only `1` enables.
 #[skuld::test]
 fn any_group_value_but_0_runs() {
@@ -139,7 +152,7 @@ mod reexec {
     /// Mutant: the group's `requires` never fails, so `=0` runs the test.
     #[skuld::test]
     fn group_zero_reports_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test(Some("0"), Some("1"));
+        let (outcome, success, stdout) = run_namespaces_test(Some("0"), None);
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -176,7 +189,7 @@ mod reexec {
     /// Mutant: the setup grants a group that is off.
     #[skuld::test]
     fn group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), None, None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
@@ -196,9 +209,9 @@ mod reexec {
     /// Mutant: the group's fixture carries no label, so `SKULD_LABELS=namespaces` selects none of its tests.
     #[skuld::test]
     fn the_group_label_selects_its_tests() {
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("namespaces"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("!namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("!namespaces"));
         assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }

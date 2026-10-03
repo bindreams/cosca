@@ -11,3 +11,11 @@ pub const NAMESPACES: skuld::Label;
 /// Selects the test that maps a drive letter for the whole logon session.
 #[skuld::label]
 pub const DRIVE_MAPPING: skuld::Label;
+
+/// Selects the `SETUID` group's tests.
+#[skuld::label]
+pub const SETUID: skuld::Label;
+
+/// Selects the setuid test that is also run as root (the `setuid-root` lane).
+#[skuld::label]
+pub const SETUID_ROOT: skuld::Label;

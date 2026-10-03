@@ -5,9 +5,6 @@
 pub(crate) mod setuid;
 
 #[cfg(test)]
-#[path = "test_privilege/setuid_gate_tests.rs"]
-mod setuid_gate_tests;
-#[cfg(test)]
 #[path = "test_privilege/setuid_helper_tests.rs"]
 mod setuid_helper_tests;
 #[cfg(test)]

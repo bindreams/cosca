@@ -198,7 +198,7 @@ mod drive_mapping_group {
     /// Mutant: the group's `requires` never fails, so `=0` runs the test.
     #[skuld::test]
     fn drive_mapping_group_zero_reports_ignored() {
-        let (outcome, success, stdout) = run_drive_test(&[], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_drive_test(&[], Some("0"), None, None);
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -239,7 +239,7 @@ mod drive_mapping_group {
     /// Mutant: the setup grants a group that is off, so `--ignored` runs the body.
     #[skuld::test]
     fn drive_mapping_group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_drive_test(&["--ignored"], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_drive_test(&["--ignored"], Some("0"), None, None);
         assert_eq!(
             (outcome.test_count, outcome.passed, outcome.failed, outcome.ignored),
             (1, 0, 1, 0),
@@ -256,9 +256,9 @@ mod drive_mapping_group {
     /// Mutant: the fixture carries no label, so `SKULD_LABELS=drive_mapping` selects none of its tests.
     #[skuld::test]
     fn the_drive_mapping_label_selects_its_test() {
-        let (outcome, _, stdout) = run_drive_test(&[], Some("0"), Some("1"), Some("drive_mapping"));
+        let (outcome, _, stdout) = run_drive_test(&[], Some("0"), None, Some("drive_mapping"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_drive_test(&[], Some("0"), Some("1"), Some("!drive_mapping"));
+        let (outcome, _, stdout) = run_drive_test(&[], Some("0"), None, Some("!drive_mapping"));
         assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }
