@@ -268,7 +268,8 @@ fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
         .env(FIXTURE_LOAD_EXACT_PROBE_ENV, current_dir)
         .current_dir(process_cwd);
     crate::test_reexec::scrub_env(|var| _ = c.env_remove(var));
-    // skuld writes its per-test start line to fd 1 before its capture begins.
+    // The runner (libtest-mimic, under skuld) prints its test lines and summary to fd 1, and skuld
+    // its start line to fd 2.
     c.stdout(crate::stdio::Stdio::null()).expect("stdout null");
     c.stderr(crate::stdio::Stdio::null()).expect("stderr null");
     c.spawn().expect("spawn the fixture").wait().expect("wait").code()

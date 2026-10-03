@@ -518,10 +518,9 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
 /// real, process-global, un-undone `SetHandleInformation` on our own std handles, so running it
 /// before the refusal would leave a disposition-less side effect behind.
 ///
-/// The two legs differ by one bit and are one `#[skuld::test]` so their order is guaranteed; nextest
-/// runs each test in its own process and skuld's runner gives each trial its own named thread, so
-/// the thread-local seam starts clean. The positive leg
-/// is what stops the negative one passing on a seam that was never wired.
+/// The two legs differ by one bit and are one `#[skuld::test]` so their order is guaranteed; each
+/// test runs on its own thread, so the thread-local seam starts clean. The positive leg is what
+/// stops the negative one passing on a seam that was never wired.
 ///
 /// The real handle flags are deliberately NOT measured instead: the mutation is process-global
 /// and permanent, so any earlier contained spawn in this binary would already have made that

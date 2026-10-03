@@ -35,7 +35,7 @@ const REAP: u8 = b'r';
 const EXIT: u8 = b'x';
 
 fn say(line: &str) {
-    // Not `println!`: it panics on a write error, and this write must fail naming the driver.
+    // Not `println!`: it panics on a write error.
     writeln!(std::io::stdout(), "@@{line}@@").expect("write to the driver");
 }
 
@@ -124,8 +124,9 @@ enum Msg {
     Done(std::io::Result<Option<std::process::ExitStatus>>, Vec<HolderStep>),
 }
 
-/// The next line of the helper's stdout that ends in `@@<expected>@@`: skuld's own output, which
-/// the helper shares, may precede it on the same line.
+/// The next line of the helper's stdout that ends in `@@<expected>@@`: libtest-mimic's
+/// `test <name> ... ` prefix (skuld's harness), which the helper shares, may precede it on the
+/// same line.
 fn expect_line(lines: &mut impl Iterator<Item = std::io::Result<String>>, expected: &str) {
     let want = format!("@@{expected}@@");
     for line in lines {
