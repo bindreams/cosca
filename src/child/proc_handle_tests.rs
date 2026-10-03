@@ -68,8 +68,7 @@ mod own_reap {
         assert!(h.is_reaped());
     }
 
-    /// `is_reaped` is read from the state that records the reap, so it is `true` while the
-    /// `try_wait` that made the reap is still on its way out.
+    /// `is_reaped` is true once the reap is recorded, before `try_wait` returns.
     ///
     /// Mutant: `is_reaped` read from a flag stored after `try_wait` returns.
     #[test]
@@ -126,8 +125,7 @@ mod own_reap {
 
 // The reap is visible before the waiter returns =====
 
-/// `is_reaped` is read from the state that records the reap, so it is `true` while the waiter
-/// that made the reap is still on its way out of `wait`.
+/// `is_reaped` is true once the reap is recorded, before `wait` returns.
 ///
 /// Mutant: `is_reaped` read from a flag stored after `wait` returns.
 #[test]
@@ -156,8 +154,7 @@ fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
     });
 }
 
-/// `is_reaped` is read from the state that records the reap, so it is `true` while the waiter
-/// that made the reap is still on its way out of `wait_deadline`. The far deadline is only a
+/// `is_reaped` is true once the reap is recorded, before `wait_deadline` returns. The far deadline is only a
 /// failure bound; the wait ends on the child's real exit.
 ///
 /// Mutant: `is_reaped` read from a flag stored after `wait_deadline` returns.
