@@ -74,7 +74,4 @@ macro_rules! test_group {
 }
 
 test_group!(NAMESPACES => namespaces, env = "COSCA_TEST_NAMESPACES", consent = "unshares namespaces and mounts");
-
-#[cfg(test)]
-#[path = "test_groups_tests.rs"]
-mod test_groups_tests;
+test_group!(DRIVE_MAPPING => drive_mapping, env = "COSCA_TEST_DRIVE_MAPPING", consent = "maps a drive letter for the whole logon session");

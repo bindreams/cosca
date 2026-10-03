@@ -7,3 +7,7 @@ pub const REEXEC_SELFCHECK: skuld::Label;
 /// Selects the tests that unshare namespaces and mounts (the `NAMESPACES` group).
 #[skuld::label]
 pub const NAMESPACES: skuld::Label;
+
+/// Selects the test that maps a drive letter for the whole logon session.
+#[skuld::label]
+pub const DRIVE_MAPPING: skuld::Label;
