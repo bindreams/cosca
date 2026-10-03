@@ -266,6 +266,9 @@ fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_leaves_the_child
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    assert!(has_not_exited(pid.get()), "nothing may have signalled or reaped the pid");
+    assert!(
+        has_not_exited(pid.get()),
+        "nothing may have signalled or reaped the pid"
+    );
     end_unsignalled_and_reap(pid.get());
 }
