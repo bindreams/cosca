@@ -711,6 +711,46 @@ impl ProcSource {
         self.release();
     }
 
+    /// Linux teardown of a spawn whose identity check could not answer: kill the child through its
+    /// pidfd, which pins it whatever any peek said, then reap it through the same pidfd, and forget
+    /// tokio's `Child` (its drop would reap a pid that is already collected). Consumes the backend.
+    /// A refused kill is handled as in [`reap_now`](ProcSource::reap_now). **Invariant:** no `wait()`
+    /// future for this child is in flight.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn teardown_through_pidfd(mut self, pid: u32) {
+        use crate::wait::exit_only::{self, Target};
+
+        crate::bounded::assert_may_block("teardown_through_pidfd");
+        if let Err(e) = self.signal(Sig::Kill) {
+            self.forget_if_foreign();
+            self.release();
+            log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
+            debug_assert!(
+                matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+                "the teardown kill of an owned child failed: {e}"
+            );
+            return;
+        }
+        let ProcSource::Tokio { pidfd, .. } = &self else {
+            unreachable!("a freshly spawned backend is a tokio child");
+        };
+        match exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))) {
+            Ok(Ok(_reaped)) =>
+            {
+                #[cfg(test)]
+                if let exit_only::Reaped::Status(status) = _reaped {
+                    crate::child::spawn::fault::record_teardown_reap(pid, status);
+                }
+            }
+            Ok(Err(_foreign)) => log::debug!("child {pid} was reaped by someone else during its teardown"),
+            Err(e) => {
+                log::warn!("teardown of child {pid}: reaping through its pidfd failed: {e}");
+                debug_assert!(false, "waitid on a child's own pidfd failed: {e}");
+            }
+        }
+        self.forget_foreign();
+    }
+
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —
     /// the observer seam exists solely for the raw async wait path.
     #[cfg(all(test, windows))]

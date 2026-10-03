@@ -769,3 +769,16 @@ fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     let status = b.shared.wait().expect("the zombie was never consumed");
     assert!(status.success(), "{status:?}");
 }
+
+/// A verified peek (a caller that treats `Running` as "ours") cannot read an `ECHILD` pid's id: a
+/// denial is not a reap, so it is an error with the errno, where the plain peek calls it `Gone`.
+///
+/// Mutant: the verified peek maps `Held::Refused` to `Foreign(Gone)`.
+#[skuld::test]
+fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
+    let (pid, unique) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(unique));
+    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
+    let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}

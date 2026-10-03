@@ -128,8 +128,13 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
             Held::Parent(_) => Ok(Peek::Running),
             // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
             Held::Gone => Ok(peeked),
-            // A MACF denial: not ours to see.
-            Held::Refused(_) => Ok(peeked),
+            // A MACF denial: not ours to see. A caller that treats `Running` as "this is our
+            // child" cannot tell a reap from a denial, so it gets the error, with the errno.
+            Held::Refused(_) if !verified => Ok(peeked),
+            Held::Refused(errno) => Err(io::Error::new(
+                io::Error::from_raw_os_error(errno).kind(),
+                format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be reaped"),
+            )),
         },
         Peek::Foreign(Foreign::Other) => Ok(peeked),
     }

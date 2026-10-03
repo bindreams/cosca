@@ -1142,3 +1142,7 @@ pub(crate) mod fault {
         Error::Io(std::io::Error::other("forced kill failure (test seam)"))
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/identity_macos_tests.rs"]
+mod identity_macos_tests;
