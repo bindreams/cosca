@@ -1092,6 +1092,11 @@ pub(crate) fn resolve_identity(
     };
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::AfterIdentityRead, pid);
+    // MUTANT: macOS does not re-read.
+    #[cfg(target_os = "macos")]
+    if true {
+        return read;
+    }
     #[cfg(unix)]
     {
         use crate::wait::exit_only::Peek;
