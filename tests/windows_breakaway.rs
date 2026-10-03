@@ -11,15 +11,18 @@
 //! assertion deterministic whatever ambient job a CI runner holds. The helper reports its own
 //! independent reading of the job's limits, so a shape that was not built the way the test names
 //! it fails loudly instead of measuring something else.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::net::TcpListener;
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 use common::{read_report_line, report_field, testbin};
 
+#[cfg(windows)]
 /// Run the `report-breakaway` helper for one job shape and one spawn vehicle, and return its
 /// report line. The helper blocks on the report socket until this function drops it, so every
 /// field describes a live measurement.
@@ -37,10 +40,12 @@ fn breakaway_report(shape: &str, vehicle: &str) -> String {
     report
 }
 
+#[cfg(windows)]
 /// `ERROR_ACCESS_DENIED`, as the helper encodes a raw `io::Error`.
 const RAW_ACCESS_DENIED: &str = "Io-5";
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn a_permitting_job_lets_a_raw_flag_child_break_away() {
     let r = breakaway_report("permit", "raw");
     assert_eq!(report_field(&r, "limits"), "breakaway-ok", "wrong job shape: {r}");
@@ -52,9 +57,10 @@ fn a_permitting_job_lets_a_raw_flag_child_break_away() {
     );
 }
 
+#[cfg(windows)]
 /// The negative control for the row above: without the flag, the same child in the same job
 /// STAYS. Without it, `in_inner == 0` there could hold for a reason unrelated to the request.
-#[test]
+#[skuld::test]
 fn a_child_without_the_raw_flag_stays_in_the_permitting_job() {
     let r = breakaway_report("permit-no-request", "raw");
     assert_eq!(report_field(&r, "limits"), "breakaway-ok", "wrong job shape: {r}");
@@ -62,8 +68,9 @@ fn a_child_without_the_raw_flag_stays_in_the_permitting_job() {
     assert_eq!(report_field(&r, "in_any"), "1", "{r}");
 }
 
+#[cfg(windows)]
 /// The fact the typed containment error rests on.
-#[test]
+#[skuld::test]
 fn a_forbidding_job_denies_the_raw_flag() {
     let r = breakaway_report("forbid", "raw");
     assert_eq!(report_field(&r, "limits"), "none", "wrong job shape: {r}");
@@ -74,13 +81,14 @@ fn a_forbidding_job_denies_the_raw_flag() {
     );
 }
 
+#[cfg(windows)]
 /// Breakaway leaves the immediate job and climbs the parent chain until a job forbids it, so a
 /// successful breakaway under nesting can still leave the child inside an ancestor.
 ///
 /// The nesting is CONSTRUCTED, not observed, so `in_outer == 1` is deterministic — and it is the
 /// half a partial breakaway can fail. Asserting only `in_inner == 0` would pass under any
 /// breakaway at all.
-#[test]
+#[skuld::test]
 fn nested_breakaway_climbs_to_the_first_forbidding_job() {
     let r = breakaway_report("nested", "raw");
     assert_eq!(report_field(&r, "limits"), "breakaway-ok", "wrong inner job shape: {r}");
@@ -98,11 +106,12 @@ fn nested_breakaway_climbs_to_the_first_forbidding_job() {
     assert_eq!(report_field(&r, "in_any"), "1", "{r}");
 }
 
+#[cfg(windows)]
 /// A silent-breakaway job keeps new children out ON ITS OWN, without the child requesting
 /// anything. Paired with `a_child_without_the_raw_flag_stays_in_the_permitting_job`'s
 /// `in_inner == 1`, this is a discriminating measurement: the same no-request child lands inside
 /// one job and outside the other, so the difference is attributable to the limit.
-#[test]
+#[skuld::test]
 fn a_child_without_the_raw_flag_already_leaves_a_silent_breakaway_job() {
     let r = breakaway_report("silent-no-request", "raw");
     assert_eq!(
@@ -114,6 +123,7 @@ fn a_child_without_the_raw_flag_already_leaves_a_silent_breakaway_job() {
     assert_eq!(report_field(&r, "in_inner"), "0", "{r}");
 }
 
+#[cfg(windows)]
 /// Whether a silent-breakaway job also refuses the explicit FLAG is undocumented, and the spawn
 /// outcome is the only thing this shape can measure about the request: `in_inner == 0` holds here
 /// with or without the flag (the control above measures exactly that), so asserting it would be a
@@ -123,7 +133,7 @@ fn a_child_without_the_raw_flag_already_leaves_a_silent_breakaway_job() {
 /// arm for `SilentBreakaway` — it keeps the raw error, because no breakaway request can reach the
 /// classifier from such a job at all. The verdict exists solely to stop a silent-breakaway job
 /// being misread as one that forbids breakaway, whose message would be wrong about the world.
-#[test]
+#[skuld::test]
 fn a_silent_breakaway_job_accepts_the_raw_flag() {
     let r = breakaway_report("silent", "raw");
     assert_eq!(
@@ -147,7 +157,8 @@ fn a_silent_breakaway_job_accepts_the_raw_flag() {
 // for these exact two builder shapes; the `control-block` child reports no backend evidence of
 // its own, so no assertion here restates the routing rule.
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn cosca_breaks_a_child_away_via_the_std_backend() {
     let r = breakaway_report("permit", "argv");
     assert_eq!(report_field(&r, "limits"), "breakaway-ok", "wrong job shape: {r}");
@@ -155,7 +166,8 @@ fn cosca_breaks_a_child_away_via_the_std_backend() {
     assert_eq!(report_field(&r, "in_inner"), "0", "{r}");
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn cosca_breaks_a_child_away_via_the_raw_backend() {
     let r = breakaway_report("permit", "exec");
     assert_eq!(report_field(&r, "limits"), "breakaway-ok", "wrong job shape: {r}");
@@ -163,18 +175,29 @@ fn cosca_breaks_a_child_away_via_the_raw_backend() {
     assert_eq!(report_field(&r, "in_inner"), "0", "{r}");
 }
 
+#[cfg(windows)]
 /// The raw vehicle gets `Io-5` for this shape (`a_forbidding_job_denies_the_raw_flag`); cosca
 /// turns the same refusal into a typed error naming the job's limit and the remedy.
-#[test]
+#[skuld::test]
 fn a_forbidding_job_yields_a_typed_containment_error_via_the_std_backend() {
     let r = breakaway_report("forbid", "argv");
     assert_eq!(report_field(&r, "limits"), "none", "wrong job shape: {r}");
     assert_eq!(report_field(&r, "spawn"), "Containment", "{r}");
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn a_forbidding_job_yields_a_typed_containment_error_via_the_raw_backend() {
     let r = breakaway_report("forbid", "exec");
     assert_eq!(report_field(&r, "limits"), "none", "wrong job shape: {r}");
     assert_eq!(report_field(&r, "spawn"), "Containment", "{r}");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

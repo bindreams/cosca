@@ -2,14 +2,17 @@
 //! `pidfd_open` refuses such a tid (EINVAL < 6.16, ENOENT >= 6.16); see `open_verified`. A live
 //! one is `NotThreadGroupLeader`; an exited-but-unreaped (ptraced) one is exited. The
 //! reaped-leader sibling is in `src/wait/linux_tests.rs`.
-#![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
 use std::io::{BufRead, Write};
 
+#[cfg(target_os = "linux")]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(target_os = "linux")]
 use common::testbin;
 
+#[cfg(target_os = "linux")]
 /// Spawn the testbin `mode`, returning the child, its stdin writer, and the listener its control
 /// connection arrives on.
 fn spawn_tid_reporter(mode: &str) -> (cosca::Child, std::io::PipeWriter, std::net::TcpListener) {
@@ -26,6 +29,7 @@ fn spawn_tid_reporter(mode: &str) -> (cosca::Child, std::io::PipeWriter, std::ne
     (child, writer, listener)
 }
 
+#[cfg(target_os = "linux")]
 fn accept_reader(
     listener: &std::net::TcpListener,
     child: &mut cosca::Child,
@@ -33,15 +37,17 @@ fn accept_reader(
     std::io::BufReader::new(common::accept_or_die(listener, child))
 }
 
+#[cfg(target_os = "linux")]
 fn read_tid(reader: &mut std::io::BufReader<std::net::TcpStream>) -> u32 {
     let mut line = String::new();
     reader.read_line(&mut line).expect("read the reported tid");
     line.trim().parse().expect("the reported tid is a plain decimal number")
 }
 
+#[cfg(target_os = "linux")]
 /// A live non-leader tid is `NotThreadGroupLeader`, on every kernel, with the pid and the
 /// `pidfd_open` errno as data.
-#[test]
+#[skuld::test]
 fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
     let (mut child, writer, listener) = spawn_tid_reporter("report-tid-block-stdin");
     let mut reader = accept_reader(&listener, &mut child);
@@ -75,10 +81,11 @@ fn block_until_exit_on_a_live_non_leader_tid_is_an_error() {
     );
 }
 
+#[cfg(target_os = "linux")]
 /// A ptraced non-leader thread that has exited stays a zombie, attached to its pid, until its
 /// tracer waits for it: `pidfd_open` refuses it like a live one, `/proc` still lists it, but it is
 /// exited. Waiting on it must report exited.
-#[test]
+#[skuld::test]
 fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
     let (mut child, writer, listener) = spawn_tid_reporter("traced-worker");
     let leader = child.id().pid() as libc::pid_t;
@@ -162,6 +169,7 @@ fn block_until_exit_on_a_ptraced_zombie_thread_reports_exited() {
     assert!(status.success(), "the child must exit 0 on stdin EOF, got {status:?}");
 }
 
+#[cfg(target_os = "linux")]
 /// The tracer's side of the ptrace test. If the test panics, kills the traced child and reaps its
 /// worker thread: a thread group's leader cannot finish exiting while a traced thread is an
 /// unreaped zombie, so without this a failed assertion would hang the child's own reap.
@@ -171,6 +179,7 @@ struct Tracer {
     writer: Option<std::io::PipeWriter>,
 }
 
+#[cfg(target_os = "linux")]
 impl Tracer {
     fn writer(&mut self) -> &mut std::io::PipeWriter {
         self.writer
@@ -179,6 +188,7 @@ impl Tracer {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Tracer {
     fn drop(&mut self) {
         if !std::thread::panicking() {
@@ -193,6 +203,7 @@ impl Drop for Tracer {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Block until `pid` (a tracee of this thread) reports a stop; returns the raw wait status.
 fn wait_stop(pid: libc::pid_t) -> i32 {
     let mut status = 0;
@@ -211,6 +222,7 @@ fn wait_stop(pid: libc::pid_t) -> i32 {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn resume(pid: libc::pid_t) {
     // SAFETY: PTRACE_CONT on a stopped tracee of this thread, delivering no signal. `ptrace` is
     // variadic and the kernel reads `addr`/`data` at full width, so pass pointer-width values.
@@ -225,8 +237,9 @@ fn resume(pid: libc::pid_t) {
     assert_eq!(rc, 0, "PTRACE_CONT({pid}): {}", std::io::Error::last_os_error());
 }
 
+#[cfg(target_os = "linux")]
 /// A tid reporter that dies before connecting fails the helper naming the death, not hangs it.
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_connecting() {
     let (mut child, _writer, listener) = spawn_tid_reporter("--not-a-real-mode");
     let pid = child.id().pid();
@@ -236,4 +249,13 @@ fn death_watch_accept_or_die_reader_panics_when_the_tid_reporter_dies_before_con
         message.contains(&format!("the control target (pid {pid}) died before it connected")),
         "got: {message:?}"
     );
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

@@ -9,22 +9,29 @@
 //! members here run the testbin's `control-echo-pid` round-trip (via `spawn-grandchild-echo`),
 //! mirroring `tests/macos_fdmarker.rs`'s `Member` (alive = a real write/read round trip; dead =
 //! EOF/reset on a socket the test itself still holds).
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use std::os::windows::io::{BorrowedHandle, RawHandle};
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 use windows::core::PWSTR;
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows::Win32::System::Threading::{
     CreateProcessW, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
 
+#[cfg(windows)]
 /// One tree member's control channel: its pid, the socket that proves it alive or dead, and
 /// an owned handle opened while it was provably alive.
 ///
@@ -41,6 +48,7 @@ struct Member {
     process: HANDLE,
 }
 
+#[cfg(windows)]
 impl Drop for Member {
     fn drop(&mut self) {
         // SAFETY: `process` is this struct's own handle, opened once and closed only here.
@@ -51,6 +59,7 @@ impl Drop for Member {
     }
 }
 
+#[cfg(windows)]
 impl Member {
     /// Alive, proven positively: a byte in, the same byte back. A dead member EOFs instead.
     fn assert_alive(&mut self, who: &str) {
@@ -83,6 +92,7 @@ impl Member {
     }
 }
 
+#[cfg(windows)]
 /// A process created `CREATE_SUSPENDED` via a raw `CreateProcessW` call — never through
 /// `cosca::Command` — so the test genuinely exercises the caller sequence `cosca::Job`'s docs
 /// describe: create suspended, assign, only then resume.
@@ -92,6 +102,7 @@ struct Suspended {
     pid: u32,
 }
 
+#[cfg(windows)]
 impl Suspended {
     /// Spawn `exe` with `args` (argv[1..]), suspended. The command line is built with
     /// `cosca::quote::windows::join_wide` rather than hand-rolled quoting.
@@ -164,6 +175,7 @@ impl Suspended {
     }
 }
 
+#[cfg(windows)]
 impl common::Target for Suspended {
     fn pid(&self) -> u32 {
         self.pid
@@ -175,6 +187,7 @@ impl common::Target for Suspended {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Suspended {
     fn drop(&mut self) {
         // Best-effort cleanup: whether the tree is contained, disarmed, or already dead by the
@@ -189,6 +202,7 @@ impl Drop for Suspended {
     }
 }
 
+#[cfg(windows)]
 /// Spawn the testbin's `spawn-grandchild-echo` tree, contained: create the root suspended,
 /// assign it to a fresh `cosca::Job`, resume it, then demux both members' `<tag><pid>\n`
 /// handshakes by tag. The grandchild is spawned by the ROOT after resume — proving the job
@@ -250,10 +264,11 @@ fn spawn_contained_tree() -> (Suspended, cosca::Job, Member, Member) {
     )
 }
 
+#[cfg(windows)]
 /// The contract this whole primitive exists for: a caller that spawns its own process
 /// (suspend/assign/resume, never `cosca::Command`) still gets the full kernel guarantee —
 /// `kill_tree()` reaps every descendant, including one the root spawned after being resumed.
-#[test]
+#[skuld::test]
 fn kill_tree_reaps_every_descendant() {
     let (_root, job, mut root_member, mut grand_member) = spawn_contained_tree();
     root_member.assert_alive("the root, before teardown");
@@ -265,10 +280,11 @@ fn kill_tree_reaps_every_descendant() {
     grand_member.assert_dead("the grandchild, after kill_tree");
 }
 
+#[cfg(windows)]
 /// The other half of the contract: `disarm()` is "session ended normally, leave background
 /// processes alone" — dropping (or having already dropped) the `Job` afterward must not kill
 /// anything, for the whole tree, not just the root.
-#[test]
+#[skuld::test]
 fn disarm_leaves_every_descendant_running() {
     let (root, job, mut root_member, mut grand_member) = spawn_contained_tree();
     root_member.assert_alive("the root, before disarm");
@@ -288,13 +304,14 @@ fn disarm_leaves_every_descendant_running() {
     drop(root);
 }
 
+#[cfg(windows)]
 /// Dropping a live `Job` reaps the tree, exactly as `kill_tree` does.
 ///
 /// This is the path a caller reaches by doing nothing, and it is the one the `#[must_use]` on
 /// `assign` warns about — so it needs coverage of its own rather than being inferred from
 /// `kill_tree`'s. The distinction matters: `kill_tree` terminates explicitly, whereas this
 /// relies on `KILL_ON_JOB_CLOSE` firing when the last handle closes.
-#[test]
+#[skuld::test]
 fn dropping_a_live_job_reaps_every_descendant() {
     let (root, job, mut root_member, mut grand_member) = spawn_contained_tree();
     root_member.assert_alive("the root, before drop");
@@ -307,10 +324,11 @@ fn dropping_a_live_job_reaps_every_descendant() {
     drop(root);
 }
 
+#[cfg(windows)]
 /// The block keeps names Windows keeps apart (`straße`/`STRASSE`, two different malformed names)
 /// and merges names differing only in case, the later spelling winning. Its entries come out in
 /// ascending ordinal-ignore-case order, as `CreateProcessW` requires.
-#[test]
+#[skuld::test]
 fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -365,8 +383,18 @@ fn env_block_keys_names_by_ordinal_per_unit_case_folding() {
     }
 }
 
+#[cfg(windows)]
 /// An empty environment is still a valid block: two NULs, the first ending the absent first entry.
-#[test]
+#[skuld::test]
 fn env_block_of_nothing_is_a_double_nul() {
     assert_eq!(common::windows_env::env_block([]), [0, 0]);
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

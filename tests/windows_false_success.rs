@@ -15,20 +15,27 @@
 //! persistent dead entry in the caller's console process list. CI runners get a fresh console per
 //! job; locally, run this suite from a fresh terminal. No test here asserts the absence of a pid
 //! it did not just spawn.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::io::{Read, Write};
+#[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use cosca::identity::Liveness;
+#[cfg(windows)]
 use cosca::{ContainMode, Containment, GracefulMechanism};
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 use common::testbin;
 
+#[cfg(windows)]
 /// Spawn a testbin control child with arbitrary builder configuration, and read its 1-byte tag
 /// BEFORE returning — the real edge proving the child is running and has completed console
 /// registration.
@@ -56,6 +63,7 @@ fn spawn_configured(mode: &str, configure: impl Fn(&mut cosca::Command)) -> (cos
     (child, sock)
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
 async fn spawn_configured_async(
     mode: &str,
@@ -76,12 +84,13 @@ async fn spawn_configured_async(
     (child, sock)
 }
 
+#[cfg(windows)]
 /// THE CONTROL. A contained root with no flag methods really receives the break: its own console
 /// ctrl handler writes `B` back over its socket, which is the only positive evidence of delivery
 /// — the Win32 return value is evidence in neither direction.
 ///
 /// Without this leg the three below pass against any build that never signals anything.
-#[test]
+#[skuld::test]
 fn a_plain_contained_root_really_receives_the_break() {
     let (child, mut sock) = spawn_configured("control-block-ack-break", |c| {
         c.contain();
@@ -99,12 +108,14 @@ fn a_plain_contained_root_really_receives_the_break() {
     child.wait().expect("reap");
 }
 
+#[cfg(windows)]
 /// A delivered `CTRL_BREAK` ends a handler-less child with `STATUS_CONTROL_C_EXIT`. Measured on
 /// Windows 11 26100, 20 consecutive runs each way: a plain contained child exits with this, and a
 /// suppressed or detached one exits `0` because nothing reached it and it was released by the
 /// test's own byte.
 const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
 
+#[cfg(windows)]
 /// The shared body of the three false-success legs: a contained root whose creation flags put it
 /// in a console of its own.
 ///
@@ -159,24 +170,27 @@ fn assert_false_success(expected_containment: Containment, configure: impl Fn(&m
     drop(sock);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn a_no_window_contained_root_gets_a_false_success() {
     assert_false_success(Containment::JobObject, |c| {
         c.contain().no_window();
     });
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn a_detached_contained_root_gets_a_false_success() {
     assert_false_success(Containment::JobObject, |c| {
         c.contain().detached();
     });
 }
 
+#[cfg(windows)]
 /// A distinct route into the same call site: on Windows `Attached::TreeWalk` reaches
 /// `containment::windows::terminate` through `treewalk::terminate`, so a change made in one arm
 /// only would miss it.
-#[test]
+#[skuld::test]
 fn a_treewalk_contained_root_gets_a_false_success_too() {
     assert_false_success(Containment::TreeWalk, |c| {
         c.contain_with(ContainMode::TreeWalk).no_window();
@@ -185,8 +199,9 @@ fn a_treewalk_contained_root_gets_a_false_success_too() {
 
 // ===== async mirrors: parity is not compiler-enforced =====
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_plain_contained_root_really_receives_the_break() {
     let (mut child, mut sock) = spawn_configured_async("control-block-ack-break", |c| {
         c.contain();
@@ -205,6 +220,7 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
     child.wait().await.expect("reap");
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
 async fn assert_false_success_async(expected_containment: Containment, configure: impl Fn(&mut cosca::tokio::Command)) {
     let (mut child, mut sock) = spawn_configured_async("control-block", &configure).await;
@@ -234,8 +250,9 @@ async fn assert_false_success_async(expected_containment: Containment, configure
     drop(sock);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_no_window_contained_root_gets_a_false_success() {
     assert_false_success_async(Containment::JobObject, |c| {
         c.contain().no_window();
@@ -243,8 +260,9 @@ async fn an_async_no_window_contained_root_gets_a_false_success() {
     .await;
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_detached_contained_root_gets_a_false_success() {
     assert_false_success_async(Containment::JobObject, |c| {
         c.contain().detached();
@@ -252,11 +270,21 @@ async fn an_async_detached_contained_root_gets_a_false_success() {
     .await;
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
     assert_false_success_async(Containment::TreeWalk, |c| {
         c.contain_with(ContainMode::TreeWalk).no_window();
     })
     .await;
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

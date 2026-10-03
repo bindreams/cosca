@@ -39,19 +39,24 @@
 
 // The whole file is Linux-only in purpose (see the module docs above) — gated here, once, rather
 // than on every item, so the file compiles to nothing (no unused-code warnings) elsewhere.
-#![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Read};
+#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 
+#[cfg(target_os = "linux")]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(target_os = "linux")]
 use common::setuid;
 
+#[cfg(target_os = "linux")]
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
 }
 
+#[cfg(target_os = "linux")]
 /// `kill(pid, 0)` performs only the existence/permission check, sending nothing. `Ok(())` means
 /// the pid is live and this caller may signal it. `EPERM` ALSO means alive — this is the exact
 /// property under test: an unprivileged caller probing a genuinely-root-owned process gets
@@ -68,15 +73,19 @@ fn probe_kill0(pid: u32) -> Result<(), Option<i32>> {
     Err(std::io::Error::last_os_error().raw_os_error())
 }
 
+#[cfg(target_os = "linux")]
 /// The uid this test re-executes itself as when started as root: `nobody`.
 const UNPRIVILEGED: u32 = 65534;
 
+#[cfg(target_os = "linux")]
 /// Set by the parent to its own pid; the re-executed child accepts it only if it equals its
 /// parent's pid (see [`rerun_role`]). The child then prints [`RERAN`] because libtest exits 0 when
 /// the filter matches no test.
 const RERUN_ENV: &str = "COSCA_TEST_SETUID_RERUN";
+#[cfg(target_os = "linux")]
 const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
 
+#[cfg(target_os = "linux")]
 /// The libtest `--exact` name of `$name`; a rename that misses this call site fails to compile
 /// instead of matching zero tests.
 macro_rules! test_path {
@@ -86,6 +95,7 @@ macro_rules! test_path {
     }};
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
 enum Role {
     /// Started by a user or harness: no marker.
@@ -94,6 +104,7 @@ enum Role {
     Rerun,
 }
 
+#[cfg(target_os = "linux")]
 /// Classifies this process from the inherited [`RERUN_ENV`] value and its parent's pid. A value
 /// that is not the parent's pid was inherited from something else (a shell export, an outer
 /// harness) and is an error, never proof that this is the re-run.
@@ -107,6 +118,7 @@ fn rerun_role(inherited: Option<&str>, parent_pid: u32) -> Result<Role, String> 
     }
 }
 
+#[cfg(target_os = "linux")]
 fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
     use std::os::unix::process::CommandExt as _;
 
@@ -124,6 +136,7 @@ fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
     cmd
 }
 
+#[cfg(target_os = "linux")]
 /// The child inherits `COSCA_TEST_SETUID_HELPER`, so the helper (mode `u+s`, readable and
 /// executable by anyone) and this binary must be reachable by [`UNPRIVILEGED`]; if not, the
 /// child's failure says so.
@@ -140,22 +153,26 @@ fn rerun_unprivileged() {
     );
 }
 
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn rerun_role_without_the_variable_is_fresh() {
     assert_eq!(rerun_role(None, 42), Ok(Role::Fresh));
 }
 
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn rerun_role_accepts_the_parents_pid() {
     assert_eq!(rerun_role(Some("42"), 42), Ok(Role::Rerun));
 }
 
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn rerun_role_rejects_an_inherited_value_naming_the_variable() {
     let err = rerun_role(Some("1"), 42).unwrap_err();
     assert!(err.contains(RERUN_ENV) && err.contains("inherited"), "{err}");
 }
 
+#[cfg(target_os = "linux")]
 /// One accepted control connection, classified by its first line:
 /// - `"R"` — the ordinary group leader, ready and blocked.
 /// - `"P <pid>"` — the setuid-root helper, ready (fully real-uid-0) and blocked, reporting its
@@ -168,6 +185,7 @@ enum Handshake {
     Privileged { pid: u32, sock: BufReader<TcpStream> },
 }
 
+#[cfg(target_os = "linux")]
 /// Reads the one handshake line a control member writes before it blocks. Split out of
 /// `classify` below so it can run INSIDE `accept_tree`'s `on_accept` — before the socket
 /// becomes a death-watch for a later accept, its handshake line must already be drained (see
@@ -179,6 +197,7 @@ fn read_handshake_line(stream: &mut TcpStream) -> String {
     line.trim_end_matches('\n').to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn classify(line: &str, stream: TcpStream) -> Handshake {
     if let Some(reason) = line.strip_prefix("F ") {
         panic!(
@@ -200,13 +219,14 @@ fn classify(line: &str, stream: TcpStream) -> Handshake {
     panic!("unexpected control handshake line: {line:?}");
 }
 
+#[cfg(target_os = "linux")]
 /// The one test that proves issue #61's fix actually works end to end, through the REAL public
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
 ///
 /// Gated by `COSCA_TEST_SETUID` (see the module docs' "Gating" section). Started as root it only
 /// takes the gate, then re-executes itself as an unprivileged user, whose run takes the helper.
-#[test]
+#[skuld::test]
 fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     if setuid::setuid_gate(|k| std::env::var(k).ok()) == setuid::Gate::Disabled {
         return;
@@ -345,4 +365,13 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     // exits on its own — the only way this test can end it, since it is genuinely unkillable by
     // this process. Its new parent (reparented off the killed root) reaps it in due course.
     drop(priv_sock);
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

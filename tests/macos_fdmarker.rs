@@ -1,24 +1,30 @@
 //! macOS inherited-fd marker containment, end to end. Death is proven by control-socket EOF
 //! and life by a control-socket round trip — never by sleeping or polling.
-#![cfg(target_os = "macos")]
 
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "macos")]
 use std::net::{TcpListener, TcpStream};
 
+#[cfg(target_os = "macos")]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(target_os = "macos")]
 use common::testbin;
 
+#[cfg(target_os = "macos")]
 /// `Holder.clexec` is `pub(crate)`, unreachable from this crate; the ONLY observable production
 /// effect of `holders()`'s CLOEXEC AND-fold is this warning, so that is what this test asserts on.
 const WOULD_LOSE_MARKER_LOG_NEEDLE: &str = "will lose the marker at its next";
 
+#[cfg(target_os = "macos")]
 /// One tree member's control channel: its pid, and the socket that proves it alive or dead.
 struct Member {
     pid: u32,
     sock: TcpStream,
 }
 
+#[cfg(target_os = "macos")]
 impl Member {
     /// Alive, proven positively: a byte in, the same byte back. A dead member EOFs instead.
     fn assert_alive(&mut self, who: &str) {
@@ -60,6 +66,7 @@ impl Member {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Spawn the orphan-escapee tree contained. Returns the root child plus the root's and the
 /// orphaned grandchild's members, demuxed by tag. Each member publishes `<tag><pid>\n`.
 fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member) {
@@ -102,6 +109,7 @@ fn spawn_orphan_tree(mode: cosca::ContainMode) -> (cosca::Child, Member, Member)
     (child, root.expect("root tag"), grand.expect("grandchild tag"))
 }
 
+#[cfg(target_os = "macos")]
 /// The orphan is provably outside both legacy channels: launchd is its parent, so the ppid
 /// walk cannot reach it, and its pgid differs from the root's, so `killpg` misses it.
 fn assert_escaped(root_pid: u32, grand_pid: u32) {
@@ -123,6 +131,7 @@ fn assert_escaped(root_pid: u32, grand_pid: u32) {
     );
 }
 
+#[cfg(target_os = "macos")]
 /// Cleanup that is never an assertion: SIGKILL anything the test deliberately left running.
 fn reap(pids: &[u32]) {
     for pid in pids {
@@ -130,7 +139,8 @@ fn reap(pids: &[u32]) {
     }
 }
 
-#[test]
+#[cfg(target_os = "macos")]
+#[skuld::test]
 fn a_contained_macos_root_reports_the_fd_marker_mechanism() {
     let (child, _root, _grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     assert_eq!(
@@ -141,10 +151,11 @@ fn a_contained_macos_root_reports_the_fd_marker_mechanism() {
     child.kill_tree().expect("kill_tree");
 }
 
+#[cfg(target_os = "macos")]
 /// `killpg` misses the orphan (different pgid) and the ppid walk misses it (ppid 1). The
 /// marker sweep finds it, and `kill_tree` kills it — proven by EOF on the grandchild's
 /// socket, which the test holds open across the teardown.
-#[test]
+#[skuld::test]
 fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     assert_escaped(child.id().pid(), grand.pid);
@@ -152,7 +163,8 @@ fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan() {
     grand.assert_dead("the reparented setsid orphan");
 }
 
-#[test]
+#[cfg(target_os = "macos")]
+#[skuld::test]
 fn terminate_tree_reaches_the_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     assert_escaped(child.id().pid(), grand.pid);
@@ -161,9 +173,10 @@ fn terminate_tree_reaches_the_reparented_orphan() {
     child.kill_tree().expect("kill_tree cleanup");
 }
 
+#[cfg(target_os = "macos")]
 /// `ContainMode::TreeWalk` creates no process group, so the marker is the ONLY channel that
 /// can reach this orphan. Without the marker this test fails outright.
-#[test]
+#[skuld::test]
 fn treewalk_mode_reaches_the_orphan_through_the_marker_alone() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::TreeWalk);
     assert_escaped(child.id().pid(), grand.pid);
@@ -171,8 +184,9 @@ fn treewalk_mode_reaches_the_orphan_through_the_marker_alone() {
     grand.assert_dead("the orphan, with no process-group channel available");
 }
 
+#[cfg(target_os = "macos")]
 /// `detach()` drops the marker's read end; that must kill nothing.
-#[test]
+#[skuld::test]
 fn detach_leaves_a_marked_tree_running() {
     let (child, mut root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     let (root_pid, grand_pid) = (root.pid, grand.pid);
@@ -182,8 +196,9 @@ fn detach_leaves_a_marked_tree_running() {
     reap(&[root_pid, grand_pid]);
 }
 
+#[cfg(target_os = "macos")]
 /// Dropping a contained `Child` sweeps the tree, orphan included.
-#[test]
+#[skuld::test]
 fn dropping_a_marked_child_kills_the_reparented_orphan() {
     let (child, _root, mut grand) = spawn_orphan_tree(cosca::ContainMode::Strongest);
     assert_escaped(child.id().pid(), grand.pid);
@@ -191,6 +206,7 @@ fn dropping_a_marked_child_kills_the_reparented_orphan() {
     grand.assert_dead("the reparented orphan, on Child::drop");
 }
 
+#[cfg(target_os = "macos")]
 /// The async spawn path (`src/tokio/spawn.rs`) is a hand-maintained mirror of the sync path's
 /// Task 5 marker restructuring (widen `spawn_lock` around `prepare()..drop(tcmd)`) — every
 /// OTHER test in this file spawns exclusively through `cosca::Command`, so nothing else would
@@ -238,8 +254,9 @@ async fn spawn_orphan_tree_async(mode: cosca::ContainMode) -> (cosca::tokio::Chi
     (child, root.expect("root tag"), grand.expect("grandchild tag"))
 }
 
+#[cfg(target_os = "macos")]
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_spawn() {
     let (mut child, _root, mut grand) = spawn_orphan_tree_async(cosca::ContainMode::Strongest).await;
     assert_escaped(child.id().pid(), grand.pid);
@@ -247,6 +264,7 @@ async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_sp
     grand.assert_dead("the reparented setsid orphan (tokio spawn path)");
 }
 
+#[cfg(target_os = "macos")]
 /// Proves the marker survives a REAL `cosca::Command::fd()` mapping through the ACTUAL
 /// production wiring (`child_ends.keys()` in `src/child/spawn.rs`, feeding `prepare`'s
 /// `reserved` argument) — not `super::install()` called directly with a hand-typed reserved
@@ -267,7 +285,7 @@ async fn kill_tree_reaches_a_setsid_double_forked_reparented_orphan_via_tokio_sp
 /// collection silently dropped an entry and the marker landed on it, the child's descriptor at
 /// that number would be the caller's `Stdio::null()`, not the marker, and the orphan — whose
 /// only channel under `ContainMode::TreeWalk` is the marker — would survive `kill_tree()`.
-#[test]
+#[skuld::test]
 fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
@@ -316,6 +334,7 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
     grand.assert_dead("the orphan, reachable only via a marker that must have survived a real, wide caller fd mapping");
 }
 
+#[cfg(target_os = "macos")]
 /// `holders()` reports a holder as CLOEXEC only when EVERY matching descriptor is (#59): a
 /// regression to first-fd-wins would misreport a holder that also keeps a non-CLOEXEC copy. The
 /// testbin dups a second, CLOEXEC copy of its inherited marker fd, which the correct AND-fold
@@ -326,7 +345,7 @@ fn kill_tree_reaches_the_orphan_through_a_real_wide_fd_mapping() {
 /// process state. An earlier version had the testbin scan its own open fds for "the one nobody
 /// else explains"; that passed locally but was flaky on a GitHub-hosted macOS runner, which
 /// hands the process extra inherited descriptors the scan could not tell apart from the marker.
-#[test]
+#[skuld::test]
 fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
     common::install_log_capture();
     let mark = common::log_mark();
@@ -355,4 +374,13 @@ fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
         "a holder that still keeps a non-CLOEXEC copy of the marker must not be reported as \
          about to lose it — the AND-fold must have regressed to first-fd-wins"
     );
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }
