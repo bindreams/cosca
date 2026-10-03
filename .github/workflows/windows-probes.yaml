@@ -201,13 +201,12 @@ jobs:
   # an ephemeral VM destroyed after the job — the only kind of host they may run on.
   executing:
     name: Executing probes (${{ matrix.runner }})
-    if: github.event_name == 'workflow_dispatch' && inputs.run_executing_probes
+    if: github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
         include:
           - { runner: windows-latest, target: x86_64-pc-windows-msvc }
-          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:

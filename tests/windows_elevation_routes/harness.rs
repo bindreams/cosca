@@ -775,7 +775,6 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE, ancestor_co
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
             ("COSCA_PROBE_CHILD", "1".into()),
-            skuld_db_dir(dir.path()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {

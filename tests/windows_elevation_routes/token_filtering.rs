@@ -416,7 +416,6 @@ fn unelevated_caller_view() {
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", child_report.display().to_string()),
             ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
-            skuld_db_dir(dir.path()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
