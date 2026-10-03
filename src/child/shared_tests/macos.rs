@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, Blocker};
 use crate::child::shared::SharedChild;
 use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
+use crate::test_groups::{setuid, Group};
 use crate::wait::backend::test_hooks::{self, ForcedOnce};
 use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap, HolderStep};
 use crate::wait::exit_only::{self, Foreign, Peek, Target};
@@ -625,9 +626,9 @@ fn a_reap_that_finds_no_exit_record_after_reapable_waits_again() {
 // A child whose identity a same-user read refuses (the `setuid` group) =====
 
 /// A setuid-root `setuid-stdin-block root` child that has become root, with its stdin.
-fn spawn_root_child() -> Option<(std::process::Child, std::process::ChildStdin)> {
+fn spawn_root_child() -> (std::process::Child, std::process::ChildStdin) {
     use std::io::Read as _;
-    let helper = crate::test_privilege::setuid::setuid_helper()?;
+    let helper = crate::test_privilege::setuid::setuid_helper();
     let mut cmd = std::process::Command::new(helper);
     cmd.args(["setuid-stdin-block", "root"])
         .stdin(std::process::Stdio::piped())
@@ -643,7 +644,7 @@ fn spawn_root_child() -> Option<(std::process::Child, std::process::ChildStdin)>
         .read_exact(&mut ready)
         .expect("the helper reports ready");
     assert_eq!(ready, *b"+");
-    Some((child, stdin))
+    (child, stdin)
 }
 
 /// `kill` of a child this caller may not signal reads its identity all the same, and surfaces the
@@ -651,10 +652,8 @@ fn spawn_root_child() -> Option<(std::process::Child, std::process::ChildStdin)>
 ///
 /// Mutant: the identity read through the same-user `PROC_PIDTBSDINFO`: `ErrorKind::Other`.
 #[skuld::test]
-fn setuid_kill_of_a_root_child_is_permission_denied() {
-    let Some((child, stdin)) = spawn_root_child() else {
-        return;
-    };
+fn setuid_kill_of_a_root_child_is_permission_denied(#[fixture(setuid)] _group: &Group) {
+    let (child, stdin) = spawn_root_child();
     let id = super::fixtures::identity_of(&child);
     let shared = SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     assert!(
@@ -674,10 +673,8 @@ fn setuid_kill_of_a_root_child_is_permission_denied() {
 ///
 /// Mutant: as above.
 #[skuld::test]
-fn setuid_child_kill_is_permission_denied() {
-    let Some(helper) = crate::test_privilege::setuid::setuid_helper() else {
-        return;
-    };
+fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
+    let helper = crate::test_privilege::setuid::setuid_helper();
     let mut cmd = crate::Command::new();
     // `args` is the whole argv, program name included.
     cmd.executable(&helper)

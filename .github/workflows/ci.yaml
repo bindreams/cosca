@@ -539,8 +539,8 @@ jobs:
       # truly unsignalable by this job's ordinary unprivileged user, giving a REAL mixed process
       # group. Only preparing the helper copy needs root; the tests run as the normal runner user,
       # no sudo. The lane check fails the lane unless the helper really reaches uid 0 and may
-      # create a user namespace. The group is the tests named `setuid_*` and the
-      # `group_teardown_setuid` binary (see principle 10).
+      # create a user namespace. The group is selected by its label (`SKULD_LABELS=setuid`), in the
+      # two binaries that carry it (see principle 10).
       - name: Set up setuid-root helper (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -561,7 +561,7 @@ jobs:
 
       - name: Build setuid tests (Linux)
         if: matrix.os == 'linux'
-        run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci -E 'test(/setuid_/) | binary(group_teardown_setuid)'
+        run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci -E 'binary(cosca) | binary(group_teardown_setuid)'
 
       - name: Run setuid tests (Linux)
         if: matrix.os == 'linux'
@@ -570,7 +570,8 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --features tokio --target ${{ matrix.target }} -E 'test(/setuid_/) | binary(group_teardown_setuid)'
+          SKULD_LABELS: setuid
+        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
 
       # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
@@ -596,10 +597,11 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
+          SKULD_LABELS: setuid_root
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
           exec python3 .github/scripts/run-nextest.py setuid-root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
-            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" -E "binary(group_teardown_setuid) & test(=kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running)"
+            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "binary(group_teardown_setuid)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
 
@@ -787,14 +789,15 @@ jobs:
         run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
 
       - name: Build setuid tests (macOS)
-        run: cargo nextest run --locked --no-run --features tokio --profile ci -E 'test(/setuid_/)'
+        run: cargo nextest run --locked --no-run --features tokio --profile ci -E 'binary(cosca)'
 
       - name: Run setuid tests (macOS)
         timeout-minutes: 8
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
-        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --features tokio -E 'test(/setuid_/)'
+          SKULD_LABELS: setuid
+        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio -E 'binary(cosca)'
 
       - name: Archive the privilege tests
         timeout-minutes: 10

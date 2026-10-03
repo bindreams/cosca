@@ -1,8 +1,12 @@
 //! Tests of the testbin's `setuid-stdin-block` protocol, run against the setuid helper.
 
 use super::setuid::setuid_helper;
+use crate::test_groups::{setuid, Group};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+
+// Selection only.
+skuld::default_labels!(crate::test_harness::SETUID);
 
 struct Helper {
     child: Child,
@@ -72,8 +76,8 @@ mod linux {
     }
 
     #[skuld::test]
-    fn setuid_testbin_modes_reach_their_triples() {
-        let Some(helper) = setuid_helper() else { return };
+    fn setuid_testbin_modes_reach_their_triples(#[fixture(setuid)] _group: &Group) {
+        let helper = setuid_helper();
         let c = caller();
         for (mode, want) in [
             ("root", (0, 0, 0)),
@@ -91,8 +95,8 @@ mod linux {
     /// From every mode the caller's and root's uid are still among the current ids, so `d` then
     /// `r` succeed and are acknowledged only once the kernel shows the new triple.
     #[skuld::test]
-    fn setuid_testbin_credential_commands_ack_after_their_syscall_in_every_mode() {
-        let Some(helper) = setuid_helper() else { return };
+    fn setuid_testbin_credential_commands_ack_after_their_syscall_in_every_mode(#[fixture(setuid)] _group: &Group) {
+        let helper = setuid_helper();
         let c = caller();
         for mode in ["root", "permitted", "euid-only", "suid-only"] {
             let mut h = Helper::start(&helper, mode);
@@ -112,8 +116,8 @@ mod linux {
     /// the only evidence from outside that `n` created a namespace (the helper's
     /// `/proc/<pid>/ns/user` is closed to this caller), and the failed command must not be acked.
     #[skuld::test]
-    fn setuid_testbin_unshare_creates_a_namespace_where_credential_commands_fail() {
-        let Some(helper) = setuid_helper() else { return };
+    fn setuid_testbin_unshare_creates_a_namespace_where_credential_commands_fail(#[fixture(setuid)] _group: &Group) {
+        let helper = setuid_helper();
         let mut h = Helper::start(&helper, "root");
         assert_eq!(h.byte(), Some(b'+'));
         h.send(b'n');
@@ -129,8 +133,8 @@ mod linux {
     }
 
     #[skuld::test]
-    fn setuid_testbin_rejects_an_unknown_mode_and_command() {
-        let Some(helper) = setuid_helper() else { return };
+    fn setuid_testbin_rejects_an_unknown_mode_and_command(#[fixture(setuid)] _group: &Group) {
+        let helper = setuid_helper();
         let mut h = Helper::start(&helper, "bogus");
         assert_eq!(h.byte(), None);
         let (code, stderr) = h.finish();
@@ -148,8 +152,8 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn setuid_testbin_modes_reach_their_triples() {
-    let Some(helper) = setuid_helper() else { return };
+fn setuid_testbin_modes_reach_their_triples(#[fixture(setuid)] _group: &Group) {
+    let helper = setuid_helper();
     let mut h = Helper::start(&helper, "root");
     assert_eq!(h.byte(), Some(b'+'), "the macOS setuid helper did not reach uid 0");
     h.send_last(b'd');

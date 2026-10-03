@@ -225,9 +225,9 @@ namespaces) has a consent variable too, and is declared as a `test_group!` row i
 `src/test_groups.rs`, which gives its tests the off-switch, the consent check and a `SKULD_LABELS`
 label. A test joins with `#[fixture(namespaces)] _group: &Group`, not by name. So does `COSCA_TEST_SETUID` (tests that run a setuid-root
 copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the helper only in the
-Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there. Its
-members are the tests whose names start with `setuid_` and the `group_teardown_setuid` binary; a
-new member takes the gate and that prefix. So does
+Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there.
+`SKULD_LABELS=setuid` selects its tests, and `setuid_root` the one the Linux root-run step also
+runs. So does
 `COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids): CI turns
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane, whose names contain `cgroup`

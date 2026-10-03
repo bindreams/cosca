@@ -1,8 +1,6 @@
-//! The `COSCA_TEST_SETUID` group: tests that need a real setuid-root helper. Depends only on std
-//! and libc, so an integration test includes this file with `#[path]`.
+//! The helper side of the `SETUID` group (`test_groups.rs`): tests that need a real setuid-root
+//! helper. Depends only on std and libc, so an integration test includes this file with `#[path]`.
 //!
-//! On unless `COSCA_TEST_SETUID=0`. An enabled group fails, rather than skips, unless
-//! `COSCA_TEST_SETUID_CONSENT=1`: the helper is root, so run it in a sandbox or on CI.
 //! `COSCA_TEST_SETUID_HELPER` names a copy of `cosca_testbin` that is owned by root with the
 //! set-user-ID bit, on a filesystem not mounted `nosuid`.
 
@@ -10,44 +8,16 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-const GROUP: &str = "COSCA_TEST_SETUID";
-const CONSENT: &str = "COSCA_TEST_SETUID_CONSENT";
 const HELPER: &str = "COSCA_TEST_SETUID_HELPER";
 
-/// Whether the group's tests run.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Gate {
-    Run,
-    Disabled,
-}
-
-/// `Disabled` for an explicit `COSCA_TEST_SETUID=0`; otherwise `Run`.
+/// The helper's path. Call it only from a test that joined the `SETUID` group.
 ///
 /// # Panics
-/// When enabled and `COSCA_TEST_SETUID_CONSENT` is not exactly `1`.
-pub fn setuid_gate(var: impl Fn(&str) -> Option<String>) -> Gate {
-    if var(GROUP).is_some_and(|v| v == "0") {
-        return Gate::Disabled;
-    }
-    assert!(
-        var(CONSENT).is_some_and(|v| v == "1"),
-        "this test runs a setuid-root helper, which must never run on a developer host. Run it in a \
-         container, VM or CI's setuid lane with {CONSENT}=1, or switch the group off with {GROUP}=0"
-    );
-    Gate::Run
-}
-
-/// The helper's path, or `None` when the group is disabled.
-///
-/// # Panics
-/// When the gate panics, or as [`check_helper`] does.
-pub fn setuid_helper() -> Option<PathBuf> {
-    if setuid_gate(|k| std::env::var(k).ok()) == Gate::Disabled {
-        return None;
-    }
+/// As [`check_helper`] does.
+pub fn setuid_helper() -> PathBuf {
     // SAFETY: `geteuid` has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    Some(check_helper(std::env::var_os(HELPER), stat, euid))
+    check_helper(std::env::var_os(HELPER), stat, euid)
 }
 
 /// What [`check_helper`] needs to know about the helper file.
