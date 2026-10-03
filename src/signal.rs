@@ -63,14 +63,9 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
 /// A child's identity, read the moment its handle is made: the 64-bit unique id, which is never
 /// reused and survives `exec`. It is the only identity macOS checks a by-pid action against.
 /// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
-/// A handle built on a refused read holds no id and acts on its pid never.
-///
-/// The read is of our own child, which nothing reaps but us, unless something else does (a
-/// `SIG_IGN` host, another thread's `waitpid(-1)`) before the read: `None` then says the child is
-/// already reaped, and the handle acts on nothing by a bare pid. If it reaps the child and *any*
-/// process then reuses the pid before the read, the id is that process's, and the handle waits on
-/// it and `kill` signals it: macOS has no handle to pin the pid (principle 5).
-#[cfg(target_os = "macos")]
+/// A child's unique id by pid. Tests only: a spawned child reports its own before `exec` (see
+/// `child::spawn::unique_report`), and a by-pid read here could name a stranger that took the pid.
+#[cfg(all(target_os = "macos", test))]
 pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
     match uniq_info(pid, ReadPurpose::Adopt) {
