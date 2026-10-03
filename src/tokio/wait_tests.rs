@@ -135,8 +135,8 @@ async fn grace_wait_true_when_child_dies_mid_wait() {
 
 // The Windows release mechanism itself, deterministically: a PRE-signaled cancel event must
 // release the wait on a LIVE child — no race, nothing to time. If the cancel plumbing were
-// broken, the wait would sit at the unbounded `None` (=> INFINITE) watch and the test
-// harness's own bound would surface the hang loudly.
+// broken, the wait would sit at the unbounded `None` (=> INFINITE) watch, and the nextest
+// override in `.config/nextest.toml` ends it as a failure.
 #[cfg(windows)]
 #[skuld::test]
 fn cancel_event_releases_the_blocking_wait() {
@@ -153,7 +153,8 @@ fn cancel_event_releases_the_blocking_wait() {
 // The concurrent case: signal the cancel while the wait is (or is about to be) in flight.
 // The manual-reset event is set-once/released-forever, so EVERY interleaving must release
 // the watcher — this is race-INSENSITIVITY being proven, not an outcome bet on a race. If
-// the release were broken, the join would hang at the harness's own failure bound.
+// the release were broken, the join would hang until the nextest override in
+// `.config/nextest.toml` ends it as a failure.
 #[cfg(windows)]
 #[skuld::test]
 fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {

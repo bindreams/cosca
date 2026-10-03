@@ -5,7 +5,7 @@
 //! `tests/tokio_foreign.rs`, and the two negative cases are here because they need
 //! crate-internal fixtures.
 //!
-//! Plain `#[test]`, not `#[tokio::test]`: these two methods are synchronous by design.
+//! Synchronous `#[skuld::test]`s, with no async runtime: these two methods are synchronous by design.
 
 use super::Process;
 use crate::identity::{Existence, Liveness, ProcessId};

@@ -18,6 +18,13 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 filter = 'test(/::pidfd_handshake_tests::/) | test(/tokio::spawn::pidfd_tests::/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
+# The Windows cancel-event tests wait with no timeout of their own (`None`, INFINITE): a broken
+# release would hang the wait, so this bound turns that into a failure. Correct code returns at
+# once.
+[[profile.default.overrides]]
+filter = 'test(/tokio::wait::wait_tests::cancel_event_/)'
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+
 [profile.ci]
 fail-fast = false
 # Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.
