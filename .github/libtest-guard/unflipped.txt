@@ -1,4 +1,1 @@
-test:spawn_io
 test:test_enablement
-test:tokio_control
-test:tokio_io

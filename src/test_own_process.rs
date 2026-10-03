@@ -54,7 +54,7 @@ const STARTED: &[u8] = b"started";
 /// What the child writes to the token pipe once its body has returned.
 const RETURNED: &[u8] = b"returned";
 
-/// The path of the `#[test] fn` `$name`, for [`own_process`]. `let _: fn() = $name;` makes a
+/// The path of the test fn `$name` (sync or `async`), for [`own_process`]. `let _ = $name;` makes a
 /// stale name a compile error rather than a filter that matches nothing.
 #[allow(
     unused_macros,
@@ -62,7 +62,7 @@ const RETURNED: &[u8] = b"returned";
 )]
 macro_rules! test_path {
     ($name:ident) => {{
-        let _: fn() = $name;
+        let _ = $name;
         concat!(module_path!(), "::", stringify!($name))
     }};
 }
