@@ -20,7 +20,7 @@ use crate::test_support::require_group;
 /// without `WNOWAIT` (`src/wait/exit_only/linux.rs`), which consumes the stop yet still returns
 /// `None`; a `try_wait` that caches a state. Each fails by assertion.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -179,7 +179,7 @@ mod macos {
     /// leaves the state `N`.
     ///
     /// Mutant: a `waitpid(WNOHANG)` reap returns the stop as a status and writes `E`.
-    #[test]
+    #[skuld::test]
     fn try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped() {
         if !crate::test_support::require_group("TRACER") {
             return;
@@ -205,7 +205,7 @@ mod macos {
     /// `kern_exit.c`), and the second peek consumes it.
     ///
     /// Mutant: one consuming reap leaves the zombie, which the final peek still finds.
-    #[test]
+    #[skuld::test]
     fn a_child_this_process_traces_is_reaped_fully() {
         if !crate::test_support::require_group("TRACER") {
             return;
@@ -240,7 +240,7 @@ mod macos {
     /// first reap's status is kept, and one `warn` names the pid.
     ///
     /// Mutant: a second reap that panics on a refused identity read.
-    #[test]
+    #[skuld::test]
     fn a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n() {
         if !crate::test_support::require_group("TRACER") {
             return;

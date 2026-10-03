@@ -31,7 +31,7 @@ fn letter_of(p: &Path) -> char {
 
 /// With the real cwd and environment as readers, the result is `absolutise_exact`'s for every
 /// shape, UNC-shaped ones included.
-#[test]
+#[skuld::test]
 fn matches_absolutise_exact_given_the_real_cwd() {
     let cwd = std::env::current_dir().unwrap();
     let letter = letter_of(&cwd);
@@ -82,7 +82,7 @@ fn counted<'a>(base: &str, reads: &'a Cell<u32>) -> impl FnOnce() -> Result<Path
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_relative_or_rooted_path_uses_one_read() {
     for (path, base, want) in [
         (r"sub\tool.exe", r"C:\base", r"C:\base\sub\tool.exe"),
@@ -105,7 +105,7 @@ fn a_relative_or_rooted_path_uses_one_read() {
 
 /// Another drive's relative path takes that drive's own current directory (`=Q:`), or its root,
 /// never this process's cwd. The cwd is read once, to learn the current drive, and not used.
-#[test]
+#[skuld::test]
 fn another_drives_relative_path_does_not_use_the_cwd() {
     let qcwd = tempfile::tempdir().unwrap();
     let qcwd = qcwd.path().to_str().unwrap();
@@ -123,7 +123,7 @@ fn another_drives_relative_path_does_not_use_the_cwd() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_absolute_or_unc_shaped_path_reads_nothing() {
     for path in [
         r"C:\abs\tool.exe",
@@ -143,7 +143,7 @@ fn an_absolute_or_unc_shaped_path_reads_nothing() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn completed_is_what_a_caller_reads() {
     let Completed { path, used_cwd } = complete_on(Path::new(r"C:\a\..\b"), || unreachable!(), no_drive).unwrap();
     assert_eq!(path, PathBuf::from(r"C:\b"));
@@ -151,7 +151,7 @@ fn completed_is_what_a_caller_reads() {
 }
 
 /// Any one unit is a drive: `1:tool.exe` is relative to drive `1`, never to this process's cwd.
-#[test]
+#[skuld::test]
 fn a_digit_drive_takes_that_drives_directory() {
     let reads = Cell::new(0);
     let got = complete_on(Path::new("1:tool.exe"), counted(r"C:\base", &reads), no_drive).unwrap();
@@ -161,7 +161,7 @@ fn a_digit_drive_takes_that_drives_directory() {
 
 /// `complete_on` uses a drive directory only when fully qualified; its reader answers whether one
 /// exists.
-#[test]
+#[skuld::test]
 fn a_drive_directory_is_used_only_when_fully_qualified() {
     for (value, want) in [
         (r"Q:\qcwd", r"Q:\qcwd\tool.exe"),
@@ -183,7 +183,7 @@ fn a_drive_directory_is_used_only_when_fully_qualified() {
 /// A spawn uses a drive's `=X:` value only when it is fully qualified and names an existing
 /// directory, on any drive; otherwise the drive's root, as `GetFullPathNameW` does (measured by
 /// `tests/windows_process_cwd.rs`).
-#[test]
+#[skuld::test]
 fn only_an_existing_fully_qualified_drive_directory_is_used() {
     let dir = tempfile::tempdir().unwrap();
     let existing = dir.path().to_str().unwrap().to_owned();
@@ -210,7 +210,7 @@ fn only_an_existing_fully_qualified_drive_directory_is_used() {
 }
 
 /// Each drive is probed once per spawn, however many steps ask, and however they spell it.
-#[test]
+#[skuld::test]
 fn a_drive_directory_is_probed_once() {
     thread_local! {
         static PROBES: Cell<usize> = const { Cell::new(0) };
@@ -233,7 +233,7 @@ fn a_drive_directory_is_probed_once() {
 /// On a verbatim cwd a relative name is joined as written and `GetFullPathNameW` collapses it,
 /// with Win32's floor: after `\\?\UNC\`, not after the share (measured by
 /// `tests/windows_process_cwd.rs`).
-#[test]
+#[skuld::test]
 fn a_relative_name_on_a_verbatim_unc_cwd_collapses_as_win32_does() {
     let cwd = || Ok(PathBuf::from(r"\\?\UNC\srv\shr\d"));
     for (name, want) in [
@@ -257,7 +257,7 @@ fn a_relative_name_on_a_verbatim_unc_cwd_collapses_as_win32_does() {
 }
 
 /// The same on a verbatim drive cwd, whose floor is after `\\?\`, not after the drive (measured).
-#[test]
+#[skuld::test]
 fn a_relative_name_on_a_verbatim_drive_cwd_collapses_as_win32_does() {
     let got = complete_on(Path::new(r"..\..\t.exe"), || Ok(PathBuf::from(r"\\?\C:\d")), no_drive).unwrap();
     assert_eq!(got.path, PathBuf::from(r"\\?\t.exe"));
@@ -265,7 +265,7 @@ fn a_relative_name_on_a_verbatim_drive_cwd_collapses_as_win32_does() {
 
 /// On a verbatim cwd a rooted name is refused: Win32 completes it to `\\t.exe`, off the cwd's
 /// volume and share (measured by `tests/windows_process_cwd.rs`).
-#[test]
+#[skuld::test]
 fn a_rooted_name_on_a_verbatim_cwd_is_refused() {
     for cwd in [r"\\?\UNC\srv\shr\d", r"\\?\C:\d"] {
         for complete in [complete_on, absolutise_exact_on] {
@@ -285,7 +285,7 @@ fn empty_env() -> EnvSnapshot {
 
 /// The raw backend's directory is completed by the same rule, so a digit-drive process cwd keeps
 /// its drive for a rooted or relative `current_dir`, and another drive takes its own directory.
-#[test]
+#[skuld::test]
 fn the_effective_cwd_completes_current_dir_as_win32_does() {
     // The cwd is read once for every shape that needs it, the drive-relative one to learn the
     // current drive, and never for a drive-absolute one.
@@ -309,7 +309,7 @@ fn the_effective_cwd_completes_current_dir_as_win32_does() {
 }
 
 /// A drive's own directory comes from the spawn's snapshot, not a second read of the environment.
-#[test]
+#[skuld::test]
 fn the_effective_cwd_reads_a_drive_directory_from_the_given_snapshot() {
     let qcwd = tempfile::tempdir().unwrap();
     let qcwd = qcwd.path().to_str().unwrap();
@@ -324,7 +324,7 @@ fn the_effective_cwd_reads_a_drive_directory_from_the_given_snapshot() {
 }
 
 /// With no `current_dir`, the effective cwd is one read of this process's cwd, whatever the program.
-#[test]
+#[skuld::test]
 fn the_effective_cwd_without_a_current_dir_is_one_read() {
     let reads = Cell::new(0);
     let got = super::effective_cwd(None, &DriveDirs::new(&empty_env()), counted(r"C:\x", &reads)).unwrap();
@@ -334,7 +334,7 @@ fn the_effective_cwd_without_a_current_dir_is_one_read() {
 
 /// A `current_dir` Win32 reads as UNC with no share completes to itself, a path on no drive or
 /// share, and is refused rather than handed to the resolver, whose contract it would break.
-#[test]
+#[skuld::test]
 fn the_effective_cwd_refuses_a_share_less_unc_current_dir() {
     // `\\srv\\x` is not among them: Win32 collapses the doubled separator (measured), so it names
     // the share root `\\srv\x`.
@@ -350,7 +350,7 @@ fn the_effective_cwd_refuses_a_share_less_unc_current_dir() {
 
 /// A NUL in `current_dir` is refused as a NUL in the working directory before anything completes
 /// it, which would otherwise search a truncated directory the caller never named.
-#[test]
+#[skuld::test]
 fn the_effective_cwd_refuses_a_nul_before_completing() {
     use std::os::windows::ffi::OsStringExt;
     let dir = OsString::from_wide(&"sub\0x".encode_utf16().collect::<Vec<u16>>());
@@ -367,7 +367,7 @@ fn the_effective_cwd_refuses_a_nul_before_completing() {
 
 /// A verbatim base: `./tool.exe` is found in it, not probed as a literal `.` component, which a
 /// `\\?\` path passes to the filesystem unparsed.
-#[test]
+#[skuld::test]
 fn a_verbatim_current_dir_finds_a_dot_relative_name() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("tool.exe"), b"x").unwrap();
@@ -380,7 +380,7 @@ fn a_verbatim_current_dir_finds_a_dot_relative_name() {
 /// Every caller NUL-checks a path before completing it, naming its field; a NUL reaching
 /// `GetFullPathNameW` would complete a truncated path, and the assertion catches it.
 #[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
-#[test]
+#[skuld::test]
 #[should_panic(expected = "path to complete")]
 fn a_nul_reaching_get_full_path_name_is_a_contract_violation() {
     use std::os::windows::ffi::OsStringExt;
@@ -397,7 +397,7 @@ const VERBATIM_REWRITES: &[(&str, &str)] = &[
     (r"\\?\C:\t\a ", r"\\?\C:\t\a"),
 ];
 
-#[test]
+#[skuld::test]
 fn get_full_path_name_rewrites_a_verbatim_path_as_measured() {
     for (path, want) in VERBATIM_REWRITES {
         assert_eq!(
@@ -411,7 +411,7 @@ fn get_full_path_name_rewrites_a_verbatim_path_as_measured() {
 /// A verbatim `current_dir` is kept as written when `GetFullPathNameW` leaves it alone, and refused
 /// when it would rewrite it: whatever completes the child's `lpCurrentDirectory` may rewrite it the
 /// same way, and the directory resolved against must be the one run in.
-#[test]
+#[skuld::test]
 fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
     for (path, rewritten) in VERBATIM_REWRITES {
         match complete_on(Path::new(path), || panic!("must not read the cwd"), no_drive) {
@@ -431,7 +431,7 @@ fn a_verbatim_directory_is_kept_or_refused_never_rewritten() {
 /// The raw backend takes a verbatim `raw_executable()` token as written, as `CreateProcessW` loads
 /// it: `\\?\C:\t\tool.exe.` names that file, not its sibling `tool.exe`, and `...` is a file name
 /// there.
-#[test]
+#[skuld::test]
 fn a_verbatim_exact_token_is_taken_as_written() {
     for token in [r"\\?\C:\t\tool.exe.", r"\\?\C:\t\x\..\tool.exe", r"\\?\C:\t\..."] {
         let got = absolutise_exact_on(Path::new(token), || panic!("must not read the cwd"), no_drive).unwrap();
@@ -441,7 +441,7 @@ fn a_verbatim_exact_token_is_taken_as_written() {
 
 /// The elevated path completes a verbatim token as main does: `GetFullPathNameW` on it, then the
 /// shape check on the result, which refuses a name normalised down to a directory.
-#[test]
+#[skuld::test]
 fn the_elevated_completion_normalises_a_verbatim_token() {
     for (token, want) in [
         (r"\\?\C:\t\tool.exe.", r"\\?\C:\t\tool.exe"),
@@ -462,7 +462,7 @@ fn the_elevated_completion_normalises_a_verbatim_token() {
 /// A relative name completed against a verbatim PROCESS cwd is normalised, as Win32 completes it:
 /// the `\\?\` came from the base, not the caller, so what loads and where the child runs are what
 /// `CreateProcessW` would make of the name.
-#[test]
+#[skuld::test]
 fn a_relative_name_on_a_verbatim_process_cwd_is_normalised() {
     let cwd = || Ok(PathBuf::from(r"\\?\C:\d"));
     let got = absolutise_exact_on(Path::new("tool.exe."), cwd, no_drive).unwrap();

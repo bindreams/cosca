@@ -7,19 +7,19 @@ use super::{std_teardown_action, StdTeardown};
 // keyed on the flag it would take the blocking-wait branch and HANG in Drop. Encoding the rule
 // as a pure function makes the "any Err -> never block" invariant unit-testable without root.
 
-#[test]
+#[skuld::test]
 fn kill_success_reaps_with_a_blocking_wait() {
     assert_eq!(std_teardown_action(&Ok(())), StdTeardown::ReapBlocking);
 }
 
-#[test]
+#[skuld::test]
 fn eperm_never_blocks_even_without_an_elevated_flag() {
     // The self-privileged-child case: EPERM must route to the NON-blocking reap, never a wait().
     let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     assert_eq!(std_teardown_action(&Err(eperm)), StdTeardown::ReapNonBlocking);
 }
 
-#[test]
+#[skuld::test]
 fn any_other_kill_error_also_never_blocks() {
     let other = std::io::Error::from(std::io::ErrorKind::NotFound);
     assert_eq!(std_teardown_action(&Err(other)), StdTeardown::ReapNonBlocking);
@@ -57,7 +57,7 @@ mod own_reap {
 
     /// Adoption never reaps, so an already-exited child is still a zombie afterwards, and the
     /// handle's own `wait` is the reap.
-    #[test]
+    #[skuld::test]
     fn adopting_an_already_exited_child_is_not_a_reap() {
         let mut cmd = std::process::Command::new("true");
         let child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
@@ -71,7 +71,7 @@ mod own_reap {
     /// `is_reaped` is true once the reap is recorded, before `try_wait` returns.
     ///
     /// Mutant: `is_reaped` read from a flag stored after `try_wait` returns.
-    #[test]
+    #[skuld::test]
     fn is_reaped_is_true_as_soon_as_try_wait_records_the_reap() {
         use crate::child::shared::seams;
         let h = killed_zombie();
@@ -89,14 +89,14 @@ mod own_reap {
         });
     }
 
-    #[test]
+    #[skuld::test]
     fn wait_is_an_own_reap() {
         let h = killed_zombie();
         h.wait().expect("wait");
         assert!(h.is_reaped());
     }
 
-    #[test]
+    #[skuld::test]
     fn try_wait_is_an_own_reap_only_once_it_returns_a_status() {
         let (h, pid) = adopt(&["sleep", "300"]);
         assert_eq!(h.try_wait().expect("try_wait"), None);
@@ -107,7 +107,7 @@ mod own_reap {
         assert!(h.is_reaped());
     }
 
-    #[test]
+    #[skuld::test]
     fn wait_deadline_is_an_own_reap_only_once_it_returns_a_status() {
         let (h, pid) = adopt(&["sleep", "300"]);
         assert_eq!(h.wait_deadline(Instant::now()).expect("expired"), None);
@@ -128,7 +128,7 @@ mod own_reap {
 /// `is_reaped` is true once the reap is recorded, before `wait` returns.
 ///
 /// Mutant: `is_reaped` read from a flag stored after `wait` returns.
-#[test]
+#[skuld::test]
 fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
     use crate::child::shared::seams;
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
@@ -158,7 +158,7 @@ fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
 /// failure bound; the wait ends on the child's real exit.
 ///
 /// Mutant: `is_reaped` read from a flag stored after `wait_deadline` returns.
-#[test]
+#[skuld::test]
 fn is_reaped_is_true_as_soon_as_wait_deadline_records_the_reap() {
     use crate::child::shared::seams;
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
@@ -188,7 +188,7 @@ fn is_reaped_is_true_as_soon_as_wait_deadline_records_the_reap() {
 /// A waiter parked in the unlocked wait is a holder (`W`), not a reap.
 ///
 /// Mutant: `is_reaped` counts every state but `N` (so `W`) as reaped.
-#[test]
+#[skuld::test]
 fn is_reaped_is_false_while_a_holder_waits() {
     use crate::child::shared::seams;
     let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
@@ -251,7 +251,7 @@ fn teardown_levels_when_the_reap_fails(errno: i32) -> Vec<log::Level> {
 ///
 /// Mutant: `_ = s.wait()`.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_failed_teardown_reap_is_warned() {
     assert_eq!(teardown_levels_when_the_reap_fails(libc::EIO), [log::Level::Warn]);
 }
@@ -260,7 +260,7 @@ fn a_failed_teardown_reap_is_warned() {
 ///
 /// Mutant: every failure at `warn`; or none logged.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_teardown_reap_that_meets_echild_is_debug() {
     assert_eq!(teardown_levels_when_the_reap_fails(libc::ECHILD), [log::Level::Debug]);
 }

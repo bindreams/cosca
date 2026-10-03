@@ -21,7 +21,7 @@ fn far() -> Instant {
 /// a debug build and is an error in a release build, never a `Running` the holder loops on.
 ///
 /// Mutant: `Ok(None)` folded into the non-exit arm, which answers `Running`.
-#[test]
+#[skuld::test]
 fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -43,7 +43,7 @@ fn a_blocking_waitid_that_finds_no_record_is_a_contract_breach() {
 ///
 /// Mutant: `Ok(None)` folded into the ptrace-stop arm, which waits again (a busy loop without
 /// the seam; here the next wait reaps the child and answers).
-#[test]
+#[skuld::test]
 fn a_blocking_reap_that_finds_no_record_is_a_contract_breach() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -66,7 +66,7 @@ fn a_blocking_reap_that_finds_no_record_is_a_contract_breach() {
 /// 100% CPU until the tracer lets go.
 ///
 /// Mutant: re-polls, `poll, reap, poll, reap`.
-#[test]
+#[skuld::test]
 fn an_unbounded_holder_whose_reap_finds_none_blocks_in_waitid() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -88,7 +88,7 @@ fn an_unbounded_holder_whose_reap_finds_none_blocks_in_waitid() {
 /// re-polling, then re-peeks.
 ///
 /// Mutant: re-polls.
-#[test]
+#[skuld::test]
 fn a_deadline_holder_whose_reap_finds_none_backs_off() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -110,7 +110,7 @@ fn a_deadline_holder_whose_reap_finds_none_backs_off() {
 /// `kill` returns.
 ///
 /// Mutant: the `waitid` under the lock, so `Debug`'s `try_lock` fails and prints `locked`.
-#[test]
+#[skuld::test]
 fn a_holder_in_its_blocking_waitid_holds_no_lock() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -147,7 +147,7 @@ fn a_holder_in_its_blocking_waitid_holds_no_lock() {
 ///
 /// Mutant: an unbounded poll under a deadline (its `debug_assert!` fires); no final peek; every
 /// round armed with 1ns.
-#[test]
+#[skuld::test]
 fn a_deadline_poll_arms_the_remaining_time_and_peeks_once_at_expiry() {
     let b = Blocker::spawn();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -188,7 +188,7 @@ fn a_deadline_poll_arms_the_remaining_time_and_peeks_once_at_expiry() {
 /// remaining, recomputed after every wake, so a spurious wake shrinks the next timeout.
 ///
 /// Mutant: the remaining time computed once, before the loop.
-#[test]
+#[skuld::test]
 fn a_deadline_condvar_wait_is_clamped_to_the_remaining_time() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -241,7 +241,7 @@ fn a_deadline_condvar_wait_is_clamped_to_the_remaining_time() {
 /// exit is what wakes the first (capped) poll.
 ///
 /// Mutant: no clamp on the poll's remaining time: the recorded timeout is the whole distance.
-#[test]
+#[skuld::test]
 fn a_deadline_beyond_the_block_limit_is_armed_clamped() {
     let (child, stdin) = spawn_std_blocker();
     let id = super::fixtures::identity_of(&child);
@@ -274,7 +274,7 @@ fn adopt_gone_on(errno: rustix::io::Errno) {
 ///
 /// Mutant: `EINVAL` returned as `Io`, so `adopt` fails and the spawn tears down a child that was
 /// never ours.
-#[test]
+#[skuld::test]
 fn adopt_on_einval_takes_the_gone_path() {
     adopt_gone_on(rustix::io::Errno::INVAL);
 }
@@ -282,7 +282,7 @@ fn adopt_on_einval_takes_the_gone_path() {
 /// `ENOENT` (from 6.16: a number reused by a live non-leader thread) is the gone path too.
 ///
 /// Mutant: `ENOENT` returned as `Io`, so `adopt` fails on a 6.16 kernel.
-#[test]
+#[skuld::test]
 fn adopt_on_enoent_takes_the_gone_path() {
     adopt_gone_on(rustix::io::Errno::NOENT);
 }
@@ -290,7 +290,7 @@ fn adopt_on_enoent_takes_the_gone_path() {
 /// A pidfd whose identity no longer matches is gone, whatever the pid now names.
 ///
 /// Mutant: a by-number pidfd trusted unchecked.
-#[test]
+#[skuld::test]
 fn adopt_treats_a_pidfd_whose_identity_is_gone_as_gone() {
     super::fixtures::assert_adoption_is_gone(|| fault::force_exists_once(crate::identity::Existence::Gone));
 }
@@ -299,7 +299,7 @@ fn adopt_treats_a_pidfd_whose_identity_is_gone_as_gone() {
 /// it opens and its identity matches: it is gone for us.
 ///
 /// Mutant: a by-number pidfd trusted unchecked.
-#[test]
+#[skuld::test]
 fn adopt_treats_a_pidfd_that_is_not_our_child_as_gone() {
     // SAFETY: `getppid` takes no arguments and cannot fail.
     let parent = unsafe { libc::getppid() } as u32;
@@ -328,7 +328,7 @@ fn adopt_under_view_with_exists_gone(view: crate::identity::proc_view_fault::For
 ///
 /// Mutant: trust `exists()` on a diverged `/proc`: `pidfd: None`, and `kill` answers `ECHILD` on
 /// a live child.
-#[test]
+#[skuld::test]
 fn adopt_skips_the_identity_check_on_a_diverged_proc() {
     adopt_under_view_with_exists_gone(crate::identity::proc_view_fault::ForcedView::Diverged);
 }
@@ -336,7 +336,7 @@ fn adopt_skips_the_identity_check_on_a_diverged_proc() {
 /// Likewise when the view cannot be assessed.
 ///
 /// Mutant: the same.
-#[test]
+#[skuld::test]
 fn adopt_on_an_unassessable_proc_view_skips_the_identity_check() {
     adopt_under_view_with_exists_gone(crate::identity::proc_view_fault::ForcedView::Unassessable);
 }
@@ -351,7 +351,7 @@ const SLOT_CASE_ENV: &str = "COSCA_TEST_SHARED_STDIO_SLOT_CASE";
 /// Each case runs in a fresh re-exec, since a closed slot is process-wide.
 ///
 /// Mutant: the pidfd kept at the lowest free number.
-#[test]
+#[skuld::test]
 fn an_adopted_pidfd_never_sits_in_a_stdio_slot() {
     if !crate::test_child::is_marked_fixture_reexec(SLOT_MARKER) {
         for case in ["0", "1", "2"] {

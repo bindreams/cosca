@@ -2,7 +2,7 @@ use super::*;
 
 /// Keys longer than `i32::MAX` units are compared in pieces; small pieces must give the same
 /// answer as one whole-string call.
-#[test]
+#[skuld::test]
 fn chunked_comparison_matches_whole_string_comparison() {
     let keys: Vec<Vec<u16>> = [
         "",
@@ -35,7 +35,7 @@ fn chunked_comparison_matches_whole_string_comparison() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn env_key_equality_follows_its_order() {
     assert_eq!(EnvKey::new(OsStr::new("Path")), EnvKey::new(OsStr::new("PATH")));
     assert_ne!(EnvKey::new(OsStr::new("ß")), EnvKey::new(OsStr::new("SS")));

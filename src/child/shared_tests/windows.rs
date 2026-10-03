@@ -12,7 +12,7 @@ use crate::wait::exit_only::seams::{self as exit_seams, ForcedReap};
 /// build the state goes back to `N` and the caller gets an error, so it never spins.
 ///
 /// Mutant: S11m resumes the wait.
-#[test]
+#[skuld::test]
 #[cfg_attr(debug_assertions, should_panic(expected = "signalled process handle"))]
 fn a_reap_that_finds_none_after_signalled_is_a_contract_breach() {
     let mut b = Blocker::spawn();
@@ -27,7 +27,7 @@ fn a_reap_that_finds_none_after_signalled_is_a_contract_breach() {
 /// longer, and the wait re-arms against the frozen clock until the deadline.
 ///
 /// Mutant: a timeout computed once, before the loop.
-#[test]
+#[skuld::test]
 fn a_deadline_wait_for_single_object_arms_the_remaining_time() {
     let b = Blocker::spawn();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -65,7 +65,7 @@ fn a_deadline_wait_for_single_object_arms_the_remaining_time() {
 ///
 /// Mutant: the holder's wait trusts the first `WAIT_TIMEOUT` (one `WaitForSingleObject` in place
 /// of `wait_until`): `Ok(None)` after 1 ms.
-#[test]
+#[skuld::test]
 fn a_wait_timeout_before_the_deadline_is_not_trusted() {
     let (child, stdin) = spawn_std_blocker();
     let id = identity_of(&child);

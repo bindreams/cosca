@@ -13,7 +13,7 @@ use crate::wait::exit_only::{self, Reap, Target};
 ///
 /// Mutant: a by-pid `ECHILD` taken for a foreign reap without checking the pid still names the
 /// child.
-#[test]
+#[skuld::test]
 fn a_child_held_by_a_tracer_is_running_until_the_hand_back() {
     if !crate::test_support::require_group("TRACER") {
         return;
@@ -75,7 +75,7 @@ fn wait_blocked<'s, G>(
 /// running.
 ///
 /// Mutant: a by-pid `ECHILD` taken for a foreign reap: the wait returns `ECHILD`.
-#[test]
+#[skuld::test]
 fn a_wait_blocked_across_the_exit_and_the_hand_back_returns_the_status() {
     let Some((tracee, stdin)) = held() else { return };
     let mut helper = tracer::start(Mode::Auto).attach_shared(&tracee);
@@ -93,7 +93,7 @@ fn a_wait_blocked_across_the_exit_and_the_hand_back_returns_the_status() {
 /// `kill` reaches a held child, the tracer hands the zombie back, and the wait returns the kill.
 ///
 /// Mutant: `kill` refused for a pid the start read cannot see, or a wait that gives up on `ECHILD`.
-#[test]
+#[skuld::test]
 fn kill_ends_a_held_child_and_the_wait_returns_the_kill() {
     let Some((tracee, _stdin)) = held() else { return };
     let mut helper = tracer::start(Mode::Auto).attach_shared(&tracee);
@@ -114,7 +114,7 @@ fn kill_ends_a_held_child_and_the_wait_returns_the_kill() {
 ///
 /// Mutant: an `ECHILD` for a resolvable pid taken for a reap once nothing traces it (a held
 /// zombie is no longer flagged as traced): the wait and `try_wait` answer `ECHILD`.
-#[test]
+#[skuld::test]
 fn a_zombie_a_tracer_holds_is_running_until_the_hand_back() {
     let Some((tracee, stdin)) = held() else { return };
     let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);

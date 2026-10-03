@@ -78,7 +78,7 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 }
 
 /// Mutants: `killpg` still sent after the reap; no warn; the warn without the pgid.
-#[test]
+#[skuld::test]
 fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -113,7 +113,7 @@ fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_p
 
 /// The warn is for the skip only. Mutant: the reaped test is inverted or dropped, so a running
 /// root is skipped too.
-#[test]
+#[skuld::test]
 fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_warn() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -133,7 +133,7 @@ fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_war
 /// A root that exited but is not reaped is a zombie: it still pins its group number, so the group
 /// kill is safe and still reaches the descendants. Mutant: reaped judged with `try_wait`, which
 /// reaps the zombie and then skips.
-#[test]
+#[skuld::test]
 fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -150,7 +150,7 @@ fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
 }
 
 /// Real `killpg`: `kill_tree()` before `wait()` ends a descendant that outlives the root.
-#[test]
+#[skuld::test]
 fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
     let (child, mut pipes) = spawn_cat_tree();
 
@@ -170,7 +170,7 @@ fn kill_tree_before_wait_ends_a_descendant_of_an_exited_root() {
 /// identity after a reap and so ends this descendant. That path is
 /// `fd_marker_drop_after_wait_sweeps_the_marker_holders_but_sends_no_killpg`.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
     let (child, mut pipes) = spawn_cat_tree();
     child.wait().expect("reap the root");
@@ -189,7 +189,7 @@ fn drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly() {
 /// A `TreeWalk` names its tree by ppid edges from the root's number. After the reap the only
 /// processes with that ppid belong to whoever reused the number, so the drop walks nothing and
 /// warns naming the root. Mutant: the reaped `TreeWalk` still walks.
-#[test]
+#[skuld::test]
 fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
     crate::log_capture::install();
     let walks = record_walks();
@@ -224,7 +224,7 @@ fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pi
 
 /// Positive control for the recorder above, and the warn's other half: a running `TreeWalk` root
 /// is walked, and nothing is warned. Mutant: the reaped test is inverted or dropped.
-#[test]
+#[skuld::test]
 fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
     crate::log_capture::install();
     let walks = record_walks();
@@ -256,7 +256,7 @@ fn waited_on_sleep_root() -> (u32, crate::Child) {
 /// under a `/proc` whose view is another pid namespace's) must not read as "not reaped". A live
 /// process on the number would be needed to provoke a real `Unknown`, so the seam forces the read.
 /// Mutants: the own-reap flag is ignored; `wait()` does not set it.
-#[test]
+#[skuld::test]
 fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -278,7 +278,7 @@ fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg()
 
 /// With no own reap, an `Unknown` read means the root is not known to be reaped: the drop kills as
 /// for any unreaped root, and says the read failed. Mutant: `Unknown` is treated as reaped.
-#[test]
+#[skuld::test]
 fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_failed_read() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -300,7 +300,7 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
 }
 
 /// A root reaped by someone else is seen through its number. Mutant: the identity read dropped.
-#[test]
+#[skuld::test]
 fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -328,7 +328,7 @@ fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
 
 /// The skip is quiet once this handle has already hard-killed the tree: the warn's own remedy
 /// (`kill_tree()` then `wait()`) must not draw it. Mutant: the tree-killed flag is ignored.
-#[test]
+#[skuld::test]
 fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -347,7 +347,7 @@ fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 }
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
-#[test]
+#[skuld::test]
 fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -366,7 +366,7 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 
 /// A failed elevated spawn's cleanup kills the tree, then kills and reaps the root, then drops the
 /// handle: an internal path with no call order for the user to change.
-#[test]
+#[skuld::test]
 fn a_failed_elevated_spawns_cleanup_drops_its_handle_at_debug() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -387,7 +387,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_at_debug() {
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
 /// tree-killed flag is set on the attempt.
-#[test]
+#[skuld::test]
 fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -407,7 +407,7 @@ fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 /// The same for a `TreeWalk` whose walk was incomplete but returned `Ok`. Not on macOS, where
 /// `TreeWalk` mode is an fd marker, whose incompleteness is an `Err` (the test above).
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     crate::log_capture::install();
     let mut cmd = Command::new();
@@ -439,7 +439,7 @@ fn assert_skipped_at_debug(mark: usize) {
 /// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_CONSENT=1`.
 /// Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -475,7 +475,7 @@ fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
 /// `drop_after_wait_leaves_a_descendant_running_until_it_is_ended_explicitly`. Mutants: the sweep
 /// skipped too; the `killpg` or the walk still run.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_roots_number() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -527,7 +527,7 @@ fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::Child) {
 /// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs.
 /// Mutant: the walk or the root kill still run for it.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
     crate::log_capture::install();
     let walks = record_walks();
@@ -545,7 +545,7 @@ fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
 /// The same with a group: no `killpg`, no walk, one warn. Mutant: the walk still runs for a marker
 /// that has a group.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() {
     crate::log_capture::install();
     let recorder = record_kill_group();
@@ -564,7 +564,7 @@ fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() 
 
 /// The decision from its inputs, over every own-reap and number-read combination. Mutants: the
 /// own-reap input ignored; `Unknown` read as reaped; the different-process arm dropped.
-#[test]
+#[skuld::test]
 fn a_root_is_reaped_by_its_own_reap_or_by_its_number_reading_gone_or_different() {
     use crate::identity::{ProcessId, Resolved};
     let id = ProcessId::from_parts_for_test(4242, 7);

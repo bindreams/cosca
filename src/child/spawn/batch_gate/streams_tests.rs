@@ -2,7 +2,7 @@
 ///
 /// `x.bat ` and `x.bat.` resolve to `x.bat`, and `x.bat:s` names a stream of it. This pins the
 /// PIECES, which is not the verdict — `is_batch_program` is where the pieces become one.
-#[test]
+#[skuld::test]
 fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
     for (probe, want) in [
         ("x.bat ", vec!["x.bat"]),
@@ -43,7 +43,7 @@ fn ntfs_stream_names_splits_off_every_stream_then_trims_space_and_dot() {
 /// The shell's extension rule, which is NOT `Path::extension()` — it takes the last `.` anywhere.
 /// Both divergences matter: a name that IS `.bat`, and a batch extension hiding after a data
 /// stream separator.
-#[test]
+#[skuld::test]
 fn is_batch_by_shell_follows_the_last_dot_anywhere_in_the_name() {
     for yes in [
         ".bat",
@@ -73,7 +73,7 @@ fn is_batch_by_shell_follows_the_last_dot_anywhere_in_the_name() {
 /// Every probe here is grouped by the piece of `ntfs_stream_names` it depends on. That is the
 /// only reading left — see `the_stream_reading_subsumes_the_shell_reading` for why a second one
 /// would add no refusal.
-#[test]
+#[skuld::test]
 fn is_batch_program_on_windows_refuses_every_stream_piece() {
     // The name itself, after Win32's trailing-character trim.
     for probe in [

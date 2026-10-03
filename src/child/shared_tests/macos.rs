@@ -38,7 +38,7 @@ fn unique_of(pid: u32) -> u64 {
 /// state goes back to `N`.
 ///
 /// Mutant: a `debug_assert!` on the by-pid target.
-#[test]
+#[skuld::test]
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -56,7 +56,7 @@ fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
 /// S2g: an id-checked peek whose identity read says the pid is `Gone` answers `Foreign(Gone)`.
 ///
 /// Mutant: `Gone` treated as a match: the peek returns `Exit`.
-#[test]
+#[skuld::test]
 fn an_identity_read_gone_takes_the_echild_path() {
     let (child, stdin) = spawn_std_blocker();
     let unique = unique_of(child.id());
@@ -108,7 +108,7 @@ fn second_reap_with_unique(read: UniqRead) -> std::process::Child {
 /// S10r: a second reap whose start no longer matches is skipped: nothing is consumed.
 ///
 /// Mutant: a second consume without the start check.
-#[test]
+#[skuld::test]
 fn a_second_reap_with_an_id_mismatch_is_skipped() {
     let mut child = second_reap_with_unique(found(99));
     let status = child
@@ -120,7 +120,7 @@ fn a_second_reap_with_an_id_mismatch_is_skipped() {
 /// S10r: a second reap whose start matches consumes the leftover zombie.
 ///
 /// Mutant: the start check inverted.
-#[test]
+#[skuld::test]
 fn a_second_reap_with_a_matching_id_consumes_the_leftover() {
     let child = second_reap_with_unique(found(7));
     let mut status = 0;
@@ -135,7 +135,7 @@ fn a_second_reap_with_a_matching_id_consumes_the_leftover() {
 /// warning.
 ///
 /// Mutant: the `ECHILD` logged at `warn`.
-#[test]
+#[skuld::test]
 fn a_second_reap_that_meets_echild_is_skipped() {
     crate::log_capture::install();
     let (mut child, stdin) = spawn_std_blocker();
@@ -158,7 +158,7 @@ fn a_second_reap_that_meets_echild_is_skipped() {
 /// consume by a bare pid could take a reusing process's record.
 ///
 /// Mutant: the consume runs when there is no start.
-#[test]
+#[skuld::test]
 fn a_second_reap_without_an_id_is_skipped_with_a_warning() {
     crate::log_capture::install();
     let (mut child, stdin) = spawn_std_blocker();
@@ -175,7 +175,7 @@ fn a_second_reap_without_an_id_is_skipped_with_a_warning() {
 /// S10r: a second consume that finds nothing is skipped quietly.
 ///
 /// Mutant: a `debug_assert!` on the by-pid consume.
-#[test]
+#[skuld::test]
 fn a_second_reap_that_finds_nothing_is_skipped() {
     crate::log_capture::install();
     let (mut child, stdin) = spawn_std_blocker();
@@ -200,7 +200,7 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
 /// answers `ECHILD` and is skipped quietly.
 ///
 /// Mutant: a second peek gated on `p_oppid`: no `SecondPeek` step for an untraced child.
-#[test]
+#[skuld::test]
 fn a_second_peek_runs_after_every_first_reap() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -213,7 +213,7 @@ fn a_second_peek_runs_after_every_first_reap() {
 /// leaves the other two reads untouched.
 ///
 /// Mutant: a purpose-blind seam.
-#[test]
+#[skuld::test]
 fn force_uniq_read_once_hits_only_its_purpose() {
     let pid = std::process::id();
     let real = uniq_info(pid, ReadPurpose::Peek);
@@ -260,7 +260,7 @@ fn ignoring_sigchld_with_a_sibling() -> (SharedChild, std::process::Child, std::
 /// the `SIG_IGN` cases below prove by hanging.
 ///
 /// Mutant: the holder's platform wait is a blocking `waitid(WNOWAIT)`.
-#[test]
+#[skuld::test]
 fn the_holder_waits_on_the_kqueue_not_in_waitid() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -276,7 +276,7 @@ fn the_holder_waits_on_the_kqueue_not_in_waitid() {
 ///
 /// Mutant: a blocking `waitid` instead of the kqueue form, which sleeps until the child list
 /// empties.
-#[test]
+#[skuld::test]
 fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
         return run_case(
@@ -292,7 +292,7 @@ fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
 /// A `wait_deadline` far past the bound returns `ECHILD`, not `Ok(None)`.
 ///
 /// Mutant: the same.
-#[test]
+#[skuld::test]
 fn a_wait_timeout_far_past_the_bound_returns_echild() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
         return run_case(
@@ -309,7 +309,7 @@ fn a_wait_timeout_far_past_the_bound_returns_echild() {
 /// `ECHILD` instead of sleeping.
 ///
 /// Mutant: the same.
-#[test]
+#[skuld::test]
 fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
         return run_case(
@@ -332,7 +332,7 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
 /// The handle's target carries the child's unique id, so every peek and consume checks it.
 ///
 /// Mutant: `Target::pid(pid, None)`.
-#[test]
+#[skuld::test]
 fn the_shared_childs_target_carries_its_unique_id() {
     let b = Blocker::spawn();
     let target = b.shared.target().expect("a target");
@@ -345,7 +345,7 @@ fn the_shared_childs_target_carries_its_unique_id() {
 /// consumes nothing.
 ///
 /// Mutant: `target()` without the id: the exit is reported.
-#[test]
+#[skuld::test]
 fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -361,7 +361,7 @@ fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
 /// before any reap step.
 ///
 /// Mutant: the wait's peek without the id: it reports `Reapable` and reaches the reap.
-#[test]
+#[skuld::test]
 fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -382,7 +382,7 @@ fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
 /// by EOF on its stdin, and exits cleanly.
 ///
 /// Mutant: `kill` by the bare pid, as std's `Child::kill` does: the child dies of `SIGKILL`.
-#[test]
+#[skuld::test]
 fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
     let mut b = Blocker::spawn();
     let log = crate::send_log::Capture::start();
@@ -399,7 +399,7 @@ fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
 /// `kill` on a live child sends `SIGKILL` by pid and records it.
 ///
 /// Mutant: nothing sent.
-#[test]
+#[skuld::test]
 fn kill_signals_a_live_child_by_its_verified_pid() {
     let b = Blocker::spawn();
     let log = crate::send_log::Capture::start();
@@ -436,7 +436,7 @@ fn orphaned_to_launchd() -> ppid_fault::Forced {
 /// reap.
 ///
 /// Mutant: `ECHILD` mapped to `Foreign(Gone)` without the id and parent check.
-#[test]
+#[skuld::test]
 fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
@@ -455,7 +455,7 @@ fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
 /// kernel, pid 0, not launchd.
 ///
 /// Mutant: the parent read through a same-user flavor: `Foreign(Gone)`.
-#[test]
+#[skuld::test]
 fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
     let target = Target::pid(1, Some(unique_of(1)));
     assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Running);
@@ -469,7 +469,7 @@ fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
 /// tracer died and which XNU reparented to launchd. Only a wait by launchd would hand it back.
 ///
 /// Mutant: the parent ignored: `Running`.
-#[test]
+#[skuld::test]
 fn an_echild_for_a_pid_orphaned_to_launchd_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
@@ -488,7 +488,7 @@ fn an_echild_for_a_pid_orphaned_to_launchd_is_foreign() {
 /// debug build and is `Gone` in a release build.
 ///
 /// Mutant: a failed parent read taken for a parent pid, and so for `Running`.
-#[test]
+#[skuld::test]
 fn an_echild_whose_parent_read_fails_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
@@ -512,7 +512,7 @@ fn an_echild_whose_parent_read_fails_is_foreign() {
 /// closes the parent read says so; a pid that is gone or unreadable is gone.
 ///
 /// Mutant: any `ECHILD` taken for `Running`; the closing read dropped.
-#[test]
+#[skuld::test]
 fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
@@ -541,7 +541,7 @@ fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
 /// A `Running` peek names a child of ours; if the pid now reads as another process, it is a reuse.
 ///
 /// Mutant: `Running` never checks the id.
-#[test]
+#[skuld::test]
 fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
     let mut b = Blocker::spawn();
     let unique = unique_of(b.shared.id());
@@ -562,7 +562,7 @@ fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
 /// With no id there is nothing to check an `ECHILD` against: it stays a reap.
 ///
 /// Mutant: `ECHILD` taken for `Running` whatever the id.
-#[test]
+#[skuld::test]
 fn an_echild_with_no_id_stays_foreign() {
     let (pid, _) = echild_yet_resolvable();
     assert_eq!(
@@ -574,7 +574,7 @@ fn an_echild_with_no_id_stays_foreign() {
 /// The kqueue wait does not read a held child as reaped: it is still running at its deadline.
 ///
 /// Mutant: the wait's peek without the id: `Gone`.
-#[test]
+#[skuld::test]
 fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() {
     use crate::wait::backend::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
@@ -588,7 +588,7 @@ fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() 
 /// The wait's verdict for a pid that reads as another process is `Gone`.
 ///
 /// Mutant: the wait ignores the id.
-#[test]
+#[skuld::test]
 fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
     use crate::wait::backend::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
@@ -602,7 +602,7 @@ fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
 /// foreign reap is `Foreign`): the holder waits again, and gets the exit.
 ///
 /// Mutant: `Gone` at once: the wait answers `ECHILD`.
-#[test]
+#[skuld::test]
 fn a_reap_that_finds_no_exit_record_after_reapable_waits_again() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -647,7 +647,7 @@ fn spawn_root_child() -> Option<(std::process::Child, std::process::ChildStdin)>
 /// `EPERM` as `PermissionDenied`, not an untyped error.
 ///
 /// Mutant: the identity read through the same-user `PROC_PIDTBSDINFO`: `ErrorKind::Other`.
-#[test]
+#[skuld::test]
 fn setuid_kill_of_a_root_child_is_permission_denied() {
     let Some((child, stdin)) = spawn_root_child() else {
         return;
@@ -670,7 +670,7 @@ fn setuid_kill_of_a_root_child_is_permission_denied() {
 /// wrapper's mapping turns into `Unkillable`.
 ///
 /// Mutant: as above.
-#[test]
+#[skuld::test]
 fn setuid_child_kill_is_permission_denied() {
     let Some(helper) = crate::test_privilege::setuid::setuid_helper() else {
         return;
@@ -715,7 +715,7 @@ fn adopt_exited_child_reading(read: UniqRead) -> Result<SharedChild, (crate::err
 /// another process's (a reuser), and stays for its own handle.
 ///
 /// Mutant: the id-less target: `try_wait` consumes the reuser's exit and reports it as ours.
-#[test]
+#[skuld::test]
 fn a_child_gone_at_adoption_never_consumes_by_bare_pid() {
     let shared = adopt_exited_child_reading(UniqRead::Gone).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
@@ -738,7 +738,7 @@ fn a_child_gone_at_adoption_never_consumes_by_bare_pid() {
 /// the child back untouched for the caller to tear down.
 ///
 /// Mutant: the adoption succeeds with no identity: a bare-pid consume.
-#[test]
+#[skuld::test]
 fn a_child_whose_identity_is_unreadable_at_adoption_is_not_adopted() {
     let (error, mut child) = match adopt_exited_child_reading(UniqRead::Refused(libc::EPERM)) {
         Ok(_) => panic!("adopted with no identity"),
@@ -753,7 +753,7 @@ fn a_child_whose_identity_is_unreadable_at_adoption_is_not_adopted() {
 /// `kqueue` wait's own peek.
 ///
 /// Mutant: the refused read handed back the id-less peek, which `try_reap` then consumes.
-#[test]
+#[skuld::test]
 fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();

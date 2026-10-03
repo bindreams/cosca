@@ -23,7 +23,7 @@ use crate::error::Error;
 /// Deleting it would have been silent: with the disjunct present this property holds trivially.
 /// Asserted here so that the day `ntfs_stream_names` stops yielding the piece that holds the last
 /// dot, the loss is a failure and not a quietly narrower gate.
-#[test]
+#[skuld::test]
 fn the_stream_reading_subsumes_the_shell_reading() {
     let mut missed = Vec::new();
     for_every_string(6, |probe| {
@@ -41,7 +41,7 @@ fn the_stream_reading_subsumes_the_shell_reading() {
 /// END TO END WITH THE PLATFORM FORCED — the whole Windows composition
 /// (`win32_effective_file_name` -> `is_batch_program`) on every lane, not just the two Windows
 /// ones.
-#[test]
+#[skuld::test]
 fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file() {
     use std::path::Path;
     for probe in [
@@ -185,7 +185,7 @@ fn reject_batch_path_on_windows_refuses_every_spelling_that_reaches_a_batch_file
 /// refused for the shape rather than for that danger. Either way the refusal costs nothing: with
 /// every named component popped away, what is left to resolve is a directory (the current one, an
 /// ancestor, a drive's current directory, a root), and a directory is never a loadable image.
-#[test]
+#[skuld::test]
 fn reject_batch_path_on_windows_refuses_a_path_that_names_no_file_of_its_own() {
     use std::path::Path;
     for probe in [
@@ -225,7 +225,7 @@ fn reject_batch_path_on_windows_refuses_a_path_that_names_no_file_of_its_own() {
 /// the executable — so handing out the wrong one is a bug even though the verdict is right.
 ///
 /// `x.bat\...\..` reaches `x.bat`: the interior `...` is a name the `..` pops.
-#[test]
+#[skuld::test]
 fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
     use std::path::Path;
     let detail = |probe: &str| match super::reject_batch_path_on(Path::new(probe), true) {
@@ -270,7 +270,7 @@ fn the_refusal_advises_the_fix_for_the_reason_it_refused() {
 /// Judging the shape alone — one unit and a colon — made the verdict depend on how
 /// long the name happens to be: `C:\bin\a:` was refused as "names no file" while `C:\bin\x.exe:`,
 /// the same spelling of the same thing, was accepted.
-#[test]
+#[skuld::test]
 fn a_drive_prefix_is_one_only_at_the_front_of_the_path() {
     use std::path::Path;
     // At the front: a bare drive prefix resolves to that drive's current directory, a name this
@@ -305,7 +305,7 @@ fn a_drive_prefix_is_one_only_at_the_front_of_the_path() {
 /// root. So `1:..` pops a current directory exactly as `C:..` does, and names a file this gate
 /// cannot see. A character outside the BMP is two units, so `Path[1]` is its low surrogate and the
 /// path is plain-relative: `𝒳:..` names the file `𝒳` through an empty stream.
-#[test]
+#[skuld::test]
 fn any_one_utf16_unit_before_a_colon_is_a_drive_prefix() {
     use std::path::Path;
     for probe in [
@@ -355,7 +355,7 @@ fn any_one_utf16_unit_before_a_colon_is_a_drive_prefix() {
 
 /// The same with a real lone surrogate, which only a Windows `OsStr` can carry.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_lone_surrogate_before_a_colon_is_a_drive_prefix() {
     use std::os::windows::ffi::OsStringExt;
     let wide: Vec<u16> = [0xD800].into_iter().chain(":..".encode_utf16()).collect();
@@ -384,7 +384,7 @@ fn a_lone_surrogate_before_a_colon_is_a_drive_prefix() {
 ///
 /// `..` is the one component that names nothing even here: no collapse happens, and the object
 /// manager rejects the literal name (measured: `ERROR_INVALID_NAME`). Refusing it costs nothing.
-#[test]
+#[skuld::test]
 fn a_verbatim_path_is_judged_the_way_std_judges_one() {
     use std::path::Path;
     // std's literal suffix test fires: these are the verbatim paths that reach cmd.exe.
@@ -472,7 +472,7 @@ fn a_verbatim_path_is_judged_the_way_std_judges_one() {
 /// NOTHING. Every spelling the Win32 half above refuses is listed here accepted, so a `win32`
 /// argument dropped on the floor — or a Win32 rule that leaked out of its branch — fails here
 /// rather than only on a Linux or macOS lane at spawn time.
-#[test]
+#[skuld::test]
 fn reject_batch_path_on_posix_refuses_nothing_but_a_nul() {
     use std::path::Path;
     for probe in [
@@ -510,7 +510,7 @@ fn reject_batch_path_on_posix_refuses_nothing_but_a_nul() {
 ///
 /// Asked of the Win32 verdict as data, so the wording is pinned from every host; the production
 /// leg below shows the loop is real on the host that has it.
-#[test]
+#[skuld::test]
 fn the_refusal_advises_a_route_that_is_not_itself_refused() {
     let err = super::reject_batch_path_on(std::path::Path::new("x.bat"), true)
         .expect_err("the first token of `commandline(\"x.bat --flag\")` is refused");
@@ -603,7 +603,7 @@ fn on_posix(token: &std::ffi::OsStr) -> Result<(), Error> {
 ///
 /// Pinned on the gate itself because the gate is the std backend's ONLY NUL check: an `Ok` here is
 /// a token the crate hands to `std::process` for its internals to catch or not.
-#[test]
+#[skuld::test]
 fn an_interior_nul_is_refused_on_the_win32_verdict_too() {
     let nul_then_bat = with_interior_nul("setup", ".bat");
     let bat_then_nul = with_interior_nul("setup.bat", "junk");
@@ -627,7 +627,7 @@ fn an_interior_nul_is_refused_on_the_win32_verdict_too() {
 /// `junk` names no file at all — there is nothing to truncate, no cmd.exe, and no CVE-2024-24576
 /// to audit — so the honest verdict is the NUL, and blaming batch escaping is the very
 /// misattribution the prefix rule exists to remove, one platform over.
-#[test]
+#[skuld::test]
 fn a_nul_bearing_program_is_diagnosed_as_a_nul_off_win32() {
     for token in [
         with_interior_nul("x.bat", "junk"),
@@ -653,7 +653,7 @@ fn a_nul_bearing_program_is_diagnosed_as_a_nul_off_win32() {
 /// precisely so both are reachable here. Both refuse the NUL, but each names its own reason — off
 /// Win32 nothing truncates, so citing the truncation would send a Linux caller to audit a platform
 /// they are not on.
-#[test]
+#[skuld::test]
 fn each_verdict_gives_the_nul_refusal_its_own_reason() {
     let bat_then_nul = with_interior_nul("x.bat", "junk");
     assert!(invalid_input_message(on_win32(&bat_then_nul)).contains("truncate"));
@@ -663,7 +663,7 @@ fn each_verdict_gives_the_nul_refusal_its_own_reason() {
 /// The WRAPPER, which none of the tests above reach: they spell `win32` out as data, so pinning
 /// [`super::reject_batch_path`]'s `cfg!(windows)` argument to `true` leaves every one of them
 /// green while POSIX callers get the Win32 diagnosis back.
-#[test]
+#[skuld::test]
 fn the_gate_wrapper_asks_for_this_hosts_verdict() {
     let bat_then_nul = with_interior_nul("setup.bat", "junk");
     let nul_then_bat = with_interior_nul("setup", ".bat");
@@ -686,7 +686,7 @@ fn the_gate_wrapper_asks_for_this_hosts_verdict() {
 /// The batch rule is a WIN32 verdict — why, in [`super::reject_batch_path_on`]'s doc. Both legs
 /// matter: the NUL arm above must not have swallowed the rule where it does apply, and the rule
 /// must not reach a host with no cmd.exe to blame.
-#[test]
+#[skuld::test]
 fn a_clean_batch_program_is_a_win32_verdict_only() {
     let token = std::ffi::OsString::from(r"C:\tools\setup.bat");
     assert!(unsupported_op(on_win32(&token)).contains("setup.bat"));
@@ -699,7 +699,7 @@ fn a_clean_batch_program_is_a_win32_verdict_only() {
 /// What makes that POSIX arm a correction rather than a preference: here `.bat` is an ordinary
 /// suffix, and the gate refused a command this host executes.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_posix_host_runs_its_own_executable_named_bat() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -736,7 +736,7 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
 /// The KIND is asserted on every host, not just off Win32: this token's extension is the one the
 /// batch rule could plausibly claim, so an `.expect_err` alone would be satisfied on a Windows run
 /// by the very misattribution the gate exists to prevent.
-#[test]
+#[skuld::test]
 fn the_std_backend_judges_the_program_token_the_caller_named() {
     let mut c = Command::new();
     c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
@@ -756,7 +756,7 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
 /// negative form, which cannot tell "refused for the right reason" from "not refused at all" —
 /// and what follows an `Ok` here is `std::process`, whose own NUL check is an internal of another
 /// crate for this one to be leaning on.
-#[test]
+#[skuld::test]
 fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
     let mut c = Command::new();
     c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
@@ -771,7 +771,7 @@ fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
 /// `x.bat ` is the sharper of the pair: Win32 strips the trailing space and reaches the batch
 /// file, so Windows must refuse it — while on POSIX it is an ordinary filename that must stay
 /// spawnable. A single expectation cannot satisfy both, so this kills both mutants.
-#[test]
+#[skuld::test]
 fn the_gate_wrapper_carries_the_hosts_verdict_into_the_win32_only_spellings() {
     use std::path::Path;
     let trailing_space = super::reject_batch_path(Path::new("x.bat "));
@@ -867,7 +867,7 @@ pub(super) fn verbatim_extension_rule_this_replaced(text: &str) -> bool {
 /// 2. Nothing refused on POSIX: `main` made the batch rule a Win32 verdict, and every probe here
 ///    is NUL-free, so the POSIX verdict has nothing left to say about any of them.
 /// 3. No batch suffix accepted on Windows: the property the whole gate exists for.
-#[test]
+#[skuld::test]
 fn the_gate_never_accepts_what_the_rule_it_replaced_refused() {
     let mut newly_accepted = Vec::new();
     let mut posix_refused = Vec::new();
@@ -905,7 +905,7 @@ fn the_gate_never_accepts_what_the_rule_it_replaced_refused() {
 /// a suffix rule applied to every stream piece of the final component, each trimmed of trailing
 /// dots and spaces. std's literal verbatim test passes `\\?\C:\t\x.bat.`, so refusing it is an
 /// over-refusal as far as std goes; how kernelbase reads it is unmeasured.
-#[test]
+#[skuld::test]
 fn a_normalised_batch_path_is_refused_by_suffix_on_every_stream_piece() {
     for p in [
         r"C:\t\.bat",
@@ -967,7 +967,7 @@ fn std_routed(args: &[&str], lines: &[&str]) -> Vec<(String, Command)> {
 /// std runs a batch file through cmd.exe once `GetFullPathNameW` has trimmed the name, and a
 /// `commandline()` tail reaches it unescaped, so these must be refused as they are on the raw route.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn the_std_route_refuses_a_batch_only_normalisation_exposes() {
     // Trailing dot; one trailing space; a file named `.bat`.
     for (via, c) in std_routed(&["x.bat.", "x.bat ", ".bat"], &["x.bat. a&b"]) {
@@ -979,7 +979,7 @@ fn the_std_route_refuses_a_batch_only_normalisation_exposes() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn the_std_route_accepts_an_exe_named_like_a_batch() {
     for (via, c) in std_routed(&["x.bat.exe", "tool.exe"], &["x.bat.exe a&b"]) {
         if let Err(e) = crate::child::spawn::build_std_command(&c) {

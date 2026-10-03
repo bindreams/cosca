@@ -19,7 +19,7 @@ fn treewalk_blocker() -> (crate::Child, std::io::PipeWriter) {
 /// The walk could not find the descendants, and killing the root first would reparent them out of
 /// any retry's reach: nothing is killed, the root included, and the error is returned. Mutant: "run
 /// the handle backstop after a snapshot failure".
-#[test]
+#[skuld::test]
 fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
     let (child, stdin) = treewalk_blocker();
     let forced = force_proc_view_once(ForcedView::Diverged);
@@ -36,7 +36,7 @@ fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
 }
 
 /// A retry once the view recovers finds the tree and kills it.
-#[test]
+#[skuld::test]
 fn kill_tree_succeeds_on_a_retry_after_the_view_recovers() {
     let (child, _stdin) = treewalk_blocker();
     let forced = force_proc_view_once(ForcedView::Diverged);
@@ -49,7 +49,7 @@ fn kill_tree_succeeds_on_a_retry_after_the_view_recovers() {
 /// `Drop` cannot retry, so it still kills the root through its handle, and says descendants may be
 /// orphaned. Mutant: "skip the root kill on a snapshot failure" (the root would outlive its
 /// handle).
-#[test]
+#[skuld::test]
 fn drop_over_an_untrusted_view_kills_the_root_and_warns_of_orphans() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
