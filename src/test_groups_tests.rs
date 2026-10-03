@@ -101,25 +101,48 @@ mod reexec {
     const NAMESPACES_TEST: &str =
         "wait::backend::linux_namespace_tests::namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working";
 
-    /// Re-execs this binary on exactly [`NAMESPACES_TEST`] with the group's variables set as given (`None` removes them).
-    fn run_namespaces_test(group: Option<&str>, consent: Option<&str>) -> (SuiteOutcome, bool, String) {
-        run_namespaces_test_with(&[], group, consent, None)
+    /// A real `ROOT` test: it needs a DAC bypass, so only a granted group may run it.
+    const ROOT_TEST: &str = "resolve::resolve_base_tests::a_denied_candidate_is_denied_by_an_exec_child";
+
+    /// A group under test: its real test, its variable and its label.
+    struct Case {
+        test: &'static str,
+        var: &'static str,
+        label: &'static str,
     }
 
-    /// [`run_namespaces_test`] with `extra` arguments, such as `--ignored`, and `SKULD_LABELS` set to `labels`.
-    fn run_namespaces_test_with(
+    const NAMESPACES: Case = Case {
+        test: NAMESPACES_TEST,
+        var: "COSCA_TEST_NAMESPACES",
+        label: "namespaces",
+    };
+    const ROOT: Case = Case {
+        test: ROOT_TEST,
+        var: "COSCA_TEST_ROOT",
+        label: "root",
+    };
+
+    /// Re-execs this binary on exactly the case's test with the group's variables set as given (`None` removes them).
+    fn run_case(case: &Case, group: Option<&str>, consent: Option<&str>) -> (SuiteOutcome, bool, String) {
+        run_case_with(case, &[], group, consent, None)
+    }
+
+    /// [`run_case`] with `extra` arguments, such as `--ignored`, and `SKULD_LABELS` set to `labels`.
+    fn run_case_with(
+        case: &Case,
         extra: &[&str],
         group: Option<&str>,
         consent: Option<&str>,
         labels: Option<&str>,
     ) -> (SuiteOutcome, bool, String) {
         let mut cmd = command(std::env::current_exe().expect("current_exe"));
-        cmd.args(["--test-threads=1", "--exact", NAMESPACES_TEST, NOCAPTURE]);
+        cmd.args(["--test-threads=1", "--exact", case.test, NOCAPTURE]);
         cmd.args(extra);
         with_json_events(&mut cmd);
+        let consent_var = format!("{}_CONSENT", case.var);
         for (var, value) in [
-            ("COSCA_TEST_NAMESPACES", group),
-            ("COSCA_TEST_NAMESPACES_CONSENT", consent),
+            (case.var, group),
+            (consent_var.as_str(), consent),
             ("SKULD_LABELS", labels),
         ] {
             match value {
@@ -136,10 +159,8 @@ mod reexec {
         )
     }
 
-    /// Mutant: the group's `requires` never fails, so `=0` runs the test.
-    #[skuld::test]
-    fn group_zero_reports_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test(Some("0"), Some("1"));
+    fn assert_group_zero_reports_ignored(case: &Case) {
+        let (outcome, success, stdout) = run_case(case, Some("0"), Some("1"));
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -153,52 +174,97 @@ mod reexec {
         assert!(success, "{stdout}");
     }
 
-    /// Mutant: the group's setup does not check consent (the body then runs where it may).
-    #[skuld::test]
-    fn unset_consent_fails() {
-        let (outcome, success, stdout) = run_namespaces_test(None, None);
+    fn assert_consent_refused(case: &Case, consent: Option<&str>) {
+        let (outcome, success, stdout) = run_case(case, None, consent);
         assert_eq!(outcome.failed, 1, "{stdout}");
         assert_eq!(outcome.passed + outcome.ignored, 0, "{stdout}");
         assert!(!success, "{stdout}");
-        assert!(stdout.contains("COSCA_TEST_NAMESPACES_CONSENT=1"), "{stdout}");
+        assert!(stdout.contains(&format!("{}_CONSENT=1", case.var)), "{stdout}");
     }
 
-    /// Mutant: any non-empty consent counts.
-    #[skuld::test]
-    fn consent_other_than_1_fails() {
-        let (outcome, success, stdout) = run_namespaces_test(None, Some("yes"));
-        assert_eq!(outcome.failed, 1, "{stdout}");
-        assert_eq!(outcome.passed + outcome.ignored, 0, "{stdout}");
-        assert!(!success, "{stdout}");
-        assert!(stdout.contains("COSCA_TEST_NAMESPACES_CONSENT=1"), "{stdout}");
-    }
-
-    /// Mutant: the setup grants a group that is off.
-    #[skuld::test]
-    fn group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"), None);
+    fn assert_zero_never_runs_the_body_under_run_ignored(case: &Case) {
+        let (outcome, success, stdout) = run_case_with(case, &["--ignored"], Some("0"), Some("1"), None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
         assert!(!success, "{stdout}");
-        // A body that ran would fail on `unshare` too (unprivileged), so `failed` alone proves nothing: only the
+        // A body that ran would fail on `unshare` or the DAC check too (unprivileged), so `failed` alone proves nothing: only the
         // test's own `failed` event carries the fixture's refusal. (The whole output cannot tell: skuld prints the
         // unavailable-test list after every run.)
         let failure = stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|event| event["type"] == "test" && event["event"] == "failed" && event["name"] == NAMESPACES_TEST)
+            .find(|event| event["type"] == "test" && event["event"] == "failed" && event["name"] == case.test)
             .unwrap_or_else(|| panic!("no `failed` event for the test: {stdout}"));
         let message = failure["stdout"].as_str().unwrap_or_default();
-        assert!(message.contains("setup failed: COSCA_TEST_NAMESPACES=0"), "{failure}");
+        assert!(message.contains(&format!("setup failed: {}=0", case.var)), "{failure}");
+    }
+
+    fn assert_label_selects(case: &Case) {
+        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), Some("1"), Some(case.label));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), Some("1"), Some(&format!("!{}", case.label)));
+        assert_eq!(outcome.test_count, 0, "{stdout}");
+    }
+
+    /// Mutant: the group's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn group_zero_reports_ignored() {
+        assert_group_zero_reports_ignored(&NAMESPACES);
+    }
+
+    /// Mutant: the group's setup does not check consent (the body then runs where it may).
+    #[skuld::test]
+    fn unset_consent_fails() {
+        assert_consent_refused(&NAMESPACES, None);
+    }
+
+    /// Mutant: any non-empty consent counts.
+    #[skuld::test]
+    fn consent_other_than_1_fails() {
+        assert_consent_refused(&NAMESPACES, Some("yes"));
+    }
+
+    /// Mutant: the setup grants a group that is off.
+    #[skuld::test]
+    fn group_zero_never_runs_the_body_under_run_ignored() {
+        assert_zero_never_runs_the_body_under_run_ignored(&NAMESPACES);
     }
 
     /// Mutant: the group's fixture carries no label, so `SKULD_LABELS=namespaces` selects none of its tests.
     #[skuld::test]
     fn the_group_label_selects_its_tests() {
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("namespaces"));
-        assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("!namespaces"));
-        assert_eq!(outcome.test_count, 0, "{stdout}");
+        assert_label_selects(&NAMESPACES);
+    }
+
+    /// Mutant: the `ROOT` row's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn root_group_zero_reports_ignored() {
+        assert_group_zero_reports_ignored(&ROOT);
+    }
+
+    /// Mutant: the `ROOT` setup does not check consent.
+    #[skuld::test]
+    fn root_unset_consent_fails() {
+        assert_consent_refused(&ROOT, None);
+    }
+
+    /// Mutant: any non-empty consent counts for `ROOT`.
+    #[skuld::test]
+    fn root_consent_other_than_1_fails() {
+        assert_consent_refused(&ROOT, Some("yes"));
+    }
+
+    /// Mutant: the `ROOT` setup grants a group that is off.
+    #[skuld::test]
+    fn root_group_zero_never_runs_the_body_under_run_ignored() {
+        assert_zero_never_runs_the_body_under_run_ignored(&ROOT);
+    }
+
+    /// Mutant: the `ROOT` fixture carries no label. The test drops the module default
+    /// (`labels = []`), so the fixture's label alone selects it.
+    #[skuld::test]
+    fn the_root_label_selects_its_tests() {
+        assert_label_selects(&ROOT);
     }
 }

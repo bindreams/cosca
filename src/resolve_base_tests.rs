@@ -1,6 +1,10 @@
 //! [`ResolveInput::cwd`]: which names need a base, and that `None` resolves those that do not.
 
 use super::*;
+#[cfg(unix)]
+use crate::test_groups::{root, Group};
+
+skuld::default_labels!(crate::test_harness::ROOT);
 
 #[skuld::test]
 fn absolute_names_by_grammar() {
@@ -539,13 +543,12 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
 /// An `execve` from the fixture must not give DAC bypass back. `test_privilege` sets
 /// `no_new_privs` for exactly that: without it, a uid-0 `execve` regains the capabilities from the
 /// bounding set (`capabilities(7)`, set-user-ID-root compatibility). The driver needs a DAC bypass
-/// for there to be anything to drop, root or not; see [`crate::test_privilege::root_tests_enabled`].
+/// for there to be anything to drop, root or not; see [`crate::test_privilege::assert_holds_dac_bypass`].
 #[cfg(unix)]
-#[skuld::test]
-fn a_denied_candidate_is_denied_by_an_exec_child() {
-    if !crate::test_privilege::root_tests_enabled() {
-        return;
-    }
+// `labels = []` drops the module's `ROOT` default, so the `root` fixture's own label selects this test.
+#[skuld::test(labels = [])]
+fn a_denied_candidate_is_denied_by_an_exec_child(#[fixture(root)] _group: &Group) {
+    crate::test_privilege::assert_holds_dac_bypass();
     crate::test_child::run_fixture(crate::test_child::fixture_path!(
         fixture_a_denied_candidate_is_denied_by_an_exec_child
     ));

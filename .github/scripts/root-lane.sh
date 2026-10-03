@@ -18,10 +18,11 @@ ${PREFIX:-} bash /repo/.github/scripts/root-lane-check.sh
 # The JUnit file is copied out of the container's nextest store afterwards, even when nextest failed.
 status=0
 # shellcheck disable=SC2086
-${PREFIX:-} cargo-nextest nextest run \
+${PREFIX:-} env SKULD_LABELS=root cargo-nextest nextest run \
     --archive-file /artifacts/root-lane.tar.zst \
     --workspace-remap /repo \
     --profile ci \
+    --no-tests=fail \
     -E "${PRIVILEGE_TESTS:?}" || status=$?
 if [[ -f /repo/target/nextest/ci/junit.xml ]]; then
     cp /repo/target/nextest/ci/junit.xml /junit-out/lane.xml

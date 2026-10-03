@@ -1,5 +1,7 @@
 //! Test-only child processes shared across the crate's unit tests.
 
+skuld::default_labels!(crate::test_harness::ROOT);
+
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaces;
 
