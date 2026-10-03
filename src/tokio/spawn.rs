@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
 #[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
 use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
@@ -126,7 +127,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(target_os = "linux")]
     let (std_cmd, handshake) =
         crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)?;
-    #[cfg(not(target_os = "linux"))]
+    // macOS: the child reports its own unique id before `exec`; see `unique_report`.
+    #[cfg(target_os = "macos")]
+    let (std_cmd, report) =
+        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::unique_report::register)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let std_cmd = build_std_command(cmd)?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
@@ -278,7 +283,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, child) = {
+    let (mut prepared, child, unique) = {
         let _guard = crate::child::spawn::spawn_lock();
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
@@ -288,6 +293,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
+        // Registered first (above), so `fd_map`'s `dup2` below cannot move the pipe from under it.
+        let report = report.open(&_guard)?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -310,15 +317,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard` at the top of this function"
         )]
-        let c = match tcmd.spawn().map_err(Error::Io) {
-            Ok(c) => c,
+        let (c, unique) = match report.run(|| tcmd.spawn().map_err(Error::Io)) {
+            Ok(spawned) => spawned,
             Err(e) => {
                 warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
                 return Err(e);
             }
         };
         drop(tcmd);
-        (prepared, c)
+        (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
     let (prepared, child) = {
@@ -421,13 +428,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let proc_handle = child
         .raw_handle()
         .expect("a freshly spawned tokio child has a raw handle");
-    // macOS: the unique id every by-pid signal to this child is checked against. It is read by pid
-    // alone, so a foreign reap and a reuse of the pid before it make it the stranger's id. A refused
-    // read leaves the backend with no id, so it acts on the pid never, and the spawn fails below
-    // once the backend exists.
+    // macOS: the unique id every by-pid signal to this child is checked against, which the child
+    // reported itself before `exec` (see `unique_report`), so it is the id of the process this
+    // spawn forked. A refused read leaves the backend with no id, so it acts on the pid never, and
+    // the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
-    let (identity, identity_refused) = match crate::signal::read_identity(pid) {
-        Ok(identity) => (identity, None),
+    let (identity, identity_refused) = match unique {
+        Ok(unique) => (Some(unique), None),
         Err(errno) => (None, Some(errno)),
     };
     // Built first so failure arms tear the child down through its handle, not its pid. A refused id
