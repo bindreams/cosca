@@ -414,8 +414,7 @@ pub(crate) async fn wait_tree_deadline(
 /// resolve the wait; its bytes were discarded when `suppress_drain` is false and left buffered
 /// when true). Never `Spurious`. A `#[cfg(test)]` thread-local installed by an RAII guard, like
 /// `wait::macos::test_hooks::HookGuard`, so no production signature carries it. It relies on a
-/// current-thread runtime (skuld's default): the future is polled on the installing
-/// thread.
+/// current-thread runtime: the future is polled on the installing thread.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod declined_hook {
     use std::cell::RefCell;
