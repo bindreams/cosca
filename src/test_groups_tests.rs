@@ -182,7 +182,18 @@ mod reexec {
         let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
-        assert_eq!(outcome.failed + outcome.ignored, 1, "{stdout}");
-        assert!(!success || outcome.ignored == 1, "{stdout}");
+        assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
+        assert!(!success, "{stdout}");
+        // Without `CAP_SYS_ADMIN` a body that ran would fail too, on `unshare`, so `failed` alone
+        // proves nothing. The test's own `failed` event carries the fixture's refusal, which cosca's
+        // `require_consent` words, only when setup stopped it. (The run's whole output does not
+        // tell: skuld lists the unavailable tests, with this text, after every run.)
+        let failure = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "test" && event["event"] == "failed" && event["name"] == NAMESPACES_TEST)
+            .unwrap_or_else(|| panic!("no `failed` event for the test: {stdout}"));
+        let message = failure["stdout"].as_str().unwrap_or_default();
+        assert!(message.contains("setup failed: COSCA_TEST_NAMESPACES=0"), "{failure}");
     }
 }
