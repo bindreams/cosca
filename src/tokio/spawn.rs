@@ -321,7 +321,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, child) = {
+    let (prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -422,8 +422,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         .raw_handle()
         .expect("a freshly spawned tokio child has a raw handle");
     // macOS: the unique id every by-pid signal to this child is checked against. It is read by pid
-    // alone, so a foreign reap and a reuse of the pid before it make it the stranger's id. A refused read leaves the backend with no id, so it acts on the
-    // pid never, and the spawn fails below once the backend exists.
+    // alone, so a foreign reap and a reuse of the pid before it make it the stranger's id. A refused
+    // read leaves the backend with no id, so it acts on the pid never, and the spawn fails below
+    // once the backend exists.
     #[cfg(target_os = "macos")]
     let (identity, identity_refused) = match crate::signal::read_identity(pid) {
         Ok(identity) => (identity, None),
@@ -432,7 +433,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // Built first so failure arms tear the child down through its handle, not its pid. A refused id
     // read leaves it id-less; the spawn fails below.
     #[cfg(target_os = "linux")]
-    let mut proc = {
+    let proc = {
         // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.
         let held_pidfd = held_pidfd.expect("a spawned child holds the pidfd its handshake opened");
         ProcSource::new(child, held_pidfd)
