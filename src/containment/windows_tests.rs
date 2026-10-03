@@ -415,6 +415,7 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
     let child = crate::test_spawn::spawn(
         crate::test_reexec::command(&exe)
             .args(crate::test_reexec::fixture_args(fixture))
+            .args(crate::test_reexec::JSON_FORMAT)
             .env(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped()),
@@ -428,12 +429,12 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
         "job-breakaway probe fixture failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status,
     );
-    assert!(
-        stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed;"),
-        "fixture exited 0 but its libtest banner shows something other than exactly one test run \
-         and passed — most likely the `--exact` filter matched ZERO tests, which libtest also \
-         exits 0 for:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-    );
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output.stdout) {
+        panic!(
+            "fixture exited 0 but did not run and pass exactly one test: {why}\n--- stdout ---\n{stdout}\n\
+             --- stderr ---\n{stderr}"
+        );
+    }
 }
 
 /// The child half of [`probe_agrees_with_an_independent_is_process_in_job_measurement`]: a no-op

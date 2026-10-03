@@ -23,6 +23,7 @@ pub(crate) fn run_fixture_output_within(
 ) -> Result<Output, Output> {
     let mut cmd = crate::test_reexec::command(program);
     super::configure_fixture_command(&mut cmd, fixture);
+    cmd.args(crate::test_reexec::JSON_FORMAT);
     cmd.env(marker_env, std::process::id().to_string());
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     output_within(child, bound)

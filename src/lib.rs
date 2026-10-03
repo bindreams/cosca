@@ -142,7 +142,12 @@ mod relayed_probe;
 mod test_child;
 
 #[cfg(test)]
+mod test_harness;
+
+#[cfg(test)]
 mod test_reexec;
+#[cfg(test)]
+mod test_reexec_tests;
 
 #[cfg(all(test, unix))]
 mod test_privilege;

@@ -2469,12 +2469,13 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
         let out = crate::test_spawn::output_captured(
             crate::test_reexec::command(std::env::current_exe().expect("this test binary"))
                 .args([NAME, "--exact", crate::test_reexec::NOCAPTURE, "--test-threads=1"])
+                .args(crate::test_reexec::JSON_FORMAT)
                 .env(INNER, "1"),
         )
         .expect("run the case alone");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            out.status.success() && stdout.contains("1 passed"),
+            out.status.success() && crate::test_reexec::suite_passed_exactly_one(&out.stdout).is_ok(),
             "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
