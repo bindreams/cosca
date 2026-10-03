@@ -433,7 +433,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // spawn forked. A refused read leaves the backend with no id, so it acts on the pid never, and
     // the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
-    let (identity, identity_refused) = match unique {
+    let (identity, identity_refused) = match crate::signal::read_identity(pid) { // MUTANT M6
+        Ok(u) => (u, None),
+        Err(errno) => (None, Some(errno)),
+    };
+    let _ = match unique {
         Ok(unique) => (Some(unique), None),
         Err(errno) => (None, Some(errno)),
     };

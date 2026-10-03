@@ -65,7 +65,7 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
 /// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
 /// A child's unique id by pid. Tests only: a spawned child reports its own before `exec` (see
 /// `child::spawn::unique_report`), and a by-pid read here could name a stranger that took the pid.
-#[cfg(all(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
     match uniq_info(pid, ReadPurpose::Adopt) {

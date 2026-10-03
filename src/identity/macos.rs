@@ -75,7 +75,6 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 pub(crate) enum ReadPurpose {
     /// The child's identity, read by pid at adoption (tests: production spawns take the child's
     /// own report).
-    #[cfg_attr(not(test), allow(dead_code, reason = "only the test-only by-pid read uses it"))]
     Adopt,
     /// The re-read just before a signal.
     Kill,
