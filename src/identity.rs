@@ -244,7 +244,7 @@ pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Err
     None
 }
 
-#[cfg(all(target_os = "linux", test, feature = "tokio"))]
+#[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::fault;
 
 /// The [`proc_view`] and fdinfo forcing seams.
