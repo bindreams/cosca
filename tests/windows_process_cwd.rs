@@ -88,7 +88,7 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 /// other falls back to the drive's root, and `GetFullPathNameW` then rewrites `=X:` to it.
 ///
 /// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
-/// session, so it is the `DRIVE_MAPPING` group (`src/test_groups.rs`).
+/// session, so it is the `DRIVE_MAPPING` group (`src/test_group_rules.rs`).
 #[skuld::test]
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[fixture(drive_mapping)] _group: &Group) {
     let report = probe("drive-dir", env!("CARGO_BIN_EXE_cosca_testbin_image"));
@@ -263,7 +263,7 @@ mod drive_mapping_group {
     }
 }
 
-#[path = "../src/test_groups.rs"]
+#[path = "../src/test_group_rules.rs"]
 mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;

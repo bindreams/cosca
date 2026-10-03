@@ -6,7 +6,7 @@
 //! /bin/sh with the privilege clause removed, plus an `osacompile` parse of the
 //! unmodified elevated script.
 //!
-//! Live elevation tier: the `ELEVATION` group (`src/test_groups.rs`, principle 10). It is on unless
+//! Live elevation tier: the `ELEVATION` group (`src/test_group_rules.rs`, principle 10). It is on unless
 //! `COSCA_TEST_ELEVATION=0`, it needs `COSCA_TEST_ELEVATION_CONSENT=1`, and `SKULD_LABELS=elevation`
 //! selects it. Run where elevation cannot work, a test fails; none returns early. The pure tiers cover
 //! all logic unconditionally; only the privilege-gain (and the cross-process controlling-terminal
