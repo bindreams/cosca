@@ -5,7 +5,7 @@ use crate::test_groups::{setuid, Group};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
-// Selection only: `SKULD_LABELS=setuid` selects this module wholesale.
+// Selection only.
 skuld::default_labels!(crate::test_harness::SETUID);
 
 struct Helper {

@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-// Selection only: `SKULD_LABELS=setuid` selects this module wholesale.
+// Selection only.
 skuld::default_labels!(crate::test_harness::SETUID);
 
 const LINUX: &str = "Linux";

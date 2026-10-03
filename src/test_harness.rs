@@ -12,7 +12,7 @@ pub const NAMESPACES: skuld::Label;
 #[skuld::label]
 pub const DRIVE_MAPPING: skuld::Label;
 
-/// Selects the tests that run a setuid-root copy of `cosca_testbin` (the `SETUID` group).
+/// Selects the `SETUID` group's tests.
 #[skuld::label]
 pub const SETUID: skuld::Label;
 

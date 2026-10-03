@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 
 const HELPER: &str = "COSCA_TEST_SETUID_HELPER";
 
-/// The helper's path. A test calls this only after taking the `SETUID` fixture, which has checked
-/// the group's switch and consent.
+/// The helper's path. Call it only from a test that joined the `SETUID` group.
 ///
 /// # Panics
 /// As [`check_helper`] does.
