@@ -127,8 +127,10 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
 /// A failed kill in the async spawn's error teardown is not waited on, and EPERM — a setuid
 /// child refusing SIGKILL — is not asserted, because it is reachable without a bug; any other
 /// kind is. The child is left alive, blocked on stdin, and exits when the failed spawn drops the
-/// pipe's parent end; tokio's own `Child` drop hands it to the runtime's orphan reaper, which the
-/// test drives until the child is reaped.
+/// pipe's parent end. macOS: tokio's own `Child` drop hands it to the runtime's orphan reaper,
+/// which the test drives until the child is reaped. Linux: tokio's `Child` is forgotten and the
+/// child goes to the pidfd teardown (the seam refuses only the first kill), so it is reaped through
+/// its pidfd and never released to tokio's by-pid reap.
 #[test]
 fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
     use crate::stdio::Stdio;
@@ -164,12 +166,12 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
         if let Ok(err) = outcome {
             err.expect("the forced arm must fail the spawn");
         }
-        // Asserted before the driver below, which only ends when tokio's orphan queue reaps the
-        // child: a refused kill must have handed it to tokio, not forgotten it.
+        // Asserted before the driver below. macOS: the driver only ends when tokio's orphan queue
+        // reaps the child, so a refused kill must have handed it to tokio. Linux: it must not have.
         assert_eq!(
             releases.get(),
-            1,
-            "{kind:?}: the refused-kill arm must release the child to tokio exactly once"
+            usize::from(!cfg!(target_os = "linux")),
+            "{kind:?}: the refused-kill arm releases the child to tokio exactly when there is no pidfd"
         );
         let captured = fault::take_captured().expect("seam captured the child's identity");
         drive_until_reaped(&runtime, &captured);
