@@ -252,6 +252,7 @@ pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
+    #[cfg(test)]
     pub(crate) fn holds_verdict_to_take(&self) -> bool {
         self.report.is_some()
     }
