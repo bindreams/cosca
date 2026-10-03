@@ -25,6 +25,12 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 filter = 'test(/tokio::wait::wait_tests::(cancel_event_|grace_wait_windows_)/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
+# A broken cancel-event release leaves the test runtime's drop joining a `Duration::MAX` watcher,
+# so this bound fails the test instead of letting it hang.
+[[profile.default.overrides]]
+filter = 'binary(tokio_control) & test(=async_graceful_tree_cancel_does_not_escalate_on_windows)'
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+
 [profile.ci]
 fail-fast = false
 # Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.
