@@ -134,12 +134,12 @@ def commands(args: argparse.Namespace, t: Target, release: bool) -> list[list[st
 
 
 def execute(cmd: list[str], conf_dir: Path) -> Run:
-    # A compiler cache in front of clippy-driver (CI sets RUSTC_WRAPPER=sccache; cargo config can
-    # set build.rustc-wrapper) replays no lints, so both are overridden with an empty wrapper.
+    # A compiler cache (RUSTC_WRAPPER=sccache, as CI sets it) stays in front of rustc and clippy-driver.
+    # sccache 0.18.0 cannot cache a `clippy-driver rustc ...` call (its argument parser sees multiple
+    # inputs), so workspace crates always compile; only dependencies are served from the cache. A
+    # finding is a compile error, which is never cached either.
     env = {
         **os.environ,
-        "RUSTC_WRAPPER": "",
-        "CARGO_BUILD_RUSTC_WRAPPER": "",
         "CLIPPY_CONF_DIR": str(conf_dir),
         "RUSTC_WORKSPACE_WRAPPER": "clippy-driver",
     }

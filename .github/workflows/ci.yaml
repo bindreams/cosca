@@ -41,7 +41,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured: 492 s, 714 s and 732 s in three runs. 25 min is 2.0x the slowest.
+    # Measured: 192 s to 242 s in three runs since the libtest guard left it. 25 min is 6x the slowest, a failure bound for a hang.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -63,7 +63,10 @@ jobs:
 
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
+      # The libtest guard hook is skipped: the Test job runs it, per target and over the feature powerset.
       - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2
+        env:
+          SKIP: libtest-guard
         with:
           prek-version: 0.5.3
 
@@ -137,78 +140,30 @@ jobs:
         shell: bash
         run: .github/scripts/clippy.sh --feature-powerset --release
 
-  # The libtest guard runs inside clippy.sh for a lane's own architecture. This job checks the other
-  # one. It is a job of its own because on Windows and macOS the guard compiles the whole lib for every
-  # feature combination, which pushed the test job past its bound.
-  libtest-guard:
-    name: Libtest guard (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            runner: ubuntu-latest
-            other: aarch64-unknown-linux-gnu
-          - os: windows
-            runner: windows-latest
-            other: aarch64-pc-windows-msvc
-          - os: darwin
-            runner: macos-latest
-            other: x86_64-apple-darwin
-    runs-on: ${{ matrix.runner }}
-    # Measured, at most: 672 s (linux), 1050 s (windows), 684 s (darwin). 40 min is 2.3x the slowest, a
-    # failure bound for a hang.
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          components: clippy
-          targets: ${{ matrix.other }}
-
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-hack@0.6.45
-
-      - name: Install the aarch64 Linux cross compiler
-        if: matrix.os == 'linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
-      - uses: ./.github/actions/libtest-guard-other-arch
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        with:
-          target: ${{ matrix.other }}
-        # The guard and its self-test took 1002 s at most (windows); 35 min is 2.1x that.
-        timeout-minutes: 35
-
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
+        # `other` is the OS's other architecture: the libtest guard's self-test compiles for it.
         include:
           - os: linux
             arch: amd64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            other: x86_64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: darwin
             arch: arm64
             runner: macos-latest
             target: aarch64-apple-darwin
+            other: x86_64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
             # This is the one darwin lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
@@ -217,11 +172,13 @@ jobs:
             arch: amd64
             runner: macos-15
             target: x86_64-apple-darwin
+            other: aarch64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: windows
             arch: amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            other: aarch64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
             # This is the one Windows lane that also runs the feature-powerset
             # Clippy step below; see there for why one arch stands in for both.
@@ -230,12 +187,13 @@ jobs:
             arch: arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            other: x86_64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # The slowest lane is windows/amd64: 1654 s at most. Its two Clippy steps, which also run the guard,
-    # add ~6 s per flipped integration-test target; projected <= 1800 s after the remaining flips (T3,
-    # T5). 50 min is 1.7x that. All lanes share this bound.
+    # The slowest lanes are darwin/amd64 (1902 s at most) and windows/amd64 (1888 s), each with the
+    # libtest guard (313-877 s) and its self-test (55-248 s). The guard adds ~6 s per flipped
+    # integration-test target. 50 min is 1.6x the slowest. All lanes share this bound.
     timeout-minutes: 50
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
@@ -249,15 +207,19 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
         with:
-          targets: ${{ matrix.target }}
-          # see Clippy (feature powerset) step below for why only the
-          # matrix.lint lanes get the component
-          components: ${{ matrix.lint && 'clippy' || '' }}
+          targets: ${{ matrix.target }},${{ matrix.other }}
+          # The libtest guard runs clippy-driver on every lane; the Clippy steps only on the matrix.lint ones.
+          components: clippy
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-hack@0.6.45
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -602,6 +564,29 @@ jobs:
             "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" -E "binary(group_teardown_setuid) & test(=kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
+
+      # The libtest guard (.github/scripts/libtest_guard.py) checks that the test suite is complete: no
+      # built-in `#[test]` in a `harness = false` target, where it would silently never run. It runs
+      # on every lane, not once per OS like the Clippy steps: a test gated on `target_arch` is only
+      # seen when the guard compiles for that architecture. Both profiles, over the feature powerset.
+      #
+      # Placed after every test step, just before the JUnit upload: a guard failure must not skip the
+      # Linux-only steps above, which have no `!cancelled()` (the Clippy steps' rationale). Its debug
+      # library units are the ones `Build tests` built, and its type-checked test targets the ones
+      # Clippy checked, so cargo reuses them. `!cancelled()`: reported even after an earlier failure.
+      - name: Libtest guard
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: uv run --script .github/scripts/libtest_guard.py --feature-powerset --both-profiles --target "$TARGET"
+
+      # Runs the guard on .github/fixtures/libtest-guard, natively and for `matrix.other`, behind a
+      # private sccache on a cold and then a warm cache.
+      - name: Test the libtest guard
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: uv run --script .github/scripts/libtest_guard_tests.py
 
       - name: Upload JUnit
         if: ${{ !cancelled() }}
