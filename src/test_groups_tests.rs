@@ -155,7 +155,7 @@ mod reexec {
     /// Mutant: the group's `requires` never fails, so `=0` runs the test.
     #[skuld::test]
     fn group_zero_reports_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test(Some("0"), Some("1"));
+        let (outcome, success, stdout) = run_namespaces_test(Some("0"), None);
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -192,7 +192,7 @@ mod reexec {
     /// Mutant: the setup grants a group that is off.
     #[skuld::test]
     fn group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), None, None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
@@ -212,9 +212,9 @@ mod reexec {
     /// Mutant: the group's fixture carries no label, so `SKULD_LABELS=namespaces` selects none of its tests.
     #[skuld::test]
     fn the_group_label_selects_its_tests() {
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("namespaces"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("!namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("!namespaces"));
         assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }
