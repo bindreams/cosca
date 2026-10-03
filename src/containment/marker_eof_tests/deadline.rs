@@ -76,7 +76,7 @@ fn block_until_marker_ready_again(fd: BorrowedFd<'_>) {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_quiet_live_holder_resolves_in_one_real_blocking_kevent_call() {
     // A live holder that never writes must resolve the bounded wait in exactly ONE real,
     // blocking `kevent` call; the call count is what catches a busy-poll, not a CPU-time
@@ -106,7 +106,7 @@ fn a_quiet_live_holder_resolves_in_one_real_blocking_kevent_call() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn block_until_drained_never_returns_before_a_real_deadline() {
     // The never-early half of the deadline contract: cosca promises it never reports a
     // verdict before the deadline (a `now >= deadline` check on a monotonic clock), and never
@@ -140,7 +140,7 @@ fn block_until_drained_never_returns_before_a_real_deadline() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
     // The structural half of the deadline contract, proven without any wall-clock upper-bound
     // assertion (cosca promises none): a frozen clock makes round 0's requested timeout
@@ -249,7 +249,7 @@ fn a_sustained_writer_is_checked_against_the_deadline_every_round() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn an_event_that_arrives_after_the_clock_moves_past_the_deadline_mid_round_does_not_drain() {
     // The gap the test above cannot reach: there, the clock moves BEFORE round 1's own
     // `remaining(deadline)` is computed, so the pre-call `already_elapsed` sample is already
@@ -297,7 +297,7 @@ fn an_event_that_arrives_after_the_clock_moves_past_the_deadline_mid_round_does_
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn a_spurious_ok0_under_a_frozen_clock_retries_until_the_clock_advances() {
     // No other test exercises `block_on_kqueue`'s own defensive branch: `Ok(0)` with
     // `remaining(deadline)` still non-zero (see that function's own doc for why it exists — a
@@ -345,7 +345,7 @@ fn a_spurious_ok0_under_a_frozen_clock_retries_until_the_clock_advances() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     // The unbounded counterpart to the quiet-holder test above: with `deadline: None` there is
     // no caller-supplied bound to pay a per-round drain against, so this wait must not drain
@@ -437,7 +437,7 @@ fn an_unbounded_wait_against_a_sustained_writer_blocks_without_spending_cpu() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
     // White-box proof `arm` requests `EV_CLEAR`: a level that crossed the clamp once and has
     // stayed there ever since, unchanged and undrained, must not re-fire.
@@ -473,7 +473,7 @@ fn arm_sets_ev_clear_so_a_repeated_poll_without_a_new_edge_reports_nothing() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn interpret_read_event_suppresses_drain_when_told_to() {
     // White-box: `suppress_drain = true` must never consume bytes, exercised with a real event.
     let cap = measure_pipe_capacity();
@@ -504,7 +504,7 @@ fn interpret_read_event_suppresses_drain_when_told_to() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn probe_never_drains_even_past_the_low_water_clamp() {
     // `probe` is itself a check AT expiry (principle 13); this fills the pipe in-process BEFORE
     // the holder child exists, so there's no race with an external writer to call `probe` too

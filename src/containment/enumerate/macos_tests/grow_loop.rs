@@ -16,7 +16,7 @@ fn kernel_with(total: usize) -> impl FnMut(&mut [libc::c_int]) -> std::io::Resul
     }
 }
 
-#[test]
+#[skuld::test]
 fn grows_until_the_buffer_is_not_the_limit() {
     // The starting capacity was 4 but 100 pids are there: the first fill saturates, and a
     // saturated answer must not be believed. 4 -> 8 -> ... -> 128 is 6 fills.
@@ -29,7 +29,7 @@ fn grows_until_the_buffer_is_not_the_limit() {
     assert_eq!(filled.rounds, 6, "each saturated fill doubles the buffer and retries");
 }
 
-#[test]
+#[skuld::test]
 fn one_round_when_the_first_buffer_has_room() {
     let filled = collect_pids(16, kernel_with(3), allocate_pids).expect("fill succeeds");
     assert_eq!(
@@ -40,7 +40,7 @@ fn one_round_when_the_first_buffer_has_room() {
     assert_eq!(filled.rounds, 1, "a buffer with room needs no retry");
 }
 
-#[test]
+#[skuld::test]
 fn a_failing_fill_is_an_error_not_a_short_list() {
     let err = collect_pids(
         16,
@@ -55,7 +55,7 @@ fn a_failing_fill_is_an_error_not_a_short_list() {
 /// `libc::c_int::MAX` pids already overflows the `int` size argument on the very first
 /// `allocate_pids` call, before `collect_pids` ever reaches `cap *= 2`. The doubling-then-
 /// refusal path is pinned separately, in `doubling_then_refusal_ends_in_an_error`.
-#[test]
+#[skuld::test]
 fn an_immediate_overflow_ends_in_an_error_without_allocating() {
     let err = collect_pids(libc::c_int::MAX as usize, |buf| Ok(buf.len()), allocate_pids)
         .expect_err("a pid count this large cannot be described in the size argument");
@@ -82,7 +82,7 @@ fn allocate_with_ceiling(limit: usize) -> impl FnMut(usize) -> std::io::Result<V
 /// The doubling-then-refusal path: several successful grow rounds, THEN a refusal - distinct
 /// production control flow from the immediate round-1 overflow above. 4 -> 8 -> 16 -> 32 ->
 /// 64 all succeed against the ceiling of 100; 128 does not.
-#[test]
+#[skuld::test]
 fn doubling_then_refusal_ends_in_an_error() {
     let err = collect_pids(4, |buf| Ok(buf.len()), allocate_with_ceiling(100))
         .expect_err("a ceiling crossed after several successful rounds must still be an error");
@@ -96,7 +96,7 @@ fn doubling_then_refusal_ends_in_an_error() {
 /// pinned directly via the injected `allocate` step, since a real `try_reserve_exact` cannot
 /// be made to fail deterministically without genuine memory pressure (see `allocate_pids`'s
 /// own doc).
-#[test]
+#[skuld::test]
 fn a_failing_allocation_is_an_error_not_an_abort() {
     let err = collect_pids(
         16,
@@ -117,7 +117,7 @@ fn a_failing_allocation_is_an_error_not_an_abort() {
 /// same non-termination hazard the `cap == 0` entry guard prevents, reached from inside the
 /// loop instead. Two shapes of "does not grow": empty every round, and a fixed nonzero
 /// length that ignores `cap` after the first round.
-#[test]
+#[skuld::test]
 fn an_allocate_returning_an_empty_buffer_is_an_error_not_an_infinite_loop() {
     let err = collect_pids(4, |buf| Ok(buf.len()), |_cap| Ok(Vec::new()))
         .expect_err("an empty buffer for a nonzero capacity cannot make progress");
@@ -127,7 +127,7 @@ fn an_allocate_returning_an_empty_buffer_is_an_error_not_an_infinite_loop() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_allocate_that_ignores_cap_is_an_error_not_an_infinite_loop() {
     // Always returns 4 slots regardless of the requested cap - saturates every round
     // (`written == n == 4`), so the loop would spin forever on `cap = n * 2` alone.
@@ -142,7 +142,7 @@ fn an_allocate_that_ignores_cap_is_an_error_not_an_infinite_loop() {
 /// A `fill` cannot legitimately report more pids written than the buffer it was handed -
 /// that is a contract violation, not saturation, and must be loud rather than silently
 /// folded into "ask again with more room".
-#[test]
+#[skuld::test]
 fn a_fill_reporting_more_than_the_buffer_holds_is_an_error() {
     let err = collect_pids(4, |buf| Ok(buf.len() + 1), allocate_pids)
         .expect_err("written > n must not be treated as saturation");
@@ -153,7 +153,7 @@ fn a_fill_reporting_more_than_the_buffer_holds_is_an_error() {
 }
 
 /// See `collect_pids`'s doc for why `cap == 0` is refused rather than looped on.
-#[test]
+#[skuld::test]
 fn a_zero_capacity_is_an_error_not_an_infinite_loop() {
     let err = collect_pids(0, |_| Ok(0), allocate_pids).expect_err("a zero-capacity buffer cannot make progress");
     assert!(

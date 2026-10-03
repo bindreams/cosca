@@ -35,7 +35,7 @@ fn await_zombie(pid: u32) {
 use crate::test_child::{await_member_ready, member_command};
 
 /// A group we lead lists the member we put in it, with a token that resolves to Alive.
-#[test]
+#[skuld::test]
 fn members_lists_a_live_owned_group() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
@@ -56,7 +56,7 @@ fn members_lists_a_live_owned_group() {
 /// Once the leader has exited unreaped, the kernel still lists it in the group,
 /// and its token must resolve to Dead (zombie) — the state that makes an EPERM
 /// answer meaningless.
-#[test]
+#[skuld::test]
 fn members_marks_an_unreaped_leader_as_dead() {
     use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
@@ -90,7 +90,7 @@ fn members_marks_an_unreaped_leader_as_dead() {
 /// real pid/pgid is ever allocated anywhere near it — `kern.maxproc`/`pid_max` stay far
 /// below `2^31` on every real system), so this is a fixed value, not a scan, and the
 /// assertion is a genuine independent check rather than a restatement of the fixture.
-#[test]
+#[skuld::test]
 fn members_of_an_absent_group_is_empty() {
     assert_eq!(members(i32::MAX).expect("list an absent group"), vec![]);
 }
@@ -100,7 +100,7 @@ fn members_of_an_absent_group_is_empty() {
 /// comparing like with like. (macOS: pinned across `proc_pidinfo` and `sysctl` by the
 /// existing `kinfo_tests` cross-source oracle; this test pins the listing itself against
 /// `ProcessId::of`'s live read, on both platforms.)
-#[test]
+#[skuld::test]
 fn members_token_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
@@ -122,7 +122,7 @@ fn members_token_matches_a_live_read_of_the_same_pid() {
 
 /// A group we own holds no refusers once SIGKILLed — and `state` really did deliver the
 /// signal, not just classify: the leader is dead afterward.
-#[test]
+#[skuld::test]
 fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -146,7 +146,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
 
 /// A group whose only member is our own unreaped zombie is cleared: there is nothing left
 /// running. This is the benign case macOS reports as EPERM.
-#[test]
+#[skuld::test]
 fn state_of_an_all_zombie_group_is_cleared() {
     use std::os::unix::process::CommandExt;
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
@@ -166,7 +166,7 @@ fn state_of_an_all_zombie_group_is_cleared() {
 /// identically from its answer — the fix for a guard-then-do inversion review caught
 /// (`classify_member`'s own doc comment has the full account). `Reached::Unknown` still needs
 /// a real permission-denying host (`hidepid`) to construct for real; exercised here directly.
-#[test]
+#[skuld::test]
 fn classify_member_is_total_over_liveness_and_reached() {
     use super::{classify_member, MemberOutcome, Reached};
     use crate::identity::Liveness;
@@ -197,7 +197,7 @@ fn classify_member_is_total_over_liveness_and_reached() {
 /// `Survivor` carries (see this function's own doc comment for why `Unknown` and `Dead` are
 /// not equivalent here). `NotASurvivor`/`Unassessable` pass through untouched (the panicking
 /// closure proves no second check runs for them at all — there is nothing to reconfirm).
-#[test]
+#[skuld::test]
 fn reconfirm_survivor_downgrades_only_on_dead() {
     use super::{reconfirm_survivor, MemberOutcome};
     use crate::identity::Liveness;
@@ -231,7 +231,7 @@ fn reconfirm_survivor_downgrades_only_on_dead() {
 /// `decide`'s pure priority ordering, isolated from any real listing: a known refusal beats
 /// an unresolved member, which beats a clean group — and neither a refuser nor an
 /// unassessable member is ever silently dropped when both are present at once.
-#[test]
+#[skuld::test]
 fn decide_prioritizes_refused_over_unassessable_over_cleared() {
     use super::{decide, GroupState};
 
@@ -263,7 +263,7 @@ fn decide_prioritizes_refused_over_unassessable_over_cleared() {
 /// `excluded_from_sigkill_resend`'s pure predicate, isolated from any real listing or signal:
 /// pid 1 is excluded regardless of `system`, a `system`-flagged pid is excluded regardless of
 /// its number, and an ordinary user pid is excluded by neither rule.
-#[test]
+#[skuld::test]
 fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
     use super::excluded_from_sigkill_resend;
 
@@ -293,7 +293,7 @@ fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
 ///
 /// **`reachable` is asked directly of the kernel, not derived from a hand-reconstructed
 /// permission rule.**
-#[test]
+#[skuld::test]
 fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable() {
     let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(1)))
         .expect("pid 1 has a process group")
@@ -335,7 +335,7 @@ fn pid1_uid() -> u32 {
 /// Mutants: the op is another `PidfdOp`; the forced errno is not consumed (no fallback, so no
 /// line).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
@@ -370,7 +370,7 @@ fn a_refused_pidfd_open_falls_back_to_kill_naming_group_teardown() {
 /// Mutants: the `Io` arm of the fallback is `Reached::Unknown`; the `Io` context drops
 /// `pidfd_open:`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
@@ -398,7 +398,7 @@ fn a_transient_pidfd_open_failure_falls_back_to_kill_naming_the_syscall() {
 /// `pid` argument is a disposable child, so a regression that fell back would land on it, never on
 /// this test process.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     use crate::containment::cgroup::test_support::{block_on, fork_running};
 
@@ -438,7 +438,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
 /// here, so the listing is an error naming the view, never an answer about `pgid`. Mutant:
 /// "scan `/proc` by path whatever the view".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_is_an_error_when_the_proc_view_is_diverged() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _forced = force_proc_view_once(ForcedView::Diverged);
@@ -447,7 +447,7 @@ fn members_is_an_error_when_the_proc_view_is_diverged() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _forced = force_proc_view_once(ForcedView::Unassessable);
@@ -459,7 +459,7 @@ fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
 /// `Unsupported`, naming the requirement, as a spawn does. Mutant: "surface every unreadable view
 /// as `io::Error::other`".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_without_openat2_is_unsupported_naming_the_requirement() {
     use crate::identity::proc_view_fault::force_openat2_errno;
     for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
@@ -482,7 +482,7 @@ fn members_without_openat2_is_unsupported_naming_the_requirement() {
 /// Any other `openat2` failure is not the requirement: it keeps its kind and does not claim
 /// `openat2` is missing. Mutant: "flag every `/proc` open failure as missing `openat2`".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_with_another_openat2_failure_is_not_unsupported() {
     use crate::identity::proc_view_fault::force_openat2_errno;
     let forced = force_openat2_errno(rustix::io::Errno::NOENT);
@@ -499,7 +499,7 @@ fn members_with_another_openat2_failure_is_not_unsupported() {
 /// The pgid matches nothing, so the honest answer is an empty listing. Mutant: "propagate every
 /// read error".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
         let _forced = super::fault::force_stat_read(errno, None);
@@ -512,7 +512,7 @@ fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
 /// error naming the pid and the errno. Mutant: "exclude every read error" (the group reads as
 /// `Cleared` while alive; EMFILE from a full fd table hits every pid at once).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
     for errno in [
         libc::EXDEV,
@@ -545,7 +545,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 /// the checked directory answering afterwards tells them apart: if it refuses too, this is a
 /// refusal, not a hidden pid. Mutant: "exclude EPERM without the re-check".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn members_is_an_error_for_eperm_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
         let _forced = super::fault::force_stat_read(libc::EPERM, Some(recheck));

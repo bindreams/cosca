@@ -25,7 +25,7 @@ const ABSENT_PID: u32 = (1 << 22) + 1;
 /// "no such process" must not read as "not in the leaf".
 ///
 /// Mutant: `holds_via` maps a failed read to `Ok(false)`.
-#[test]
+#[skuld::test]
 fn holds_via_an_absent_pid_is_the_reads_own_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf = pathed_leaf(&dir);
@@ -38,7 +38,7 @@ fn holds_via_an_absent_pid_is_the_reads_own_error() {
 }
 
 /// A view with no OS error behind it (forced) keeps the kind `Other` and has no source.
-#[test]
+#[skuld::test]
 fn holds_under_an_unassessable_view_without_an_os_error_has_no_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf = pathed_leaf(&dir);
@@ -53,7 +53,7 @@ fn holds_under_an_unassessable_view_without_an_os_error_has_no_source() {
 /// A `Diverged` view is an error naming the outer pid namespace.
 ///
 /// Mutant: `holds` reads without the view check.
-#[test]
+#[skuld::test]
 fn holds_under_a_diverged_view_is_an_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf = pathed_leaf(&dir);
@@ -65,7 +65,7 @@ fn holds_under_a_diverged_view_is_an_error() {
 /// A member in a cgroup nested under the leaf is in the leaf.
 ///
 /// Mutant: `holds_via` compares the member's path to the leaf's for equality.
-#[test]
+#[skuld::test]
 fn cgroup_holds_via_counts_a_member_nested_under_the_leaf() {
     use crate::containment::cgroup::test_support::occupied_leaf;
     use crate::containment::TreeDrain;

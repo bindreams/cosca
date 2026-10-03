@@ -53,7 +53,7 @@ fn walks() -> [(&'static str, Walk); 4] {
 
 /// Mutant: "`process_parents` yields an empty snapshot when the view is not `Same`", or "signal
 /// the root, then return the error": the walk reports success, or kills the root.
-#[test]
+#[skuld::test]
 fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         for (view, cause) in views() {
@@ -73,7 +73,7 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
 /// Without `openat2` every walk errors `Unsupported` naming the requirement, and signals nothing.
 /// Mutants: "map the snapshot's error to `Unassessable`" in `hard_kill`, `terminate`, or the
 /// snapshot itself.
-#[test]
+#[skuld::test]
 fn every_walk_without_openat2_is_unsupported_naming_it() {
     for (name, walk) in walks() {
         for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
@@ -94,7 +94,7 @@ fn every_walk_without_openat2_is_unsupported_naming_it() {
 
 /// `parent` and `children` are `Unsupported` naming `openat2`, never "none". Mutant: "map the
 /// error to `Ok(None)` / `Ok(vec![])`".
-#[test]
+#[skuld::test]
 fn parent_and_children_without_openat2_are_unsupported_naming_it() {
     let me = crate::Process::from_id(ProcessId::current());
     for (errno, code) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
@@ -131,7 +131,7 @@ fn queries() -> [(&'static str, Query); 3] {
 /// The snapshot is the first view read, so the anchor that follows it vouches for the pid across
 /// the whole snapshot. Mutant: "the anchor is checked before the snapshot" - the forced view lands
 /// on the anchor and the error blames the wrong read.
-#[test]
+#[skuld::test]
 fn parent_and_children_take_the_snapshot_before_the_anchor() {
     let me = crate::Process::from_id(ProcessId::current());
     for (name, query) in queries() {
@@ -152,7 +152,7 @@ fn parent_and_children_take_the_snapshot_before_the_anchor() {
 /// The anchor failing after a good snapshot names the view that failed it (the one the failing read
 /// used, not a second look), and the pid. Mutants: "`unqueryable` re-derives the cause" (the view
 /// has recovered by then, so the error blames access); "the table read's error is dropped".
-#[test]
+#[skuld::test]
 fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
     let me = crate::Process::from_id(ProcessId::current());
     let pid = me.id().pid();
@@ -175,7 +175,7 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
 /// its own, and are never signalled. Mutant: "walk without an anchor".
-#[test]
+#[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, _) = live_member();
@@ -187,7 +187,7 @@ fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
 
 /// A root whose pid cannot be queried is an error naming the pid and the view, with nothing
 /// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped".
-#[test]
+#[skuld::test]
 fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
@@ -215,7 +215,7 @@ fn every_walk_from_a_root_that_cannot_be_queried_errors_and_signals_nothing() {
 /// This process is live, so a table without it is not "no parent" / "no children": the entry was
 /// omitted, not the process gone. `EACCES` makes the scan skip every pid, `self` included.
 /// Mutant: "a `self` missing from the table is `Ok(None)` / `Ok(vec![])`".
-#[test]
+#[skuld::test]
 fn a_live_self_missing_from_the_table_is_unassessable() {
     let me = crate::Process::from_id(ProcessId::current());
     let _forced = crate::identity::pid_stat::fault::force_stat_read(libc::EACCES, None);

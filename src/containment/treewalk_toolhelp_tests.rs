@@ -18,7 +18,7 @@ fn assert_names_toolhelp(result: Result<(), Error>, what: &str) {
 
 /// Mutants: "the walk reads an empty snapshot for a failed one" (`Ok`); "terminate the root, then
 /// return the error".
-#[test]
+#[skuld::test]
 fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
     type Walk = fn(ProcessId) -> Result<(), Error>;
     let walks: [(&str, Walk); 2] = [
@@ -36,7 +36,7 @@ fn every_walk_over_a_failed_snapshot_errors_and_terminates_nothing() {
 }
 
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
-#[test]
+#[skuld::test]
 fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
     let me = crate::Process::from_id(ProcessId::current());
     let forced = force_snapshot_failure();
@@ -53,7 +53,7 @@ fn parent_and_children_over_a_failed_snapshot_are_unassessable() {
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
 /// its own. Mutant: "walk without an anchor".
-#[test]
+#[skuld::test]
 fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
     let me = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));

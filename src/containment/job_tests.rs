@@ -25,7 +25,7 @@ fn spawn_blocker() -> std::process::Child {
     .expect("spawn cmd /C more")
 }
 
-#[test]
+#[skuld::test]
 fn assign_then_kill_tree_terminates_the_process() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -41,7 +41,7 @@ fn assign_then_kill_tree_terminates_the_process() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn disarm_clears_kill_on_job_close() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -75,7 +75,7 @@ fn disarm_clears_kill_on_job_close() {
     _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn wait_tree_reports_members_remain_then_all_exited() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -100,7 +100,7 @@ fn wait_tree_reports_members_remain_then_all_exited() {
     assert_eq!(verdict, crate::containment::TreeDrain::AllMembersExited);
 }
 
-#[test]
+#[skuld::test]
 fn wait_tree_after_kill_tree_is_unassessable() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -119,7 +119,7 @@ fn wait_tree_after_kill_tree_is_unassessable() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn assign_to_an_invalid_handle_is_an_error() {
     // A real, valid, open handle — just not a process handle. `BorrowedHandle::borrow_raw`
     // requires a genuinely live handle (never null / INVALID_HANDLE_VALUE), which a plain
@@ -132,7 +132,7 @@ fn assign_to_an_invalid_handle_is_an_error() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn job_debug_differs_before_and_after_kill_tree() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -154,7 +154,7 @@ fn job_debug_differs_before_and_after_kill_tree() {
 /// racy if the handle is not locked. Pinning the bound here means a future change that makes
 /// `Job` thread-hostile fails at compile time rather than silently narrowing what callers may
 /// do — the same assertion `Process` carries.
-#[test]
+#[skuld::test]
 fn job_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Job>();
@@ -168,7 +168,7 @@ fn job_is_send_and_sync() {
 /// window measured in instructions. What actually holds the invariant is structural: the lock
 /// makes load-then-use indivisible, and `job_is_send_and_sync` pins the bound that makes the
 /// sharing legal in the first place.
-#[test]
+#[skuld::test]
 fn disarm_and_kill_tree_from_two_threads_complete() {
     for _ in 0..64 {
         let mut child = spawn_blocker();
@@ -190,7 +190,7 @@ fn disarm_and_kill_tree_from_two_threads_complete() {
 /// This is the deterministic half of the concurrency story above, and it is the state the lock
 /// exists to make observable: without it, a `disarm` arriving after the close would read a
 /// stale value and write to whatever kernel object had inherited it.
-#[test]
+#[skuld::test]
 fn disarm_after_kill_tree_does_nothing() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();
@@ -210,7 +210,7 @@ fn disarm_after_kill_tree_does_nothing() {
 }
 
 /// A zero timeout on a live tree reports `MembersRemain` rather than blocking or guessing.
-#[test]
+#[skuld::test]
 fn wait_tree_timeout_zero_reports_members_remain() {
     let mut child = spawn_blocker();
     let raw = child.as_raw_handle();

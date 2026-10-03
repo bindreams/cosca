@@ -46,7 +46,7 @@ fn await_zombie(pid: u32) {
 /// plan's Background measures. Safe to test directly: no real process or process group is
 /// involved, and a correct implementation never reaches the `killpg`/`signal_direct` calls
 /// this guards, so there is nothing to signal even if the test is wrong.
-#[test]
+#[skuld::test]
 fn kill_group_and_term_group_reject_non_positive_pgid() {
     for pgid in [0, -1, i32::MIN] {
         let kill_err = kill_group(pgid).expect_err("kill_group(non-positive) must be Err");
@@ -63,7 +63,7 @@ fn kill_group_and_term_group_reject_non_positive_pgid() {
 }
 
 /// kill_group on a real owned process group succeeds, and really did kill it.
-#[test]
+#[skuld::test]
 fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
@@ -102,7 +102,7 @@ fn kill_group_on_owned_group_succeeds() {
 ///
 /// Linux only: `fork` refuses once a fatal signal is pending; no such guarantee is asserted elsewhere.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn kill_group_dooms_the_group_before_it_is_listed() {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
@@ -152,7 +152,7 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
 /// `converge` would report `Cleared`, and `term_group` would return `Ok(())` while the leader
 /// stayed alive — exactly the false-`Ok` class #61 exists to close, on the one path with no
 /// closer until now.
-#[test]
+#[skuld::test]
 fn term_group_on_owned_group_succeeds() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
     // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
@@ -184,7 +184,7 @@ fn term_group_on_owned_group_succeeds() {
 /// the pgrp iteration before counting, so `killpg` reports EPERM for what is
 /// really an empty group. The assertion below pins that, so the test cannot
 /// quietly stop exercising the interesting path.
-#[test]
+#[skuld::test]
 fn kill_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
     let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
@@ -211,7 +211,7 @@ fn kill_group_on_an_all_zombie_group_is_ok() {
 /// future change to macOS's zombie-exclusion behavior (or a Linux-vs-macOS divergence
 /// change) could leave this test passing on `term_group`'s own answer alone while silently
 /// no longer exercising the branch it documents.
-#[test]
+#[skuld::test]
 fn term_group_on_an_all_zombie_group_is_ok() {
     use std::os::unix::process::CommandExt;
     let child = crate::test_spawn::spawn(std::process::Command::new("true").process_group(0)).expect("spawn true");
@@ -250,7 +250,7 @@ fn term_group_on_an_all_zombie_group_is_ok() {
 /// spawn, not as `Unassessable` with the kind buried in `source`. Mutant: "`verify` maps every
 /// unlistable group to `Unassessable`".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn kill_group_and_term_group_without_openat2_are_unsupported() {
     use crate::error::Error;
     use crate::identity::proc_view_fault::force_openat2_errno;

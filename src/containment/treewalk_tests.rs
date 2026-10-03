@@ -31,7 +31,7 @@ fn root() -> ProcessId {
 
 // A genuine later child (token > root) is kept under BOTH rules =====
 
-#[test]
+#[skuld::test]
 fn keeps_genuine_later_child_under_both_rules() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 5)]);
@@ -43,7 +43,7 @@ fn keeps_genuine_later_child_under_both_rules() {
 
 // Same-tick child (token == root) depends on the rule =====
 
-#[test]
+#[skuld::test]
 fn same_tick_child_included_when_allow_equal_true() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
@@ -51,7 +51,7 @@ fn same_tick_child_included_when_allow_equal_true() {
     assert_eq!(pids(got), [200], "same-tick child included with allow_equal=true");
 }
 
-#[test]
+#[skuld::test]
 fn same_tick_child_excluded_when_allow_equal_false() {
     let parents = [(200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN)]); // equal token
@@ -64,7 +64,7 @@ fn same_tick_child_excluded_when_allow_equal_false() {
 // include pid 200 here (its ppid chains to the root), so this assertion fails if
 // the guard is removed.
 
-#[test]
+#[skuld::test]
 fn stale_ppid_impostor_excluded_under_both_rules() {
     // pid 200's ppid points at the root pid, but 200 was created BEFORE the root
     // acquired that pid (token < root.token): a recycled-pid impostor.
@@ -78,7 +78,7 @@ fn stale_ppid_impostor_excluded_under_both_rules() {
 
 // Deep trees recurse =====
 
-#[test]
+#[skuld::test]
 fn recurses_into_deep_tree() {
     // root(100) -> 200 -> 300 -> 400, all created after the root.
     let parents = [(200, ROOT_PID), (300, 200), (400, 300)];
@@ -91,7 +91,7 @@ fn recurses_into_deep_tree() {
     assert_eq!(pids(got), [200, 300, 400]);
 }
 
-#[test]
+#[skuld::test]
 fn impostor_prunes_its_whole_subtree() {
     // 200 is a stale-ppid impostor; its real-looking child 300 must NOT be
     // collected, because 200 was rejected (the subtree under an impostor is
@@ -107,7 +107,7 @@ fn impostor_prunes_its_whole_subtree() {
 
 // A reparented orphan (ppid no longer == root) is honestly missed =====
 
-#[test]
+#[skuld::test]
 fn reparented_orphan_is_missed() {
     // 300 was a grandchild, but its parent 200 exited and 300 was reparented to
     // pid 1; its ppid no longer chains to the root, so the walk cannot reach it.
@@ -119,7 +119,7 @@ fn reparented_orphan_is_missed() {
 
 // The root itself is never included =====
 
-#[test]
+#[skuld::test]
 fn root_is_never_included() {
     // An edge naming the root as its own child would be degenerate; ensure the
     // root pid never appears in the descendant set even if such an edge exists.
@@ -131,7 +131,7 @@ fn root_is_never_included() {
 
 // A duplicate edge enumerates the pid only once =====
 
-#[test]
+#[skuld::test]
 fn duplicate_edge_yields_pid_once() {
     // A snapshot that lists the same (pid, ppid) edge twice must not enumerate
     // (or later double-kill) the same process twice.
@@ -143,7 +143,7 @@ fn duplicate_edge_yields_pid_once() {
 
 // An unresolvable candidate (already gone) is skipped =====
 
-#[test]
+#[skuld::test]
 fn unresolvable_candidate_is_skipped() {
     // 200 chains to the root but is absent from the resolver (it exited between
     // snapshot and resolve); it is dropped along with anything under it.
@@ -155,7 +155,7 @@ fn unresolvable_candidate_is_skipped() {
 
 // One-level child filter keeps only genuine direct children =====
 
-#[test]
+#[skuld::test]
 fn children_of_keeps_one_level_genuine_children_only() {
     use super::{children_of_with, ALLOW_EQUAL_TOKEN};
     use crate::identity::ProcessId;
@@ -178,7 +178,7 @@ fn children_of_keeps_one_level_genuine_children_only() {
 
 // children_of_with wires allow_equal into the same-tick boundary =====
 
-#[test]
+#[skuld::test]
 fn children_of_same_tick_child_depends_on_allow_equal() {
     use super::children_of_with;
     // Direct child 101 whose token EQUALS the parent's: kept under allow_equal=true,
@@ -199,7 +199,7 @@ fn children_of_same_tick_child_depends_on_allow_equal() {
 
 // A duplicate edge enumerates a direct child only once =====
 
-#[test]
+#[skuld::test]
 fn children_of_duplicate_edge_yields_pid_once() {
     use super::children_of_with;
     // A snapshot listing the same (pid, ppid) edge twice must not enumerate (or later
@@ -217,7 +217,7 @@ fn children_of_duplicate_edge_yields_pid_once() {
 /// `resolve_or_drop` is a named discard site: an access-denied descendant must be dropped
 /// from the walk AND leave a warn behind, never be silently folded in with a gone pid.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     crate::log_capture::install();
@@ -237,7 +237,7 @@ fn resolve_or_drop_drops_an_access_denied_pid_and_warns() {
 
 /// `kill_by_identity`-s pre-open Denied arm - the outcome that can leave a process running.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
     let child = crate::identity::windows_fixture::spawn_unkillable();
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -250,7 +250,7 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale
 /// identity names a recycled pid, and killing it would kill a stranger.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     // The ACE must grant QUERY_LIMITED as well as TERMINATE: kill_by_identity opens for

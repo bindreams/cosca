@@ -37,14 +37,14 @@ fn kill_file(fake: &FakeLeaf) -> Vec<u8> {
 
 /// A leaf that never drains, released while armed: the release returns. A release that ran the
 /// blocking `Drop` would wait for the drain, which the debug contract turns into a panic.
-#[test]
+#[skuld::test]
 fn release_without_waiting_never_runs_the_blocking_drop() {
     let name = "cosca-release-never-blocks";
     let (_fake, leaf) = entered(name, true);
     let _ = release(leaf, name);
 }
 
-#[test]
+#[skuld::test]
 fn an_armed_undrained_leaf_is_killed_left_behind_and_warned_about() {
     let name = "cosca-release-armed-undrained";
     let (fake, leaf) = entered(name, true);
@@ -62,7 +62,7 @@ fn an_armed_undrained_leaf_is_killed_left_behind_and_warned_about() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_drained_leaf_is_removed_without_a_kill_and_without_a_warning() {
     let name = "cosca-release-drained";
     let (fake, leaf) = entered(name, false);
@@ -74,7 +74,7 @@ fn a_drained_leaf_is_removed_without_a_kill_and_without_a_warning() {
 }
 
 /// The kill lands before the release reads the drain: the leaf is swept and removed.
-#[test]
+#[skuld::test]
 fn a_leaf_that_drains_by_the_time_of_the_read_is_swept_and_removed() {
     crate::log_capture::install();
     let name = "cosca-release-drains-after-kill";
@@ -100,7 +100,7 @@ fn a_leaf_that_drains_by_the_time_of_the_read_is_swept_and_removed() {
 /// Killed by this handle and disarmed after (`Child::detach`): the release fires the kill again,
 /// and warns when the leaf has not drained. The armed twin, which `finish_elevated` leaves, is
 /// `an_armed_undrained_leaf_is_killed_left_behind_and_warned_about`.
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_this_handle_killed_is_killed_again_and_warned_about() {
     let name = "cosca-release-disarmed-killed";
     let (fake, leaf) = entered(name, true);
@@ -114,7 +114,7 @@ fn a_disarmed_leaf_this_handle_killed_is_killed_again_and_warned_about() {
 }
 
 /// A tree the caller asked to leave running is not killed and not a leak: `debug`.
-#[test]
+#[skuld::test]
 fn a_disarmed_never_killed_leaf_is_never_killed_and_logs_at_debug() {
     let name = "cosca-release-disarmed-never-killed";
     let (fake, leaf) = entered(name, true);
@@ -129,7 +129,7 @@ fn a_disarmed_never_killed_leaf_is_never_killed_and_logs_at_debug() {
 
 /// A kill the caller attempted and that failed is a mechanism failure, not a request to leave
 /// the tree running.
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_kill_attempt_failed_is_warned_about_and_not_killed_again() {
     let name = "cosca-release-disarmed-kill-failed";
     let (fake, leaf) = entered(name, true);
@@ -144,7 +144,7 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_warned_about_and_not_killed_agai
 }
 
 /// A tree that exited on its own is swept and removed, though nobody killed it.
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_that_drained_on_its_own_is_swept_and_removed() {
     let name = "cosca-release-disarmed-self-drained";
     let fake = FakeLeaf::new(name, false);
@@ -167,7 +167,7 @@ fn a_disarmed_leaf_that_drained_on_its_own_is_swept_and_removed() {
 }
 
 /// An armed leaf whose kill write fails is left behind and warned about, naming the kill.
-#[test]
+#[skuld::test]
 fn an_armed_leaf_whose_kill_write_fails_is_warned_about() {
     let name = "cosca-release-armed-kill-fails";
     let (fake, leaf) = entered(name, true);
@@ -210,14 +210,14 @@ fn assert_unreadable_drain_is_reported(leaf: CgroupLeaf, name: &str, level: log:
 }
 
 /// Mutant: the `Err` from `drain_now` falls into the same arms as `MembersRemain`.
-#[test]
+#[skuld::test]
 fn an_armed_leaf_whose_drain_cannot_be_read_reports_the_read_error() {
     let name = "cosca-release-armed-unreadable";
     let (_fake, leaf) = entered_unreadable(name);
     assert_unreadable_drain_is_reported(leaf, name, log::Level::Warn);
 }
 
-#[test]
+#[skuld::test]
 fn a_disarmed_never_killed_leaf_whose_drain_cannot_be_read_reports_the_read_error_at_debug() {
     let name = "cosca-release-disarmed-unreadable";
     let (_fake, leaf) = entered_unreadable(name);
@@ -225,7 +225,7 @@ fn a_disarmed_never_killed_leaf_whose_drain_cannot_be_read_reports_the_read_erro
     assert_unreadable_drain_is_reported(leaf, name, log::Level::Debug);
 }
 
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_kill_failed_and_drain_cannot_be_read_reports_the_read_error() {
     let name = "cosca-release-kill-failed-unreadable";
     let (fake, leaf) = entered_unreadable(name);
@@ -240,7 +240,7 @@ fn a_disarmed_leaf_whose_kill_failed_and_drain_cannot_be_read_reports_the_read_e
 /// says it ended by the time the release returns, since the release joins it.
 ///
 /// Mutant: `release_without_waiting` leaves the pump running, or does not join it.
-#[test]
+#[skuld::test]
 fn release_stops_and_joins_the_leafs_pump() {
     let name = "cosca-release-joins-pump";
     let (_fake, leaf) = entered(name, true);

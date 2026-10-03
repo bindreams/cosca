@@ -26,7 +26,7 @@ fn sizing_answer() -> usize {
 /// runs every test in this crate in one shared process — other tests in that process, themselves
 /// spawn processes), so a round-count assertion would be flaky against correct code, not just
 /// against the regression it exists to catch.
-#[test]
+#[skuld::test]
 fn the_first_buffer_is_large_enough() {
     let n = sizing_answer();
     assert!(
@@ -51,7 +51,7 @@ fn the_first_buffer_is_large_enough() {
 /// `nprocs + 20`, so `expected <= 64` means fewer than ~44 live processes - implausible for
 /// a full OS, but an explicit floor is cheaper than trusting that. Fails loudly rather than
 /// passing vacuously if it's ever wrong.
-#[test]
+#[skuld::test]
 fn snapshot_count_agrees_with_the_kernels_sizing_answer() {
     let before = sizing_answer();
     let pids = all_pids();
@@ -90,7 +90,7 @@ fn snapshot_count_agrees_with_the_kernels_sizing_answer() {
 /// Pinned with the same proportional tolerance as
 /// `snapshot_count_agrees_with_the_kernels_sizing_answer`, not a fixed round or pid count:
 /// both are host-load-dependent - see that test's doc for why.
-#[test]
+#[skuld::test]
 fn collect_pids_grows_against_the_live_kernel() {
     let before = sizing_answer();
     let filled = collect_pids(2, fill_from_kernel, allocate_pids).expect("fill succeeds");

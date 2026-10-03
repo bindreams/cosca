@@ -6,7 +6,7 @@ use super::super::snapshot;
 /// own sizing return, read here independently of the code under test: the kernel's own count
 /// of what it is about to hand over. A units mistake (treating that return as bytes) yields
 /// roughly a quarter of the table and fails this immediately.
-#[test]
+#[skuld::test]
 fn the_pid_list_is_at_least_as_large_as_the_kernels_own_sizing_return() {
     // SAFETY: the sizing form of proc_listallpids takes a null buffer.
     let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -31,7 +31,7 @@ fn the_pid_list_is_at_least_as_large_as_the_kernels_own_sizing_return() {
 }
 
 /// Two pids that provably exist for the whole test must both be present.
-#[test]
+#[skuld::test]
 fn the_pid_list_contains_launchd_and_this_process() {
     let (pids, _, _) = snapshot();
     assert!(pids.contains(&1), "launchd must be in the pid list");
@@ -49,7 +49,7 @@ fn the_pid_list_contains_launchd_and_this_process() {
 /// reason every fdmarker test that spawns does: an unlocked fork here is a bystander that could
 /// transiently inherit another test's still-open marker write end, exactly the fork-bystander
 /// window `spawn_lock()` exists to close host-wide within this process.
-#[test]
+#[skuld::test]
 fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
     let out = crate::test_spawn::output_captured(std::process::Command::new("/bin/ps").args(["-Ao", "pid="]))
         .expect("run ps");
@@ -74,7 +74,7 @@ fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
 }
 
 /// The ppid pairs are a subset of the pid list: every edge names a pid the sweep will visit.
-#[test]
+#[skuld::test]
 fn every_ppid_edge_names_a_pid_from_the_same_snapshot() {
     let (pids, parents, _) = snapshot();
     let set: std::collections::HashSet<u32> = pids.into_iter().collect();

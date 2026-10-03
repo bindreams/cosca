@@ -7,7 +7,7 @@ use super::{fd_path, LeafDir};
 ///
 /// Container seccomp profiles refuse `unshare`, so it is gated on `CGROUP`, which means the
 /// unconfined cgroup lane: a delegated cgroup with `unshare` permitted.
-#[test]
+#[skuld::test]
 fn cgroup_fd_path_names_the_calling_threads_own_descriptor() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -50,7 +50,7 @@ fn cgroup_fd_path_names_the_calling_threads_own_descriptor() {
 }
 
 /// A leaf whose directory was made but could not be held is removed again, not leaked.
-#[test]
+#[skuld::test]
 fn a_leaf_that_cannot_be_held_after_its_mkdir_is_removed() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_leaf_open_failure(true);
@@ -71,7 +71,7 @@ fn a_leaf_that_cannot_be_held_after_its_mkdir_is_removed() {
 
 /// Mounts are never crossed by the child sweep. A bind mount inside a leaf keeps whatever it
 /// shows: an unprivileged run cannot mount, so the lane runs this one.
-#[test]
+#[skuld::test]
 fn cgroup_the_child_sweep_never_crosses_a_mount() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -157,7 +157,7 @@ fn cgroup_the_child_sweep_never_crosses_a_mount() {
 }
 
 /// `rmdir` removes the leaf it holds.
-#[test]
+#[skuld::test]
 fn rmdir_removes_the_held_leaf() {
     let parent = tempfile::tempdir().expect("tempdir");
     let leaf = parent.path().join("cosca-held");
@@ -177,7 +177,7 @@ fn held_leaf(name: &str) -> (tempfile::TempDir, std::path::PathBuf, LeafDir) {
 }
 
 /// A leaf removed by another party is `ENOENT`.
-#[test]
+#[skuld::test]
 fn rmdir_of_a_leaf_removed_since_is_enoent() {
     let (_parent, leaf, dir) = held_leaf("cosca-removed");
     std::fs::remove_dir_all(&leaf).expect("remove the leaf");
@@ -186,7 +186,7 @@ fn rmdir_of_a_leaf_removed_since_is_enoent() {
 
 /// A leaf removed, and its name taken by another directory since: `ENOENT`, and the other
 /// directory is left alone.
-#[test]
+#[skuld::test]
 fn rmdir_spares_a_directory_that_took_a_removed_leafs_name() {
     let (_parent, leaf, dir) = held_leaf("cosca-replaced");
     std::fs::remove_dir_all(&leaf).expect("remove the leaf");
@@ -198,7 +198,7 @@ fn rmdir_spares_a_directory_that_took_a_removed_leafs_name() {
 
 /// A live leaf whose name now names another directory: an error, not `Ok` or `ENOENT`, since the
 /// leaf is still there; the other directory is left alone.
-#[test]
+#[skuld::test]
 fn rmdir_spares_a_directory_that_took_a_live_leafs_name() {
     let (parent, leaf, dir) = held_leaf("cosca-swapped");
     std::fs::rename(&leaf, parent.path().join("elsewhere")).expect("move the leaf away");
@@ -210,7 +210,7 @@ fn rmdir_spares_a_directory_that_took_a_live_leafs_name() {
 }
 
 /// The same holds for a symlink that took the name: it is not followed.
-#[test]
+#[skuld::test]
 fn rmdir_spares_a_symlink_that_took_a_live_leafs_name() {
     let (parent, leaf, dir) = held_leaf("cosca-linked");
     let moved = parent.path().join("moved");

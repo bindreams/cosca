@@ -39,7 +39,7 @@ fn queries() -> [(&'static str, Query); 3] {
 
 /// Mutants: "the walk reads an empty snapshot for a failed listing" (`Ok`, nothing found); "signal
 /// the root, then return the error".
-#[test]
+#[skuld::test]
 fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
@@ -55,7 +55,7 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
 }
 
 /// Mutant: "`parent` / `children` map the snapshot's error to `Ok(None)` / `Ok(vec![])`".
-#[test]
+#[skuld::test]
 fn parent_and_children_over_a_failed_listing_are_unassessable() {
     let me = crate::Process::from_id(ProcessId::current());
     for (name, query) in queries() {
@@ -72,7 +72,7 @@ fn parent_and_children_over_a_failed_listing_are_unassessable() {
 /// A pid denied its ppid read leaves its subtree out of any walk, so the snapshot is
 /// `Unassessable` naming the count and the pid, and no walk signals. Mutant: "`denied > 0` still
 /// returns `Ok`".
-#[test]
+#[skuld::test]
 fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
@@ -88,7 +88,7 @@ fn every_walk_over_a_snapshot_with_a_denied_ppid_errors_and_signals_nothing() {
 }
 
 /// Mutant: "`parent` / `children` ignore a denied ppid elsewhere in the table".
-#[test]
+#[skuld::test]
 fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
     let (child, id) = live_member();
     let me = crate::Process::from_id(ProcessId::current());
@@ -103,7 +103,7 @@ fn parent_and_children_over_a_snapshot_with_a_denied_ppid_are_unassessable() {
 
 /// An allocation failure joining the edges is `Unassessable` too, not an empty tree. Mutant:
 /// "`join_edges`' failure is an empty snapshot".
-#[test]
+#[skuld::test]
 fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
     for (name, walk) in walks() {
         let (child, id) = live_member();
@@ -120,7 +120,7 @@ fn every_walk_over_a_failed_edge_allocation_errors_and_signals_nothing() {
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
 /// its own. Mutant: "walk without an anchor".
-#[test]
+#[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_is_ok_and_signals_nothing() {
     let me = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(me.pid(), me.start_token_raw().wrapping_sub(1));

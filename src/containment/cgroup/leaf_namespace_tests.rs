@@ -23,7 +23,7 @@ fn enabled() -> bool {
 /// still see the real `/proc`, where the member is in the leaf.
 ///
 /// Mutant: `holds_via` reads `/proc/{pid}/cgroup` by absolute path.
-#[test]
+#[skuld::test]
 fn namespaces_cgroup_membership_is_read_through_the_given_proc_dirfd() {
     if !enabled() {
         return;
@@ -31,7 +31,7 @@ fn namespaces_cgroup_membership_is_read_through_the_given_proc_dirfd() {
     ns::run(fixture_path!(fixture_leaf_overmount));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_leaf_overmount() {
     if !ns::is_child() {
         return;
@@ -65,7 +65,7 @@ fn fixture_leaf_overmount() {
 /// and the raw errno both survive `holds`.
 ///
 /// Mutant: `holds` keeps only the source's kind.
-#[test]
+#[skuld::test]
 fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
     if !enabled() {
         return;
@@ -87,7 +87,7 @@ fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc() {
 /// what is there, and what the mount holds survives.
 ///
 /// Mutant: `ChrootScratch::finish` removes recursively.
-#[test]
+#[skuld::test]
 fn namespaces_a_failed_chroot_cleanup_never_deletes_through_a_mount() {
     if !ns::enabled() {
         return;
@@ -109,7 +109,7 @@ fn namespaces_a_failed_chroot_cleanup_never_deletes_through_a_mount() {
     std::fs::remove_dir(&scratch).expect("remove the scratch directory");
 }
 
-#[test]
+#[skuld::test]
 fn fixture_cleanup_over_mount() {
     if !ns::is_child() {
         return;
@@ -126,7 +126,7 @@ fn fixture_cleanup_over_mount() {
     assert!(evidence.is_file(), "the cleanup reached through the mount");
 }
 
-#[test]
+#[skuld::test]
 fn fixture_leaf_no_proc() {
     if !ns::is_child() {
         return;

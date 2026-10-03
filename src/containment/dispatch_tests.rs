@@ -4,13 +4,13 @@
 use super::is_nested;
 
 /// Without the marker the process is the root (not nested).
-#[test]
+#[skuld::test]
 fn is_nested_without_marker_is_false() {
     assert!(!is_nested(false));
 }
 
 /// With the marker the process is already inside a contained tree (nested).
-#[test]
+#[skuld::test]
 fn is_nested_with_marker_is_true() {
     assert!(is_nested(true));
 }
@@ -21,7 +21,7 @@ fn is_nested_with_marker_is_true() {
 /// `ProcessGroup`. This is the critical S3 invariant: calling both setsid AND
 /// setpgid/process_group(0) on the same Command would cause EPERM.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_setup_for_session_selects_setsid() {
     use super::{unix_setup_for, UnixSetup};
     use crate::containment::ContainMode;
@@ -30,7 +30,7 @@ fn unix_setup_for_session_selects_setsid() {
 
 /// `ContainMode::Strongest` must select `UnixSetup::ProcessGroup` — never Session.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_setup_for_strongest_selects_process_group() {
     use super::{unix_setup_for, UnixSetup};
     use crate::containment::ContainMode;
@@ -42,7 +42,7 @@ fn unix_setup_for_strongest_selects_process_group() {
 /// `setsid`/`setpgid`, so the root must not be put in a group; teardown is by
 /// identity at kill time.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_setup_for_treewalk_selects_none() {
     use super::{unix_setup_for, UnixSetup};
     use crate::containment::ContainMode;
@@ -53,7 +53,7 @@ fn unix_setup_for_treewalk_selects_none() {
 /// prepare path gates on `mode.is_some()` before calling this, but the
 /// default fallback is well-defined).
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_setup_for_none_mode_selects_process_group() {
     use super::{unix_setup_for, UnixSetup};
     assert_eq!(unix_setup_for(None), UnixSetup::ProcessGroup);
@@ -61,7 +61,7 @@ fn unix_setup_for_none_mode_selects_process_group() {
 
 // Attached actionability + nested delegation =====
 
-#[test]
+#[skuld::test]
 fn attached_is_actionable() {
     use super::Attached;
     // No teardown mechanism -> not actionable (the _tree guard rejects these).
@@ -83,7 +83,7 @@ fn attached_is_actionable() {
 /// a macOS `FdMarker` that carries a pgid must be covered too, since it fires `killpg`
 /// unconditionally on pass 1 of every sweep, exactly the hazard this precondition guards.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn attached_carries_recyclable_pgid() {
     use super::Attached;
     assert!(!Attached::None.carries_recyclable_pgid());
@@ -102,7 +102,7 @@ fn attached_carries_recyclable_pgid() {
 /// `Attached::TreeWalk` itself, while a marker built for any grouped mode (`pgid: Some(_)`)
 /// must read `true`, matching `Attached::ProcessGroup`.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -129,7 +129,7 @@ fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
 /// (`!is_root`) contained spawn must yield BOTH halves of the delegated pair —
 /// `Containment::Delegated` and `Attached::Delegated` — for a kernel mechanism
 /// (Strongest) and TreeWalk, so `containment()` predicts the `_tree` error.
-#[test]
+#[skuld::test]
 fn nested_attach_is_delegated() {
     use super::{attach, Attached, Prepared};
     use crate::containment::{ContainMode, Containment};
@@ -196,7 +196,7 @@ fn nested_attach_is_delegated() {
 // marker installs for every contained root regardless of requested mode) — its `sweep` calls
 // `treewalk::kill_by_identity` directly, never `treewalk::hard_kill`, so `treewalk::fault`'s
 // seam is never consumed there; `fdmarker::fault` provides the matching seam instead.
-#[test]
+#[skuld::test]
 fn sync_kill_tree_backstop_is_load_bearing() {
     #[cfg(not(target_os = "macos"))]
     use super::super::treewalk::fault;
@@ -271,7 +271,7 @@ async fn async_kill_tree_backstop_is_load_bearing() {
 /// nested spawn ever does (it inherits the root's), no uncontained spawn does, and an
 /// elevation-derived spawn does not (its `sudo` wrapper closes every descriptor >= 3).
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn marker_wanted_installs_for_every_contained_root_and_nothing_else() {
     use crate::containment::fdmarker::marker_wanted;
     use crate::containment::ContainMode;
@@ -297,7 +297,7 @@ fn marker_wanted_installs_for_every_contained_root_and_nothing_else() {
 
 /// The marker mechanism is actionable: `kill_tree`/`terminate_tree` act on it.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn attached_fd_marker_is_actionable() {
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -318,7 +318,7 @@ fn attached_fd_marker_is_actionable() {
 /// `prepare` must thread the caller's reserved child fds through to the placement, or a user
 /// fd mapping would dup2 over the marker in the child.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn prepare_places_the_marker_above_the_callers_reserved_fds() {
     use crate::containment::{ContainMode, ContainRequest, Nesting};
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -344,7 +344,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
 
 /// A failed install degrades to the pre-existing mechanism rather than failing the spawn.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn a_failed_marker_install_leaves_prepare_without_one() {
     use crate::containment::fdmarker::fault::{lock_for_log_assertion, set_fault, Fault};
     use crate::containment::{ContainMode, ContainRequest, Nesting};
@@ -373,7 +373,7 @@ fn a_failed_marker_install_leaves_prepare_without_one() {
 
 /// An elevation-derived spawn must not install a marker: `sudo` closes every descriptor >= 3.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
     use crate::containment::{ContainMode, ContainRequest, Nesting};
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -396,7 +396,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
@@ -428,7 +428,7 @@ fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
 /// Where `openat2` is unavailable the root's identity cannot be read, and the error says why.
 /// Mutant: "`resolve_root_id` reports every `Unknown` as a bare `Unassessable`".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn resolve_root_id_names_a_missing_openat2() {
     let _forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOSYS);
     let Err(super::AttachError {
@@ -445,7 +445,7 @@ fn resolve_root_id_names_a_missing_openat2() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn wait_drained_is_unsupported_without_a_marker() {
     // Mirrors `require_contained`: a mechanism that cannot answer says so, rather than
     // implying a guarantee it has not got.
@@ -459,7 +459,7 @@ fn wait_drained_is_unsupported_without_a_marker() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn wait_drained_reports_members_remain_then_all_markers_closed() {
     use super::Attached;
     use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
@@ -514,7 +514,7 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
 /// fail. What the dispatcher then does with the value is
 /// `signal_refuses_a_child_cosca_did_not_create`, in `src/graceful_tests.rs`.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn uac_elevated_attachment_has_no_in_process_route() {
     use super::{Attached, Attachment};
     use crate::containment::Containment;
@@ -581,7 +581,7 @@ fn leaf_listing_another_pid(dir: &std::path::Path) -> std::path::PathBuf {
 /// A child that reported its write accepted, and has since exited: `cgroup.procs` no longer
 /// lists it. Anything it forked is still in the leaf, so the leaf owns the tree.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = leaf_listing_another_pid(dir.path());
@@ -605,7 +605,7 @@ fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
 /// Membership that cannot be read is unknown, not absent — and the child's own report already
 /// answers it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-decision-leaf");
@@ -620,7 +620,7 @@ fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
 /// A child whose write failed never entered the leaf, so neither did anything it forked: the
 /// spawn degrades and the empty leaf is removed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_write_degrades_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-decision-leaf");
@@ -637,7 +637,7 @@ fn a_failed_write_degrades_and_removes_the_leaf() {
 /// will not go away: whatever is in it, cosca did not put there. The leaf left behind is
 /// reported.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_degrade_never_kills_through_the_leaf() {
     crate::log_capture::install();
     for report in [ChildReport::WriteFailed, ChildReport::NotReported] {
@@ -668,7 +668,7 @@ fn a_degrade_never_kills_through_the_leaf() {
 /// A leaf whose report cannot be waited for (no pidfd) and was never entered degrades the spawn
 /// to its process group, removes the leaf, and never writes `cgroup.kill`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unwaitable");
@@ -715,7 +715,7 @@ fn cgroup_attachment_for_test(leaf_path: &std::path::Path) -> super::Attachment 
 /// `kill_on_drop(false)` must disarm the cgroup leaf. Without it the handle's own teardown is
 /// skipped and the leaf's `Drop` kills the tree anyway — the opposite of the opt-out.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn kill_on_drop_false_disarms_a_cgroup_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-false-leaf");
@@ -734,7 +734,7 @@ fn kill_on_drop_false_disarms_a_cgroup_leaf() {
 /// The same leaf under `kill_on_drop(true)` DOES fire `cgroup.kill`, so the test above pins
 /// the disarm rather than an inert path.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-true-leaf");
@@ -755,7 +755,7 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
 ///
 /// Mutant: `resolve_root_id` drops the verdict (`identity: None`), or swaps `Gone` and `Unknown`.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn resolve_root_id_hands_back_the_identity_verdict() {
     use super::RootIdentity;
     use crate::child::spawn::fault;

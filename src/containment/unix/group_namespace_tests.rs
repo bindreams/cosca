@@ -8,7 +8,7 @@ use crate::test_child::{await_member_ready, fixture_path, member_command};
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: its listing names the
 /// outer namespace's processes, whose pgids mean nothing to this caller. Mutant: "scan `/proc`
 /// whatever the view" — the outer processes whose pgid is 1 are returned.
-#[test]
+#[skuld::test]
 fn namespaces_an_outer_procfs_lists_no_group() {
     if !ns::enabled() {
         return;
@@ -16,7 +16,7 @@ fn namespaces_an_outer_procfs_lists_no_group() {
     ns::run(fixture_path!(fixture_group_outer));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_group_outer() {
     if !ns::is_child() {
         return;
@@ -25,7 +25,7 @@ fn fixture_group_outer() {
     ns::run(fixture_path!(fixture_group_inner));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_group_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -37,7 +37,7 @@ fn fixture_group_inner() {
 /// A file mounted over a member's `stat` is a mount below `/proc`, which no read crosses: the
 /// listing is an error, never an exclusion. Mutant: "read `stat` with a plain `openat`" — the fake
 /// record (another pgid) is read and the live member is silently excluded.
-#[test]
+#[skuld::test]
 fn namespaces_a_stat_mounted_over_a_member_is_an_error_not_an_exclusion() {
     if !ns::enabled() {
         return;
@@ -45,7 +45,7 @@ fn namespaces_a_stat_mounted_over_a_member_is_an_error_not_an_exclusion() {
     ns::run(fixture_path!(fixture_group_stat_overmount));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_group_stat_overmount() {
     if !ns::is_child() {
         return;
