@@ -191,9 +191,9 @@ a skip.
 A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
 delegated cgroup with `unshare` permitted.
 
-Today's gates take two shapes, neither matching this: some assert an opt-in variable
-(`COSCA_TEST_ELEVATION*`), and some return early instead (every `gated()` caller in
-`tests/elevation.rs`, and every `require_group` caller, in the library and in `tests/`).
+Today's gates take two shapes, neither matching this: some assert an opt-in variable, and some return
+early instead (`COSCA_TEST_ELEVATION_GUI`'s test in `tests/elevation.rs`, and every `require_group`
+caller, in the library and in `tests/`).
 [#234] tracks the migration, names the groups, and is the authoritative inventory of what's left.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
@@ -237,8 +237,10 @@ so that lane selects them): CI turns it off workflow-wide and the cgroup step op
 Windows groups: `COSCA_TEST_WINDOWS_PATH_CANARY` (the `windows_path_resolution` canaries and surveys),
 `COSCA_TEST_WINDOWS_ELEVATING_PROBES` (`windows_shell_execute`) and
 `COSCA_TEST_WINDOWS_EXECUTING_PROBES` (`windows_shell_resolution` and `windows_elevation_routes`).
-CI turns each off workflow-wide and opts in only in the step or job that runs it. Some
-system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
+CI turns each off workflow-wide and opts in only in the step or job that runs it. `COSCA_TEST_ELEVATION` (the tests that
+run commands with real administrator or root privileges) is a `test_group!` row too: CI turns it off
+workflow-wide and its own lane opts in. Some system-affecting groups have no `COSCA_TEST_<GROUP>` at
+all; see [#234].
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle

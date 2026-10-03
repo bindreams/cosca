@@ -30,6 +30,8 @@ env:
   COSCA_TEST_SETUID: "0"
   # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
   COSCA_TEST_CGROUP: "0"
+  # The elevation tests gain real administrator or root privileges; only the `elevation` job runs them.
+  COSCA_TEST_ELEVATION: "0"
   # Windows groups. The drive-mapping test runs in one step below; the probes and canaries run
   # only in windows-probes.yaml.
   COSCA_TEST_DRIVE_MAPPING: "0"
@@ -619,6 +621,112 @@ jobs:
         if: (cancelled() || failure()) && matrix.os == 'darwin'
         timeout-minutes: 2
         run: ps -axo pid,ppid,pgid,stat,etime,command
+
+  # The ELEVATION group (`COSCA_TEST_ELEVATION`, off workflow-wide), selected by its label. Every runner here
+  # is an ephemeral VM, so the group consents. `-E binary(=elevation)`: the only binary with elevation tests;
+  # libtest binaries ignore `SKULD_LABELS` and would run whole.
+  elevation_linux:
+    name: Elevation (linux/amd64)
+    runs-on: ubuntu-26.04 # systemd 259 has `run0` (24.04's 255 does not)
+    timeout-minutes: 30
+    env:
+      COSCA_TEST_ELEVATION: "1"
+      COSCA_TEST_ELEVATION_CONSENT: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build tests
+        run: cargo nextest run --locked --no-run --features tokio --profile ci
+
+      # `run0` asks polkit, so the runner user is allowed every action without a prompt.
+      - name: Allow transient units without a prompt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y polkitd
+          sudo tee /etc/polkit-1/rules.d/49-cosca-elevation.rules >/dev/null <<'RULES'
+          polkit.addRule(function(action, subject) {
+            if (subject.user == "runner") { return polkit.Result.YES; }
+          });
+          RULES
+          sudo systemctl restart polkit
+          test "$(run0 --no-ask-password /usr/bin/id -u)" = 0
+
+      # Passwordless `sudo` for `id` and `cosca_testbin` only; `whoami` asks the password the two
+      # `Auth::Stdin` / `Auth::Askpass` tests deliver.
+      - name: Provision sudo
+        shell: bash
+        run: |
+          set -euxo pipefail
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "COSCA_TEST_ELEVATION_PASSWORD=$password" >> "$GITHUB_ENV"
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh "$USER" "$PWD/target/debug/cosca_testbin"
+
+      - name: Run elevation tests
+        timeout-minutes: 8
+        shell: bash
+        env:
+          SKULD_LABELS: elevation
+        run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --no-tests=fail -E 'binary(=elevation)'
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-linux-amd64
+
+      - name: Print the process table
+        if: cancelled() || failure()
+        timeout-minutes: 2
+        run: ps -eo pid,ppid,pgid,stat,etime,args
+
+  # Windows: the runner's account is already elevated, so `elevation-lane-windows.ps1` runs the test
+  # executable as a fresh local administrator, whose token is unelevated. The runner elevates `runas`
+  # for it without a prompt (`ConsentPromptBehaviorAdmin` is 0).
+  elevation_windows:
+    name: Elevation (windows/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build tests
+        shell: pwsh
+        run: cargo build --locked --features tokio --tests --bins --target ${{ matrix.target }}
+
+      - name: Run elevation tests
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $exe = cargo test --locked --features tokio --target ${{ matrix.target }} --test elevation --no-run --message-format json |
+            ForEach-Object { $_ | ConvertFrom-Json -ErrorAction SilentlyContinue } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'elevation' -and $_.profile.test } |
+            Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) { throw 'cargo did not name the elevation test executable' }
+          ./.github/scripts/elevation-lane-windows.ps1 $exe
 
   # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
   # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest

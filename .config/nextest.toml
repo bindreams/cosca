@@ -58,6 +58,9 @@ inherits = "ci"
 [profile.ci-namespaces]
 inherits = "ci"
 
+[profile.ci-elevation]
+inherits = "ci"
+
 [profile.ci-setuid]
 inherits = "ci"
 

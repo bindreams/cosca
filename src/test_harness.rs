@@ -11,3 +11,7 @@ pub const NAMESPACES: skuld::Label;
 /// Selects the test that maps a drive letter for the whole logon session.
 #[skuld::label]
 pub const DRIVE_MAPPING: skuld::Label;
+
+/// Selects the tests that gain real administrator or root privileges (the `ELEVATION` group).
+#[skuld::label]
+pub const ELEVATION: skuld::Label;
