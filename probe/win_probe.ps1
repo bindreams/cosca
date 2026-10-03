@@ -43,24 +43,23 @@ if ($Mode -eq "outer") {
   "== runas from the job's own process:"; [P]::Run($payload, $payloadArgs)
   # Elevate without a prompt, so a medium-IL caller's runas can complete unattended.
   Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" ConsentPromptBehaviorAdmin 0
-  # runneradmin is not UAC-filtered (a Limited task still ran High, measured), so make a filtered admin.
+  # runneradmin is High already; a fresh local admin logged on with -Credential gets the filtered
+  # Medium token (the shape of PR #552's elevation lane), and ConsentPromptBehaviorAdmin=0 elevates.
   $dir = "C:\kefprobe"; New-Item -ItemType Directory -Force $dir | Out-Null
   icacls $dir /grant "Everyone:(OI)(CI)F" | Out-Null
-  icacls $dir /setintegritylevel "(OI)(CI)low" | Out-Null
   Copy-Item $PSCommandPath "$dir\win_probe.ps1"
-  $pw = "Kf!" + [guid]::NewGuid().ToString("N").Substring(0, 16)
-  net user kefadm $pw /add | Out-Null
-  net localgroup Administrators kefadm /add | Out-Null
+  $pw = (-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 24 | ForEach-Object { [char]$_ })) + "aA1!"
+  Write-Host "::add-mask::$pw"
+  $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+  New-LocalUser kefadm -Password $sec -AccountNeverExpires | Out-Null
+  Add-LocalGroupMember -Group Administrators -Member kefadm
   $out = "$dir\kef-inner.txt"
-  $w = New-Object System.IO.FileSystemWatcher($dir, "kef-inner.txt")
-  $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dir\win_probe.ps1`" -Mode inner -Out `"$out`""
   try {
-    Register-ScheduledTask -TaskName "kef-limited" -Action $act -User "$env:COMPUTERNAME\kefadm" -Password $pw -RunLevel Limited -Force | Out-Null
-    Start-ScheduledTask -TaskName "kef-limited"
-    $res = $w.WaitForChanged([System.IO.WatcherChangeTypes]::Renamed, 120000)  # failure bound on an external process
-    "== Limited task as a fresh filtered admin (kefadm): timed out=$($res.TimedOut)"
+    $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\kefadm", $sec)
+    $pr = Start-Process powershell.exe -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","$dir\win_probe.ps1","-Mode","inner","-Out",$out -Credential $cred -LoadUserProfile -WorkingDirectory $dir -Wait -PassThru
+    "== runas from a fresh admin's filtered logon (kefadm), exit $($pr.ExitCode):"
     if (Test-Path $out) { Get-Content $out }
-  } catch { "== task failed: $_" }
+  } catch { "== inner failed: $_" } finally { Remove-LocalUser kefadm -ErrorAction Continue }
 } else {
   try {
     $r = @("inner: " + (Facts)); $r += "inner runas: " + [P]::Run($payload, $payloadArgs)
