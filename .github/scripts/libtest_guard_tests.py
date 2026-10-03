@@ -119,8 +119,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cfg(not(debug_assertions)) test, release", 1, both("fn release_only"), "lt", "--features", "release_only", "--release")
     check("both profiles", 1, both("fn release_only"), "lt", "--features", "release_only", "--both-profiles")
 
-    # A `test = true` target is type-checked, not code-generated: `post_mono` (in `it` only) is an error only code
-    # generation sees. Code generation per target and combination is what made the guard grow with each flip.
+    # `post_mono` (tests/pm.rs) is an error only code generation sees, so a test target must not be code-generated.
     check("no code generation for a test target, debug", 0, (), "lt", "--features", "post_mono")
     check("no code generation for a test target, release", 0, (), "lt", "--features", "post_mono", "--release")
     check("no code generation for a test target, powerset, both profiles", 1, both("fn ps_none"), "lt", "--feature-powerset",

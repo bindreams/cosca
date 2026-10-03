@@ -44,7 +44,7 @@ name = "it"
 path = "tests/it.rs"
 harness = false
 
-# Only `post_mono`: the one target whose guard run holds no finding.
+# Only `post_mono`: a test target whose guard run holds no finding, so a codegen failure is not masked.
 [[test]]
 name = "pm"
 path = "tests/pm.rs"

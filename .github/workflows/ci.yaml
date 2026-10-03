@@ -233,10 +233,9 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # The slowest lane is windows/amd64: 1654 s at most since the guard stopped code-generating test
-    # targets (2534-3014 s before). Its two Clippy steps, which also run the guard, add ~6 s per
-    # flipped target; projected <= 1800 s after the remaining flips. 50 min is 1.7x that. All lanes
-    # share this bound.
+    # The slowest lane is windows/amd64: 1654 s at most. Its two Clippy steps, which also run the guard,
+    # add ~6 s per flipped integration-test target; projected <= 1800 s after the remaining flips (T3,
+    # T5). 50 min is 1.7x that. All lanes share this bound.
     timeout-minutes: 50
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
