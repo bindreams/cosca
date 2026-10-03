@@ -7,7 +7,7 @@
 //! then finds gone.
 
 use crate::tokio::Command;
-use crate::wait::exit_only::seams::force_peek_once;
+use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
 use crate::wait::exit_only::{Foreign, Peek};
 
 /// Watches one child from outside cosca and reaps it on the test's behalf.
@@ -144,7 +144,7 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, witness) = exited_unreaped(true);
-    let _looks = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
     let _refused = super::fault::force_kill_failure();
     let kills = super::drop_fault::record();
 
@@ -416,7 +416,6 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 
     use crate::child::spawn::fault;
     use crate::error::Error;
-    use crate::wait::exit_only::seams::force_peeks;
 
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
