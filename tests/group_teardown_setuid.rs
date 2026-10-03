@@ -149,8 +149,8 @@ fn rerun_unprivileged() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    // The marker proves the body ran past the gate. The suite events prove the runner listed and
-    // passed exactly the one fixture, so a renamed fixture cannot leave the marker to vouch alone.
+    // The marker proves the body got past the gate; the suite events prove the one fixture was the
+    // one that ran and passed.
     common::test_reexec::suite_passed_exactly_one(&out).expect("the unprivileged re-run ran and passed");
 }
 
