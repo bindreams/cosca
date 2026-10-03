@@ -31,8 +31,9 @@
 //! step exercises this path.
 //!
 //! # Gating
-//! The `COSCA_TEST_SETUID` group, through `common::setuid` (its docs give the rule and what
-//! `COSCA_TEST_SETUID_HELPER` must be). The spawned helper (`setuid-control-block` in
+//! The `SETUID` group (`COSCA_TEST_SETUID`, a `test_group!` row in `src/test_groups.rs`), selected
+//! by `SKULD_LABELS=setuid`, or `setuid_root` for the root-run step. `common::setuid` gives what
+//! `COSCA_TEST_SETUID_HELPER` must be. The spawned helper (`setuid-control-block` in
 //! `testbin/main.rs`) runs the shared provisioning check of `setuid-stdin-block` and reports a
 //! failure over the control socket used for the readiness handshake, so a nosuid mount or a wrong
 //! owner/mode surfaces as a loud panic here, not a false green.
@@ -46,7 +47,7 @@ use std::net::{TcpListener, TcpStream};
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(target_os = "linux")]
-use common::setuid;
+use test_groups::{setuid, Group};
 
 #[cfg(target_os = "linux")]
 fn testbin() -> &'static str {
@@ -87,7 +88,7 @@ const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
 /// instead of matching zero tests.
 macro_rules! test_path {
     ($name:ident) => {{
-        let _: fn() = $name;
+        let _ = $name;
         stringify!($name)
     }};
 }
@@ -225,13 +226,11 @@ fn classify(line: &str, stream: TcpStream) -> Handshake {
 /// `Child::kill_tree` path (not a pure helper, not a fault-injection seam) against a REAL mixed
 /// process group.
 ///
-/// Gated by `COSCA_TEST_SETUID` (see the module docs' "Gating" section). Started as root it only
-/// takes the gate, then re-executes itself as an unprivileged user, whose run takes the helper.
-#[skuld::test]
-fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
-    if setuid::setuid_gate(|k| std::env::var(k).ok()) == setuid::Gate::Disabled {
-        return;
-    }
+/// Joins the `SETUID` group (see the module docs' "Gating" section); `SETUID_ROOT` selects it for
+/// the root-run step. Started as root it only takes the group's fixture, then re-executes itself as
+/// an unprivileged user, whose run takes the helper.
+#[skuld::test(labels = [test_harness::SETUID, test_harness::SETUID_ROOT])]
+fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running(#[fixture(setuid)] _group: &Group) {
     let role = rerun_role(
         std::env::var(RERUN_ENV).ok().as_deref(),
         std::os::unix::process::parent_id(),
@@ -249,7 +248,7 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
         );
         return rerun_unprivileged();
     }
-    let helper = setuid::setuid_helper().expect("the gate ran above and did not disable the group");
+    let helper = common::setuid::setuid_helper();
     let helper = helper.to_str().expect("a UTF-8 helper path");
     if role == Role::Rerun {
         use std::io::Write as _;
@@ -368,8 +367,140 @@ fn kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running() {
     drop(priv_sock);
 }
 
+#[cfg(target_os = "linux")]
+mod setuid_group {
+    //! Re-execs this binary on the one real `SETUID` test. Its body never runs here: each case is
+    //! either opted out or refused at setup, so these are safe on any host.
+
+    use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
+
+    const SETUID_TEST: &str = "kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running";
+
+    fn run_setuid_test(
+        extra: &[&str],
+        group: Option<&str>,
+        consent: Option<&str>,
+        labels: Option<&str>,
+    ) -> (SuiteOutcome, bool, String) {
+        let mut cmd = command(std::env::current_exe().expect("current_exe"));
+        cmd.args(["--test-threads=1", "--exact", SETUID_TEST, NOCAPTURE]);
+        cmd.args(extra);
+        with_json_events(&mut cmd);
+        for (var, value) in [
+            ("COSCA_TEST_SETUID", group),
+            ("COSCA_TEST_SETUID_CONSENT", consent),
+            ("SKULD_LABELS", labels),
+        ] {
+            match value {
+                Some(value) => cmd.env(var, value),
+                None => cmd.env_remove(var),
+            };
+        }
+        let out = crate::common::output_locked(&mut cmd).expect("re-exec this test binary");
+        let outcome = suite_outcome(&out.stdout).expect("the child reports its suite");
+        (
+            outcome,
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    /// The `failed` event of [`SETUID_TEST`]: its message tells a setup refusal from a body failure.
+    fn failure_message(stdout: &str) -> String {
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|e| e["type"] == "test" && e["event"] == "failed" && e["name"] == SETUID_TEST)
+            .unwrap_or_else(|| panic!("no `failed` event for the test: {stdout}"))["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Mutant: the group's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn setuid_group_zero_reports_ignored() {
+        let (outcome, success, stdout) = run_setuid_test(&[], Some("0"), Some("1"), None);
+        assert_eq!(
+            outcome,
+            SuiteOutcome {
+                test_count: 1,
+                passed: 0,
+                failed: 0,
+                ignored: 1
+            },
+            "{stdout}"
+        );
+        assert!(success, "{stdout}");
+    }
+
+    /// Mutant: the group's setup does not check consent (the body then runs a setuid-root helper).
+    #[skuld::test]
+    fn setuid_unset_consent_fails() {
+        let (outcome, success, stdout) = run_setuid_test(&[], None, None, None);
+        assert_eq!((outcome.failed, outcome.passed, outcome.ignored), (1, 0, 0), "{stdout}");
+        assert!(!success, "{stdout}");
+        assert!(
+            failure_message(&stdout).contains("COSCA_TEST_SETUID_CONSENT=1"),
+            "{stdout}"
+        );
+    }
+
+    /// Mutant: any non-empty consent counts.
+    #[skuld::test]
+    fn setuid_consent_other_than_1_fails() {
+        let (outcome, success, stdout) = run_setuid_test(&[], None, Some("yes"), None);
+        assert_eq!((outcome.failed, outcome.passed, outcome.ignored), (1, 0, 0), "{stdout}");
+        assert!(!success, "{stdout}");
+        assert!(
+            failure_message(&stdout).contains("COSCA_TEST_SETUID_CONSENT=1"),
+            "{stdout}"
+        );
+    }
+
+    /// Mutant: the setup grants a group that is off, so `--ignored` runs the body.
+    #[skuld::test]
+    fn setuid_group_zero_never_runs_the_body_under_run_ignored() {
+        let (outcome, success, stdout) = run_setuid_test(&["--ignored"], Some("0"), Some("1"), None);
+        assert_eq!(
+            (outcome.test_count, outcome.passed, outcome.failed, outcome.ignored),
+            (1, 0, 1, 0),
+            "{stdout}"
+        );
+        assert!(!success, "{stdout}");
+        // Only the fixture's refusal carries this message; a body that ran cannot.
+        assert!(
+            failure_message(&stdout).contains("setup failed: COSCA_TEST_SETUID=0"),
+            "{stdout}"
+        );
+    }
+
+    /// Mutant: the test carries no `SETUID` label, so `SKULD_LABELS=setuid` selects none of the group.
+    #[skuld::test]
+    fn the_setuid_label_selects_its_test() {
+        let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("setuid"));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("!setuid"));
+        assert_eq!(outcome.test_count, 0, "{stdout}");
+    }
+
+    /// Mutant: the test carries no `SETUID_ROOT` label, so the root-run step selects nothing.
+    #[skuld::test]
+    fn the_setuid_root_label_selects_only_the_root_run_test() {
+        let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("setuid_root"));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("!setuid_root"));
+        assert_eq!(outcome.test_count, 0, "{stdout}");
+    }
+}
+
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
+
+// Selection only: `SKULD_LABELS=setuid` also selects this binary's tests that do not join the group.
+skuld::default_labels!(test_harness::SETUID);
 
 fn main() {
     let mut runner = skuld::TestRunner::new();

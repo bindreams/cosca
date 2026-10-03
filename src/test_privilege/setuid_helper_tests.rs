@@ -4,6 +4,9 @@ use super::setuid::{check_helper, stat, Meta};
 use std::ffi::OsString;
 use std::path::Path;
 
+// Selection only: `SKULD_LABELS=setuid` selects this module wholesale.
+skuld::default_labels!(crate::test_harness::SETUID);
+
 const SETUID_ROOT: Meta = Meta {
     uid: 0,
     mode: 0o104755,
