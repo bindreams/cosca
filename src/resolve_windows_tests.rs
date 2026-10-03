@@ -585,7 +585,7 @@ fn locked_then_open() -> LockedThenOpen {
 /// `PermissionDenied` — see the module doc for how easy that is to get wrong on Windows
 /// specifically. This test additionally checks the same raw code survives through to
 /// [`resolve`]'s own returned error, via its wrapped `source()`.
-#[test]
+#[skuld::test]
 fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
     let fixture = locked_then_open();
 
@@ -600,7 +600,7 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
 
 /// An ordinary spawn skips the denied candidate and goes on, as before, so one ACL-denied `PATH`
 /// directory does not break every unelevated spawn.
-#[test]
+#[skuld::test]
 fn an_undeterminable_windows_acl_is_skipped_by_an_ordinary_search() {
     let fixture = locked_then_open();
     assert_eq!(

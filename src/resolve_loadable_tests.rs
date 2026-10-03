@@ -44,7 +44,7 @@ fn bin_with(files: &[&str]) -> (tempfile::TempDir, PathBuf) {
     (cwd, bin)
 }
 
-#[test]
+#[skuld::test]
 fn an_extensionless_sibling_does_not_block_the_exe() {
     // The located axis prefers the exact name, so choosing first and refusing after would return
     // `InvalidInput` here — although `bin/tool.exe` exists, and although anyone able to write an
@@ -53,7 +53,7 @@ fn an_extensionless_sibling_does_not_block_the_exe() {
     assert_eq!(go("bin/tool", cwd.path(), None, true).unwrap(), bin.join("tool.exe"));
 }
 
-#[test]
+#[skuld::test]
 fn only_an_extensionless_file_is_not_found() {
     // `NotFound`, not `InvalidInput`: `bin/tool.exe` would satisfy this very string.
     let (cwd, _bin) = bin_with(&["tool"]);
@@ -63,13 +63,13 @@ fn only_an_extensionless_file_is_not_found() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn only_the_exe_resolves_to_it() {
     let (cwd, bin) = bin_with(&["tool.exe"]);
     assert_eq!(go("bin/tool", cwd.path(), None, true).unwrap(), bin.join("tool.exe"));
 }
 
-#[test]
+#[skuld::test]
 fn a_loadable_name_written_by_the_caller_is_kept() {
     // Case-insensitive, like `has_loadable_extension`, and `.com` counts.
     let (cwd, bin) = bin_with(&["TOOL.EXE", "more.com"]);
@@ -83,7 +83,7 @@ fn a_loadable_name_written_by_the_caller_is_kept() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_with_no_loadable_candidate_is_refused_on_shape() {
     // `bin/tool.bat` gets one candidate, itself, and the filter removes it: no filesystem can make
     // this string succeed, so `InvalidInput` whether or not the file exists.
@@ -104,7 +104,7 @@ fn a_located_name_with_no_loadable_candidate_is_refused_on_shape() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_bare_name_resolves_as_it_does_unelevated() {
     // A bare name's only candidate already ends in `.exe`, so the filter removes nothing.
     let cwd = tempfile::tempdir().unwrap();
@@ -116,7 +116,7 @@ fn a_bare_name_resolves_as_it_does_unelevated() {
     assert_eq!(go("tool", cwd.path(), Some(path), false).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn unelevated_resolution_is_unchanged() {
     // `loadable_only: false` is the ordinary spawn: the exact name still wins, and a file with no
     // loadable name still resolves.

@@ -15,35 +15,35 @@ fn sw_strings(s: &str) -> Vec<String> {
     sw(s).into_iter().map(|t| String::from_utf16(&t).unwrap()).collect()
 }
 
-#[test]
+#[skuld::test]
 fn simple_args_separated_by_space() {
     assert_eq!(jw(&["a", "b"]), "a b");
 }
 
-#[test]
+#[skuld::test]
 fn args_with_space_or_tab_are_quoted() {
     assert_eq!(jw(&["a b"]), "\"a b\"");
     assert_eq!(jw(&["a\tb"]), "\"a\tb\"");
 }
 
-#[test]
+#[skuld::test]
 fn empty_arg_becomes_empty_quotes() {
     assert_eq!(jw(&["a", "", "b"]), "a \"\" b");
 }
 
-#[test]
+#[skuld::test]
 fn embedded_quote_is_backslash_escaped() {
     // a"b  ->  a\"b
     assert_eq!(jw(&["a\"b"]), "a\\\"b");
 }
 
-#[test]
+#[skuld::test]
 fn empty_argv_returns_empty_vec() {
     let empty: Vec<&[u16]> = vec![];
     assert_eq!(join_wide(&empty), Vec::<u16>::new());
 }
 
-#[test]
+#[skuld::test]
 fn lone_surrogate_passes_through_verbatim() {
     // 0xD800 is an unpaired surrogate — not representable in a Rust `String`,
     // which is the core justification for the u16-based API: routing through
@@ -54,26 +54,26 @@ fn lone_surrogate_passes_through_verbatim() {
     assert_eq!(result, &[b'a' as u16, 0xD800u16, b'b' as u16]);
 }
 
-#[test]
+#[skuld::test]
 fn lone_backslashes_not_before_quote_stay_literal() {
     assert_eq!(jw(&["a\\b"]), "a\\b");
     assert_eq!(jw(&["a\\"]), "a\\");
 }
 
-#[test]
+#[skuld::test]
 fn multiple_consecutive_backslashes_unquoted_stay_literal() {
     // Four backslashes between letters with no spaces: no quoting triggered,
     // so the backslashes must not be doubled.
     assert_eq!(jw(&["a\\\\\\\\b"]), "a\\\\\\\\b");
 }
 
-#[test]
+#[skuld::test]
 fn backslashes_before_quote_are_doubled_plus_one() {
     // a\"b  ->  a\\\"b   (one backslash + escaped quote)
     assert_eq!(jw(&["a\\\"b"]), "a\\\\\\\"b");
 }
 
-#[test]
+#[skuld::test]
 fn trailing_backslashes_doubled_before_closing_quote() {
     assert_eq!(jw(&["a\\ b"]), "\"a\\ b\""); // single backslash, space forces quotes
     assert_eq!(jw(&["a b\\"]), "\"a b\\\\\""); // trailing \ doubled before closing "
@@ -81,104 +81,104 @@ fn trailing_backslashes_doubled_before_closing_quote() {
 
 // split_wide ================================================================
 
-#[test]
+#[skuld::test]
 fn split_wide_empty_input_returns_empty_vec() {
     assert_eq!(split_wide(&[]).unwrap(), Vec::<Vec<u16>>::new());
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_whitespace_only_input_returns_empty_vec() {
     assert_eq!(sw("   \t "), Vec::<Vec<u16>>::new());
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_simple_args() {
     assert_eq!(sw_strings("a b c"), vec!["a", "b", "c"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_skips_leading_whitespace_before_argv0() {
     // Same deliberate deviation `first_token_wide` already documents.
     assert_eq!(sw_strings("   cmd arg"), vec!["cmd", "arg"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_tab_separates_rest_args() {
     assert_eq!(sw_strings("prog\ta\tb"), vec!["prog", "a", "b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_quoted_arg_with_embedded_space() {
     assert_eq!(sw_strings("prog \"a b\""), vec!["prog", "a b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_empty_quoted_arg_between_args() {
     assert_eq!(sw_strings("prog \"\" x"), vec!["prog", "", "x"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_adjacent_empty_quotes_concatenate() {
     // a""b -> ab: a fresh run of exactly 2 bare quotes (the mod-3 counter
     // goes 0->1->2 and the run ends there) resets with no literal `"`.
     assert_eq!(sw_strings("prog a\"\"b"), vec!["prog", "ab"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_triple_quote_run_yields_one_literal_quote() {
     // The undocumented shell32 mod-3 rule: 3 consecutive bare quotes collapse
     // to one literal `"` with no net toggle of "inside quotes".
     assert_eq!(sw_strings("prog a\"\"\"b"), vec!["prog", "a\"b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_double_quote_inside_quoted_region_embeds_literal_quote() {
     // The classic "double a quote to embed one" idiom: "a""b" -> a"b.
     assert_eq!(sw_strings("prog \"a\"\"b\""), vec!["prog", "a\"b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_backslash_before_quote_odd_count() {
     // One backslash before a quote: (1-1)/2 = 0 literal backslashes, quote is literal.
     assert_eq!(sw_strings("prog a\\\"b"), vec!["prog", "a\"b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_backslash_before_quote_even_count() {
     // Two backslashes before a quote: 2/2 = 1 literal backslash, quote toggles.
     assert_eq!(sw_strings("prog a\\\\\"b"), vec!["prog", "a\\b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_trailing_backslash_stays_literal() {
     assert_eq!(sw_strings("prog a\\"), vec!["prog", "a\\"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_backslashes_before_whitespace_stay_literal() {
     // Not just end-of-input: backslashes not immediately followed by a quote
     // are always literal, including right before a token-ending whitespace.
     assert_eq!(sw_strings("prog a\\\\ b"), vec!["prog", "a\\\\", "b"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_argv0_only_no_further_args() {
     assert_eq!(sw_strings("prog"), vec!["prog"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_trailing_whitespace_after_last_arg_yields_no_spurious_empty_token() {
     assert_eq!(sw_strings("prog a   "), vec!["prog", "a"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_unterminated_quote_in_rest_arg_consumes_to_end() {
     // Mirrors `unterminated_opening_quote_consumes_to_end` for argv[0], but
     // through the args[1..] parser's own qcount/bcount state machine.
     assert_eq!(sw_strings("prog \"abc"), vec!["prog", "abc"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_trailing_backslash_run_before_unterminated_opening_quote() {
     // Exercises the truncate-on-EOF interaction: an even backslash run
     // (halved to 1 literal `\`) immediately before a bare opening quote that
@@ -187,7 +187,7 @@ fn split_wide_trailing_backslash_run_before_unterminated_opening_quote() {
     assert_eq!(sw_strings("prog abc\\\\\""), vec!["prog", "abc\\"]);
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_round_trips_join_wide_for_rest_args() {
     let cases: Vec<Vec<&str>> = vec![
         vec!["a", "b"],
@@ -204,7 +204,7 @@ fn split_wide_round_trips_join_wide_for_rest_args() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn split_wide_lone_surrogate_passes_through_verbatim() {
     // 0xD800 is an unpaired surrogate: legal as a raw code unit, not valid on
     // its own in a Rust `String`. Confirms split_wide doesn't require valid
@@ -255,7 +255,7 @@ mod roundtrip {
         }
     }
 
-    #[test]
+    #[skuld::test]
     fn first_token_deviates_from_os_on_leading_whitespace() {
         // "   cmd arg": OS does not skip leading whitespace, so argv[0] = "" (an
         // empty string formed by the whitespace-only prefix); our function skips
@@ -280,7 +280,7 @@ mod roundtrip {
         );
     }
 
-    #[test]
+    #[skuld::test]
     fn join_wide_round_trips_through_os_parser() {
         // Each test case is a complete argv. The program tokens (first element of
         // every case) are simple ASCII identifiers that round-trip cleanly through
@@ -303,7 +303,7 @@ mod roundtrip {
         }
     }
 
-    #[test]
+    #[skuld::test]
     fn split_wide_matches_os_parse_for_representative_cases() {
         let cases: Vec<Vec<&str>> = vec![
             vec!["plain", "args"],
@@ -325,7 +325,7 @@ mod roundtrip {
         }
     }
 
-    #[test]
+    #[skuld::test]
     fn split_wide_matches_os_parse_for_adversarial_quote_runs() {
         // Hand-written lines exercising the shell32 mod-3 rule for runs of
         // consecutive bare quotes, plus unterminated-quote edge cases — none
@@ -348,7 +348,7 @@ mod roundtrip {
         }
     }
 
-    #[test]
+    #[skuld::test]
     fn split_wide_deviates_from_os_like_first_token_on_leading_whitespace() {
         // Same deviation as `first_token_wide`, now exercised through the
         // full splitter: we skip leading whitespace before argv[0]; the OS
@@ -373,7 +373,7 @@ fn split_first(s: &str) -> Option<(String, String)> {
     first_token_and_rest_wide(&w(s)).map(|(a, b)| (String::from_utf16(&a).unwrap(), String::from_utf16(&b).unwrap()))
 }
 
-#[test]
+#[skuld::test]
 fn first_token_and_rest_splits_unquoted() {
     assert_eq!(
         split_first("git status --short"),
@@ -381,7 +381,7 @@ fn first_token_and_rest_splits_unquoted() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn first_token_and_rest_splits_quoted_program_with_spaces() {
     assert_eq!(
         split_first("\"C:\\Program Files\\app.exe\" --flag x"),
@@ -389,29 +389,29 @@ fn first_token_and_rest_splits_quoted_program_with_spaces() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn first_token_and_rest_empty_rest() {
     assert_eq!(split_first("solo"), Some(("solo".into(), "".into())));
 }
 
-#[test]
+#[skuld::test]
 fn first_token_and_rest_none_for_blank() {
     assert_eq!(split_first("   "), None);
 }
 
-#[test]
+#[skuld::test]
 fn first_token_stops_at_whitespace() {
     assert_eq!(first("git status --short").as_deref(), Some("git"));
 }
 
-#[test]
+#[skuld::test]
 fn first_token_skips_leading_whitespace_by_design() {
     // Deliberate deviation from CommandLineToArgvW argv[0] (which does NOT skip):
     // we resolve a program from a user command line, so leading blanks are ignored.
     assert_eq!(first("   \t cmd arg").as_deref(), Some("cmd"));
 }
 
-#[test]
+#[skuld::test]
 fn quoted_first_token_spans_to_closing_quote() {
     assert_eq!(
         first("\"C:\\Program Files\\app.exe\" --flag").as_deref(),
@@ -419,30 +419,30 @@ fn quoted_first_token_spans_to_closing_quote() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn unterminated_opening_quote_consumes_to_end() {
     assert_eq!(first("\"C:\\no close").as_deref(), Some("C:\\no close"));
 }
 
-#[test]
+#[skuld::test]
 fn backslashes_are_literal_in_first_token() {
     assert_eq!(first("C:\\bin\\tool.exe x").as_deref(), Some("C:\\bin\\tool.exe"));
 }
 
-#[test]
+#[skuld::test]
 fn empty_or_whitespace_only_has_no_first_token() {
     assert_eq!(first(""), None);
     assert_eq!(first("   \t "), None);
 }
 
-#[test]
+#[skuld::test]
 fn mid_token_embedded_quotes_are_not_terminators() {
     // In the unquoted branch, `"` is not a space/tab so the token continues
     // through it; quotes mid-token are passed through verbatim.
     assert_eq!(first("a\"b\"c").as_deref(), Some("a\"b\"c"));
 }
 
-#[test]
+#[skuld::test]
 fn bare_empty_quotes_yield_empty_token() {
     // `""` enters the quoted branch; the inner loop exits immediately on the
     // closing quote, returning an empty token rather than None.

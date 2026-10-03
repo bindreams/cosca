@@ -86,7 +86,7 @@ fn path_var_for(dirs: &[&Path], windows: bool) -> OsString {
 
 // ── pure logic: safe to simulate either platform, since nothing touches the filesystem ──
 
-#[test]
+#[skuld::test]
 fn path_var_is_split_on_the_simulated_platforms_separator() {
     let win = split_path_var(Some(OsStr::new(r"C:\a;C:\b")), true);
     assert_eq!(win.len(), 2, "{win:?}");
@@ -103,7 +103,7 @@ fn path_var_is_split_on_the_simulated_platforms_separator() {
 
 // ── quoted PATH elements ─────────────────────────────────────────────────────────────
 
-#[test]
+#[skuld::test]
 fn windows_path_var_quoting_protects_an_embedded_separator() {
     // A Windows PATH element may be wrapped in `"` so a directory containing a literal `;`
     // survives as ONE element rather than being torn in half by a naive byte-level `;` split.
@@ -111,7 +111,7 @@ fn windows_path_var_quoting_protects_an_embedded_separator() {
     assert_eq!(got, vec![PathBuf::from(r"C:\a;b"), PathBuf::from(r"C:\c")], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn windows_path_var_quoting_strips_the_wrapping_quotes() {
     // A quoted-but-unstripped element (`"C:\bin"`, quote characters retained) fails the
     // `joined.is_absolute()` check inside `resolve()`'s search loop — a leading `"` is not a
@@ -127,7 +127,7 @@ fn windows_path_var_quoting_strips_the_wrapping_quotes() {
     assert_eq!(got, vec![PathBuf::from(r"C:\bin")], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn posix_path_var_quotes_are_not_special() {
     // On POSIX, `"` is an ordinary filename character and `;` is not a PATH separator: quoting
     // must NOT be applied there. Only `:` splits, and any quote characters in an element are
@@ -173,7 +173,7 @@ fn candidate(n: &str, w: bool) -> Vec<String> {
         .collect()
 }
 
-#[test]
+#[skuld::test]
 fn bare_extensionless_name_gets_only_the_exe_candidate() {
     // Catches the extensionless fallback candidate coming back: under the old two-candidate rule
     // this would have been `vec!["tool.exe", "tool"]`, which this exact-equality `assert_eq!`
@@ -183,7 +183,7 @@ fn bare_extensionless_name_gets_only_the_exe_candidate() {
     assert_eq!(got, vec!["tool.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn dotted_name_without_a_loadable_extension_still_gets_exe_appended() {
     // Catches the OLD has-a-dot heuristic returning: under that rule `python3.11` (already
     // containing a dot) would have been left unchanged and never resolved, even though
@@ -192,13 +192,13 @@ fn dotted_name_without_a_loadable_extension_still_gets_exe_appended() {
     assert_eq!(got, vec!["python3.11.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_name_already_ending_in_exe_is_not_doubled() {
     let got = candidate("tool.exe", true);
     assert_eq!(got, vec!["tool.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn the_exe_extension_check_is_case_insensitive() {
     // Catches a `== ".exe"` (exact-case) comparison: `TOOL.EXE`/`Tool.Exe` must not become
     // `TOOL.EXE.exe`/`Tool.Exe.exe`.
@@ -206,7 +206,7 @@ fn the_exe_extension_check_is_case_insensitive() {
     assert_eq!(candidate("Tool.Exe", true), vec!["Tool.Exe"]);
 }
 
-#[test]
+#[skuld::test]
 fn a_com_extension_is_in_the_allowlist() {
     // `more.com`/`chcp.com`/`tree.com` are ordinary PEs shipped in System32 with a cosmetic `.com`
     // extension; `.com` missing from the allowlist would break resolving them.
@@ -214,7 +214,7 @@ fn a_com_extension_is_in_the_allowlist() {
     assert_eq!(got, vec!["more.com"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_bat_extension_is_not_yet_in_the_allowlist() {
     // Batch resolution is a separate, not-yet-implemented feature (planned as its own follow-up),
     // not a statement that scripts are unsafe — see `filename_candidates`'s doc. Until it lands,
@@ -224,7 +224,7 @@ fn a_bat_extension_is_not_yet_in_the_allowlist() {
     assert_eq!(got, vec!["tool.bat.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_tries_the_exact_name_before_the_exe_one() {
     // The `.exe` convention belongs to names that get SEARCHED, not to files that get LOADED:
     // the PE/COFF format makes no extension normative, and `CreateProcessW` documents
@@ -239,7 +239,7 @@ fn a_located_name_tries_the_exact_name_before_the_exe_one() {
     assert_eq!(got, vec!["bin/my-program", "bin/my-program.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_located_dotted_name_gets_only_the_exact_candidate() {
     // `.bin` is not a LOADABLE extension, but it IS an extension — and `main` keyed its `.exe`
     // fallback on `Path::extension().is_none()`. Appending here would let
@@ -250,7 +250,7 @@ fn a_located_dotted_name_gets_only_the_exact_candidate() {
     assert_eq!(got, vec![r"tools\thing.bin"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_with_only_a_leading_dot_still_gets_the_exe_fallback() {
     // `Path::extension()` treats a leading dot as part of the stem, not an extension separator,
     // so `.helper` has NO extension and keeps the portable `.exe` fallback. Pinned because
@@ -259,7 +259,7 @@ fn a_located_name_with_only_a_leading_dot_still_gets_the_exe_fallback() {
     assert_eq!(got, vec![r"bin\.helper", r"bin\.helper.exe"], "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_already_ending_in_exe_or_com_gets_one_candidate() {
     // Nothing to append: appending would only ever produce `x.exe.exe`, which names a file the
     // caller did not write. One candidate, same as the bare case.
@@ -270,7 +270,7 @@ fn a_located_name_already_ending_in_exe_or_com_gets_one_candidate() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn posix_never_appends_exe_for_any_of_the_above() {
     for n in [
         "tool",
@@ -290,7 +290,7 @@ fn posix_never_appends_exe_for_any_of_the_above() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn every_searched_name_produces_exactly_one_candidate() {
     // BARE names only — the ones that visit `system_dirs`/`PATH`. A second candidate here would
     // reintroduce the ordering hazard: an ambient extensionless file winning in some directory
@@ -313,7 +313,7 @@ fn every_searched_name_produces_exactly_one_candidate() {
 
 // ── shape classification ─────────────────────────────────────────────────────────────
 
-#[test]
+#[skuld::test]
 fn a_drive_relative_name_is_located_not_bare() {
     // `C:tool` has no separator, so a naive rule calls it a bare name and searches PATH — but
     // joining a PATH directory onto it collapses back to `C:tool`, which resolves through drive
@@ -335,7 +335,7 @@ fn a_drive_relative_name_is_located_not_bare() {
 
 // ── the current directory is not searched ────────────────────────────────────────────
 
-#[test]
+#[skuld::test]
 fn bare_name_is_not_resolved_from_the_current_directory() {
     let cwd = tempfile::tempdir().unwrap();
     // `&exe_name("tool")`, not literal `"tool"`: on a Windows host the candidate this resolution
@@ -348,7 +348,7 @@ fn bare_name_is_not_resolved_from_the_current_directory() {
     assert_not_found("tool", go("tool", cwd.path(), None));
 }
 
-#[test]
+#[skuld::test]
 fn bare_name_resolves_from_path() {
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
@@ -357,7 +357,7 @@ fn bare_name_resolves_from_path() {
     assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn path_wins_over_an_identically_named_file_in_cwd() {
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
@@ -367,7 +367,7 @@ fn path_wins_over_an_identically_named_file_in_cwd() {
     assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn a_name_with_a_separator_resolves_against_cwd() {
     let cwd = tempfile::tempdir().unwrap();
     // Located (contains a separator) tries the exact name first and `.exe` second, so planting
@@ -400,7 +400,7 @@ fn go_win(program: &str, cwd: &Path) -> Result<std::path::PathBuf, Error> {
     go_win_path(program, cwd, None)
 }
 
-#[test]
+#[skuld::test]
 fn a_located_extensionless_image_resolves_on_windows() {
     // THE REGRESSION GATE. `main` returned an existing absolute/pathed file verbatim; extending
     // the bare-name rule to the located axis briefly made `executable(r"C:\tools\myapp")` a hard
@@ -414,7 +414,7 @@ fn a_located_extensionless_image_resolves_on_windows() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn a_located_image_with_an_unrelated_extension_resolves_on_windows() {
     // Same gate, for the `.bin`/`.dat`/staged-payload shape: the PE/COFF format makes no
     // extension normative, so cosca must not invent one for a file the caller named by path.
@@ -424,7 +424,7 @@ fn a_located_image_with_an_unrelated_extension_resolves_on_windows() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_prefers_the_exact_file_over_the_exe_one() {
     // Candidate ORDER, pinned: with both `myapp` and `myapp.exe` present, the exact name the
     // caller wrote wins. This is `main`'s ordering, kept deliberately — "you named this file"
@@ -436,7 +436,7 @@ fn a_located_name_prefers_the_exact_file_over_the_exe_one() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_still_falls_back_to_exe_when_only_that_exists() {
     // The cross-platform ergonomic the `.exe` rule exists for: `executable("bin/my-program")`
     // written once must find `my-program.exe` on Windows without the caller appending it. Losing
@@ -447,7 +447,7 @@ fn a_located_name_still_falls_back_to_exe_when_only_that_exists() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn empty_path_elements_are_skipped() {
     let cwd = tempfile::tempdir().unwrap();
     touch(cwd.path(), &exe_name("tool"));
@@ -480,7 +480,7 @@ const FIXTURE_EMPTY_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_EMPTY_PATH_ELEME
 /// unfiltered suite run ([`FIXTURE_EMPTY_PATH_ELEMENTS_MARKER`] is unset there). Re-executed via
 /// `run_fixture_with_cwd`, [`crate::test_child::expected_cwd`] both fetches the directory the
 /// parent prepared AND asserts `std::env::current_dir()` here actually IS it.
-#[test]
+#[skuld::test]
 fn fixture_empty_path_elements_are_skipped() {
     let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_EMPTY_PATH_ELEMENTS_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -493,7 +493,7 @@ fn fixture_empty_path_elements_are_skipped() {
     assert_not_found("tool", go("tool", &cwd, Some(OsStr::new(empty))));
 }
 
-#[test]
+#[skuld::test]
 fn relative_path_elements_are_skipped() {
     let cwd = tempfile::tempdir().unwrap();
     touch(cwd.path(), &exe_name("tool"));
@@ -519,7 +519,7 @@ const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH
 
 /// The child half of [`relative_path_elements_are_skipped`]; see
 /// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
-#[test]
+#[skuld::test]
 fn fixture_relative_path_elements_are_skipped() {
     let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -533,7 +533,7 @@ fn fixture_relative_path_elements_are_skipped() {
 
 // ── the Windows .exe rule ────────────────────────────────────────────────────────────
 
-#[test]
+#[skuld::test]
 fn the_exe_file_wins_over_an_extensionless_namesake_beside_it() {
     // Named for what it can actually observe. Re-adding an extensionless SECOND candidate for a
     // bare name would NOT fail this test — `tool.exe` is tried first and wins either way — so it
@@ -548,7 +548,7 @@ fn the_exe_file_wins_over_an_extensionless_namesake_beside_it() {
     assert_eq!(go_win_path("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     // There is no extensionless fallback candidate, so a bare `tool` with only an extensionless
     // `tool` file on PATH — no `tool.exe` anywhere — must fail to resolve, matching
@@ -567,7 +567,7 @@ fn an_extensionless_file_no_longer_resolves_even_with_no_exe_on_path() {
     assert_eq!(go_win_path("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
     // N1, end to end: before quote handling, an unquoted split shredded `sub;dir` at the `;`,
     // and even a quoted-but-unstripped entry failed `is_absolute()` and vanished with no error —
@@ -587,7 +587,7 @@ fn a_quoted_path_entry_with_an_embedded_semicolon_is_not_silently_dropped() {
 
 // ── the contract every backend depends on ────────────────────────────────────────────
 
-#[test]
+#[skuld::test]
 fn result_is_always_absolute() {
     let cwd = tempfile::tempdir().unwrap();
     touch(cwd.path(), &exe_name("tool"));
@@ -601,7 +601,7 @@ fn result_is_always_absolute() {
 // ── the execute bit, and the cwd ─────────────────────────────────────────────────────
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_readable_but_non_executable_match_is_skipped() {
     use std::os::unix::fs::PermissionsExt;
     let cwd = tempfile::tempdir().unwrap();
@@ -617,7 +617,7 @@ fn a_readable_but_non_executable_match_is_skipped() {
     assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
     let tmp = tempfile::tempdir().unwrap();
     let sub = tmp.path().join("sub");
@@ -650,7 +650,7 @@ const FIXTURE_RELATIVE_CWD_MARKER: &str = "COSCA_FIXTURE_RELATIVE_CWD";
 /// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape. Reconstructs `want`
 /// from its own (already-`tmp.path()`) cwd rather than receiving it from the parent, since the two
 /// are guaranteed equal by construction.
-#[test]
+#[skuld::test]
 fn fixture_relative_cwd_is_absolutised() {
     let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_CWD_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -684,7 +684,7 @@ fn fixture_relative_cwd_is_absolutised() {
 /// REAL current directory on drive C — the directory the `cwd` parameter never names, since
 /// `PathBuf::push` clears for any prefixed path.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_drive_relative_name_fails_closed() {
     let cwd = tempfile::tempdir().unwrap();
     // Planted where the process's actual OS cwd is about to be, so any route that reached drive
@@ -706,7 +706,7 @@ const FIXTURE_DRIVE_RELATIVE_MARKER: &str = "COSCA_FIXTURE_DRIVE_RELATIVE";
 /// The child half of [`a_drive_relative_name_fails_closed`]; see
 /// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn fixture_drive_relative_name_fails_closed() {
     let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_DRIVE_RELATIVE_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -728,7 +728,7 @@ fn fixture_drive_relative_name_fails_closed() {
 // not just the Windows runner. `system_dirs` here always calls back into a fabricated closure the
 // test controls, so these tests do not depend on real system directories existing.
 
-#[test]
+#[skuld::test]
 fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     // THE regression gate. If system-directory precedence over PATH is ever silently dropped
     // again (e.g. by a future edit that forgets to prepend `system_dirs` before `split_path_var`,
@@ -761,7 +761,7 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn bare_name_only_on_path_still_resolves_from_path() {
     // Adding a search step ahead of PATH must not turn into REPLACING PATH: a name that exists
     // only on PATH, with real (non-matching) system dirs present, must still resolve — otherwise
@@ -787,7 +787,7 @@ fn bare_name_only_on_path_still_resolves_from_path() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     // Every test in this file predating this fix calls `go()`, which passes
     // `system_dirs: &no_system_dirs` (see `go`'s definition above). That is only a safe default if
@@ -827,7 +827,7 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
     assert_not_found("tool", miss);
 }
 
-#[test]
+#[skuld::test]
 fn posix_ignores_system_dirs_entirely() {
     // `system_dirs` exists to reproduce a WINDOWS-only search order (`CreateProcessW`'s
     // NULL-`lpApplicationName` rule) — POSIX's own `execvp`/`posix_spawn` PATH search has no
@@ -862,7 +862,7 @@ fn posix_ignores_system_dirs_entirely() {
     assert_not_found("tool", got);
 }
 
-#[test]
+#[skuld::test]
 fn a_located_name_still_resolves_when_the_system_dirs_query_fails() {
     // `system_dirs` is called only from the `BareName` arm (see `ResolveInput::system_dirs`'s own
     // doc), after every shape refusal above it has already passed — a `Located` name (one
@@ -888,7 +888,7 @@ fn a_located_name_still_resolves_when_the_system_dirs_query_fails() {
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
 }
 
-#[test]
+#[skuld::test]
 fn a_bare_name_fails_closed_when_the_system_dirs_query_fails() {
     // The mirror image of the test above: a TRUE bare name (no separator) does reach the
     // `BareName` arm, so a failing `system_dirs` query must fail the whole resolution — the
@@ -922,7 +922,7 @@ fn a_bare_name_fails_closed_when_the_system_dirs_query_fails() {
 
 // ── the located axis does not search, and a miss is NotFound ─────────────────────────
 
-#[test]
+#[skuld::test]
 fn a_located_name_never_falls_back_to_a_search() {
     // `resolve_executable_in`'s doc promises a name containing a separator "resolves against
     // base_cwd with NO SEARCH AT ALL". Nothing gated that: making `Shape::Located` also visit
@@ -939,7 +939,7 @@ fn a_located_name_never_falls_back_to_a_search() {
     assert_not_found("./helper", go_win_path("./helper", cwd.path(), Some(&pv)));
 }
 
-#[test]
+#[skuld::test]
 fn a_miss_is_reported_as_not_found() {
     // `resolve_executable_in`'s doc promises `ErrorKind::NotFound` for a miss. Nothing asserted
     // the kind, so changing it was invisible. (A drive-relative name is a REFUSAL, not a miss —
@@ -952,7 +952,7 @@ fn a_miss_is_reported_as_not_found() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_directory_named_like_the_program_is_not_returned() {
     // `is_execable` keys on `is_file()`, not `exists()`. It matters most on POSIX, where
     // `faccessat(X_OK)` SUCCEEDS on a directory — so an `exists()`-based check would hand a
@@ -973,7 +973,7 @@ fn a_directory_named_like_the_program_is_not_returned() {
     assert_eq!(go("tool", cwd.path(), Some(&p2)).unwrap(), want);
 }
 
-#[test]
+#[skuld::test]
 fn a_separator_terminated_located_name_gets_no_exe_fallback() {
     // THE WIDENING GUARD. Appending to a name that ends in a separator produces a DOTFILE INSIDE
     // the named directory — `C:\tools\thing.bin\.exe` — which a writer of that directory can
@@ -990,7 +990,7 @@ fn a_separator_terminated_located_name_gets_no_exe_fallback() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_empty_program_never_resolves() {
     // `classify("")` is a bare name, and the `.exe` rule turned it into the single candidate
     // `.exe` — so `executable("")` resolved to any file literally named `.exe` sitting in a PATH
@@ -1022,7 +1022,7 @@ fn assert_not_found(name: &str, got: Result<std::path::PathBuf, Error>) {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_drive_relative_name_is_refused_on_shape() {
     // `C:tool` names a file relative to drive C's OWN current directory — state cosca does not
     // track and never will, so no filesystem can make it resolve. Under the kind rule that is a
@@ -1036,7 +1036,7 @@ fn a_drive_relative_name_is_refused_on_shape() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_accepted_name_that_is_simply_absent_is_not_found() {
     // The negative control for every refusal in this block, and the other half of the kind rule:
     // each of these IS accepted, IS searched, and merely misses — a different disk (or `PATH`)
@@ -1059,7 +1059,7 @@ fn an_accepted_name_that_is_simply_absent_is_not_found() {
     assert_not_found("tool", go(&exe_name("tool"), cwd.path(), None));
 }
 
-#[test]
+#[skuld::test]
 fn a_program_with_no_stem_is_refused() {
     // A path whose final component is empty, `.` or `..` names a DIRECTORY, so it cannot name an
     // executable — and resolving it anyway is not merely futile, it invents names. `C:\t\.` grew
@@ -1085,7 +1085,7 @@ fn a_program_with_no_stem_is_refused() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_stemless_program_is_refused_on_posix_too() {
     // The rule is not a Windows one: `execvp("bin/")`, `execvp(".")` and `execvp("..")` fail for
     // the same reason. Only the separator set is platform-dependent, so `bin\` stays a legitimate
@@ -1096,7 +1096,7 @@ fn a_stemless_program_is_refused_on_posix_too() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_dot_terminated_name_never_invents_a_planted_sibling() {
     // The live half of the bug, on the filesystem: with `..exe` planted beside it, `C:\t\.` used
     // to resolve to that file. The directory it names is real and the plant is real, so nothing
@@ -1109,7 +1109,7 @@ fn a_dot_terminated_name_never_invents_a_planted_sibling() {
     assert_refused_on_shape(&named, go_win_path(&named, cwd.path(), None));
 }
 
-#[test]
+#[skuld::test]
 fn a_trailing_dot_or_space_is_an_ordinary_name_on_both_platforms() {
     // A trailing dot or space is an ordinary filename character on either platform, so each of
     // these names a file and gets searched for. Win32's trimming is not modelled: it describes a
@@ -1137,7 +1137,7 @@ fn a_trailing_dot_or_space_is_an_ordinary_name_on_both_platforms() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_dot_run_name_is_searched_for_like_any_other_bare_name() {
     // The live half, on the filesystem: `...` is a NAME, so the bare rule appends `.exe` to it and
     // the search finds `....exe` exactly as it finds `tool.exe` for `tool`. Not a plantable
@@ -1151,7 +1151,7 @@ fn a_dot_run_name_is_searched_for_like_any_other_bare_name() {
     assert_eq!(got, planted, "{got:?}");
 }
 
-#[test]
+#[skuld::test]
 fn the_exe_rule_appends_to_the_name_as_written() {
     // `.exe` goes onto the name the caller wrote, unmodified: `tool.` -> `tool..exe` is the SAME
     // rule as `tool` -> `tool.exe`. Trimming the dot first would search every system and `PATH`
@@ -1176,7 +1176,7 @@ fn the_exe_rule_appends_to_the_name_as_written() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
     // A share, a volume or a device namespace is a ROOT, not a file — the same shape as `C:\`,
     // which was already refused while these were not. On Windows `Path::file_name()` is `None`
@@ -1201,7 +1201,7 @@ fn a_prefix_only_located_name_is_refused_like_a_drive_root() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string() {
     // ONE string must not parse under TWO separator sets. Reading a verbatim prefix with a
     // `\`-only rule while the final component is split on `/` and `\` alike let the prefix swallow
@@ -1240,7 +1240,7 @@ fn a_verbatim_prefix_is_split_on_the_same_separators_as_the_rest_of_the_string()
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
     // `resolve` refuses these before `filename_candidates` runs; this pins the candidate rule
     // itself, which `takes_the_exe_fallback`'s own doc promises is defence in depth for any
@@ -1251,7 +1251,7 @@ fn a_prefix_only_located_name_never_grows_an_exe_candidate() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_name_that_names_no_file_grows_no_candidate_on_either_axis() {
     // `resolve` refuses all of these before `filename_candidates` runs, but the candidate rule
     // must not depend on that. The two axes must answer with ONE predicate: a `.`-terminated
@@ -1275,7 +1275,7 @@ fn a_name_that_names_no_file_grows_no_candidate_on_either_axis() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_name_under_a_windows_prefix_is_still_a_filename() {
     // The negative control: only the PREFIX itself is not a filename. Everything below it is one,
     // with the ordinary candidate rule — including `\\.\pipe\x`, whose `x` IS a `Normal`
@@ -1299,7 +1299,7 @@ fn a_name_under_a_windows_prefix_is_still_a_filename() {
 /// POSIX-simulating on a Windows host shreds every candidate on its drive colon (see
 /// `HOST_WINDOWS`). On a POSIX host `go` already applies the POSIX rules.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_posix_name_with_a_stem_still_resolves() {
     // The POSIX twin, and the negative control for the separator set — the one half of the stem
     // rule that is platform-dependent. A backslash is an ordinary filename character here, so
@@ -1315,7 +1315,7 @@ fn a_posix_name_with_a_stem_still_resolves() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_name_with_a_stem_still_resolves() {
     // Negative control for the three tests above: the refusal must key on a MISSING stem, not on
     // a leading dot. `.helper` and `..helper` are ordinary filenames and must survive.
@@ -1332,7 +1332,7 @@ fn a_name_with_a_stem_still_resolves() {
 // ===== the elevated image allowlist =====
 
 /// The allowlist itself; see [`reject_unloadable_image`]'s doc for why only the name can be gated.
-#[test]
+#[skuld::test]
 fn an_image_without_a_loadable_extension_is_refused() {
     for n in [
         r"C:\dir\tool",
@@ -1351,7 +1351,7 @@ fn an_image_without_a_loadable_extension_is_refused() {
 
 /// An allowlist refuses every other registered association by construction; a denylist of script
 /// extensions would let these through.
-#[test]
+#[skuld::test]
 fn the_elevated_allowlist_also_refuses_the_wider_association_surface() {
     for n in [
         r"C:\dir\shortcut.lnk",
@@ -1370,7 +1370,7 @@ fn the_elevated_allowlist_also_refuses_the_wider_association_surface() {
 
 /// Negative control, case-insensitive. `.com` because `more.com`/`chcp.com`/`tree.com` ship in
 /// System32 as ordinary PEs.
-#[test]
+#[skuld::test]
 fn a_loadable_image_name_is_accepted() {
     for n in [
         r"C:\dir\tool.exe",
@@ -1389,7 +1389,7 @@ fn a_loadable_image_name_is_accepted() {
 
 /// Kills dropping the `names_no_file` guard: without it the whole-string suffix test accepts a
 /// share root whose share happens to be named `*.exe`.
-#[test]
+#[skuld::test]
 fn a_prefix_ending_in_exe_is_not_an_image_name() {
     for n in [r"\\server\share.exe", r"\\?\UNC\server\share.com"] {
         assert!(

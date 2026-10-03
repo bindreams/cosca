@@ -11,239 +11,239 @@ fn strs(input: &str) -> Vec<String> {
 // (A) Python posix_data port — adapted from CPython Lib/test/test_shlex.py (PSF-licensed).
 // Test vectors (input/expected pairs) are factual data, not copyrighted expression.
 
-#[test]
+#[skuld::test]
 fn py_single_word() {
     assert_eq!(strs("x"), ["x"]);
 }
-#[test]
+#[skuld::test]
 fn py_two_words() {
     assert_eq!(strs("foo bar"), ["foo", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_leading_ws() {
     assert_eq!(strs(" foo bar"), ["foo", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_leading_trailing_ws() {
     assert_eq!(strs(" foo bar "), ["foo", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_multi_ws() {
     assert_eq!(strs("foo   bar  bla     fasel"), ["foo", "bar", "bla", "fasel"]);
 }
-#[test]
+#[skuld::test]
 fn py_embedded_runs() {
     assert_eq!(strs("x y  z              xxxx"), ["x", "y", "z", "xxxx"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_x() {
     assert_eq!(strs(r"\x bar"), ["x", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_x() {
     assert_eq!(strs(r"\ x bar"), [" x", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space() {
     assert_eq!(strs(r"\ bar"), [" bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_x_mid() {
     assert_eq!(strs(r"foo \x bar"), ["foo", "x", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_x_mid() {
     assert_eq!(strs(r"foo \ x bar"), ["foo", " x", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_mid() {
     assert_eq!(strs(r"foo \ bar"), ["foo", " bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_word() {
     assert_eq!(strs(r#"foo "bar" bla"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_all_dq() {
     assert_eq!(strs(r#""foo" "bar" "bla""#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_mixed_dq() {
     assert_eq!(strs(r#""foo" bar "bla""#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_start() {
     assert_eq!(strs(r#""foo" bar bla"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_sq_word() {
     assert_eq!(strs(r#"foo 'bar' bla"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_all_sq() {
     assert_eq!(strs(r#"'foo' 'bar' 'bla'"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_mixed_sq() {
     assert_eq!(strs(r#"'foo' bar 'bla'"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_sq_start() {
     assert_eq!(strs(r#"'foo' bar bla"#), ["foo", "bar", "bla"]);
 }
-#[test]
+#[skuld::test]
 fn py_adjacent_dq() {
     assert_eq!(
         strs(r#"blurb foo"bar"bar"fasel" baz"#),
         ["blurb", "foobarbarfasel", "baz"]
     );
 }
-#[test]
+#[skuld::test]
 fn py_adjacent_sq() {
     assert_eq!(
         strs(r#"blurb foo'bar'bar'fasel' baz"#),
         ["blurb", "foobarbarfasel", "baz"]
     );
 }
-#[test]
+#[skuld::test]
 fn py_empty_dq_mid() {
     assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_empty_sq_mid() {
     assert_eq!(strs("foo '' bar"), ["foo", "", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_triple_empty_dq() {
     assert_eq!(strs(r#"foo "" "" "" bar"#), ["foo", "", "", "", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_triple_empty_sq() {
     assert_eq!(strs("foo '' '' '' bar"), ["foo", "", "", "", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_dq_unquoted() {
     assert_eq!(strs(r#"\""#), [r#"""#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_dq() {
     assert_eq!(strs(r#""\"""#), [r#"""#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_space() {
     assert_eq!(strs(r#""foo\ bar""#), [r"foo\ bar"]);
 } // \<space> in dQ: both literal
-#[test]
+#[skuld::test]
 fn py_dq_bs_bs_space() {
     assert_eq!(strs(r#""foo\\ bar""#), [r"foo\ bar"]);
 } // \\ in dQ: consume one
-#[test]
+#[skuld::test]
 fn py_dq_bs_bs_space_bs_dq() {
     assert_eq!(strs(r#""foo\\ bar\"""#), [r#"foo\ bar""#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_bs_close_bs_dq() {
     assert_eq!(strs(r#""foo\\" bar\""#), [r"foo\", r#"bar""#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_multi() {
     assert_eq!(strs(r#""foo\\ bar\" dfadf""#), [r#"foo\ bar" dfadf"#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_multi_triple_bs() {
     assert_eq!(strs(r#""foo\\\ bar\" dfadf""#), [r#"foo\\ bar" dfadf"#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_multi_triple_bs_x() {
     assert_eq!(strs(r#""foo\\\x bar\" dfadf""#), [r#"foo\\x bar" dfadf"#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_x_mid() {
     assert_eq!(strs(r#""foo\x bar\" dfadf""#), [r#"foo\x bar" dfadf"#]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_sq_unquoted() {
     assert_eq!(strs(r"\'"), ["'"]);
 }
-#[test]
+#[skuld::test]
 fn py_sq_bs_space() {
     assert_eq!(strs(r"'foo\ bar'"), [r"foo\ bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_sq_bs_bs_space() {
     assert_eq!(strs(r"'foo\\ bar'"), [r"foo\\ bar"]);
 }
-#[test]
+#[skuld::test]
 fn py_mixed_hard() {
     assert_eq!(strs(r#""foo\\\x bar\" df'a\ 'df""#), [r#"foo\\x bar" df'a\ 'df"#]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_dq_foo() {
     assert_eq!(strs(r#"\"foo"#), [r#""foo"#]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_dq_foo_bs_x() {
     assert_eq!(strs(r#"\"foo\x"#), [r#""foox"#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_x() {
     assert_eq!(strs(r#""foo\x""#), [r"foo\x"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_trailing_space() {
     assert_eq!(strs(r#""foo\ ""#), [r"foo\ "]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_mid_word() {
     assert_eq!(strs(r"foo\ xx"), ["foo xx"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_bs_x() {
     assert_eq!(strs(r"foo\ x\x"), ["foo xx"]);
 }
-#[test]
+#[skuld::test]
 fn py_bs_space_bs_x_bs_dq() {
     assert_eq!(strs(r#"foo\ x\x\""#), [r#"foo xx""#]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_space_bs_x() {
     assert_eq!(strs(r#""foo\ x\x""#), [r"foo\ x\x"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_bs_space_bs_x_bs_bs() {
     assert_eq!(strs(r#""foo\ x\x\\""#), [r"foo\ x\x\"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_mix_adjacent() {
     assert_eq!(strs(r#""foo\ x\x\\""foobar""#), [r"foo\ x\x\foobar"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_mix_adjacent_bs_sq() {
     assert_eq!(strs(r#""foo\ x\x\\"\'"foobar""#), [r"foo\ x\x\'foobar"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_mix_adjacent_bs_sq_embedded_sq() {
     assert_eq!(strs(r#""foo\ x\x\\"\'"fo'obar""#), [r"foo\ x\x\'fo'obar"]);
 }
-#[test]
+#[skuld::test]
 fn py_dq_adjacent_with_sq_dont() {
     assert_eq!(
         strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t'"#),
         [r"foo\ x\x\'fo'obar", "don't"]
     );
 }
-#[test]
+#[skuld::test]
 fn py_dq_adjacent_trailing_bs_bs() {
     assert_eq!(
         strs(r#""foo\ x\x\\"\'"fo'obar" 'don'\''t' \\"#),
         [r"foo\ x\x\'fo'obar", "don't", r"\"]
     );
 }
-#[test]
+#[skuld::test]
 fn py_literal_faces() {
     assert_eq!(strs(":-) ;-)"), [":-)", ";-)"]);
 }
-#[test]
+#[skuld::test]
 fn py_unicode() {
     assert_eq!(strs("áéíóú"), ["áéíóú"]);
 }
@@ -251,71 +251,71 @@ fn py_unicode() {
 // (B) Python-is-wrong per POSIX: strict POSIX consumes the backslash before $, `, and <LF>
 // inside "...". Python preserves it. We follow POSIX.
 
-#[test]
+#[skuld::test]
 fn dq_escaped_dollar() {
     assert_eq!(strs(r#""\$""#), ["$"]);
 }
-#[test]
+#[skuld::test]
 fn dq_escaped_backtick() {
     assert_eq!(strs("\"\\\x60\""), ["`"]);
 }
-#[test]
+#[skuld::test]
 fn dq_line_cont() {
     assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]);
 }
 
 // (C) Python agrees with POSIX on these.
 
-#[test]
+#[skuld::test]
 fn dq_escaped_quote() {
     assert_eq!(strs(r#""\"""#), [r#"""#]);
 }
-#[test]
+#[skuld::test]
 fn dq_escaped_backslash() {
     assert_eq!(strs(r#""\\""#), [r"\"]);
 }
-#[test]
+#[skuld::test]
 fn dq_non_special() {
     assert_eq!(strs(r#""\P""#), [r"\P"]);
 }
 
 // (D) Windows path matrix.
 
-#[test]
+#[skuld::test]
 fn win_quoted_single_bs() {
     assert_eq!(strs(r#""C:\Projects\qodana-cli""#), [r"C:\Projects\qodana-cli"]);
 }
-#[test]
+#[skuld::test]
 fn win_quoted_double_bs() {
     assert_eq!(strs(r#""C:\\Projects\\qodana-cli""#), [r"C:\Projects\qodana-cli"]);
 }
-#[test]
+#[skuld::test]
 fn win_forward_slash() {
     assert_eq!(strs("C:/Projects/qodana-cli"), ["C:/Projects/qodana-cli"]);
 }
-#[test]
+#[skuld::test]
 fn win_unquoted_bs_consumed() {
     assert_eq!(strs(r"C:\Projects\qodana-cli"), ["C:Projectsqodana-cli"]);
 }
-#[test]
+#[skuld::test]
 fn win_include_dir() {
     assert_eq!(strs(r#"-I"C:\Projects\qodana-cli""#), [r"-IC:\Projects\qodana-cli"]);
 }
-#[test]
+#[skuld::test]
 fn win_program_files_plus_arg() {
     assert_eq!(
         strs(r#""C:\Program Files\LLVM\bin\clang.exe" -c "src\main.c""#),
         [r"C:\Program Files\LLVM\bin\clang.exe", "-c", r"src\main.c"],
     );
 }
-#[test]
+#[skuld::test]
 fn win_post_json_single_bs() {
     assert_eq!(
         strs(r"c:\tools\clang.exe -c src\main.c"),
         ["c:toolsclang.exe", "-c", "srcmain.c"],
     );
 }
-#[test]
+#[skuld::test]
 fn win_post_json_quoted() {
     assert_eq!(
         strs(r#""c:\tools\clang.exe" -c "src\main.c""#),
@@ -325,266 +325,266 @@ fn win_post_json_quoted() {
 
 // (E) Adjacent quoting / empty-token concatenation.
 
-#[test]
+#[skuld::test]
 fn dq_adjacent() {
     assert_eq!(strs(r#""a""b""#), ["ab"]);
 }
-#[test]
+#[skuld::test]
 fn sq_adjacent() {
     assert_eq!(strs("'a''b'"), ["ab"]);
 }
-#[test]
+#[skuld::test]
 fn dq_then_sq() {
     assert_eq!(strs(r#""a"'b'"#), ["ab"]);
 }
-#[test]
+#[skuld::test]
 fn sq_then_dq() {
     assert_eq!(strs(r#"'a'"b""#), ["ab"]);
 }
-#[test]
+#[skuld::test]
 fn word_dq_word() {
     assert_eq!(strs(r#"a"b"c"#), ["abc"]);
 }
-#[test]
+#[skuld::test]
 fn dq_word_dq() {
     assert_eq!(strs(r#""a"b"c""#), ["abc"]);
 }
-#[test]
+#[skuld::test]
 fn foo_empty_dq() {
     assert_eq!(strs(r#"foo"""#), ["foo"]);
 }
-#[test]
+#[skuld::test]
 fn empty_dq_foo() {
     assert_eq!(strs(r#"""foo"#), ["foo"]);
 }
-#[test]
+#[skuld::test]
 fn bare_empty_dq() {
     assert_eq!(strs(r#""""#), [""]);
 }
-#[test]
+#[skuld::test]
 fn two_adjacent_empty_dq() {
     assert_eq!(strs("\"\"\"\""), [""]);
 }
-#[test]
+#[skuld::test]
 fn foo_dq_empty_dq_bar() {
     assert_eq!(strs(r#"foo "" bar"#), ["foo", "", "bar"]);
 }
-#[test]
+#[skuld::test]
 fn foo_sq_empty_sq_bar() {
     assert_eq!(strs("foo '' '' bar"), ["foo", "", "", "bar"]);
 }
 
 // (F) Whitespace — all blank inputs yield empty vec.
 
-#[test]
+#[skuld::test]
 fn ws_empty() {
     assert!(split(b"").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_space() {
     assert!(split(b" ").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_tab() {
     assert!(split(b"\t").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_lf() {
     assert!(split(b"\n").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_cr() {
     assert!(split(b"\r").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_runs() {
     assert!(split(b"   ").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_crlf() {
     assert!(split(b"\r\n").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn ws_a_cr_b() {
     assert_eq!(strs("a\rb"), ["a", "b"]);
 }
-#[test]
+#[skuld::test]
 fn ws_a_crlf_b() {
     assert_eq!(strs("a\r\nb"), ["a", "b"]);
 }
-#[test]
+#[skuld::test]
 fn ws_trailing_space() {
     assert_eq!(strs("a "), ["a"]);
 }
-#[test]
+#[skuld::test]
 fn ws_double_space_mid() {
     assert_eq!(strs("a  b"), ["a", "b"]);
 }
-#[test]
+#[skuld::test]
 fn ws_leading_and_trailing() {
     assert_eq!(strs(" a "), ["a"]);
 }
-#[test]
+#[skuld::test]
 fn ws_all_types() {
     assert!(split(b" \t\n\r").unwrap().is_empty());
 }
 
 // (G) Literal special chars (documented deviations).
 
-#[test]
+#[skuld::test]
 fn hash_mid_word() {
     assert_eq!(strs("foo#bar"), ["foo#bar"]);
 }
-#[test]
+#[skuld::test]
 fn hash_at_start() {
     assert_eq!(strs("#foo"), ["#foo"]);
 }
-#[test]
+#[skuld::test]
 fn hash_as_separate_word() {
     assert_eq!(strs("a #b c"), ["a", "#b", "c"]);
 }
-#[test]
+#[skuld::test]
 fn cmd_subst() {
     assert_eq!(strs("$(rm -rf /)"), ["$(rm", "-rf", "/)",]);
 }
-#[test]
+#[skuld::test]
 fn param_expansion() {
     assert_eq!(strs("${foo}"), ["${foo}"]);
 }
-#[test]
+#[skuld::test]
 fn backtick_subst() {
     assert_eq!(strs("`backtick`"), ["`backtick`"]);
 }
-#[test]
+#[skuld::test]
 fn shell_operators_no_ws() {
     assert_eq!(strs("a&b;c|d"), ["a&b;c|d"]);
 }
-#[test]
+#[skuld::test]
 fn double_pipe() {
     assert_eq!(strs("a || b"), ["a", "||", "b"]);
 }
-#[test]
+#[skuld::test]
 fn redirects_literal() {
     assert_eq!(strs("a >b <c"), ["a", ">b", "<c"]);
 }
 
 // (I) Line continuation — LF, CRLF, and bare CR (NOT line continuation).
 
-#[test]
+#[skuld::test]
 fn lf_unquoted_mid_word() {
     assert_eq!(strs("foo\\\nbar"), ["foobar"]);
 }
-#[test]
+#[skuld::test]
 fn lf_inside_dq() {
     assert_eq!(strs("\"foo\\\nbar\""), ["foobar"]);
 }
-#[test]
+#[skuld::test]
 fn lf_at_start_only() {
     assert!(split(b"\\\n").unwrap().is_empty());
 }
-#[test]
+#[skuld::test]
 fn lf_split_mid() {
     assert_eq!(strs("a\\\nb c"), ["ab", "c"]);
 }
-#[test]
+#[skuld::test]
 fn crlf_unquoted() {
     assert_eq!(strs("foo\\\r\nbar"), ["foobar"]);
 }
-#[test]
+#[skuld::test]
 fn bare_cr_unquoted_literal() {
     assert_eq!(s("foo\\\rbar"), [b"foo\rbar".to_vec()]);
 }
-#[test]
+#[skuld::test]
 fn crlf_inside_dq() {
     assert_eq!(strs("\"a\\\r\nb\""), ["ab"]);
 }
-#[test]
+#[skuld::test]
 fn bare_cr_inside_dq_preserved() {
     assert_eq!(s("\"a\\\rb\""), [b"a\\\rb".to_vec()]);
 }
 
 // (S) UTF-8 pass-through.
 
-#[test]
+#[skuld::test]
 fn unicode_two_words() {
     assert_eq!(strs("héllo 世界"), ["héllo", "世界"]);
 }
-#[test]
+#[skuld::test]
 fn unicode_inside_dq() {
     assert_eq!(strs("\"café au lait\""), ["café au lait"]);
 }
-#[test]
+#[skuld::test]
 fn unicode_after_bs_unquoted() {
     assert_eq!(strs("\\é"), ["é"]);
 }
-#[test]
+#[skuld::test]
 fn unicode_after_bs_in_dq() {
     assert_eq!(strs("\"\\é\""), ["\\é"]);
 }
 
 // (H) Non-ASCII bytes / NUL pass-through (byte-level, not string-level).
 
-#[test]
+#[skuld::test]
 fn non_ascii_bytes_pass_through() {
     let input = [b'a', 0xC3, 0xA9, b'b']; // "a", 0xC3 0xA9 (é utf8), "b"
     assert_eq!(split(&input).unwrap(), vec![input.to_vec()]);
 }
-#[test]
+#[skuld::test]
 fn nul_byte_is_a_valid_word_byte() {
     assert_eq!(split(b"a\0b").unwrap(), vec![b"a\0b".to_vec()]);
 }
 
 // (H) Errors — assert typed QuoteError with exact pos and kind.
 
-#[test]
+#[skuld::test]
 fn error_unterminated_dq_at_start() {
     let e = split(b"\"foo").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedDoubleQuote);
     assert_eq!(e.pos, 0);
 }
-#[test]
+#[skuld::test]
 fn error_unterminated_sq_at_start() {
     let e = split(b"'foo").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.pos, 0);
 }
-#[test]
+#[skuld::test]
 fn error_bare_sq() {
     let e = split(b"'").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.pos, 0);
 }
-#[test]
+#[skuld::test]
 fn error_empty_dq_then_unterminated_sq() {
     let e = split(b"\"\"'").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.pos, 2);
 }
-#[test]
+#[skuld::test]
 fn error_mid_token_sq() {
     let e = split(b"foo'bar").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.pos, 3);
 }
-#[test]
+#[skuld::test]
 fn error_mid_token_dq() {
     let e = split(b"foo\"bar").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::UnterminatedDoubleQuote);
     assert_eq!(e.pos, 3);
 }
-#[test]
+#[skuld::test]
 fn error_trailing_bs_after_word() {
     let e = split(b"foo\\").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::TrailingBackslash);
     assert_eq!(e.pos, 3);
 }
-#[test]
+#[skuld::test]
 fn error_trailing_bs_in_dq() {
     let e = split(b"\"foo\\").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::TrailingBackslash);
     assert_eq!(e.pos, 4);
 }
-#[test]
+#[skuld::test]
 fn error_lone_bs() {
     let e = split(b"\\").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::TrailingBackslash);
@@ -593,35 +593,35 @@ fn error_lone_bs() {
 
 use crate::quote::posix::{join, quote};
 
-#[test]
+#[skuld::test]
 fn quote_passes_safe_strings_through() {
     assert_eq!(quote(b"abcXYZ_0-9@%+=:,./"), b"abcXYZ_0-9@%+=:,./");
 }
 
-#[test]
+#[skuld::test]
 fn quote_wraps_empty_in_single_quotes() {
     assert_eq!(quote(b""), b"''");
 }
 
-#[test]
+#[skuld::test]
 fn quote_wraps_unsafe_and_escapes_single_quotes() {
     assert_eq!(quote(b"a b"), b"'a b'");
     assert_eq!(quote(b"it's"), br#"'it'"'"'s'"#);
 }
 
-#[test]
+#[skuld::test]
 fn join_empty_is_empty() {
     let empty: Vec<&[u8]> = vec![];
     assert_eq!(join(&empty), b"");
 }
 
-#[test]
+#[skuld::test]
 fn join_separates_with_single_space() {
     let args: Vec<&[u8]> = vec![b"a", b"b c", b"d"];
     assert_eq!(join(&args), b"a 'b c' d");
 }
 
-#[test]
+#[skuld::test]
 fn split_join_round_trips() {
     let cases: Vec<Vec<&[u8]>> = vec![
         vec![b"echo", b"hello world"],
@@ -648,7 +648,7 @@ fn is_safe_byte(b: u8) -> bool {
 }
 
 // (L) quote — exhaustive single-byte matrix. Doubles as a property test for SAFE.
-#[test]
+#[skuld::test]
 fn quote_exhaustive_single_byte() {
     for i in 0u16..=255 {
         let b = i as u8;
@@ -665,7 +665,7 @@ fn quote_exhaustive_single_byte() {
 }
 
 // (M) quote golden table.
-#[test]
+#[skuld::test]
 fn quote_golden() {
     let cases: Vec<(&[u8], &[u8])> = vec![
         (b"", b"''"),
@@ -688,7 +688,7 @@ fn quote_golden() {
 }
 
 // (N) join golden table.
-#[test]
+#[skuld::test]
 fn join_golden() {
     let cases: Vec<(Vec<&[u8]>, &[u8])> = vec![
         (vec![], b""),
@@ -785,7 +785,7 @@ fn assert_round_trip(args: &[Vec<u8>]) {
 }
 
 // (O) Round-trip invariant over the hand-curated corpus.
-#[test]
+#[skuld::test]
 fn join_split_round_trip_corpus() {
     for args in round_trip_corpus() {
         assert_round_trip(&args);
@@ -794,7 +794,7 @@ fn join_split_round_trip_corpus() {
 
 // (Q) Variable-arity round-trip — argv reconstructed from unit-separator-packed
 // seeds, the deterministic analogue of the Go fuzz target.
-#[test]
+#[skuld::test]
 fn join_split_round_trip_variable_arity() {
     let seeds: &[&[u8]] = &[
         b"",
@@ -820,7 +820,7 @@ fn join_split_round_trip_variable_arity() {
 }
 
 // (P) quote output is always a single token.
-#[test]
+#[skuld::test]
 fn quote_output_is_single_token() {
     let mut singles: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
     singles.extend([
@@ -842,7 +842,7 @@ fn quote_output_is_single_token() {
 
 // (R) quote is NOT idempotent on unsafe input — guards the round-trip invariant
 // against a future "optimization" that would re-break it.
-#[test]
+#[skuld::test]
 fn quote_not_idempotent() {
     let q1 = quote(b"'");
     let q2 = quote(&q1);
@@ -859,7 +859,7 @@ fn quote_not_idempotent() {
 // deterministic — no randomness, no external dependencies.
 //
 // Input count: Σ_{k=0}^{4} 12^k = 1 + 12 + 144 + 1728 + 20736 = 22621 inputs.
-#[test]
+#[skuld::test]
 fn split_never_panics_and_pos_in_bounds_exhaustive() {
     const ALPHA: &[u8] = &[
         b' ', b'\t', b'\n', b'\r', b'\\', b'\'', b'"', b'$', b'`', b'#', b'a', 0xFF,
@@ -906,7 +906,7 @@ fn split_never_panics_and_pos_in_bounds_exhaustive() {
 //
 // Representative args: b"", b"abc", b"a b", b"a'b", b"x\\$", b"\xFF"  (6 elements).
 // Vector count: Σ_{k=0}^{3} 6^k = 1 + 6 + 36 + 216 = 259 vectors.
-#[test]
+#[skuld::test]
 fn round_trip_exhaustive_small() {
     const REPR_ARGS: &[&[u8]] = &[b"", b"abc", b"a b", b"a'b", br"x\$", b"\xFF"];
 
