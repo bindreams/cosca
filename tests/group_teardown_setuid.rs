@@ -79,14 +79,14 @@ const UNPRIVILEGED: u32 = 65534;
 
 #[cfg(target_os = "linux")]
 /// Set by the parent to its own pid; the re-executed child accepts it only if it equals its
-/// parent's pid (see [`rerun_role`]). The child then prints [`RERAN`] because libtest exits 0 when
+/// parent's pid (see [`rerun_role`]). The child then prints [`RERAN`] because the runner exits 0 when
 /// the filter matches no test.
 const RERUN_ENV: &str = "COSCA_TEST_SETUID_RERUN";
 #[cfg(target_os = "linux")]
 const RERAN: &str = "COSCA_TEST_SETUID_RERUN ran";
 
 #[cfg(target_os = "linux")]
-/// The libtest `--exact` name of `$name`; a rename that misses this call site fails to compile
+/// The `--exact` name of `$name`; a rename that misses this call site fails to compile
 /// instead of matching zero tests.
 macro_rules! test_path {
     ($name:ident) => {{
@@ -123,6 +123,7 @@ fn rerun_command(db_dir: &std::path::Path) -> std::process::Command {
     use std::os::unix::process::CommandExt as _;
 
     let mut cmd = common::test_reexec::command(std::env::current_exe().expect("this test binary"));
+    common::test_reexec::with_json_events(&mut cmd);
     cmd.args([
         "--exact",
         test_path!(kill_tree_reports_refused_and_leaves_the_real_setuid_survivor_running),
@@ -151,6 +152,9 @@ fn rerun_unprivileged() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+    // The marker proves the body ran past the gate. The suite events prove the runner listed and
+    // passed exactly the one fixture, so a renamed fixture cannot leave the marker to vouch alone.
+    common::test_reexec::suite_passed_exactly_one(&out).expect("the unprivileged re-run ran and passed");
 }
 
 #[cfg(target_os = "linux")]
