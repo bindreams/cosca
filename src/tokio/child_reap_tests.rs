@@ -639,7 +639,7 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
     reap_behind_the_owner(pid);
 }
 
-/// A refused identity read fails the spawn with `Unassessable`, and the child is forgotten with a
+/// A refused identity read (the child's own, before `exec`) fails the spawn with `Unassessable`, and the child is forgotten with a
 /// warning: never signalled or reaped by pid. The child is a blocker that only a signal ends, so one
 /// that is still alive and unreaped afterwards was not signalled.
 ///
@@ -649,12 +649,12 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
 #[skuld::test]
 async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
     crate::tokio::test_runtime::assert_current_thread();
-    use crate::identity::{uniq_fault, Liveness, ReadPurpose, UniqRead};
+    use crate::identity::Liveness;
 
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let backend_drops = super::fault::count_backend_drops();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let _forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("set stdin");
