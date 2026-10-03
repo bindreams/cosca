@@ -37,27 +37,46 @@
 //! Nothing here runs a batch file or needs elevation. Temp directories are removed on drop and
 //! planted files explicitly, but a removal failure is only printed; whatever it leaves goes with
 //! the ephemeral runner.
-#![cfg(windows)]
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(windows)]
 #[path = "windows_path_resolution/dots_and_spaces.rs"]
 mod dots_and_spaces;
+#[cfg(windows)]
 #[path = "windows_path_resolution/harness.rs"]
 mod harness;
+#[cfg(windows)]
 #[path = "windows_path_resolution/provenance.rs"]
 mod provenance;
+#[cfg(windows)]
 #[path = "windows_path_resolution/pure.rs"]
 mod pure;
+#[cfg(windows)]
 #[path = "windows_path_resolution/spawn.rs"]
 mod spawn;
+#[cfg(windows)]
 #[path = "windows_path_resolution/streams.rs"]
 mod streams;
+#[cfg(windows)]
 #[path = "windows_path_resolution/surveys.rs"]
 mod surveys;
+#[cfg(windows)]
 #[path = "windows_path_resolution/unc_and_device.rs"]
 mod unc_and_device;
+#[cfg(windows)]
 #[path = "windows_path_resolution/verdict.rs"]
 mod verdict;
+#[cfg(windows)]
 #[path = "windows_path_resolution/winapi.rs"]
 mod winapi;
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
+}

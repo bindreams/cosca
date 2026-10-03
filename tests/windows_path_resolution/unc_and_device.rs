@@ -13,7 +13,7 @@ use crate::pure::rooted_prefix;
 /// trimmed. `\\...\x.bat\y\..` is `\\...\x.bat`.
 ///
 /// String-level only: `GetFullPathNameW` contacts no server and opens no device.
-#[test]
+#[skuld::test]
 fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -131,7 +131,7 @@ fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
 /// literal prefix, and only std's `is_verbatim` (`\\?\` or `\??\`, exactly) and the file APIs read
 /// it. `dots_and_spaces::a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain` shows
 /// which file each spelling opens.
-#[test]
+#[skuld::test]
 fn verbatim_marker_spellings_resolve_alike() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;

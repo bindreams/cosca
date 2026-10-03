@@ -5,11 +5,12 @@
 //! Precondition, asserted rather than skipped: long paths are enabled for the probe, which needs
 //! its `longPathAware` manifest (embedded by `build.rs` on MSVC) and the machine's
 //! `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled` set to 1.
-#![cfg(windows)]
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 fn probe(mode: &str, child: &str) -> String {
     let base = tempfile::tempdir().unwrap();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cosca_testbin_cwd"));
@@ -24,11 +25,12 @@ fn probe(mode: &str, child: &str) -> String {
     report
 }
 
+#[cfg(windows)]
 /// No route spawns from a cwd past `MAX_PATH`, even in a long-path-aware process with the policy
 /// on: `CreateProcessW` refuses a NULL `lpCurrentDirectory` inherited from it as
 /// `ERROR_INVALID_PARAMETER` (87), and the same directory passed explicitly as `ERROR_DIRECTORY`
 /// (267). It fails before any child runs, so the child's own manifest changes nothing.
-#[test]
+#[skuld::test]
 fn no_route_spawns_from_a_long_cwd_even_when_long_path_aware() {
     let report = probe("long", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
@@ -50,9 +52,10 @@ fn no_route_spawns_from_a_long_cwd_even_when_long_path_aware() {
     assert_eq!(facts, expected, "full report:\n{report}");
 }
 
+#[cfg(windows)]
 /// A relative name against a verbatim process cwd: cosca loads and runs where Win32 does, by
 /// `raw_executable()` and by `executable()`'s search alike.
-#[test]
+#[skuld::test]
 fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
     let report = probe("verbatim", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
@@ -75,6 +78,7 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
     assert_eq!(facts, expected, "full report:\n{report}");
 }
 
+#[cfg(windows)]
 /// A drive-relative `current_dir` on another drive takes that drive's own directory, `=X:`, as
 /// Win32 does: cosca's raw backend runs the child where `GetFullPathNameW` and std do, for every
 /// shape of that variable. Only a fully qualified value naming an existing directory is used; any
@@ -83,7 +87,7 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 /// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
 /// session, so it is the `WINDOWS_DRIVE_MAP` group, which CI turns on in one step of its own
 /// (`.github/workflows/ci.yaml`).
-#[test]
+#[skuld::test]
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
     if !crate::common::require_group("WINDOWS_DRIVE_MAP") {
         return;
@@ -109,13 +113,14 @@ fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does() {
     assert_eq!(facts, expected, "full report:\n{report}");
 }
 
+#[cfg(windows)]
 /// A UNC `current_dir` runs the child there, plainly and verbatim; and against a verbatim UNC
 /// process cwd, `GetFullPathNameW` completes a rooted name and a `..` run as measured here.
 ///
 /// Precondition, asserted rather than skipped: the machine serves its administrative share
 /// (`\\localhost\C$`) and this process's token may open it, which takes an administrator's
 /// elevated token. CI runners have both.
-#[test]
+#[skuld::test]
 fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does() {
     let report = probe("verbatim-unc", env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let facts: Vec<&str> = report.lines().collect();
@@ -139,4 +144,13 @@ fn a_unc_current_dir_runs_there_and_a_verbatim_unc_cwd_completes_as_win32_does()
         r"gfpn_written_past_share=\\?\UNC\localhost\t.exe",
     ];
     assert_eq!(facts, expected, "full report:\n{report}");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

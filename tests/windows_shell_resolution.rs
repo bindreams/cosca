@@ -97,18 +97,32 @@
 //! step for every verb. Using the default verb instead of `runas` measures the same thing with no
 //! UAC prompt and no elevated child — so these run unattended, and a failed probe cannot leave an
 //! elevated process behind.
-#![cfg(windows)]
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(windows)]
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 
+#[cfg(windows)]
 #[path = "windows_shell_resolution/harness.rs"]
 mod harness;
+#[cfg(windows)]
 #[path = "windows_shell_resolution/pathext.rs"]
 mod pathext;
+#[cfg(windows)]
 #[path = "windows_shell_resolution/precedence.rs"]
 mod precedence;
+#[cfg(windows)]
 #[path = "windows_shell_resolution/trailing_dot.rs"]
 mod trailing_dot;
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
+}

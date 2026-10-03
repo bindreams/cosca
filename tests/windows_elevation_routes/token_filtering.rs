@@ -54,7 +54,7 @@ use crate::windows_probe::mark_test_passed;
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
 /// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
 /// token, nothing more.
-#[test]
+#[skuld::test]
 fn measure_this_token() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -120,7 +120,7 @@ fn measure_this_token() {
 /// `CreateProcessAsUser`/`CreateProcessWithToken` chain is even reachable from a filtered caller.
 ///
 /// Read-only: `PROCESS_QUERY_LIMITED_INFORMATION` plus `TOKEN_QUERY`, nothing else.
-#[test]
+#[skuld::test]
 fn measure_another_process_token() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -240,7 +240,7 @@ fn measure_another_process_token() {
 /// The UAC policy in force. Without these values a token-shape measurement is uninterpretable: on
 /// a machine with `EnableLUA=0` there is no filtering to observe and every result below would be
 /// a misleading "elevation just works".
-#[test]
+#[skuld::test]
 fn measure_uac_policy() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -284,7 +284,7 @@ fn measure_uac_policy() {
 /// [`unelevated_caller_view`], which takes the same measurement at medium integrity and is the one
 /// that can actually answer the question — but only when its own report confirms
 /// `TokenIsElevated=false`; see that function's doc for when it cannot.
-#[test]
+#[skuld::test]
 fn linked_token_chain_here() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -325,7 +325,7 @@ fn linked_token_chain_here() {
 /// `TokenLinkedToken` — the genuine filtered token Windows made, not an imitation. Otherwise one
 /// is synthesised by disabling the Administrators SID and stamping the medium integrity label,
 /// which is close but NOT identical, and the report says which was used.
-#[test]
+#[skuld::test]
 fn unelevated_caller_view() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -608,7 +608,7 @@ fn synthesise_medium_token(own: &Token) -> Token {
 /// is assumed"? `windows_shell_resolution.rs` measured `ShellExecuteEx` violating the intuitive
 /// reading of ITS docs twice, so this claim is measured rather than trusted. It is the whole
 /// reason a `CreateProcess*` route would be an improvement.
-#[test]
+#[skuld::test]
 fn does_createprocessw_lpapplicationname_apply_pathext() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -688,7 +688,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
 /// **Question 2's first step.** Which logon types return a FILTERED token for an account in
 /// Administrators, and which return the full one? `LogonUser` is where UAC token filtering is
 /// applied, so this is where the chain either starts or dies.
-#[test]
+#[skuld::test]
 fn which_logon_types_return_a_filtered_token() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;

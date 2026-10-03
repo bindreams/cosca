@@ -1,16 +1,20 @@
 //! The raw and std Windows backends hand a child the same environment block — names, values and
 //! order — for the same inherited environment and env ops.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::ffi::OsString;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 /// The environment every intermediate process starts with, and so the one both backends inherit.
 const INHERITED: [(&str, &str); 4] = [("Path", "inh"), ("SS", "inh"), ("Foo", "inh"), ("zz", "inh")];
 
+#[cfg(windows)]
 /// The block a child spawned through `backend` receives.
 ///
 /// The inherited environment is controlled without touching this process's own: an intermediate
@@ -36,6 +40,7 @@ fn child_block(backend: &str, ops: &[String]) -> Vec<OsString> {
     parse_block(&out.stdout)
 }
 
+#[cfg(windows)]
 /// `dump-env-block`'s output: one entry per line, each UTF-16 unit as four hex digits.
 fn parse_block(stdout: &[u8]) -> Vec<OsString> {
     std::str::from_utf8(stdout)
@@ -51,7 +56,8 @@ fn parse_block(stdout: &[u8]) -> Vec<OsString> {
         .collect()
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn raw_and_std_backends_give_a_child_the_same_environment_block() {
     let system_root = std::env::var("SystemRoot").expect("SystemRoot");
     let set_root = format!("set:SystemRoot={system_root}");
@@ -86,12 +92,13 @@ fn raw_and_std_backends_give_a_child_the_same_environment_block() {
     }
 }
 
+#[cfg(windows)]
 /// With no ops the raw backend passes this process's block on byte for byte, as std's NULL block
 /// does: unsorted entries and an `EnvKey`-equal duplicate reach both children unchanged. The
 /// intermediate's block is built by `spawn-with-env-block`, since std's `Command` would clean it.
 /// No `=`-less entry: `CreateProcessW` refuses one (see `create_process_block_acceptance`), so no
 /// parent can hand its child such a block.
-#[test]
+#[skuld::test]
 fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
     let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let entries = [system_root.as_str(), "Path=a", "zz=1", "PATH=b", "ß=1", "SS=2"];
@@ -111,6 +118,7 @@ fn with_no_ops_both_backends_pass_the_parent_block_verbatim() {
     assert_eq!(run("raw"), std);
 }
 
+#[cfg(windows)]
 /// `entries` as a child receives them from the OS. On ARM64 Windows the OS prepends
 /// `PROCESSOR_ARCHITECTURE=ARM64` to a child's block that lacks it; on x64 it adds nothing.
 fn as_the_os_delivers(entries: &[&str]) -> Vec<OsString> {
@@ -124,11 +132,12 @@ fn as_the_os_delivers(entries: &[&str]) -> Vec<OsString> {
     want
 }
 
+#[cfg(windows)]
 /// A contained spawn's environment is the snapshot its containment decision was read from, on both
 /// backends. std cannot pass a block verbatim, so both rebuild it: the duplicate `PATH` collapses to
 /// one entry, first name and last value. The inherited marker makes the spawn nested, so no marker
 /// op is added and no ops at all are recorded.
-#[test]
+#[skuld::test]
 fn a_contained_child_gets_the_rebuilt_snapshot_on_both_backends() {
     let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let entries = [system_root.as_str(), "Path=a", "zz=1", "PATH=b", "__COSCA_GROUP_ROOT=1"];
@@ -148,8 +157,9 @@ fn a_contained_child_gets_the_rebuilt_snapshot_on_both_backends() {
     assert_eq!(run("raw contain"), std);
 }
 
+#[cfg(windows)]
 /// What `CreateProcessW` accepts as a child's block, measured: which parent blocks can exist.
-#[test]
+#[skuld::test]
 fn create_process_block_acceptance() {
     let system_root = format!("SystemRoot={}", std::env::var("SystemRoot").expect("SystemRoot"));
     let probe = |extra: &[&str]| {
@@ -163,4 +173,13 @@ fn create_process_block_acceptance() {
     assert_eq!(probe(&["Path=a", "zz=1", "PATH=b"]), "ok", "duplicates, unsorted");
     assert_eq!(probe(&["=C:=C:\\x"]), "ok", "a drive-cwd entry");
     assert_eq!(probe(&["JUNK"]), "err=87", "an entry with no `=`");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

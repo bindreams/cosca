@@ -11,7 +11,7 @@ use crate::winapi::full_path_name;
 /// not split at the separator before trimming: `x.bat.:s` and `x.bat :s` (one space) come back
 /// unchanged. String-level only: no stream is created or opened, so which file the file system
 /// would open for them is not measured here.
-#[test]
+#[skuld::test]
 fn a_stream_suffix_stays_in_the_final_component() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;

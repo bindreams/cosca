@@ -25,7 +25,7 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// `tool.bat` in its own temp directory, so nothing ties its result to this probe's — a change to
 /// either file's setup could silently make the two probes' conclusions stop actually comparing the
 /// same thing.
-#[test]
+#[skuld::test]
 fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -149,7 +149,7 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// `shell_execute_bounded` instead, bounded by `SHELL_EXECUTE_BOUND`. Hitting that bound is a hard
 /// failure here, never a conclusion about whether the dotted spelling opens the file: see
 /// `SHELL_EXECUTE_BOUND`'s doc.
-#[test]
+#[skuld::test]
 fn does_a_trailing_dot_still_open_the_extensionless_file() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;

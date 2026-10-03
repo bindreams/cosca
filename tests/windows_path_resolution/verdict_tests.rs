@@ -18,7 +18,7 @@ fn verdict(failures: &[String], facts: &Disagreements) -> (bool, Option<String>)
     (marked.get(), message)
 }
 
-#[test]
+#[skuld::test]
 fn a_passing_canary_is_marked() {
     let mut facts = Disagreements::about("Windows");
     facts.check(true, "fact", "ok");
@@ -26,7 +26,7 @@ fn a_passing_canary_is_marked() {
     assert_eq!(verdict(&[], &facts), (true, None));
 }
 
-#[test]
+#[skuld::test]
 fn a_measurement_failure_is_reported_and_not_marked() {
     let mut facts = Disagreements::about("Windows");
     facts.check(false, "fact", "other");
@@ -35,14 +35,14 @@ fn a_measurement_failure_is_reported_and_not_marked() {
     assert!(message.unwrap().contains("could not be taken: probe broke"));
 }
 
-#[test]
+#[skuld::test]
 fn a_canary_that_checked_nothing_is_not_marked() {
     let (marked, message) = verdict(&[], &Disagreements::about("Windows"));
     assert!(!marked);
     assert!(message.unwrap().contains("checked no fact"));
 }
 
-#[test]
+#[skuld::test]
 fn a_broken_fact_is_reported_before_a_coverage_shortfall_and_not_marked() {
     let mut facts = Disagreements::about("Windows");
     facts.check(false, "x resolves to y", "z");
@@ -58,7 +58,7 @@ fn a_broken_fact_is_reported_before_a_coverage_shortfall_and_not_marked() {
     assert!(!message.contains("planted"), "{message}");
 }
 
-#[test]
+#[skuld::test]
 fn an_unmet_requirement_is_reported_and_not_marked() {
     let mut facts = Disagreements::about("Windows");
     facts.check(true, "fact", "ok");

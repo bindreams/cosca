@@ -29,50 +29,67 @@
 //! process, so it cannot reach across processes to guard them — `.config/nextest.toml`'s test
 //! group, capped at one concurrent test, is what actually keeps these from racing each other
 //! under nextest.
-#![cfg(windows)]
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(windows)]
 #[path = "common/windows_probe.rs"]
 mod windows_probe;
 
+#[cfg(windows)]
 use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(windows)]
 use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+#[cfg(windows)]
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
     REG_OPTION_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
 };
+#[cfg(windows)]
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
 };
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_CLASSNAME, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
     SHELLEXECUTEINFOW,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+#[cfg(windows)]
 /// `ERROR_FILE_NOT_FOUND` as the HRESULT `ShellExecuteExW` fails with (measured).
 const FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
+#[cfg(windows)]
 /// `ERROR_NO_ASSOCIATION` as an HRESULT: the class has no command for the verb (measured).
 const NO_ASSOCIATION: i32 = 0x8007_0483_u32 as i32;
 
+#[cfg(windows)]
 /// Serialize the tests in this file: see the module doc.
 fn serial() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(windows)]
 /// An environment variable set for a test's duration and restored on drop to exactly what it was,
 /// absent included.
 struct EnvVar(&'static str, Option<OsString>);
 
+#[cfg(windows)]
 impl EnvVar {
     /// Set `name` to `value(previous)`.
     fn set(name: &'static str, value: impl FnOnce(Option<&OsStr>) -> OsString) -> Self {
@@ -82,6 +99,7 @@ impl EnvVar {
     }
 }
 
+#[cfg(windows)]
 impl Drop for EnvVar {
     fn drop(&mut self) {
         match &self.1 {
@@ -91,17 +109,22 @@ impl Drop for EnvVar {
     }
 }
 
+#[cfg(windows)]
 const APP: &str = "cosca_probe_a.exe";
+#[cfg(windows)]
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\cosca_probe_a.exe";
 
+#[cfg(windows)]
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain([0]).collect()
 }
 
+#[cfg(windows)]
 /// An App Paths key for [`APP`], deleted on drop. Created only if absent, so a key this probe did
 /// not make is never touched.
 struct AppPathKey(HKEY, Vec<u16>);
 
+#[cfg(windows)]
 impl AppPathKey {
     fn register(hive: HKEY, options: REG_OPEN_CREATE_OPTIONS, target: &Path) -> Result<Self, String> {
         let name = wide(OsStr::new(KEY));
@@ -144,6 +167,7 @@ impl AppPathKey {
     }
 }
 
+#[cfg(windows)]
 impl Drop for AppPathKey {
     fn drop(&mut self) {
         // SAFETY: the name is NUL-terminated and owned by `self`.
@@ -154,6 +178,7 @@ impl Drop for AppPathKey {
     }
 }
 
+#[cfg(windows)]
 fn is_elevated() -> Result<bool, String> {
     let mut token = HANDLE::default();
     // SAFETY: the pseudo-handle needs no closing; `token` is closed below.
@@ -177,6 +202,7 @@ fn is_elevated() -> Result<bool, String> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
+#[cfg(windows)]
 fn uac_policy(name: &str) -> String {
     let key = wide(OsStr::new(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"));
     let value = wide(OsStr::new(name));
@@ -201,6 +227,7 @@ fn uac_policy(name: &str) -> String {
     }
 }
 
+#[cfg(windows)]
 /// What a payload run reported: the image it was loaded from, and its current directory.
 #[derive(Debug)]
 struct Report {
@@ -208,6 +235,7 @@ struct Report {
     cwd: String,
 }
 
+#[cfg(windows)]
 /// Why a launch produced no report.
 #[derive(Debug)]
 enum Failure {
@@ -216,6 +244,7 @@ enum Failure {
     Other(#[expect(dead_code, reason = "read through `Debug`, in failure messages")] String),
 }
 
+#[cfg(windows)]
 /// Launch `file` in `dir` through `ShellExecuteExW(verb)`, optionally as `class`, from a
 /// single-threaded COM apartment as cosca's own launch does, and return what the payload reported.
 ///
@@ -226,6 +255,7 @@ fn launch(verb: &str, file: &OsStr, dir: &Path, class: Option<&str>, report: &Pa
     windows_probe::in_com_apartment(Failure::Other, || launch_in_apartment(verb, file, dir, class, report))
 }
 
+#[cfg(windows)]
 fn launch_in_apartment(
     verb: &str,
     file: &OsStr,
@@ -286,6 +316,7 @@ fn launch_in_apartment(
     }
 }
 
+#[cfg(windows)]
 /// The scratch layout both tests use: `a\cosca_probe_a.exe`, `b\cosca_probe_b.exe`,
 /// `a\cosca_probe_c.com`, `onpath\cosca_probe_p.exe` (copies of the payload) and an empty dir.
 struct Layout {
@@ -299,6 +330,7 @@ struct Layout {
     launches: std::cell::Cell<u32>,
 }
 
+#[cfg(windows)]
 fn layout() -> Layout {
     match is_elevated() {
         Ok(true) => {}
@@ -339,6 +371,7 @@ fn layout() -> Layout {
     }
 }
 
+#[cfg(windows)]
 fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Option<&str>) -> Result<Report, Failure> {
     // A report path of its own for every launch: a child no one waited for (a success without a
     // handle) can then write only its own report, never a later launch's.
@@ -352,15 +385,18 @@ fn run(l: &Layout, label: &str, verb: &str, file: &OsStr, dir: &Path, class: Opt
     got
 }
 
+#[cfg(windows)]
 fn ends_with(got: &Result<Report, Failure>, path: &Path) -> bool {
     got.as_ref()
         .is_ok_and(|r| windows_probe::same_file(Path::new(&r.image), path))
 }
 
+#[cfg(windows)]
 fn failed_with(got: &Result<Report, Failure>, hresult: i32) -> bool {
     matches!(got, Err(Failure::Shell(code)) if *code == hresult)
 }
 
+#[cfg(windows)]
 /// The last component of `path`, which is all the probe compares: the root may come back 8.3.
 fn last_component(path: &str) -> String {
     Path::new(path)
@@ -368,10 +404,11 @@ fn last_component(path: &str) -> String {
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
+#[cfg(windows)]
 /// Canary: with `SEE_MASK_CLASSNAME` and `lpClass = "exefile"`, `runas` runs a FULL path — an
 /// `.exe`, and a `.com` too — and finds nothing by a bare name, in `lpDirectory` or on `PATH`,
 /// where the same launch without the class finds both. `comfile` has no `runas` verb.
-#[test]
+#[skuld::test]
 fn classname_runas_needs_a_full_path() {
     if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
         return;
@@ -462,10 +499,11 @@ fn classname_runas_needs_a_full_path() {
     windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
+#[cfg(windows)]
 /// Canary: `ShellExecuteExW` consults an HKLM App Paths registration for a bare name, for `runas`
 /// and `open` alike, and loads the registered image — but not when launched as `exefile`. An HKCU
 /// registration is not consulted at all; that is printed, not asserted.
-#[test]
+#[skuld::test]
 fn exefile_skips_the_app_paths_lookup() {
     if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
         return;
@@ -500,10 +538,11 @@ fn exefile_skips_the_app_paths_lookup() {
     windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
+#[cfg(windows)]
 /// Canary: launched as `exefile`, a `%` is taken literally, in `lpFile` and in `lpDirectory`
 /// alike: with `COSCA_PROBE_PCT=exp` set, `…\%COSCA_PROBE_PCT%\…` loads from, and runs in, the
 /// directory literally named that, not `…\exp\…`.
-#[test]
+#[skuld::test]
 fn exefile_takes_percent_literally() {
     if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
         return;
@@ -553,4 +592,13 @@ fn exefile_takes_percent_literally() {
     drop(l.root);
     assert!(failures.is_empty(), "{}", failures.join("; "));
     windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

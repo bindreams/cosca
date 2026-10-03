@@ -3,7 +3,7 @@
 
 use super::pure::*;
 
-#[test]
+#[skuld::test]
 fn verbatim_spelling_of_each_prefix() {
     assert_eq!(verbatim_spelling(r"C:\a\b"), r"\\?\C:\a\b");
     assert_eq!(verbatim_spelling(r"\\?\C:\a"), r"\\?\C:\a");
@@ -12,7 +12,7 @@ fn verbatim_spelling_of_each_prefix() {
     assert_eq!(verbatim_spelling(r"\??\C:\a"), r"\??\C:\a");
 }
 
-#[test]
+#[skuld::test]
 fn pop_past_expectation_is_the_parent_or_the_root_itself() {
     assert_eq!(pop_past_expectation(r"D:\a\b"), r"D:\a");
     assert_eq!(pop_past_expectation(r"D:\a"), "D:");
@@ -24,7 +24,7 @@ fn pop_past_expectation_is_the_parent_or_the_root_itself() {
     assert_eq!(pop_past_expectation(r"\\.\C:"), r"\\.");
 }
 
-#[test]
+#[skuld::test]
 fn rooted_prefix_is_the_drive_or_the_share() {
     assert_eq!(rooted_prefix(r"D:\a\b").as_deref(), Some("D:"));
     assert_eq!(rooted_prefix(r"\\srv\share\a").as_deref(), Some(r"\\srv\share"));
@@ -38,7 +38,7 @@ fn rooted_prefix_is_the_drive_or_the_share() {
     assert_eq!(rooted_prefix(r"a\b"), None);
 }
 
-#[test]
+#[skuld::test]
 fn compare_across_roots_maps_the_root_in_errors_too() {
     let (e, n) = (r"T:\edir", r"T:\ndir");
     let same_err = compare_across_roots(
@@ -71,14 +71,14 @@ fn fake_reg(value: &[u16]) -> impl FnMut(&mut [u16], &mut u32) -> u32 + '_ {
     }
 }
 
-#[test]
+#[skuld::test]
 fn read_growing_retries_until_the_value_fits() {
     let value: Vec<u16> = (0..500).map(|i| u16::from(b'a') + (i % 26)).collect();
     let got = read_growing(fake_reg(&value)).unwrap();
     assert_eq!(&got[..value.len()], &value[..]);
 }
 
-#[test]
+#[skuld::test]
 fn read_growing_follows_a_value_that_grows_between_calls() {
     let mut calls = 0u32;
     let got = read_growing(|buf, bytes| {
@@ -99,12 +99,12 @@ fn read_growing_follows_a_value_that_grows_between_calls() {
     assert_eq!(&got[..2], &[u16::from(b'z'), 0]);
 }
 
-#[test]
+#[skuld::test]
 fn read_growing_passes_other_errors_through() {
     assert_eq!(read_growing(|_, _| 2), Err(2));
 }
 
-#[test]
+#[skuld::test]
 fn payload_outcome_separates_the_payloads_own_error_from_other_exits() {
     let ok = "module=C:\\m\nimage=C:\\t\\x \n";
     assert_eq!(payload_outcome(Some(0), ok), PayloadOutcome::Image("C:\\t\\x "));
@@ -120,7 +120,7 @@ fn payload_outcome_separates_the_payloads_own_error_from_other_exits() {
     assert_eq!(payload_outcome(None, ok), PayloadOutcome::OtherExit);
 }
 
-#[test]
+#[skuld::test]
 fn all_succeeded_reports_every_failed_step() {
     assert_eq!(all_succeeded([("a", Ok(())), ("b", Ok(()))]), Ok(()));
     assert_eq!(
@@ -133,7 +133,7 @@ fn all_succeeded_reports_every_failed_step() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn marker_file_name_is_a_valid_windows_file_name() {
     assert_eq!(
         marker_file_name("dots_and_spaces::a_final_component"),
@@ -142,7 +142,7 @@ fn marker_file_name_is_a_valid_windows_file_name() {
     assert_eq!(marker_file_name("top_level"), "top_level");
 }
 
-#[test]
+#[skuld::test]
 fn reap_after_terminate_reaps_only_a_terminated_child() {
     let mut reaped = false;
     let outcome = reap_after_terminate(
