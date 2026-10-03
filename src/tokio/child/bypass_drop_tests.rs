@@ -398,3 +398,63 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
         "after the unwind this process still holds the stdin write end"
     );
 }
+
+/// The spawn's identity check peeks through the child's pidfd. A peek that fails cannot show the
+/// child ours, so the spawn fails `Unassessable`, warns at the call, and forgets tokio's `Child`:
+/// its drop would reap by pid. The second failed peek is the forget decision's own look.
+///
+/// Mutants: the identity read moves before `ProcSource::new` (tokio's `Child` is then dropped by
+/// value on the error path, so `forgets()` is 0); the failed check goes to `reap_now` without the
+/// forget decision (`backend_drops` is 1).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+    use crate::error::Error;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
+    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let (slot, armed) = (Rc::clone(&slot), Rc::clone(&armed));
+        move || {
+            *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
+            // Armed here, not before `spawn()`: the handshake's own peeks run first.
+            *armed.borrow_mut() = Some(Box::new(force_peeks([
+                Err(std::io::Error::other("forced peek failure 91c4")),
+                Err(std::io::Error::other("forced peek failure 91c4")),
+            ])));
+        }
+    });
+    let forgets = super::drop_fault::record();
+    let backend_drops = super::fault::count_backend_drops();
+    let mark = crate::log_capture::mark();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
+
+    let err = cmd.spawn().err();
+
+    drop(armed);
+    let err = err.expect("a failed identity peek fails the spawn");
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "a failed peek is Unassessable, not a vanish: {err:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, "forced peek failure 91c4"),
+        "the failed peek is warned at the call"
+    );
+    assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
+    let witness = slot.borrow_mut().take().expect("the hook ran");
+    witness.kill();
+    witness.wait_exited();
+    witness
+        .reap()
+        .expect("the failed spawn must not have reaped the child by pid");
+}
