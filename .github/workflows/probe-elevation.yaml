@@ -154,3 +154,25 @@ jobs:
           "child exit: $($p.ExitCode)"
           Get-Content C:\elev-who.txt
           Get-Content C:\elev-out.txt
+  run0kill:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Does killing the run0 client end the unit?
+        continue-on-error: true
+        run: |
+          set -x
+          systemctl --version | head -1
+          for mode in --pipe --pty "--pipe --collect" "--pipe --property=KillMode=control-group" ; do
+            echo "=== run0 $mode"
+            ( setsid run0 --no-ask-password $mode /usr/bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $! > /tmp/client.pid )
+            sleep 3
+            systemctl list-units --all 'run-u*.service' --no-legend || true
+            kill -9 "$(cat /tmp/client.pid)" || true
+            sleep 5
+            echo "--- after SIGKILL of the client"
+            systemctl list-units --all 'run-u*.service' --no-legend || true
+            pgrep -a sleep || true
+            sudo pkill -f '/usr/bin/sleep 600' || true
+            sleep 1
+          done
