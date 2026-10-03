@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 pub(crate) struct ChrootScratch {
     scratch: PathBuf,
     root: PathBuf,
-    // Dropped recursively: it holds skuld's DB files, and no mount in this namespace (the fixture
-    // binds it only in a namespace of its own).
+    // Removed recursively by `finish`: no mount can be in it (the fixture binds it only in a
+    // namespace of its own).
     db: tempfile::TempDir,
 }
 
@@ -36,7 +36,7 @@ impl ChrootScratch {
         Self { scratch, root, db }
     }
 
-    /// The fixture's `SKULD_DB_DIR`, directly under `/tmp`.
+    /// The fixture's `SKULD_DB_DIR`.
     pub(crate) fn db_dir(&self) -> &Path {
         self.db.path()
     }
@@ -53,28 +53,42 @@ impl ChrootScratch {
     /// a non-recursive `remove_dir`. On `Err` whatever failed is left in place, for the message to
     /// name.
     pub(crate) fn finish(self) -> Result<(), String> {
-        // The mount point of the DB directory, if the fixture made one: `root/tmp/<name>`, empty once
-        // the fixture's mount namespace is gone.
-        let mount_point = self
-            .root
-            .join(self.db.path().strip_prefix("/").expect("an absolute DB directory"));
-        for dir in mount_point.ancestors().take_while(|dir| *dir != self.root) {
-            match std::fs::remove_dir(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(describe_remove_dir(dir, &e)),
-            }
+        let Self { scratch, root, db } = self;
+        let dirs = remove_dirs(&scratch, &root, db.path());
+        // The DB directory holds only skuld's files, and no mount in this namespace.
+        let db_path = db.path().to_owned();
+        let closed = db
+            .close()
+            .map_err(|e| format!("remove the skuld DB directory {db_path:?}: {e}"));
+        match (dirs, closed) {
+            (Ok(()), closed) => closed,
+            (Err(dirs), Ok(())) => Err(dirs),
+            (Err(dirs), Err(closed)) => Err(format!("{dirs}; also {closed}")),
         }
-        remove_root(&self.root)?;
-        let left: Vec<_> = std::fs::read_dir(&self.scratch)
-            .map_err(|e| format!("read the scratch directory {:?}: {e}", self.scratch))?
-            .map(|entry| entry.map(|e| e.path()))
-            .collect();
-        if !left.is_empty() {
-            return Err(format!("the fixture left {} behind in {:?}", list(&left), self.scratch));
-        }
-        std::fs::remove_dir(&self.scratch).map_err(|e| format!("remove the scratch directory {:?}: {e}", self.scratch))
     }
+}
+
+/// The non-recursive removals of [`ChrootScratch::finish`].
+fn remove_dirs(scratch: &Path, root: &Path, db_dir: &Path) -> Result<(), String> {
+    // The mount point of the DB directory, if the fixture made one: `root/tmp/<name>`, empty once
+    // the fixture's mount namespace is gone.
+    let mount_point = root.join(db_dir.strip_prefix("/").expect("an absolute DB directory"));
+    for dir in mount_point.ancestors().take_while(|dir| *dir != root) {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(describe_remove_dir(dir, &e)),
+        }
+    }
+    remove_root(root)?;
+    let left: Vec<_> = std::fs::read_dir(scratch)
+        .map_err(|e| format!("read the scratch directory {scratch:?}: {e}"))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect();
+    if !left.is_empty() {
+        return Err(format!("the fixture left {} behind in {scratch:?}", list(&left)));
+    }
+    std::fs::remove_dir(scratch).map_err(|e| format!("remove the scratch directory {scratch:?}: {e}"))
 }
 
 /// Removes the chroot root with a non-recursive `remove_dir`; on failure it stays, and the message

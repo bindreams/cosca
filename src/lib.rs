@@ -53,8 +53,6 @@
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
-// Shadows the built-in #[test] in every module of this crate's unit-test build, so a stray one registers with skuld
-// (harness = false) instead of silently never running. Goes when every test is spelled #[skuld::test] (plan E, unit N).
 #[cfg(test)]
 #[allow(
     unused_imports,

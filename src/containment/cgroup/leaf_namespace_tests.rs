@@ -135,7 +135,7 @@ fn fixture_leaf_no_proc() {
     let pid = member.id();
     let root = std::env::var_os(CHROOT_ROOT_ENV).expect("the driver names the chroot root");
     let db_dir = std::env::var_os(ns::SKULD_DB_DIR_ENV).expect("the driver names the skuld DB directory");
-    // Skuld checks the DB's path at the end of this test, after the chroot.
+    // Keep skuld's end-of-test DB path check resolvable after the chroot.
     ns::enter_private_mount_ns();
     ns::bind_into_root(std::path::Path::new(&root), std::path::Path::new(&db_dir));
     ns::chroot_into(std::path::Path::new(&root));

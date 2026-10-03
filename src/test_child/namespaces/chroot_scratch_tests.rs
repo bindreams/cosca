@@ -80,7 +80,7 @@ fn a_file_left_in_the_db_mount_point_chain_fails_finish_and_stays() {
     let err = s.finish().unwrap_err();
     assert!(err.contains("stray"), "{err}");
     assert!(stray.is_file(), "evidence must survive");
-    // Non-recursive removal left everything above the stray file.
+    // Clean up: the failed finish() removed nothing above the stray file.
     std::fs::remove_file(&stray).unwrap();
     std::fs::remove_dir(stray.parent().unwrap()).unwrap();
     std::fs::remove_dir(&root).unwrap();
@@ -92,4 +92,12 @@ fn the_db_directory_is_directly_under_tmp() {
     let s = ChrootScratch::new();
     assert_eq!(s.db_dir().parent(), Some(Path::new("/tmp")));
     s.finish().unwrap();
+}
+
+#[test]
+fn a_db_directory_that_cannot_be_removed_fails_finish() {
+    let s = ChrootScratch::new();
+    std::fs::remove_dir(s.db_dir()).unwrap();
+    let err = s.finish().unwrap_err();
+    assert!(err.contains("skuld DB directory"), "{err}");
 }

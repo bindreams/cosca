@@ -140,6 +140,7 @@ async fn tokio_bypass_drop_of_a_detached_child_after_a_foreign_reap_reaps_nothin
 /// `is_reaped` check dropped there (a false "left running" warning).
 #[skuld::test]
 async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, witness) = exited_unreaped(true);
@@ -298,6 +299,7 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
 /// by-pid reap.
 #[skuld::test]
 async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -330,6 +332,7 @@ async fn a_panicking_logger_in_the_tree_teardown_warn_does_not_reap_the_child_by
 /// a child its handle shows ours to tokio's drop and its orphan queue.
 #[skuld::test]
 async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
@@ -361,6 +364,7 @@ async fn a_panicking_refused_kill_warn_in_drop_does_not_strand_or_reap_by_pid() 
 /// descriptor, which stays closed in this single-threaded test.
 #[skuld::test]
 async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
+    crate::tokio::test_runtime::assert_current_thread();
     use std::os::fd::AsRawFd;
     crate::log_capture::install();
     let mut cmd = Command::new();

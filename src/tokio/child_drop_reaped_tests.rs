@@ -3,8 +3,8 @@
 //! group, so the drop skips it and warns instead.
 //!
 //! The recorder replaces `killpg` (`unix::fault::record_kill_group`), so a mutant that still
-//! sends it never reaches a real group. The recorder is thread-local and `#[tokio::test]` is
-//! current-thread, so the drop's kill runs on the recording thread.
+//! sends it never reaches a real group. The recorder is thread-local and skuld's default
+//! runtime is current-thread, so the drop's kill runs on the recording thread.
 
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
@@ -37,6 +37,7 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 /// without the pgid.
 #[skuld::test]
 async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -73,6 +74,7 @@ async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with
 /// root is skipped too.
 #[skuld::test]
 async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -91,6 +93,7 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
 /// kill is safe. Mutant: reaped judged with `try_wait`, which reaps the zombie and then skips.
 #[skuld::test]
 async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -110,6 +113,7 @@ async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_gro
 /// `TreeWalk` still walks.
 #[skuld::test]
 async fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
@@ -140,6 +144,7 @@ async fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_r
 /// warned.
 #[skuld::test]
 async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
@@ -162,6 +167,7 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
 /// takes only its own state.
 #[skuld::test]
 async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -206,6 +212,7 @@ fn foreign_reaped(mut cmd: Command) -> crate::tokio::Child {
 /// under `kill_on_drop`.
 #[skuld::test]
 async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
@@ -222,6 +229,7 @@ async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
 /// The same through the command's opt-out. Mutant: as above.
 #[skuld::test]
 async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
@@ -236,6 +244,7 @@ async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
 /// flag is ignored.
 #[skuld::test]
 async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["true"]).spawn().expect("spawn");
@@ -255,6 +264,7 @@ async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
 #[skuld::test]
 async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -277,6 +287,7 @@ async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 /// a skip decided on anything but the reaped root.
 #[skuld::test]
 async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -306,6 +317,7 @@ async fn waited_on_sleep_root() -> crate::tokio::Child {
 /// drop takes only the number's read.
 #[skuld::test]
 async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -324,6 +336,7 @@ async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_ki
 /// Mutant: `Unknown` is treated as reaped.
 #[skuld::test]
 async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_failed_read() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -346,6 +359,7 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
 /// tree-killed flag is set on the attempt.
 #[skuld::test]
 async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     recorder.fail_with_unassessable();
@@ -366,6 +380,7 @@ async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = Command::new();
     cmd.args(["sleep", "300"]);
@@ -398,6 +413,7 @@ mod cgroup_common;
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
     if !crate::test_support::require_group("CGROUP") {
@@ -456,6 +472,7 @@ fn assert_skipped_at_debug(mark: usize) {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_roots_number() {
+    crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
     crate::log_capture::install();
@@ -519,6 +536,7 @@ async fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let (pid, child) = reaped_sleep_root(ContainMode::TreeWalk).await;
@@ -537,6 +555,7 @@ async fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holder
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();

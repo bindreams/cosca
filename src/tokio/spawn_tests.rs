@@ -202,6 +202,7 @@ fn drive_until_reaped(
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = blocker();
     cmd.contain_with(crate::ContainMode::TreeWalk);
@@ -294,6 +295,7 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::fault as cgroup_fault;
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -583,6 +585,7 @@ async fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_password_write_kills_the_contained_tree() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-password-leaf");
@@ -636,6 +639,7 @@ async fn a_failed_password_write_kills_the_contained_tree() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::fault as leaf_fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
 
@@ -688,6 +692,7 @@ async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-password-kill-fail-leaf");
@@ -812,6 +817,7 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
 #[cfg(unix)]
 #[skuld::test]
 async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
+    crate::tokio::test_runtime::assert_current_thread();
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();

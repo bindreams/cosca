@@ -482,6 +482,7 @@ async fn wait_exit_cancel_leaves_child_untouched() {
 #[cfg(windows)]
 #[skuld::test]
 async fn wait_exit_drop_releases_the_windows_watcher() {
+    crate::tokio::test_runtime::assert_current_thread();
     use std::future::Future;
     let (tx, rx) = std::sync::mpsc::channel();
     let guard = super::fault_observer::install(tx);
@@ -641,6 +642,7 @@ async fn the_armed_probe_reaches_the_blocking_watch_of_a_live_target() {
 #[cfg(windows)]
 #[skuld::test]
 async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (own_tx, own_rx) = std::sync::mpsc::channel();
     let _guard = super::fault_observer::install(own_tx);
 
@@ -771,6 +773,7 @@ async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::test_support::FakeLeaf;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -791,6 +794,7 @@ async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::test_support::FakeLeaf;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1013,6 +1017,7 @@ async fn wait_tree_deadline_reports_an_eof_pending_when_the_timer_wins_the_first
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn wait_tree_deadline_arms_the_callers_deadline_instant() {
+    crate::tokio::test_runtime::assert_current_thread();
     use std::os::fd::AsFd;
 
     let mut cmd = crate::Command::new();

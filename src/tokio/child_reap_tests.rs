@@ -184,6 +184,7 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_reap() {
+    crate::tokio::test_runtime::assert_current_thread();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let child = spawn_a_tokio_child_that_exits();
     let real_pid = child.id().expect("tokio owns an un-reaped child");
@@ -204,6 +205,7 @@ async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_
 #[cfg(unix)]
 #[skuld::test]
 async fn wait_and_reap_of_a_child_reaped_behind_the_owner_is_foreign() {
+    crate::tokio::test_runtime::assert_current_thread();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -221,6 +223,7 @@ async fn wait_and_reap_of_a_child_reaped_behind_the_owner_is_foreign() {
 #[cfg(unix)]
 #[skuld::test]
 async fn tokio_forget_foreign_warns_naming_the_leak() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let child = spawn_a_tokio_child_that_exits();
@@ -403,6 +406,7 @@ async fn dropping_a_backend_implicitly_after_wait_releases_it() {
 #[cfg(unix)]
 #[skuld::test]
 async fn an_implicit_drop_logs_its_forget_only_when_not_unwinding() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let reaped_elsewhere = || {
         let child = spawn_a_tokio_child_that_exits();
@@ -629,6 +633,7 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::identity::{uniq_fault, Liveness, ReadPurpose, UniqRead};
 
     crate::log_capture::install();

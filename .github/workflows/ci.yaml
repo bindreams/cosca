@@ -41,8 +41,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured after the lib flipped to skuld (the guard then compiles the lib): 492 s, 714 s and 732 s in
-    # three runs. 25 min is 2.0x the slowest.
+    # Measured: 492 s, 714 s and 732 s in three runs. 25 min is 2.0x the slowest.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -139,9 +138,8 @@ jobs:
         run: .github/scripts/clippy.sh --feature-powerset --release
 
   # The libtest guard runs inside clippy.sh for a lane's own architecture. This job checks the other
-  # one. It is a job of its own because on Windows, and on macOS once the lib was flipped (P1: the
-  # guard then compiles the whole lib for every feature combination), the same steps pushed the
-  # test job past its bound.
+  # one. It is a job of its own because on Windows and macOS the guard compiles the whole lib for every
+  # feature combination, which pushed the test job past its bound.
   libtest-guard:
     name: Libtest guard (${{ matrix.os }})
     strategy:
@@ -158,8 +156,8 @@ jobs:
             runner: macos-latest
             other: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
-    # Measured after the lib flipped to skuld, at most: 672 s (linux), 1050 s (windows), 684 s (darwin).
-    # 40 min is 2.3x the slowest, a failure bound for a hang and not an expectation.
+    # Measured, at most: 672 s (linux), 1050 s (windows), 684 s (darwin). 40 min is 2.3x the slowest, a
+    # failure bound for a hang.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -188,8 +186,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         with:
           target: ${{ matrix.other }}
-        # The guard and its self-test took 1002 s at most (windows) after the lib flipped; 35 min is
-        # 2.1x that.
+        # The guard and its self-test took 1002 s at most (windows); 35 min is 2.1x that.
         timeout-minutes: 35
 
   test:
@@ -236,7 +233,7 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # Measured after the lib flipped to skuld, at most: windows/amd64 1548 s (its two Clippy steps, which
+    # Measured, at most: windows/amd64 1548 s (its two Clippy steps, which
     # now also run the guard over the lib, took 1010 s), darwin/amd64 1278 s, darwin/arm64 1272 s.
     # 50 min is 1.9x the slowest. All lanes share this bound.
     timeout-minutes: 50

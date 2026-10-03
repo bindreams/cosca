@@ -62,11 +62,12 @@ async fn async_wait_drop_cancels_and_child_stays_waitable() {
 /// The async twin of `a_refused_raw_spawn_does_not_clear_our_handle_inheritance`. Not padding:
 /// the async raw backend has its own copy of the ordering, which the sync test cannot see.
 ///
-/// `#[tokio::test]` is single-threaded, which matters — the seam is per *thread*, so a
+/// Skuld's default runtime is single-threaded, which matters — the seam is per *thread*, so a
 /// multi-thread runtime could move the spawn off this test's thread.
 #[cfg(windows)]
 #[skuld::test]
 async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::windows::observe;
     use crate::error::Error;
 
@@ -100,6 +101,7 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
 #[cfg(windows)]
 #[skuld::test]
 async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::windows::observe;
     use crate::error::Error;
 

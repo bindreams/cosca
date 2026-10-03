@@ -12,3 +12,8 @@ fn paused_runtime_is_paused_with_io_and_time() {
             .expect("the IO driver is enabled");
     });
 }
+
+#[test]
+fn assert_current_thread_accepts_a_current_thread_runtime() {
+    super::paused().block_on(async { super::assert_current_thread() });
+}

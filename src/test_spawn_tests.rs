@@ -290,6 +290,7 @@ fn status_releases_the_lock_before_the_wait() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn output_captured_tokio_releases_the_lock_before_the_wait() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (held, _armed) = record_lock_held_at_wait();
     super::output_captured_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
         .await
@@ -300,6 +301,7 @@ async fn output_captured_tokio_releases_the_lock_before_the_wait() {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn status_tokio_releases_the_lock_before_the_wait() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (held, _armed) = record_lock_held_at_wait();
     super::status_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
         .await

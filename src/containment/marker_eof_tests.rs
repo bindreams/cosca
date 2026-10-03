@@ -723,16 +723,11 @@ fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
+    crate::tokio::test_runtime::assert_current_thread();
     // `wait_tree_drained` has no deadline, so past the clamp it must not drain: draining for a
     // stuck writer forever is the unbounded CPU spin this primitive exists to avoid.
     //
-    // The seam below is a thread-local, so this needs the current-thread runtime that
-    // `#[tokio::test]` defaults to.
-    assert_eq!(
-        ::tokio::runtime::Handle::current().runtime_flavor(),
-        ::tokio::runtime::RuntimeFlavor::CurrentThread,
-        "declined_hook is thread-local: the future must be polled on this thread"
-    );
+    // The seam below is a thread-local, so this needs skuld's default current-thread runtime.
 
     // This process fills the pipe before `arm`, so nothing can grow it afterwards. The child
     // never writes; it only holds the write end open so the wait has a live holder.

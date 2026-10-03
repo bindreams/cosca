@@ -100,6 +100,7 @@ async fn macos_a_child_with_no_unique_id_is_reaped_elsewhere() {
 /// Mutant: a failed peek is no evidence.
 #[skuld::test]
 async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::wait::exit_only::seams::force_peek_once;
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -140,6 +141,7 @@ fn running_backend_with(held: impl FnOnce(u64) -> u64) -> (super::proc_source::P
 /// "ours".
 #[skuld::test]
 async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewhere() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     for read in [UniqRead::Refused(libc::EPERM), UniqRead::Gone] {
         let (proc, pid) = running_backend();
@@ -166,6 +168,7 @@ async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewher
 /// Mutants: the watch is armed on a fresh read of the pid; the re-read after arming is missing.
 #[skuld::test]
 async fn macos_wait_does_not_watch_a_stranger_that_took_the_pid_after_the_pre_check() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::identity::{uniq_fault, ReadPurpose, UniqInfo, UniqRead};
     use std::task::Poll;
     let mut stored = 0;
@@ -235,6 +238,7 @@ async fn macos_dropping_a_backend_implicitly_forgets_a_child_with_no_unique_id()
 /// Mutant: the drop does not forget.
 #[skuld::test]
 async fn macos_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     let child = foreign_reaped_blocker().await;
     let root = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();

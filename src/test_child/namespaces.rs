@@ -37,9 +37,9 @@ pub(crate) fn run_with_env(fixture: &str, env: &[(&str, &Path)]) {
 
 /// [`run`] for a fixture that calls [`drop_to_nobody`]. Skuld opened its DB as root, and checks at
 /// the end of the test that the DB's path still resolves; `nobody` must be able to search it, which
-/// the directory beside the executable need not allow.
+/// the directory beside the executable need not allow. The directory stays root-owned.
 pub(crate) fn run_dropping_to_nobody(fixture: &str) {
-    let db_dir = super::db_dir::fixture_db_dir_owned_by(NOBODY);
+    let db_dir = super::db_dir::fixture_db_dir_searchable();
     let mut cmd = super::fixture_command(fixture);
     cmd.env(SKULD_DB_DIR_ENV, db_dir.path());
     super::run_fixture_command(fixture, cmd);
@@ -113,7 +113,7 @@ pub(crate) fn tid_in_proc() -> u32 {
         .unwrap_or_else(|| panic!("thread-self's target {target:?} has no tid"))
 }
 
-/// The uid and gid [`drop_to_nobody`] drops to.
+/// The uid and gid of `nobody`, which [`drop_to_nobody`] drops to.
 const NOBODY: libc::uid_t = 65534;
 
 /// Drop this whole process to `nobody` ([`NOBODY`]) with no supplementary groups.

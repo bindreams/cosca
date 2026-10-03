@@ -35,6 +35,7 @@ async fn kill_tree_over_an_untrusted_view_errors_and_leaves_the_root_alive() {
 /// Mutant: "skip the root kill on a snapshot failure".
 #[skuld::test]
 async fn drop_over_an_untrusted_view_warns_of_orphans_and_still_kills_the_root() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, _stdin) = treewalk_blocker();
