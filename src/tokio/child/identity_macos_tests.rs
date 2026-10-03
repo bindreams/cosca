@@ -38,10 +38,10 @@ async fn macos_tokio_spawn_identity_after_a_real_reap_is_gone() {
     assert!(vanished(&err), "a reaped child is Gone, not Unassessable: {err:?}");
 }
 
-/// As the sync twin: another unique id at the re-read is `Gone`, and the stranger is not
-/// signalled. The child cannot be shown ours, so tokio's `Child` is forgotten, not dropped.
+/// As the sync twin: another unique id at the re-read is `Gone`. Only the re-read is forced, so the
+/// teardown's own verified kill still matches the real child and ends it.
 ///
-/// Mutant: the re-read compares nothing.
+/// Mutant: the re-read compares nothing, so the spawn is `Ok`.
 #[skuld::test]
 async fn macos_tokio_spawn_identity_with_a_different_unique_id_is_gone() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -56,14 +56,11 @@ async fn macos_tokio_spawn_identity_with_a_different_unique_id_is_gone() {
             *armed.borrow_mut() = Some(uniq_fault::force_uniq_read_once(ReadPurpose::Running, other));
         }
     });
-    let backend_drops = backend_fault::count_backend_drops();
     let outcome = cmd.spawn();
     drop(armed);
+    assert_ne!(pid.get(), 0, "the hook must have run");
     let err = outcome.expect_err("a pid with another unique id is not the child");
     assert!(vanished(&err), "another unique id is Gone, not Unassessable: {err:?}");
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
-    assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
-    kill_and_reap(pid.get());
 }
 
 /// As the sync twin: the failed re-read fails the spawn `Unassessable` and warns. Nothing pins
