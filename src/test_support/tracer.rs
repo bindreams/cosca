@@ -639,7 +639,7 @@ fn await_ready(tracee: &mut crate::Child) -> Ready {
 /// stdout and points stdout at `/dev/null` (libtest fails a run whose report it cannot write, and
 /// the test drops the pipe), then reads stdin until EOF or one byte, then exits 0. A no-op unless
 /// `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
-#[test]
+#[skuld::test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
@@ -745,7 +745,7 @@ fn reexec_as(kind: &str) -> ! {
 }
 
 /// The helper's entry point. A no-op unless `COSCA_UH_ROLE=helper`.
-#[test]
+#[skuld::test]
 fn uh_helper_entry() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("helper") {
         return;
