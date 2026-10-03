@@ -624,22 +624,16 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
     reap_behind_the_owner(pid);
 }
 
-/// A refused identity read fails the spawn with `Unassessable`, and the child is forgotten with a
-/// warning: never signalled or reaped by pid. The child is a blocker that only a signal ends, so one
-/// that is still alive and unreaped afterwards was not signalled.
+/// A unique-id read the child itself is refused fails the spawn with `Unassessable` and stops the
+/// child before `exec`: the program did not run, so there is nothing to forget or reap.
 ///
-/// Mutants: the refused-read arm tears the child down by pid (it is killed and reaped); it drops
-/// the backend normally (counted).
+/// Mutants: the hook execs anyway (a child is left); the failure maps to `Gone`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
+async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_not_run() {
     crate::tokio::test_runtime::assert_current_thread();
-    use crate::identity::{uniq_fault, Liveness, ReadPurpose, UniqRead};
 
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let backend_drops = super::fault::count_backend_drops();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let _forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     let mut cmd = crate::tokio::Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("set stdin");
@@ -648,43 +642,10 @@ async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
     let err = cmd.spawn().err();
 
     match err.expect("a refused identity read must fail the spawn") {
-        crate::error::Error::Unassessable { detail, .. } => {
-            assert!(detail.contains("identity could not be read"), "{detail}")
-        }
+        crate::error::Error::Unassessable { detail, .. } => assert!(detail.contains("did not start"), "{detail}"),
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    assert_eq!(
-        backend_drops.get(),
-        0,
-        "tokio's Child must have been forgotten, not dropped"
-    );
-    assert!(
-        crate::log_capture::contains_since(mark, "cannot be shown to be ours; forgetting"),
-        "the forget must warn"
-    );
-    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
-        panic!("the refused arm captured the child's identity");
-    };
-    assert_eq!(id.is_alive(), Liveness::Alive, "the child must not have been killed");
-    // Cleanup of the test's own child, which was never reaped, so it is still ours to signal and
-    // reap. `SIGUSR1` fixes its status only if nothing signalled it first: `is_alive` stays `Alive`
-    // until the child is a zombie, so a `SIGKILL` from the code under test shows here.
-    // SAFETY: `pid` is this test's own unreaped child (its backend was forgotten, not reaped).
-    let status = unsafe {
-        libc::kill(id.pid() as libc::pid_t, libc::SIGUSR1);
-        let mut status = 0;
-        assert_eq!(
-            libc::waitpid(id.pid() as libc::pid_t, &mut status, 0),
-            id.pid() as libc::pid_t
-        );
-        status
-    };
-    assert!(libc::WIFSIGNALED(status), "status {status:#x}");
-    assert_eq!(
-        libc::WTERMSIG(status),
-        libc::SIGUSR1,
-        "the child must not have been signalled by the code under test"
-    );
+    crate::child::spawn::identity_macos_tests::assert_program_did_not_run();
 }
 
 /// A wait whose peek or kqueue fails cannot show the child is ours, so it is `Foreign`, and tokio
