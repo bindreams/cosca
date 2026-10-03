@@ -156,6 +156,38 @@ fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
     });
 }
 
+/// `is_reaped` is read from the state that records the reap, so it is `true` while the waiter
+/// that made the reap is still on its way out of `wait_deadline`. The far deadline is only a
+/// failure bound; the wait ends on the child's real exit.
+///
+/// Mutant: `is_reaped` read from a flag stored after `wait_deadline` returns.
+#[test]
+fn is_reaped_is_true_as_soon_as_wait_deadline_records_the_reap() {
+    use crate::child::shared::seams;
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
+    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let h = ProcHandle::std(shared);
+    assert!(!h.is_reaped());
+    let (gate, reached, release) = seams::park_gate();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            let _armed = seams::park_after_reap_recorded_on(gate);
+            h.wait_deadline(std::time::Instant::now() + std::time::Duration::from_secs(600))
+                .expect("wait_deadline")
+        });
+        // The blocker exits cleanly once its stdin closes; `wait` is blocked on that real exit.
+        drop(stdin);
+        reached.recv().expect("the reap was recorded");
+        let seen = h.is_reaped();
+        release.send(()).expect("release");
+        a.join().expect("join");
+        assert!(seen, "the reap was recorded, but is_reaped answered false");
+    });
+}
+
 /// A waiter parked in the unlocked wait is a holder (`W`), not a reap.
 ///
 /// Mutant: `is_reaped` counts every state but `N` (so `W`) as reaped.

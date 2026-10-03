@@ -246,10 +246,7 @@ impl SharedChild {
 
     /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
     /// someone else is not seen here.
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "the Windows drop path does not read it yet; the tests do")
-    )]
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lock().state, State::E(_))
     }

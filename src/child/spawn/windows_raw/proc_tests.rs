@@ -2,10 +2,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
 use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
+    OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTUPINFOEXW,
 };
 
 use super::{create_process, win32_io_error, RawChild};
@@ -43,6 +43,10 @@ fn spawn_suspended_runas() -> KillOnDrop {
 }
 
 fn spawn_suspended_as(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> KillOnDrop {
+    KillOnDrop(suspended_raw(wrap))
+}
+
+fn suspended_raw(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChild) -> RawChild {
     let mut cmdline: Vec<u16> = "cmd /C exit 0\0".encode_utf16().collect();
     let mut si = STARTUPINFOEXW::default();
     let (proc, pid) = create_process(
@@ -54,7 +58,7 @@ fn spawn_suspended_as(wrap: fn(std::os::windows::io::OwnedHandle, u32) -> RawChi
         EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_SUSPENDED.0,
     )
     .expect("spawn suspended");
-    KillOnDrop(wrap(proc, pid))
+    wrap(proc, pid)
 }
 
 /// A runas `RawChild` over a second handle to `owner`'s process that lacks `PROCESS_TERMINATE`,
@@ -93,14 +97,45 @@ fn end_on_wait(owner: &KillOnDrop) -> super::fault::Observer {
     super::fault::observe_waits(move || end_with_code_zero(handle))
 }
 
-/// Mutants: `is_reaped` answers `false`; `is_reaped` answers `true`.
+/// Block on the child's exit without going through `RawChild`, so nothing of the handle's own is
+/// recorded. The wait is on a real external event.
+fn wait_for_exit_unrecorded(handle: HANDLE) {
+    // SAFETY: the caller's live process handle.
+    let r = unsafe { WaitForSingleObject(handle, INFINITE) };
+    assert_eq!(r, WAIT_OBJECT_0);
+}
+
+/// An exited child nobody waited on is not reaped; its own `wait` is the reap.
+///
+/// Mutants: `is_reaped` polls the process handle (fails the first assertion); `wait` never records
+/// (fails the last).
 #[test]
-fn raw_is_reaped_after_exit() {
+fn raw_is_reaped_only_once_its_own_wait_returns() {
     let child = spawn_suspended();
-    assert!(!child.is_reaped(), "a suspended child has not exited");
+    assert!(!child.is_reaped());
     child.kill().expect("kill");
+    wait_for_exit_unrecorded(child.handle());
+    assert!(!child.is_reaped(), "an exit nobody waited on is not a recorded reap");
     child.wait().expect("wait");
     assert!(child.is_reaped());
+}
+
+/// [`raw_is_reaped_only_once_its_own_wait_returns`], through the `ProcHandle::Raw` arm.
+///
+/// Mutants: the arm polls the handle; the arm answers `false`.
+#[test]
+fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
+    use crate::child::proc_handle::ProcHandle;
+    let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
+    assert!(!handle.is_reaped());
+    handle.kill().expect("kill");
+    wait_for_exit_unrecorded(match &handle {
+        ProcHandle::Raw(r) => r.handle(),
+        ProcHandle::Std(_) => unreachable!(),
+    });
+    assert!(!handle.is_reaped(), "an exit nobody waited on is not a recorded reap");
+    handle.wait().expect("wait");
+    assert!(handle.is_reaped());
 }
 
 /// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
