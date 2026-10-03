@@ -60,11 +60,11 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
     }
 }
 
-/// A child's identity, read the moment its handle is made: the 64-bit unique id, which is never
-/// reused and survives `exec`. It is the only identity macOS checks a by-pid action against.
-/// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
-/// A child's unique id by pid. Tests only: a spawned child reports its own before `exec` (see
-/// `child::spawn::unique_report`), and a by-pid read here could name a stranger that took the pid.
+/// A process's unique id by pid: the 64-bit id that is never reused and survives `exec`, which is
+/// the only identity macOS checks a by-pid action against. `Ok(None)` is a pid with no process
+/// (`ESRCH`); `Err(errno)` is a refused read. Tests only: a spawned child reports its own id before
+/// `exec` (see `child::spawn::unique_report`), because a by-pid read could name a stranger that
+/// took the pid.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
