@@ -985,7 +985,7 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     teardown.assert_killed();
 }
 
-/// macOS: an identity read that is refused at adoption fails the spawn as `Unassessable`, naming
+/// macOS: an identity read that is refused (the child's own, before `exec`) fails the spawn as `Unassessable`, naming
 /// the errno. The child cannot be shown to be ours (a refusal is also what a pid reused by another
 /// user's process answers), so nothing is signalled or waited on by pid: it is left running and
 /// unreaped, with a warning that names it.
@@ -995,11 +995,10 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
 #[cfg(target_os = "macos")]
 #[test]
 fn adopt_on_a_refused_identity_read_is_unassessable_and_leaves_the_child_alone() {
-    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let mut cmd = blocker();
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     let err = cmd.spawn().err();
     drop(forced);
     let left = captured_child();
