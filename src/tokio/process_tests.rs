@@ -10,7 +10,7 @@
 use super::Process;
 use crate::identity::{Existence, Liveness, ProcessId};
 
-#[test]
+#[skuld::test]
 fn a_recycled_pid_reads_as_gone_through_the_async_wrapper() {
     let real = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
@@ -21,7 +21,7 @@ fn a_recycled_pid_reads_as_gone_through_the_async_wrapper() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_denied_identity_reads_as_unknown_not_gone_through_the_async_wrapper() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);

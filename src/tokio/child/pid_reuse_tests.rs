@@ -42,7 +42,7 @@ fn spawn_blocker_with(kill_on_drop: bool) -> (crate::tokio::Child, std::io::Pipe
 
 /// Mutant: the spawn drops the pidfd the handshake opened (`held.map(|held| held.child)`), so the
 /// backend holds one that names nothing, or none.
-#[test]
+#[skuld::test]
 fn tokio_child_holds_its_handshake_pidfd() {
     runtime().block_on(async {
         let (mut child, writer) = spawn_blocker();
@@ -215,7 +215,7 @@ fn elevation_detail(err: crate::error::Error) -> String {
 ///
 /// Mutant: `kill`'s `Ok` for a gone child is read as "terminated" (the detail says so, and a wait
 /// is recorded or attempted).
-#[test]
+#[skuld::test]
 fn finish_elevated_after_a_foreign_reap_does_not_claim_a_termination() {
     runtime().block_on(async {
         let (child, writer) = spawn_blocker();
@@ -550,7 +550,7 @@ in_fresh_pid_ns!(
 /// elsewhere: the child is forgotten, never released to tokio's by-pid reap.
 ///
 /// Mutant: a failed peek counts as ours.
-#[test]
+#[skuld::test]
 fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
     use crate::wait::exit_only::seams::force_peek_once;
     runtime().block_on(async {

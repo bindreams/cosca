@@ -138,7 +138,7 @@ async fn grace_wait_true_when_child_dies_mid_wait() {
 // broken, the wait would sit at the unbounded `None` (=> INFINITE) watch and the test
 // harness's own bound would surface the hang loudly.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn cancel_event_releases_the_blocking_wait() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -155,7 +155,7 @@ fn cancel_event_releases_the_blocking_wait() {
 // the watcher — this is race-INSENSITIVITY being proven, not an outcome bet on a race. If
 // the release were broken, the join would hang at the harness's own failure bound.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn cancel_event_signaled_mid_wait_releases_the_blocking_wait() {
     let mut child = std_blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
@@ -373,13 +373,13 @@ mod classify {
 
     use super::super::classify_pidfd_ready;
 
-    #[test]
+    #[skuld::test]
     fn readable_and_read_closed_mean_exited() {
         assert!(matches!(classify_pidfd_ready(Ready::READABLE), Some(Ok(()))));
         assert!(matches!(classify_pidfd_ready(Ready::READ_CLOSED), Some(Ok(()))));
     }
 
-    #[test]
+    #[skuld::test]
     fn error_readiness_is_surfaced_not_swallowed() {
         assert!(matches!(
             classify_pidfd_ready(Ready::ERROR | Ready::READABLE),
@@ -388,7 +388,7 @@ mod classify {
         assert!(matches!(classify_pidfd_ready(Ready::ERROR), Some(Err(_))));
     }
 
-    #[test]
+    #[skuld::test]
     fn unclassified_readiness_retries_never_a_false_verdict() {
         // tokio's documented false-positive wake: not an exit (would skip escalation on a
         // live child), not an error (would force-kill a graceful exit) — re-await.
@@ -505,7 +505,7 @@ async fn wait_exit_drop_releases_the_windows_watcher() {
 
 // Mutant: make `relayed_probe::Guard::drop` a no-op -> the slot stays installed after the scope.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn fault_observer_guard_uninstalls_on_drop() {
     let (tx, rx) = std::sync::mpsc::channel();
     {
@@ -518,7 +518,7 @@ fn fault_observer_guard_uninstalls_on_drop() {
 
 // Mutant: delete the `debug_assert!` in `relayed_probe::insert` -> no panic.
 #[cfg(all(windows, debug_assertions))]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "nested on the same thread")]
 fn fault_observer_install_panics_when_nested() {
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -533,7 +533,7 @@ fn fault_observer_install_panics_when_nested() {
 // Mutant: `mem::forget` the `_relay` guard in `blocking_watch`'s closure -> the second
 // watch's release reaches the first's channel.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn the_relayed_observer_does_not_outlive_its_blocking_call() {
     let rt = ::tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1077,7 +1077,7 @@ async fn arm_at_waits_unbounded_for_a_deadline_inside_the_timer_margin_in_releas
 
 /// The Windows job wait is measured on the real clock: a tokio-clock deadline keeps its remaining
 /// time, an expired one keeps none, and unbounded stays unbounded.
-#[test]
+#[skuld::test]
 fn to_real_clock_preserves_the_remaining_time_across_clocks() {
     let real = std::time::Instant::now();
     let tokio = real + Duration::from_secs(3600); // virtual time ran ahead
