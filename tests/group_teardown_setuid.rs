@@ -37,9 +37,6 @@
 //! failure over the control socket used for the readiness handshake, so a nosuid mount or a wrong
 //! owner/mode surfaces as a loud panic here, not a false green.
 
-// The whole file is Linux-only in purpose (see the module docs above) — gated here, once, rather
-// than on every item, so the file compiles to nothing (no unused-code warnings) elsewhere.
-
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Read};
 #[cfg(target_os = "linux")]
