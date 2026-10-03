@@ -1,0 +1,73 @@
+name: probe-elevation
+on:
+  pull_request:
+jobs:
+  win:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Facts
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          whoami
+          whoami /groups
+          reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLUA
+          reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdmin
+          reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v PromptOnSecureDesktop
+          reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v FilterAdministratorToken
+      - name: Start-Process RunAs
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $p = Start-Process -FilePath cmd.exe -ArgumentList '/c','echo hi > C:\Windows\Temp\probe-runas.txt' -Verb RunAs -Wait -PassThru
+          "exit: $($p.ExitCode)"
+          Get-Content C:\Windows\Temp\probe-runas.txt
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Elevation tests as they stand
+        shell: pwsh
+        continue-on-error: true
+        env:
+          COSCA_TEST_ELEVATION: "1"
+          COSCA_TEST_ELEVATION_MARKER_DIR: C:\Windows\Temp
+        run: cargo nextest run --locked --target ${{ matrix.target }} --features tokio --test elevation --no-fail-fast --no-capture
+  lin:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Facts
+        continue-on-error: true
+        run: |
+          id; systemd --version | head -2; command -v sudo doas pkexec run0 polkitd || true
+          sudo -n true && echo "sudo -n ok"; ls /etc/sudoers.d; sudo cat /etc/sudoers.d/* | head
+          ls /usr/lib/polkit-1 /usr/libexec/polkitd 2>&1 | head
+          dpkg -l | grep -i polkit || true
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Elevation tests as they stand
+        continue-on-error: true
+        env:
+          COSCA_TEST_ELEVATION: "1"
+          COSCA_TEST_ELEVATION_PASSWORD: "x"
+        run: cargo nextest run --locked --features tokio --test elevation --no-fail-fast --no-capture
