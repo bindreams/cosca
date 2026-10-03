@@ -1,4 +1,4 @@
-//! Unit tests for the group rules, and re-exec tests that drive one real test of the `NAMESPACES` group and one of the `ROOT` group under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
+//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test and one real `ROOT` test under chosen environments. Neither body runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 
@@ -104,7 +104,6 @@ mod reexec {
     /// A real `ROOT` test: it needs a DAC bypass, so only a granted group may run it.
     const ROOT_TEST: &str = "resolve::resolve_base_tests::a_denied_candidate_is_denied_by_an_exec_child";
 
-    /// A group under test: its real test, its variable and its label.
     struct Case {
         test: &'static str,
         var: &'static str,
@@ -188,9 +187,8 @@ mod reexec {
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
         assert!(!success, "{stdout}");
-        // A body that ran would fail on `unshare` or the DAC check too (unprivileged), so `failed` alone proves nothing: only the
-        // test's own `failed` event carries the fixture's refusal. (The whole output cannot tell: skuld prints the
-        // unavailable-test list after every run.)
+        // `failed` alone proves nothing (a body that ran would fail unprivileged too): only the test's own `failed`
+        // event carries the fixture's refusal. The whole output cannot tell: skuld lists unavailable tests after every run.
         let failure = stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())

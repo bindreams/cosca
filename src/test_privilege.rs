@@ -17,9 +17,8 @@ mod setuid_lane_check_tests;
 #[path = "test_privilege/setuid_protocol_tests.rs"]
 mod setuid_protocol_tests;
 
-/// Fails unless the caller holds a DAC bypass (see [`holds_dac_bypass`]): the `ROOT` group
-/// (`test_groups.rs`) switches the tests that need one off, or asks consent for them, and a lane
-/// that runs them without the bypass must fail.
+/// Fails unless the caller holds a DAC bypass (see [`holds_dac_bypass`]). Off-switch and consent belong
+/// to the `ROOT` group (`test_groups.rs`).
 pub(crate) fn assert_holds_dac_bypass() {
     assert!(
         holds_dac_bypass(),
