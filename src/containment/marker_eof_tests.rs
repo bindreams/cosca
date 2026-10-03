@@ -26,9 +26,8 @@ fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
 
 /// A marker pipe: `(read_end, write_end)`, both owned by this process. Built with
 /// `std::io::pipe()` (CLOEXEC by default, matching `fdmarker::create_pipe`'s own convention) —
-/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because under a plain `cargo
-/// test --lib`, which runs every test in this crate in one shared process, tests run concurrently
-/// on separate threads of that process, and a non-CLOEXEC test pipe fd would be inherited by any
+/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because when trials overlap
+/// in one process (`--nocapture` with `--test-threads` > 1), a non-CLOEXEC test pipe fd would be inherited by any
 /// OTHER concurrently-running test's spawned child, keeping that child a spurious extra "holder"
 /// of a pipe this test never intended to share.
 fn marker_pipe() -> (OwnedFd, OwnedFd) {
@@ -233,8 +232,8 @@ fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
         "expected Error::Containment, got {err:?}"
     );
     drop(w);
-    // NOT `assert_eq!(..., Clear)`: under a plain `cargo test` (see `marker_pipe`'s doc), this
-    // process's fd table is being churned by every other test running at the same moment. The
+    // NOT `assert_eq!(..., Clear)`: when trials overlap (see `marker_pipe`'s doc), this
+    // process's fd table is being churned by every other running test. The
     // property under test is that a CLEARED write end is never mistaken for a still-held one.
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);

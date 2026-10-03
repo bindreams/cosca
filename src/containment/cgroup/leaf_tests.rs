@@ -641,7 +641,7 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     let mark = crate::log_capture::mark();
 
     // Its OWN leaf name, not the shared placeholder: `log_capture` is process-wide and
-    // libtest runs this file in parallel, so a marker a sibling test also emits makes the
+    // trials can overlap (`--nocapture` with `--test-threads` > 1), so a marker a sibling test also emits makes the
     // count below a count of whatever else happened to run alongside.
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
         "/nonexistent/cosca-hard-kill-already-gone",
