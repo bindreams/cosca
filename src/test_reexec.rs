@@ -46,6 +46,12 @@ pub fn fixture_args(fixture: &str) -> [&str; 4] {
 /// Makes the child print its test events as JSON lines on stdout, for [`suite_outcome`].
 pub const JSON_FORMAT: [&str; 2] = ["--format", "json"];
 
+/// Makes `cmd`'s child print its test events as JSON lines, for [`suite_outcome`]. Every launcher
+/// whose child is checked with [`suite_passed_exactly_one`] adds it here.
+pub fn with_json_events(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.args(JSON_FORMAT)
+}
+
 /// What a skuld run reported about itself.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SuiteOutcome {
@@ -83,7 +89,7 @@ pub fn suite_outcome(stdout: &[u8]) -> Result<SuiteOutcome, String> {
     }
     let [started] = started.as_slice() else {
         return Err(format!(
-            "expected exactly one suite `started` event, found {}",
+            "expected exactly one suite `started` event, found {} (the child must run with `--format json`)",
             started.len()
         ));
     };

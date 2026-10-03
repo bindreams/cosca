@@ -2467,19 +2467,25 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
     const INNER: &str = "COSCA_TEST_DECIDED_ALONE";
     if std::env::var_os(INNER).is_none() {
         let out = crate::test_spawn::output_captured(
-            crate::test_reexec::command(std::env::current_exe().expect("this test binary"))
-                .args([NAME, "--exact", crate::test_reexec::NOCAPTURE, "--test-threads=1"])
-                .args(crate::test_reexec::JSON_FORMAT)
-                .env(INNER, "1"),
+            crate::test_reexec::with_json_events(
+                crate::test_reexec::command(std::env::current_exe().expect("this test binary")).args([
+                    NAME,
+                    "--exact",
+                    crate::test_reexec::NOCAPTURE,
+                    "--test-threads=1",
+                ]),
+            )
+            .env(INNER, "1"),
         )
         .expect("run the case alone");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            crate::test_reexec::suite_passed_exactly_one(&out).is_ok(),
-            "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&out) {
+            panic!(
+                "{why}\n{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         return;
     }
 

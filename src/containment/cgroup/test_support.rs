@@ -303,19 +303,25 @@ pub(crate) fn alone(name: &str) -> bool {
         return true;
     }
     let out = crate::test_spawn::output_captured(
-        crate::test_reexec::command(std::env::current_exe().expect("this test binary"))
-            .args([name, "--exact", crate::test_reexec::NOCAPTURE, "--test-threads=1"])
-            .args(crate::test_reexec::JSON_FORMAT)
-            .env(ALONE, name),
+        crate::test_reexec::with_json_events(
+            crate::test_reexec::command(std::env::current_exe().expect("this test binary")).args([
+                name,
+                "--exact",
+                crate::test_reexec::NOCAPTURE,
+                "--test-threads=1",
+            ]),
+        )
+        .env(ALONE, name),
     )
     .expect("run the test alone");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        crate::test_reexec::suite_passed_exactly_one(&out).is_ok(),
-        "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&out) {
+        panic!(
+            "{why}\n{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     false
 }
 

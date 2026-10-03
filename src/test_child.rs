@@ -654,7 +654,7 @@ pub(crate) fn run_fixture_with_cwd(fixture: &str, cwd: &std::path::Path, marker_
 pub(crate) fn run_fixture(fixture: &str) {
     let scratch = tempfile::tempdir().expect("tempdir for fixture scratch root");
     let (mut cmd, _dirs) = fixture_command_without_dac_bypass(fixture);
-    cmd.args(crate::test_reexec::JSON_FORMAT);
+    crate::test_reexec::with_json_events(&mut cmd);
 
     #[cfg(target_os = "linux")]
     {
@@ -840,7 +840,7 @@ fn write_gate_passed() {
 /// Spawns `cmd` (from [`fixture_command`]) under `spawn_lock()` and waits for it; panics as
 /// [`run_fixture_with_cwd`] documents.
 fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
-    cmd.args(crate::test_reexec::JSON_FORMAT);
+    crate::test_reexec::with_json_events(&mut cmd);
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     finish_fixture_command(fixture, child);
 }
@@ -853,18 +853,13 @@ fn finish_fixture_command(fixture: &str, child: std::process::Child) {
 
 /// Panics unless `output` is that of a fixture that ran and passed exactly one test, and wrote its
 /// gate line. For a launcher that waits for the fixture by its own means; the fixture must have run
-/// with [`JSON_FORMAT`](crate::test_reexec::JSON_FORMAT).
+/// with [`with_json_events`](crate::test_reexec::with_json_events).
 pub(crate) fn assert_fixture_passed(fixture: &str, output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        output.status,
-    );
     if let Err(why) = crate::test_reexec::suite_passed_exactly_one(output) {
         panic!(
-            "fixture {fixture} exited 0 but did not run and pass exactly one test: {why}\n--- stdout \
+            "fixture {fixture} did not run and pass exactly one test: {why}\n--- stdout \
              ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
     }
@@ -907,18 +902,12 @@ pub(crate) fn run_fixture_output(fixture: &str, marker_env: &str) -> std::proces
 #[cfg(unix)]
 pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, case: &str) {
     let mut cmd = fixture_command(fixture);
-    cmd.env(marker_env, std::process::id().to_string())
-        .env(case_env, case)
-        .args(crate::test_reexec::JSON_FORMAT);
+    cmd.env(marker_env, std::process::id().to_string()).env(case_env, case);
+    crate::test_reexec::with_json_events(&mut cmd);
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     let output = child.wait_with_output().expect("wait for fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "fixture {fixture} case {case:?} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        output.status,
-    );
     if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output) {
         panic!(
             "fixture {fixture} case {case:?} did not run and pass exactly one test: {why}\n--- stdout \

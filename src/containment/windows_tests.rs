@@ -413,25 +413,20 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
     let exe = std::env::current_exe().expect("current_exe");
     let fixture = crate::test_child::fixture_path!(fixture_reports_job_breakaway_probe);
     let child = crate::test_spawn::spawn(
-        crate::test_reexec::command(&exe)
-            .args(crate::test_reexec::fixture_args(fixture))
-            .args(crate::test_reexec::JSON_FORMAT)
-            .env(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER, "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
+        crate::test_reexec::with_json_events(
+            crate::test_reexec::command(&exe).args(crate::test_reexec::fixture_args(fixture)),
+        )
+        .env(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped()),
     )
     .expect("spawn the job-breakaway probe fixture");
     let output = child.wait_with_output().expect("wait for the fixture child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "job-breakaway probe fixture failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        output.status,
-    );
     if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output) {
         panic!(
-            "fixture exited 0 but did not run and pass exactly one test: {why}\n--- stdout ---\n{stdout}\n\
+            "job-breakaway probe fixture did not run and pass exactly one test: {why}\n--- stdout ---\n{stdout}\n\
              --- stderr ---\n{stderr}"
         );
     }
