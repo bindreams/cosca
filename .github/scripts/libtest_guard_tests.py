@@ -11,7 +11,8 @@ arch-gated cases assert the host's own OS and architecture; each OS is covered b
 script on it.
 
 Every compiling case runs three times: with no compiler wrapper, then behind a private sccache on a
-cold cache and on a warm one. Needs sccache on PATH and the other architecture's target installed
+cold cache and on a warm one. The warm pass shows that the cases still pass when the dependencies come
+from the cache and that the cache was used; sccache never caches the guard's own workspace compiles. Needs sccache on PATH and the other architecture's target installed
 (`rustup target add`).
 """
 
@@ -172,10 +173,10 @@ with tempfile.TemporaryDirectory() as tmp:
     compile_cases()
 
     # A compiler cache in front of every compile ------------------------------------------------------------
-    # RUSTC_WRAPPER=sccache sits in front of clippy-driver as well as rustc. A finding is a compile error and
-    # sccache never caches a failed compile, so a warm cache must still catch every case. CARGO_INCREMENTAL=0
-    # makes the workspace crates cacheable too (an incremental compile is never cached): the worst case.
-    # The cold pass fills a private cache, the warm pass compiles the same units, at the same paths, from it.
+    # RUSTC_WRAPPER=sccache sits in front of clippy-driver as well as rustc. sccache 0.18.0 cannot cache a
+    # `clippy-driver rustc ...` call (multiple input files), so the workspace crates are compiled every
+    # time and every warm hit is a dependency. The cold pass fills a private cache, the warm pass compiles
+    # the same units, at the same paths, from it; the check below fails if no hit happened.
     sccache = shutil.which("sccache")
     if sccache is None:
         sys.exit("::error::sccache not found: the self-test runs the guard behind it (setup-rust installs it)")
@@ -188,7 +189,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "RUSTC_WRAPPER": sccache,
         "SCCACHE_DIR": str(cache_dir),
         "SCCACHE_SERVER_PORT": str(port),
-        "CARGO_INCREMENTAL": "0",
     }
 
     def sccache_stats() -> dict:
