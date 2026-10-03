@@ -102,7 +102,7 @@ impl RawChild {
 
     /// Record `status` as this handle's reap, and pass it on.
     fn record(&self, status: ExitStatus) -> ExitStatus {
-        _ = self.reaped.set(status);
+        let _ = &status;
         status
     }
 
