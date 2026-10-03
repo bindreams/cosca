@@ -1,7 +1,9 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
-use crate::test_harness::{DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, SHELL_EXECUTE, SHELL_PROBES};
+use crate::test_harness::{
+    DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, SETUID, SHELL_EXECUTE, SHELL_PROBES,
+};
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
@@ -113,6 +115,7 @@ fn every_group_fixture_carries_exactly_its_label() {
     for (fixture, label) in [
         ("namespaces", NAMESPACES),
         ("drive_mapping", DRIVE_MAPPING),
+        ("setuid", SETUID),
         ("path_probes", PATH_PROBES),
         ("shell_execute", SHELL_EXECUTE),
         ("shell_probes", SHELL_PROBES),
