@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
+use crate::child::spawn::unique_report;
 use crate::error::Error;
 use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqInfo, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
@@ -149,35 +150,38 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     );
 }
 
-// The first unique-id read =====
+// The child's own unique-id read =====
 
-/// The first read finds no process: `Gone`, with the pid never read and the child left alone.
+/// The unique id is the child's own report, not a read by pid: a by-pid read made to fail is never
+/// reached, and the spawn still succeeds with an id that the re-read confirms.
 ///
-/// Mutant: the `Ok(None)` arm continues to the identity read (the spawn is `Ok` or reads the pid).
+/// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), so the forced refusal is
+/// consumed and the spawn fails.
 #[skuld::test]
-fn macos_sync_spawn_first_read_gone_is_gone_and_leaves_the_child() {
-    let (mut cmd, _writer) = sync_blocker();
-    let pid = Rc::new(Cell::new(0));
-    let _hook = record_pid(&pid);
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Gone);
-    let err = cmd
-        .spawn()
-        .expect_err("a first read that finds nothing fails the spawn");
-    assert!(vanished(&err), "no process is Gone, not Unassessable: {err:?}");
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
-    kill_and_reap(pid.get());
+fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
+    let (mut cmd, writer) = sync_blocker();
+    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let child = cmd.spawn().expect("the child's own report needs no by-pid read");
+    assert_eq!(
+        uniq_fault::unconsumed(ReadPurpose::Adopt),
+        1,
+        "nothing may have read the unique id by pid"
+    );
+    drop(writer);
+    drop(child);
 }
 
-/// The first read is refused: `Unassessable`, and the child is left running.
+/// The child's own read is refused (forced inside the child): `Unassessable`, and the child is left
+/// running, unsignalled and unreaped.
 ///
-/// Mutant: the `Err` arm maps to `Gone`.
+/// Mutant: the refusal maps to `Gone`, or the report is ignored.
 #[skuld::test]
-fn macos_sync_spawn_first_read_refused_is_unassessable_and_leaves_the_child() {
+fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_leaves_the_child() {
     let (mut cmd, _writer) = sync_blocker();
     let pid = Rc::new(Cell::new(0));
     let _hook = record_pid(&pid);
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
-    let err = cmd.spawn().expect_err("a refused first read fails the spawn");
+    let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
+    let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"

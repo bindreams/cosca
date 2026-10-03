@@ -223,7 +223,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     }
     #[cfg(target_os = "linux")]
     let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register)?;
-    #[cfg(not(target_os = "linux"))]
+    // macOS: the child reports its own unique id before `exec`; see `unique_report`.
+    #[cfg(target_os = "macos")]
+    let (mut std_cmd, report) = build_std_command_with(cmd, unique_report::register)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut std_cmd = build_std_command(cmd)?;
 
     // Resolve every configured slot to a child end via the shared core. Slots: 0/1/2
@@ -293,7 +296,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
     // code can close.
     #[cfg(target_os = "macos")]
-    let (prepared, child) = {
+    let (prepared, child, unique) = {
         let _guard = spawn_lock();
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -303,6 +306,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
+        // Registered first (above), so `fd_map`'s `dup2` below cannot move the pipe from under it.
+        let report = report.open(&_guard)?;
 
         // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
         // that dup2's each OwnedFd to its target number post-fork. It is registered
@@ -324,9 +329,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard`, taken at the top of this block"
         )]
-        let c = std_cmd.spawn().map_err(Error::Io)?;
+        let (c, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io))?;
         drop(std_cmd);
-        (prepared, c)
+        (prepared, c, unique)
     };
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
     // Everything from the channel's creation to the helper's join is under `spawn_lock`.
@@ -431,17 +436,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
-    // macOS has no handle: the unique id read here is what the identity is checked against, and the
-    // one the shared child is adopted with. This first read is by pid alone: a foreign reap and a
-    // reuse of the pid before it make it the stranger's id, and nothing later can tell.
+    // macOS has no handle: the unique id the child reported is what the identity is checked
+    // against, and the one the shared child is adopted with. The child read it itself before
+    // `exec`, so it is the id of the process this spawn forked, whatever became of the pid since.
     #[cfg(target_os = "macos")]
-    let unique = match crate::signal::read_identity(child.id()) {
-        Ok(Some(unique)) => unique,
-        // Reaped elsewhere before the first read: nothing is left to check the pid against.
-        Ok(None) => {
-            leave_unverified_child(child, crate::containment::RootIdentity::Gone);
-            return Err(spawn_identity_error(crate::identity::Resolved::Gone));
-        }
+    let unique = match unique {
+        Ok(unique) => unique,
         Err(errno) => {
             let error = crate::signal::identity_unreadable(child.id(), errno);
             return Err(teardown_after_failed_adoption(child, error));
@@ -605,7 +605,7 @@ pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     build_std_command_with(cmd, |_| ()).map(|(std_cmd, ())| std_cmd)
 }
@@ -1082,8 +1082,7 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`).
 /// - **Windows:** the process handle pins the pid, so the read stands.
 ///
-/// On macOS the `through` id itself was read by pid alone, so a reap and reuse before that first
-/// read are not caught here.
+/// On macOS the `through` id is the one the child reported before `exec`.
 pub(crate) fn resolve_identity(
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
@@ -1955,3 +1954,7 @@ pub(crate) mod identity_macos_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_peek_tests.rs"]
 mod identity_peek_tests;
+
+#[cfg(target_os = "macos")]
+#[path = "spawn/unique_report.rs"]
+pub(crate) mod unique_report;

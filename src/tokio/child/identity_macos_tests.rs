@@ -5,9 +5,8 @@ use std::rc::Rc;
 
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
-use crate::child::spawn::identity_macos_tests::{
-    exists, kill_and_reap, other_unique_id, reap_by_pid, record_pid, vanished,
-};
+use crate::child::spawn::identity_macos_tests::{exists, kill_and_reap, other_unique_id, reap_by_pid, vanished};
+use crate::child::spawn::unique_report;
 use crate::error::Error;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
@@ -110,33 +109,33 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
     kill_and_reap(pid.get());
 }
 
-/// As the sync twin: no process at the first read is `Gone`, the child is left alone.
+/// As the sync twin: the unique id is the child's own report, and no by-pid read is made.
 ///
-/// Mutant: the `None` target continues to the identity read.
+/// Mutant: the spawn reads the unique id by pid.
 #[skuld::test]
-async fn macos_tokio_spawn_first_read_gone_is_gone_and_leaves_the_child() {
+async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut cmd, _writer) = tokio_blocker();
-    let pid = Rc::new(Cell::new(0));
-    let _hook = record_pid(&pid);
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Gone);
-    let err = cmd
-        .spawn()
-        .expect_err("a first read that finds nothing fails the spawn");
-    assert!(vanished(&err), "no process is Gone, not Unassessable: {err:?}");
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
-    kill_and_reap(pid.get());
+    let (mut cmd, writer) = tokio_blocker();
+    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let mut child = cmd.spawn().expect("the child's own report needs no by-pid read");
+    assert_eq!(
+        uniq_fault::unconsumed(ReadPurpose::Adopt),
+        1,
+        "nothing may have read the unique id by pid"
+    );
+    drop(writer);
+    child.wait().await.expect("wait");
 }
 
-/// As the sync twin: a refused first read is `Unassessable`, the child is left running.
+/// As the sync twin: a refused own read is `Unassessable`, the child is left running.
 ///
 /// Mutant: the refusal maps to `Gone`.
 #[skuld::test]
-async fn macos_tokio_spawn_first_read_refused_is_unassessable_and_leaves_the_child() {
+async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_leaves_the_child() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut cmd, _writer) = tokio_blocker();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
-    let err = cmd.spawn().expect_err("a refused first read fails the spawn");
+    let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
+    let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
