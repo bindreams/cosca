@@ -5,53 +5,19 @@ on:
 permissions:
   contents: read
 jobs:
-  probe:
-    name: probe (${{ matrix.runner }}, ${{ matrix.mode }})
+  window:
+    name: window (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-latest]
-        mode: [serial, par4, unittest]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Environment
-        run: |
-          uname -a; sw_vers; sysctl -n machdep.cpu.brand_string hw.ncpu; which python3; python3 -VV; file "$(python3 -c 'import sys; print(sys.executable)')"
-      - name: Probe
-        if: matrix.mode != 'unittest'
-        timeout-minutes: 38
+        run: uname -a; sw_vers; which python3; python3 -VV
+      - name: Deterministic window reproduction
+        timeout-minutes: 15
         working-directory: .github/scripts
-        env:
-          PROBE_OUT: ${{ runner.temp }}/probe
-        run: |
-          mkdir -p "$PROBE_OUT"
-          if [ "${{ matrix.mode }}" = serial ]; then
-            python3 fwd_probe.py 9000 s0
-          else
-            for k in 0 1 2 3; do python3 fwd_probe.py 4500 "p$k" & done
-            wait
-          fi
-      - name: Repeat the real test classes, counting failures
-        if: matrix.mode == 'unittest'
-        timeout-minutes: 38
-        working-directory: .github/scripts
-        run: |
-          fails=0
-          start=$(date +%s)
-          for i in $(seq 1500); do
-            if ! python3 -m unittest -f forward_tests.Waiting forward_tests.Relay forward_tests.SpawnWindow > "$RUNNER_TEMP/u.log" 2>&1; then
-              fails=$((fails+1)); echo "iteration $i failed"; cat "$RUNNER_TEMP/u.log"
-            fi
-            if [ $(( $(date +%s) - start )) -gt 2100 ]; then echo "stopping at iteration $i"; break; fi
-          done
-          echo "unittest iterations failed: $fails"
-      - name: Summary
-        if: always() && matrix.mode != 'unittest'
-        run: python3 .github/scripts/fwd_probe_summary.py "${{ runner.temp }}/probe"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always() && matrix.mode != 'unittest'
-        with:
-          name: probe-${{ matrix.runner }}-${{ matrix.mode }}
-          path: ${{ runner.temp }}/probe
+        run: python3 fwd_window.py 20
