@@ -99,7 +99,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let view = crate::containment::DropView::read(child.id, child.proc.has_reaped(), &child.tree_killed);
+    let view = crate::containment::DropView::read(child.id, child.proc.is_reaped(), &child.tree_killed);
     let mut skipped = None;
     let tree = child.containment().can_teardown().then(|| {
         child

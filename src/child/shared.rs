@@ -244,6 +244,16 @@ impl SharedChild {
         child.as_handle().try_clone_to_owned()
     }
 
+    /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
+    /// someone else is not seen here.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "the Windows drop path does not read it yet; the tests do")
+    )]
+    pub(crate) fn is_reaped(&self) -> bool {
+        matches!(self.lock().state, State::E(_))
+    }
+
     /// The child's process id.
     pub(crate) fn id(&self) -> u32 {
         self.id.pid()
@@ -398,6 +408,8 @@ impl SharedChild {
                     lock.set(State::E(reaped));
                     self.notify(&mut lock);
                     drop(lock);
+                    #[cfg(test)]
+                    seams::park_after_reap_recorded();
                     self.log_unreadable(reaped);
                     status_of(reaped).map(Some)
                 }
