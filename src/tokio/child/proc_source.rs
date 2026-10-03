@@ -622,6 +622,13 @@ impl ProcSource {
     /// registration, on macOS its `SIGCHLD` watch — so it is logged at `warn`, naming the pid.
     #[cfg(unix)]
     pub(crate) fn forget_foreign(&mut self) {
+        self.forget_because("was reaped by someone else, or cannot be shown to be ours");
+    }
+
+    /// [`forget_foreign`](ProcSource::forget_foreign) for any reason: `why` completes "child N ...",
+    /// so the warning says what actually happened.
+    #[cfg(unix)]
+    fn forget_because(&mut self, why: &str) {
         let ProcSource::Tokio {
             child,
             stdin,
@@ -646,10 +653,7 @@ impl ProcSource {
         } else {
             "tokio's SIGCHLD watch"
         };
-        log::warn!(
-            "child {pid} was reaped by someone else, or cannot be shown to be ours; forgetting \
-             tokio's handle for it leaks {leak}"
-        );
+        log::warn!("child {pid} {why}; forgetting tokio's handle for it leaks {leak}");
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that
@@ -732,11 +736,11 @@ impl ProcSource {
             Ok(pidfd) => pidfd,
             Err(e) => {
                 log::warn!("child {pid}: its pidfd could not be duplicated ({e}); it is left as it is");
-                self.forget_foreign();
+                self.forget_because("could not be handed to the pidfd teardown");
                 return;
             }
         };
-        self.forget_foreign();
+        self.forget_because("had its teardown kill refused and is handed to the pidfd teardown");
         crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd);
     }
 

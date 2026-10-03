@@ -482,7 +482,8 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 /// seam refuses only the first kill, so that teardown's kill lands and its reap is recorded.
 ///
 /// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
-/// recorded); the arm forgets it and does nothing else (no teardown reap is recorded).
+/// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
+/// warns with the foreign-reap text.
 #[cfg(target_os = "linux")]
 fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box<dyn std::any::Any>>) {
     use std::cell::RefCell;
@@ -505,6 +506,8 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
     let reaps = fault::record_teardown_reaps();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let (stdin, _writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -515,6 +518,17 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     fault::set_force_attach_failure(false);
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
+    assert!(
+        crate::log_capture::contains_since(
+            mark,
+            "had its teardown kill refused and is handed to the pidfd teardown"
+        ),
+        "the forget must say the kill was refused and the child handed on"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "was reaped by someone else"),
+        "the child was not reaped by someone else"
+    );
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(
         backend_drops.get(),
