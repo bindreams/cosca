@@ -279,8 +279,7 @@ jobs:
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
-      # logon session) is the `DRIVE_MAPPING` group, off everywhere else. This step opts in and
-      # selects the group by its label. `--test windows_process_cwd` scopes it to a skuld binary.
+      # logon session) is the `DRIVE_MAPPING` group, off everywhere else.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 8

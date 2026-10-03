@@ -234,8 +234,7 @@ it off workflow-wide and opts in only in the root lanes that can `setuid` to tho
 so that lane selects them): CI turns it off workflow-wide and the cgroup step opts in. So does
 `COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with
 `#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So do the other
-Windows groups:
-`COSCA_TEST_WINDOWS_PATH_CANARY` (the `windows_path_resolution` canaries and surveys),
+Windows groups: `COSCA_TEST_WINDOWS_PATH_CANARY` (the `windows_path_resolution` canaries and surveys),
 `COSCA_TEST_WINDOWS_ELEVATING_PROBES` (`windows_shell_execute`) and
 `COSCA_TEST_WINDOWS_EXECUTING_PROBES` (`windows_shell_resolution` and `windows_elevation_routes`).
 CI turns each off workflow-wide and opts in only in the step or job that runs it. Some

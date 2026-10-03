@@ -88,8 +88,7 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 /// other falls back to the drive's root, and `GetFullPathNameW` then rewrites `=X:` to it.
 ///
 /// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
-/// session, so it is the `DRIVE_MAPPING` group (`src/test_groups.rs`), which CI turns on in one
-/// step of its own (`.github/workflows/ci.yaml`).
+/// session, so it is the `DRIVE_MAPPING` group (`src/test_groups.rs`).
 #[skuld::test]
 fn a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does(#[fixture(drive_mapping)] _group: &Group) {
     let report = probe("drive-dir", env!("CARGO_BIN_EXE_cosca_testbin_image"));
@@ -247,7 +246,7 @@ mod drive_mapping_group {
             "{stdout}"
         );
         assert!(!success, "{stdout}");
-        // A body that ran would fail or pass on its own; only the fixture's refusal carries this message.
+        // Only the fixture's refusal carries this message; a body that ran cannot.
         assert!(
             failure_message(&stdout).contains("setup failed: COSCA_TEST_DRIVE_MAPPING=0"),
             "{stdout}"

@@ -8,6 +8,6 @@ pub const REEXEC_SELFCHECK: skuld::Label;
 #[skuld::label]
 pub const NAMESPACES: skuld::Label;
 
-/// Selects the test that maps a drive letter for the whole logon session (the `DRIVE_MAPPING` group).
+/// Selects the test that maps a drive letter for the whole logon session.
 #[skuld::label]
 pub const DRIVE_MAPPING: skuld::Label;
