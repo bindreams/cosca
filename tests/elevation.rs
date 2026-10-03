@@ -139,8 +139,11 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 // run0 client -> transient-unit kill propagation. The payload holds a socket to this
 // test, so its death is EOF on that socket. run0 authenticates via polkit;
 // `--no-ask-password` (Auth::NonInteractive) suppresses the prompt.
+//
+// TEMPORARILY OFF (#354): killing the run0 client leaves the root payload running, so this fails on a
+// real run0 host. The owner accepted the exception on 2026-10-03; the #354 fix re-enables the test.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(ignore = "#354: killing the run0 client leaves the root payload running; the fix re-enables this test")]
 fn run0_client_kill_propagates_to_the_transient_unit(#[fixture(elevation)] _group: &Group) {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
