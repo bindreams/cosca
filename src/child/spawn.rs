@@ -432,7 +432,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
     // macOS has no handle: the unique id read here is what the identity is checked against, and the
-    // one the shared child is adopted with.
+    // one the shared child is adopted with. This first read is by pid alone: a foreign reap and a
+    // reuse of the pid before it make it the stranger's id, and nothing later can tell.
     #[cfg(target_os = "macos")]
     let unique = match crate::signal::read_identity(child.id()) {
         Ok(Some(unique)) => unique,
@@ -1077,9 +1078,12 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 /// - **Linux:** a peek through the pidfd after the read. `Running` and `Exit` keep the read (a
 ///   reap is irreversible, so the pid named our child throughout); `Foreign` is `Gone`; a failed
 ///   peek is `Unknown`, warned.
-/// - **macOS:** the same, with a peek that checks the pid's unique id (spawn-time `through`), so a
-///   pid that was reaped and reused, or whose id cannot be read, is not taken for the child.
+/// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
+///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`).
 /// - **Windows:** the process handle pins the pid, so the read stands.
+///
+/// On macOS the `through` id itself was read by pid alone, so a reap and reuse before that first
+/// read are not caught here.
 pub(crate) fn resolve_identity(
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
@@ -1510,6 +1514,8 @@ pub(crate) mod fault {
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(feature = "tokio")]
+        static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
@@ -1689,6 +1695,9 @@ pub(crate) mod fault {
         /// Right before the spawn reads the child's identity (the tokio spawn's macOS unique id is
         /// read earlier, before the backend exists).
         BeforeIdentity,
+        /// Right before the async spawn attaches the containment, after `BeforeIdentity`.
+        #[cfg(feature = "tokio")]
+        BeforeAttach,
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
         AfterIdentityRead,
@@ -1697,6 +1706,8 @@ pub(crate) mod fault {
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
         match point {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
+            #[cfg(feature = "tokio")]
+            SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
         }
     }
@@ -1939,4 +1950,8 @@ mod identity_error_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "spawn/identity_macos_tests.rs"]
-mod identity_macos_tests;
+pub(crate) mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_peek_tests.rs"]
+mod identity_peek_tests;
