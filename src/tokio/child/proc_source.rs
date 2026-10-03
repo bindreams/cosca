@@ -215,8 +215,8 @@ impl ProcSource {
 
     /// The handle that names the child, for a check that must not go by pid alone. Linux: the pidfd.
     /// macOS: the pid with its unique id, while both are known. Windows: tokio's process handle.
-    /// `None` when there is nothing to check a pid against: a forgotten or already reaped child, or
-    /// (macOS) one whose unique id is unknown.
+    /// `None` when there is nothing to check a pid against: a forgotten child, a raw Windows child,
+    /// or (macOS) one whose unique id or pid is unknown. On Linux a live backend always has its pidfd.
     pub(crate) fn target(&self) -> Option<crate::wait::exit_only::Target<'_>> {
         use crate::wait::exit_only::Target;
         match self {

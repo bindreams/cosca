@@ -409,7 +409,7 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 /// child ours, so the spawn fails `Unassessable`, warns at the call, and forgets tokio's `Child`:
 /// its drop would reap by pid. The second failed peek is the forget decision's own look.
 ///
-/// Mutants: the identity read moves before `ProcSource::new` (tokio's `Child` is then dropped by
+/// Mutants: the call-site warn drops the error (`let _ = e;`); the identity read moves before `ProcSource::new` (tokio's `Child` is then dropped by
 /// value on the error path, so `forgets()` is 0); the failed check goes to `reap_now` without the
 /// forget decision (`backend_drops` is 1).
 #[cfg(target_os = "linux")]
@@ -431,8 +431,8 @@ async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
             *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
             // Armed here, not before `spawn()`: the handshake's own peeks run first.
             *armed.borrow_mut() = Some(Box::new(force_peeks([
-                Err(std::io::Error::other("forced peek failure 91c4")),
-                Err(std::io::Error::other("forced peek failure 91c4")),
+                Err(std::io::Error::other("forced identity-check failure 91c4")),
+                Err(std::io::Error::other("forced forget-decision failure 91c4")),
             ])));
         }
     });
@@ -452,8 +452,11 @@ async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
         "a failed peek is Unassessable, not a vanish: {err:?}"
     );
     assert!(
-        crate::log_capture::contains_since(mark, "forced peek failure 91c4"),
-        "the failed peek is warned at the call"
+        crate::log_capture::contains_since(
+            mark,
+            "could not be checked against its handle (forced identity-check failure 91c4)"
+        ),
+        "the failed peek is warned at the call, naming its own error"
     );
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");

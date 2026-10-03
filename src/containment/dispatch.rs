@@ -559,13 +559,13 @@ impl From<AttachError> for Error {
     }
 }
 
-/// Resolve the spawned root's identity by pid. **Precondition:** the caller holds the owning
-/// `Child` (sync `std::process::Child` / async `::tokio::process::Child`) across this call — it
-/// pins the pid against reuse, so the by-pid resolve is race-free (the freshly spawned root is
-/// un-reaped, and on Windows still suspended, hence resolvable).
+/// Resolve the spawned root's identity by pid alone, with no handle to check the read against.
+/// The read is only as good as the pid: on Unix a foreign reap and reuse before it makes it name
+/// a stranger (the spawn's own identity read is checked through the child's handle; this one is
+/// not, until the attach takes the verified id). On Windows the held process handle pins the pid.
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
-    // Via `resolve_identity` so the test seam applies here too.
+    // Via `resolve_identity_unchecked` so the test seam applies here too.
     match crate::child::spawn::resolve_identity_unchecked(pid) {
         crate::identity::Resolved::Found(id) => Ok(id),
         crate::identity::Resolved::Gone => Err(AttachError {
