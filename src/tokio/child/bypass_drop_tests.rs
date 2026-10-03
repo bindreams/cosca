@@ -185,6 +185,8 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
     let backend_drops = super::fault::count_backend_drops();
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
@@ -194,6 +196,14 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     fault::set_force_attach_failure(false);
     drop(armed);
     assert!(err.is_some(), "the forced attach failure fails the spawn");
+    assert!(
+        crate::log_capture::contains_since(mark, "reap_now refused); it is not waited on"),
+        "a forgotten child was handed nowhere, and the warning must say so"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "handed to the pidfd teardown"),
+        "nothing was handed to the pidfd teardown"
+    );
     assert_eq!(backend_drops.get(), 0, "tokio's Child must have been forgotten");
     let witness = slot.borrow_mut().take().expect("the hook ran");
     witness

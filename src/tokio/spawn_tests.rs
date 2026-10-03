@@ -141,6 +141,7 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
             .build()
             .unwrap();
         let releases = crate::tokio::child::fault::count_backend_drops();
+        let reaps = fault::record_teardown_reaps();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let mut cmd = crate::tokio::Command::new();
@@ -173,6 +174,15 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
             usize::from(!cfg!(target_os = "linux")),
             "{kind:?}: the refused-kill arm releases the child to tokio exactly when there is no pidfd"
         );
+        // Linux: the pidfd teardown has reaped the child by now. Asserted before the driver, which
+        // would spin on a missing hand-off.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            reaps.recorded().len(),
+            1,
+            "{kind:?}: the refused-kill arm must have reaped the child through its pidfd"
+        );
+        drop(reaps);
         let captured = fault::take_captured().expect("seam captured the child's identity");
         drive_until_reaped(&runtime, &captured);
         fault::assert_child_reaped(captured);
