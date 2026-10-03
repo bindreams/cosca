@@ -30,12 +30,10 @@ FORWARD = str(HERE / "forward.py")
 BOUND = 30
 TAIL = 65536  # bytes of a forwarder's log that a failure message keeps
 
-# Prologue of a test command that catches TERM in Python and then blocks. CPython runs the handler at
-# its next signal check, and none runs between the last one and the `read(2)` of `os.read`: a TERM
-# that lands there (a stopped command resumed with TERM pending is one way) is consumed, its handler
-# never runs, and the read blocks for good. The wakeup fd is written by the C trampoline, so a
-# `select` on it still returns, and the handler runs once the call is over. Put it before
-# `signal.signal`, and block with `WAIT.format(path)`, never `os.read`.
+# Prologue for test commands that catch TERM in Python and then block. A TERM landing between
+# CPython's last signal check and the read(2) in `os.read` is consumed without running the handler,
+# and the read blocks forever. The wakeup fd is written by the C-level handler, so `select` on it
+# returns. Install before `signal.signal`; block with `WAIT.format(path)`, never `os.read`.
 WAKEUP = (
     "import os, select, signal\n"
     "_wake, _wake_w = os.pipe()\n"
@@ -361,8 +359,8 @@ class Relay(Workdir):
             "        os._exit(9)\n"
             "    signal.signal(signal.SIGTERM, handler)\n"
             "    os.write(os.open(f'{work}/up', os.O_RDWR), b'x')\n"
-            "    select.select([os.open(f'{work}/release', os.O_RDWR), _wake], [], [])\n"
-            "    finish(name, 'released')\n"
+            "    " + WAIT.format("f'{work}/release'")
+            + "    finish(name, 'released')\n"
             "if len(sys.argv) > 2:\n"
             "    hold('grandchild')\n"
             "    sys.exit(0)\n"
@@ -413,7 +411,7 @@ class Relay(Workdir):
             "    os._exit(0)\n"
             "signal.signal(signal.SIGTERM, note)\n"
             "os.write(os.open(sys.argv[1] + '/reader-up', os.O_RDWR), b'x')\n"
-            "while True:  # to the end of the input, which is the first stage's exit\n"
+            "while True:  # until EOF\n"
             "    select.select([0, _wake], [], [])\n"
             "    if not os.read(0, 65536):\n"
             "        break\n"
