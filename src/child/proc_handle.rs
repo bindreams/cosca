@@ -28,7 +28,7 @@ impl ProcHandle {
         ProcHandle::Std(shared)
     }
 
-    /// Whether this handle itself has reaped the root: adoption, [`wait`](Self::wait),
+    /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// Read from the state that records the reap, so it is `true` from the moment of the reap, even
     /// while the waiter that made it is still returning. A reap by someone else is not seen here.

@@ -156,6 +156,35 @@ fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
     });
 }
 
+/// A waiter parked in the unlocked wait is a holder (`W`), not a reap.
+///
+/// Mutant: `is_reaped` counts every state but `N` (so `W`) as reaped.
+#[test]
+fn is_reaped_is_false_while_a_holder_waits() {
+    use crate::child::shared::seams;
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
+    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let h = ProcHandle::std(shared);
+    let (gate, reached, release) = seams::park_gate();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            let _armed = seams::park_in_unlocked_wait(gate);
+            h.wait().expect("wait")
+        });
+        reached.recv().expect("the holder reached its unlocked wait");
+        let seen = h.is_reaped();
+        // The blocker exits cleanly once its stdin closes; the holder's wait ends on that exit.
+        drop(stdin);
+        release.send(()).expect("release");
+        a.join().expect("join");
+        assert!(!seen, "a holder is waiting, but is_reaped read it as reaped");
+        assert!(h.is_reaped());
+    });
+}
+
 // The reap after a successful kill =====
 
 /// A live blocker adopted as a `Std` handle. The child is ended by the teardown under test.
