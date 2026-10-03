@@ -2,11 +2,11 @@
 //! integration test that holds it across a `cosca::Command::spawn` must get a named panic, not a
 //! hang. The check is compiled in only under `debug_assertions`, so this file is too; nothing in
 //! CI runs the integration binaries in release.
-#![cfg(debug_assertions)]
 
+#[cfg(debug_assertions)]
 /// `#[expect]` fails the build if the guard stops being `#[must_use]`. The `let _ =` form is
 /// covered by the lib crate's lint (`spawn_lock_tests`), which this crate does not enable.
-#[test]
+#[skuld::test]
 fn discarding_the_test_guard_is_linted() {
     #[expect(
         unused_must_use,
@@ -15,7 +15,8 @@ fn discarding_the_test_guard_is_linted() {
     cosca::test_spawn_lock();
 }
 
-#[test]
+#[cfg(debug_assertions)]
+#[skuld::test]
 fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
     let outer = cosca::test_spawn_lock();
     let unwound = std::panic::catch_unwind(|| {
@@ -36,4 +37,13 @@ fn a_spawn_under_an_outer_test_spawn_lock_panics_naming_the_reentry() {
         message.contains("spawn_lock re-entered"),
         "the panic must name the re-entry, got: {message}"
     );
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

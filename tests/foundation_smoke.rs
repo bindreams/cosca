@@ -4,7 +4,7 @@ use cosca::quote::windows;
 use cosca::Command;
 use cosca::Containment;
 
-#[test]
+#[skuld::test]
 fn public_surface_is_usable() {
     // POSIX round-trip via the public path.
     let args: Vec<&[u8]> = vec![b"echo", b"a b"];
@@ -37,7 +37,7 @@ fn public_surface_is_usable() {
 /// waits — all via the public API. The full tree-death proof lives in
 /// `spawn_io.rs`; this is just the surface reachability check.
 #[cfg(any(unix, windows))]
-#[test]
+#[skuld::test]
 fn containment_smoke() {
     let tb = env!("CARGO_BIN_EXE_cosca_testbin");
     let mut cmd = cosca::Command::new();
@@ -75,7 +75,7 @@ fn containment_smoke() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn spawn_public_surface_is_usable() {
     use cosca::{run, Stdio};
     // run([...]) -> output() captures; status code reachable.
@@ -87,4 +87,13 @@ fn spawn_public_surface_is_usable() {
     // The Stdio constructors are reachable from the crate root.
     let _ = Stdio::pipe();
     let _ = Stdio::null();
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }
