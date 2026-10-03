@@ -144,7 +144,7 @@ pub(crate) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 /// [`peek`] for a caller that treats `Running` as "this is our child". On macOS a running child
 /// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
 /// that tells it from a reuse of the pid. Other platforms use [`peek`].
-#[cfg(all(target_os = "macos", feature = "tokio"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<Peek> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {

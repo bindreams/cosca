@@ -43,7 +43,14 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<Peek> {
         // A ptrace stop, which Linux reports to the tracer whatever the options say: not an exit.
         Ok(Some(_)) | Ok(None) => Ok(Peek::Running),
         Err(Errno::CHILD) => Ok(Peek::Foreign(Foreign::Gone)),
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            // Our own pidfd is open and names a child: the kernel has no other reason to refuse it.
+            debug_assert!(
+                !matches!(e, Errno::BADF | Errno::INVAL),
+                "waitid(P_PIDFD) refused our own pidfd: {e}"
+            );
+            Err(e.into())
+        }
     }
 }
 

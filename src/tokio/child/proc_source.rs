@@ -213,6 +213,33 @@ impl ProcSource {
         }
     }
 
+    /// The handle that names the child, for a check that must not go by pid alone. Linux: the pidfd.
+    /// macOS: the pid with its unique id, while both are known. Windows: tokio's process handle.
+    /// `None` when there is nothing to check a pid against: a forgotten or already reaped child, or
+    /// (macOS) one whose unique id is unknown.
+    pub(crate) fn target(&self) -> Option<crate::wait::exit_only::Target<'_>> {
+        use crate::wait::exit_only::Target;
+        match self {
+            #[cfg(target_os = "linux")]
+            ProcSource::Tokio { pidfd, .. } => Some(Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))),
+            #[cfg(target_os = "macos")]
+            ProcSource::Tokio { child, identity, .. } => Some(Target::pid(child.id()?, Some((*identity)?))),
+            #[cfg(windows)]
+            ProcSource::Tokio { child, .. } => {
+                let handle = child.raw_handle()?;
+                // SAFETY: tokio owns the live process handle while `raw_handle` is `Some`, and the
+                // borrow lasts no longer than `self`.
+                Some(Target::Handle(unsafe {
+                    std::os::windows::io::BorrowedHandle::borrow_raw(handle)
+                }))
+            }
+            #[cfg(unix)]
+            ProcSource::Foreign { .. } => None,
+            #[cfg(windows)]
+            ProcSource::Raw(_) => None,
+        }
+    }
+
     /// Take tokio's own stdin stream (the Raw backend serves its piped std ends via `owned_std`,
     /// so it has none here).
     pub(crate) fn take_stdin(&mut self) -> Option<::tokio::process::ChildStdin> {
