@@ -21,7 +21,7 @@ env:
   NEXTEST_VERSION: "0.9.146"
   # The binaries the root lanes run, selected within by `SKULD_LABELS=root`: the `ROOT` group and
   # the modules labelled with it in `cosca`, and `process_root`, gated on `COSCA_TEST_UID_SWITCH`.
-  # Only these binaries are flipped to skuld; a libtest binary ignores `SKULD_LABELS` and would run whole.
+  # `-E` names the skuld binaries that have root tests: a libtest binary ignores `SKULD_LABELS` and would run whole.
   PRIVILEGE_TESTS: "binary(cosca) | binary(process_root)"
   # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
   COSCA_TEST_UID_SWITCH: "0"

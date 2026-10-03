@@ -1,4 +1,4 @@
-//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
+//! Unit tests for the group rules, and re-exec tests that drive one real test of the `NAMESPACES` group and one of the `ROOT` group under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 
