@@ -118,3 +118,39 @@ jobs:
           COSCA_TEST_ELEVATION_RUN0: "1"
           COSCA_TEST_ELEVATION_PASSWORD: "x"
         run: cargo nextest run --locked --features tokio --test elevation --no-fail-fast --no-capture
+  win2:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        shell: pwsh
+        run: cargo build --locked --features tokio --tests --bins --target ${{ matrix.target }}
+      - name: Run the elevation tests as a throwaway administrator (medium integrity)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 24 | ForEach-Object {[char]$_}) + "aA1!"
+          net user coscaelev $pw /add
+          net localgroup Administrators coscaelev /add
+          New-Item -ItemType Directory C:\elevmarker | Out-Null
+          icacls C:\elevmarker /inheritance:r /grant "BUILTIN\Administrators:(OI)(CI)F" "NT AUTHORITY\SYSTEM:(OI)(CI)F" | Out-Null
+          icacls C:\elevmarker
+          $exe = (Get-ChildItem target\${{ matrix.target }}\debug\deps\elevation-*.exe | Where-Object { $_.Name -notmatch 'pkexec' } | Select-Object -First 1).FullName
+          "test exe: $exe"
+          $cmd = "whoami /groups | findstr /i `"Label Administrators`" > C:\elevmarker\..\elev-who.txt 2>&1 & set COSCA_TEST_ELEVATION=1& set COSCA_TEST_ELEVATION_MARKER_DIR=C:\elevmarker& `"$exe`" --nocapture > C:\elev-out.txt 2>&1"
+          $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\coscaelev", (ConvertTo-SecureString $pw -AsPlainText -Force))
+          icacls C:\ /grant "coscaelev:(CI)(OI)M" | Out-Null
+          $p = Start-Process cmd.exe -ArgumentList '/c', $cmd -Credential $cred -WorkingDirectory $PWD.Path -Wait -PassThru
+          "child exit: $($p.ExitCode)"
+          Get-Content C:\elev-who.txt
+          Get-Content C:\elev-out.txt
