@@ -7,7 +7,7 @@
 //! then finds gone.
 
 use crate::tokio::Command;
-use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
+use crate::wait::exit_only::seams::force_peek_once;
 use crate::wait::exit_only::{Foreign, Peek};
 
 /// Watches one child from outside cosca and reaps it on the test's behalf.
@@ -144,7 +144,7 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (child, witness) = exited_unreaped(true);
-    let _looks = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
+    let _looks = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
     let _refused = super::fault::force_kill_failure();
     let kills = super::drop_fault::record();
 
@@ -177,8 +177,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
             // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
-            // would consume it. The evidence follows the identity check's own peek, which the
-            // test answers `Running`: the child is ours until the forced attach failure.
+            // would consume it.
             *armed.borrow_mut() = Some(evidence());
             *slot.borrow_mut() = Some(witness);
         }
@@ -207,7 +206,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 /// Mutant: no forget in `reap_now`'s refused-kill arm (tokio's drop reaps the zombie by pid).
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
-    reap_now_after_a_refused_kill(|| Box::new(force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))])));
+    reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Ok(Peek::Foreign(Foreign::Gone)))));
 }
 
 /// A failed look cannot show the child is ours, so the arm forgets it too.
@@ -215,12 +214,7 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
 /// Mutant: a failed look counts as ours.
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_failed_look_reaps_nothing() {
-    reap_now_after_a_refused_kill(|| {
-        Box::new(force_peeks([
-            Ok(Peek::Running),
-            Err(std::io::Error::other("forced peek failure 6e2a")),
-        ]))
-    });
+    reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Err(std::io::Error::other("forced peek failure 6e2a")))));
 }
 
 /// `try_wait` and `wait` on a child shown reaped elsewhere answer `ECHILD` and take nothing: tokio's
@@ -406,20 +400,23 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 }
 
 /// The spawn's identity check peeks through the child's pidfd. A peek that fails cannot show the
-/// child ours, so the spawn fails `Unassessable`, warns at the call, and forgets tokio's `Child`:
-/// its drop would reap by pid. The second failed peek is the forget decision's own look.
+/// child ours, but the pidfd pins it whatever the peek said: the spawn fails `Unassessable`, warns
+/// at the call, kills and reaps the child through the pidfd, and forgets tokio's `Child` (its drop
+/// would reap a collected pid).
 ///
-/// Mutants: the call-site warn drops the error (`let _ = e;`); the identity read moves before `ProcSource::new` (tokio's `Child` is then dropped by
-/// value on the error path, so `forgets()` is 0); the failed check goes to `reap_now` without the
-/// forget decision (`backend_drops` is 1).
+/// Mutants: the call-site warn drops the error; the identity read moves before `ProcSource::new`
+/// (tokio's `Child` is dropped by value on the error path, so `forgets()` is 0); the failed check
+/// goes to `reap_now` (`backend_drops` is 1); the teardown only forgets the child (no teardown
+/// reap is recorded, and the child is left running).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
+async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio_child() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::child::spawn::fault;
     use crate::error::Error;
+    use crate::wait::exit_only::seams::force_peeks;
 
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
@@ -430,18 +427,19 @@ async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
         move || {
             *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
             // Armed here, not before `spawn()`: the handshake's own peeks run first.
-            *armed.borrow_mut() = Some(Box::new(force_peeks([
-                Err(std::io::Error::other("forced identity-check failure 91c4")),
-                Err(std::io::Error::other("forced forget-decision failure 91c4")),
-            ])));
+            *armed.borrow_mut() = Some(Box::new(force_peeks([Err(std::io::Error::other(
+                "forced identity-check failure 91c4",
+            ))])));
         }
     });
     let forgets = super::drop_fault::record();
     let backend_drops = super::fault::count_backend_drops();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let mark = crate::log_capture::mark();
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::stdio::Stdio::null()).expect("stdin");
+    cmd.stdin(stdin).expect("stdin");
 
     let err = cmd.spawn().err();
 
@@ -461,9 +459,19 @@ async fn a_failed_identity_peek_is_unknown_and_forgets_the_tokio_child() {
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
     let witness = slot.borrow_mut().take().expect("the hook ran");
-    witness.kill();
-    witness.wait_exited();
-    witness
-        .reap()
-        .expect("the failed spawn must not have reaped the child by pid");
+    let recorded = reaps.recorded();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the teardown must have reaped the child: {recorded:?}"
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&recorded[0].1),
+        Some(libc::SIGKILL),
+        "the teardown must have killed the child through its pidfd"
+    );
+    assert!(
+        witness.reap().is_err(),
+        "the child is reaped already: nothing is left for the test to reap"
+    );
 }

@@ -560,9 +560,9 @@ impl From<AttachError> for Error {
 }
 
 /// Resolve the spawned root's identity by pid alone, with no handle to check the read against.
-/// The read is only as good as the pid: on Unix a foreign reap and reuse before it makes it name
-/// a stranger (the spawn's own identity read is checked through the child's handle; this one is
-/// not, until the attach takes the verified id). On Windows the held process handle pins the pid.
+/// On Unix a foreign reap and reuse before the read makes it name a stranger. The spawn's own
+/// identity read, taken after this attach and checked through the child's handle, then fails the
+/// spawn `Gone`. On Windows the held process handle pins the pid.
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
     // Via `resolve_identity_unchecked` so the test seam applies here too.

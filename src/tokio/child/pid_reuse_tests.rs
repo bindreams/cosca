@@ -764,7 +764,7 @@ in_fresh_pid_ns!(
 /// vanished, and the stranger is signalled by the test alone.
 ///
 /// Mutant: `resolve_identity` skips the peek through the handle.
-fn spawn_identity_after_foreign_reap_and_reuse_is_gone_body() {
+fn spawn_identity_gone_after_a_reap_at(point: crate::child::spawn::fault::SpawnPoint) {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -779,7 +779,7 @@ fn spawn_identity_after_foreign_reap_and_reuse_is_gone_body() {
 
         let stranger = Rc::new(RefCell::new(None));
         let alias: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
-        let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let _hook = fault::set_at(point, {
             let (stranger, alias) = (Rc::clone(&stranger), Rc::clone(&alias));
             move || {
                 let pid = fault::spawn_pid();
@@ -810,11 +810,29 @@ fn spawn_identity_after_foreign_reap_and_reuse_is_gone_body() {
         drop(alias);
     });
 }
+fn spawn_identity_after_foreign_reap_and_reuse_is_gone_body() {
+    spawn_identity_gone_after_a_reap_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity);
+}
 in_fresh_pid_ns!(
     namespaces_tokio_spawn_identity_after_foreign_reap_and_reuse_is_gone,
     fixture_tokio_spawn_identity_gone_driver,
     fixture_tokio_spawn_identity_gone_init,
     spawn_identity_after_foreign_reap_and_reuse_is_gone_body
+);
+
+/// The reap lands right before the attach. The attach reads the tree-walk root by pid, so it must
+/// come before the checked identity read: attached after, the stranger would be the attachment's
+/// root under an identity that passed, and the spawn would be `Ok`.
+///
+/// Mutant: the async spawn attaches after the identity check.
+fn spawn_reap_before_the_attach_is_gone_body() {
+    spawn_identity_gone_after_a_reap_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach);
+}
+in_fresh_pid_ns!(
+    namespaces_tokio_spawn_reap_before_the_attach_is_gone,
+    fixture_tokio_spawn_attach_gone_driver,
+    fixture_tokio_spawn_attach_gone_init,
+    spawn_reap_before_the_attach_is_gone_body
 );
 
 // Panicking loggers =====
