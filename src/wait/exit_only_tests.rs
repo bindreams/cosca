@@ -18,7 +18,7 @@ mod unix {
     /// (XNU ORs `p_xhighbits` into its high byte, `kern_exit.c:3255`).
     ///
     /// Mutant: a mask-free mapping keeps the high bits in the raw status.
-    #[test]
+    #[skuld::test]
     fn an_exited_record_gives_the_low_byte_as_the_code() {
         assert_eq!(
             status(libc::CLD_EXITED, 0x0A00_0107),
@@ -29,7 +29,7 @@ mod unix {
     /// `CLD_KILLED` and `CLD_DUMPED` give the signal, and a core dump sets the core bit.
     ///
     /// Mutant: a mask-free mapping; `CLD_DUMPED` mapped like `CLD_KILLED`.
-    #[test]
+    #[skuld::test]
     fn killed_and_dumped_records_give_the_signal() {
         assert_eq!(
             status(libc::CLD_KILLED, 0x0A00_0009),
@@ -45,7 +45,7 @@ mod unix {
     /// never a panic.
     ///
     /// Mutant: a trap read as an exit.
-    #[test]
+    #[skuld::test]
     fn a_trapped_record_is_not_an_exit_record() {
         for code in [libc::CLD_TRAPPED, libc::CLD_STOPPED, libc::CLD_CONTINUED, 0, 99] {
             assert!(!is_exit_record(code), "si_code {code}");
@@ -66,7 +66,7 @@ mod step_hooks {
     /// A dropped guard takes its unfired hook with it: the next `step` runs nothing.
     ///
     /// Mutant: the guard's `Drop` does nothing.
-    #[test]
+    #[skuld::test]
     fn a_dropped_step_hook_guard_removes_its_hook() {
         let fired = Rc::new(Cell::new(false));
         let guard = seams::on_holder_step(HolderStep::FinalPeek, {
@@ -83,7 +83,7 @@ mod step_hooks {
     /// later hook for the same step armed.
     ///
     /// Mutant: the guard removes every hook of its step.
-    #[test]
+    #[skuld::test]
     fn a_step_hook_guard_removes_only_its_own_hook() {
         let first = seams::on_holder_step(HolderStep::FinalPeek, || ());
         seams::step(HolderStep::FinalPeek);

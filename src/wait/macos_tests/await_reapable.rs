@@ -43,7 +43,7 @@ fn confirm_exit(child: &Child) {
 /// root with its status.
 ///
 /// Mutant: the peek consumes (drops `WNOWAIT`), so the caller's `wait` finds nothing.
-#[test]
+#[skuld::test]
 fn await_reapable_reports_a_zombie_and_leaves_it_reapable() {
     let (mut child, stdin) = spawn_blocker();
     drop(stdin);
@@ -57,7 +57,7 @@ fn await_reapable_reports_a_zombie_and_leaves_it_reapable() {
 /// A deadline already past still takes its final peek, and a zombie it finds is `Reapable`.
 ///
 /// Mutant: no final peek at expiry: `DeadlinePassed`.
-#[test]
+#[skuld::test]
 fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     let (child, stdin) = spawn_blocker();
     drop(stdin);
@@ -102,7 +102,7 @@ fn spurious_wake() {
 /// Mutant: an unbounded `kevent` under a deadline (its `debug_assert!` fires); a round after the
 /// deadline (no expiry check before the block); a timeout above the time remaining, or computed
 /// once per wait; no final peek; the clock not held (the stall at round 0 ends the wait there).
-#[test]
+#[skuld::test]
 fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -154,7 +154,7 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
 ///
 /// Mutant: the timeout computed once, before the retry loop; the clock not held (the stall leaves
 /// less than `spent` for round 0).
-#[test]
+#[skuld::test]
 fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -186,7 +186,7 @@ fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
 /// is imminent when the first `kevent` is called.
 ///
 /// Mutant: no clamp in `kevent_timeout`: `EINVAL` from the first call.
-#[test]
+#[skuld::test]
 fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
     let (mut child, stdin) = spawn_blocker();
     let mut stdin = Some(stdin);
@@ -210,7 +210,7 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
 ///
 /// Mutant: `kevent_round` arms its `kevent` without `kevent_timeout`: one call carries the whole
 /// remaining time; the clock not held (the stall leaves round 0 5 ms, and it ends the wait).
-#[test]
+#[skuld::test]
 fn await_reapable_rearms_a_remaining_time_above_the_clamp_in_pieces() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -244,7 +244,7 @@ fn await_reapable_rearms_a_remaining_time_above_the_clamp_in_pieces() {
 /// A dropped hook guard takes its unfired hook with it.
 ///
 /// Mutant: a guard whose `Drop` does nothing.
-#[test]
+#[skuld::test]
 fn dropped_hook_guards_remove_their_hooks() {
     let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let count = |fired: &std::rc::Rc<std::cell::Cell<u32>>| {
@@ -274,7 +274,7 @@ const MARKER_KNOTE: &str = "COSCA_TEST_AWAIT_KNOTE";
 /// posts before `SZOMB` and the `SIGCHLD`, `kern_exit.c:2562` against `:2631`, `:2637`.)
 ///
 /// Mutant: the knote registered without `EV_CLEAR`.
-#[test]
+#[skuld::test]
 fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER_KNOTE) {
         return run_case(
@@ -348,7 +348,7 @@ const MARKER_ESRCH: &str = "COSCA_TEST_AWAIT_ESRCH";
 /// if the zombie is there and `Gone` if XNU reaped the child itself (`kern_exit.c:2577`).
 ///
 /// Mutant: a wait that decides from the disposition it saw when it started.
-#[test]
+#[skuld::test]
 fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER_ESRCH) {
         for case in ["dfl_then_ign", "ign_then_dfl"] {
@@ -400,7 +400,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
 /// sibling XNU sends no `SIGCHLD`, and nothing else would wake the kqueue.
 ///
 /// Mutant: no self-registration: the wait blocks on a `NOTE_EXIT` that never comes.
-#[test]
+#[skuld::test]
 fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
     const MARKER: &str = "COSCA_TEST_AWAIT_CALLER_ESRCH";
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
