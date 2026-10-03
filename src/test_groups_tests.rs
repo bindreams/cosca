@@ -159,7 +159,7 @@ mod reexec {
     }
 
     fn assert_group_zero_reports_ignored(case: &Case) {
-        let (outcome, success, stdout) = run_case(case, Some("0"), Some("1"));
+        let (outcome, success, stdout) = run_case(case, Some("0"), None);
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -174,7 +174,11 @@ mod reexec {
     }
 
     fn assert_consent_refused(case: &Case, consent: Option<&str>) {
-        let (outcome, success, stdout) = run_case(case, None, consent);
+        assert_consent_refused_with(case, None, consent);
+    }
+
+    fn assert_consent_refused_with(case: &Case, group: Option<&str>, consent: Option<&str>) {
+        let (outcome, success, stdout) = run_case(case, group, consent);
         assert_eq!(outcome.failed, 1, "{stdout}");
         assert_eq!(outcome.passed + outcome.ignored, 0, "{stdout}");
         assert!(!success, "{stdout}");
@@ -182,7 +186,7 @@ mod reexec {
     }
 
     fn assert_zero_never_runs_the_body_under_run_ignored(case: &Case) {
-        let (outcome, success, stdout) = run_case_with(case, &["--ignored"], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_case_with(case, &["--ignored"], Some("0"), None, None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
@@ -199,9 +203,9 @@ mod reexec {
     }
 
     fn assert_label_selects(case: &Case) {
-        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), Some("1"), Some(case.label));
+        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), None, Some(case.label));
         assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), Some("1"), Some(&format!("!{}", case.label)));
+        let (outcome, _, stdout) = run_case_with(case, &[], Some("0"), None, Some(&format!("!{}", case.label)));
         assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 
@@ -215,6 +219,12 @@ mod reexec {
     #[skuld::test]
     fn unset_consent_fails() {
         assert_consent_refused(&NAMESPACES, None);
+    }
+
+    /// Mutant: an enabled group needs no consent. `=1` is not consent.
+    #[skuld::test]
+    fn group_one_without_consent_fails() {
+        assert_consent_refused_with(&NAMESPACES, Some("1"), None);
     }
 
     /// Mutant: any non-empty consent counts.
@@ -239,6 +249,12 @@ mod reexec {
     #[skuld::test]
     fn root_group_zero_reports_ignored() {
         assert_group_zero_reports_ignored(&ROOT);
+    }
+
+    /// Mutant: an enabled `ROOT` group needs no consent. `=1` is not consent.
+    #[skuld::test]
+    fn root_group_one_without_consent_fails() {
+        assert_consent_refused_with(&ROOT, Some("1"), None);
     }
 
     /// Mutant: the `ROOT` setup does not check consent.
