@@ -39,13 +39,7 @@ impl Prepared {
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
     /// never for the child the caller will reap. A no-op without a leaf, or once taken.
-    #[cfg_attr(
-        not(any(test, feature = "tokio")),
-        allow(
-            dead_code,
-            reason = "consumers are #[cfg(test)] fixtures and the tokio spawn failure path"
-        )
-    )]
+    #[cfg(any(test, all(feature = "tokio", target_os = "macos")))]
     pub(crate) fn settle_verdict(&mut self, pid: u32) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
