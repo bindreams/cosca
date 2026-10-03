@@ -22,4 +22,3 @@ fn main() {}
 #[cfg(all(feature = "crate_allow"))] #[test] fn crate_allowed() {}
 #[cfg(all(feature = "arch_x86_64", target_arch = "x86_64"))] #[tokio::test] async fn arch_x86_64() {}
 #[cfg(all(feature = "arch_aarch64", target_arch = "aarch64"))] #[tokio::test] async fn arch_aarch64() {}
-#[cfg(feature = "post_mono")] #[no_mangle] pub extern "C" fn post_mono_it() { struct S<T>(T); impl<T> S<T> { const OK: () = assert!(core::mem::size_of::<T>() == 0); } let () = S::<u8>::OK; }

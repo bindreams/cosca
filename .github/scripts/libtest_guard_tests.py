@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (work / "cwd-with-wrapper" / ".cargo").mkdir(parents=True)
     (work / "cwd-with-wrapper" / ".cargo" / "config.toml").write_text('[build]\nrustc-wrapper = "false"\n')
 
-    def check(name, want_rc, want_found, unflipped_name, *args, env=None, cwd=None, stderr_has=()):
+    def check(name, want_rc, want_found, unflipped_name, *args, env=None, cwd=None, stderr_has=(), stderr_lacks=()):
         """Run the guard with the unflipped file UNFLIPPED_NAME; assert exit code, findings and stderr."""
         global checks
         checks += 1
@@ -93,6 +93,10 @@ with tempfile.TemporaryDirectory() as tmp:
             if text not in done.stderr:
                 ok = False
                 print(f"missing in stderr: {text!r}")
+        for text in stderr_lacks:
+            if text in done.stderr:
+                ok = False
+                print(f"unexpected in stderr: {text!r}")
         if ok:
             print(f"ok   - {name}")
         else:
@@ -120,7 +124,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check("no code generation for a test target, debug", 0, (), "lt", "--features", "post_mono")
     check("no code generation for a test target, release", 0, (), "lt", "--features", "post_mono", "--release")
     check("no code generation for a test target, powerset, both profiles", 1, both("fn ps_none"), "lt", "--feature-powerset",
-          "--features", "post_mono", "--both-profiles")
+          "--features", "post_mono", "--both-profiles",
+          stderr_lacks=("failed without a libtest-attribute finding",))
 
     # One OS-gated test per OS: flagged on its own OS, absent elsewhere ---------------------------------
     for os_name in ("linux", "macos", "windows"):
