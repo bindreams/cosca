@@ -33,10 +33,7 @@ impl ProcHandle {
     /// Read from the state that records the reap, so it is `true` from the moment of the reap, even
     /// while the waiter that made it is still returning. A reap by someone else is not seen here.
     /// `Raw` (Windows) reads the process handle's signalled state: nothing is consumed there.
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "the Windows drop path does not read it yet; the tests do")
-    )]
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
             ProcHandle::Std(s) => s.is_reaped(),
