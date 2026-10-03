@@ -78,6 +78,12 @@ fn require_consent_grants_only_on_exactly_1() {
         require_consent("COSCA_TEST_X", "does a thing", env(&[("COSCA_TEST_X_CONSENT", "1")])),
         Ok(Group)
     ));
+    // Off: skuld still runs a test body under `--run-ignored only`, so setup refuses.
+    let off = [("COSCA_TEST_X", "0"), ("COSCA_TEST_X_CONSENT", "1")];
+    let why = require_consent("COSCA_TEST_X", "does a thing", env(&off))
+        .err()
+        .expect("a group that is off");
+    assert!(why.contains("COSCA_TEST_X=0"), "{why}");
     for vars in [&[][..], &[("COSCA_TEST_X_CONSENT", "yes")]] {
         let why = require_consent("COSCA_TEST_X", "does a thing", env(vars))
             .err()
@@ -100,8 +106,18 @@ mod reexec {
     /// Re-execs this binary on exactly [`NAMESPACES_TEST`] with the group's variables set as given
     /// (`None` removes them), and returns its suite outcome, its exit status and its stdout.
     fn run_namespaces_test(group: Option<&str>, consent: Option<&str>) -> (SuiteOutcome, bool, String) {
+        run_namespaces_test_with(&[], group, consent)
+    }
+
+    /// [`run_namespaces_test`] with `extra` arguments, such as `--ignored`.
+    fn run_namespaces_test_with(
+        extra: &[&str],
+        group: Option<&str>,
+        consent: Option<&str>,
+    ) -> (SuiteOutcome, bool, String) {
         let mut cmd = command(std::env::current_exe().expect("current_exe"));
         cmd.args(["--test-threads=1", "--exact", NAMESPACES_TEST, NOCAPTURE]);
+        cmd.args(extra);
         with_json_events(&mut cmd);
         for (var, value) in [
             ("COSCA_TEST_NAMESPACES", group),
@@ -157,5 +173,16 @@ mod reexec {
         assert_eq!(outcome.passed + outcome.ignored, 0, "{stdout}");
         assert!(!success, "{stdout}");
         assert!(stdout.contains("COSCA_TEST_NAMESPACES_CONSENT=1"), "{stdout}");
+    }
+
+    /// skuld runs the body of an ignored test under `--ignored`, so `=0` must stop the body in the
+    /// fixture. Mutant: the setup grants a group that is off.
+    #[skuld::test]
+    fn group_zero_never_runs_the_body_under_run_ignored() {
+        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        assert_eq!(outcome.passed, 0, "{stdout}");
+        assert_eq!(outcome.failed + outcome.ignored, 1, "{stdout}");
+        assert!(!success || outcome.ignored == 1, "{stdout}");
     }
 }

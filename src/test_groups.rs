@@ -34,14 +34,19 @@ pub(crate) fn require_enabled(enabled_var: &str, var: impl Fn(&str) -> Option<St
 }
 
 /// A consent-asking group's setup: [`check_group`]'s rule, where `what` says what the group does.
+/// A group that is off is an `Err` too, so its body never runs.
 pub(crate) fn require_consent(
     enabled_var: &str,
     what: &str,
     var: impl Fn(&str) -> Option<String>,
 ) -> Result<Group, String> {
-    check_group(enabled_var, var)
-        .map(|_| Group)
-        .map_err(|why| format!("the group {what}: {why}"))
+    match check_group(enabled_var, var) {
+        Ok(true) => Ok(Group),
+        // skuld runs the body of a test whose `requires` failed when ignored tests are included
+        // (`--run-ignored only`), so a group that is off refuses here as well.
+        Ok(false) => Err(format!("{enabled_var}=0")),
+        Err(why) => Err(format!("the group {what}: {why}")),
+    }
 }
 
 /// Declares a test group: the fixture `$fixture`, labelled `$label` (declared in
@@ -54,7 +59,7 @@ macro_rules! test_group {
         test_group!(@declare $label, $fixture, $env, require_consent($env, $what, |name| std::env::var(name).ok()));
     };
     ($label:ident => $fixture:ident, env = $env:literal) => {
-        test_group!(@declare $label, $fixture, $env, Ok(Group));
+        test_group!(@declare $label, $fixture, $env, require_enabled($env, |name| std::env::var(name).ok()).map(|()| Group));
     };
     (@declare $label:ident, $fixture:ident, $env:literal, $setup:expr) => {
         mod $fixture {

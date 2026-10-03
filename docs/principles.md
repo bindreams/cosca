@@ -221,17 +221,19 @@ test rather than running it. The check may be a skuld fixture, but either way a 
 a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
 the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
 `COSCA_TEST_ROOT_CONSENT=1`. `COSCA_TEST_NAMESPACES` (tests that unshare mount and pid
-namespaces) has a consent variable too. A group is declared once, as a `test_group!` row in
+namespaces) has a consent variable too, and is the first group declared as a `test_group!` row in
 `src/test_groups.rs`: one skuld fixture that carries the off-switch (`requires`, `Err` only for
 `=0`, so an opted-out test is reported ignored), the consent check (a setup that fails the test
-unless the consent variable is exactly `1`) and a label (`src/test_harness.rs`) that CI lanes
-select by with `SKULD_LABELS`. A test joins the group with `#[fixture(<group>)] _group: &Group`,
-and cannot have the gate without the label or the label without the gate; a group's tests are not
-recognised by their names. So does `COSCA_TEST_SETUID` (tests that run a setuid-root
+unless the consent variable is exactly `1`, and refuses a group that is off, since skuld runs the
+body of an ignored test under `--run-ignored only`) and a label (`src/test_harness.rs`) that CI
+lanes select by with `SKULD_LABELS`. A test joins with `#[fixture(namespaces)] _group: &Group`, so
+it has the gate and the label together, and is not recognised by its name. The other groups below
+still use their own gates and the name conventions given for each, until they too become
+`test_group!` rows. So does `COSCA_TEST_SETUID` (tests that run a setuid-root
 copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the helper only in the
 Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there. Its
 members are the tests whose names start with `setuid_` and the `group_teardown_setuid` binary; a
-new member takes the gate and that prefix (until the group becomes a `test_group!`). So does
+new member takes the gate and that prefix. So does
 `COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids): CI turns
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane, whose names contain `cgroup`

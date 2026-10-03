@@ -160,6 +160,9 @@ fn foreign_kill_helper_main(pid: u32) -> i32 {
     }
 }
 
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
 fn main() {
     #[cfg(unix)]
     {
@@ -173,5 +176,7 @@ fn main() {
             }
         }
     }
-    skuld::run_all();
+    let mut runner = skuld::TestRunner::new();
+    runner.require_known_labels();
+    runner.run()
 }
