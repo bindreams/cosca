@@ -3,6 +3,7 @@
 //! that against a rewrite of its signal path.
 
 use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
+use crate::test_groups::namespaces;
 use crate::Command;
 
 fn spawn_blocker() -> (crate::Child, std::io::PipeWriter) {

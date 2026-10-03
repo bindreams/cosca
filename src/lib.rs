@@ -142,6 +142,9 @@ mod relayed_probe;
 mod test_child;
 
 #[cfg(test)]
+mod test_groups;
+
+#[cfg(test)]
 mod test_harness;
 
 #[cfg(test)]
@@ -204,5 +207,6 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
 fn main() {
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
+    runner.require_known_labels();
     runner.run()
 }

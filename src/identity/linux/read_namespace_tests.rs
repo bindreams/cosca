@@ -6,6 +6,7 @@ use crate::identity::stat_parse::parse_starttime_jiffies;
 use crate::identity::{Existence, Liveness, ProcessId, Resolved};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_groups::{namespaces, Group};
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: `/proc/1` is the outer
 /// init. Also an inner-namespace child, whose pid the outer `/proc` may not hold or may give
@@ -16,10 +17,7 @@ use crate::test_child::namespaces as ns;
 /// resolves a live child to `Gone`" - `of(child)` is `Gone`; "`spawn_identity_error` names no
 /// cause" - the spawn's error carries no view.
 #[skuld::test]
-fn namespaces_an_outer_procfs_gives_current_its_own_token_and_reads_unknown() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_an_outer_procfs_gives_current_its_own_token_and_reads_unknown(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_outer_procfs_outer));
 }
 

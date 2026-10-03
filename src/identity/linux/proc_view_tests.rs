@@ -4,6 +4,7 @@ use std::os::fd::AsFd;
 
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_groups::{namespaces, Group};
 
 use super::fault::{force_proc_view_once, force_status_once, ForcedView};
 use super::{
@@ -311,10 +312,7 @@ fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd)
 ///
 /// In the namespaces group: `unshare` is refused by default container seccomp profiles.
 #[skuld::test]
-fn namespaces_the_fdinfo_is_read_through_the_calling_threads_fd_table() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_the_fdinfo_is_read_through_the_calling_threads_fd_table(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_fdinfo_after_unshare_files));
 }
 
@@ -349,10 +347,9 @@ fn fixture_fdinfo_after_unshare_files() {
 ///
 /// Mutant: "compare `thread-self/stat`'s id with `gettid()`" — the coincidence reads as `Same`.
 #[skuld::test]
-fn namespaces_no_nspid_under_an_outer_procfs_numbering_this_thread_alike_is_diverged() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_no_nspid_under_an_outer_procfs_numbering_this_thread_alike_is_diverged(
+    #[fixture(namespaces)] _group: &Group,
+) {
     ns::run(fixture_path!(fixture_coinciding_tid_driver));
 }
 
@@ -411,10 +408,7 @@ fn fixture_coinciding_tid_inner() {
 /// "compare `thread-self/stat`'s id with `gettid()`" (the second: it needs no permission, so it
 /// answers `Same`).
 #[skuld::test]
-fn namespaces_no_nspid_under_this_namespaces_own_procfs_is_same() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_no_nspid_under_this_namespaces_own_procfs_is_same(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_own_procfs_driver));
 }
 

@@ -16,14 +16,12 @@ use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions
 use super::namespaces as ns;
 
 /// Runs `$body` as pid 1 of a fresh pid namespace with its own procfs. Defines the `#[test]`
-/// `$test` (the entry, which skips under `COSCA_TEST_NAMESPACES=0`) and its two fixtures.
+/// `$test` (the entry, in the `NAMESPACES` group) and its two fixtures. The caller imports
+/// `crate::test_groups::namespaces`.
 macro_rules! in_fresh_pid_ns {
     ($test:ident, $driver:ident, $init:ident, $body:path) => {
         #[skuld::test]
-        fn $test() {
-            if !crate::test_child::namespaces::enabled() {
-                return;
-            }
+        fn $test(#[fixture(namespaces)] _group: &crate::test_groups::Group) {
             crate::test_child::namespaces::run(crate::test_child::fixture_path!($driver));
         }
 

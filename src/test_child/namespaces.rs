@@ -2,9 +2,11 @@
 //! so the shared, multithreaded test process never changes its own namespaces.
 //!
 //! They need `CAP_SYS_ADMIN`, so they are a system-affecting group (see the
-//! system-affecting-tests principle in `docs/principles.md`): on by default, `COSCA_TEST_NAMESPACES=0` switches the group off, and running it needs
-//! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. Run them in a container,
-//! VM, or CI's root lane, never on a developer host.
+//! system-affecting-tests principle in `docs/principles.md`), declared in `test_groups.rs`: on by
+//! default, `COSCA_TEST_NAMESPACES=0` ignores the group's tests, and running them needs
+//! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. A test joins with
+//! `#[fixture(namespaces)] _group: &Group`, which also labels it `namespaces`. Run them in a
+//! container, VM, or CI's root lane, never on a developer host.
 
 mod chroot_scratch;
 pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch};
@@ -15,13 +17,6 @@ pub(crate) use super::db_dir::SKULD_DB_DIR_ENV;
 
 use rustix::mount::{mount, mount_bind, mount_change, MountPropagationFlags};
 use rustix::thread::{unshare_unsafe, UnshareFlags};
-
-/// Whether the caller should run the group's body: `false` only for an explicit
-/// `COSCA_TEST_NAMESPACES=0`; otherwise panics unless `COSCA_TEST_NAMESPACES_CONSENT=1`. The
-/// group's shared gate is [`require_group`](crate::test_support::require_group).
-pub(crate) fn enabled() -> bool {
-    crate::test_support::require_group("NAMESPACES")
-}
 
 /// Re-exec this binary on `fixture`, to run as the child half of a test.
 pub(crate) fn run(fixture: &str) {

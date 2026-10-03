@@ -10,6 +10,7 @@ use crate::error::Error;
 use crate::identity::{proc_view, ProcDir, ProcView, ProcessId};
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_groups::{namespaces, Group};
 
 /// A status file mounted over `/proc/<pid>/status` is a mount below the checked `/proc`, which no
 /// read crosses: the view is `Unassessable` naming the refused crossing. A live foreign kill does
@@ -19,10 +20,7 @@ use crate::test_child::namespaces as ns;
 /// Mutants: "the success path requires a `Same` `proc_view()`" — every live `open_verified` is
 /// then `Unassessable`; "read `status` with a plain `openat`" — the fake status is read as real.
 #[skuld::test]
-fn namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_status_mounted_over));
 }
 
@@ -72,10 +70,7 @@ fn fixture_status_mounted_over() {
 /// token differs from this `ProcessId`'s, so `open_verified` answers `Ok(None)` (gone) for a live
 /// target.
 #[skuld::test]
-fn namespaces_an_outer_procfs_is_diverged_and_unassessable() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_an_outer_procfs_is_diverged_and_unassessable(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_pid_ns_outer));
 }
 
@@ -173,10 +168,7 @@ fn assert_unassessable_existence(result: Result<Option<rustix::fd::OwnedFd>, Err
 /// Mutant: "read `/proc/{pid}/stat` by path" — the fake stat has another start token, so a
 /// live target reads as gone (`Ok(None)`).
 #[skuld::test]
-fn namespaces_the_success_path_reads_through_the_checked_proc_dirfd() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_the_success_path_reads_through_the_checked_proc_dirfd(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_overmount_success));
 }
 
@@ -197,10 +189,7 @@ fn fixture_overmount_success() {
 
 /// Same for the `EINVAL`/`ENOENT` arm, against a live non-leader tid.
 #[skuld::test]
-fn namespaces_the_einval_arm_reads_through_the_checked_proc_dirfd() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_the_einval_arm_reads_through_the_checked_proc_dirfd(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_overmount_einval));
 }
 
@@ -231,10 +220,7 @@ fn fixture_overmount_einval() {
 /// Mutant: "open sub-paths with a plain `openat`" — the fake token is read and a live target
 /// reads as gone (`Ok(None)`).
 #[skuld::test]
-fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_success_path() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_success_path(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_stat_overmount_success));
 }
 
@@ -255,10 +241,7 @@ fn fixture_stat_overmount_success() {
 
 /// Same for the `EINVAL`/`ENOENT` arm.
 #[skuld::test]
-fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_einval_arm() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_stat_mounted_over_below_proc_is_not_read_on_the_einval_arm(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_stat_overmount_einval));
 }
 
@@ -282,10 +265,7 @@ fn fixture_stat_overmount_einval() {
 /// A tmpfs mounted at `/proc` before the dirfd is opened is not procfs. Mutant: "no `fstatfs`
 /// magic check" — the fake `/proc` is trusted and its reads are taken for the kernel's.
 #[skuld::test]
-fn namespaces_a_tmpfs_at_proc_is_not_procfs() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_tmpfs_at_proc_is_not_procfs(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_tmpfs_at_proc));
 }
 
@@ -315,10 +295,7 @@ fn fixture_tmpfs_at_proc() {
 /// A procfs subtree bound over `/proc` has procfs's magic but is not its root. Mutant: "check
 /// the magic but not the root inode".
 #[skuld::test]
-fn namespaces_a_procfs_subtree_bound_over_proc_is_not_the_procfs_root() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_procfs_subtree_bound_over_proc_is_not_the_procfs_root(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_subtree_at_proc));
 }
 
