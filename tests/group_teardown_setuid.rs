@@ -486,7 +486,7 @@ mod setuid_group {
 
     /// Mutant: the test carries no `SETUID_ROOT` label, so the root-run step selects nothing.
     #[skuld::test]
-    fn the_setuid_root_label_selects_only_the_root_run_test() {
+    fn the_setuid_root_label_selects_the_root_run_test() {
         let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("setuid_root"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
         let (outcome, _, stdout) = run_setuid_test(&[], Some("0"), Some("1"), Some("!setuid_root"));
