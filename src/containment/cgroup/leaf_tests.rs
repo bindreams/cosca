@@ -2475,7 +2475,7 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
         .expect("run the case alone");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            out.status.success() && crate::test_reexec::suite_passed_exactly_one(&out.stdout).is_ok(),
+            crate::test_reexec::suite_passed_exactly_one(&out).is_ok(),
             "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)

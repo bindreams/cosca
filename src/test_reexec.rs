@@ -106,9 +106,15 @@ pub fn suite_outcome(stdout: &[u8]) -> Result<SuiteOutcome, String> {
     })
 }
 
-/// `Ok` if the run listed exactly one test, and it passed.
-pub fn suite_passed_exactly_one(stdout: &[u8]) -> Result<(), String> {
-    let outcome = suite_outcome(stdout)?;
+/// `Ok` if the child exited successfully and listed exactly one test, which passed.
+///
+/// The exit status is checked as well as the events: skuld can still fail the process after it
+/// printed the `ok` event (its `fail_on_violations`, exit 101).
+pub fn suite_passed_exactly_one(output: &std::process::Output) -> Result<(), String> {
+    if !output.status.success() {
+        return Err(format!("the child exited with {}", output.status));
+    }
+    let outcome = suite_outcome(&output.stdout)?;
     if outcome.test_count == 1 && outcome.passed == 1 && outcome.failed == 0 {
         Ok(())
     } else {

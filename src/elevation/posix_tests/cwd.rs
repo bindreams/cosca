@@ -218,7 +218,7 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     let out = child.wait_with_output().expect("wait");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && crate::test_reexec::suite_passed_exactly_one(&out.stdout).is_ok(),
+        crate::test_reexec::suite_passed_exactly_one(&out).is_ok(),
         "{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );

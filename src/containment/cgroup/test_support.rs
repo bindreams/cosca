@@ -311,7 +311,7 @@ pub(crate) fn alone(name: &str) -> bool {
     .expect("run the test alone");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && crate::test_reexec::suite_passed_exactly_one(&out.stdout).is_ok(),
+        crate::test_reexec::suite_passed_exactly_one(&out).is_ok(),
         "{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
         out.status,
         String::from_utf8_lossy(&out.stderr)

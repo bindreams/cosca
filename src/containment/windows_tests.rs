@@ -429,7 +429,7 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
         "job-breakaway probe fixture failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status,
     );
-    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output.stdout) {
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output) {
         panic!(
             "fixture exited 0 but did not run and pass exactly one test: {why}\n--- stdout ---\n{stdout}\n\
              --- stderr ---\n{stderr}"

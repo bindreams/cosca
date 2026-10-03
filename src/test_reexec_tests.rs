@@ -1,8 +1,6 @@
 use crate::test_child::fixture_path;
 use crate::test_harness::REEXEC_SELFCHECK;
-use crate::test_reexec::{
-    command, suite_outcome, suite_passed_exactly_one, SuiteOutcome, JSON_FORMAT, NOCAPTURE, SCRUBBED_ENV,
-};
+use crate::test_reexec::{command, suite_outcome, suite_passed_exactly_one, SuiteOutcome, JSON_FORMAT, NOCAPTURE};
 
 // Real child runs =====
 
@@ -22,14 +20,23 @@ fn run_json(test: &str, labels: Option<&str>) -> std::process::Output {
 #[skuld::test]
 fn fixture_a_trivial_passing_test() {}
 
-fn one_test_run() -> Vec<u8> {
-    run_json(fixture_path!(fixture_a_trivial_passing_test), None).stdout
+fn one_test_run() -> std::process::Output {
+    run_json(fixture_path!(fixture_a_trivial_passing_test), None)
+}
+
+/// `output` with its stdout replaced.
+fn with_stdout(output: &std::process::Output, stdout: &str) -> std::process::Output {
+    std::process::Output {
+        status: output.status,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
 }
 
 #[skuld::test]
 fn suite_outcome_reads_a_real_zero_test_run() {
-    let stdout = run_json("__cosca_no_such_test__", None).stdout;
-    let outcome = suite_outcome(&stdout).expect("a zero-test run still reports its suite");
+    let run = run_json("__cosca_no_such_test__", None);
+    let outcome = suite_outcome(&run.stdout).expect("a zero-test run still reports its suite");
     assert_eq!(
         outcome,
         SuiteOutcome {
@@ -39,14 +46,14 @@ fn suite_outcome_reads_a_real_zero_test_run() {
             ignored: 0
         }
     );
-    assert!(suite_passed_exactly_one(&stdout).is_err());
+    assert!(suite_passed_exactly_one(&run).is_err());
 }
 
 #[skuld::test]
 fn suite_outcome_reads_a_real_one_test_run() {
-    let stdout = one_test_run();
+    let run = one_test_run();
     assert_eq!(
-        suite_outcome(&stdout).expect("a real run"),
+        suite_outcome(&run.stdout).expect("a real run"),
         SuiteOutcome {
             test_count: 1,
             passed: 1,
@@ -54,23 +61,24 @@ fn suite_outcome_reads_a_real_one_test_run() {
             ignored: 0
         }
     );
-    suite_passed_exactly_one(&stdout).expect("exactly one test passed");
+    suite_passed_exactly_one(&run).expect("exactly one test passed");
 }
 
 #[skuld::test]
 fn suite_outcome_rejects_missing_or_repeated_terminal_events() {
-    let real = String::from_utf8(one_test_run()).expect("utf-8 output");
+    let run = one_test_run();
+    let real = String::from_utf8(run.stdout.clone()).expect("utf-8 output");
     let (without_terminal, _) = real
         .rsplit_once(r#"{ "type": "suite", "event": "ok""#)
         .expect("the real run ends in a terminal suite event");
     let err = suite_outcome(without_terminal.as_bytes()).expect_err("a truncated capture");
     assert!(err.contains("terminal"), "{err}");
-    assert!(suite_passed_exactly_one(without_terminal.as_bytes()).is_err());
+    assert!(suite_passed_exactly_one(&with_stdout(&run, without_terminal)).is_err());
 
     let doubled = real.repeat(2);
     let err = suite_outcome(doubled.as_bytes()).expect_err("a doubled capture");
     assert!(err.contains("started"), "{err}");
-    assert!(suite_passed_exactly_one(doubled.as_bytes()).is_err());
+    assert!(suite_passed_exactly_one(&with_stdout(&run, &doubled)).is_err());
 
     let err = suite_outcome(b"").expect_err("no output at all");
     assert!(err.contains("started"), "{err}");
@@ -95,7 +103,23 @@ fn suite_outcome_reads_a_failed_run_and_skips_other_lines() {
             ignored: 0
         }
     );
-    assert!(suite_passed_exactly_one(stdout.as_bytes()).is_err());
+    assert!(suite_passed_exactly_one(&with_stdout(&one_test_run(), stdout)).is_err());
+}
+
+/// Skuld can fail the process after printing its `ok` event.
+#[skuld::test]
+fn a_failing_exit_status_fails_a_run_whose_events_say_ok() {
+    // A real failing status, from a child that is not this binary.
+    let failing = crate::test_spawn::output_captured(&mut {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.arg("--no-such-flag");
+        cmd
+    })
+    .expect("run with a bad flag");
+    assert!(!failing.status.success());
+    let ok_events = with_stdout(&failing, std::str::from_utf8(&one_test_run().stdout).expect("utf-8"));
+    let err = suite_passed_exactly_one(&ok_events).expect_err("a failing status");
+    assert!(err.contains("exited"), "{err}");
 }
 
 // The scrub =====
@@ -103,7 +127,7 @@ fn suite_outcome_reads_a_failed_run_and_skips_other_lines() {
 #[skuld::test]
 fn reexec_command_scrubs_skuld_env() {
     let cmd = command("x");
-    for var in SCRUBBED_ENV {
+    for var in ["SKULD_LABELS", "SKULD_NEXTEST_METADATA_PATH"] {
         assert!(
             cmd.get_envs().any(|(k, v)| k == var && v.is_none()),
             "{var} is not removed"
@@ -116,7 +140,7 @@ fn reexec_command_scrubs_skuld_env() {
 #[skuld::test(labels = [REEXEC_SELFCHECK])]
 fn fixture_labelled_driver_reexecs_an_unlabelled_fixture() {
     let out = run_json(fixture_path!(fixture_a_trivial_passing_test), None);
-    suite_passed_exactly_one(&out.stdout).unwrap_or_else(|e| {
+    suite_passed_exactly_one(&out).unwrap_or_else(|e| {
         panic!(
             "the unlabelled fixture did not run: {e}\n--- stdout ---\n{}",
             String::from_utf8_lossy(&out.stdout)
@@ -136,5 +160,5 @@ fn a_labelled_reexec_still_runs_its_fixture() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    suite_passed_exactly_one(&out.stdout).expect("the driver itself ran and passed");
+    suite_passed_exactly_one(&out).expect("the driver itself ran and passed");
 }

@@ -862,7 +862,7 @@ pub(crate) fn assert_fixture_passed(fixture: &str, output: &std::process::Output
         "fixture {fixture} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status,
     );
-    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output.stdout) {
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(output) {
         panic!(
             "fixture {fixture} exited 0 but did not run and pass exactly one test: {why}\n--- stdout \
              ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -919,7 +919,7 @@ pub(crate) fn run_fixture_case(fixture: &str, marker_env: &str, case_env: &str, 
         "fixture {fixture} case {case:?} failed (status {:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         output.status,
     );
-    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output.stdout) {
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&output) {
         panic!(
             "fixture {fixture} case {case:?} did not run and pass exactly one test: {why}\n--- stdout \
              ---\n{stdout}\n--- stderr ---\n{stderr}"
