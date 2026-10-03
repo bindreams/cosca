@@ -14,6 +14,10 @@ public static class P {
   [DllImport("kernel32.dll", SetLastError = true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
   [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint code);
   [DllImport("kernel32.dll", SetLastError = true)] public static extern int GetProcessId(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr h, uint acc, out IntPtr tok);
+  [DllImport("advapi32.dll", SetLastError = true)] public static extern bool GetTokenInformation(IntPtr t, int cls, out int v, int len, out int ret);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr CreateJobObjectW(IntPtr a, IntPtr n);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
   public static string Run(string file, string args) {
     var i = new SEI(); i.cbSize = Marshal.SizeOf(typeof(SEI)); i.fMask = 0x40 | 0x100; // NOCLOSEPROCESS | NOASYNC
     i.lpVerb = "runas"; i.lpFile = file; i.lpParameters = args; i.nShow = 0;
@@ -22,6 +26,11 @@ public static class P {
     uint access = BitConverter.ToUInt32(b, 4);
     string s = String.Format("child pid {0}; NtQueryObject status 0x{1:X}; GrantedAccess 0x{2:X8} (TERMINATE bit 0x1: {3}, SYNCHRONIZE 0x100000: {4}, QUERY_LIMITED 0x1000: {5})",
       GetProcessId(i.hProcess), st, access, (access & 1) != 0, (access & 0x100000) != 0, (access & 0x1000) != 0);
+    IntPtr tok; int elev = -1, ret2;
+    if (OpenProcessToken(i.hProcess, 0x8, out tok)) { if (!GetTokenInformation(tok, 20, out elev, 4, out ret2)) elev = -2; }
+    s += "; child TokenElevation=" + (elev == -1 ? ("OpenProcessToken failed " + Marshal.GetLastWin32Error()) : elev.ToString());
+    IntPtr job = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero);
+    s += "; AssignProcessToJobObject -> " + (AssignProcessToJobObject(job, i.hProcess) ? "OK" : ("FAILED " + Marshal.GetLastWin32Error()));
     bool t = TerminateProcess(i.hProcess, 7); int e = Marshal.GetLastWin32Error();
     s += "; TerminateProcess -> " + (t ? "OK" : ("FAILED error " + e));
     uint w = WaitForSingleObject(i.hProcess, 30000); uint code; GetExitCodeProcess(i.hProcess, out code);
@@ -39,7 +48,7 @@ function Facts {
 $payload = "$env:SystemRoot\System32\waitfor.exe"
 $payloadArgs = "/t 60 kefNeverSignalled"  # blocks on a named signal nobody sends; /t is only the failure bound
 if ($Mode -eq "outer") {
-  "== outer (the job's own process)"; Facts
+  "== outer (the job's own process)"; Facts; "build: " + [Environment]::OSVersion.VersionString
   "== runas from the job's own process:"; [P]::Run($payload, $payloadArgs)
   # Elevate without a prompt, so a medium-IL caller's runas can complete unattended.
   Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" ConsentPromptBehaviorAdmin 0

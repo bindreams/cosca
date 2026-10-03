@@ -1,0 +1,13 @@
+name: tmp killable-elevation probe, windows (do not merge)
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: UAC handle rights
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File probe\win_probe.ps1 -Mode outer
