@@ -15,7 +15,7 @@ const PIDFILE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_PIDFILE";
 
 // The gated body =====
 
-/// `test_path!` names an `async` test as well as a sync one; the `tokio_io` tests need it.
+/// `test_path!` names an `async` test as well as a sync one.
 #[skuld::test]
 async fn test_path_names_an_async_test() {
     assert!(

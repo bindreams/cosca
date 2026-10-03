@@ -276,10 +276,9 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);
     let _ = child.wait().await.expect("reap after cancelled graceful");
-    // End-to-end release proof rides on test teardown: the test runtime's drop JOINS
-    // blocking tasks, so if the dropped guard's cancel event failed to release the
-    // Duration::MAX watcher, this test would hang at shutdown, and a nextest override ends
-    // it as a failure.
+    // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
+    // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
+    // the nextest override).
 }
 
 #[cfg(feature = "tokio")]

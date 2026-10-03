@@ -13,10 +13,9 @@ fn testbin() -> &'static str {
 ///
 /// Without a logger installed, `log` drops every record on the floor — so a containment
 /// degrade explains itself into nothing and a failing `assert_eq!(…, CgroupV2)` is as
-/// undiagnosable from CI output as it was before the reason existed. nextest captures a
-/// failing test's stderr and prints it with the failure (skuld itself captures nothing under
-/// nextest, which always passes `--nocapture`), so with this installed the reason lands
-/// directly above the assertion.
+/// undiagnosable from CI output as it was before the reason existed. nextest prints a failing
+/// test's stderr with the failure, so with this installed the reason lands directly above the
+/// assertion.
 ///
 /// Unix-gated, not Linux-gated: BOTH Unix containment mechanisms that can degrade explain
 /// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker

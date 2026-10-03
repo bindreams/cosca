@@ -491,7 +491,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 
-      # The namespaces group has its own step below. `spawn_io` and `tokio_io` run under skuld, so `SKULD_LABELS` applies to them; they have no namespace tests.
+      # The namespaces group has its own step below; `spawn_io` and `tokio_io` have no namespace tests.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
@@ -512,7 +512,7 @@ jobs:
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 
       # The namespaces group (`COSCA_TEST_NAMESPACES`, off workflow-wide), selected by its label.
-      # `-E binary(cosca)`: the only binary with namespace tests; a libtest binary (`test_enablement`) ignores `SKULD_LABELS` and would run whole.
+      # `-E binary(cosca)`: the only binary with namespace tests; libtest binaries ignore `SKULD_LABELS` and would run whole.
       - name: Run namespace tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8

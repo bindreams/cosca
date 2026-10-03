@@ -181,8 +181,7 @@ fn zombie_record(pid: cosca::identity::RawPid) -> libc::siginfo_t {
 /// original, which a separate compilation unit like this one cannot name, extended to also echo
 /// every record to stderr (in the same `[LEVEL] text` format `spawn_io.rs`'s `stderr_log` used to
 /// print through a logger of its own) so a failing `assert_eq!(…, CgroupV2)`'s degrade reason
-/// still reaches CI output — libtest captures a failing test's stderr and prints it with the
-/// failure.
+/// still reaches CI output — nextest prints a failing test's stderr with the failure.
 ///
 /// `log::set_logger` is once-per-process, so a second, competing logger in the same test binary
 /// would race this one and panic whichever call lost — a real failure under `cargo test`'s
