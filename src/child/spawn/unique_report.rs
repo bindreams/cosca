@@ -231,7 +231,7 @@ fn report(shared: &Shared, #[cfg(test)] forced_errno: i32) -> io::Result<()> {
         if n == REPORT_LEN as isize {
             // A refused read stops the child here, before `exec`: the program never runs.
             return match tag {
-                REPORT_ERRNO => Err(io::Error::from_raw_os_error(value as i32)),
+                REPORT_ERRNO => Ok(()), // MUTANT: hook execs anyway
                 _ => Ok(()),
             };
         }
