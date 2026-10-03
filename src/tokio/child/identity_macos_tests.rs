@@ -6,7 +6,7 @@ use std::rc::Rc;
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
-    arm_launchd_hold, has_not_exited, kill_and_reap, other_unique_id, reap_by_pid, record_pid, vanished,
+    arm_launchd_hold, end_unsignalled_and_reap, has_not_exited, other_unique_id, reap_by_pid, record_pid, vanished,
 };
 use crate::error::Error;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
@@ -129,7 +129,7 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
         has_not_exited(pid.get()),
         "the child must be left running, unsignalled and unreaped"
     );
-    kill_and_reap(pid.get());
+    end_unsignalled_and_reap(pid.get());
 }
 
 /// As the sync twin: no process at the first read is `Gone`, the child is left alone.
@@ -150,7 +150,7 @@ async fn macos_tokio_spawn_first_read_gone_is_gone_and_leaves_the_child() {
         has_not_exited(pid.get()),
         "nothing may have signalled or reaped the pid"
     );
-    kill_and_reap(pid.get());
+    end_unsignalled_and_reap(pid.get());
 }
 
 /// As the sync twin: a refused first read is `Unassessable`, the child is left running.
@@ -171,5 +171,5 @@ async fn macos_tokio_spawn_first_read_refused_is_unassessable_and_leaves_the_chi
         panic!("the refused arm must have captured the child's identity")
     };
     assert!(has_not_exited(id.pid()), "nothing may have signalled or reaped the pid");
-    kill_and_reap(id.pid());
+    end_unsignalled_and_reap(id.pid());
 }
