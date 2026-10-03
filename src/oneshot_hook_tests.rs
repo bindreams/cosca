@@ -12,7 +12,7 @@ fn counter() -> (Rc<Cell<u32>>, impl FnOnce() + 'static) {
     (count, move || seen.set(seen.get() + 1))
 }
 
-#[test]
+#[skuld::test]
 fn an_armed_hook_fires_once() {
     let (count, hook) = counter();
     let _guard = arm(&HOOK, hook);
@@ -21,12 +21,12 @@ fn an_armed_hook_fires_once() {
     assert_eq!(count.get(), 1);
 }
 
-#[test]
+#[skuld::test]
 fn firing_an_unarmed_slot_does_nothing() {
     fire(&HOOK);
 }
 
-#[test]
+#[skuld::test]
 fn an_unfired_hook_is_cleared_and_dropped_with_its_guard() {
     let (count, hook) = counter();
     drop(arm(&HOOK, hook));
@@ -36,7 +36,7 @@ fn an_unfired_hook_is_cleared_and_dropped_with_its_guard() {
 }
 
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "already armed")]
 fn arming_over_a_live_hook_is_refused() {
     let _first = arm(&HOOK, || {});
@@ -44,7 +44,7 @@ fn arming_over_a_live_hook_is_refused() {
 }
 
 /// The guard of a hook that already fired must leave a hook armed after it alone.
-#[test]
+#[skuld::test]
 fn a_guard_dropping_after_a_foreign_rearm_leaves_the_foreign_hook() {
     let first = arm(&HOOK, || {});
     fire(&HOOK);

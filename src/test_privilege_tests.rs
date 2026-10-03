@@ -7,7 +7,7 @@ mod bypasses_dac_tests {
 
     /// The precondition is a capability, not uid 0: a uid-1000 caller with an ambient
     /// `CAP_DAC_OVERRIDE` bypasses DAC, and a root caller stripped of both capabilities does not.
-    #[test]
+    #[skuld::test]
     fn either_dac_capability_counts_and_nothing_else_does() {
         assert!(bypasses_dac(CapabilitySet::DAC_OVERRIDE));
         assert!(bypasses_dac(CapabilitySet::DAC_READ_SEARCH));

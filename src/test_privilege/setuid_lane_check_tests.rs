@@ -67,7 +67,7 @@ fn assert_rejected(name: &str, out: &Output, reason: &str) {
     );
 }
 
-#[test]
+#[skuld::test]
 fn setuid_lane_check_accepts_a_helper_that_behaves_like_a_real_one() {
     for os in [LINUX, DARWIN] {
         let out = lane_check(os, "1000", &good(os));
@@ -80,7 +80,7 @@ fn setuid_lane_check_accepts_a_helper_that_behaves_like_a_real_one() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn setuid_lane_check_rejects_a_root_caller_before_reading_the_helper() {
     for os in [LINUX, DARWIN] {
         let out = lane_check(os, "0", &good(os));
@@ -88,7 +88,7 @@ fn setuid_lane_check_rejects_a_root_caller_before_reading_the_helper() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn setuid_lane_check_rejects_an_unsupported_os() {
     assert_rejected(
         "Plan9",
@@ -99,7 +99,7 @@ fn setuid_lane_check_rejects_an_unsupported_os() {
 
 /// A helper that does not reach uid 0 prints nothing, or the wrong thing, or exits wrongly: the
 /// check must fail for each, and say why.
-#[test]
+#[skuld::test]
 fn setuid_lane_check_rejects_a_linux_helper_that_does_not_reach_root() {
     let p = prelude(LINUX);
     for (name, tail, reason) in [
@@ -132,7 +132,7 @@ fn setuid_lane_check_rejects_a_linux_helper_that_does_not_reach_root() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn setuid_lane_check_rejects_a_macos_helper_that_does_not_reach_root() {
     let p = prelude(DARWIN);
     for (name, tail, reason) in [
@@ -147,7 +147,7 @@ fn setuid_lane_check_rejects_a_macos_helper_that_does_not_reach_root() {
 }
 
 /// The fakes above are only as strict as their prelude: it must exit 99 on any other invocation.
-#[test]
+#[skuld::test]
 fn setuid_lane_check_fake_rejects_any_other_invocation() {
     fn run(os: &str, args: &[&str], stdin: &str) -> Option<i32> {
         let dir = tempfile::tempdir().expect("tempdir");

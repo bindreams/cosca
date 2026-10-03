@@ -1,7 +1,7 @@
 use super::Process;
 use crate::identity::ProcessId;
 
-#[test]
+#[skuld::test]
 fn current_resolves_and_is_alive() {
     let me = Process::current();
     assert_eq!(me.is_alive(), crate::identity::Liveness::Alive);
@@ -14,7 +14,7 @@ fn current_resolves_and_is_alive() {
     assert_eq!(Process::from_pid(me.id().pid()), crate::identity::Resolved::Found(me));
 }
 
-#[test]
+#[skuld::test]
 fn a_recycled_pid_is_reported_by_exists_not_by_the_constructor() {
     // A live pid bearing a DIFFERENT start token is the recycle case: the pid resolves, but
     // its identity does not match the saved one. Built against our own (definitely-live) pid
@@ -31,14 +31,14 @@ fn a_recycled_pid_is_reported_by_exists_not_by_the_constructor() {
     assert_eq!(p.is_alive(), crate::identity::Liveness::Dead);
 }
 
-#[test]
+#[skuld::test]
 fn process_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Process>();
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn from_pid_is_unknown_for_an_access_denied_process() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
@@ -54,7 +54,7 @@ fn from_pid_is_unknown_for_an_access_denied_process() {
 /// `from_pid` - it additionally compares the resolved identity against the caller-s, and that
 /// comparison is where an Unknown-into-Gone collapse would hide.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_process_built_from_a_denied_identity_is_unknown_not_gone() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
@@ -79,7 +79,7 @@ fn a_process_built_from_a_denied_identity_is_unknown_not_gone() {
 
 /// An unassessable anchor is an error, not the empty answer a gone one gives.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
@@ -105,7 +105,7 @@ fn parent_and_children_of_an_unassessable_anchor_are_unassessable() {
 /// PARENT is access-denied. Built by having the restricted fixture itself be the parent - a
 /// DACL is not inherited, so `cmd.exe` is unopenable while the `ping` it spawns is not.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_ppid() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let parent = crate::identity::windows_fixture::spawn_restricted_shell(PROCESS_SYNCHRONIZE.0);
@@ -129,7 +129,7 @@ fn parent_of_a_process_whose_parent_is_access_denied_is_unassessable_naming_the_
 
 /// A gone or recycled anchor is a real "nothing": `Ok`, not an error. Mutant: "an error for a
 /// gone anchor".
-#[test]
+#[skuld::test]
 fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
     let real = ProcessId::current();
     let stale = ProcessId::from_parts_for_test(real.pid(), real.start_token_raw().wrapping_add(1));
@@ -145,7 +145,7 @@ fn parent_and_children_of_a_gone_anchor_are_ok_and_empty() {
 /// A live pid whose identity read is refused (`hidepid`, a sandbox) is not absent: `Unassessable`
 /// blaming access. Mutant: "an unqueryable anchor is `Ok(None)` / `Ok(vec![])`".
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let (child, id) = crate::test_child::live_exiting_member();
     let forced = crate::identity::force_unknown_identity(id.pid());
@@ -168,7 +168,7 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
 /// The parent being access-denied is `Unassessable` naming the ppid, not "no parent". Mutant: "an
 /// unknown ppid reads as no parent".
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
     let (child, id) = crate::test_child::live_exiting_member();
     let me = std::process::id();

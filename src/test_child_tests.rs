@@ -9,7 +9,7 @@ mod restore_mode_tests {
 
     /// `TempDir::drop` needs to list a directory to remove it, so a locked one would leak without
     /// the restore. This mirrors the declaration order callers rely on (`dir`, then `_restore`).
-    #[test]
+    #[skuld::test]
     fn a_locked_dir_is_removed_on_drop() {
         let path = {
             let dir = tempfile::tempdir().unwrap();
@@ -27,7 +27,7 @@ mod restore_mode_tests {
 /// takes a non-zero exit as proof of a kill relies on this: were it non-zero, a natural end would
 /// read as a kill.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_more_exits_zero_when_its_stdin_closes() {
     let mut cmd = crate::Command::new();
     cmd.args([super::windows_more()]);
@@ -45,7 +45,7 @@ fn windows_more_exits_zero_when_its_stdin_closes() {
 /// A signal handled while `watch_macos` is parked must retry the wait, not panic (see
 /// `kevent_eintr`), and the wait must still report the target's exit.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
     use super::kevent_eintr;
 
@@ -77,7 +77,7 @@ fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
 /// Windows `accept_or_signalled`: a connection that arrives while nothing has drained is accepted
 /// and acked, and its stream is returned.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_signalled_returns_the_acked_connection_while_nothing_has_drained() {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -99,7 +99,7 @@ fn death_watch_accept_or_signalled_returns_the_acked_connection_while_nothing_ha
 
 /// A drain and a queued connection both ready: the drain wins.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_queued() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let _queued = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
@@ -119,7 +119,7 @@ fn death_watch_accept_or_signalled_reports_the_drain_when_a_connection_is_also_q
 /// A watcher whose `wait_tree` panics signals the drain at once, with an error outcome. The
 /// signal is read with a zero-timeout wait, so a missing wake fails by assertion.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn death_watch_a_panicking_watcher_wakes_the_acceptor_with_an_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let drained = super::DrainSignal::new();

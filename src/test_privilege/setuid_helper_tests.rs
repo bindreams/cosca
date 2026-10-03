@@ -23,13 +23,13 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
         .expect("a string panic message")
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_accepts_a_setuid_root_file_and_an_unprivileged_caller() {
     let path = check_helper(Some("/h".into()), stat_of(SETUID_ROOT), 1000);
     assert_eq!(path, Path::new("/h"));
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_naming_the_variable_when_it_is_unset() {
     let msg = panic_message(|| {
         check_helper(None, stat_of(SETUID_ROOT), 1000);
@@ -37,7 +37,7 @@ fn setuid_check_helper_panics_naming_the_variable_when_it_is_unset() {
     assert!(msg.contains("COSCA_TEST_SETUID_HELPER is not set"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_when_the_file_is_unreadable() {
     let msg = panic_message(|| {
         check_helper(
@@ -49,7 +49,7 @@ fn setuid_check_helper_panics_when_the_file_is_unreadable() {
     assert!(msg.contains("/nope") && msg.contains("unreadable"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_when_the_path_is_not_a_regular_file() {
     let dir = Meta {
         is_file: false,
@@ -61,7 +61,7 @@ fn setuid_check_helper_panics_when_the_path_is_not_a_regular_file() {
     assert!(msg.contains("not a regular file"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_unless_owned_by_root() {
     let msg = panic_message(|| {
         let meta = Meta {
@@ -73,7 +73,7 @@ fn setuid_check_helper_panics_unless_owned_by_root() {
     assert!(msg.contains("owned by root") && msg.contains("owner uid 1000"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_without_the_set_user_id_bit() {
     let msg = panic_message(|| {
         let meta = Meta {
@@ -85,7 +85,7 @@ fn setuid_check_helper_panics_without_the_set_user_id_bit() {
     assert!(msg.contains("set-user-ID bit") && msg.contains("mode 755"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_panics_for_a_root_caller() {
     let msg = panic_message(|| {
         check_helper(Some("/h".into()), stat_of(SETUID_ROOT), 0);
@@ -93,7 +93,7 @@ fn setuid_check_helper_panics_for_a_root_caller() {
     assert!(msg.contains("the caller is root"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn setuid_check_helper_rejects_real_paths_that_are_not_a_setuid_root_file() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("plain");

@@ -12,28 +12,28 @@ fn argv(cmd: &Command) -> Vec<String> {
     }
 }
 
-#[test]
+#[skuld::test]
 fn new_is_empty() {
     let cmd = Command::new();
     assert!(matches!(cmd.input(), CommandInput::Empty));
     assert!(cmd.executable_path().is_none());
 }
 
-#[test]
+#[skuld::test]
 fn args_sets_and_extends_argv() {
     let mut cmd = Command::new();
     cmd.args(["git", "status"]).args(["--short"]);
     assert_eq!(argv(&cmd), ["git", "status", "--short"]);
 }
 
-#[test]
+#[skuld::test]
 fn arg_appends_one() {
     let mut cmd = Command::new();
     cmd.arg("echo").arg("hi");
     assert_eq!(argv(&cmd), ["echo", "hi"]);
 }
 
-#[test]
+#[skuld::test]
 fn commandline_sets_string_source() {
     let mut cmd = Command::new();
     cmd.commandline(r#"git "status""#);
@@ -43,21 +43,21 @@ fn commandline_sets_string_source() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn commandline_then_args_switches_source_and_discards() {
     let mut cmd = Command::new();
     cmd.commandline("ignored string").args(["real", "argv"]);
     assert_eq!(argv(&cmd), ["real", "argv"]);
 }
 
-#[test]
+#[skuld::test]
 fn args_then_commandline_switches_to_string() {
     let mut cmd = Command::new();
     cmd.args(["a", "b"]).commandline("c d");
     assert!(matches!(cmd.input(), CommandInput::CommandLine(_)));
 }
 
-#[test]
+#[skuld::test]
 fn executable_overrides_load_path_independently_of_argv() {
     let mut cmd = Command::new();
     cmd.executable("/bin/busybox").args(["sh", "-c", "echo hi"]);
@@ -65,7 +65,7 @@ fn executable_overrides_load_path_independently_of_argv() {
     assert_eq!(argv(&cmd), ["sh", "-c", "echo hi"]);
 }
 
-#[test]
+#[skuld::test]
 fn stdout_shorthand_records_resolved_pipe_out() {
     let mut cmd = Command::new();
     cmd.args(["x"]);
@@ -77,7 +77,7 @@ fn stdout_shorthand_records_resolved_pipe_out() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn stdin_pipe_infers_in() {
     let mut cmd = Command::new();
     cmd.stdin(Stdio::pipe()).unwrap();
@@ -87,13 +87,13 @@ fn stdin_pipe_infers_in() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn bare_pipe_on_fd3_errs_at_attach() {
     let mut cmd = Command::new();
     assert!(cmd.fd(3, Stdio::pipe()).is_err());
 }
 
-#[test]
+#[skuld::test]
 fn explicit_pipe_out_on_fd3_attaches() {
     let mut cmd = Command::new();
     cmd.fd(3, Stdio::pipe_out()).unwrap();
@@ -107,7 +107,7 @@ fn explicit_pipe_out_on_fd3_attaches() {
 /// silently accepted (and later dropped or aborted downstream), and not left to a debug-only
 /// `debug_assert!` inside `Fd`'s `From<i32>` (which would panic here rather than return `Err`,
 /// and would do nothing at all in release).
-#[test]
+#[skuld::test]
 fn fd_rejects_negative_slot_with_invalid_input() {
     let mut cmd = Command::new();
     let err = cmd.fd(-1, Stdio::null()).expect_err("a negative fd must be rejected");
@@ -121,7 +121,7 @@ fn fd_rejects_negative_slot_with_invalid_input() {
 
 /// `i32::MIN` is the sharpest edge for the non-negativity check: `.abs()` or a naive negation
 /// would overflow on it. Also must be an explicit `Err`, not a panic.
-#[test]
+#[skuld::test]
 fn fd_rejects_i32_min_slot_with_invalid_input() {
     let mut cmd = Command::new();
     let err = cmd.fd(i32::MIN, Stdio::null()).expect_err("i32::MIN must be rejected");
@@ -131,7 +131,7 @@ fn fd_rejects_i32_min_slot_with_invalid_input() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn kill_on_drop_defaults_true_and_toggles() {
     let mut cmd = Command::new();
     assert!(cmd.kill_on_drop_flag());
@@ -139,7 +139,7 @@ fn kill_on_drop_defaults_true_and_toggles() {
     assert!(!cmd.kill_on_drop_flag());
 }
 
-#[test]
+#[skuld::test]
 fn fd_last_set_wins_for_same_slot() {
     let mut cmd = Command::new();
     cmd.stdout(Stdio::pipe()).unwrap();
@@ -147,21 +147,21 @@ fn fd_last_set_wins_for_same_slot() {
     assert!(matches!(cmd.fds().get(&Fd::STDOUT), Some(ResolvedStdio::Null)));
 }
 
-#[test]
+#[skuld::test]
 fn inherit_resolves_through_builder() {
     let mut cmd = Command::new();
     cmd.stderr(Stdio::inherit()).unwrap();
     assert!(matches!(cmd.fds().get(&Fd::STDERR), Some(ResolvedStdio::Inherit)));
 }
 
-#[test]
+#[skuld::test]
 fn null_resolves_through_builder() {
     let mut cmd = Command::new();
     cmd.stdin(Stdio::null()).unwrap();
     assert!(matches!(cmd.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
 }
 
-#[test]
+#[skuld::test]
 fn merge_resolves_through_builder() {
     let mut cmd = Command::new();
     cmd.stderr(Stdio::merge(Fd::STDOUT)).unwrap();
@@ -171,7 +171,7 @@ fn merge_resolves_through_builder() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn env_ops_recorded_in_order() {
     use crate::command::EnvOp;
     let mut cmd = Command::new();
@@ -188,21 +188,21 @@ fn env_ops_recorded_in_order() {
     assert_eq!(ops.len(), 5);
 }
 
-#[test]
+#[skuld::test]
 fn envs_empty_iterator_records_nothing() {
     let mut cmd = Command::new();
     cmd.envs::<_, &str, &str>([]);
     assert!(cmd.env_ops().is_empty());
 }
 
-#[test]
+#[skuld::test]
 fn cwd_recorded() {
     let mut cmd = Command::new();
     cmd.current_dir("/tmp");
     assert_eq!(cmd.cwd(), Some(Path::new("/tmp")));
 }
 
-#[test]
+#[skuld::test]
 fn contain_records_strongest_request() {
     let mut cmd = Command::new();
     cmd.contain();
@@ -211,12 +211,12 @@ fn contain_records_strongest_request() {
     assert_eq!(req.nesting, Nesting::Mark);
 }
 
-#[test]
+#[skuld::test]
 fn uncontained_by_default() {
     assert_eq!(Command::new().contain_request().mode, None);
 }
 
-#[test]
+#[skuld::test]
 fn contain_with_and_nesting_recorded() {
     let mut cmd = Command::new();
     cmd.contain_with(ContainMode::TreeWalk).nesting(Nesting::Opaque);
@@ -225,7 +225,7 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
-#[test]
+#[skuld::test]
 fn elevate_enables_with_defaults() {
     let mut c = Command::new();
     c.args(["id", "-u"]).elevate();
@@ -235,7 +235,7 @@ fn elevate_enables_with_defaults() {
     assert!(matches!(req.auth, crate::elevation::Auth::Interactive));
 }
 
-#[test]
+#[skuld::test]
 fn elevation_overrides_apply_and_enable() {
     let mut c = Command::new();
     c.arg("id")
@@ -247,7 +247,7 @@ fn elevation_overrides_apply_and_enable() {
     assert!(matches!(req.auth, crate::elevation::Auth::NonInteractive));
 }
 
-#[test]
+#[skuld::test]
 fn command_without_elevate_is_disabled() {
     let c = Command::new();
     assert!(!c.elevation_request().enabled);
@@ -258,7 +258,7 @@ fn command_without_elevate_is_disabled() {
 // that internal default must not trip the same "caller-configured stdin" rejection a real
 // user-supplied stdin would — that would make Auth::Stdin unusable via any of the three
 // convenience methods, a regression this pins at the builder level (no live spawn needed).
-#[test]
+#[skuld::test]
 fn default_stdin_is_not_forced_when_auth_stdin_reserves_fd0() {
     let mut c = Command::new();
     c.args(["id"])
@@ -270,7 +270,7 @@ fn default_stdin_is_not_forced_when_auth_stdin_reserves_fd0() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn default_stdin_is_forced_without_auth_stdin() {
     let mut c = Command::new();
     c.args(["id"]);
@@ -278,7 +278,7 @@ fn default_stdin_is_forced_without_auth_stdin() {
     assert!(matches!(c.fds().get(&Fd::STDIN), Some(ResolvedStdio::Null)));
 }
 
-#[test]
+#[skuld::test]
 fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
     let mut derived = crate::Command::new();
     assert!(!derived.fd_marker_suppressed(), "a fresh command suppresses nothing");
@@ -290,7 +290,7 @@ fn suppress_fd_marker_sets_the_flag_a_fresh_command_does_not_have() {
 
 /// `no_window()` is the one portable flag intent: it records the same request on every platform,
 /// and only the lowering differs (a creation flag / a show-command / nothing at all).
-#[test]
+#[skuld::test]
 fn no_window_is_recorded_on_every_platform() {
     let mut cmd = Command::new();
     assert!(!cmd.flags_request().no_window, "the default requests nothing");
@@ -299,7 +299,7 @@ fn no_window_is_recorded_on_every_platform() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn detached_and_raw_flags_are_recorded() {
     let mut cmd = Command::new();
     let before = *cmd.flags_request();
@@ -316,7 +316,7 @@ fn detached_and_raw_flags_are_recorded() {
 /// hatch must never do — so `creation_flags(0)` is the documented way to clear a word set
 /// earlier, and this test would fail under an or-in implementation at both later calls.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
     let mut cmd = Command::new();
     cmd.creation_flags(0x0000_0040);
@@ -336,7 +336,7 @@ fn repeated_creation_flags_calls_replace_rather_than_accumulate() {
 /// The two setters differ only in whether the path is later resolved, so the discriminant IS the
 /// feature: with one field and no variant, nothing downstream can tell "find this for me" from
 /// "load exactly this", and both contracts cannot coexist.
-#[test]
+#[skuld::test]
 fn executable_records_search_and_raw_executable_records_exact() {
     let mut a = Command::new();
     a.executable("helper");
@@ -350,7 +350,7 @@ fn executable_records_search_and_raw_executable_records_exact() {
 /// One field, two setters: they are alternatives rather than additive, and the LAST call wins
 /// whichever order they arrive in. A caller switching from one to the other must not end up
 /// carrying both intents.
-#[test]
+#[skuld::test]
 fn last_executable_setter_wins_in_either_order() {
     let mut a = Command::new();
     a.executable("search-me").raw_executable("exact-me");
@@ -365,7 +365,7 @@ fn last_executable_setter_wins_in_either_order() {
 /// guards, backend routing, the argv and command-line builders) want only the path and don't care
 /// which setter produced it. Keeping this getter working means only the sites that actually
 /// resolve need to special-case `Exact`.
-#[test]
+#[skuld::test]
 fn executable_path_is_variant_agnostic() {
     let mut a = Command::new();
     a.executable("/bin/busybox");

@@ -250,17 +250,17 @@ mod write_to_possibly_dead_stdin_tests {
         }
     }
 
-    #[test]
+    #[skuld::test]
     fn a_dead_reader_is_expected() {
         write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::BrokenPipe), b"x");
     }
 
-    #[test]
+    #[skuld::test]
     fn a_live_reader_is_expected() {
         write_to_possibly_dead_stdin(&mut Vec::new(), b"x");
     }
 
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "other than a dead reader")]
     fn any_other_error_panics() {
         write_to_possibly_dead_stdin(&mut FailsWith(std::io::ErrorKind::PermissionDenied), b"x");
@@ -1166,7 +1166,7 @@ pub(crate) const FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV: &str = "COSCA_FIXTURE_S
 /// open. Mirrors [`spawn_a_process_that_exits`]'s
 /// filtered-re-exec idiom (see its own doc for why the filter is mandatory) put to a second use.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn fixture_survives_group_signal() {
     let Some(addr) = std::env::var_os(FIXTURE_SURVIVES_GROUP_SIGNAL_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -1228,7 +1228,7 @@ pub(crate) fn registration_rendezvous() -> (std::net::TcpListener, String) {
 /// It installs no console-control handler, so `CTRL_BREAK`'s default disposition terminates it.
 /// Blocking on the socket rather than parking means a panicking or aborted caller closes the
 /// socket and the fixture exits on EOF instead of orphaning.
-#[test]
+#[skuld::test]
 fn fixture_registers_then_blocks() {
     let Some(addr) = std::env::var_os(FIXTURE_REGISTERS_THEN_BLOCKS_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -1250,7 +1250,7 @@ const FIXTURE_CONNECTS_AND_EXITS_ADDR_ENV: &str = "COSCA_FIXTURE_CONNECTS_AND_EX
 
 /// A child that connects, tags, and exits 0 immediately, with no blocking read. Whether it waits
 /// for the accept ack after connecting is up to its environment ([`ack::ACK_ENV`]).
-#[test]
+#[skuld::test]
 fn fixture_connects_and_exits() {
     let Some(addr) = std::env::var_os(FIXTURE_CONNECTS_AND_EXITS_ADDR_ENV) else {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -1303,7 +1303,7 @@ fn wait_unreaped(pid: u32) {
 /// A fixture that connects and exits without waiting for the ack (not opted in) is dead whether
 /// or not its connection reached the accept queue: the exit alone decides. The target has exited,
 /// unreaped, before `accept_or_die` starts.
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
     let (mut child, target) = spawn_connects_and_exits(&listener, false);
@@ -1328,7 +1328,7 @@ fn death_watch_accept_or_die_reports_a_target_that_connected_and_exited_without_
 
 /// The ack protects an opted-in fixture that connects, tags and exits at once: it cannot exit
 /// before `accept_or_die` accepted and acked, so the connection is always returned.
-#[test]
+#[skuld::test]
 fn death_watch_accept_or_die_returns_the_connection_of_an_acked_target_that_exits_at_once() {
     use std::io::Read;
 

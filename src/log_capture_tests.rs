@@ -3,7 +3,7 @@
 
 /// `levels_since` reports each matching record's own level, in emission order — the fact a
 /// "this must not be narrated at `warn`" assertion rests on.
-#[test]
+#[skuld::test]
 fn levels_since_reports_each_matching_records_level() {
     super::install();
     let mark = super::mark();
@@ -17,7 +17,7 @@ fn levels_since_reports_each_matching_records_level() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn pre_mark_records_never_satisfy_a_post_mark_scan() {
     super::install();
     log::warn!("log_capture stale-probe 5f21");
@@ -36,7 +36,7 @@ fn pre_mark_records_never_satisfy_a_post_mark_scan() {
 /// A record with the same text emitted by ANOTHER thread after the mark is invisible to the
 /// current-thread scan; this thread's own record is found. The other thread is joined before the
 /// scan, so the order is fixed by the join, not by timing.
-#[test]
+#[skuld::test]
 fn current_thread_scan_ignores_identical_records_from_other_threads() {
     super::install();
     let mark = super::mark();

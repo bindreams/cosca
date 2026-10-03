@@ -28,7 +28,7 @@ mod linux {
     }
 
     /// Mutant: a missing pidfd is an error, or a signal sent by pid.
-    #[test]
+    #[skuld::test]
     fn no_pidfd_is_gone_and_sends_nothing() {
         let log = Capture::start();
         assert_eq!(via_pidfd(None, 4242, Sig::Kill).expect("gone is Ok"), Sent::Gone);
@@ -36,7 +36,7 @@ mod linux {
     }
 
     /// Mutant: the send is not recorded, or recorded under another address.
-    #[test]
+    #[skuld::test]
     fn a_live_child_is_signalled_through_its_pidfd_and_recorded() {
         let (mut child, _stdin) = spawn();
         let pidfd = pidfd_of(&child);
@@ -54,7 +54,7 @@ mod linux {
     }
 
     /// Mutant: `ESRCH` returned as an error.
-    #[test]
+    #[skuld::test]
     fn a_reaped_child_is_gone_but_the_attempt_is_recorded() {
         let (mut child, stdin) = spawn();
         let pidfd = pidfd_of(&child);
@@ -92,7 +92,7 @@ mod macos {
     // `uniq_info` -----
 
     /// Mutant: `PROC_PIDTBSDINFO`, whose start read is refused for another user's process.
-    #[test]
+    #[skuld::test]
     fn uniq_info_reads_another_users_process() {
         // launchd runs as root. On a runner that is not root this is another user's process.
         let a = unique_id_of(1);
@@ -100,7 +100,7 @@ mod macos {
     }
 
     /// Mutant: `arg = 0`, which does not look for zombies.
-    #[test]
+    #[skuld::test]
     fn uniq_info_reads_a_zombie() {
         let (mut child, stdin) = spawn();
         let live = unique_id_of(child.id());
@@ -121,7 +121,7 @@ mod macos {
     }
 
     /// Mutant: `ESRCH` classified as refused.
-    #[test]
+    #[skuld::test]
     fn uniq_info_says_gone_for_a_pid_that_names_nothing() {
         assert_eq!(uniq_info(NEVER_A_PID, ReadPurpose::Adopt), UniqRead::Gone);
     }
@@ -131,7 +131,7 @@ mod macos {
     /// The adoption error names the pid and keeps the errno's kind.
     ///
     /// Mutant: the errno is dropped from the source, or the error is not `Unassessable`.
-    #[test]
+    #[skuld::test]
     fn identity_unreadable_names_the_pid_and_keeps_the_errno() {
         let err = crate::signal::identity_unreadable(77, libc::EPERM);
         match err {
@@ -149,7 +149,7 @@ mod macos {
     // `via_verified_pid` -----
 
     /// Mutant: the id is not compared, so a reused pid is signalled.
-    #[test]
+    #[skuld::test]
     fn a_pid_with_another_unique_id_is_gone_and_sends_nothing() {
         let (mut child, stdin) = spawn();
         let other = Some(unique_id_of(child.id()) ^ 1);
@@ -165,7 +165,7 @@ mod macos {
     }
 
     /// Mutant: a process that was gone at adoption is signalled anyway.
-    #[test]
+    #[skuld::test]
     fn a_child_gone_at_adoption_is_gone_and_sends_nothing() {
         let log = Capture::start();
         assert_eq!(
@@ -179,7 +179,7 @@ mod macos {
     /// `Unkillable`; nothing is sent.
     ///
     /// Mutant: `Refused` taken for a match, or turned into `ErrorKind::Other`.
-    #[test]
+    #[skuld::test]
     fn a_refused_identity_reread_keeps_its_errno_and_sends_nothing() {
         let (mut child, stdin) = spawn();
         let known = Some(unique_id_of(child.id()));
@@ -195,7 +195,7 @@ mod macos {
     }
 
     /// Mutant: `ESRCH` returned as an error.
-    #[test]
+    #[skuld::test]
     fn a_pid_that_vanishes_after_the_check_is_gone_and_the_attempt_is_recorded() {
         let log = Capture::start();
         let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Found(UniqInfo { unique_id: 7 }));
@@ -207,7 +207,7 @@ mod macos {
     }
 
     /// Mutant: the send is not recorded, or nothing is sent.
-    #[test]
+    #[skuld::test]
     fn a_verified_live_child_is_signalled_and_recorded() {
         let (mut child, _stdin) = spawn();
         let identity = read_identity(child.id()).expect("readable");

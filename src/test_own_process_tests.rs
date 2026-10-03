@@ -15,7 +15,7 @@ const PIDFILE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_PIDFILE";
 
 // The gated body =====
 
-#[test]
+#[skuld::test]
 fn the_body_runs_only_in_the_re_executed_process() {
     let Some(_done) = own_process(test_path!(the_body_runs_only_in_the_re_executed_process), spawn) else {
         return;
@@ -27,7 +27,7 @@ fn the_body_runs_only_in_the_re_executed_process() {
 }
 
 /// Fixture driven by `MODE` and `PIDFILE`; the tests below run it via `run` or a subprocess.
-#[test]
+#[skuld::test]
 fn fixture_records_its_pid_and_misbehaves_on_request() {
     let Some(_done) = own_process(test_path!(fixture_records_its_pid_and_misbehaves_on_request), spawn) else {
         return;
@@ -78,12 +78,12 @@ fn child_inherits(fd: RawFd) -> bool {
 
 // The run reports the body =====
 
-#[test]
+#[skuld::test]
 fn a_returning_body_passes_the_run() {
     run(FIXTURE, &[], spawn).expect("a body that returns normally passes");
 }
 
-#[test]
+#[skuld::test]
 fn a_failing_body_fails_the_run() {
     let failure = run(FIXTURE, &[(MODE, "panic")], spawn).expect_err("a body that panics must fail the run");
     assert!(matches!(failure.kind, FailureKind::Exited(_)), "got {:?}", failure.kind);
@@ -93,13 +93,13 @@ fn a_failing_body_fails_the_run() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_body_that_exits_zero_mid_way_fails_the_run() {
     let failure = run(FIXTURE, &[(MODE, "exit")], spawn).expect_err("exit(0) mid-body must not count as a pass");
     assert!(matches!(failure.kind, FailureKind::DidNotReturn), "got {failure}");
 }
 
-#[test]
+#[skuld::test]
 fn a_body_that_reports_completion_then_exits_non_zero_fails_the_run() {
     let failure = run(FIXTURE, &[(MODE, "exit-after-done")], spawn).expect_err("a non-zero exit is not a pass");
     assert!(matches!(failure.kind, FailureKind::Exited(_)), "got {failure}");
@@ -107,12 +107,12 @@ fn a_body_that_reports_completion_then_exits_non_zero_fails_the_run() {
 
 /// A child the body spawns must not hold the token pipe's write end: it would outlive the body
 /// with a copy of the parent's token.
-#[test]
+#[skuld::test]
 fn the_bodys_children_do_not_inherit_the_token_fd() {
     run(FIXTURE, &[(MODE, "spawn-child")], spawn).expect("the body's child must not hold the token fd");
 }
 
-#[test]
+#[skuld::test]
 fn a_filter_that_matches_no_test_fails_the_run() {
     let failure = run("test_own_process_tests::no_such_test", &[], spawn).expect_err("nothing ran, so nothing passed");
     assert!(matches!(failure.kind, FailureKind::NeverStarted), "got {failure}");
@@ -150,7 +150,7 @@ fn nonblocking_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     (read, write)
 }
 
-#[test]
+#[skuld::test]
 fn drain_returns_what_an_exited_writer_left_while_a_bystander_holds_the_write_end() {
     let (mut read, mut write) = nonblocking_pipe();
     let bystander = Bystander::holding(write.try_clone().expect("dup the write end"));
@@ -160,7 +160,7 @@ fn drain_returns_what_an_exited_writer_left_while_a_bystander_holds_the_write_en
     drop(bystander);
 }
 
-#[test]
+#[skuld::test]
 fn drain_returns_what_is_left_at_end_of_file() {
     let (mut read, mut write) = nonblocking_pipe();
     write.write_all(b"abc").expect("write");
@@ -169,7 +169,7 @@ fn drain_returns_what_is_left_at_end_of_file() {
 }
 
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "nonblocking")]
 fn drain_refuses_a_blocking_pipe() {
     let (mut read, write) = std::io::pipe().expect("pipe");
@@ -194,12 +194,12 @@ fn genuine_args() -> Vec<OsString> {
     child_args(TEST).iter().map(OsString::from).collect()
 }
 
-#[test]
+#[skuld::test]
 fn role_without_the_variable_is_parent() {
     assert_eq!(role(None, 42, &genuine_args(), TEST), Role::Parent);
 }
 
-#[test]
+#[skuld::test]
 fn role_accepts_the_parents_pid_the_test_and_the_exact_argv() {
     assert_eq!(
         role(Some(&value(42, 7, TEST)), 42, &genuine_args(), TEST),
@@ -207,12 +207,12 @@ fn role_accepts_the_parents_pid_the_test_and_the_exact_argv() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn role_rejects_a_value_set_by_another_process() {
     assert_eq!(role(Some(&value(41, 7, TEST)), 42, &genuine_args(), TEST), Role::Parent);
 }
 
-#[test]
+#[skuld::test]
 fn role_rejects_a_value_naming_another_test() {
     assert_eq!(
         role(Some(&value(42, 7, "m::other")), 42, &genuine_args(), TEST),
@@ -220,7 +220,7 @@ fn role_rejects_a_value_naming_another_test() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
     let shared: &[&[&str]] = &[
         &[],
@@ -243,7 +243,7 @@ fn role_rejects_every_argv_that_is_not_exactly_the_single_test_shape() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn role_rejects_malformed_values() {
     for bad in [
         "",
@@ -261,7 +261,7 @@ fn role_rejects_malformed_values() {
 
 /// A process with a forged `ENV` (right test, and where possible right parent) but not the exact
 /// argv must not run the body itself.
-#[test]
+#[skuld::test]
 fn a_forged_environment_never_runs_the_body_in_a_shared_process() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pidfile = dir.path().join("pid");
@@ -314,14 +314,14 @@ fn drained(mut read: std::io::PipeReader) -> Vec<u8> {
     got
 }
 
-#[test]
+#[skuld::test]
 fn a_completion_dropped_normally_reports() {
     let (read, done) = token_pipe();
     drop(done);
     assert!(!drained(read).is_empty());
 }
 
-#[test]
+#[skuld::test]
 fn a_completion_dropped_while_panicking_reports_nothing() {
     let (read, done) = token_pipe();
     std::panic::catch_unwind(move || {
@@ -334,7 +334,7 @@ fn a_completion_dropped_while_panicking_reports_nothing() {
 
 // A re-executed child that is not accepted panics instead of re-executing =====
 
-#[test]
+#[skuld::test]
 fn a_reexecution_is_named_by_this_test_and_the_real_parent() {
     assert!(is_reexecution(Some(&value(42, 7, TEST)), 42, TEST));
     assert!(!is_reexecution(None, 42, TEST));
@@ -346,7 +346,7 @@ fn a_reexecution_is_named_by_this_test_and_the_real_parent() {
 /// A process this one launched with a value that names it as parent and the fixture as the test,
 /// but without the exact argv, is a re-executed child that was not accepted: it must panic, not
 /// run the body and not re-execute.
-#[test]
+#[skuld::test]
 fn a_reexecuted_child_that_is_not_accepted_panics_instead_of_re_executing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pidfile = dir.path().join("pid");
@@ -367,7 +367,7 @@ fn a_reexecuted_child_that_is_not_accepted_panics_instead_of_re_executing() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn child_completion_in_an_ordinary_process_is_none_and_runs_nothing() {
     assert!(child_completion(test_path!(
         child_completion_in_an_ordinary_process_is_none_and_runs_nothing

@@ -20,7 +20,7 @@ fn identity(fd: RawFd) -> Option<impl Eq + std::fmt::Debug + Copy> {
     None
 }
 
-#[test]
+#[skuld::test]
 fn close_frees_the_fd_and_drop_puts_the_same_file_back() {
     let Some(done) = own_process(test_path!(close_frees_the_fd_and_drop_puts_the_same_file_back), spawn) else {
         return;
@@ -32,7 +32,7 @@ fn close_frees_the_fd_and_drop_puts_the_same_file_back() {
     assert_eq!(identity(2), Some(before), "drop must restore the same file");
 }
 
-#[test]
+#[skuld::test]
 fn a_panic_partway_through_close_still_restores_the_fds_already_closed() {
     let Some(done) = own_process(
         test_path!(a_panic_partway_through_close_still_restores_the_fds_already_closed),

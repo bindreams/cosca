@@ -22,7 +22,7 @@ fn fixture_uid() -> u32 {
     euid
 }
 
-#[test]
+#[skuld::test]
 fn a_dropped_identity_fixture_gets_an_absolute_existing_skuld_db_dir_it_owns() {
     let (cmd, _dirs) = crate::test_child::fixture_command_without_dac_bypass("unused::fixture");
     let dir = db_dir_of(&cmd);
@@ -36,14 +36,14 @@ fn a_dropped_identity_fixture_gets_an_absolute_existing_skuld_db_dir_it_owns() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn each_dropped_identity_fixture_gets_its_own_skuld_db_dir() {
     let (a, _da) = crate::test_child::fixture_command_without_dac_bypass("unused::a");
     let (b, _db) = crate::test_child::fixture_command_without_dac_bypass("unused::b");
     assert_ne!(db_dir_of(&a), db_dir_of(&b));
 }
 
-#[test]
+#[skuld::test]
 fn the_skuld_db_dir_outlives_the_command_and_goes_with_its_guard() {
     let (cmd, dirs) = crate::test_child::fixture_command_without_dac_bypass("unused::fixture");
     let dir = db_dir_of(&cmd);

@@ -6,7 +6,7 @@ fn os(errno: i32) -> io::Error {
     io::Error::from_raw_os_error(errno)
 }
 
-#[test]
+#[skuld::test]
 fn a_not_empty_root_names_the_entries_left_inside() {
     let inside = Ok(vec![Ok(PathBuf::from("/r/a")), Err(os(libc::EIO))]);
     let msg = describe_remove_failure(Path::new("/r"), &os(libc::ENOTEMPTY), inside);
@@ -16,20 +16,20 @@ fn a_not_empty_root_names_the_entries_left_inside() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_unlistable_root_prints_the_listing_error() {
     let msg = describe_remove_failure(Path::new("/r"), &os(libc::ENOTEMPTY), Err(os(libc::EACCES)));
     assert!(msg.contains("listing it failed:"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn another_error_names_its_errno_and_claims_no_leftovers() {
     let msg = describe_remove_failure(Path::new("/r"), &os(libc::EBUSY), Ok(vec![]));
     assert!(msg.contains(&format!("errno Some({})", libc::EBUSY)), "{msg}");
     assert!(!msg.contains("left"), "{msg}");
 }
 
-#[test]
+#[skuld::test]
 fn an_untouched_scratch_finishes_and_is_removed() {
     let s = ChrootScratch::new();
     let scratch = s.scratch().to_owned();
@@ -37,7 +37,7 @@ fn an_untouched_scratch_finishes_and_is_removed() {
     assert!(!scratch.exists());
 }
 
-#[test]
+#[skuld::test]
 fn something_left_in_scratch_fails_finish_and_stays() {
     let s = ChrootScratch::new();
     let stray = s.scratch().join("stray");
@@ -58,7 +58,7 @@ fn make_mount_point_chain(s: &ChrootScratch) -> PathBuf {
     inside
 }
 
-#[test]
+#[skuld::test]
 fn finish_removes_the_db_mount_point_chain_and_the_db_directory() {
     let s = ChrootScratch::new();
     let db = s.db_dir().to_owned();
@@ -69,7 +69,7 @@ fn finish_removes_the_db_mount_point_chain_and_the_db_directory() {
     assert!(!db.exists(), "the DB directory outlived the scratch");
 }
 
-#[test]
+#[skuld::test]
 fn a_file_left_in_the_db_mount_point_chain_fails_finish_and_stays() {
     let s = ChrootScratch::new();
     let inside = make_mount_point_chain(&s);
@@ -87,14 +87,14 @@ fn a_file_left_in_the_db_mount_point_chain_fails_finish_and_stays() {
     std::fs::remove_dir(&scratch).unwrap();
 }
 
-#[test]
+#[skuld::test]
 fn the_db_directory_is_directly_under_tmp() {
     let s = ChrootScratch::new();
     assert_eq!(s.db_dir().parent(), Some(Path::new("/tmp")));
     s.finish().unwrap();
 }
 
-#[test]
+#[skuld::test]
 fn a_db_directory_that_cannot_be_removed_fails_finish() {
     let s = ChrootScratch::new();
     std::fs::remove_dir(s.db_dir()).unwrap();

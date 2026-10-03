@@ -1,19 +1,19 @@
 use super::assert_may_block;
 use super::Section;
 
-#[test]
+#[skuld::test]
 fn outside_a_section_a_wait_is_allowed() {
     assert_may_block("a test wait");
 }
 
-#[test]
+#[skuld::test]
 #[should_panic(expected = "a test wait would block inside an async Drop")]
 fn inside_a_section_a_wait_panics() {
     let _section = Section::enter();
     assert_may_block("a test wait");
 }
 
-#[test]
+#[skuld::test]
 fn a_section_ends_when_dropped_and_nests() {
     let outer = Section::enter();
     let inner = Section::enter();
@@ -26,7 +26,7 @@ fn a_section_ends_when_dropped_and_nests() {
     assert_may_block("after both");
 }
 
-#[test]
+#[skuld::test]
 fn a_section_is_per_thread() {
     let _section = Section::enter();
     std::thread::spawn(|| assert_may_block("another thread"))
@@ -45,7 +45,7 @@ mod waits {
     /// `wait::block_until_exit`, which every platform's process-exit wait sits behind.
     ///
     /// Mutant: drop the assert from `wait::block_until_exit`.
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn block_until_exit_refuses_inside_a_section() {
         let _section = Section::enter();
@@ -55,7 +55,7 @@ mod waits {
     /// `Attached::wait_drained`, on a mechanism with no drain edge: refused all the same.
     ///
     /// Mutant: drop the assert from `Attached::wait_drained`.
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn attached_wait_drained_refuses_inside_a_section() {
         let _section = Section::enter();
@@ -66,7 +66,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `CgroupLeaf::wait_drained`.
     #[cfg(target_os = "linux")]
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn cgroup_wait_drained_refuses_inside_a_section() {
         use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
@@ -83,7 +83,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `Marker::wait_drained`.
     #[cfg(target_os = "macos")]
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn marker_wait_drained_refuses_inside_a_section() {
         use crate::containment::fdmarker::{pipe_handle_of, Marker, PreparedMarker};
@@ -111,7 +111,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `JobHandle::wait_drained`.
     #[cfg(windows)]
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn job_wait_drained_refuses_inside_a_section() {
         let job = crate::containment::windows::JobHandle::create_empty_for_test();
@@ -123,7 +123,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `wait_drained_raw`.
     #[cfg(windows)]
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn job_wait_drained_raw_refuses_inside_a_section() {
         let job = crate::containment::windows::JobHandle::create_empty_for_test();
@@ -136,7 +136,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `block_until_exit_or_cancel`.
     #[cfg(windows)]
-    #[test]
+    #[skuld::test]
     #[should_panic(expected = "would block inside an async Drop")]
     fn block_until_exit_or_cancel_refuses_inside_a_section() {
         let cancel = crate::wait::backend::new_cancel_event().expect("event");
