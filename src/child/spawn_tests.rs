@@ -984,32 +984,28 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     teardown.assert_killed();
 }
 
-/// macOS: an identity read that is refused (the child's own, before `exec`) fails the spawn as `Unassessable`, naming
-/// the errno. The child cannot be shown to be ours (a refusal is also what a pid reused by another
-/// user's process answers), so nothing is signalled or waited on by pid: it is left running and
-/// unreaped, with a warning that names it.
+/// macOS: a unique-id read the child itself is refused fails the spawn as `Unassessable`, naming
+/// the errno, and the hook stops the child before `exec`: the program did not run, and there is no
+/// child to leave behind.
 ///
-/// Mutant: the arm tears the child down by pid (it is killed and reaped); `Unassessable` mapped to
-/// `Io`; a spawn that succeeds with no identity.
+/// Mutant: the hook execs anyway (a child is left running); `Unassessable` mapped to `Io`; a spawn
+/// that succeeds with no identity.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn adopt_on_a_refused_identity_read_is_unassessable_and_leaves_the_child_alone() {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
+fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
     let mut cmd = blocker();
     let forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     let err = cmd.spawn().err();
     drop(forced);
-    let left = captured_child();
 
     match err.expect("a refused identity read must fail the spawn") {
         Error::Unassessable { detail, source } => {
-            assert!(detail.contains("identity could not be read"), "{detail}");
+            assert!(detail.contains("did not start"), "{detail}");
             assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EPERM));
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    assert_left_alone(mark, "cannot be shown to be ours", &left);
+    crate::child::spawn::identity_macos_tests::assert_program_did_not_run();
 }
 
 /// macOS: the child a failed spawn left behind. Dropping it kills and reaps it, so a failing

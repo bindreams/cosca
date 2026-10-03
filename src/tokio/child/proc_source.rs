@@ -52,10 +52,10 @@ pub(crate) enum ProcSource {
         /// the pid.
         #[cfg(target_os = "linux")]
         pidfd: PinnedPidfd,
-        /// The child's unique id, read right after the spawn (see
-        /// [`crate::signal::read_identity`]): the only identity a by-pid signal on macOS is checked
-        /// against. `None`: the child was already reaped when it was read, or the read was refused;
-        /// either way nothing shows the pid names this child, and it is acted on never.
+        /// The child's unique id, which the child reported itself before `exec` (see
+        /// `child::spawn::unique_report`): the only identity a by-pid signal on macOS is checked
+        /// against. `None`: the child's own read was refused, so nothing shows the pid names this
+        /// child, and it is acted on never.
         #[cfg(target_os = "macos")]
         identity: Option<u64>,
     },

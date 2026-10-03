@@ -56,14 +56,18 @@ pub(crate) fn end_unsignalled_and_reap(pid: u32) {
     );
 }
 
-pub(crate) fn vanished(err: &Error) -> bool {
-    matches!(err, Error::Io(e) if e.to_string().contains("reaped by another party"))
+/// Asserts the failed spawn left no child behind: the spawn captures the identity of every child it
+/// tears down or leaves, and none was captured. A hook that execs anyway leaves one, which is ended
+/// here before the assertion fails.
+pub(crate) fn assert_program_did_not_run() {
+    if let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() {
+        end_unsignalled_and_reap(id.pid());
+        panic!("the program ran: a failed spawn left child {}", id.pid());
+    }
 }
 
-/// Records the spawned child's pid when the spawn reaches `BeforeIdentity`.
-pub(crate) fn record_pid(pid: &Rc<Cell<u32>>) -> crate::oneshot_hook::Armed {
-    let pid = Rc::clone(pid);
-    fault::set_at(SpawnPoint::BeforeIdentity, move || pid.set(fault::spawn_pid()))
+pub(crate) fn vanished(err: &Error) -> bool {
+    matches!(err, Error::Io(e) if e.to_string().contains("reaped by another party"))
 }
 
 /// A child's unique id that differs from `pid`'s own.
@@ -251,24 +255,18 @@ fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
     drop(child);
 }
 
-/// The child's own read is refused (forced inside the child): `Unassessable`, and the child is left
-/// running, unsignalled and unreaped.
+/// The child's own read is refused (forced inside the child): the hook fails before `exec`, so the
+/// spawn is `Unassessable` and the program did not run.
 ///
-/// Mutant: the refusal maps to `Gone`, or the report is ignored; the unverified child is killed.
+/// Mutant: the hook execs anyway (the spawn still reports the refusal, but a child is left running).
 #[skuld::test]
-fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_leaves_the_child() {
+fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     let (mut cmd, _writer) = sync_blocker();
-    let pid = Rc::new(Cell::new(0));
-    let _hook = record_pid(&pid);
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
     let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    assert!(
-        has_not_exited(pid.get()),
-        "nothing may have signalled or reaped the pid"
-    );
-    end_unsignalled_and_reap(pid.get());
+    assert_program_did_not_run();
 }
