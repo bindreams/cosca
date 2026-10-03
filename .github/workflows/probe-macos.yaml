@@ -1,0 +1,34 @@
+name: probe-macos
+on:
+  pull_request:
+jobs:
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Facts
+        continue-on-error: true
+        run: |
+          id; sw_vers; sudo -n true && echo sudo-n-ok
+          sudo cat /etc/sudoers.d/* 2>&1 | head; sudo grep -v '^#' /etc/sudoers | grep -v '^$' | head -20
+          echo "console user: $(stat -f%Su /dev/console)"; who; launchctl managername
+          command -v visudo osascript sysadminctl dscl
+      - name: osascript GUI elevation (60s bound)
+        continue-on-error: true
+        run: |
+          set +e
+          /usr/bin/perl -e 'alarm 60; exec @ARGV' /usr/bin/osascript -e 'do shell script "id -u" with administrator privileges'
+          echo "osascript rc=$?"
+      - name: Throwaway local admin with a password, sudo requires it
+        continue-on-error: true
+        run: |
+          set -x +e
+          pw="Zq9-$(openssl rand -hex 8)"
+          sudo sysadminctl -addUser coscaelev -password "$pw" -admin 2>&1; echo "addUser rc=$?"
+          # runner's blanket NOPASSWD would not apply to the new user
+          sudo -u coscaelev -H bash -c "echo $pw | sudo -S -p '' id -u" 2>&1; echo "sudo -S as coscaelev rc=$?"
+          sudo -u coscaelev -H bash -c "sudo -n id -u" 2>&1; echo "sudo -n as coscaelev (expect fail) rc=$?"
