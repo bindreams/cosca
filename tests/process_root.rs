@@ -163,6 +163,9 @@ fn foreign_kill_helper_main(pid: u32) -> i32 {
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
+// The root lanes run this target whole; `UID_SWITCH` (above) is what gates its test.
+skuld::default_labels!(test_harness::ROOT);
+
 fn main() {
     #[cfg(unix)]
     {

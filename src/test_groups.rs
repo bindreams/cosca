@@ -73,5 +73,6 @@ macro_rules! test_group {
     };
 }
 
+test_group!(ROOT => root, env = "COSCA_TEST_ROOT", consent = "runs as root, for a DAC bypass");
 test_group!(NAMESPACES => namespaces, env = "COSCA_TEST_NAMESPACES", consent = "unshares namespaces and mounts");
 test_group!(DRIVE_MAPPING => drive_mapping, env = "COSCA_TEST_DRIVE_MAPPING", consent = "maps a drive letter for the whole logon session");
