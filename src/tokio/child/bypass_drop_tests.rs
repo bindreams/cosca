@@ -172,15 +172,17 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
         let slot = Rc::clone(&slot);
-        let armed = Rc::clone(&armed);
         move || {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
-            // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
-            // would consume it.
-            *armed.borrow_mut() = Some(evidence());
             *slot.borrow_mut() = Some(witness);
         }
+    });
+    // Armed after the identity read's own check through the handle, which would consume it, and
+    // not before `spawn()`: the handshake's own watch peek runs first and would too.
+    let _after_read = fault::set_at(fault::SpawnPoint::AfterIdentityRead, {
+        let armed = Rc::clone(&armed);
+        move || *armed.borrow_mut() = Some(evidence())
     });
     fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
