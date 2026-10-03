@@ -9,7 +9,7 @@ fn s(o: std::ffi::OsString) -> String {
 /// A verbatim base is normalised as std's `PathBuf::push` does it: `.` dropped, `..` popped but
 /// never into the prefix, `/` a separator. Win32 passes a `\\?\` path through unparsed, so a literal
 /// `.`, `..` or `/` left in it names nothing.
-#[test]
+#[skuld::test]
 fn a_verbatim_base_is_normalised() {
     for (base, rest, want) in [
         (r"\\?\C:\work", "./t.exe", r"\\?\C:\work\t.exe"),
@@ -47,7 +47,7 @@ fn a_verbatim_base_is_normalised() {
 }
 
 /// Any other base takes `rest` as units after one separator, none after a bare drive.
-#[test]
+#[skuld::test]
 fn any_other_base_is_appended_as_units() {
     for (base, rest, want) in [
         (r"1:\work", "tool.exe", r"1:\work\tool.exe"),
@@ -66,7 +66,7 @@ fn any_other_base_is_appended_as_units() {
 
 /// A name joins by its type: Rooted takes the base's drive or share, Relative is appended, and
 /// anything fully qualified stands alone.
-#[test]
+#[skuld::test]
 fn a_name_joins_by_its_type() {
     for (base, name, want) in [
         (r"1:\work", r"\tool.exe", r"1:\tool.exe"),
@@ -87,7 +87,7 @@ fn a_name_joins_by_its_type() {
 /// Held to std itself where std parses Windows paths: `PathBuf::push` on a verbatim base is the
 /// rule `append` claims to follow.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_verbatim_append_matches_std() {
     for base in [
         r"\\?\C:\work",

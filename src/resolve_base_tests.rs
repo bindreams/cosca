@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[test]
+#[skuld::test]
 fn absolute_names_by_grammar() {
     for (name, windows, want) in [
         (r"C:\t\tool", true, true),
@@ -47,7 +47,7 @@ fn absolute_names_by_grammar() {
 }
 
 /// An absolute name resolves with no base at all: joining it onto any directory yields it again.
-#[test]
+#[skuld::test]
 fn an_absolute_name_needs_no_base() {
     let dir = tempfile::tempdir().unwrap();
     let tool = dir.path().join("tool");
@@ -70,7 +70,7 @@ fn an_absolute_name_needs_no_base() {
 }
 
 /// A bare name is searched on `PATH` alone, so it needs no base either.
-#[test]
+#[skuld::test]
 fn a_bare_name_needs_no_base() {
     let dir = tempfile::tempdir().unwrap();
     let name = if cfg!(windows) { "tool.exe" } else { "tool" };
@@ -96,7 +96,7 @@ fn a_bare_name_needs_no_base() {
 /// Win32 reads a name starting with two separators as UNC. One that parses no share names no
 /// local file, so it is refused rather than joined onto a base, which would load a file on the
 /// base's own drive (`\\tool.exe` onto `C:\d` is `C:\tool.exe`).
-#[test]
+#[skuld::test]
 fn a_unc_shaped_name_with_no_share_is_refused() {
     for name in [
         r"\\tool.exe",
@@ -123,7 +123,7 @@ fn a_unc_shaped_name_with_no_share_is_refused() {
 
 /// Exactly the names the resolver reads a base for: a relative located name. A bare name, an
 /// absolute one, and the two refused shapes do not.
-#[test]
+#[skuld::test]
 fn which_names_need_a_base() {
     for (name, want) in [
         (r"sub\tool.exe", true),
@@ -143,7 +143,7 @@ fn which_names_need_a_base() {
 
 /// Win32's path type (`RtlDetermineDosPathNameType_U`): separators first, then a drive of any one
 /// UTF-16 unit before `:`.
-#[test]
+#[skuld::test]
 fn path_types_as_win32_reads_them() {
     use PathType::*;
     for (name, want) in [
@@ -172,7 +172,7 @@ fn path_types_as_win32_reads_them() {
 }
 
 /// A lone surrogate is one UTF-16 unit, three WTF-8 bytes, so it is a drive like any other unit.
-#[test]
+#[skuld::test]
 fn a_lone_surrogate_is_a_drive() {
     for (rest, want) in [
         (&b":x"[..], PathType::DriveRelative),
@@ -190,7 +190,7 @@ fn a_lone_surrogate_is_a_drive() {
 
 /// Every classifier agrees with the path type: `1:tool.exe` is drive-relative to all of them, so
 /// the resolver refuses it rather than searching `PATH` for `1:tool.exe.exe`.
-#[test]
+#[skuld::test]
 fn a_digit_drive_is_drive_relative_everywhere() {
     let name = OsStr::new("1:tool.exe");
     assert_eq!(classify(name, true), Shape::Located);
@@ -213,7 +213,7 @@ fn a_digit_drive_is_drive_relative_everywhere() {
 }
 
 /// A separator in slot 0 is never a drive, so `\:x` has no prefix.
-#[test]
+#[skuld::test]
 fn a_leading_separator_is_never_a_drive_prefix() {
     assert_eq!(windows_prefix_len(br"\:x"), 0);
     assert_eq!(windows_prefix_len(b"1:x"), 2);
@@ -222,7 +222,7 @@ fn a_leading_separator_is_never_a_drive_prefix() {
 
 /// A name that needs a base resolved without one is a caller's contract violation, never a
 /// second, untracked read of this process's cwd.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "needs a base")]
 fn a_located_name_without_a_base_is_a_contract_violation() {
     _ = resolve(ResolveInput {
@@ -238,7 +238,7 @@ fn a_located_name_without_a_base_is_a_contract_violation() {
 
 /// A candidate is joined by the one classifier, never by `PathBuf::join`, which parses the base
 /// with std's letter-only drive rule: a Rooted name on a digit-drive base keeps that drive.
-#[test]
+#[skuld::test]
 fn candidates_join_by_the_one_classifier() {
     let sep = std::path::MAIN_SEPARATOR_STR;
     for (dir, candidate, want) in [
@@ -264,7 +264,7 @@ fn candidates_join_by_the_one_classifier() {
 
 /// Acceptance asks the one classifier too: `1:\tool.exe` is fully qualified to Win32 though std
 /// knows no drive `1`.
-#[test]
+#[skuld::test]
 fn a_candidate_is_accepted_when_fully_qualified() {
     for (joined, want) in [
         (r"1:\tool.exe", true),
@@ -312,7 +312,7 @@ fn windows_path_var(first: &Path, second: &Path) -> std::ffi::OsString {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn windows_path_var_resolves_two_ordinary_directories() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
@@ -323,7 +323,7 @@ fn windows_path_var_resolves_two_ordinary_directories() {
 
 /// An ambient `TMPDIR` containing the `PATH` separator must not merge two entries into one.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn windows_path_var_resolves_a_directory_whose_name_contains_the_separator() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::Builder::new().prefix("has;semicolon").tempdir().unwrap();
@@ -333,7 +333,7 @@ fn windows_path_var_resolves_a_directory_whose_name_contains_the_separator() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "must not contain a `\"`")]
 fn windows_path_var_refuses_a_component_holding_a_quote() {
     windows_path_var(Path::new("/tmp/has\"quote"), Path::new("/tmp/b"));
@@ -428,7 +428,7 @@ const STAT_ERRNO_PREFIX: &str = "COSCA_FIXTURE_STAT_ERRNO=";
 /// its real stderr as `STAT_ERRNO_PREFIX<n>`. A number carries no locale, unlike `strerror()` text,
 /// and unlike the exit status it cannot be confused with libtest's own codes.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn fixture_stat_errno_probe() {
     use std::io::Write as _;
     let Some(target) = std::env::var_os(FIXTURE_STAT_TARGET_ENV) else {
@@ -472,7 +472,7 @@ fn stat_errno_via_grandchild(target: &Path) -> Option<i32> {
 /// the entry after it must not win because a check errored. Uid-independent: passes as root and as
 /// any other caller alike.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
     let (_root, _open, path) = loop_then_open();
     match search_tool(&path, true) {
@@ -484,7 +484,7 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
 /// The `EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]: the
 /// production case (`resolve.rs`'s `Err(e) if input.loadable_only` arm). Runs in a re-exec.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_denied_candidate_fails_a_loadable_only_search_closed() {
     crate::test_child::run_fixture(crate::test_child::fixture_path!(
         fixture_a_denied_candidate_fails_a_loadable_only_search_closed
@@ -494,7 +494,7 @@ fn a_denied_candidate_fails_a_loadable_only_search_closed() {
 /// The child half of [`a_denied_candidate_fails_a_loadable_only_search_closed`]; inert unless
 /// [`crate::test_child::run_fixture`] started it.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -509,7 +509,7 @@ fn fixture_a_denied_candidate_fails_a_loadable_only_search_closed() {
 /// An ordinary spawn skips it and goes on, as before, so one `PATH` entry whose candidate cannot be
 /// checked does not break every unelevated spawn.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
     let (_root, open, path) = loop_then_open();
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
@@ -518,7 +518,7 @@ fn an_undeterminable_candidate_is_skipped_by_an_ordinary_search() {
 /// The `EACCES` twin of [`an_undeterminable_candidate_is_skipped_by_an_ordinary_search`]: the
 /// production case (`resolve.rs`'s `Err(e) => log::warn!(...)` skip arm). Runs in a re-exec.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
     crate::test_child::run_fixture(crate::test_child::fixture_path!(
         fixture_a_denied_candidate_is_skipped_by_an_ordinary_search
@@ -527,7 +527,7 @@ fn a_denied_candidate_is_skipped_by_an_ordinary_search() {
 
 /// The child half of [`a_denied_candidate_is_skipped_by_an_ordinary_search`].
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -541,7 +541,7 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
 /// bounding set (`capabilities(7)`, set-user-ID-root compatibility). The driver needs a DAC bypass
 /// for there to be anything to drop, root or not; see [`crate::test_privilege::root_tests_enabled`].
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_denied_candidate_is_denied_by_an_exec_child() {
     if !crate::test_privilege::root_tests_enabled() {
         return;
@@ -554,7 +554,7 @@ fn a_denied_candidate_is_denied_by_an_exec_child() {
 /// The child half of [`a_denied_candidate_is_denied_by_an_exec_child`]: an exec'd probe must be
 /// denied too.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
     if !crate::test_child::is_fixture_reexec() {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -576,7 +576,7 @@ fn fixture_a_denied_candidate_is_denied_by_an_exec_child() {
 
 /// Which metadata errors are a definite "not here": absence, a non-directory in the path, or no
 /// such drive. A denied or failed check is not.
-#[test]
+#[skuld::test]
 fn only_definite_misses_count_as_absent() {
     #[cfg(windows)]
     let cases = [
@@ -608,7 +608,7 @@ fn only_definite_misses_count_as_absent() {
 /// The execute-permission answer: only "denied" and a definite absence are "not executable"; any
 /// other failure is undeterminable and reaches `resolve`'s disposition.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn only_a_denied_or_absent_execute_check_is_a_no() {
     assert!(execute_permission(0, 0).unwrap());
     for errno in [libc::EACCES, libc::ENOENT, libc::ENOTDIR] {
@@ -622,7 +622,7 @@ fn only_a_denied_or_absent_execute_check_is_a_no() {
 
 /// A Windows base must be fully qualified: the caller completes it as Win32 does. A relative one is
 /// a contract violation, reported in debug at the call boundary and in release where it is used.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "must be fully qualified")]
 fn a_relative_windows_base_is_a_contract_violation() {
     _ = resolve(ResolveInput {
@@ -638,7 +638,7 @@ fn a_relative_windows_base_is_a_contract_violation() {
 
 /// `loadable_only` is a Windows rule; asking for it on the POSIX grammar is a contract violation.
 #[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
-#[test]
+#[skuld::test]
 #[should_panic(expected = "loadable_only is a Windows rule")]
 fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
     _ = resolve(ResolveInput {
@@ -654,7 +654,7 @@ fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
 
 /// A candidate made verbatim by its base, not by the caller, is normalised as Win32 completes a
 /// relative name against a verbatim cwd, and the normalised path is the one probed and returned.
-#[test]
+#[skuld::test]
 fn a_candidate_made_verbatim_by_its_base_is_normalised() {
     let dir = tempfile::tempdir().unwrap();
     let tool = dir.path().join("tool.exe");
@@ -679,7 +679,7 @@ fn a_candidate_made_verbatim_by_its_base_is_normalised() {
 
 /// A name made verbatim by its base is joined as written, `..` included, so `normalise` collapses
 /// it with Win32's floor rather than std's: past a verbatim share, not at it.
-#[test]
+#[skuld::test]
 fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
     let seen = std::cell::RefCell::new(Vec::new());
     let normalise = |p: &Path| {
@@ -699,7 +699,7 @@ fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
 }
 
 /// A rooted name on a verbatim base is refused: Win32 completes it off the base's volume.
-#[test]
+#[skuld::test]
 fn a_rooted_name_on_a_verbatim_base_is_refused() {
     let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be probed") };
     for cwd in [r"\\?\UNC\srv\shr\d", r"\\?\C:\d"] {
@@ -720,7 +720,7 @@ fn a_rooted_name_on_a_verbatim_base_is_refused() {
 }
 
 /// A name written verbatim, or joined onto a plain base, is probed as it stands.
-#[test]
+#[skuld::test]
 fn only_a_verbatim_base_makes_a_candidate_normalised() {
     let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be normalised") };
     for (program, cwd) in [
@@ -745,7 +745,7 @@ fn only_a_verbatim_base_makes_a_candidate_normalised() {
 
 /// A verbatim `PATH` or system directory is written verbatim by whoever set it, so a candidate
 /// under it is probed as written: `\\?\C:\x\bin.` is the directory `bin.`, never `bin`.
-#[test]
+#[skuld::test]
 fn a_verbatim_search_directory_is_taken_as_written() {
     let never = |p: &Path| -> std::io::Result<PathBuf> { panic!("{p:?} must not be normalised") };
     let system = [PathBuf::from(r"\\?\C:\a\..\b")];
@@ -768,7 +768,7 @@ fn a_verbatim_search_directory_is_taken_as_written() {
 /// `UNC` marks a verbatim UNC prefix only before `\`, as NT reads it: after `UNC/` the prefix is
 /// the namespace `\\?\UNC`, split on either separator as every prefix component is here, and
 /// `tool.exe` is a file in it rather than a share.
-#[test]
+#[skuld::test]
 fn a_verbatim_unc_marker_needs_a_backslash() {
     assert_eq!(
         windows_prefix_len(br"\\?\UNC\srv\shr\tool.exe"),
@@ -781,7 +781,7 @@ fn a_verbatim_unc_marker_needs_a_backslash() {
 /// A made-verbatim candidate that Win32's completion turns into a share root, or a path on no
 /// share, names no file: it is refused as `InvalidInput`, as `raw_executable()` refuses it, not
 /// reported as a miss.
-#[test]
+#[skuld::test]
 fn a_normalised_candidate_that_names_no_file_is_refused() {
     for completed in [r"\\?\UNC\srv\t.exe", r"\\?\UNC\t.exe", r"\\?\t.exe"] {
         let normalise = |_: &Path| Ok(PathBuf::from(completed));

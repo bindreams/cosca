@@ -27,27 +27,27 @@ fn unescape_literal(s: &str) -> Vec<u8> {
     out
 }
 
-#[test]
+#[skuld::test]
 fn tn2065_worked_examples() {
     // Straight from TN2065: `a "quote" mark` and `a back\slash`.
     assert_eq!(escape_literal(br#"a "quote" mark"#).unwrap(), r#"a \"quote\" mark"#);
     assert_eq!(escape_literal(br"a back\slash").unwrap(), r"a back\\slash");
 }
 
-#[test]
+#[skuld::test]
 fn safe_text_is_returned_verbatim() {
     assert_eq!(escape_literal(b"/usr/bin/id -u").unwrap(), "/usr/bin/id -u");
     assert_eq!(escape_literal(b"").unwrap(), "");
 }
 
-#[test]
+#[skuld::test]
 fn control_characters_use_the_defined_escapes() {
     assert_eq!(escape_literal(b"a\nb").unwrap(), r"a\nb");
     assert_eq!(escape_literal(b"a\rb").unwrap(), r"a\rb");
     assert_eq!(escape_literal(b"a\tb").unwrap(), r"a\tb");
 }
 
-#[test]
+#[skuld::test]
 fn round_trips_through_an_independent_unescaper() {
     let cases: &[&[u8]] = &[
         b"",
@@ -67,14 +67,14 @@ fn round_trips_through_an_independent_unescaper() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn non_utf8_input_is_rejected_at_its_offset() {
     let e = escape_literal(b"ok\xffbad").unwrap_err();
     assert_eq!(e.kind, QuoteErrorKind::NonUtf8);
     assert_eq!(e.pos, 2);
 }
 
-#[test]
+#[skuld::test]
 fn nul_is_rejected_not_dropped() {
     // Dropping or substituting would silently change the command.
     let e = escape_literal(b"a\0b").unwrap_err();
@@ -82,7 +82,7 @@ fn nul_is_rejected_not_dropped() {
     assert_eq!(e.pos, 1);
 }
 
-#[test]
+#[skuld::test]
 fn other_controls_pass_through_raw_rather_than_being_refused_on_inference() {
     // Verified against real osascript by
     // `both_quoting_layers_survive_a_real_osascript_round_trip`; if that fails on
