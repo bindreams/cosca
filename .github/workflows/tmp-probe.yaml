@@ -1,0 +1,42 @@
+name: tmp killable-elevation probe (do not merge)
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: build shim
+        run: cc -O1 -Wall -o probe/shim2 probe/shim2.c && sw_vers && sudo -V | head -1
+      - name: fd survival through sudo
+        run: |
+          exec 7</etc/hosts
+          echo "caller fds: $(ls /dev/fd | tr '\n' ' ')"
+          sudo -n /bin/sh -c 'echo "sudo command fds: $(ls /dev/fd | tr "\n" " ")"; echo PATH=$PATH'
+      - name: baseline (no shim), kill the sudo front
+        timeout-minutes: 3
+        run: python3 probe/baseline.py '["sudo","-n","--"]'
+      - name: shim through sudo
+        timeout-minutes: 6
+        run: |
+          for sc in kill term lifeline detach exit42 stdio; do
+            echo "######## [socket path] macOS sudo no tty: $sc"
+            SHIM=$PWD/probe/shim2 python3 probe/drive2.py '["sudo","-n","--"]' $sc
+          done
+      - name: shim through osascript (caller already root via sudo, so no dialog)
+        timeout-minutes: 6
+        run: |
+          for sc in kill lifeline exit42; do
+            echo "######## [socket path] macOS osascript do shell script (sudo osascript): $sc"
+            SHIM=$PWD/probe/shim2 python3 probe/drive2.py '["OSA","sudo","-n"]' $sc
+          done
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: UAC handle rights
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File probe\win_probe.ps1 -Mode outer
