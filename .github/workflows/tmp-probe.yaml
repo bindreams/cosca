@@ -1,0 +1,35 @@
+name: tmp-probe
+on: pull_request
+permissions: {}
+jobs:
+  macos-protocol:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          sw_vers; sudo -V | head -1; python3 --version
+          cc -Wall -o probe/shim4 probe/shim4.c
+      - name: scenarios
+        timeout-minutes: 15
+        run: |
+          python3 probe/scenarios.py impostor_peer wiring symlink_swap tmpdir_refusal d2_symlink fork_owner sigpipe \
+            connect_after_accept connect_before_accept refuse_wins connect_wins second_root_peer \
+            front_death_prestart front_death_live shim_death shim_death_backlog exit_races_kill \
+            detach_pending detach_refuses kill_then_detach marker_checks detach_backlog detach_live \
+            osascript mac_term_swallowed
+      - name: mutant sigpipe-unsafe (must FAIL)
+        timeout-minutes: 5
+        run: |
+          sed -i '' 's/gate=None, tmp=None, sigpipe_safe=True)/gate=None, tmp=None, sigpipe_safe=False)/' probe/cosca_proto.py
+          grep -q 'sigpipe_safe=False)' probe/cosca_proto.py
+          if python3 probe/scenarios.py sigpipe; then echo "MUTANT SURVIVED"; exit 1; else echo "MUTANT KILLED"; fi
+      - name: mutant marker-owner-unchecked (must FAIL)
+        timeout-minutes: 5
+        run: |
+          git checkout probe/cosca_proto.py
+          sed -i '' 's/int dir_ok = fstat(d, \&st) == 0 \&\& st.st_uid == uid \&\& (st.st_mode \& 0777) == 0700;/int dir_ok = fstat(d, \&st) == 0;/' probe/shim4.c
+          grep -q 'int dir_ok = fstat(d, &st) == 0;' probe/shim4.c
+          cc -o probe/shim4 probe/shim4.c
+          if python3 probe/scenarios.py marker_checks; then echo "MUTANT SURVIVED"; exit 1; else echo "MUTANT KILLED"; fi
