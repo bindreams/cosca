@@ -1439,6 +1439,16 @@ fn main() {
         "is-elevated-report" => {
             println!("{}", if cosca::elevation::is_elevated() { "1" } else { "0" });
         }
+        // `tests/elevation.rs`: spawn `true` with elevation requested and report how the spawn was
+        // elevated (`ElevatedVia`'s name).
+        #[cfg(unix)]
+        "elevated-spawn-report" => {
+            let mut c = cosca::Command::new();
+            c.args(["true"]).elevation_auth(cosca::elevation::Auth::NonInteractive);
+            let child = c.spawn().expect("spawn");
+            println!("{:?}", child.elevation().expect("elevation requested").via);
+            let _ = child.wait();
+        }
         // `tests/elevation_pkexec_version.rs`: a `Backend::Pkexec` + `Auth::Gui` spawn of
         // `/bin/true`, from a non-root uid, reported as `OK` or `UNSUPPORTED <detail>`. The test
         // gives this process a `PATH` holding only a fake pkexec.
