@@ -25,10 +25,10 @@
 //! # How to run it
 //!
 //! ```text
-//! COSCA_TEST_WINDOWS_PATH_CANARY_CONSENT=1 cargo nextest run --test windows_path_resolution --no-capture
+//! COSCA_TEST_PATH_PROBES_CONSENT=1 cargo nextest run --test windows_path_resolution --no-capture
 //! ```
 //!
-//! The canaries and surveys are the `WINDOWS_PATH_CANARY` group (principle 9), so an ordinary run
+//! The canaries and surveys are the `PATH_PROBES` group (principle 9), so an ordinary run
 //! never mistakes a platform measurement for coverage of cosca. The canary's own string logic and
 //! verdict are tested by `windows_path_logic`, which runs by default on every host. `GetFullPathNameW` works on the string alone and touches no disk
 //! or network, so UNC and device inputs here reach no server or device. The file and spawn tests
@@ -72,6 +72,8 @@ mod verdict;
 #[path = "windows_path_resolution/winapi.rs"]
 mod winapi;
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

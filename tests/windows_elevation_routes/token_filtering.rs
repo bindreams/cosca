@@ -3,6 +3,7 @@
 //! this process's own, another process's, or a synthesised/derived medium one — without creating an
 //! account or logging anyone on; [`crate::logon_routes`] covers the routes that do either of those.
 
+use crate::test_groups::{elevation_routes, Group};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -27,8 +28,8 @@ use windows::Win32::System::Threading::{
 
 use crate::harness::{
     contain, describe, elevation_type_name, env_block, linked_token, measure, open_own_token, require_gate,
-    self_report_cmdline, skuld_db_dir, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide,
-    wide_path, ScratchAccount, Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
+    self_report_cmdline, splice_child_report, token_elevation_type, token_is_elevated, wait_for, wide, wide_path,
+    ScratchAccount, Token, CHILD_EXIT_BOUND_MS, WAIT_INCOMPLETE_TOKEN,
 };
 use crate::windows_probe::mark_test_passed;
 
@@ -43,7 +44,7 @@ use crate::windows_probe::mark_test_passed;
 /// set, and is read independently of the branch below: whether this process runs the whole chain is
 /// decided by `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone, but whether it is actually nested
 /// inside a `contain()`-created job is a different question that condition cannot answer on its
-/// own — a human running `COSCA_PROBE_REPORT_TO=... cargo test measure_this_token`
+/// own — a human running `COSCA_PROBE_REPORT_TO=... <test binary> --cosca-probe-helper measure-token`
 /// directly at the top level satisfies that same condition without ever being contained. Only
 /// `logon_one_account` and `unelevated_caller_view` actually wrap their child in `contain` (before
 /// ever resuming it, `CREATE_SUSPENDED`) before it can reach here, so only they set this marker;
@@ -54,11 +55,7 @@ use crate::windows_probe::mark_test_passed;
 /// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
 /// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
 /// token, nothing more.
-#[skuld::test]
-fn measure_this_token() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+pub(crate) fn measure_this_token() {
     let mut out = String::new();
     // `ShellExecuteEx` cannot carry an environment at all, so whether an explicitly built block
     // survives a token-based spawn is one of the capabilities being measured. The canary is only
@@ -121,10 +118,7 @@ fn measure_this_token() {
 ///
 /// Read-only: `PROCESS_QUERY_LIMITED_INFORMATION` plus `TOKEN_QUERY`, nothing else.
 #[skuld::test]
-fn measure_another_process_token() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn measure_another_process_token(#[fixture(elevation_routes)] _group: &Group) {
     // Whether this run resolved `pid` itself (looking specifically for `explorer.exe`) or took it
     // on trust from the caller — see the image-identity check below for why that distinction
     // matters.
@@ -241,10 +235,7 @@ fn measure_another_process_token() {
 /// a machine with `EnableLUA=0` there is no filtering to observe and every result below would be
 /// a misleading "elevation just works".
 #[skuld::test]
-fn measure_uac_policy() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn measure_uac_policy(#[fixture(elevation_routes)] _group: &Group) {
     const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
     let mut any = false;
     for name in [
@@ -285,10 +276,7 @@ fn measure_uac_policy() {
 /// that can actually answer the question — but only when its own report confirms
 /// `TokenIsElevated=false`; see that function's doc for when it cannot.
 #[skuld::test]
-fn linked_token_chain_here() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn linked_token_chain_here(#[fixture(elevation_routes)] _group: &Group) {
     let mut out = String::new();
     // This test runs at the top level, uncontained — nothing above it in this process's own
     // ancestry ever called `contain`. `ancestor_contained=false`: see `measure`'s and
@@ -326,10 +314,7 @@ fn linked_token_chain_here() {
 /// is synthesised by disabling the Administrators SID and stamping the medium integrity label,
 /// which is close but NOT identical, and the report says which was used.
 #[skuld::test]
-fn unelevated_caller_view() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     let own = open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)
         .expect("the probe needs its own token to derive a medium one");
 
@@ -416,7 +401,6 @@ fn unelevated_caller_view() {
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", child_report.display().to_string()),
             ("COSCA_PROBE_ANCESTOR_CONTAINED", "1".into()),
-            skuld_db_dir(dir.path()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {
@@ -609,10 +593,7 @@ fn synthesise_medium_token(own: &Token) -> Token {
 /// reading of ITS docs twice, so this claim is measured rather than trusted. It is the whole
 /// reason a `CreateProcess*` route would be an improvement.
 #[skuld::test]
-fn does_createprocessw_lpapplicationname_apply_pathext() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn does_createprocessw_lpapplicationname_apply_pathext(#[fixture(elevation_routes)] _group: &Group) {
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let marker = dir.path().join("bat-marker.txt");
     std::fs::write(
@@ -689,10 +670,7 @@ fn does_createprocessw_lpapplicationname_apply_pathext() {
 /// Administrators, and which return the full one? `LogonUser` is where UAC token filtering is
 /// applied, so this is where the chain either starts or dies.
 #[skuld::test]
-fn which_logon_types_return_a_filtered_token() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn which_logon_types_return_a_filtered_token(#[fixture(elevation_routes)] _group: &Group) {
     require_gate("COSCA_PROBE_ALLOW_ACCOUNTS", "creates and deletes local user accounts");
     let mut measured_admin = false;
     let mut measured_std = false;

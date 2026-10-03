@@ -1,6 +1,7 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
+use crate::test_harness::{DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, SHELL_EXECUTE, SHELL_PROBES};
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
@@ -93,6 +94,21 @@ fn require_consent_grants_only_on_exactly_1() {
     }
 }
 
+/// Mutant: a row's fixture carries no label, or another row's, so `SKULD_LABELS=<label>` selects none of its tests (or someone else's).
+#[skuld::test]
+fn every_group_fixture_carries_exactly_its_label() {
+    for (fixture, label) in [
+        ("namespaces", NAMESPACES),
+        ("drive_mapping", DRIVE_MAPPING),
+        ("path_probes", PATH_PROBES),
+        ("shell_execute", SHELL_EXECUTE),
+        ("shell_probes", SHELL_PROBES),
+        ("elevation_routes", ELEVATION_ROUTES),
+    ] {
+        assert_eq!(skuld::fixture::collect_fixture_labels(&[fixture]), [label], "{fixture}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod reexec {
     use crate::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
@@ -139,7 +155,7 @@ mod reexec {
     /// Mutant: the group's `requires` never fails, so `=0` runs the test.
     #[skuld::test]
     fn group_zero_reports_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test(Some("0"), Some("1"));
+        let (outcome, success, stdout) = run_namespaces_test(Some("0"), None);
         assert_eq!(
             outcome,
             SuiteOutcome {
@@ -176,7 +192,7 @@ mod reexec {
     /// Mutant: the setup grants a group that is off.
     #[skuld::test]
     fn group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"), None);
+        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), None, None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
@@ -196,9 +212,9 @@ mod reexec {
     /// Mutant: the group's fixture carries no label, so `SKULD_LABELS=namespaces` selects none of its tests.
     #[skuld::test]
     fn the_group_label_selects_its_tests() {
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("namespaces"));
         assert_eq!(outcome.test_count, 1, "{stdout}");
-        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("!namespaces"));
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), None, Some("!namespaces"));
         assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }

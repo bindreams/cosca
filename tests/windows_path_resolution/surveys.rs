@@ -2,6 +2,7 @@
 
 use crate::provenance::survey_platform;
 use crate::pure::compare_across_roots;
+use crate::test_groups::{path_probes, Group};
 use crate::winapi::{full_path_name, full_path_name_parts, full_path_name_raw, listing, outcome, report_roots};
 
 /// Segment shapes for [`which_segment_positions_get_trimmed`]. Every one is an ORDINARY name — `x`
@@ -50,10 +51,7 @@ pub(crate) fn build(shape: &str, root: &str, seg: &str) -> String {
 /// so "does the directory have to exist?" is settled by comparing two strings rather than by
 /// trusting the documentation's claim that this is pure string manipulation.
 #[skuld::test]
-fn which_segment_positions_get_trimmed() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn which_segment_positions_get_trimmed(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -146,10 +144,7 @@ pub(crate) fn cross_root(prefix: &str, shape: &str, seg: &str, root_e: &str, roo
 /// it short, so this reports the raw UTF-16 units, the length Win32 returned, an independent size
 /// query, and where `lpFilePart` lands in the buffer.
 #[skuld::test]
-fn the_verbatim_parent_result_is_raw_or_truncated() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn the_verbatim_parent_result_is_raw_or_truncated(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
     report_roots(&[r"C:\dir", r"C:\"]);
     for (input, note) in [
@@ -179,10 +174,7 @@ fn the_verbatim_parent_result_is_raw_or_truncated() {
 /// its own directory; here every step touches the same one and says so, so the plain and verbatim
 /// `x<sp>` can be seen coexisting.
 #[skuld::test]
-fn x_space_measured_in_a_single_directory() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn x_space_measured_in_a_single_directory(#[fixture(path_probes)] _group: &Group) {
     survey_platform();
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path().to_str().expect("temp path is not UTF-8").to_string();
