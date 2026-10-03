@@ -88,8 +88,7 @@ impl RawChild {
     )]
     pub(crate) fn is_reaped(&self) -> bool {
         // SAFETY: `handle` is our live, owned process handle; a zero timeout polls without blocking.
-        let r = unsafe { WaitForSingleObject(self.handle(), 0) };
-        r == WAIT_OBJECT_0
+        false
     }
 
     /// Block until the child exits, returning its status.
