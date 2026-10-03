@@ -80,6 +80,18 @@ impl RawChild {
         self.pid
     }
 
+    /// Whether the process has exited: its handle is signalled. Nothing is consumed on Windows, so
+    /// this is the whole of "reaped". A failed poll answers `false`.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "the Windows drop path does not read it yet; the tests do")
+    )]
+    pub(crate) fn is_reaped(&self) -> bool {
+        // SAFETY: `handle` is our live, owned process handle; a zero timeout polls without blocking.
+        let r = unsafe { WaitForSingleObject(self.handle(), 0) };
+        r == WAIT_OBJECT_0
+    }
+
     /// Block until the child exits, returning its status.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match wait_handle_or_cancel(self.handle(), None)? {

@@ -648,7 +648,7 @@ impl Drop for Child {
         // landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
         // its number, until `teardown_on_drop` below.
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(self.id, self.proc.has_reaped(), &self.tree_killed);
+        let view = crate::containment::DropView::read(self.id, self.proc.is_reaped(), &self.tree_killed);
         #[cfg(unix)]
         let tree = self.attached.hard_kill_for_drop(view);
         #[cfg(not(unix))]
