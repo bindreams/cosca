@@ -5,13 +5,13 @@ use super::{
 };
 use std::time::{Duration, Instant};
 
-#[test]
+#[skuld::test]
 fn remaining_unbounded_and_overflow_are_none() {
     assert_eq!(remaining(None), None);
     assert_eq!(remaining(Some(None)), None);
 }
 
-#[test]
+#[skuld::test]
 fn remaining_past_deadline_saturates_to_zero() {
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     assert_eq!(remaining(Some(Some(past))), Some(Duration::ZERO));
@@ -19,7 +19,7 @@ fn remaining_past_deadline_saturates_to_zero() {
 
 /// A deadline within tokio's own ~1ms round-up margin of `Instant`'s ceiling must saturate to
 /// unbounded, not reach a primitive whose own margin arithmetic overflows on it.
-#[test]
+#[skuld::test]
 fn deadline_from_saturates_when_the_result_is_too_close_to_instants_ceiling() {
     let now = Instant::now();
     // 500µs short of the true ceiling (found from `now`): comfortably more than the time this
@@ -33,7 +33,7 @@ fn deadline_from_saturates_when_the_result_is_too_close_to_instants_ceiling() {
 /// Pins `remaining`'s ZERO boundary exactly, via the frozen test clock rather than a real one:
 /// 250ms remaining a full 250ms before the deadline, exactly ZERO at the deadline itself (never
 /// early), and still (just barely) above zero one nanosecond before it.
-#[test]
+#[skuld::test]
 fn remaining_pins_the_exact_zero_boundary() {
     let (_guard, t0) = test_clock::FrozenClockGuard::install();
     let at = t0 + Duration::from_millis(250);
@@ -49,7 +49,7 @@ fn remaining_pins_the_exact_zero_boundary() {
 // `ceil_millis`/`win32_timeout_ms` tests: pure and portable.
 
 /// Mutant: `d.as_millis()` instead of ceiling -> 500us floors to 0.
-#[test]
+#[skuld::test]
 fn ceil_millis_rounds_up_sub_millisecond_remainders() {
     assert_eq!(ceil_millis(Duration::from_nanos(1)), 1);
     assert_eq!(ceil_millis(Duration::from_micros(500)), 1);
@@ -61,13 +61,13 @@ fn ceil_millis_rounds_up_sub_millisecond_remainders() {
 /// A zero remainder stays a poll, not a wait.
 ///
 /// Mutant: round zero up to 1 -> fails.
-#[test]
+#[skuld::test]
 fn ceil_millis_zero_stays_zero() {
     assert_eq!(ceil_millis(Duration::ZERO), 0);
 }
 
 /// Mutant: add a millisecond of slack -> whole milliseconds grow.
-#[test]
+#[skuld::test]
 fn ceil_millis_whole_milliseconds_are_unchanged() {
     assert_eq!(ceil_millis(Duration::from_millis(1)), 1);
     assert_eq!(ceil_millis(Duration::from_millis(7)), 7);
@@ -75,13 +75,13 @@ fn ceil_millis_whole_milliseconds_are_unchanged() {
 }
 
 /// Mutant: map `None` to a finite value -> an unbounded wait gets a deadline.
-#[test]
+#[skuld::test]
 fn win32_timeout_ms_unbounded_is_the_win32_infinite_sentinel() {
     assert_eq!(win32_timeout_ms(None), u32::MAX);
 }
 
 /// Mutant: truncate instead of ceiling -> 500us arms 0.
-#[test]
+#[skuld::test]
 fn win32_timeout_ms_ceils_rather_than_truncates() {
     assert_eq!(win32_timeout_ms(Some(Duration::from_micros(500))), 1);
     assert_eq!(win32_timeout_ms(Some(Duration::ZERO)), 0);
@@ -91,7 +91,7 @@ fn win32_timeout_ms_ceils_rather_than_truncates() {
 /// A finite remainder never arms `INFINITE`, even at exactly `u32::MAX` ms.
 ///
 /// Mutant: drop the clamp -> `u32::MAX` (the sentinel) instead of `u32::MAX - 1`.
-#[test]
+#[skuld::test]
 fn win32_timeout_ms_never_returns_the_infinite_sentinel_for_a_finite_remaining() {
     let ms = win32_timeout_ms(Some(Duration::from_millis(u64::from(u32::MAX))));
     assert_ne!(ms, u32::MAX);
@@ -99,7 +99,7 @@ fn win32_timeout_ms_never_returns_the_infinite_sentinel_for_a_finite_remaining()
 }
 
 /// Mutant: ignore the clamp seam -> the 1s remainder arms 1000, not 5.
-#[test]
+#[skuld::test]
 fn win32_timeout_ms_honors_the_clamp_seam() {
     let guard = wait_clamp_seam::set(5);
     assert_eq!(win32_timeout_ms(Some(Duration::from_secs(1))), 5);
@@ -110,7 +110,7 @@ fn win32_timeout_ms_honors_the_clamp_seam() {
 /// The override applies to exactly one call.
 ///
 /// Mutant: leave the override armed after `take` -> the second call sees 3, not 999.
-#[test]
+#[skuld::test]
 fn remaining_override_seam_is_consumed_exactly_once() {
     let guard = remaining_override_seam::set(Duration::from_millis(3));
     assert_eq!(win32_timeout_ms(Some(Duration::from_millis(999))), 3);
@@ -121,7 +121,7 @@ fn remaining_override_seam_is_consumed_exactly_once() {
 /// An unconsumed override does not outlive its guard.
 ///
 /// Mutant: make the guard's `Drop` a no-op -> the stale 3 leaks into the next call.
-#[test]
+#[skuld::test]
 fn remaining_override_seam_guard_clears_an_unconsumed_override_on_drop() {
     let guard = remaining_override_seam::set(Duration::from_millis(3));
     drop(guard);
@@ -131,7 +131,7 @@ fn remaining_override_seam_guard_clears_an_unconsumed_override_on_drop() {
 /// The probe pairs what a site asked for with what was armed.
 ///
 /// Mutant: record the overridden duration as `requested` -> `requested` is 3ms, not 999ms.
-#[test]
+#[skuld::test]
 fn wait_ms_probe_records_the_requested_remaining_beside_the_armed_one() {
     wait_ms_probe::take();
     let _override = remaining_override_seam::set(Duration::from_millis(3));
@@ -145,7 +145,7 @@ fn wait_ms_probe_records_the_requested_remaining_beside_the_armed_one() {
 
 /// `ceiling - MARGIN` clears (adding the margin lands ON
 /// the ceiling, representable); one nanosecond later does not.
-#[test]
+#[skuld::test]
 fn deadline_at_passes_through_up_to_the_margin_and_is_unbounded_past_it() {
     let now = Instant::now();
     let ceiling = instant_near_ceiling(now);
@@ -168,7 +168,7 @@ fn deadline_at_passes_through_up_to_the_margin_and_is_unbounded_past_it() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn clears_tokio_timer_margin_is_true_exactly_up_to_the_margin() {
     let ceiling = instant_near_ceiling(Instant::now());
     assert!(clears_tokio_timer_margin(ceiling - TOKIO_TIMER_ROUNDING_MARGIN));
@@ -178,7 +178,7 @@ fn clears_tokio_timer_margin_is_true_exactly_up_to_the_margin() {
 }
 
 /// `deadline_from` is `deadline_at` on the frozen clock, wrapped in `Some`.
-#[test]
+#[skuld::test]
 fn deadline_from_applies_deadline_at_on_the_test_clock() {
     let (_guard, t0) = test_clock::FrozenClockGuard::install();
     let span = instant_near_ceiling(t0).saturating_duration_since(t0);
@@ -194,7 +194,7 @@ fn deadline_from_applies_deadline_at_on_the_test_clock() {
 /// Each round after a real wait sees a frozen clock that has moved on, so a finite deadline ends.
 ///
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call -> the second round sees the same instant.
-#[test]
+#[skuld::test]
 fn rearm_until_advances_the_frozen_clock_by_each_round() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let deadline = Some(Some(at + Duration::from_millis(30)));
@@ -215,7 +215,7 @@ fn rearm_until_advances_the_frozen_clock_by_each_round() {
 /// clock.
 ///
 /// Mutant: derive the round's remaining from the real clock.
-#[test]
+#[skuld::test]
 fn rearm_until_hands_a_round_the_frozen_remaining() {
     let (_clock, at) = test_clock::FrozenClockGuard::install_lagging(Duration::from_secs(1));
     let deadline = Some(Some(at + Duration::from_millis(50)));
@@ -231,7 +231,7 @@ fn rearm_until_hands_a_round_the_frozen_remaining() {
 /// A deadline already past still runs one round, armed with zero, and reports its `None`.
 ///
 /// Mutant: check `remaining` before the first round.
-#[test]
+#[skuld::test]
 fn rearm_until_polls_once_for_a_past_deadline() {
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let mut rounds = Vec::new();
@@ -246,7 +246,7 @@ fn rearm_until_polls_once_for_a_past_deadline() {
 /// A round's error ends the loop at once, wherever in the loop it arrives.
 ///
 /// Mutant: treat `Err` as `None` -> the third round runs and reports `Some`.
-#[test]
+#[skuld::test]
 fn rearm_until_stops_at_a_round_error() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let deadline = Some(Some(at + Duration::from_secs(3600)));
@@ -267,7 +267,7 @@ fn rearm_until_stops_at_a_round_error() {
 /// interleaved in order with the marks a call site drops.
 ///
 /// Mutant: skip `record` in `remaining_at` -> the log is empty.
-#[test]
+#[skuld::test]
 fn read_probe_records_reads_and_marks_in_order() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (_clock, at) = test_clock::FrozenClockGuard::install();
@@ -294,7 +294,7 @@ fn read_probe_records_reads_and_marks_in_order() {
 /// A probe does not outlive its guard, including when the guard is dropped by an unwind.
 ///
 /// Mutant: make the guard's `Drop` a no-op -> the read after the panic is still recorded.
-#[test]
+#[skuld::test]
 fn read_probe_guard_uninstalls_on_drop_even_when_unwinding() {
     let (tx, rx) = std::sync::mpsc::channel();
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -312,7 +312,7 @@ fn read_probe_guard_uninstalls_on_drop_even_when_unwinding() {
 /// handle [`read_probe::current`] hands out, which is how a `spawn_blocking` closure joins one.
 ///
 /// Mutant: make `current` return `None` -> the installed thread's read goes unrecorded.
-#[test]
+#[skuld::test]
 fn read_probe_reaches_another_thread_only_through_current() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _guard = read_probe::install(tx);
@@ -339,7 +339,7 @@ fn read_probe_reaches_another_thread_only_through_current() {
 /// Two rounds with no advance between them, under a frozen clock, are a stalled re-arm.
 ///
 /// Mutant: drop the check in `RoundCheck::round` -> no panic.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn round_check_panics_on_two_rounds_without_an_advance() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
@@ -351,7 +351,7 @@ fn round_check_panics_on_two_rounds_without_an_advance() {
 /// An advance call between rounds is progress even when it advanced by zero.
 ///
 /// Mutant: bump the generation only for a nonzero elapsed -> panics here.
-#[test]
+#[skuld::test]
 fn round_check_accepts_an_advance_of_zero_between_rounds() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
     let mut check = test_clock::RoundCheck::new("test");
@@ -367,7 +367,7 @@ fn round_check_accepts_an_advance_of_zero_between_rounds() {
 ///
 /// Mutant: compare against a thread-local last generation instead of the invocation's own ->
 /// panics here.
-#[test]
+#[skuld::test]
 fn round_check_state_is_per_invocation() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
     let mut first = test_clock::RoundCheck::new("first");
@@ -379,7 +379,7 @@ fn round_check_state_is_per_invocation() {
 /// `SkipAdvanceGuard` stops the advance while it lives and only then.
 ///
 /// Mutant: make the guard's `Drop` a no-op -> the advance after the drop is still skipped.
-#[test]
+#[skuld::test]
 fn skip_advance_guard_resets_on_drop() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let skip = test_clock::SkipAdvanceGuard::install();
@@ -393,7 +393,7 @@ fn skip_advance_guard_resets_on_drop() {
 /// `ZeroElapsedGuard` pins the measured elapsed to zero while it lives and only then.
 ///
 /// Mutant: make the guard's `Drop` a no-op -> the advance after the drop is still zero.
-#[test]
+#[skuld::test]
 fn zero_elapsed_guard_resets_on_drop() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let zero = test_clock::ZeroElapsedGuard::install();
@@ -412,7 +412,7 @@ fn zero_elapsed_guard_resets_on_drop() {
 /// round three.
 ///
 /// Mutant: compare against the first round's generation -> no panic.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn round_check_compares_against_the_previous_round_only() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
@@ -427,7 +427,7 @@ fn round_check_compares_against_the_previous_round_only() {
 /// unfrozen once its guard drops.
 ///
 /// Mutant: ignore `is_frozen` -> panics here.
-#[test]
+#[skuld::test]
 fn round_check_ignores_an_unfrozen_clock() {
     {
         let (_clock, _at) = test_clock::FrozenClockGuard::install();
@@ -443,7 +443,7 @@ fn round_check_ignores_an_unfrozen_clock() {
 /// per-invocation state of the check itself is pinned by
 /// `round_check_state_is_per_invocation`, which this end-to-end path cannot reach: every
 /// `rearm_until` round is followed by an advance.
-#[test]
+#[skuld::test]
 fn two_sequential_waits_with_the_same_remaining_do_not_trip_the_check() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
     // Unbounded: no `remaining` is needed here, and a finite deadline would let a preempted
@@ -463,7 +463,7 @@ fn two_sequential_waits_with_the_same_remaining_do_not_trip_the_check() {
 /// are not its concern.
 ///
 /// Mutant: make `wait_ms_probe::record` panic on a repeated remaining -> panics here.
-#[test]
+#[skuld::test]
 fn wait_ms_probe_does_not_judge_progress() {
     let (_clock, _at) = test_clock::FrozenClockGuard::install();
     wait_ms_probe::take();
@@ -482,7 +482,7 @@ fn wait_ms_probe_does_not_judge_progress() {
 ///
 /// Mutant: judge progress by the `remaining` values (equal `Some` remainings in consecutive
 /// rounds are no progress) -> the zero-elapsed rounds repeat the same remaining and panic.
-#[test]
+#[skuld::test]
 fn the_override_seam_and_a_zero_elapsed_round_do_not_trip_the_check() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
     let _zero = test_clock::ZeroElapsedGuard::install();
@@ -516,7 +516,7 @@ fn the_override_seam_and_a_zero_elapsed_round_do_not_trip_the_check() {
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call in `rearm_until` -> same panic, without
 /// the seam. Mutant: drop `rearm_until`'s `check.round()` -> the second round runs and fails the
 /// test with a different message, instead of the loop spinning forever.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn rearm_until_panics_when_its_advance_is_dropped() {
     let (_clock, at) = test_clock::FrozenClockGuard::install();
@@ -537,7 +537,7 @@ const ROUND_CHECK_ABORT_MARKER: &str = "COSCA_FIXTURE_ROUND_CHECK_ABORT";
 /// The child half of [`round_check_exits_when_it_fires_while_panicking`]: inert in an ordinary
 /// suite run. Stalls a [`test_clock::RoundCheck`] in a `Drop` that runs while its own panic
 /// unwinds.
-#[test]
+#[skuld::test]
 fn fixture_round_check_violation_while_panicking() {
     struct StalledInDrop;
     impl Drop for StalledInDrop {
@@ -562,7 +562,7 @@ fn fixture_round_check_violation_while_panicking() {
 /// Mutant: store the violation and return -> the child exits with the test's own failure (101).
 /// Mutant: panic regardless of `thread::panicking()` -> the double panic aborts, and the exit
 /// code differs whatever the environment.
-#[test]
+#[skuld::test]
 fn round_check_exits_when_it_fires_while_panicking() {
     let output = crate::test_child::run_fixture_output(
         crate::test_child::fixture_path!(fixture_round_check_violation_while_panicking),

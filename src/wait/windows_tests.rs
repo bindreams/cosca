@@ -44,7 +44,7 @@ fn let_child_exit(mut child: std::process::Child) {
 ///
 /// Mutant: truncate in `win32_timeout_ms` (`d.as_millis()`) -> `ms` is 0. Mutant: add slack ->
 /// `ms` is above 1. Mutant: ignore the site's deadline -> `requested` is not 5ms.
-#[test]
+#[skuld::test]
 fn block_until_exit_arms_the_ceiling_of_the_remaining_duration() {
     let (child, id) = spawn_never_exiting();
     let (_clock, at) = FrozenClockGuard::install();
@@ -74,7 +74,7 @@ fn block_until_exit_arms_the_ceiling_of_the_remaining_duration() {
 ///
 /// Mutant: return on the first `WAIT_TIMEOUT` (no recheck, or one conditioned on the clamp) ->
 /// one arm, wrongly reports alive.
-#[test]
+#[skuld::test]
 fn block_until_exit_never_reports_still_alive_before_the_deadline() {
     let (mut child, id) = spawn_never_exiting();
     let stdin = child.stdin.take().expect("piped stdin");
@@ -94,7 +94,7 @@ fn block_until_exit_never_reports_still_alive_before_the_deadline() {
 ///
 /// Mutant: drop the re-arm loop -> one arm, wrongly reports alive. Mutant: hoist `remaining`
 /// above the loop -> `remaining` does not shrink.
-#[test]
+#[skuld::test]
 fn block_until_exit_re_arms_past_a_clamped_timeout() {
     let (mut child, id) = spawn_never_exiting();
     let stdin = child.stdin.take().expect("piped stdin");
@@ -114,7 +114,7 @@ fn block_until_exit_re_arms_past_a_clamped_timeout() {
 ///
 /// Mutant: drop `advance_by_elapsed_if_frozen` from `wait_until` -> `remaining` never shrinks
 /// and the call re-arms forever.
-#[test]
+#[skuld::test]
 fn block_until_exit_terminates_under_a_frozen_clock() {
     let (child, id) = spawn_never_exiting();
     let (_clock, at) = FrozenClockGuard::install();
@@ -131,7 +131,7 @@ fn block_until_exit_terminates_under_a_frozen_clock() {
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call in `rearm_until` -> same panic, without
 /// the seam. Mutant: drop `rearm_until`'s `check.round()` -> the second round fails the test with
 /// a different message, instead of the loop spinning forever.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn wait_until_panics_when_its_advance_is_dropped() {
     use windows::Win32::Foundation::WAIT_TIMEOUT;
@@ -153,7 +153,7 @@ fn wait_until_panics_when_its_advance_is_dropped() {
 ///
 /// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
 /// Mutant: ignore the site's grace -> `requested` is not 5ms.
-#[test]
+#[skuld::test]
 fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
     let (child, id) = spawn_never_exiting();
     let cancel = super::new_cancel_event().expect("create cancel event");
@@ -184,7 +184,7 @@ fn block_until_exit_or_cancel_arms_the_ceiling_of_the_remaining_duration() {
 /// re-arms. Exit (`Ok(true)`) proves it, since a cancel or a timeout would both read `Ok(false)`.
 ///
 /// Mutant: return on the first `WAIT_TIMEOUT` -> one arm, wrongly reports alive.
-#[test]
+#[skuld::test]
 fn block_until_exit_or_cancel_never_reports_still_alive_before_the_deadline() {
     let (mut child, id) = spawn_never_exiting();
     let stdin = child.stdin.take().expect("piped stdin");
@@ -204,7 +204,7 @@ fn block_until_exit_or_cancel_never_reports_still_alive_before_the_deadline() {
 ///
 /// Mutant: drop the re-arm loop -> one arm, wrongly reports alive. Mutant: hoist `remaining`
 /// above the loop -> `remaining` does not shrink.
-#[test]
+#[skuld::test]
 fn block_until_exit_or_cancel_re_arms_past_a_clamped_timeout() {
     let (mut child, id) = spawn_never_exiting();
     let stdin = child.stdin.take().expect("piped stdin");

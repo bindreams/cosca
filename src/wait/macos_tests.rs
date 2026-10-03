@@ -2,7 +2,7 @@
 
 use crate::identity::ProcessId;
 
-#[test]
+#[skuld::test]
 fn drain_reports_none_when_no_event_pending() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
     // Alive until this test kills it: the arm-then-drain checks below need that.
@@ -29,7 +29,7 @@ fn drain_reports_none_when_no_event_pending() {
 /// `kernel_task`'s *genuine* identity. It is not exercised here on purpose: a regression in
 /// it would SIGKILL the CI runner's process group rather than fail a test. Its own contract
 /// is pinned by `identity::probe::probe_tests::signal_target_is_the_guard_for_real_signals`.
-#[test]
+#[skuld::test]
 fn a_pid_zero_identity_never_reaches_kill() {
     let bogus = crate::identity::ProcessId::from_parts_for_test(0, 1);
     // Already-gone is success: the pid holds a process, but not the one named.
@@ -49,7 +49,7 @@ fn a_pid_zero_identity_never_reaches_kill() {
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call in `block_on_kqueue` -> same panic,
 /// without the seam. Mutant: drop `block_on_kqueue`'s `check.round()` -> the round hook fails the
 /// test with a different message, instead of the loop spinning forever.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn block_on_kqueue_panics_when_its_advance_is_dropped() {
     use crate::wait::test_clock::{FrozenClockGuard, SkipAdvanceGuard};
@@ -73,7 +73,7 @@ fn block_on_kqueue_panics_when_its_advance_is_dropped() {
 ///
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call in `block_on_kqueue` -> the second round
 /// panics with "no progress" instead of re-arming forever.
-#[test]
+#[skuld::test]
 fn block_on_kqueue_terminates_under_a_frozen_clock() {
     use crate::wait::test_clock::FrozenClockGuard;
     use nix::sys::event::Kqueue;
@@ -90,7 +90,7 @@ fn block_on_kqueue_terminates_under_a_frozen_clock() {
 /// ended from the round hook, so the exit is pending or imminent when `kevent` is called.
 ///
 /// Mutant: drop the clamp in `kevent_timeout` -> `Io(EINVAL)` at once.
-#[test]
+#[skuld::test]
 fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
     use std::time::Duration;
 
@@ -115,7 +115,7 @@ fn a_deadline_beyond_the_kevent_limit_still_returns_the_exit() {
 /// from the round hook, so real round durations cannot change the round count.
 ///
 /// Mutants: drop the clamp -> the first call carries the whole 50ms; halve it -> 5ms calls.
-#[test]
+#[skuld::test]
 fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
     use nix::sys::event::Kqueue;
@@ -142,7 +142,7 @@ fn a_remaining_time_above_the_clamp_is_rearmed_in_pieces() {
 /// The clamp override is reset only by a `HookGuard`'s `Drop`, so setting it without one is a
 /// contract violation.
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "needs a live HookGuard")]
 fn the_clamp_override_requires_a_hook_guard() {
     super::test_hooks::set_clamp_override(std::time::Duration::from_millis(10));
@@ -151,7 +151,7 @@ fn the_clamp_override_requires_a_hook_guard() {
 /// The override may only lower the clamp: zero makes every `kevent` a poll, and anything above
 /// `KEVENT_MAX_SECS` brings back the `EINVAL` the clamp exists to prevent.
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "may only lower the clamp to a positive value")]
 fn the_clamp_override_rejects_zero() {
     let _hooks = super::test_hooks::HookGuard::install(|_, _| {});
@@ -159,7 +159,7 @@ fn the_clamp_override_rejects_zero() {
 }
 
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "may only lower the clamp to a positive value")]
 fn the_clamp_override_rejects_a_value_above_the_kevent_limit() {
     let _hooks = super::test_hooks::HookGuard::install(|_, _| {});
@@ -169,7 +169,7 @@ fn the_clamp_override_rejects_a_value_above_the_kevent_limit() {
 /// A forced timeout is checked like a computed one: above the limit it is a test bug, not an
 /// `EINVAL` from the kernel.
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "exceeds XNU's INT32_MAX limit")]
 fn a_forced_timeout_above_the_kevent_limit_is_rejected() {
     use nix::sys::event::Kqueue;
@@ -184,7 +184,7 @@ fn a_forced_timeout_above_the_kevent_limit_is_rejected() {
 /// `kevent_timeout` at the limit's edges, on the real `KEVENT_MAX_SECS`.
 ///
 /// Mutants: always return the cap; drop `subsec_nanos`; cap at `KEVENT_MAX_SECS + 1`.
-#[test]
+#[skuld::test]
 fn kevent_timeout_caps_at_the_limit_and_keeps_the_rest() {
     use std::time::Duration;
 
@@ -211,7 +211,7 @@ fn kevent_timeout_caps_at_the_limit_and_keeps_the_rest() {
 
 /// `Ok(0)` with time left is classified: a full-cap timeout is the intended re-arm, anything
 /// else is an anomaly. Judged against the cap in force, including a lowered one.
-#[test]
+#[skuld::test]
 fn a_zero_return_is_a_rearm_only_after_a_full_cap_timeout() {
     use super::ZeroReturn::{Anomaly, Rearm};
     use std::time::Duration;
@@ -235,7 +235,7 @@ fn a_zero_return_is_a_rearm_only_after_a_full_cap_timeout() {
 /// re-arm at debug, a short timeout that woke early at warn. Neither retries silently.
 ///
 /// Mutants: swap the arms; drop either log.
-#[test]
+#[skuld::test]
 fn a_zero_return_with_time_left_is_logged_by_kind() {
     use crate::wait::test_clock::{advance, FrozenClockGuard, ZeroElapsedGuard};
     use nix::sys::event::Kqueue;

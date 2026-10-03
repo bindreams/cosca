@@ -24,7 +24,7 @@ fn assert_names_openat2(result: Result<Option<rustix::fd::OwnedFd>, Error>, errn
 
 /// `pidfd_open` succeeds, then the fdinfo check needs the `/proc` dirfd.
 /// Mutant: "`verify_pidfd_target` reports an unopenable `/proc` as `Unassessable`".
-#[test]
+#[skuld::test]
 fn open_verified_is_unsupported_naming_openat2_when_it_is_unavailable() {
     for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let _forced = force_openat2_errno(errno);
@@ -34,7 +34,7 @@ fn open_verified_is_unsupported_naming_openat2_when_it_is_unavailable() {
 
 /// The `pidfd_open`-refused arm asks [`proc_view`](crate::identity::proc_view).
 /// Mutant: "`verify_without_pidfd` reports an unopenable `/proc` as `Unassessable`".
-#[test]
+#[skuld::test]
 fn open_verified_without_a_pidfd_is_unsupported_naming_openat2_when_it_is_unavailable() {
     let _errno = super::fault::force_pidfd_open_errno_once(rustix::io::Errno::INVAL);
     let _forced = force_openat2_errno(rustix::io::Errno::NOSYS);
