@@ -5,10 +5,10 @@ use std::rc::Rc;
 
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
-use crate::child::spawn::unique_report;
 use crate::child::spawn::identity_macos_tests::{
     arm_launchd_hold, end_unsignalled_and_reap, has_not_exited, other_unique_id, reap_by_pid, vanished,
 };
+use crate::child::spawn::unique_report;
 use crate::error::Error;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
