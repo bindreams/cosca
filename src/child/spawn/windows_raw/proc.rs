@@ -97,7 +97,7 @@ impl RawChild {
     /// backends.
     #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
-        self.reaped.get().is_some()
+        unsafe { WaitForSingleObject(self.handle(), 0) } == WAIT_OBJECT_0
     }
 
     /// Record `status` as this handle's reap, and pass it on.
