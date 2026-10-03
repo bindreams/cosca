@@ -139,21 +139,28 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 24 | ForEach-Object {[char]$_}) + "aA1!"
-          net user coscaelev $pw /add
-          net localgroup Administrators coscaelev /add
-          New-Item -ItemType Directory C:\elevmarker | Out-Null
-          icacls C:\elevmarker /inheritance:r /grant "BUILTIN\Administrators:(OI)(CI)F" "NT AUTHORITY\SYSTEM:(OI)(CI)F" | Out-Null
+          $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 24 | ForEach-Object {[char]$_})
+          $pw += "aA1!"
+          New-LocalUser coscaelev -Password (ConvertTo-SecureString $pw -AsPlainText -Force) -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group Administrators -Member coscaelev
+          New-Item -ItemType Directory C:\elevmarker, C:\elevout | Out-Null
+          icacls C:\elevmarker /inheritance:r | Out-Null
+          icacls C:\elevmarker /grant "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
           icacls C:\elevmarker
+          icacls C:\elevout /grant "coscaelev:(OI)(CI)M" | Out-Null
           $exe = (Get-ChildItem target\${{ matrix.target }}\debug\deps\elevation-*.exe | Where-Object { $_.Name -notmatch 'pkexec' } | Select-Object -First 1).FullName
           "test exe: $exe"
-          $cmd = "whoami /groups | findstr /i `"Label Administrators`" > C:\elevmarker\..\elev-who.txt 2>&1 & set COSCA_TEST_ELEVATION=1& set COSCA_TEST_ELEVATION_MARKER_DIR=C:\elevmarker& `"$exe`" --nocapture > C:\elev-out.txt 2>&1"
+          @(
+            'whoami /groups > C:\elevout\who.txt 2>&1',
+            'set COSCA_TEST_ELEVATION=1',
+            'set COSCA_TEST_ELEVATION_MARKER_DIR=C:\elevmarker',
+            "`"$exe`" --nocapture > C:\elevout\out.txt 2>&1"
+          ) | Set-Content C:\elevout\run.cmd -Encoding ascii
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\coscaelev", (ConvertTo-SecureString $pw -AsPlainText -Force))
-          icacls C:\ /grant "coscaelev:(CI)(OI)M" | Out-Null
-          $p = Start-Process cmd.exe -ArgumentList '/c', $cmd -Credential $cred -WorkingDirectory $PWD.Path -Wait -PassThru
+          $p = Start-Process cmd.exe -ArgumentList '/c', 'C:\elevout\run.cmd' -Credential $cred -WorkingDirectory C:\elevout -Wait -PassThru
           "child exit: $($p.ExitCode)"
-          Get-Content C:\elev-who.txt
-          Get-Content C:\elev-out.txt
+          Get-Content C:\elevout\who.txt | Select-String 'Label|Administrators'
+          Get-Content C:\elevout\out.txt
   run0kill:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 15
