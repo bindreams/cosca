@@ -566,7 +566,7 @@ impl From<AttachError> for Error {
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
     // Via `resolve_identity` so the test seam applies here too.
-    match crate::child::spawn::resolve_identity(pid) {
+    match crate::child::spawn::resolve_identity_unchecked(pid) {
         crate::identity::Resolved::Found(id) => Ok(id),
         crate::identity::Resolved::Gone => Err(AttachError {
             error: Error::Containment {
