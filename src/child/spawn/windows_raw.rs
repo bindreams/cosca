@@ -178,7 +178,10 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
             return Err(e);
         }
     };
-    let id = match resolve_identity(pid) {
+    let id = match resolve_identity(
+        pid,
+        &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
+    ) {
         crate::identity::Resolved::Found(id) => id,
         other => {
             raw_spawn_teardown(proc, pid);
