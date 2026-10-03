@@ -1,14 +1,17 @@
 //! `pidfd_open` refused by a real seccomp filter is `Unsupported` in the policy's message shape.
 //! The unit tests force the errno through a seam; these tests make the kernel answer it.
-#![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use cosca::error::Error;
 
+#[cfg(target_os = "linux")]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(target_os = "linux")]
 const REFUSALS: [(i32, &str); 4] = [
     (libc::EPERM, "EPERM"),
     (libc::EACCES, "EACCES"),
@@ -16,6 +19,7 @@ const REFUSALS: [(i32, &str); 4] = [
     (libc::ENOSYS, "ENOSYS"),
 ];
 
+#[cfg(target_os = "linux")]
 fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: &str) {
     match result {
         Err(e @ Error::Unsupported { .. }) => assert_eq!(
@@ -31,7 +35,8 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, errno: 
 
 /// Mutants: an errno missing from the refusals; an op named as another; the message shape;
 /// `Child::kill` routed through `pidfd_open`.
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
     for (code, name) in REFUSALS {
         let (child, _control) = common::spawn_blocker();
@@ -60,8 +65,9 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_operation() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
     for (code, name) in REFUSALS {
         let (child, _control) = common::spawn_blocker();
@@ -104,7 +110,8 @@ fn a_seccomp_refused_pidfd_open_is_unsupported_for_every_async_operation() {
 /// `Unsupported` naming `spawn`, with no fallback.
 ///
 /// Mutants: the op is another; an errno missing from the refusals.
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
     for (code, name) in REFUSALS {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -130,7 +137,8 @@ fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
 /// or zombie, and the program never ran.
 ///
 /// Mutant: the pre-fork probe is skipped.
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
     use std::io::Read;
 
@@ -169,4 +177,13 @@ fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
         reader.read_to_string(&mut out).expect("read to EOF");
         assert_eq!(out, "", "{name}: the program must not have run");
     }
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

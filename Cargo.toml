@@ -187,6 +187,16 @@ path = "tests/tokio_foreign.rs"
 harness = false
 
 [[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+harness = false
+
+[[test]]
+name = "linux_pidfd_refused"
+path = "tests/linux_pidfd_refused.rs"
+harness = false
+
+[[test]]
 name = "process"
 path = "tests/process.rs"
 harness = false

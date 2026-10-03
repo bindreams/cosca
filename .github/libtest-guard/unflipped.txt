@@ -1,6 +1,4 @@
 test:group_teardown_setuid
-test:lifecycle
-test:linux_pidfd_refused
 test:linux_pidfd_wait
 test:macos_fdmarker
 test:spawn_io
