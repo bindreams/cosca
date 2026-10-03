@@ -43,25 +43,28 @@ if ($Mode -eq "outer") {
   "== runas from the job's own process:"; [P]::Run($payload, $payloadArgs)
   # Elevate without a prompt, so a medium-IL caller's runas can complete unattended.
   Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" ConsentPromptBehaviorAdmin 0
-  $out = Join-Path $env:RUNNER_TEMP "kef-inner.txt"
-  $done = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, "Global\kefInnerDone")
-  $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode inner -Out `"$out`""
-  foreach ($lt in @("Interactive", "S4U")) {
-    try {
-      $pr = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType $lt -RunLevel Limited
-      Register-ScheduledTask -TaskName "kef-$lt" -Action $act -Principal $pr -Force | Out-Null
-      Start-ScheduledTask -TaskName "kef-$lt"
-      $signalled = $done.WaitOne(120000)  # failure bound on an external process
-      "== Limited-run-level task ($lt): signalled=$signalled"
-      if (Test-Path $out) { Get-Content $out; Remove-Item $out }
-      Unregister-ScheduledTask -TaskName "kef-$lt" -Confirm:$false
-      $done.Reset() | Out-Null
-    } catch { "== task ($lt) failed: $_" }
-  }
+  # runneradmin is not UAC-filtered (a Limited task still ran High, measured), so make a filtered admin.
+  $dir = "C:\kefprobe"; New-Item -ItemType Directory -Force $dir | Out-Null
+  icacls $dir /grant "Everyone:(OI)(CI)F" | Out-Null
+  icacls $dir /setintegritylevel "(OI)(CI)low" | Out-Null
+  Copy-Item $PSCommandPath "$dir\win_probe.ps1"
+  $pw = "Kf!" + [guid]::NewGuid().ToString("N").Substring(0, 16)
+  net user kefadm $pw /add | Out-Null
+  net localgroup Administrators kefadm /add | Out-Null
+  $out = "$dir\kef-inner.txt"
+  $w = New-Object System.IO.FileSystemWatcher($dir, "kef-inner.txt")
+  $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dir\win_probe.ps1`" -Mode inner -Out `"$out`""
+  try {
+    Register-ScheduledTask -TaskName "kef-limited" -Action $act -User "$env:COMPUTERNAME\kefadm" -Password $pw -RunLevel Limited -Force | Out-Null
+    Start-ScheduledTask -TaskName "kef-limited"
+    $res = $w.WaitForChanged([System.IO.WatcherChangeTypes]::Renamed, 120000)  # failure bound on an external process
+    "== Limited task as a fresh filtered admin (kefadm): timed out=$($res.TimedOut)"
+    if (Test-Path $out) { Get-Content $out }
+  } catch { "== task failed: $_" }
 } else {
   try {
     $r = @("inner: " + (Facts)); $r += "inner runas: " + [P]::Run($payload, $payloadArgs)
   } catch { $r += "inner error: $_" }
-  $r | Set-Content $Out
-  $ev = [System.Threading.EventWaitHandle]::OpenExisting("Global\kefInnerDone"); $ev.Set() | Out-Null
+  $r | Set-Content "$Out.tmp"
+  Move-Item "$Out.tmp" $Out
 }
