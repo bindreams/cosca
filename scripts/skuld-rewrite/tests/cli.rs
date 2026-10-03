@@ -164,6 +164,44 @@ fn unflipped_kind_name_entries_are_looked_up_in_the_manifest() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("lib:b"));
 }
 
+/// Applies `src/quote.rs` (reachable from the lib root) with `entry` unflipped. Exit 2 for the
+/// refusal only: an entry that names no target is a different exit 2, which fails here.
+fn apply_quote_with_unflipped(extra: &str, entry: &str) -> i32 {
+    let (_d, root) = toy_with(extra);
+    write(&root, "unflipped.txt", &format!("{entry}\n"));
+    let out = run(&root, &["apply", "--unflipped", "unflipped.txt", "src/quote.rs"]);
+    assert!(!stderr(&out).contains("neither a .rs path"), "{}", stderr(&out));
+    code(&out)
+}
+
+/// `lib:` means the guard's lib kinds, whatever crate types the lib has.
+#[test]
+fn unflipped_lib_matches_a_lib_of_any_crate_type() {
+    assert_eq!(
+        apply_quote_with_unflipped("\n[lib]\ncrate-type = [\"rlib\", \"cdylib\"]\n", "lib:toy"),
+        2
+    );
+    assert_eq!(apply_quote_with_unflipped("\n[lib]\nproc-macro = true\n", "lib:toy"), 2);
+    assert_eq!(apply_quote_with_unflipped("", "lib:toy"), 2);
+}
+
+/// A lib and a test with one name: `lib:` selects only the lib root, `test:` only the test root.
+#[test]
+fn unflipped_kind_separates_a_lib_and_a_test_of_the_same_name() {
+    let extra = "\n[[test]]\nname = \"toy\"\npath = \"tests/a.rs\"\n";
+    let apply = |entry: &str, target: &str| {
+        let (_d, root) = toy_with(extra);
+        write(&root, "unflipped.txt", &format!("{entry}\n"));
+        let out = run(&root, &["apply", "--unflipped", "unflipped.txt", target]);
+        assert!(!stderr(&out).contains("neither a .rs path"), "{}", stderr(&out));
+        code(&out)
+    };
+    assert_eq!(apply("lib:toy", "src/quote.rs"), 2, "the lib root is unflipped");
+    assert_eq!(apply("lib:toy", "tests/a.rs"), 0, "the test root is not");
+    assert_eq!(apply("test:toy", "tests/a.rs"), 2, "the test root is unflipped");
+    assert_eq!(apply("test:toy", "src/quote.rs"), 0, "the lib root is not");
+}
+
 #[test]
 fn unflipped_paths_work_and_a_name_that_matches_nothing_is_an_error() {
     let (_d, root) = toy();

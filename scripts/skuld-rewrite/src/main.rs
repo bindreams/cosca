@@ -56,6 +56,16 @@ enum Command {
     },
 }
 
+/// The guard's `lib` kind is every library kind; any other kind must match exactly.
+fn has_kind(target: &targets::Target, kind: &str) -> bool {
+    const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+    if kind == "lib" {
+        target.kinds.iter().any(|k| LIB_KINDS.contains(&k.as_str()))
+    } else {
+        target.kinds.iter().any(|k| k == kind)
+    }
+}
+
 fn read_unflipped(file: &Path, manifest: Option<&Path>) -> Result<Vec<PathBuf>> {
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let mut roots = Vec::new();
@@ -80,7 +90,7 @@ fn read_unflipped(file: &Path, manifest: Option<&Path>) -> Result<Vec<PathBuf>> 
         };
         let found: Vec<_> = all
             .iter()
-            .filter(|t| t.name == name && kind.is_none_or(|k| t.kinds.iter().any(|tk| tk == k)))
+            .filter(|t| t.name == name && kind.is_none_or(|k| has_kind(t, k)))
             .collect();
         if found.is_empty() {
             bail!(
