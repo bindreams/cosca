@@ -1,12 +1,8 @@
 //! Tests that need private mount or pid namespaces, run in a re-exec'd child of this test binary
 //! so the shared, multithreaded test process never changes its own namespaces.
 //!
-//! They need `CAP_SYS_ADMIN`, so they are a system-affecting group (see the
-//! system-affecting-tests principle in `docs/principles.md`), declared in `test_groups.rs`: on by
-//! default, `COSCA_TEST_NAMESPACES=0` ignores the group's tests, and running them needs
-//! `COSCA_TEST_NAMESPACES_CONSENT=1` — a missing consent FAILS the test. A test joins with
-//! `#[fixture(namespaces)] _group: &Group`, which also labels it `namespaces`. Run them in a
-//! container, VM, or CI's root lane, never on a developer host.
+//! They need `CAP_SYS_ADMIN`, so they are a system-affecting group declared in `test_groups.rs` (see
+//! `docs/principles.md`). Run them in a container, VM, or CI's root lane, never on a developer host.
 
 mod chroot_scratch;
 pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch};

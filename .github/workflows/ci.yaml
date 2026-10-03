@@ -492,9 +492,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 
-      # The namespaces group (`SKULD_LABELS=namespaces`) has its own step below, so the cgroup step
-      # leaves it out: `!namespaces`. A libtest binary ignores `SKULD_LABELS`; `spawn_io` and `tokio_io`
-      # have no namespace tests.
+      # The namespaces group has its own step below. `spawn_io` and `tokio_io` are libtest binaries (they ignore `SKULD_LABELS`) with no namespace tests.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
@@ -515,9 +513,7 @@ jobs:
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 
       # The namespaces group (`COSCA_TEST_NAMESPACES`, off workflow-wide), selected by its label.
-      # Some of its tests also need the delegated cgroup, so it runs in the same kind of leaf. Until
-      # the integration binaries are all flipped, `-E` names only the flipped one that has namespace
-      # tests (a libtest binary ignores `SKULD_LABELS` and would run whole).
+      # `-E binary(cosca)`: the only binary with namespace tests; libtest binaries ignore `SKULD_LABELS` and would run whole.
       - name: Run namespace tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
@@ -528,7 +524,6 @@ jobs:
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            # Some namespace tests also need a delegated cgroup, so their group is on too.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1

@@ -3,17 +3,16 @@
 //! A group is a skuld fixture carrying three things: `requires` (the off-switch: `Err` only for
 //! `<env>=0`, so an opted-out test is ignored, at list time too), a setup that fails the test
 //! unless `<env>_CONSENT` is exactly `1` (system-affecting groups only), and the group's label
-//! (lane selection, `SKULD_LABELS=<label>`). A test joins with `#[fixture(<fixture>)] _g: &Group`,
-//! and then has the gate and the label together.
+//! (lane selection, `SKULD_LABELS=<label>`).
 
-/// What a group's fixture yields once the group is enabled and, where asked, consented to.
+/// Proof that the group is enabled (and consented to, where asked).
 pub(crate) struct Group;
 
 /// The rule behind every group: `Ok(false)` for `enabled_var=0`; `Err` naming the consent
 /// variable for an enabled group without exactly `<enabled_var>_CONSENT=1`.
 pub(crate) fn check_group(enabled_var: &str, var: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
     let consent = format!("{enabled_var}_CONSENT");
-    if var(enabled_var).as_deref() == Some("0") {
+    if require_enabled(enabled_var, &var).is_err() {
         return Ok(false);
     }
     if var(&consent).as_deref() != Some("1") {
@@ -34,7 +33,6 @@ pub(crate) fn require_enabled(enabled_var: &str, var: impl Fn(&str) -> Option<St
 }
 
 /// A consent-asking group's setup: [`check_group`]'s rule, where `what` says what the group does.
-/// A group that is off is an `Err` too, so its body never runs.
 pub(crate) fn require_consent(
     enabled_var: &str,
     what: &str,

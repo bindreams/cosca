@@ -1,5 +1,4 @@
-//! `test_group!`'s behaviour, through one real `NAMESPACES` test re-exec'd with its own
-//! environment. In all three paths the test body never runs, so they are safe on any host.
+//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use super::{check_group, require_consent, require_enabled, Group};
 
@@ -78,7 +77,6 @@ fn require_consent_grants_only_on_exactly_1() {
         require_consent("COSCA_TEST_X", "does a thing", env(&[("COSCA_TEST_X_CONSENT", "1")])),
         Ok(Group)
     ));
-    // Off: skuld still runs a test body under `--run-ignored only`, so setup refuses.
     let off = [("COSCA_TEST_X", "0"), ("COSCA_TEST_X_CONSENT", "1")];
     let why = require_consent("COSCA_TEST_X", "does a thing", env(&off))
         .err()
@@ -103,17 +101,17 @@ mod reexec {
     const NAMESPACES_TEST: &str =
         "wait::backend::linux_namespace_tests::namespaces_a_status_mounted_over_below_proc_keeps_live_foreign_kills_working";
 
-    /// Re-execs this binary on exactly [`NAMESPACES_TEST`] with the group's variables set as given
-    /// (`None` removes them), and returns its suite outcome, its exit status and its stdout.
+    /// Re-execs this binary on exactly [`NAMESPACES_TEST`] with the group's variables set as given (`None` removes them).
     fn run_namespaces_test(group: Option<&str>, consent: Option<&str>) -> (SuiteOutcome, bool, String) {
-        run_namespaces_test_with(&[], group, consent)
+        run_namespaces_test_with(&[], group, consent, None)
     }
 
-    /// [`run_namespaces_test`] with `extra` arguments, such as `--ignored`.
+    /// [`run_namespaces_test`] with `extra` arguments, such as `--ignored`, and `SKULD_LABELS` set to `labels`.
     fn run_namespaces_test_with(
         extra: &[&str],
         group: Option<&str>,
         consent: Option<&str>,
+        labels: Option<&str>,
     ) -> (SuiteOutcome, bool, String) {
         let mut cmd = command(std::env::current_exe().expect("current_exe"));
         cmd.args(["--test-threads=1", "--exact", NAMESPACES_TEST, NOCAPTURE]);
@@ -122,6 +120,7 @@ mod reexec {
         for (var, value) in [
             ("COSCA_TEST_NAMESPACES", group),
             ("COSCA_TEST_NAMESPACES_CONSENT", consent),
+            ("SKULD_LABELS", labels),
         ] {
             match value {
                 Some(value) => cmd.env(var, value),
@@ -137,8 +136,7 @@ mod reexec {
         )
     }
 
-    /// Mutant: the group's `requires` never fails, so `=0` runs the test (and passes: the old gate
-    /// was a silent return).
+    /// Mutant: the group's `requires` never fails, so `=0` runs the test.
     #[skuld::test]
     fn group_zero_reports_ignored() {
         let (outcome, success, stdout) = run_namespaces_test(Some("0"), Some("1"));
@@ -175,19 +173,17 @@ mod reexec {
         assert!(stdout.contains("COSCA_TEST_NAMESPACES_CONSENT=1"), "{stdout}");
     }
 
-    /// skuld runs the body of an ignored test under `--ignored`, so `=0` must stop the body in the
-    /// fixture. Mutant: the setup grants a group that is off.
+    /// Mutant: the setup grants a group that is off.
     #[skuld::test]
     fn group_zero_never_runs_the_body_under_run_ignored() {
-        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"));
+        let (outcome, success, stdout) = run_namespaces_test_with(&["--ignored"], Some("0"), Some("1"), None);
         assert_eq!(outcome.test_count, 1, "{stdout}");
         assert_eq!(outcome.passed, 0, "{stdout}");
         assert_eq!((outcome.failed, outcome.ignored), (1, 0), "{stdout}");
         assert!(!success, "{stdout}");
-        // Without `CAP_SYS_ADMIN` a body that ran would fail too, on `unshare`, so `failed` alone
-        // proves nothing. The test's own `failed` event carries the fixture's refusal, which cosca's
-        // `require_consent` words, only when setup stopped it. (The run's whole output does not
-        // tell: skuld lists the unavailable tests, with this text, after every run.)
+        // A body that ran would fail on `unshare` too (unprivileged), so `failed` alone proves nothing: only the
+        // test's own `failed` event carries the fixture's refusal. (The whole output cannot tell: skuld prints the
+        // unavailable-test list after every run.)
         let failure = stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -195,5 +191,14 @@ mod reexec {
             .unwrap_or_else(|| panic!("no `failed` event for the test: {stdout}"));
         let message = failure["stdout"].as_str().unwrap_or_default();
         assert!(message.contains("setup failed: COSCA_TEST_NAMESPACES=0"), "{failure}");
+    }
+
+    /// Mutant: the group's fixture carries no label, so `SKULD_LABELS=namespaces` selects none of its tests.
+    #[skuld::test]
+    fn the_group_label_selects_its_tests() {
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("namespaces"));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        let (outcome, _, stdout) = run_namespaces_test_with(&[], Some("0"), Some("1"), Some("!namespaces"));
+        assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }
