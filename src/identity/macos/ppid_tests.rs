@@ -20,7 +20,7 @@ fn scripted(script: &[PpidRead]) -> (impl FnMut() -> PpidRead + '_, impl Fn() ->
 
 /// A fork in progress is re-read, with a pause before each re-read that grows with the attempt.
 /// Mutant: "`Forking` is `Unknown`" (a busy host's transient window fails every walk).
-#[test]
+#[skuld::test]
 fn a_fork_in_progress_is_reread_until_it_resolves() {
     let (read, count) = scripted(&[PpidRead::Forking, PpidRead::Forking, PpidRead::Found(7)]);
     let mut pauses = Vec::new();
@@ -30,14 +30,14 @@ fn a_fork_in_progress_is_reread_until_it_resolves() {
 }
 
 /// The pid exiting mid-fork ends the wait as `Gone`.
-#[test]
+#[skuld::test]
 fn a_pid_that_exits_while_forking_is_gone() {
     let (read, _) = scripted(&[PpidRead::Forking, PpidRead::Gone]);
     assert_eq!(resolve_ppid(read, |_| {}), Resolved::Gone);
 }
 
 /// A fork always finishes, so the wait has no count cap. Mutant: "give up after N re-reads".
-#[test]
+#[skuld::test]
 fn the_wait_for_a_fork_has_no_count_cap() {
     let mut script = vec![PpidRead::Forking; 100_000];
     script.push(PpidRead::Found(7));
@@ -48,7 +48,7 @@ fn the_wait_for_a_fork_has_no_count_cap() {
 
 /// A refused sysctl does not change on a re-read: `Unknown`, read once. Mutant: "a persistent
 /// refusal is retried" (the unscripted second read fails the test instead of hanging it).
-#[test]
+#[skuld::test]
 fn a_refused_sysctl_is_unknown_after_one_read() {
     let (read, count) = scripted(&[PpidRead::Refused]);
     assert_eq!(

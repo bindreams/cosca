@@ -30,7 +30,7 @@ fn keys<T: KeyLike>(v: &[T]) -> Vec<String> {
     v.iter().map(|x| x.key().to_string_lossy().into_owned()).collect()
 }
 
-#[test]
+#[skuld::test]
 fn default_strips_the_loader_family_and_injection_set() {
     let s = EnvSanitizer::default();
     let (kept, stripped) = s.apply(env(&[
@@ -47,7 +47,7 @@ fn default_strips_the_loader_family_and_injection_set() {
     assert_eq!(got, vec!["DYLD_INSERT_LIBRARIES", "IFS", "LD_BIND_NOW", "LD_PRELOAD"]);
 }
 
-#[test]
+#[skuld::test]
 fn keep_pokes_a_hole_in_a_denylist() {
     let s = EnvSanitizer::default().keep(["LD_LIBRARY_PATH"]);
     let (kept, stripped) = s.apply(env(&[("LD_LIBRARY_PATH", "/opt/lib"), ("LD_PRELOAD", "/e.so")]));
@@ -55,7 +55,7 @@ fn keep_pokes_a_hole_in_a_denylist() {
     assert_eq!(keys(&stripped), vec!["LD_PRELOAD"]);
 }
 
-#[test]
+#[skuld::test]
 fn keep_widens_an_allowlist_and_never_downgrades_it() {
     let s = EnvSanitizer::allowlist(["PATH"]).keep(["LANG"]);
     let (kept, stripped) = s.apply(env(&[("PATH", "/b"), ("LANG", "C"), ("MY_APP_CONFIG", "x")]));
@@ -63,7 +63,7 @@ fn keep_widens_an_allowlist_and_never_downgrades_it() {
     assert_eq!(keys(&stripped), vec!["MY_APP_CONFIG"]);
 }
 
-#[test]
+#[skuld::test]
 fn keep_on_a_filter_widens_it() {
     let s = EnvSanitizer::filter(|k, _v| k == "PATH").keep(["LANG"]);
     let (kept, stripped) = s.apply(env(&[("PATH", "/b"), ("LANG", "C"), ("OTHER", "x")]));
@@ -71,7 +71,7 @@ fn keep_on_a_filter_widens_it() {
     assert_eq!(keys(&stripped), vec!["OTHER"]);
 }
 
-#[test]
+#[skuld::test]
 fn allowlist_is_fail_closed() {
     let s = EnvSanitizer::allowlist(["PATH", "LANG"]);
     let (kept, stripped) = s.apply(env(&[("PATH", "/b"), ("LANG", "C"), ("MY_APP_CONFIG", "x")]));
@@ -79,7 +79,7 @@ fn allowlist_is_fail_closed() {
     assert_eq!(keys(&stripped), vec!["MY_APP_CONFIG"]);
 }
 
-#[test]
+#[skuld::test]
 fn none_keeps_everything() {
     let s = EnvSanitizer::none();
     let (kept, stripped) = s.apply(env(&[("LD_PRELOAD", "/e.so")]));
@@ -87,7 +87,7 @@ fn none_keeps_everything() {
     assert!(stripped.is_empty());
 }
 
-#[test]
+#[skuld::test]
 fn filter_runs_the_closure() {
     let s = EnvSanitizer::filter(|k, _v| k != "SECRET");
     let (kept, stripped) = s.apply(env(&[("SECRET", "x"), ("PATH", "/b")]));

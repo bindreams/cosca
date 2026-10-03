@@ -37,7 +37,7 @@ fn windows_record() -> ProcessIdRecord {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_matching_linux_record_validates() {
     assert_eq!(
         validate(&linux_record(), &Platform::Linux, &linux_scope()),
@@ -45,7 +45,7 @@ fn a_matching_linux_record_validates() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_windows_record_validates_with_an_empty_scope() {
     assert_eq!(
         validate(&windows_record(), &Platform::Windows, &Scope::none()),
@@ -53,7 +53,7 @@ fn a_windows_record_validates_with_an_empty_scope() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_is_rejected_on_windows() {
     // The measured hazard: Linux jiffies are boot-relative and would be compared against
     // an absolute FILETIME. Must never be accepted.
@@ -63,7 +63,7 @@ fn a_linux_record_is_rejected_on_windows() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_windows_record_is_rejected_on_linux() {
     assert_eq!(
         validate(&windows_record(), &Platform::Linux, &linux_scope()),
@@ -71,7 +71,7 @@ fn a_windows_record_is_rejected_on_linux() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_unknown_platform_tag_is_rejected_not_a_parse_failure() {
     let mut r = linux_record();
     r.platform = Platform::Other("freebsd".into());
@@ -81,7 +81,7 @@ fn an_unknown_platform_tag_is_rejected_not_a_parse_failure() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_unknown_version_is_rejected_before_anything_else() {
     let mut r = linux_record();
     r.version = RECORD_VERSION + 1;
@@ -94,7 +94,7 @@ fn an_unknown_version_is_rejected_before_anything_else() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_version_zero_record_is_rejected() {
     let mut r = linux_record();
     r.version = 0;
@@ -104,7 +104,7 @@ fn a_version_zero_record_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_from_a_different_boot_is_rejected() {
     // After a reboot the jiffy counter restarts, so a saved token would alias onto whatever
     // now occupies the pid.
@@ -118,7 +118,7 @@ fn a_linux_record_from_a_different_boot_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_from_a_different_pid_namespace_is_rejected() {
     // Measured: a container shares the host's boot_id but has its own pid namespace,
     // so boot_id alone does not scope the pid.
@@ -132,7 +132,7 @@ fn a_linux_record_from_a_different_pid_namespace_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_without_a_boot_id_is_rejected() {
     let mut r = linux_record();
     r.boot_id = None;
@@ -142,7 +142,7 @@ fn a_linux_record_without_a_boot_id_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_without_a_pid_namespace_is_rejected() {
     let mut r = linux_record();
     r.pid_ns = None;
@@ -152,7 +152,7 @@ fn a_linux_record_without_a_pid_namespace_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn scope_fields_the_host_does_not_use_are_ignored() {
     // A Windows record that somehow carries Linux scope fields is still valid on Windows:
     // the platform matched, and this host has no boot session to compare against.
@@ -165,7 +165,7 @@ fn scope_fields_the_host_does_not_use_are_ignored() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn platform_tags_round_trip_through_their_wire_strings() {
     for p in [Platform::Linux, Platform::MacOs, Platform::Windows] {
         assert_eq!(Platform::from_wire(p.as_str()), p);
@@ -174,7 +174,7 @@ fn platform_tags_round_trip_through_their_wire_strings() {
     assert_eq!(Platform::Other("freebsd".into()).as_str(), "freebsd");
 }
 
-#[test]
+#[skuld::test]
 fn the_wire_strings_are_the_documented_ones() {
     // Pinned literals: these strings are the persisted format and may never drift.
     assert_eq!(Platform::Linux.as_str(), "linux");
@@ -182,7 +182,7 @@ fn the_wire_strings_are_the_documented_ones() {
     assert_eq!(Platform::Windows.as_str(), "windows");
 }
 
-#[test]
+#[skuld::test]
 fn platform_current_names_this_host() {
     // Expected value from `std::env::consts::OS`, an independent fact about the build
     // target — NOT a second copy of `Platform::current`'s own cfg branching, which would
@@ -198,7 +198,7 @@ fn platform_current_names_this_host() {
 // negative, where `kill(-N, sig)` hits a whole process group. Restoring such a pid must be
 // a typed rejection, never a panic — and never a signal to the wrong target.
 
-#[test]
+#[skuld::test]
 fn a_unix_record_with_pid_zero_is_rejected() {
     let mut r = linux_record();
     r.pid = 0;
@@ -208,7 +208,7 @@ fn a_unix_record_with_pid_zero_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_macos_record_with_pid_zero_is_rejected() {
     // macOS is the platform where pid 0 actually RESOLVES (`kernel_task`), so the check
     // cannot be left to the later existence probe.
@@ -226,7 +226,7 @@ fn a_macos_record_with_pid_zero_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_unix_record_with_a_pid_above_i32_max_is_rejected() {
     let mut r = linux_record();
     r.pid = u32::MAX;
@@ -236,7 +236,7 @@ fn a_unix_record_with_a_pid_above_i32_max_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_windows_record_with_pid_zero_is_rejected() {
     let mut r = windows_record();
     r.pid = 0;
@@ -246,7 +246,7 @@ fn a_windows_record_with_pid_zero_is_rejected() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_windows_record_with_a_pid_above_i32_max_is_accepted() {
     // Deliberate asymmetry: a Windows pid is a full `DWORD` and is never a `kill(2)`
     // target, so the `i32` ceiling that protects the Unix backends does not apply here.
@@ -258,7 +258,7 @@ fn a_windows_record_with_a_pid_above_i32_max_is_accepted() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn the_pid_check_runs_after_the_platform_check() {
     // A pid-0 record from the wrong platform is ForeignPlatform: the pid rule is chosen by
     // platform, so it may not be applied before the platform is known to match.
@@ -270,7 +270,7 @@ fn the_pid_check_runs_after_the_platform_check() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_scope_mismatch_names_the_values_that_diverged() {
     // `kind` alone tells an operator the category; the detail has to say WHICH value
     // failed to match, the way the ScopeUnreadable path names its path and OS error.
@@ -301,7 +301,7 @@ fn a_scope_mismatch_names_the_values_that_diverged() {
     assert!(rendered.contains("4242"), "and the pid: {rendered}");
 }
 
-#[test]
+#[skuld::test]
 fn a_scope_read_failure_keeps_the_path_and_the_cause() {
     // The one failure to_record/try_from can have. The mapping is pure, so it is checked
     // on every host even though only Linux can trigger it for real.
@@ -337,7 +337,7 @@ fn a_failed_scope_read() -> Result<Scope, ScopeReadError> {
     })
 }
 
-#[test]
+#[skuld::test]
 fn a_failed_scope_read_aborts_writing_a_record() {
     // Drives the `?` inside `record_from` — the wiring `to_record` is one line of. Runs on
     // every host, including the two whose real `session_scope` cannot fail.
@@ -352,7 +352,7 @@ fn a_failed_scope_read_aborts_writing_a_record() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_failed_scope_read_aborts_restoring_a_record() {
     // The same for `restore`. The record itself is perfectly valid — only the host's own
     // scope read failed — so anything other than ScopeUnreadable means the `?` is misplaced
@@ -372,7 +372,7 @@ fn a_failed_scope_read_aborts_restoring_a_record() {
     assert_eq!(*kind, RecordErrorKind::ScopeUnreadable);
 }
 
-#[test]
+#[skuld::test]
 fn the_current_identity_round_trips_through_a_record() {
     let me = ProcessId::current();
     let record = me.to_record().expect("this host can describe its own boot session");
@@ -386,7 +386,7 @@ fn the_current_identity_round_trips_through_a_record() {
     assert_eq!(back.is_alive(), Liveness::Alive);
 }
 
-#[test]
+#[skuld::test]
 fn restoring_is_not_a_liveness_check() {
     // A record for a process that has exited still RESTORES — validation is about whether
     // the token can be compared here at all, not about whether the process is there.
@@ -408,7 +408,7 @@ fn restoring_is_not_a_liveness_check() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_record_from_this_host_carries_exactly_this_hosts_scope() {
     let record = ProcessId::current().to_record().expect("to_record");
     #[cfg(target_os = "linux")]
@@ -437,14 +437,14 @@ fn assert_refused(record: &ProcessIdRecord, kind: RecordErrorKind) {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_foreign_platform_record_is_refused_with_a_typed_error() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.platform = Platform::Other("freebsd".into());
     assert_refused(&record, RecordErrorKind::ForeignPlatform);
 }
 
-#[test]
+#[skuld::test]
 fn a_pid_zero_record_is_refused_through_the_live_path() {
     // The path that matters: a corrupt or hand-edited file reaching `Process::kill` with
     // pid 0 would panic in `src/wait/linux.rs` rather than return an error.
@@ -454,7 +454,7 @@ fn a_pid_zero_record_is_refused_through_the_live_path() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_pid_above_i32_max_is_refused_through_the_live_path() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.pid = u32::MAX;
@@ -467,7 +467,7 @@ fn a_pid_above_i32_max_is_refused_through_the_live_path() {
 // silently disabling the boot check (or rejecting every real restore).
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_record_from_a_different_boot_is_refused_through_the_live_path() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.boot_id = Some("00000000-0000-0000-0000-000000000000".into());
@@ -475,7 +475,7 @@ fn a_record_from_a_different_boot_is_refused_through_the_live_path() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_record_without_a_boot_id_is_refused_through_the_live_path() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.boot_id = None;
@@ -483,7 +483,7 @@ fn a_record_without_a_boot_id_is_refused_through_the_live_path() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_record_from_a_different_pid_namespace_is_refused_through_the_live_path() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.pid_ns = Some(record.pid_ns.expect("linux records carry a pid namespace") + 1);
@@ -491,7 +491,7 @@ fn a_record_from_a_different_pid_namespace_is_refused_through_the_live_path() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_record_without_a_pid_namespace_is_refused_through_the_live_path() {
     let mut record = ProcessId::current().to_record().expect("to_record");
     record.pid_ns = None;
@@ -499,7 +499,7 @@ fn a_record_without_a_pid_namespace_is_refused_through_the_live_path() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_unreadable_boot_session_is_reported_with_its_path_and_cause() {
     // A real failed read of real paths that do not exist — no mocking. This is the only
     // way ScopeUnreadable is reachable in a test; on Windows and macOS the scope read
@@ -521,7 +521,7 @@ fn an_unreadable_boot_session_is_reported_with_its_path_and_cause() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_blank_boot_id_is_refused_rather_than_stored() {
     // A container runtime that masks the boot_id file (bind-mounting /dev/null over it)
     // makes the read SUCCEED and return "". Storing that as Some("") would compare equal to

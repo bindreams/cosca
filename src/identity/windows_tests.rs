@@ -5,7 +5,7 @@ use super::{creation_token, current_token, is_running, start_token};
 use crate::identity::windows_fixture::spawn_restricted;
 use crate::identity::{Liveness, Resolved, StartToken};
 
-#[test]
+#[skuld::test]
 fn start_token_of_current_process_is_stable() {
     let pid = std::process::id();
     let a = start_token(pid);
@@ -15,12 +15,12 @@ fn start_token_of_current_process_is_stable() {
 
 /// `current_token` reads the pseudo-handle, so it must agree with the by-pid read on a
 /// process that permits both — and, unlike it, can never be denied.
-#[test]
+#[skuld::test]
 fn current_token_agrees_with_the_by_pid_read() {
     assert_eq!(current_token(), start_token(std::process::id()));
 }
 
-#[test]
+#[skuld::test]
 fn is_running_alive_for_self_dead_for_wrong_token() {
     let pid = std::process::id();
     let Resolved::Found(tok) = start_token(pid) else {
@@ -36,7 +36,7 @@ fn is_running_alive_for_self_dead_for_wrong_token() {
 }
 
 /// A LIVE process we may not open at all: ERROR_ACCESS_DENIED must NOT read as absence.
-#[test]
+#[skuld::test]
 fn denied_query_limited_reads_unknown_not_gone() {
     let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
     let token = creation_token(child.handle()).expect("the owned handle can always read the token");
@@ -57,7 +57,7 @@ fn denied_query_limited_reads_unknown_not_gone() {
 /// QUERY_LIMITED granted, SYNCHRONIZE denied: the identity resolves, but the signaled state
 /// cannot be read and GetExitCodeProcess reports STILL_ACTIVE, which does not distinguish
 /// "running" from "exited with code 259". Unknown, not Alive, not Dead.
-#[test]
+#[skuld::test]
 fn denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     let token = creation_token(child.handle()).expect("owned handle reads the token");
@@ -74,7 +74,7 @@ fn denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running() 
 /// The same process after it exits with a concrete code: GetExitCodeProcess PROVES the exit
 /// through QUERY_LIMITED alone, so this must be Dead — not Unknown, or every already-dead
 /// `kill` on such a process would report failure.
-#[test]
+#[skuld::test]
 fn exited_process_denying_synchronize_reads_dead() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     let token = creation_token(child.handle()).expect("owned handle reads the token");
@@ -85,7 +85,7 @@ fn exited_process_denying_synchronize_reads_dead() {
 
 /// A pid that cannot exist classifies as definitely-gone, not Unknown — otherwise the
 /// tri-state would degenerate to always-Unknown.
-#[test]
+#[skuld::test]
 fn nonexistent_pid_is_gone_not_unknown() {
     // OpenProcess for an unused pid returns ERROR_INVALID_PARAMETER, the "no such process"
     // signal. The value is chosen, not arbitrary: Windows allocates pids from a low, densely
@@ -99,7 +99,7 @@ fn nonexistent_pid_is_gone_not_unknown() {
 
 /// `Process::kill` documents "a real failure (no rights / access-denied on a live process)
 /// => Err". An access-denied live process must therefore not produce Ok.
-#[test]
+#[skuld::test]
 fn kill_of_an_access_denied_live_process_is_an_error() {
     let child = crate::identity::windows_fixture::spawn_unkillable();
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -121,7 +121,7 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
 }
 
 /// `Process::wait` must not report an exit it never observed.
-#[test]
+#[skuld::test]
 fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
     let child = crate::identity::windows_fixture::spawn_unkillable();
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -143,7 +143,7 @@ fn block_until_exit_of_an_access_denied_live_process_is_an_error() {
 /// The other side of the same branch: `Denied` plus a provably-Dead target must still report
 /// success, or every already-exited kill or wait on such a process would start failing. The
 /// two entry points need DIFFERENT fixtures, because their masks differ.
-#[test]
+#[skuld::test]
 fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     let id = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -155,7 +155,7 @@ fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
         .expect("waiting on an already-exited process is success"));
 }
 
-#[test]
+#[skuld::test]
 fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
     let child = crate::identity::windows_fixture::spawn_query_only();
@@ -178,7 +178,7 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
 
 /// A stale identity over a pid whose occupant we CAN read: the token comparison runs, finds
 /// a different process, and reports the original exited.
-#[test]
+#[skuld::test]
 fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())
@@ -191,7 +191,7 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
 
 /// The other half of the documented asymmetry: when the pid's occupant cannot be read
 /// either, the original's exit cannot be established. `Err`, not a guessed `Ok`.
-#[test]
+#[skuld::test]
 fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
     let child = crate::identity::windows_fixture::spawn_unkillable();
     let real = crate::identity::windows_identity_from_handle(child.handle(), child.pid())

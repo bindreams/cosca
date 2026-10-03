@@ -1,6 +1,6 @@
 use super::Secret;
 
-#[test]
+#[skuld::test]
 fn secret_debug_is_redacted() {
     let s = Secret::new("hunter2");
     let dbg = format!("{s:?}");
@@ -8,7 +8,7 @@ fn secret_debug_is_redacted() {
     assert!(dbg.contains("Secret"), "{dbg}");
 }
 
-#[test]
+#[skuld::test]
 fn secret_exposes_bytes_for_the_effect_layer() {
     let s = Secret::new("pw");
     assert_eq!(s.expose(), b"pw");
@@ -16,28 +16,28 @@ fn secret_exposes_bytes_for_the_effect_layer() {
 
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
 
-#[test]
+#[skuld::test]
 fn backend_defaults_to_auto() {
     assert_eq!(Backend::default(), Backend::Auto);
 }
 
-#[test]
+#[skuld::test]
 fn auth_defaults_to_interactive() {
     assert!(matches!(Auth::default(), Auth::Interactive));
 }
 
-#[test]
+#[skuld::test]
 fn privilege_variants_are_distinct() {
     assert_ne!(Privilege::Unprivileged, Privilege::Elevated);
 }
 
-#[test]
+#[skuld::test]
 fn elevated_via_distinguishes_windows_uac_from_wrapped() {
     assert_ne!(ElevatedVia::WindowsUac, ElevatedVia::Wrapped(Backend::Sudo));
     assert_ne!(ElevatedVia::WindowsUac, ElevatedVia::AlreadyElevated);
 }
 
-#[test]
+#[skuld::test]
 fn elevation_report_holds_achieved_state() {
     let r = ElevationReport {
         via: ElevatedVia::Wrapped(Backend::Sudo),
@@ -49,7 +49,7 @@ fn elevation_report_holds_achieved_state() {
     assert_eq!(r.stdio, ElevatedStdio::Passthrough);
 }
 
-#[test]
+#[skuld::test]
 fn already_elevated_report_is_single_sourced() {
     let r = super::already_elevated_report(ElevatedStdio::Passthrough);
     assert_eq!(r.via, ElevatedVia::AlreadyElevated);
@@ -57,7 +57,7 @@ fn already_elevated_report_is_single_sourced() {
     assert_eq!(r.stdio, ElevatedStdio::Passthrough);
 }
 
-#[test]
+#[skuld::test]
 fn remap_backend_missing_is_backend_unavailable_with_cause() {
     use crate::error::{ElevationErrorKind, Error};
     let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
@@ -80,7 +80,7 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn remap_preserves_a_non_backend_io_error() {
     use crate::error::Error;
     // The backend path exists (this test binary), so a NotFound is NOT the backend —
@@ -94,7 +94,7 @@ fn remap_preserves_a_non_backend_io_error() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn remap_passes_through_unrelated_errors() {
     use crate::error::Error;
     let e = super::remap_derived_spawn_error(
@@ -109,7 +109,7 @@ fn remap_passes_through_unrelated_errors() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn remap_backend_exists_but_not_executable_is_backend_unavailable() {
     use crate::error::{ElevationErrorKind, Error};
     use std::os::unix::fs::PermissionsExt;
@@ -136,7 +136,7 @@ fn remap_backend_exists_but_not_executable_is_backend_unavailable() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn elevated_stdio_stdin_consumed_variant_exists() {
     // POSIX Auth::Stdin binds fd0 to the elevation password channel; reporting
     // Passthrough would be a lie. This variant must exist and be distinct.
@@ -145,7 +145,7 @@ fn elevated_stdio_stdin_consumed_variant_exists() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn is_elevated_matches_effective_uid_ground_truth() {
     // Never assume ambient privilege; compare against an independent syscall.
     // SAFETY: geteuid has no preconditions and never fails.
@@ -154,14 +154,14 @@ fn is_elevated_matches_effective_uid_ground_truth() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn detect_reports_linux() {
     let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
     assert_eq!(h.os, super::plan::Os::Linux);
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-#[test]
+#[skuld::test]
 fn detect_reports_unix_os() {
     let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
     assert_eq!(h.os, super::plan::Os::Unix);
@@ -170,7 +170,7 @@ fn detect_reports_unix_os() {
 /// macOS must NOT report `Os::Unix`: the whole point of the split is that the
 /// planner can tell it apart, and detection is the only place that decision is made.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn detect_reports_macos() {
     let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive);
     assert_eq!(h.os, super::plan::Os::MacOs);
@@ -181,7 +181,7 @@ fn detect_reports_macos() {
     assert!(h.arg_max.is_some(), "kern.argmax must be readable on macOS");
 }
 
-#[test]
+#[skuld::test]
 fn kill_error_on_an_elevated_wrapper_is_unkillable() {
     use crate::error::{ElevationErrorKind, Error};
     let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
@@ -198,14 +198,14 @@ fn kill_error_on_an_elevated_wrapper_is_unkillable() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn kill_error_on_a_plain_child_stays_io() {
     use crate::error::Error;
     let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     assert!(matches!(super::map_elevated_kill_error(eperm, false), Error::Io(_)));
 }
 
-#[test]
+#[skuld::test]
 fn non_permission_kill_error_stays_io_even_when_elevated() {
     use crate::error::Error;
     let other = std::io::Error::from(std::io::ErrorKind::NotFound);
@@ -213,7 +213,7 @@ fn non_permission_kill_error_stays_io_even_when_elevated() {
 }
 
 /// Every backend's argv gate is this one function; only the words differ.
-#[test]
+#[skuld::test]
 fn the_shared_argv_gate_refuses_each_rule_with_the_backends_words() {
     use crate::command::Command;
     use crate::error::Error;

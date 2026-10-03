@@ -5,7 +5,7 @@ use super::*;
 // The kernel must agree with our struct size exactly: for a real one-record fetch, XNU
 // sets the written size to sizeof(struct kinfo_proc). (A NULL-buffer probe is NOT usable
 // here — XNU inflates it by KERN_PROCSLOP = 5*sizeof, so it reports 6*sizeof for one pid.)
-#[test]
+#[skuld::test]
 fn kernel_writes_exactly_our_kinfo_proc_size() {
     let mut buf = [0u8; 2 * std::mem::size_of::<kinfo_proc>()];
     let mut size = buf.len();
@@ -43,7 +43,7 @@ fn kernel_writes_exactly_our_kinfo_proc_size() {
 // SCOPE: the EPERM arm - a sandboxed sysctl refusal - is a DIFFERENT arm, reached by no
 // test on any available machine.
 #[cfg_attr(debug_assertions, should_panic(expected = "sysctl(KERN_PROC"))]
-#[test]
+#[skuld::test]
 fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
     let r = super::read_record(std::process::id() as super::super::RawPid, -1);
     // `assert_eq!` is impossible here: `Resolved`-s derives are T-bounded and `kinfo_proc`
@@ -54,7 +54,7 @@ fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
 // Verifies contract_violation's warn is actually captured, not just that debug panics —
 // the release lane (no should_panic) asserts the captured record directly.
 #[cfg_attr(debug_assertions, should_panic(expected = "synthetic"))]
-#[test]
+#[skuld::test]
 fn contract_violation_traces_then_trips() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -69,7 +69,7 @@ fn contract_violation_traces_then_trips() {
 // Value oracle: for a LIVE process the sysctl-derived token must equal the
 // proc_pidinfo-derived token — a wrong `p_un` offset or padding error fails here.
 // `proc_pidinfo` survives ONLY as this oracle.
-#[test]
+#[skuld::test]
 fn sysctl_token_matches_libproc_for_a_live_process() {
     let pid = std::process::id() as libc::c_int;
 
@@ -133,7 +133,7 @@ fn sysctl_token_matches_libproc_for_a_live_process() {
 // A simple grow-until-it-fits pid listing, not `collect_pids`'s hot-path doubling discipline
 // (see `containment::enumerate::macos`) — this test only needs one complete snapshot, not a
 // `hard_kill`-safe allocator.
-#[test]
+#[skuld::test]
 fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
     let mut cap = 1024usize;
     let pids = loop {
@@ -239,7 +239,7 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
 // only) and this test's own process — the latter additionally cross-checked against
 // `proc_pidinfo`'s independently-defined `PROC_FLAG_SYSTEM` (`sys/proc_info.h`, no `libc`
 // crate constant, restated here as a local, source-cited value).
-#[test]
+#[skuld::test]
 fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non_system() {
     const PROC_FLAG_SYSTEM: u32 = 1;
 

@@ -71,7 +71,7 @@ fn rewrite_reading_nothing(c: &mut Command, host: &Host) -> Result<PosixRewrite,
 }
 
 /// `RunAsIs` spawns the program itself, as an unelevated spawn does.
-#[test]
+#[skuld::test]
 fn an_already_elevated_exact_program_is_spawned_as_an_unelevated_one_is() {
     for cwd in [Some("/work"), Some("sub"), None] {
         let rw = rewrite_reading_nothing(&mut exact_tool(cwd), &elevated_sudo_host()).expect("rewrite");
@@ -86,7 +86,7 @@ fn an_already_elevated_exact_program_is_spawned_as_an_unelevated_one_is() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_elevated_exact_program_that_names_no_file_is_refused() {
     for n in ["", ".", "dir/"] {
         let mut c = Command::new();
@@ -107,7 +107,7 @@ fn an_elevated_exact_program_that_names_no_file_is_refused() {
 /// The trampoline takes no directory, so osascript's script `cd`s to an absolute one: its
 /// program and directory must come from one reading of the process cwd, or a second reading
 /// could load the program from one directory and run it in another.
-#[test]
+#[skuld::test]
 fn the_gui_rewrite_reads_the_process_cwd_exactly_once() {
     let mut gui = exact_tool(None);
     gui.elevation_backend(Backend::Auto).elevation_auth(Auth::Gui);
@@ -130,7 +130,7 @@ fn the_gui_rewrite_reads_the_process_cwd_exactly_once() {
 }
 
 /// Negative control: a `Search` program's relative `current_dir` is passed through.
-#[test]
+#[skuld::test]
 fn an_elevated_search_programs_relative_cwd_is_passed_through() {
     let mut c = exact_tool(Some("sub"));
     c.executable("tool");
@@ -139,7 +139,7 @@ fn an_elevated_search_programs_relative_cwd_is_passed_through() {
 }
 
 /// osascript needs a path to the cwd; a cwd with none fails loudly, with the OS's kind kept.
-#[test]
+#[skuld::test]
 fn a_gui_exact_program_in_a_cwd_with_no_path_says_why() {
     let mut gui = exact_tool(None);
     gui.elevation_backend(Backend::Auto).elevation_auth(Auth::Gui);
@@ -166,7 +166,7 @@ const FIXTURE_UNLINKED_CWD_ENV: &str = "COSCA_FIXTURE_UNLINKED_CWD";
 /// Inert in an ordinary suite run. Re-executed by
 /// [`an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read`], it waits for one byte on
 /// stdin — sent once its cwd has been removed — then rewrites for osascript.
-#[test]
+#[skuld::test]
 fn fixture_elevated_exact_in_an_unlinked_cwd() {
     use std::io::Read;
     if std::env::var_os(FIXTURE_UNLINKED_CWD_ENV).is_none() {
@@ -189,7 +189,7 @@ fn fixture_elevated_exact_in_an_unlinked_cwd() {
 /// An unlinked cwd has no path on any OS: the read itself fails, with `NotFound`, where an
 /// unsearchable ancestor fails it only on macOS. The cwd is removed from under a child this
 /// test spawned in it, so this process's own cwd never moves.
-#[test]
+#[skuld::test]
 fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     use std::io::Write;
     let root = tempfile::tempdir().expect("tempdir");
@@ -226,7 +226,7 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
 /// sudo, doas and run0 are started in the caller's directory, as given, handed `./tool`, and run
 /// it there (`run0` told `-D .`). None of them needs this process's cwd as a path. pkexec refuses
 /// a relative `raw_executable()` ([`pkexec_refuses_a_relative_raw_executable`]).
-#[test]
+#[skuld::test]
 fn a_cwd_keeping_backend_gets_the_program_anchored_to_the_inherited_cwd() {
     for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
         for cwd in [None, Some("sub"), Some("/work")] {
@@ -252,7 +252,7 @@ fn a_cwd_keeping_backend_gets_the_program_anchored_to_the_inherited_cwd() {
 
 /// pkexec runs a relative program only if the caller itself can execute it, so a relative
 /// `raw_executable()` is refused before anything runs, root or not, and whatever the directory.
-#[test]
+#[skuld::test]
 fn pkexec_refuses_a_relative_raw_executable() {
     for elevated in [false, true] {
         let host = Host {
@@ -275,7 +275,7 @@ fn pkexec_refuses_a_relative_raw_executable() {
 
 /// pkexec has no `--`, so a program starting with `-` would be read as an option: it is refused
 /// before anything runs, root or not.
-#[test]
+#[skuld::test]
 fn pkexec_refuses_a_leading_dash_program() {
     let commands = || {
         let mut search = Command::new();
@@ -302,7 +302,7 @@ fn pkexec_refuses_a_leading_dash_program() {
 
 /// Every other program reaches pkexec as written: an absolute `raw_executable()`, and a program
 /// named by `executable()` or `argv[0]`, relative or bare, which pkexec's own lookup resolves.
-#[test]
+#[skuld::test]
 fn pkexec_gets_every_other_program_as_written() {
     let search = |p: &str| {
         let mut c = Command::new();
@@ -330,7 +330,7 @@ fn pkexec_gets_every_other_program_as_written() {
 /// The launch execs the very file detection pinned and probed: `/proc/self/fd/N` for the pinned
 /// descriptor, with the canonical path as `argv[0]`. The derived command holds the descriptor
 /// open until it is spawned.
-#[test]
+#[skuld::test]
 fn pkexec_is_launched_through_the_pinned_descriptor() {
     use std::os::fd::AsRawFd;
     let host = every_backend_host();
@@ -361,7 +361,7 @@ fn pkexec_is_launched_through_the_pinned_descriptor() {
 }
 
 /// sudo, doas and run0 take a leading-dash program after their `--`, as written.
-#[test]
+#[skuld::test]
 fn a_leading_dash_exact_program_reaches_the_others_as_written() {
     for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
         let mut c = Command::new();
@@ -374,7 +374,7 @@ fn a_leading_dash_exact_program_reaches_the_others_as_written() {
 
 /// A pkexec not shown to be polkit 121 or later is refused whatever the command, since every
 /// launch passes `--keep-cwd`, which an older pkexec takes for the program.
-#[test]
+#[skuld::test]
 fn a_pkexec_older_than_121_is_refused() {
     for version in [
         PkexecVersion::Parsed {
@@ -411,7 +411,7 @@ fn a_pkexec_older_than_121_is_refused() {
 }
 
 /// The refusal is about the pkexec that would run; an already-root caller runs none.
-#[test]
+#[skuld::test]
 fn an_already_root_pkexec_request_runs_whatever_the_version() {
     let host = Host {
         elevated: true,
@@ -424,7 +424,7 @@ fn an_already_root_pkexec_request_runs_whatever_the_version() {
 }
 
 /// Negative control: a `Search` program still reaches the wrapper as written.
-#[test]
+#[skuld::test]
 fn an_elevated_search_program_is_passed_as_written() {
     let mut c = Command::new();
     c.executable("tool")

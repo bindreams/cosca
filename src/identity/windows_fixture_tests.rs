@@ -22,7 +22,7 @@ fn open_err(pid: u32, mask: PROCESS_ACCESS_RIGHTS) -> Option<u32> {
     }
 }
 
-#[test]
+#[skuld::test]
 fn the_fixture_child_is_actually_running() {
     let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
     assert!(
@@ -31,7 +31,7 @@ fn the_fixture_child_is_actually_running() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn query_limited_is_denied_when_not_granted() {
     let child = spawn_restricted(PROCESS_SYNCHRONIZE.0);
     assert_eq!(
@@ -45,7 +45,7 @@ fn query_limited_is_denied_when_not_granted() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn synchronize_is_denied_while_query_limited_is_granted() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     assert_eq!(open_err(child.pid(), PROCESS_QUERY_LIMITED_INFORMATION), None);
@@ -57,7 +57,7 @@ fn synchronize_is_denied_while_query_limited_is_granted() {
     assert!(child.is_running());
 }
 
-#[test]
+#[skuld::test]
 fn spawn_unkillable_denies_everything() {
     // The empty DACL is load-bearing for four downstream tests; if it ever granted anything
     // they would all take the Opened::Found path and pass vacuously.
@@ -70,7 +70,7 @@ fn spawn_unkillable_denies_everything() {
     assert!(child.is_running(), "precondition: the subject must be live");
 }
 
-#[test]
+#[skuld::test]
 fn spawn_query_only_denies_terminate_and_grants_query_limited() {
     // Its denial property is what makes `wait::kill`'s Denied arm reachable at all; without
     // this the test that depends on it would pass by terminating a corpse instead.
@@ -84,7 +84,7 @@ fn spawn_query_only_denies_terminate_and_grants_query_limited() {
     assert!(child.is_running(), "precondition: the subject must be live");
 }
 
-#[test]
+#[skuld::test]
 fn terminate_is_granted_by_spawn_restricted_and_denied_by_spawn_unkillable() {
     // Bound, not temporaries: the fixture's own handle keeps a dead child's kernel object
     // (and pid) alive, so both verdicts below hold on a corpse. Liveness must be asserted.
@@ -97,7 +97,7 @@ fn terminate_is_granted_by_spawn_restricted_and_denied_by_spawn_unkillable() {
     assert!(denied.is_running(), "precondition: the subject must be live");
 }
 
-#[test]
+#[skuld::test]
 fn terminate_records_the_exit_and_is_idempotent() {
     let child = spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
     child.terminate();

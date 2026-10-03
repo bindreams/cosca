@@ -12,7 +12,7 @@ fn refused(token: &str) -> bool {
 
 /// A `"` would end the `"%1"` quote in `exefile`'s `runas` command early, and no Win32 file name
 /// holds one, so it is refused wherever it stands.
-#[test]
+#[skuld::test]
 fn a_quote_anywhere_is_refused() {
     for token in [
         r#""C:\tools\setup.exe""#,
@@ -27,7 +27,7 @@ fn a_quote_anywhere_is_refused() {
 /// The spellings ShellExecuteEx rewrites WITHOUT a class — a URL, a shell namespace name, a `www`
 /// prefix, `%VAR%` — are none of them a fully qualified `.exe`/`.com` path, so the class launch
 /// never sees one.
-#[test]
+#[skuld::test]
 fn every_rewritten_spelling_is_refused_as_not_a_fully_qualified_image() {
     for token in [
         "file:///C:/tools/setup%2Eexe",
@@ -45,7 +45,7 @@ fn every_rewritten_spelling_is_refused_as_not_a_fully_qualified_image() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_fully_qualified_image_path_passes() {
     for token in [
         r"C:\tools\setup.exe",
@@ -67,7 +67,7 @@ fn a_fully_qualified_image_path_passes() {
 /// only a token that already names an image. The rule is
 /// [`crate::resolve::reject_unloadable_image`]'s, so it refuses with `InvalidInput` and names
 /// `PATHEXT`, ahead of the fully-qualified rule.
-#[test]
+#[skuld::test]
 fn an_elevated_token_must_end_in_exe_or_com() {
     for token in [
         r"C:\tools\setup.exe",
@@ -108,7 +108,7 @@ fn an_elevated_token_must_end_in_exe_or_com() {
 
 /// A relative or bare name would leave ShellExecuteEx a lookup to make — App Paths, `lpDirectory`,
 /// `PATH` — which is unmeasured for the consent launch, so only a fully qualified path is taken.
-#[test]
+#[skuld::test]
 fn an_elevated_program_must_be_fully_qualified() {
     for token in [
         r"C:\tools\setup.exe",
@@ -156,7 +156,7 @@ fn an_elevated_program_must_be_fully_qualified() {
 
 /// A `%` is refused in the program and in the directory, with `InvalidInput`: whether the consent
 /// launch expands it is unmeasured, so the refusal is conservative.
-#[test]
+#[skuld::test]
 fn a_percent_is_refused_in_the_program_and_the_directory() {
     let invalid = |r: Result<(), Error>, what: &str| match r {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {

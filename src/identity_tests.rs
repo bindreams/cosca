@@ -13,23 +13,23 @@ fn id(pid: RawPid, tok: u64) -> ProcessId {
     }
 }
 
-#[test]
+#[skuld::test]
 fn equal_when_pid_and_token_match() {
     assert_eq!(id(42, 1000), id(42, 1000));
 }
 
-#[test]
+#[skuld::test]
 fn differ_when_pid_differs() {
     assert_ne!(id(42, 1000), id(43, 1000));
 }
 
-#[test]
+#[skuld::test]
 fn differ_when_token_differs_same_pid() {
     // The PID-reuse case: same pid, different start token => different process.
     assert_ne!(id(42, 1000), id(42, 2000));
 }
 
-#[test]
+#[skuld::test]
 fn hash_is_consistent_with_eq() {
     let mut set = HashSet::new();
     set.insert(id(7, 9));
@@ -37,7 +37,7 @@ fn hash_is_consistent_with_eq() {
     assert!(!set.contains(&id(7, 10)));
 }
 
-#[test]
+#[skuld::test]
 fn is_copy_and_exposes_pid() {
     let a = id(5, 1);
     let b = a; // Copy: `a` remains usable below.
@@ -45,7 +45,7 @@ fn is_copy_and_exposes_pid() {
     assert_eq!(b.pid(), 5);
 }
 
-#[test]
+#[skuld::test]
 fn current_process_resolves_exists_and_is_alive() {
     let me = ProcessId::current();
     assert_eq!(me.exists(), crate::identity::Existence::Present);
@@ -54,7 +54,7 @@ fn current_process_resolves_exists_and_is_alive() {
     assert!(me.created_at().is_some());
 }
 
-#[test]
+#[skuld::test]
 fn start_token_raw_is_stable_and_matches_reresolved() {
     let me = ProcessId::current();
     // Stable across two calls on the same identity.
@@ -64,7 +64,7 @@ fn start_token_raw_is_stable_and_matches_reresolved() {
     assert_eq!(me.start_token_raw(), again.start_token_raw());
 }
 
-#[test]
+#[skuld::test]
 fn imposter_token_neither_exists_nor_is_alive() {
     let me = ProcessId::current();
     // Same live PID, deliberately wrong start token => a different identity.
@@ -85,7 +85,7 @@ fn imposter_token_neither_exists_nor_is_alive() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn an_access_denied_live_process_is_unknown_everywhere() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
@@ -101,7 +101,7 @@ fn an_access_denied_live_process_is_unknown_everywhere() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_process_denying_only_synchronize_exists_but_has_unknown_liveness() {
     use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_QUERY_LIMITED_INFORMATION.0);
