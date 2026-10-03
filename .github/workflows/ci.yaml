@@ -274,6 +274,12 @@ jobs:
       - name: Build tests
         run: cargo nextest run --locked --no-run --target ${{ matrix.target }} --profile ci
 
+      - name: K5 proofs (Windows)
+        if: matrix.os == 'windows'
+        timeout-minutes: 40
+        shell: bash
+        run: bash .github/scripts/k5-proofs.sh ${{ matrix.target }}
+
       - name: Run tests
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
