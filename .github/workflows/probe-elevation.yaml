@@ -71,3 +71,50 @@ jobs:
           COSCA_TEST_ELEVATION: "1"
           COSCA_TEST_ELEVATION_PASSWORD: "x"
         run: cargo nextest run --locked --features tokio --test elevation --no-fail-fast --no-capture
+  lin26:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Facts
+        continue-on-error: true
+        run: |
+          id; systemd --version | head -1; command -v sudo doas pkexec run0 polkitd || true
+          sudo -n true && echo "sudo-n-ok"
+          ls /usr/lib/polkit-1 /usr/libexec/polkitd 2>&1 | head
+          dpkg -l | grep -i polkit || true
+          sudo cat /etc/sudoers.d/* | head -5 || true
+          systemctl is-system-running || true
+      - name: run0 as the runner user
+        continue-on-error: true
+        run: |
+          run0 --no-ask-password id -u; echo "rc=$?"
+      - name: run0 after installing polkit and a rule
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq polkitd pkexec
+          sudo mkdir -p /etc/polkit-1/rules.d
+          sudo tee /etc/polkit-1/rules.d/49-runner.rules >/dev/null <<'RULE'
+          polkit.addRule(function(action, subject) {
+            if (subject.user == "runner") { return polkit.Result.YES; }
+          });
+          RULE
+          sudo systemctl restart polkit || true
+          run0 --no-ask-password id -u; echo "run0 rc=$?"
+          pkexec id -u; echo "pkexec rc=$?"
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Elevation tests as they stand, with run0
+        continue-on-error: true
+        env:
+          COSCA_TEST_ELEVATION: "1"
+          COSCA_TEST_ELEVATION_RUN0: "1"
+          COSCA_TEST_ELEVATION_PASSWORD: "x"
+        run: cargo nextest run --locked --features tokio --test elevation --no-fail-fast --no-capture
