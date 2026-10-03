@@ -1,6 +1,6 @@
 //! Smoke tests for the testbin helper modes the raw-`CreateProcessW` backend tests rely on
 //! (`read-fd` / `write-fd` / `argv0-report` / `isatty-fd`). Windows-only: the raw backend and
-//! its fd/argv[0]/CRT-device proofs are a Windows concern, so the whole crate is `#![cfg(windows)]`.
+//! its fd/argv[0]/CRT-device proofs are a Windows concern, so every item but `main` is `#[cfg(windows)]`.
 //! These prove the four modes EXIST and emit their documented output over std pipes; the
 //! executable-vs-argv[0] independence itself is proven later via the crate's own `Command`.
 
