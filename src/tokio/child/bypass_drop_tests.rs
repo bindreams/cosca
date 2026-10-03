@@ -172,17 +172,16 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
         let slot = Rc::clone(&slot);
+        let armed = Rc::clone(&armed);
         move || {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
+            // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
+            // would consume it. The evidence follows the identity check's own peek, which the
+            // test answers `Running`: the child is ours until the forced attach failure.
+            *armed.borrow_mut() = Some(evidence());
             *slot.borrow_mut() = Some(witness);
         }
-    });
-    // Armed after the identity read's own check through the handle, which would consume it, and
-    // not before `spawn()`: the handshake's own watch peek runs first and would too.
-    let _after_read = fault::set_at(fault::SpawnPoint::AfterIdentityRead, {
-        let armed = Rc::clone(&armed);
-        move || *armed.borrow_mut() = Some(evidence())
     });
     fault::set_force_attach_failure(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
@@ -208,7 +207,7 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 /// Mutant: no forget in `reap_now`'s refused-kill arm (tokio's drop reaps the zombie by pid).
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
-    reap_now_after_a_refused_kill(|| Box::new(force_evidence()));
+    reap_now_after_a_refused_kill(|| Box::new(force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))])));
 }
 
 /// A failed look cannot show the child is ours, so the arm forgets it too.
@@ -216,7 +215,12 @@ async fn reap_now_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
 /// Mutant: a failed look counts as ours.
 #[skuld::test]
 async fn reap_now_after_a_refused_kill_and_a_failed_look_reaps_nothing() {
-    reap_now_after_a_refused_kill(|| Box::new(force_peek_once(Err(std::io::Error::other("forced peek failure 6e2a")))));
+    reap_now_after_a_refused_kill(|| {
+        Box::new(force_peeks([
+            Ok(Peek::Running),
+            Err(std::io::Error::other("forced peek failure 6e2a")),
+        ]))
+    });
 }
 
 /// `try_wait` and `wait` on a child shown reaped elsewhere answer `ECHILD` and take nothing: tokio's
