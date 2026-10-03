@@ -513,7 +513,7 @@ fn waitid_status(pid: u32) -> std::process::ExitStatus {
 
 /// `exit_status_of` decodes a real child's `siginfo_t` to the status std reports for it.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn exit_status_of_matches_std_for_exited_and_killed_children() {
     for script in ["exit 3", "kill -KILL $$"] {
         let mut child = crate::test_spawn::spawn(std::process::Command::new("sh").args(["-c", script])).expect("spawn");
@@ -527,7 +527,7 @@ fn exit_status_of_matches_std_for_exited_and_killed_children() {
 /// decoding is checked on the `si_code`/`si_status` pair itself: the low bits hold the signal and
 /// bit 7 the core flag, as in std's wait status.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn exit_status_from_parts_encodes_a_dumped_child() {
     use std::os::unix::process::ExitStatusExt as _;
     let dumped = super::exit_status_from_parts(libc::CLD_DUMPED, libc::SIGSEGV);

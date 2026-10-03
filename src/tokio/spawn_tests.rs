@@ -131,7 +131,7 @@ async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(
 /// which the test drives until the child is reaped. Linux: tokio's `Child` is forgotten and the
 /// child goes to the pidfd teardown (the seam refuses only the first kill), so it is reaped through
 /// its pidfd and never released to tokio's by-pid reap.
-#[test]
+#[skuld::test]
 fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
     use crate::stdio::Stdio;
     use std::io::ErrorKind;
@@ -235,7 +235,7 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
 
 /// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
 /// entry point.
-#[test]
+#[skuld::test]
 fn the_unreachable_child_warning_is_every_time() {
     use crate::containment::AbandonedChild;
 
@@ -257,7 +257,7 @@ fn the_unreachable_child_warning_is_every_time() {
 
 /// `AbandonedChild::Ended` means nothing of the child runs and it is reaped or will be — not a
 /// degraded guarantee, so it logs nothing at all.
-#[test]
+#[skuld::test]
 fn ended_abandoned_child_logs_nothing() {
     use crate::containment::AbandonedChild;
 
@@ -432,7 +432,7 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
     use std::io::{Read, Seek, Write};
     use std::os::fd::{AsFd, AsRawFd};

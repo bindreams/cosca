@@ -109,7 +109,7 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
 /// forced before the helper is joined.
 ///
 /// Mutant: no forced EOF on unwind (the unwind checks shut the channel and record it).
-#[test]
+#[skuld::test]
 fn a_runtime_without_io_panics_without_waiting_on_a_held_copy() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
