@@ -468,18 +468,21 @@ fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
 /// A by-pid `ECHILD` for a pid that still names the child but that launchd owns: a zombie whose
 /// tracer died and which XNU reparented to launchd. Only a wait by launchd would hand it back.
 ///
-/// Mutant: the parent ignored: `Running`.
+/// Mutant: the parent ignored: `Running`; the launchd hold mapped to `Gone` (a reap).
 #[skuld::test]
-fn an_echild_for_a_pid_orphaned_to_launchd_is_foreign() {
+fn an_echild_for_a_pid_orphaned_to_launchd_is_orphaned() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
     let forced = orphaned_to_launchd();
-    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Foreign(Foreign::Gone));
+    assert_eq!(
+        exit_only::peek(&target).expect("peek"),
+        Peek::Foreign(Foreign::Orphaned)
+    );
     drop(forced);
     let _forced = orphaned_to_launchd();
     assert_eq!(
         exit_only::try_reap(&target).expect("try_reap"),
-        exit_only::Reap::Foreign(Foreign::Gone)
+        exit_only::Reap::Foreign(Foreign::Orphaned)
     );
 }
 
@@ -768,4 +771,17 @@ fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     // Still ours, unreaped: the next, verifiable, call reaps it.
     let status = b.shared.wait().expect("the zombie was never consumed");
     assert!(status.success(), "{status:?}");
+}
+
+/// A verified peek (a caller that treats `Running` as "ours") cannot read an `ECHILD` pid's id: a
+/// denial is not a reap, so it is an error with the errno, where the plain peek calls it `Gone`.
+///
+/// Mutant: the verified peek maps `Held::Refused` to `Foreign(Gone)`.
+#[skuld::test]
+fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
+    let (pid, unique) = echild_yet_resolvable();
+    let target = Target::pid(pid, Some(unique));
+    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
+    let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 }

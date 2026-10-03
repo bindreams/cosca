@@ -425,13 +425,38 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             return Err(e.error);
         }
     };
-    // Read the identity while we still own the un-reaped `std::process::Child`: the child is at
-    // worst a zombie, so on Unix its /proc entry persists, and on Windows the std Child pins the
-    // process handle so the pid cannot be reused. `SharedChild::adopt` reaps nothing, so this is
-    // also the identity it takes.
+    // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
+    // against the handle held since the spawn: a pid alone does not say whom it names once
+    // something else has reaped the child. `SharedChild::adopt` reaps nothing, so this is also the
+    // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
-    let id = match resolve_identity(child.id()) {
+    // macOS has no handle: the unique id read here is what the identity is checked against, and the
+    // one the shared child is adopted with. This first read is by pid alone: a foreign reap and a
+    // reuse of the pid before it make it the stranger's id, and nothing later can tell.
+    #[cfg(target_os = "macos")]
+    let unique = match crate::signal::read_identity(child.id()) {
+        Ok(Some(unique)) => unique,
+        // Reaped elsewhere before the first read: nothing is left to check the pid against.
+        Ok(None) => {
+            leave_unverified_child(child, crate::containment::RootIdentity::Gone);
+            return Err(spawn_identity_error(crate::identity::Resolved::Gone));
+        }
+        Err(errno) => {
+            let error = crate::signal::identity_unreadable(child.id(), errno);
+            return Err(teardown_after_failed_adoption(child, error));
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let through = child.through.target();
+    #[cfg(target_os = "macos")]
+    let through = crate::wait::exit_only::Target::pid(child.id(), Some(unique));
+    #[cfg(windows)]
+    let through = {
+        use std::os::windows::io::AsHandle;
+        crate::wait::exit_only::Target::Handle(child.as_handle())
+    };
+    let id = match resolve_identity(child.id(), &through) {
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
@@ -455,7 +480,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // The pidfd is already held, so adopting cannot fail.
     #[cfg(target_os = "linux")]
     let shared = SharedChild::adopt_opened(child.child, id, child.through.pidfd);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let shared = SharedChild::adopt_verified(child, id, unique);
+    #[cfg(windows)]
     let shared = match SharedChild::adopt(child, id) {
         Ok(shared) => shared,
         Err((error, child)) => return Err(teardown_after_failed_adoption(child, error)),
@@ -1040,14 +1067,71 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
                 source: None,
             }),
         _ => Error::Io(std::io::Error::other(
-            "spawned child vanished before its identity could be read",
+            "the spawned child exited and was reaped by another party before its identity could be read",
         )),
     }
 }
 
-/// Read the spawned child's stable identity. A test-only fault seam (`fault`) can force the
-/// vanished or unreadable branch.
-pub(crate) fn resolve_identity(pid: u32) -> crate::identity::Resolved<ProcessId> {
+/// Read the spawned child's stable identity, then check through `through`, the handle held since
+/// the spawn, that the read named our child.
+///
+/// - **Linux:** a peek through the pidfd after the read. `Running` and `Exit` keep the read (a
+///   reap is irreversible, so the pid named our child throughout); `Foreign` is `Gone`; a failed
+///   peek is `Unknown`, warned.
+/// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
+///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
+///   (held by launchd after its tracer died) is `Unknown` too.
+/// - **Windows:** the process handle pins the pid, so the read stands.
+///
+/// On macOS the `through` id itself was read by pid alone, so a reap and reuse before that first
+/// read are not caught here.
+pub(crate) fn resolve_identity(
+    pid: u32,
+    through: &crate::wait::exit_only::Target<'_>,
+) -> crate::identity::Resolved<ProcessId> {
+    use crate::identity::Resolved;
+
+    let read = resolve_identity_unchecked(pid);
+    let Resolved::Found(_) = read else {
+        return read;
+    };
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::AfterIdentityRead, pid);
+    #[cfg(unix)]
+    {
+        use crate::wait::exit_only::Peek;
+        #[cfg(target_os = "linux")]
+        let peeked = crate::wait::exit_only::peek(through);
+        #[cfg(target_os = "macos")]
+        let peeked = crate::wait::exit_only::peek_verified(through);
+        match peeked {
+            Ok(Peek::Running | Peek::Exit(_)) => read,
+            // macOS: held by launchd after its tracer died. It is neither shown reaped nor shown
+            // ours, so it is unverifiable, not "reaped by another party".
+            #[cfg(target_os = "macos")]
+            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => {
+                log::warn!(
+                    "child {pid}: launchd holds it, so its tracer died; it cannot be shown to be ours or reaped"
+                );
+                Resolved::Unknown
+            }
+            Ok(Peek::Foreign(_)) => Resolved::Gone,
+            Err(e) => {
+                log::warn!("child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours");
+                Resolved::Unknown
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = through;
+        read
+    }
+}
+
+/// [`resolve_identity`]'s read, by pid alone: for a caller with no handle to check it against. A
+/// test-only fault seam (`fault`) can force the vanished or unreadable branch.
+pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<ProcessId> {
     #[cfg(test)]
     {
         if fault::force_identity_unknown() {
@@ -1271,7 +1355,7 @@ impl Unadopted for HeldStdChild {
 /// already collected: std reaps the child of a spawn it fails; tokio can fail a spawn after std's
 /// succeeded, and drops the child neither killed nor reaped.
 #[cfg(target_os = "linux")]
-pub(super) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
+pub(crate) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
     use crate::wait::exit_only::{peek, Peek};
 
     let child = PidfdChild::new(pid, pidfd);
@@ -1440,6 +1524,9 @@ pub(crate) mod fault {
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(feature = "tokio")]
+        static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
         #[cfg(target_os = "linux")]
         static ATTACHMENT_OVERRIDE: std::cell::RefCell<Option<crate::containment::Attachment>> =
@@ -1618,11 +1705,20 @@ pub(crate) mod fault {
         /// Right before the spawn reads the child's identity (the tokio spawn's macOS unique id is
         /// read earlier, before the backend exists).
         BeforeIdentity,
+        /// Right before the async spawn attaches the containment, after `BeforeIdentity`.
+        #[cfg(feature = "tokio")]
+        BeforeAttach,
+        /// Right after the spawn read the child's identity, before it checks the read against the
+        /// child's handle.
+        AfterIdentityRead,
     }
 
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
         match point {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
+            #[cfg(feature = "tokio")]
+            SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
+            SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
         }
     }
 
@@ -1861,3 +1957,11 @@ mod exact_posix_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_error_tests.rs"]
 mod identity_error_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawn/identity_macos_tests.rs"]
+pub(crate) mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/identity_peek_tests.rs"]
+mod identity_peek_tests;

@@ -37,7 +37,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(windows, test))]
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::wait::exit_only::{self, Peek, Reap, Reaped, Target};
@@ -168,8 +168,9 @@ impl SharedChild {
         clippy::result_large_err,
         reason = "the child is handed back untouched for the caller to deal with"
     )]
-    // Production Linux spawns hold the pidfd from the handshake: see `adopt_opened`.
-    #[cfg(any(not(target_os = "linux"), test))]
+    // Production Linux spawns hold the pidfd from the handshake (`adopt_opened`), and macOS spawns
+    // read the unique id before the identity (`adopt_verified`).
+    #[cfg(any(windows, test))]
     pub(crate) fn adopt(
         child: std::process::Child,
         id: ProcessId,
@@ -181,21 +182,22 @@ impl SharedChild {
             Err(e) => return Err((e, child)),
         };
         #[cfg(target_os = "macos")]
-        let identity = match crate::signal::read_identity(id.pid()) {
-            Ok(identity) => identity,
-            Err(errno) => return Err((crate::signal::identity_unreadable(id.pid(), errno), child)),
-        };
+        {
+            match crate::signal::read_identity(id.pid()) {
+                Ok(identity) => Ok(Self::new_macos(child, id, identity)),
+                Err(errno) => Err((crate::signal::identity_unreadable(id.pid(), errno), child)),
+            }
+        }
         #[cfg(windows)]
         let handle = match Self::duplicate_handle(&child) {
             Ok(handle) => handle,
             Err(e) => return Err((Error::Io(e), child)),
         };
+        #[cfg(not(target_os = "macos"))]
         Ok(SharedChild {
             id,
             #[cfg(target_os = "linux")]
             pidfd,
-            #[cfg(target_os = "macos")]
-            identity,
             #[cfg(windows)]
             handle,
             inner: Mutex::new(Inner {
@@ -209,6 +211,32 @@ impl SharedChild {
             #[cfg(test)]
             owner: Mutex::new(None),
         })
+    }
+
+    /// [`adopt`](Self::adopt) for a macOS child whose unique id the spawn read as `identity`, the
+    /// id the identity was checked against. Infallible: nothing is left to read.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn adopt_verified(child: std::process::Child, id: ProcessId, identity: u64) -> SharedChild {
+        debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
+        Self::new_macos(child, id, Some(identity))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new_macos(child: std::process::Child, id: ProcessId, identity: Option<u64>) -> SharedChild {
+        SharedChild {
+            id,
+            identity,
+            inner: Mutex::new(Inner {
+                child,
+                state: State::N,
+                next_token: 0,
+                #[cfg(test)]
+                log: Vec::new(),
+            }),
+            condvar: Condvar::new(),
+            #[cfg(test)]
+            owner: Mutex::new(None),
+        }
     }
 
     /// [`adopt`](Self::adopt) for a Linux child that sent its pidfd to the spawn handshake while

@@ -11,6 +11,7 @@ use crate::child::spawn::build_std_command;
 use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
+use crate::identity::Resolved;
 #[cfg(unix)]
 use crate::stdio::Direction;
 use crate::stdio::{Fd, ResolvedStdio};
@@ -320,7 +321,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c)
     };
     #[cfg(not(target_os = "macos"))]
-    let (mut prepared, child) = {
+    let (prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -413,16 +414,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     };
 
     // Identity must be read before any await: spawn + attach are synchronous, so the runtime cannot
-    // park and reap the child in between. Even if the child has already exited, tokio's held handle
-    // pins the pid against reuse, so `ProcessId::of` still resolves it (as the sync spawn documents).
+    // park and reap the child in between. The read is then checked through the backend's handle
+    // (below), since on Unix nothing pins the pid against a foreign reap and reuse.
     let pid = child.id().expect("a freshly spawned, un-awaited tokio child has a pid");
     #[cfg(windows)]
     let proc_handle = child
         .raw_handle()
         .expect("a freshly spawned tokio child has a raw handle");
-    // macOS: the unique id every by-pid signal to this child is checked against, read before
-    // anything can reap the child. A refused read leaves the backend with no id, so it acts on the
-    // pid never, and the spawn fails below once the backend exists.
+    // macOS: the unique id every by-pid signal to this child is checked against. It is read by pid
+    // alone, so a foreign reap and a reuse of the pid before it make it the stranger's id. A refused
+    // read leaves the backend with no id, so it acts on the pid never, and the spawn fails below
+    // once the backend exists.
     #[cfg(target_os = "macos")]
     let (identity, identity_refused) = match crate::signal::read_identity(pid) {
         Ok(identity) => (identity, None),
@@ -437,7 +439,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         ProcSource::new(child, held_pidfd)
     };
     #[cfg(target_os = "macos")]
-    let proc = ProcSource::new(child, identity);
+    let mut proc = ProcSource::new(child, identity);
     #[cfg(windows)]
     let proc = ProcSource::new(child);
     #[cfg(target_os = "macos")]
@@ -452,19 +454,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
-    let id = match resolve_identity(pid) {
-        crate::identity::Resolved::Found(id) => id,
-        // Mirror the attach-failure path below: tear the child down so a vanished-identity error
-        // never leaks a live (Windows: still CREATE_SUSPENDED) process.
-        other => {
-            // The verdict first: tokio owns this child, so the leaf must not answer for it as an
-            // abandoned spawn's, reaping a pid tokio's own reap is about to.
-            prepared.settle_verdict(pid);
-            proc.reap_now(pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
-        }
-    };
-
+    // Attached before the identity is read and checked, as the sync spawn does: the attach reads
+    // the tree-walk root by pid, so a reap before the check makes that read name a stranger, and
+    // the check then fails the spawn `Gone`. Attached after, a reap in between would leave the
+    // attachment's root a stranger under an identity that passed.
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
     let attach = crate::child::spawn::attach_or_fault(
         pid,
         #[cfg(windows)]
@@ -473,11 +468,45 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     );
     let attachment = match attach {
         Ok(v) => v,
-        // The child is spawned (on Windows possibly CREATE_SUSPENDED) — tear it down so a failed
+        // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
             proc.reap_now(pid);
             return Err(e);
+        }
+    };
+    // The handle checks the read: a pid alone does not say whom it names once something else has
+    // reaped the child. The backend exists already, so a failure here tears the child down through
+    // it, and a panic unwinds through `ProcSource`'s `Drop`.
+    let resolved = match proc.target() {
+        Some(through) => resolve_identity(pid, &through),
+        // macOS: the unique id read at spawn found no process, so there is nothing to check a pid
+        // against, and the child is not read by pid.
+        #[cfg(target_os = "macos")]
+        None => Resolved::Gone,
+        #[cfg(not(target_os = "macos"))]
+        None => unreachable!("a freshly spawned tokio child holds its handle"),
+    };
+    let id = match resolved {
+        Resolved::Found(id) => id,
+        // Mirror the attach-failure path above: tear the child down so a vanished-identity error
+        // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
+        other => {
+            // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
+            // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
+            #[cfg(target_os = "linux")]
+            if matches!(other, Resolved::Unknown) {
+                proc.teardown_through_pidfd(pid);
+                return Err(crate::child::spawn::spawn_identity_error(other));
+            }
+            // macOS: nothing pins the pid, so a child the handle still cannot show ours is
+            // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
+            #[cfg(target_os = "macos")]
+            if matches!(other, Resolved::Unknown) {
+                proc.forget_foreign();
+            }
+            proc.reap_now(pid);
+            return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
 

@@ -39,13 +39,7 @@ impl Prepared {
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
     /// never for the child the caller will reap. A no-op without a leaf, or once taken.
-    #[cfg_attr(
-        not(any(test, feature = "tokio")),
-        allow(
-            dead_code,
-            reason = "consumers are #[cfg(test)] fixtures and the tokio spawn failure path"
-        )
-    )]
+    #[cfg(any(test, all(feature = "tokio", target_os = "macos")))]
     pub(crate) fn settle_verdict(&mut self, pid: u32) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
@@ -559,14 +553,14 @@ impl From<AttachError> for Error {
     }
 }
 
-/// Resolve the spawned root's identity by pid. **Precondition:** the caller holds the owning
-/// `Child` (sync `std::process::Child` / async `::tokio::process::Child`) across this call — it
-/// pins the pid against reuse, so the by-pid resolve is race-free (the freshly spawned root is
-/// un-reaped, and on Windows still suspended, hence resolvable).
+/// Resolve the spawned root's identity by pid alone, with no handle to check the read against.
+/// On Unix a foreign reap and reuse before the read makes it name a stranger. The spawn's own
+/// identity read, taken after this attach and checked through the child's handle, then fails the
+/// spawn `Gone`. On Windows the held process handle pins the pid.
 #[cfg(any(unix, windows))]
 fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
-    // Via `resolve_identity` so the test seam applies here too.
-    match crate::child::spawn::resolve_identity(pid) {
+    // Via `resolve_identity_unchecked` so the test seam applies here too.
+    match crate::child::spawn::resolve_identity_unchecked(pid) {
         crate::identity::Resolved::Found(id) => Ok(id),
         crate::identity::Resolved::Gone => Err(AttachError {
             error: Error::Containment {

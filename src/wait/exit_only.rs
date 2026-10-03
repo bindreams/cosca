@@ -72,6 +72,12 @@ pub(crate) enum Foreign {
     /// The pid names another process now: its start time differs from the child's.
     #[cfg(target_os = "macos")]
     Other,
+    /// `ECHILD` for a pid that still names the child, held by launchd: its tracer died and XNU
+    /// reparented it. It is not this process's to reap, and the caller cannot tell it from a reap, so
+    /// it stays unverifiable rather than "reaped by another party". Nothing is signalled or reaped
+    /// by pid.
+    #[cfg(target_os = "macos")]
+    Orphaned,
 }
 
 /// What [`peek`] saw.
@@ -144,7 +150,7 @@ pub(crate) fn peek(target: &Target<'_>) -> io::Result<Peek> {
 /// [`peek`] for a caller that treats `Running` as "this is our child". On macOS a running child
 /// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
 /// that tells it from a reuse of the pid. Other platforms use [`peek`].
-#[cfg(all(target_os = "macos", feature = "tokio"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<Peek> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
