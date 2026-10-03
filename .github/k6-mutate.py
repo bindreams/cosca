@@ -1,6 +1,6 @@
 import os
 p = "tests/windows_elevation_routes/harness.rs"
-s = open(p, newline="").read().replace("\r\n", "\n")
+s = open(p, newline="", encoding="utf-8").read().replace("\r\n", "\n")
 loop = (
     "    for (k, v) in extra {\n"
     "        map.insert(EnvKeyIgnoreCase::new(k), v.clone());\n"
@@ -15,4 +15,4 @@ elif m == "extra-first":
     anchor = "    let mut map: BTreeMap<EnvKeyIgnoreCase, String> = BTreeMap::new();\n"
     assert anchor in s
     s = s.replace(anchor, anchor + loop)
-open(p, "w", newline="\n").write(s)
+open(p, "w", newline="\n", encoding="utf-8").write(s)
