@@ -1,6 +1,6 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test under chosen environments. Its body never runs in these, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
-use super::{check_group, require_consent, require_enabled, Group};
+use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())

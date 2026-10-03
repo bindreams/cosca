@@ -144,6 +144,11 @@ mod test_child;
 #[cfg(test)]
 mod test_groups;
 
+// Declared here, not in `test_groups.rs`: integration roots include that file by `#[path]`.
+#[cfg(test)]
+#[path = "test_groups_tests.rs"]
+mod test_groups_tests;
+
 #[cfg(test)]
 mod test_harness;
 

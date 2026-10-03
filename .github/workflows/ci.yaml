@@ -32,7 +32,7 @@ env:
   COSCA_TEST_CGROUP: "0"
   # Windows groups. The drive-mapping test runs in one step below; the probes and canaries run
   # only in windows-probes.yaml.
-  COSCA_TEST_WINDOWS_DRIVE_MAP: "0"
+  COSCA_TEST_DRIVE_MAPPING: "0"
   COSCA_TEST_WINDOWS_PATH_CANARY: "0"
   COSCA_TEST_WINDOWS_ELEVATING_PROBES: "0"
   COSCA_TEST_WINDOWS_EXECUTING_PROBES: "0"
@@ -279,19 +279,19 @@ jobs:
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
       # The one Windows test that maps a drive letter (`DefineDosDeviceW`, visible to the whole
-      # logon session) is the `WINDOWS_DRIVE_MAP` group, off everywhere else. This step opts in
-      # to exactly that test.
+      # logon session) is the `DRIVE_MAPPING` group, off everywhere else. This step opts in and
+      # selects the group by its label. `--test windows_process_cwd` scopes it to a skuld binary.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 8
         env:
-          COSCA_TEST_WINDOWS_DRIVE_MAP: "1"
-          COSCA_TEST_WINDOWS_DRIVE_MAP_CONSENT: "1"
+          COSCA_TEST_DRIVE_MAPPING: "1"
+          COSCA_TEST_DRIVE_MAPPING_CONSENT: "1"
+          SKULD_LABELS: drive_mapping
         run: >-
           ${{ matrix.nextest }} drive-mapping
           cargo nextest run --locked --target ${{ matrix.target }}
-          --test windows_process_cwd
-          -E 'test(=a_drive_relative_current_dir_takes_the_drives_own_directory_as_win32_does)'
+          --test windows_process_cwd --no-tests=fail
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
