@@ -73,7 +73,9 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 /// one read without touching the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadPurpose {
-    /// The child's identity, read at spawn.
+    /// The child's identity, read by pid at adoption (tests: production spawns take the child's
+    /// own report).
+    #[cfg_attr(not(test), allow(dead_code, reason = "only the test-only by-pid read uses it"))]
     Adopt,
     /// The re-read just before a signal.
     Kill,
@@ -177,6 +179,32 @@ pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     }
 }
 
+/// The calling process's own unique id, for a child to report before `exec`. **Async-signal-safe**:
+/// one `proc_pidinfo` call (a direct `__proc_info` syscall) on a stack buffer, with no allocation,
+/// no lock and no logging. `Err` is the errno.
+pub(crate) fn own_unique_id() -> Result<u64, i32> {
+    // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
+    let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcUniqIdentifierInfo>() as libc::c_int;
+    // SAFETY: `getpid` has no preconditions; proc_pidinfo writes up to `size` bytes into `info`.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDUNIQIDENTIFIERINFO,
+            1,
+            (&mut info as *mut ProcUniqIdentifierInfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        Ok(info.p_uniqueid)
+    } else if n <= 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    } else {
+        Err(libc::EIO)
+    }
+}
+
 /// What [`held_by`] saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Held {
@@ -265,6 +293,11 @@ pub(crate) mod uniq_fault {
         fn drop(&mut self) {
             FORCED.with(|f| f.borrow_mut().clear());
         }
+    }
+
+    /// How many forced reads for `purpose` this thread has not yet consumed.
+    pub(crate) fn unconsumed(purpose: ReadPurpose) -> usize {
+        FORCED.with(|f| f.borrow().iter().filter(|(p, _)| *p == purpose).count())
     }
 
     pub(super) fn take(purpose: ReadPurpose) -> Option<UniqRead> {

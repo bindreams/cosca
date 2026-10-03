@@ -298,7 +298,7 @@ pub(crate) fn force_unknown_identity(pid: RawPid) -> impl Drop {
 pub(crate) use backend::UniqInfo;
 /// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
 #[cfg(target_os = "macos")]
-pub(crate) use backend::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
+pub(crate) use backend::{held_by, own_unique_id, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
 
 /// The identity-read forcing seams.
 #[cfg(all(target_os = "macos", test))]
