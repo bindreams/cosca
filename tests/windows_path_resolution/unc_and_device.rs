@@ -2,6 +2,7 @@
 
 use crate::harness::{canary, check_resolutions, literal_rows};
 use crate::pure::rooted_prefix;
+use crate::test_groups::{path_probes, Group};
 
 /// Canary: `..` never pops a UNC path's `\\server\share`, but pops everything after `\\.\`.
 ///
@@ -14,10 +15,7 @@ use crate::pure::rooted_prefix;
 ///
 /// String-level only: `GetFullPathNameW` contacts no server and opens no device.
 #[skuld::test]
-fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name(#[fixture(path_probes)] _group: &Group) {
     canary("Windows", |facts, failures| {
         let rows = literal_rows(&[
             (
@@ -132,10 +130,7 @@ fn dotdot_stops_at_the_unc_share_but_not_at_a_device_name() {
 /// it. `dots_and_spaces::a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain` shows
 /// which file each spelling opens.
 #[skuld::test]
-fn verbatim_marker_spellings_resolve_alike() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn verbatim_marker_spellings_resolve_alike(#[fixture(path_probes)] _group: &Group) {
     canary("Windows", |facts, failures| {
         let mut rows = literal_rows(&[
             (r"\\?\C:\dir\x.bat.", r"\\?\C:\dir\x.bat", "the verbatim marker"),

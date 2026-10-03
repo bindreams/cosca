@@ -33,9 +33,10 @@ env:
   # Windows groups. The drive-mapping test runs in one step below; the probes and canaries run
   # only in windows-probes.yaml.
   COSCA_TEST_DRIVE_MAPPING: "0"
-  COSCA_TEST_WINDOWS_PATH_CANARY: "0"
-  COSCA_TEST_WINDOWS_ELEVATING_PROBES: "0"
-  COSCA_TEST_WINDOWS_EXECUTING_PROBES: "0"
+  COSCA_TEST_PATH_PROBES: "0"
+  COSCA_TEST_SHELL_EXECUTE: "0"
+  COSCA_TEST_SHELL_PROBES: "0"
+  COSCA_TEST_ELEVATION_ROUTES: "0"
 
 jobs:
   lint:
