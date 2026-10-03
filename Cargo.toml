@@ -187,6 +187,21 @@ path = "tests/tokio_foreign.rs"
 harness = false
 
 [[test]]
+name = "spawn_io"
+path = "tests/spawn_io.rs"
+harness = false
+
+[[test]]
+name = "tokio_control"
+path = "tests/tokio_control.rs"
+harness = false
+
+[[test]]
+name = "tokio_io"
+path = "tests/tokio_io.rs"
+harness = false
+
+[[test]]
 name = "group_teardown_setuid"
 path = "tests/group_teardown_setuid.rs"
 harness = false
