@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::error::Error;
-use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
 use crate::wait::exit_only::seams::force_peek_once;
 
 /// Waits for `pid` (a child of this test) to exit, then reaps it by pid, as a foreign reaper would.
@@ -17,10 +17,24 @@ pub(crate) fn reap_by_pid(pid: u32) {
     assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
 }
 
-/// Whether `pid`, a child of this test, is still there (running or an unreaped zombie).
-pub(crate) fn exists(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks that the pid exists; `pid` is this test's own unreaped child.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+/// Whether `pid`, a child of this test, has not exited: `waitid` finds no exit record, without
+/// consuming one. A zombie still answers `kill(pid, 0)`, so only this tells a signalled child from
+/// an unsignalled one: the blocker exits only when killed or when its stdin closes, and the tests
+/// hold its writer.
+pub(crate) fn has_not_exited(pid: u32) -> bool {
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is this test's own child; `WNOWAIT` consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    info.si_pid == 0
 }
 
 /// Kills and reaps `pid`, a child of this test the spawn under test left running.
@@ -100,7 +114,10 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
     let err = outcome.expect_err("a pid with another unique id is not the child");
     assert!(vanished(&err), "another unique id is Gone, not Unassessable: {err:?}");
     // The stranger is not signalled: the child stays, and this test ends it.
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
+    assert!(
+        has_not_exited(pid.get()),
+        "nothing may have signalled or reaped the pid"
+    );
     kill_and_reap(pid.get());
 }
 
@@ -130,7 +147,7 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let adopted = outcome.as_ref().ok().map(|child| child.id());
-    let left = exists(pid.get());
+    let left = has_not_exited(pid.get());
     if adopted.is_none() {
         kill_and_reap(pid.get());
     }
@@ -149,6 +166,58 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     );
 }
 
+/// At the re-read the child answers `ECHILD` (the test reaped it) yet its pid still names it, held
+/// by launchd (forced): a dead tracer's tracee in transit. That is neither a reap nor ours, so it
+/// is `Unassessable` with a warn naming the pid, not "reaped by another party".
+///
+/// Mutant: the launchd hold maps to `Gone` (the spawn fails as reaped by another party).
+#[skuld::test]
+fn macos_sync_spawn_identity_held_by_launchd_is_unassessable() {
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    let pid = Rc::new(Cell::new(0));
+    let armed: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        move || arm_launchd_hold(&pid, &armed, writer)
+    });
+    let mark = crate::log_capture::mark();
+    let outcome = cmd.spawn();
+    drop(armed);
+    let err = outcome.expect_err("a launchd hold cannot be shown to be ours");
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "a hold by launchd is unverifiable, not a vanish: {err:?}"
+    );
+    assert!(
+        crate::log_capture::contains_since(mark, &format!("child {}: launchd holds it", pid.get())),
+        "the hold is warned at the call, naming the pid"
+    );
+}
+
+/// Reaps the child by pid (so the re-read's `waitid` answers `ECHILD`) and forces the id and parent
+/// reads that follow to say launchd holds it.
+pub(crate) fn arm_launchd_hold(
+    pid: &Rc<Cell<u32>>,
+    armed: &Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
+    writer: std::io::PipeWriter,
+) {
+    pid.set(fault::spawn_pid());
+    let UniqRead::Found(info) = uniq_info(pid.get(), ReadPurpose::Kill) else {
+        panic!("the child's unique id must be readable")
+    };
+    drop(writer);
+    reap_by_pid(pid.get());
+    let mut armed = armed.borrow_mut();
+    for _ in 0..2 {
+        armed.push(Box::new(uniq_fault::force_uniq_read_once(
+            ReadPurpose::Echild,
+            UniqRead::Found(info),
+        )));
+    }
+    armed.push(Box::new(ppid_fault::force_ppid_once(Ok(LAUNCHD))));
+}
+
 // The first unique-id read =====
 
 /// The first read finds no process: `Gone`, with the pid never read and the child left alone.
@@ -164,7 +233,10 @@ fn macos_sync_spawn_first_read_gone_is_gone_and_leaves_the_child() {
         .spawn()
         .expect_err("a first read that finds nothing fails the spawn");
     assert!(vanished(&err), "no process is Gone, not Unassessable: {err:?}");
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
+    assert!(
+        has_not_exited(pid.get()),
+        "nothing may have signalled or reaped the pid"
+    );
     kill_and_reap(pid.get());
 }
 
@@ -182,6 +254,9 @@ fn macos_sync_spawn_first_read_refused_is_unassessable_and_leaves_the_child() {
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
+    assert!(
+        has_not_exited(pid.get()),
+        "nothing may have signalled or reaped the pid"
+    );
     kill_and_reap(pid.get());
 }
