@@ -11,6 +11,8 @@ pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch
 
 use std::path::Path;
 
+pub(crate) use super::db_dir::SKULD_DB_DIR_ENV;
+
 use rustix::mount::{mount, mount_bind, mount_change, MountPropagationFlags};
 use rustix::thread::{unshare_unsafe, UnshareFlags};
 
@@ -30,6 +32,16 @@ pub(crate) fn run(fixture: &str) {
 pub(crate) fn run_with_env(fixture: &str, env: &[(&str, &Path)]) {
     let mut cmd = super::fixture_command(fixture);
     cmd.envs(env.iter().copied());
+    super::run_fixture_command(fixture, cmd);
+}
+
+/// [`run`] for a fixture that calls [`drop_to_nobody`]. Skuld opened its DB as root, and checks at
+/// the end of the test that the DB's path still resolves; `nobody` must be able to search it, which
+/// the directory beside the executable need not allow. The directory stays root-owned.
+pub(crate) fn run_dropping_to_nobody(fixture: &str) {
+    let db_dir = super::db_dir::fixture_db_dir_searchable();
+    let mut cmd = super::fixture_command(fixture);
+    cmd.env(SKULD_DB_DIR_ENV, db_dir.path());
     super::run_fixture_command(fixture, cmd);
 }
 
@@ -101,8 +113,12 @@ pub(crate) fn tid_in_proc() -> u32 {
         .unwrap_or_else(|| panic!("thread-self's target {target:?} has no tid"))
 }
 
-/// Drop this whole process to `nobody` (65534) with no supplementary groups.
+/// The uid and gid of `nobody`, which [`drop_to_nobody`] drops to.
+const NOBODY: libc::uid_t = 65534;
+
+/// Drop this whole process to `nobody` ([`NOBODY`]) with no supplementary groups.
 pub(crate) fn drop_to_nobody() {
+    let nobody = NOBODY;
     // SAFETY: plain credential syscalls; glibc and musl apply `setres[ug]id` to every thread.
     unsafe {
         assert_eq!(
@@ -112,13 +128,13 @@ pub(crate) fn drop_to_nobody() {
             std::io::Error::last_os_error()
         );
         assert_eq!(
-            libc::setresgid(65534, 65534, 65534),
+            libc::setresgid(nobody, nobody, nobody),
             0,
             "setresgid: {}",
             std::io::Error::last_os_error()
         );
         assert_eq!(
-            libc::setresuid(65534, 65534, 65534),
+            libc::setresuid(nobody, nobody, nobody),
             0,
             "setresuid: {}",
             std::io::Error::last_os_error()
@@ -136,6 +152,16 @@ pub(crate) fn mount_tmpfs(target: &Path) {
         None::<&std::ffi::CStr>,
     )
     .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
+}
+
+/// Make `dir` visible at the same absolute path inside `root`, in this process's mount namespace
+/// (enter a private one first), so that after [`chroot_into`]`(root)` a path to `dir` still names it.
+/// Creates the mount point's directories under `root`; the driver removes them
+/// ([`ChrootScratch::finish`]).
+pub(crate) fn bind_into_root(root: &Path, dir: &Path) {
+    let inside = root.join(dir.strip_prefix("/").expect("an absolute directory"));
+    std::fs::create_dir_all(&inside).unwrap_or_else(|e| panic!("mkdir the mount point {}: {e}", inside.display()));
+    bind_over(dir, &inside);
 }
 
 /// Make `root` this process's `/`, so an absolute path such as `/proc` is looked up beneath it.

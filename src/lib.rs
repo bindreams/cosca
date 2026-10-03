@@ -53,6 +53,14 @@
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "a stray #[test] must register with skuld, not silently never run"
+)]
+#[macro_use]
+extern crate skuld;
+
 pub mod containment;
 pub mod elevation;
 pub mod error;
@@ -185,4 +193,11 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
     let mut c = Command::new();
     c.commandline(line);
     c
+}
+
+#[cfg(test)]
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

@@ -35,7 +35,8 @@ enum Command {
         /// Move each root's `#![cfg(P)]` onto its top-level items, except `main` and `mod test_harness`.
         #[arg(long)]
         hoist_crate_cfg: bool,
-        /// Lines naming roots that still run under libtest: a `.rs` path, or a cargo target name.
+        /// Lines naming roots that still run under libtest: a `.rs` path, a cargo target name, or the
+        /// guard's `<kind>:<name>` (`test:spawn_io`).
         #[arg(long, value_name = "FILE")]
         unflipped: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
@@ -55,6 +56,16 @@ enum Command {
     },
 }
 
+/// The guard's `lib` kind is every library kind; any other kind must match exactly.
+fn has_kind(target: &targets::Target, kind: &str) -> bool {
+    const LIB_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+    if kind == "lib" {
+        target.kinds.iter().any(|k| LIB_KINDS.contains(&k.as_str()))
+    } else {
+        target.kinds.iter().any(|k| k == kind)
+    }
+}
+
 fn read_unflipped(file: &Path, manifest: Option<&Path>) -> Result<Vec<PathBuf>> {
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let mut roots = Vec::new();
@@ -72,7 +83,15 @@ fn read_unflipped(file: &Path, manifest: Option<&Path>) -> Result<Vec<PathBuf>> 
             Some(all) => all,
             None => by_name.insert(targets::all(manifest)?),
         };
-        let found: Vec<_> = all.iter().filter(|t| t.name == line).collect();
+        // `<kind>:<name>` (the guard's spelling) or a bare name.
+        let (kind, name) = match line.split_once(':') {
+            Some((kind, name)) => (Some(kind), name),
+            None => (None, line),
+        };
+        let found: Vec<_> = all
+            .iter()
+            .filter(|t| t.name == name && kind.is_none_or(|k| has_kind(t, k)))
+            .collect();
         if found.is_empty() {
             bail!(
                 "{}: `{line}` is neither a .rs path nor a target of the manifest",

@@ -57,7 +57,7 @@ pub(in crate::tokio::child) fn reap_behind_the_owner(pid: u32) {
 // Runs on every target: the elevated-spawn cleanup path that needs the wait-only entry is
 // `#[cfg(unix)]`, but the primitive and its Windows arm are not, and a kill re-added on either
 // arm fails here.
-#[tokio::test]
+#[skuld::test]
 async fn wait_and_reap_waits_for_the_childs_own_exit_and_never_kills() {
     use std::io::{Read, Write};
 
@@ -134,7 +134,7 @@ fn spawn_a_tokio_child_that_exits() -> ::tokio::process::Child {
     debug_assertions,
     should_panic(expected = "already-reaped child where one was impossible")
 )]
-#[tokio::test]
+#[skuld::test]
 async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -154,7 +154,7 @@ async fn wait_and_reap_refuses_an_already_reaped_child_the_caller_never_awaited(
     debug_assertions,
     should_panic(expected = "already-reaped child where one was impossible")
 )]
-#[tokio::test]
+#[skuld::test]
 async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
     let mut cmd = crate::tokio::Command::new();
     cmd.executable(std::env::current_exe().expect("current_exe"))
@@ -182,8 +182,9 @@ async fn the_elevated_cleanup_entry_refuses_an_already_reaped_child() {
 // macOS: a pid that is not this process's child fails the unique-id check while tokio still owns
 // the real child (`id()` is `Some`).
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_reap() {
+    crate::tokio::test_runtime::assert_current_thread();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let child = spawn_a_tokio_child_that_exits();
     let real_pid = child.id().expect("tokio owns an un-reaped child");
@@ -202,8 +203,9 @@ async fn wait_and_reap_on_a_pid_that_is_not_our_child_is_foreign_and_records_no_
 ///
 /// Mutant: `wait_and_reap` treats a refused wait as an exit, or records one.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn wait_and_reap_of_a_child_reaped_behind_the_owner_is_foreign() {
+    crate::tokio::test_runtime::assert_current_thread();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -219,8 +221,9 @@ async fn wait_and_reap_of_a_child_reaped_behind_the_owner_is_foreign() {
 /// A reaped-behind-its-back child the backend has been told to forget: `Foreign` warns once, naming
 /// the pid and what it leaks, and the backend reports itself reaped.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn tokio_forget_foreign_warns_naming_the_leak() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let child = spawn_a_tokio_child_that_exits();
@@ -244,7 +247,7 @@ async fn tokio_forget_foreign_warns_naming_the_leak() {
 ///
 /// Mutant: `try_wait` on a forgotten child answers `Ok(None)` (still running), or `wait` an exit.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn a_forgotten_child_answers_echild_to_wait_and_try_wait() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -265,7 +268,7 @@ async fn a_forgotten_child_answers_echild_to_wait_and_try_wait() {
 ///
 /// Mutant: `forget_foreign` drops the streams.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
     use ::tokio::io::AsyncReadExt as _;
     let child = crate::test_spawn::spawn_tokio(
@@ -292,7 +295,7 @@ async fn tokio_forget_foreign_keeps_the_untaken_stdout() {
 ///
 /// Mutant: the implicit drop forgets every child.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -310,7 +313,7 @@ async fn dropping_a_backend_implicitly_releases_a_child_shown_ours() {
 ///
 /// Mutant: a failed peek counts as ours.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_backend_implicitly_forgets_a_child_whose_peek_failed() {
     use crate::wait::exit_only::seams::force_peek_once;
     let child = spawn_a_tokio_child_that_exits();
@@ -331,7 +334,7 @@ async fn dropping_a_backend_implicitly_forgets_a_child_whose_peek_failed() {
 ///
 /// Mutant: the implicit drop releases every child.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -350,7 +353,7 @@ async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
 ///
 /// Mutant: `wait` leaves stdin open.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn wait_closes_the_untaken_stdin_first() {
     use std::future::Future;
     let child = crate::test_spawn::spawn_tokio(
@@ -383,7 +386,7 @@ async fn wait_closes_the_untaken_stdin_first() {
 ///
 /// Mutant: the implicit drop forgets a child tokio already reaped.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_backend_implicitly_after_wait_releases_it() {
     let child = spawn_a_tokio_child_that_exits();
     let mut proc = proc_source(child);
@@ -401,8 +404,9 @@ async fn dropping_a_backend_implicitly_after_wait_releases_it() {
 ///
 /// Mutant: the drop logs whether or not the thread is panicking.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn an_implicit_drop_logs_its_forget_only_when_not_unwinding() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let reaped_elsewhere = || {
         let child = spawn_a_tokio_child_that_exits();
@@ -437,7 +441,7 @@ async fn an_implicit_drop_logs_its_forget_only_when_not_unwinding() {
 ///
 /// Mutant: `forget_if_foreign` forgets unconditionally.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn forget_if_foreign_leaves_a_child_nothing_has_reaped() {
     let child = spawn_a_tokio_child_that_exits();
     let pid = child.id().expect("tokio owns an un-reaped child");
@@ -454,7 +458,7 @@ async fn forget_if_foreign_leaves_a_child_nothing_has_reaped() {
 ///
 /// Mutant: no forget in `wait_and_reap_blocking`.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
     let mut child = spawn_cosca_child_that_exits();
     reap_behind_the_owner(child.id().pid());
@@ -469,7 +473,7 @@ async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
 ///
 /// Mutant: `Child::kill` does not forget on `Sent::Gone`.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn kill_of_a_foreign_reaped_child_forgets_it() {
     let mut child = spawn_cosca_child_that_exits();
     reap_behind_the_owner(child.id().pid());
@@ -554,7 +558,7 @@ fn exited_unreaped_with(identity: impl FnOnce(u64) -> Option<u64>) -> (ProcSourc
 ///
 /// Mutant: `wait_and_reap` skips the unique-id peek.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_wait_and_reap_on_a_pid_with_another_unique_id_is_foreign() {
     let (mut proc, pid) = exited_unreaped_with(|real| Some(real ^ 1));
 
@@ -566,7 +570,7 @@ async fn macos_wait_and_reap_on_a_pid_with_another_unique_id_is_foreign() {
 
 /// Mutant: `forget_if_foreign` peeks without the unique id.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_forget_if_foreign_on_a_pid_with_another_unique_id_forgets() {
     let (mut proc, pid) = exited_unreaped_with(|real| Some(real ^ 1));
 
@@ -581,7 +585,7 @@ async fn macos_forget_if_foreign_on_a_pid_with_another_unique_id_forgets() {
 ///
 /// Mutant: `forget_if_foreign` takes a failed peek for no evidence.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_forget_if_foreign_on_a_failed_peek_forgets() {
     use crate::wait::exit_only::seams::force_peek_once;
     let (mut proc, pid) = exited_unreaped_with(Some);
@@ -598,7 +602,7 @@ async fn macos_forget_if_foreign_on_a_failed_peek_forgets() {
 ///
 /// Mutant: `wait_and_reap` peeks by pid when there is no id.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_wait_and_reap_with_no_unique_id_is_foreign() {
     let (mut proc, pid) = exited_unreaped_with(|_| None);
 
@@ -610,7 +614,7 @@ async fn macos_wait_and_reap_with_no_unique_id_is_foreign() {
 
 /// Mutant: `forget_if_foreign` peeks by pid when there is no id.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
     let (mut proc, pid) = exited_unreaped_with(|_| None);
 
@@ -627,8 +631,9 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
 /// Mutants: the refused-read arm tears the child down by pid (it is killed and reaped); it drops
 /// the backend normally (counted).
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::identity::{uniq_fault, Liveness, ReadPurpose, UniqRead};
 
     crate::log_capture::install();
@@ -687,7 +692,7 @@ async fn macos_a_refused_identity_read_fails_the_spawn_and_forgets_the_child() {
 ///
 /// Mutant: `wait_reapable` answers `Exited` on an error.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_wait_and_reap_on_a_failed_peek_is_foreign() {
     use crate::wait::exit_only::seams::force_peek_once;
     let (mut proc, pid) = exited_unreaped_with(Some);
@@ -706,7 +711,7 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_foreign() {
 ///
 /// Mutant: a by-pid `ECHILD` is taken for a foreign reap.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back() {
     use crate::test_support::tracer::{self, Mode, Report, Tracee};
     if !crate::test_support::require_group("TRACER") {

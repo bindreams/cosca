@@ -79,7 +79,7 @@ fn a_plain_spawn_forks_outside_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn spawn_tokio_forks_under_the_lock() {
     let (mut report_read, report_write) = std::io::pipe().expect("open the report pipe");
     let report_fd = report_write.as_raw_fd();
@@ -102,7 +102,7 @@ async fn spawn_tokio_forks_under_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn output_captured_tokio_forks_under_the_lock() {
     let held =
         lock_held_at_fork_tokio(|cmd| Box::pin(async move { super::output_captured_tokio(cmd).await.map(drop) })).await;
@@ -110,7 +110,7 @@ async fn output_captured_tokio_forks_under_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn status_tokio_forks_under_the_lock() {
     let held = lock_held_at_fork_tokio(|cmd| Box::pin(async move { super::status_tokio(cmd).await.map(drop) })).await;
     assert_eq!(held, Some(true), "the fork must run under spawn_lock");
@@ -168,7 +168,7 @@ fn status_locked_forks_under_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn spawn_locked_tokio_forks_under_the_lock() {
     let held =
         lock_held_at_fork_tokio(|cmd| Box::pin(async move { locked::spawn_locked_tokio(cmd)?.wait().await.map(drop) }))
@@ -177,7 +177,7 @@ async fn spawn_locked_tokio_forks_under_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn output_locked_tokio_forks_under_the_lock() {
     let held =
         lock_held_at_fork_tokio(|cmd| Box::pin(async move { locked::output_locked_tokio(cmd).await.map(drop) })).await;
@@ -185,7 +185,7 @@ async fn output_locked_tokio_forks_under_the_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn status_locked_tokio_forks_under_the_lock() {
     let held =
         lock_held_at_fork_tokio(|cmd| Box::pin(async move { locked::status_locked_tokio(cmd).await.map(drop) })).await;
@@ -234,7 +234,7 @@ fn status_returns_the_exit_code() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn output_captured_tokio_returns_the_streams_and_the_exit_status() {
     let mut cmd = ::tokio::process::Command::new("/bin/sh");
     cmd.args(["-c", CHATTY]);
@@ -247,7 +247,7 @@ async fn output_captured_tokio_returns_the_streams_and_the_exit_status() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn status_tokio_returns_the_exit_code() {
     let mut cmd = ::tokio::process::Command::new("/bin/sh");
     cmd.args(["-c", "exit 3"]);
@@ -288,8 +288,9 @@ fn status_releases_the_lock_before_the_wait() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn output_captured_tokio_releases_the_lock_before_the_wait() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (held, _armed) = record_lock_held_at_wait();
     super::output_captured_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
         .await
@@ -298,8 +299,9 @@ async fn output_captured_tokio_releases_the_lock_before_the_wait() {
 }
 
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn status_tokio_releases_the_lock_before_the_wait() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (held, _armed) = record_lock_held_at_wait();
     super::status_tokio(&mut ::tokio::process::Command::new("/usr/bin/true"))
         .await

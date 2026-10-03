@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 // The full Out-direction production shape: pair -> (connect via connect_task's underlying
 // await) -> a REAL child writes on the client end -> the server end reads to EOF. Pins the
 // connect-mandatory contract: without the connect, this read never completes.
-#[tokio::test]
+#[skuld::test]
 async fn overlapped_pipe_reads_a_real_childs_output() {
     let (server, client) = super::overlapped_out_pipe().expect("pipe pair");
     // The production seam: connect_task genuinely awaits the mandatory connect (immediate
@@ -29,7 +29,7 @@ async fn overlapped_pipe_reads_a_real_childs_output() {
 // delivers the buffered payload THEN clean EOF — the fact ChildStdin's drop contract rests
 // on. The child's stdout is read via spawn_blocking so the runtime keeps ticking (the
 // server teardown is processed via the runtime).
-#[tokio::test]
+#[skuld::test]
 async fn overlapped_in_pipe_feeds_a_real_childs_input() {
     use tokio::io::AsyncWriteExt;
     let (server, client) = super::overlapped_in_pipe().expect("pipe pair");
@@ -58,7 +58,7 @@ async fn overlapped_in_pipe_feeds_a_real_childs_input() {
 
 // A squatted name must ERROR (never attach to the stranger's pipe) in BOTH orientations:
 // first_pipe_instance makes the second create fail PermissionDenied.
-#[tokio::test]
+#[skuld::test]
 async fn overlapped_pipe_never_attaches_to_a_squatted_name() {
     let name = format!(r"\\.\pipe\cosca-test-squat.{}", std::process::id());
     let _squatter = tokio::net::windows::named_pipe::ServerOptions::new()
@@ -78,7 +78,7 @@ async fn overlapped_pipe_never_attaches_to_a_squatted_name() {
 // asserted through the CRATE'S OWN claim path: after a thief takes the single client slot,
 // the production `open_client_slot` must fail typed (never a silent wrong-attach), exactly
 // what `overlapped_pipe_named` does when it loses the race.
-#[tokio::test]
+#[skuld::test]
 async fn overlapped_pipe_client_slot_is_exclusive() {
     let name = format!(r"\\.\pipe\cosca-test-slot.{}", std::process::id());
     // The same instance overlapped_pipe_named creates (Out orientation).
@@ -108,7 +108,7 @@ async fn overlapped_pipe_client_slot_is_exclusive() {
 // Reachable through the public wrappers (a caller legally retries after `Err`; communicate's
 // write path swallows a BrokenPipe from write_all and then flushes). Event-driven: the first
 // read completes exactly when the doomed task's result lands — no timing.
-#[tokio::test]
+#[skuld::test]
 async fn owned_read_poll_after_connect_error_is_err_not_panic() {
     let handle: tokio::task::JoinHandle<std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer>> =
         tokio::spawn(async { Err(std::io::Error::other("doomed connect")) });
@@ -125,7 +125,7 @@ async fn owned_read_poll_after_connect_error_is_err_not_panic() {
 
 // Poll-after-error, the JoinError arm (a panicked connect task), through the WRITE wrapper:
 // same terminal-state contract — the error repeats, the completed handle is never re-polled.
-#[tokio::test]
+#[skuld::test]
 async fn owned_write_poll_after_join_error_is_err_not_panic() {
     let handle: tokio::task::JoinHandle<std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer>> =
         tokio::spawn(async { panic!("doomed connect task") });
@@ -146,7 +146,7 @@ async fn owned_write_poll_after_join_error_is_err_not_panic() {
 // not assumed), and a late client open completes it via a reactor wakeup. Together with
 // the two E2E tests above (client-already-open => immediate), BOTH connect worlds are
 // pinned — no timing assumption.
-#[tokio::test]
+#[skuld::test]
 async fn overlapped_pipe_connect_pending_completes_on_late_client_open() {
     use std::future::Future;
     use std::io::Write;

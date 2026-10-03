@@ -30,7 +30,7 @@ fn long_lived_contained_child() -> (crate::tokio::Child, crate::tokio::ChildStdi
     crate::test_child::held_contained_blocker_async(crate::Stdio::null())
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
     let mut cmd = quick_contained_cmd();
     let mut child = cmd.spawn().expect("spawn");
@@ -49,7 +49,7 @@ async fn async_wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
     _ = child.wait().await;
 }
 
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
     let (mut child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
@@ -69,7 +69,7 @@ async fn async_wait_tree_timeout_reports_members_remain_before_the_deadline() {
 
 /// Async twin of `wait_tree_timeout_zero_reports_members_remain_on_a_live_tree` — see there for
 /// the full rationale.
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
     let (mut child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
@@ -89,7 +89,7 @@ async fn async_wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
 
 /// Async twin of `wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained`
 /// — see there for the full rationale.
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained() {
     let mut cmd = quick_contained_cmd();
     let mut child = cmd.spawn().expect("spawn");
@@ -121,7 +121,7 @@ async fn async_wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree
 /// See the sync twin's identical test for the full rationale, including why this cannot be a
 /// single unconditional assertion (macOS promotes every contained root's mechanism to the
 /// drainable fd marker regardless of the requested mode).
-#[tokio::test]
+#[skuld::test]
 async fn async_wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     let mut cmd = crate::tokio::Command::new();
     #[cfg(unix)]

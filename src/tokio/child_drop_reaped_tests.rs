@@ -3,8 +3,8 @@
 //! group, so the drop skips it and warns instead.
 //!
 //! The recorder replaces `killpg` (`unix::fault::record_kill_group`), so a mutant that still
-//! sends it never reaches a real group. The recorder is thread-local and `#[tokio::test]` is
-//! current-thread, so the drop's kill runs on the recording thread.
+//! sends it never reaches a real group. The recorder is thread-local and skuld's default
+//! runtime is current-thread, so the drop's kill runs on the recording thread.
 
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
@@ -35,8 +35,9 @@ fn drop_warns_since(mark: usize) -> Vec<(log::Level, String)> {
 
 /// Mutants: the drop still calls `hard_kill`; `root_reaped` is always false; no warn; the warn
 /// without the pgid.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with_the_pgid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -71,8 +72,9 @@ async fn dropping_a_waited_on_process_group_child_sends_no_killpg_and_warns_with
 
 /// The warn is for the skip only. Mutant: the reaped test is inverted or dropped, so a running
 /// root is skipped too.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -89,8 +91,9 @@ async fn dropping_a_running_process_group_child_still_kills_the_group_and_does_n
 
 /// A root that exited but is not reaped is a zombie: it still pins its group number, so the group
 /// kill is safe. Mutant: reaped judged with `try_wait`, which reaps the zombie and then skips.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_group() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -108,8 +111,9 @@ async fn dropping_an_exited_but_unreaped_process_group_child_still_kills_the_gro
 /// A `TreeWalk` names its tree by ppid edges from the root's number, which after the reap belong to
 /// whoever reused it: the drop walks nothing and warns naming the root. Mutant: the reaped
 /// `TreeWalk` still walks.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_root_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
@@ -138,8 +142,9 @@ async fn dropping_a_waited_on_tree_walk_child_walks_nothing_and_warns_with_the_r
 
 /// Positive control for the recorder above: a running `TreeWalk` root is walked, and nothing is
 /// warned.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let mut cmd = Command::new();
@@ -160,8 +165,9 @@ async fn dropping_a_running_tree_walk_child_walks_from_its_pid_and_does_not_warn
 /// A root reaped by someone else is invisible to tokio's own state (it stays `Running` until
 /// polled), so the drop reads the root's number too, as the sync drop does. Mutant: tokio's drop
 /// takes only its own state.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -204,8 +210,9 @@ fn foreign_reaped(mut cmd: Command) -> crate::tokio::Child {
 /// A disarmed drop signals nothing, but tokio's own `Child` drop still `try_wait`s the root's
 /// number, so a foreign reap must forget it there too. Mutant: the foreign-reap check runs only
 /// under `kill_on_drop`.
-#[tokio::test]
+#[skuld::test]
 async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
@@ -220,8 +227,9 @@ async fn a_detached_drop_after_a_foreign_reap_forgets_tokios_child() {
 }
 
 /// The same through the command's opt-out. Mutant: as above.
-#[tokio::test]
+#[skuld::test]
 async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let root = drop_fault::record();
     let backend_drops = crate::tokio::child::fault::count_backend_drops();
@@ -234,8 +242,9 @@ async fn a_kill_on_drop_false_drop_after_a_foreign_reap_forgets_tokios_child() {
 
 /// The skip is quiet once this handle has already hard-killed the tree. Mutant: the tree-killed
 /// flag is ignored.
-#[tokio::test]
+#[skuld::test]
 async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["true"]).spawn().expect("spawn");
@@ -253,8 +262,9 @@ async fn drop_after_kill_tree_and_wait_skips_at_debug_and_does_not_warn() {
 }
 
 /// `graceful_shutdown_tree` sweeps with `kill_tree` and reaps the root, so its drop is quiet too.
-#[tokio::test]
+#[skuld::test]
 async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let mut child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -275,8 +285,9 @@ async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 /// without reaping (`WNOWAIT`), so tokio's own drop reaps it. The root is still a zombie when the
 /// handle drops, its number is pinned, and the drop has nothing to skip or to warn about. Mutant:
 /// a skip decided on anything but the reaped root.
-#[tokio::test]
+#[skuld::test]
 async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -304,8 +315,9 @@ async fn waited_on_sleep_root() -> crate::tokio::Child {
 
 /// Tokio's own reaped state is enough when the number's read is refused (`Unknown`). Mutant: the
 /// drop takes only the number's read.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -322,8 +334,9 @@ async fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_ki
 
 /// With tokio's state not reaped, an `Unknown` read means "not known to be reaped": the drop kills.
 /// Mutant: `Unknown` is treated as reaped.
-#[tokio::test]
+#[skuld::test]
 async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_failed_read() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let root = drop_fault::record();
@@ -344,8 +357,9 @@ async fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_th
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
 /// tree-killed flag is set on the attempt.
-#[tokio::test]
+#[skuld::test]
 async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     recorder.fail_with_unassessable();
@@ -364,8 +378,9 @@ async fn drop_after_a_failed_kill_tree_and_wait_still_warns() {
 /// The same for a `TreeWalk` whose walk was incomplete but returned `Ok`. Not on macOS, where
 /// `TreeWalk` mode is an fd marker, whose incompleteness is an `Err` (the test above).
 #[cfg(not(target_os = "macos"))]
-#[tokio::test]
+#[skuld::test]
 async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let mut cmd = Command::new();
     cmd.args(["sleep", "300"]);
@@ -396,8 +411,9 @@ mod cgroup_common;
 /// kill. The cgroup lane's counterpart of the sync test of the same name; `COSCA_TEST_CGROUP`
 /// is `0` everywhere else. Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
+    crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
     if !crate::test_support::require_group("CGROUP") {
@@ -454,8 +470,9 @@ fn assert_skipped_at_debug(mark: usize) {
 /// them and skips every channel that names the root's number: the `killpg`, the ppid walk and the
 /// root's own kill. Mutants: the sweep skipped too; the `killpg` or the walk still run.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn fd_marker_drop_after_wait_sweeps_the_marker_holders_but_names_nothing_by_the_roots_number() {
+    crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
     crate::log_capture::install();
@@ -517,8 +534,9 @@ async fn reaped_sleep_root(mode: ContainMode) -> (u32, crate::tokio::Child) {
 /// An fd marker with no group (`TreeWalk` mode): after a reap nothing but the holder sweep runs.
 /// Mutant: the walk or the root kill still run for it.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holders() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let walks = record_walks();
     let (pid, child) = reaped_sleep_root(ContainMode::TreeWalk).await;
@@ -535,8 +553,9 @@ async fn fd_marker_without_a_group_drop_after_wait_only_sweeps_the_marker_holder
 /// The same with a group: no `killpg`, no walk, one warn. Mutant: the walk still runs for a marker
 /// that has a group.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[skuld::test]
 async fn fd_marker_with_a_group_drop_after_wait_neither_signals_the_group_nor_walks() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let recorder = record_kill_group();
     let walks = record_walks();

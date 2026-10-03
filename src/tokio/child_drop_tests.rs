@@ -62,7 +62,7 @@ mod linux {
 
     /// The root's exit, read through a pidfd opened while the caller still holds the unreaped
     /// child, so it names that process exactly. It never consumes the exit: the root's number
-    /// belongs to tokio's reaper once the child is dropped, and a `#[tokio::test]` runtime that
+    /// belongs to tokio's reaper once the child is dropped, and a skuld test runtime that
     /// this thread never yields to has not run it. That holds only in a process running this one
     /// test (tokio's orphan queue is process-global, and any runtime that parks drains it), so
     /// [`ended_after_closing`](Self::ended_after_closing) requires `alone()`.
@@ -161,7 +161,7 @@ fn thread_ids() -> std::collections::BTreeSet<String> {
 /// `spawn` returns, so a name check can pass spuriously. Runs alone, so no other test's threads
 /// come and go between the two reads.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_drop_starts_no_thread() {
     if !alone(fixture_path!(an_async_drop_starts_no_thread)) {
         return;
@@ -176,7 +176,7 @@ async fn an_async_drop_starts_no_thread() {
 /// The parent's end of a piped stdout nobody took is closed by the time `drop` returns. Runs alone,
 /// so no other thread can take the descriptor number in between.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_drop_closes_the_childs_untaken_stdout() {
     use std::os::fd::AsRawFd as _;
 
@@ -211,7 +211,7 @@ async fn an_async_drop_closes_the_childs_untaken_stdout() {
 ///
 /// Mutants: `block_until_exit(id, None)` or `os.attached.wait_drained(None)` added to
 /// `signal_on_drop`.
-#[tokio::test]
+#[skuld::test]
 async fn a_kill_on_drop_drop_of_a_live_blocker_returns() {
     let (child, _stdin) = blocker();
     drop(child);
@@ -226,8 +226,9 @@ fn in_its_own_group(mut child: Child) -> Child {
 
 /// A live, kill-on-drop root in a process group has its group killed by the drop.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn a_drop_of_a_live_group_root_kills_its_group() {
+    crate::tokio::test_runtime::assert_current_thread();
     let (child, _stdin) = blocker();
     let child = in_its_own_group(child);
     let pgid = child.id().pid() as i32;
@@ -240,7 +241,7 @@ async fn a_drop_of_a_live_group_root_kills_its_group() {
 /// thread bumps that thread's count, not this one's.
 ///
 /// Mutant: `OsResources::release_without_waiting` moves `self` into a `std::thread::spawn`.
-#[tokio::test]
+#[skuld::test]
 async fn a_drop_releases_its_resources_once_on_the_dropping_thread() {
     let releases = fault::count_releases();
     let backend_drops = fault::count_backend_drops();
@@ -288,7 +289,7 @@ async fn ignoring_blocker() -> (Child, crate::tokio::ChildStdin, crate::tokio::C
 /// running until its stdin closes (`Exited(0)`). Mutants: the drop skips the kill, or sends
 /// `SIGTERM` or `SIGPROF`.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_kill_on_drop_drop_kills_the_root() {
     if !alone(fixture_path!(a_kill_on_drop_drop_kills_the_root)) {
         return;
@@ -309,8 +310,9 @@ async fn a_kill_on_drop_drop_kills_the_root() {
 /// The drop runs inside a bounded section, which is what turns a wait added to it into a debug
 /// panic: a hook run by the leaf's `rmdir`, inside the drop, sees it.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_drop_runs_inside_a_bounded_section() {
+    crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::fault as leaf_fault;
 
     let name = "cosca-async-drop-in-section";
@@ -334,8 +336,9 @@ async fn an_async_drop_runs_inside_a_bounded_section() {
 /// it and points at `wait_tree`. A drop that waited for the drain would panic on the debug
 /// contract instead.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_drop_never_blocks_on_an_undrained_leaf() {
+    crate::tokio::test_runtime::assert_current_thread();
     let name = "cosca-async-drop-undrained";
     let (fake, leaf) = linux::fake_leaf(name, true);
     let (child, _stdin) = blocker();
@@ -354,7 +357,7 @@ async fn an_async_drop_never_blocks_on_an_undrained_leaf() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_drop_removes_an_already_drained_leaf() {
     let name = "cosca-async-drop-drained";
     let (fake, leaf) = linux::fake_leaf(name, false);
@@ -371,7 +374,7 @@ async fn an_async_drop_removes_an_already_drained_leaf() {
 /// is still armed and this handle killed it. The tree has not drained, and the drop returns with
 /// the kill fired again, a warning, and the root untouched.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     if !alone(fixture_path!(a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks)) {
         return;
@@ -402,7 +405,7 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
     if !alone(fixture_path!(
         a_disarmed_never_killed_drop_never_kills_and_logs_at_debug
@@ -429,8 +432,9 @@ async fn a_disarmed_never_killed_drop_never_kills_and_logs_at_debug() {
 /// debug contract. The root's number now belongs to tokio's orphan queue, so this test only ever
 /// reads it through its own pidfd.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
+    crate::tokio::test_runtime::assert_current_thread();
     if !alone(fixture_path!(a_root_whose_kill_fails_is_handed_off_not_waited_on)) {
         return;
     }
@@ -489,7 +493,7 @@ async fn a_root_whose_kill_fails_is_handed_off_not_waited_on() {
 ///
 /// Mutant: `OsResources::release_without_waiting` forgets the backend instead of dropping it.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn a_dropped_root_left_to_tokio_is_reaped() {
     let (child, _stdin) = blocker();
     let root = linux::Pidfd::of(&child);
@@ -504,8 +508,9 @@ async fn a_dropped_root_left_to_tokio_is_reaped() {
 
 /// A root the drop could not signal is logged, and the drop returns: it does not wait for a root
 /// it could not stop. Closing its stdin afterwards lets it end on its own.
-#[tokio::test]
+#[skuld::test]
 async fn unreaped_root_could_not_be_terminated_on_drop_is_logged() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (child, stdin) = blocker();
     let pid = child.id().pid();
@@ -522,8 +527,9 @@ async fn unreaped_root_could_not_be_terminated_on_drop_is_logged() {
 /// (`child_tests.rs`): a failed `cgroup.kill` write reached during `Child::drop`'s OWN teardown
 /// is a real OS outcome: Drop must warn and return normally.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
+    crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-async-drop-kill-fail-leaf");

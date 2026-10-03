@@ -439,7 +439,7 @@ fn fixture_own_procfs_init() {
         proc_view()
     };
     assert!(matches!(view, ProcView::Same(_)), "got {view:?}");
-    ns::run(fixture_path!(fixture_own_procfs_unprivileged));
+    ns::run_dropping_to_nobody(fixture_path!(fixture_own_procfs_unprivileged));
 }
 
 #[test]

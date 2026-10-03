@@ -49,3 +49,55 @@ fn something_left_in_scratch_fails_finish_and_stays() {
     std::fs::remove_dir(&stray).unwrap();
     std::fs::remove_dir(&scratch).unwrap();
 }
+
+/// What a chrooting fixture leaves behind when it bound the DB directory into `root`: the
+/// mount point's directory chain, empty once its mount namespace is gone.
+fn make_mount_point_chain(s: &ChrootScratch) -> PathBuf {
+    let inside = s.root().join(s.db_dir().strip_prefix("/").unwrap());
+    std::fs::create_dir_all(&inside).unwrap();
+    inside
+}
+
+#[test]
+fn finish_removes_the_db_mount_point_chain_and_the_db_directory() {
+    let s = ChrootScratch::new();
+    let db = s.db_dir().to_owned();
+    make_mount_point_chain(&s);
+    let scratch = s.scratch().to_owned();
+    s.finish().expect("an empty mount point chain is removable");
+    assert!(!scratch.exists());
+    assert!(!db.exists(), "the DB directory outlived the scratch");
+}
+
+#[test]
+fn a_file_left_in_the_db_mount_point_chain_fails_finish_and_stays() {
+    let s = ChrootScratch::new();
+    let inside = make_mount_point_chain(&s);
+    let stray = inside.parent().unwrap().join("stray");
+    std::fs::write(&stray, b"x").unwrap();
+    let scratch = s.scratch().to_owned();
+    let root = s.root().to_owned();
+    let err = s.finish().unwrap_err();
+    assert!(err.contains("stray"), "{err}");
+    assert!(stray.is_file(), "evidence must survive");
+    // Clean up: the failed finish() removed nothing above the stray file.
+    std::fs::remove_file(&stray).unwrap();
+    std::fs::remove_dir(stray.parent().unwrap()).unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::remove_dir(&scratch).unwrap();
+}
+
+#[test]
+fn the_db_directory_is_directly_under_tmp() {
+    let s = ChrootScratch::new();
+    assert_eq!(s.db_dir().parent(), Some(Path::new("/tmp")));
+    s.finish().unwrap();
+}
+
+#[test]
+fn a_db_directory_that_cannot_be_removed_fails_finish() {
+    let s = ChrootScratch::new();
+    std::fs::remove_dir(s.db_dir()).unwrap();
+    let err = s.finish().unwrap_err();
+    assert!(err.contains("skuld DB directory"), "{err}");
+}

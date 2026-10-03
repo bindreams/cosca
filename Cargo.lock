@@ -708,6 +708,7 @@ dependencies = [
  "serde_yml",
  "skuld-macros",
  "tempfile",
+ "tokio",
  "unicode-normalization",
  "windows",
 ]

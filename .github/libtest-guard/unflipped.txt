@@ -1,4 +1,3 @@
-lib:cosca
 test:block_on_socket
 test:elevation
 test:elevation_pkexec_version
