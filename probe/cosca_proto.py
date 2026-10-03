@@ -108,9 +108,16 @@ class ShimLink:
                 c, _ = self.listener.accept()
             except BlockingIOError:
                 return
-            if self.sigpipe_safe:
-                nosigpipe(c)
-            pid, uid = peer_cred(c)
+            try:
+                pid, uid = peer_cred(c)
+                if self.sigpipe_safe:
+                    nosigpipe(c)  # macOS: EINVAL once the peer has disconnected (measured, CI)
+            except OSError as e:
+                # Unreadable or already-dead peer: close it unanswered; the state is unchanged (it may not
+                # have been our shim). A dead shim never read A, so nothing started.
+                self.ev("closed-unreadable", e.errno)
+                c.close()
+                continue
             if uid != self.expected_euid:
                 self.ev("closed-non-root", pid, uid)
                 c.close()

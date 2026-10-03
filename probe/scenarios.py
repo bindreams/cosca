@@ -169,7 +169,7 @@ def s_connect_after_accept():
     a = c.ev.get()  # the very next event must be the answer (an acceptor that never steps emits "polling")
     if a[0] != "answered":
         result("connect-after-accept", False, f"next acceptor event after listener-ready: {a}")
-        c.link.kill(c.p.pid); c.p.wait(); c.shimlog.eof(); c.link.release(False); return
+        c.link.kill(c.p.pid); c.p.wait(); c.link.release(False); c.shimlog.eof(); return
     read_ready(c)
     k = c.kill(); w = c.wait(); out = c.link.release(False)
     result("connect-after-accept", a[1] == "A" and k == "sent" and w == ("program", 9) and out == "removed", f"{a[1]} {k} {w} {out}")
@@ -218,7 +218,12 @@ def s_second_root_peer():
     a = ev_until(c.ev, "answered"); read_ready(c)
     got = as_root("import socket; s=socket.socket(socket.AF_UNIX); s.connect(%r); print(len(s.recv(1)))" % os.path.join(c.link.path, "s")).strip()
     e = ev_until(c.ev, "answered")
-    k = c.kill(); w = c.wait(); c.link.release(False)
+    k = c.kill()
+    try:
+        w = c.wait()
+    except ShimLost:
+        w = "ShimLost (the first shim lost its connection)"
+    c.link.release(False)
     result("second root peer while Live", e[1] == "closed-second" and got == "0" and w == ("program", 9), f"second peer read {got} bytes; {e[1]}; first still controls: {w}")
 
 
@@ -308,9 +313,14 @@ def s_shim_death_backlog():
     ev_until(c.ev, "listener-ready")
     as_root("import os; os.kill(%d, 9)" % shim_pid(c))
     c.shimlog.eof()
-    g.set(); a = ev_until(c.ev, "answered")
+    g.set()
+    while True:  # the dead peer is either answered-and-failed (Linux) or unreadable and closed (macOS)
+        a = c.ev.get()
+        if a[0] in ("answered", "closed-unreadable", "exited"):
+            break
     w = c.wait(); c.link.release(False)
-    result("shim-death-before-answer", a[1] == "peer-gone" and c.link.state == REFUSED and never_ran(c), f"answer={a[1]} state={c.link.state} wait={w}")
+    ok = a[0] != "exited" and (a[0] == "closed-unreadable" or a[1] == "peer-gone") and c.link.state == REFUSED and never_ran(c)
+    result("shim-death-before-answer", ok, f"acceptor={a} state after wait={c.link.state} wait={w}")
 
 
 def s_exit_races_kill():
@@ -682,4 +692,5 @@ if __name__ == "__main__":
             except Exception as e:
                 import traceback; traceback.print_exc()
                 result(n, False, "exception: %r" % e)
-    sys.exit(0 if all(RESULTS) else 1)
+    sys.stdout.flush()
+    os._exit(0 if all(RESULTS) else 1)  # a link a failed scenario left open must not keep the process alive
