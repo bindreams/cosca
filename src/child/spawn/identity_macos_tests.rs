@@ -37,11 +37,22 @@ pub(crate) fn has_not_exited(pid: u32) -> bool {
     info.si_pid == 0
 }
 
-/// Kills and reaps `pid`, a child of this test the spawn under test left running.
-pub(crate) fn kill_and_reap(pid: u32) {
+/// Ends and reaps `pid`, a child of this test the spawn under test left running, and asserts that
+/// nothing but this test signalled it. The first fatal signal fixes a process's status, and a
+/// signal the spawn under test sent would have been delivered before the spawn returned, so a
+/// `SIGUSR1` status shows no earlier signal reached the child. (An exit check cannot: a kill is
+/// delivered asynchronously, so the child may not have exited yet when it is looked at.)
+pub(crate) fn end_unsignalled_and_reap(pid: u32) {
     // SAFETY: `pid` is this test's own unreaped child.
-    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
-    reap_by_pid(pid);
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) }, 0);
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own child.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGUSR1,
+        "something other than the test signalled the child before it did: status {status:#x}"
+    );
 }
 
 pub(crate) fn vanished(err: &Error) -> bool {
@@ -118,7 +129,7 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
         has_not_exited(pid.get()),
         "nothing may have signalled or reaped the pid"
     );
-    kill_and_reap(pid.get());
+    end_unsignalled_and_reap(pid.get());
 }
 
 /// A re-read the OS refuses (forced: the peek fails) cannot show the child ours: the spawn fails
@@ -149,7 +160,7 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
     let adopted = outcome.as_ref().ok().map(|child| child.id());
     let left = has_not_exited(pid.get());
     if adopted.is_none() {
-        kill_and_reap(pid.get());
+        end_unsignalled_and_reap(pid.get());
     }
     let err = outcome.expect_err("a refused re-read fails the spawn");
     assert!(
@@ -237,7 +248,7 @@ fn macos_sync_spawn_first_read_gone_is_gone_and_leaves_the_child() {
         has_not_exited(pid.get()),
         "nothing may have signalled or reaped the pid"
     );
-    kill_and_reap(pid.get());
+    end_unsignalled_and_reap(pid.get());
 }
 
 /// The first read is refused: `Unassessable`, and the child is left running.
@@ -258,5 +269,5 @@ fn macos_sync_spawn_first_read_refused_is_unassessable_and_leaves_the_child() {
         has_not_exited(pid.get()),
         "nothing may have signalled or reaped the pid"
     );
-    kill_and_reap(pid.get());
+    end_unsignalled_and_reap(pid.get());
 }
