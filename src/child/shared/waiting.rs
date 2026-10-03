@@ -104,6 +104,8 @@ impl SharedChild {
                 // Nothing between the reap and the `E` write may panic.
                 Ok(Reap::Reaped(reaped)) => {
                     drop(holder.finish(State::E(reaped)));
+                    #[cfg(test)]
+                    super::seams::park_after_reap_recorded();
                     self.log_unreadable(reaped);
                     return status_of(reaped).map(Some);
                 }
