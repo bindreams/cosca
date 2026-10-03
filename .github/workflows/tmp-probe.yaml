@@ -1,0 +1,46 @@
+name: tmp-probe
+on: pull_request
+permissions: {}
+jobs:
+  macos-issetugid:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          cc -Wall -o ids probe/ids.c
+          cc -Wall -o sigprobe probe/sigprobe.c
+          sw_vers; sudo -V | head -1
+      - name: issetugid
+        run: |
+          set -x
+          ./ids plain
+          sudo -n ./ids sudo
+          sudo -n /bin/sh -c "exec $PWD/ids sudo-sh-exec"
+          sudo -n /usr/bin/osascript -e "do shell script \"exec $PWD/ids sudo-osascript-exec\" with administrator privileges"
+          sudo -n /usr/bin/osascript -e "do shell script \"$PWD/ids sudo-osascript-child\" with administrator privileges"
+          sudo -n cp ids /tmp/ids_suid
+          sudo -n chown root:wheel /tmp/ids_suid
+          sudo -n chmod 4755 /tmp/ids_suid
+          ls -l /tmp/ids_suid
+          /tmp/ids_suid setuid-copy-as-runner
+          sudo -n /tmp/ids_suid setuid-copy-via-sudo
+      - name: relay-inputs-sudo-no-tty
+        run: |
+          rm -f /tmp/rdy; mkfifo /tmp/rdy
+          sudo -n ./sigprobe /tmp/rdy & S=$!
+          read -r P PP < /tmp/rdy
+          echo "sudo=$S probe=$P probe-parent=$PP"; ps -o pid,ppid,pgid,sess,user,command -p $S,$P
+          kill -TERM $S
+          wait $S; echo "sudo exit $?"
+      - name: relay-inputs-sudo-pty
+        run: |
+          rm -f /tmp/rdy; mkfifo /tmp/rdy
+          script -q /dev/null sudo -n ./sigprobe /tmp/rdy < /dev/null & W=$!
+          read -r P PP < /tmp/rdy
+          ps -axo pid,ppid,pgid,sess,user,command | grep -E 'sudo|sigprobe|script' | grep -v grep
+          S=$(ps -o ppid= -p "$PP" | tr -d ' ')
+          echo "probe=$P monitor-or-parent=$PP sudo=$S"
+          sudo -n kill -TERM "$S" 2>/dev/null || kill -TERM "$S"
+          wait $W; echo "script exit $?"
