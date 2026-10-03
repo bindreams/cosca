@@ -52,7 +52,7 @@ fn never<T>(what: &'static str) -> impl FnMut() -> T {
 
 /// Mutant: the exit check is deleted, so a tracee that exited before it stopped is polled again
 /// and again (here: the `stop` script runs out).
-#[test]
+#[skuld::test]
 fn an_exit_record_ends_the_wait_with_its_code_and_status() {
     let result = settle(
         scripted("stop", vec![Ok(Stop::Running)]),
@@ -65,7 +65,7 @@ fn an_exit_record_ends_the_wait_with_its_code_and_status() {
 }
 
 /// Mutants: a normal exit and a core dump are not taken for exits.
-#[test]
+#[skuld::test]
 fn every_exit_kind_ends_the_wait() {
     for code in [libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED] {
         let result = settle(
@@ -81,7 +81,7 @@ fn every_exit_kind_ends_the_wait() {
 
 /// Mutant: any record with a pid counts as an exit, which macOS's `WEXITED` peek also fills for a
 /// stop.
-#[test]
+#[skuld::test]
 fn a_stop_record_is_not_an_exit() {
     let result = settle(
         scripted("stop", vec![Ok(Stop::Running), Ok(Stop::Stopped(libc::SIGSTOP))]),
@@ -91,7 +91,7 @@ fn a_stop_record_is_not_an_exit() {
 }
 
 /// Mutant: no pid check, so an empty record (`si_pid == 0`, `si_code` 0) is read as an event.
-#[test]
+#[skuld::test]
 fn an_empty_record_is_not_an_exit() {
     let result = settle(
         scripted("stop", vec![Ok(Stop::Running), Ok(Stop::Stopped(libc::SIGSTOP))]),
@@ -101,7 +101,7 @@ fn an_empty_record_is_not_an_exit() {
 }
 
 /// Mutant: the exit peek runs before the stop is considered, so a settled stop waits on it.
-#[test]
+#[skuld::test]
 fn a_settled_stop_ends_the_wait_without_an_exit_peek() {
     let result = settle(
         scripted("stop", vec![Ok(Stop::Stopped(libc::SIGSTOP))]),
@@ -111,7 +111,7 @@ fn a_settled_stop_ends_the_wait_without_an_exit_peek() {
 }
 
 /// Mutant: `Settling` counts as settled, so the caller acts on a stop no request can reach yet.
-#[test]
+#[skuld::test]
 fn a_settling_stop_is_polled_again() {
     let result = settle(
         scripted(
@@ -124,14 +124,14 @@ fn a_settling_stop_is_polled_again() {
 }
 
 /// Mutant: a failed stop peek is swallowed and retried.
-#[test]
+#[skuld::test]
 fn a_failed_stop_peek_is_its_errno() {
     let result = settle(scripted("stop", vec![Err(libc::EPERM)]), never("exited"));
     assert!(matches!(result, Err(AttachError::Errno(libc::EPERM))), "{result:?}");
 }
 
 /// Mutant: a failed exit peek is swallowed and retried.
-#[test]
+#[skuld::test]
 fn a_failed_exit_peek_is_its_errno() {
     let result = settle(
         scripted("stop", vec![Ok(Stop::Running)]),

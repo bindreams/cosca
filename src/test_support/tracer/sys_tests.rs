@@ -8,26 +8,26 @@ const NO_FLAGS: i32 = 0;
 /// Mutant: an uninterruptible thread counts as parked. A traced stop's thread blocks
 /// uninterruptibly on a kernel lock, keeping its kernel stack, between setting `SSTOP` and
 /// waiting on `sigwait`.
-#[test]
+#[skuld::test]
 fn an_uninterruptible_thread_is_not_parked() {
     assert!(!parked(libc::TH_STATE_UNINTERRUPTIBLE, NO_FLAGS));
 }
 
 /// Mutant: no exemption, so a stop with a never-started thread never settles.
-#[test]
+#[skuld::test]
 fn an_uninterruptible_thread_without_a_kernel_stack_is_parked() {
     assert!(parked(libc::TH_STATE_UNINTERRUPTIBLE, libc::TH_FLAGS_SWAPPED));
 }
 
 /// Mutants: a running thread counts as parked; so does any thread without a kernel stack.
-#[test]
+#[skuld::test]
 fn a_running_thread_is_not_parked() {
     assert!(!parked(libc::TH_STATE_RUNNING, NO_FLAGS));
     assert!(!parked(libc::TH_STATE_RUNNING, libc::TH_FLAGS_SWAPPED));
 }
 
 /// Mutant: one of these states is rejected, so a stop with such a thread never settles.
-#[test]
+#[skuld::test]
 fn a_waiting_suspended_or_halted_thread_is_parked() {
     assert!(parked(libc::TH_STATE_WAITING, NO_FLAGS));
     assert!(parked(libc::TH_STATE_STOPPED, NO_FLAGS));
@@ -48,7 +48,7 @@ const VANISHED: Thread = (0, None);
 
 /// Mutants: the verdict reads only the first thread, or only the last, so a stop whose stopping
 /// thread is listed elsewhere settles while that thread still runs.
-#[test]
+#[skuld::test]
 fn a_stop_settles_only_once_every_thread_is_parked() {
     let waiting = thread(libc::TH_STATE_WAITING);
     let running = thread(libc::TH_STATE_RUNNING);
@@ -61,7 +61,7 @@ fn a_stop_settles_only_once_every_thread_is_parked() {
 
 /// A thread that exited between the listing and its read leaves the stop unsettled, so every
 /// state peeks again under its backoff. Mutant: it counts as parked.
-#[test]
+#[skuld::test]
 fn a_thread_that_vanished_mid_read_is_not_parked() {
     let waiting = thread(libc::TH_STATE_WAITING);
     assert!(!all_parked(&[waiting, VANISHED, waiting]));
@@ -70,7 +70,7 @@ fn a_thread_that_vanished_mid_read_is_not_parked() {
 /// A listed thread's read meeting `ESRCH` names that thread, not the process. Mutant: `threads`
 /// propagates it, `stop` answers `Running`, and S3 then waits for a `SIGCHLD` it already
 /// consumed.
-#[test]
+#[skuld::test]
 fn a_thread_read_meeting_esrch_is_a_vanished_thread() {
     let read = |id| match id {
         2 => Err(libc::ESRCH),
@@ -93,7 +93,7 @@ fn peeked(si_pid: libc::pid_t) -> libc::siginfo_t {
 
 /// Mutants: a vanished thread ends the peek as `Running`, or the process being gone reads as
 /// settling or as an error.
-#[test]
+#[skuld::test]
 fn a_vanished_thread_reads_as_settling_and_a_vanished_process_as_running() {
     let waiting = thread(libc::TH_STATE_WAITING);
     let stopped = peeked(1);
@@ -113,7 +113,7 @@ fn a_vanished_thread_reads_as_settling_and_a_vanished_process_as_running() {
 }
 
 /// Mutant: an unknown run state counts as parked.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "pth_run_state 0 is no TH_STATE_*")]
 fn an_unknown_run_state_fails_loudly() {
     parked(0, NO_FLAGS);
@@ -168,7 +168,7 @@ impl Drop for UnstartedMachThread {
 /// Raw Mach threads never set a TSD base, so a listing keyed by it (`PROC_PIDLISTTHREADS`) names
 /// every one of them 0, and a read of 0 returns only the first. Two never-started ones must each
 /// be listed and read. Mutant: threads listed by TSD base.
-#[test]
+#[skuld::test]
 fn threads_without_a_tsd_base_read_as_distinct_threads() {
     let mach_threads = [UnstartedMachThread::new(), UnstartedMachThread::new()];
     let listed = super::threads(std::process::id()).expect("list this process's threads");
@@ -188,7 +188,7 @@ fn threads_without_a_tsd_base_read_as_distinct_threads() {
 
 /// Mutant: `proc_state` reads the wrong process, or maps the flag word wrongly. This process is
 /// running and has not begun to exit.
-#[test]
+#[skuld::test]
 fn a_running_process_has_not_begun_to_exit() {
     let state = proc_state(std::process::id());
     assert_eq!(state.p_stat, libc::SRUN, "{state:?}");

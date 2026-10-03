@@ -9,7 +9,7 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 /// process (`ESRCH`).
 ///
 /// Mutant: build the timespec inline, unclamped -> `kevent failed: EINVAL`.
-#[test]
+#[skuld::test]
 fn real_round_with_a_far_timeout_returns_the_pending_exit() {
     let mut cat = std::process::Command::new("/bin/cat");
     cat.stdin(std::process::Stdio::piped())

@@ -7,7 +7,7 @@
 //! tracer's reap) that a real debugger creates. It is a re-exec of this test binary, filtered to
 //! [`uh_helper_entry`], and takes its inputs from env vars (libtest rejects unknown options):
 //!
-//! - `COSCA_UH_ROLE=helper` marks the re-exec; without it the `#[test]` is a no-op;
+//! - `COSCA_UH_ROLE=helper` marks the re-exec; without it the `#[skuld::test]` is a no-op;
 //! - `COSCA_UH_MODE` is `auto` or `hold` ([`Mode`]);
 //! - `COSCA_UH_FORCE=<tag>:<directive>[,…]` injects results and events (transition tests only);
 //! - `COSCA_UH_TRACE=1` adds a `state <name>` report on entry to every state (transition tests
@@ -639,7 +639,7 @@ fn await_ready(tracee: &mut crate::Child) -> Ready {
 /// stdout and points stdout at `/dev/null` (libtest fails a run whose report it cannot write, and
 /// the test drops the pipe), then reads stdin until EOF or one byte, then exits 0. A no-op unless
 /// `COSCA_UH_ROLE=tracee`, so an ordinary suite run does not block on stdin.
-#[test]
+#[skuld::test]
 fn uh_tracee_fixture() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("tracee") {
         return;
@@ -745,7 +745,7 @@ fn reexec_as(kind: &str) -> ! {
 }
 
 /// The helper's entry point. A no-op unless `COSCA_UH_ROLE=helper`.
-#[test]
+#[skuld::test]
 fn uh_helper_entry() {
     if std::env::var("COSCA_UH_ROLE").as_deref() != Ok("helper") {
         return;
