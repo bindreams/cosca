@@ -187,6 +187,51 @@ path = "tests/tokio_foreign.rs"
 harness = false
 
 [[test]]
+name = "group_teardown_setuid"
+path = "tests/group_teardown_setuid.rs"
+harness = false
+
+[[test]]
+name = "linux_pidfd_wait"
+path = "tests/linux_pidfd_wait.rs"
+harness = false
+
+[[test]]
+name = "macos_fdmarker"
+path = "tests/macos_fdmarker.rs"
+harness = false
+
+[[test]]
+name = "windows_breakaway"
+path = "tests/windows_breakaway.rs"
+harness = false
+
+[[test]]
+name = "windows_console"
+path = "tests/windows_console.rs"
+harness = false
+
+[[test]]
+name = "windows_console_identity"
+path = "tests/windows_console_identity.rs"
+harness = false
+
+[[test]]
+name = "windows_creation_flags"
+path = "tests/windows_creation_flags.rs"
+harness = false
+
+[[test]]
+name = "windows_false_success"
+path = "tests/windows_false_success.rs"
+harness = false
+
+[[test]]
+name = "windows_job_object"
+path = "tests/windows_job_object.rs"
+harness = false
+
+[[test]]
 name = "lifecycle"
 path = "tests/lifecycle.rs"
 harness = false

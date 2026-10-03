@@ -8,20 +8,27 @@
 //!
 //! The matrix is discriminating because of its control leg: the no-flags row asserts the
 //! caller's pid IS in the child's list, under the identical handshake as every absence below.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 /// Raw winbase.h values: `CommandExt::creation_flags` takes a plain `u32`.
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(windows)]
 /// A running `report-console-identity` child plus the report line it wrote. The child blocks on
 /// the same socket until [`Probe::end`] closes it, so every field describes a LIVE process.
 struct Probe {
@@ -30,6 +37,7 @@ struct Probe {
     report: String,
 }
 
+#[cfg(windows)]
 impl Probe {
     fn field(&self, key: &str) -> &str {
         field(&self.report, key)
@@ -46,8 +54,10 @@ impl Probe {
     }
 }
 
+#[cfg(windows)]
 use common::{escape_report_field as escape_field, read_report_line, report_field as field};
 
+#[cfg(windows)]
 /// Bind a report listener, spawn `exe` in `report-console-identity` mode with exactly `flags`
 /// through a RAW `std::process::Command` (cosca cannot express these flags in Task 1), and read
 /// the one report line the child writes before it blocks.
@@ -66,11 +76,12 @@ fn probe_raw(exe: &str, argv_head: &[&str], flags: u32) -> Probe {
     Probe { child, sock, report }
 }
 
+#[cfg(windows)]
 /// The CONTROL leg. A console-subsystem child spawned with no flags joins the caller's console,
 /// and reports the caller's own pid in its list. Every `sees_caller=0` below is discriminating
 /// only because this one reads `1` under identical timing — a timing artefact, a wrong argv
 /// index or a broken probe fails here first.
-#[test]
+#[skuld::test]
 fn plain_child_joins_the_callers_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin"), &[], 0);
     assert_eq!(
@@ -88,9 +99,10 @@ fn plain_child_joins_the_callers_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// `CREATE_NO_WINDOW` gives the child its OWN (windowless) console — it does not merely hide a
 /// window. That is what takes such a child out of reach of an in-process console-group signal.
-#[test]
+#[skuld::test]
 fn no_window_child_gets_its_own_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin"), &[], CREATE_NO_WINDOW);
     assert_eq!(
@@ -108,19 +120,21 @@ fn no_window_child_gets_its_own_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// `DETACHED_PROCESS`: no console at all. A MEASURED absence (`0`), not the probe-failure token
 /// (`?`), so a broken probe fails this rather than satisfying it.
-#[test]
+#[skuld::test]
 fn detached_child_gets_no_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin"), &[], DETACHED_PROCESS);
     assert_eq!(p.field("console"), "0", "a detached child has no console: {}", p.report);
     p.end();
 }
 
+#[cfg(windows)]
 /// Adding `CREATE_NO_WINDOW` to `DETACHED_PROCESS` changes nothing: no console either way. The
 /// value differs from the `CREATE_NO_WINDOW`-only row's `1`, which is what makes this row
 /// carry information rather than repeat the row above.
-#[test]
+#[skuld::test]
 fn detached_plus_no_window_behaves_as_detached() {
     let p = probe_raw(
         env!("CARGO_BIN_EXE_cosca_testbin"),
@@ -136,10 +150,11 @@ fn detached_plus_no_window_behaves_as_detached() {
     p.end();
 }
 
+#[cfg(windows)]
 /// The non-skipping guard: if a lane ever runs this suite without a console, every `sees_caller=0`
 /// above would be satisfied by there being no console to be in. This says so in one line rather
 /// than leaving the control leg to imply it.
-#[test]
+#[skuld::test]
 fn caller_has_a_console_to_be_measured_against() {
     assert_eq!(
         common::in_our_console(std::process::id()),
@@ -148,10 +163,11 @@ fn caller_has_a_console_to_be_measured_against() {
     );
 }
 
+#[cfg(windows)]
 /// `CREATE_NEW_CONSOLE` gives the child its own console too. It deliberately does NOT assert the
 /// `hwnd`/`visible` columns: those need an interactive session, which is one of the two reasons
 /// this bit stays reserved rather than getting a named intent.
-#[test]
+#[skuld::test]
 fn new_console_child_gets_its_own_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin"), &[], CREATE_NEW_CONSOLE);
     assert_eq!(
@@ -164,11 +180,12 @@ fn new_console_child_gets_its_own_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// Console membership is NOT a function of the creation-flag word. A GUI-subsystem image with no
 /// flags at all gets no console, where the console-subsystem control in this same file gets one
 /// and joins ours. This is the loud-failure guard behind the shipped rustdoc's one-directional
 /// wording: absence of a detaching flag establishes nothing.
-#[test]
+#[skuld::test]
 fn a_gui_subsystem_child_never_joins_the_callers_console() {
     let p = probe_raw(env!("CARGO_BIN_EXE_cosca_testbin_gui"), &[], 0);
     assert_eq!(
@@ -186,10 +203,11 @@ fn a_gui_subsystem_child_never_joins_the_callers_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// Windows reports SUCCESS for a console control event that reaches nobody, so the return value
 /// is evidence in neither direction. The child's own `sees_caller=0` is the structural proof the
 /// event cannot arrive on this route — no timing, and no betting on how long a non-delivery takes.
-#[test]
+#[skuld::test]
 fn ctrl_break_reports_success_for_a_child_outside_our_console() {
     use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
 
@@ -213,10 +231,11 @@ fn ctrl_break_reports_success_for_a_child_outside_our_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// Only the raw `CreateProcessW` backend can give a child an `argv[0]` that differs from the
 /// image it loaded, so the escaping of `argv[0]` is how later tasks prove which backend ran.
 /// Pinned here, at the mode that emits it: a plain std spawn's `argv[0]` IS the image path.
-#[test]
+#[skuld::test]
 fn the_report_escapes_argv0_so_a_spaced_path_cannot_split_the_record() {
     let exe = env!("CARGO_BIN_EXE_cosca_testbin");
     let p = probe_raw(exe, &[], 0);
@@ -236,6 +255,7 @@ fn the_report_escapes_argv0_so_a_spaced_path_cannot_split_the_record() {
 
 // ===== cosca's own spawn paths =====
 
+#[cfg(windows)]
 /// A running cosca-spawned `report-console-identity` child plus its report line. Argv-only, so
 /// it routes to the **std** backend: an `executable()` or any fd >= 3 would route to the raw
 /// `CreateProcessW` one instead, and the existing testbin idiom uses `executable()` — so a test
@@ -246,6 +266,7 @@ struct CoscaProbe {
     report: String,
 }
 
+#[cfg(windows)]
 impl CoscaProbe {
     fn field(&self, key: &str) -> &str {
         field(&self.report, key)
@@ -258,6 +279,7 @@ impl CoscaProbe {
     }
 }
 
+#[cfg(windows)]
 /// Spawn the testbin through `cosca::Command` with the image path as `argv[0]`, apply
 /// `configure`, and read the one report line.
 fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
@@ -279,8 +301,9 @@ fn probe_cosca(configure: impl FnOnce(&mut cosca::Command)) -> CoscaProbe {
     CoscaProbe { child, sock, report }
 }
 
+#[cfg(windows)]
 /// `no_window()` reaches the child on the std backend — the path most spawns take.
-#[test]
+#[skuld::test]
 fn cosca_no_window_child_gets_its_own_console_on_the_std_path() {
     let p = probe_cosca(|c| {
         c.contain().no_window();
@@ -295,10 +318,11 @@ fn cosca_no_window_child_gets_its_own_console_on_the_std_path() {
     p.end();
 }
 
+#[cfg(windows)]
 /// The same on an UNCONTAINED spawn, which is the branch `prepare` returns from before it ever
 /// reaches its Windows work — so a composition placed inside the containment branch drops the
 /// caller's word here and nowhere else.
-#[test]
+#[skuld::test]
 fn cosca_uncontained_raw_flags_reach_the_child() {
     let p = probe_cosca(|c| {
         c.no_window();
@@ -312,9 +336,10 @@ fn cosca_uncontained_raw_flags_reach_the_child() {
     p.end();
 }
 
+#[cfg(windows)]
 /// The control for both of the above, through the identical `cosca::Command` path with no flag
 /// methods called. A red result here would mean the harness broke, not the feature.
-#[test]
+#[skuld::test]
 fn a_plain_cosca_child_still_joins_the_callers_console() {
     let p = probe_cosca(|_| {});
     assert_eq!(
@@ -326,6 +351,7 @@ fn a_plain_cosca_child_still_joins_the_callers_console() {
     p.end();
 }
 
+#[cfg(windows)]
 /// `graceful_mechanism()` must be derived from the word cosca actually composed, not from the
 /// containment half of it: a hidden child has no in-process route, and reporting `ConsoleGroup`
 /// for it tells the caller the opposite.
@@ -333,7 +359,7 @@ fn a_plain_cosca_child_still_joins_the_callers_console() {
 /// The two children are what make this discriminate. A derivation reading only the containment
 /// half reports `ConsoleGroup` for both, so the second assertion fails; a hardcoded
 /// `OtherConsoleGroup` fails the first.
-#[test]
+#[skuld::test]
 fn a_no_window_contained_child_reports_no_in_process_route() {
     use cosca::GracefulMechanism;
 
@@ -355,4 +381,14 @@ fn a_no_window_contained_child_reports_no_in_process_route() {
     );
     plain.end();
     hidden.end();
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }

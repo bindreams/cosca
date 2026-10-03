@@ -10,15 +10,18 @@
 //! child an `argv[0]` that differs from the image it loaded), and the routing rule itself is one
 //! crate-internal function both routers read, pinned by
 //! `child::spawn::spawn_tests::routes_to_raw_backend_answers_for_executables_and_high_descriptors`.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 use common::{escape_report_field, read_report_line, report_field, testbin};
 
+#[cfg(windows)]
 /// Which of the four reachable spawn configurations a leg drives.
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -30,6 +33,7 @@ enum Backend {
     AsyncExecutable,
 }
 
+#[cfg(windows)]
 impl Backend {
     /// Whether this configuration routes to the raw `CreateProcessW` backend.
     fn is_raw(self) -> bool {
@@ -44,6 +48,7 @@ impl Backend {
     }
 }
 
+#[cfg(windows)]
 /// A listener plus the argv every leg passes, so the four spawn shapes differ only in the two
 /// things under test: sync-vs-async and argv-vs-`executable()`.
 fn report_argv(addr: &str, me: &str) -> [String; 4] {
@@ -57,6 +62,7 @@ fn report_argv(addr: &str, me: &str) -> [String; 4] {
     ]
 }
 
+#[cfg(windows)]
 /// The one flag intent a leg asks for. An enum rather than a closure because the sync and async
 /// `Command` types share no trait, and widening the builder's accessors so one closure could
 /// serve both is a public-API decision this item does not own.
@@ -67,6 +73,7 @@ enum Intent {
     Detached,
 }
 
+#[cfg(windows)]
 /// Spawn a `report-console-identity` child through `backend`, read its report, tear it down, and
 /// return the report line.
 fn probe(backend: Backend, intent: Intent) -> String {
@@ -142,6 +149,7 @@ fn probe(backend: Backend, intent: Intent) -> String {
     }
 }
 
+#[cfg(windows)]
 /// Every `executable()` leg proves it reached the raw backend from the CHILD's own report:
 /// `argv[0]` differs from the image that ran, which only `CreateProcessW`'s independent
 /// `lpApplicationName`/`lpCommandLine` can produce — on the std path std sets `argv[0]` to the
@@ -156,6 +164,7 @@ fn assert_backend(backend: Backend, report: &str) {
     }
 }
 
+#[cfg(windows)]
 fn assert_no_window(backend: Backend) {
     let report = probe(backend, Intent::NoWindow);
     assert_eq!(
@@ -171,6 +180,7 @@ fn assert_no_window(backend: Backend) {
     assert_backend(backend, &report);
 }
 
+#[cfg(windows)]
 fn assert_detached(backend: Backend) {
     let report = probe(backend, Intent::Detached);
     // A MEASURED absence, so a broken probe reports `?` and fails rather than passing.
@@ -182,6 +192,7 @@ fn assert_detached(backend: Backend) {
     assert_backend(backend, &report);
 }
 
+#[cfg(windows)]
 fn assert_plain_control(backend: Backend) {
     let report = probe(backend, Intent::None);
     assert_eq!(
@@ -192,81 +203,94 @@ fn assert_plain_control(backend: Backend) {
     assert_backend(backend, &report);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn no_window_reaches_the_child_via_sync_argv() {
     assert_no_window(Backend::SyncArgv);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn no_window_reaches_the_child_via_sync_executable() {
     assert_no_window(Backend::SyncExecutable);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn no_window_reaches_the_child_via_async_argv() {
     assert_no_window(Backend::AsyncArgv);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn no_window_reaches_the_child_via_async_executable() {
     assert_no_window(Backend::AsyncExecutable);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn detached_reaches_the_child_via_sync_argv() {
     assert_detached(Backend::SyncArgv);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn detached_reaches_the_child_via_sync_executable() {
     assert_detached(Backend::SyncExecutable);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn detached_reaches_the_child_via_async_argv() {
     assert_detached(Backend::AsyncArgv);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn detached_reaches_the_child_via_async_executable() {
     assert_detached(Backend::AsyncExecutable);
 }
 
+#[cfg(windows)]
 /// The control legs. Without them every assertion above is satisfiable by a helper that never
 /// reached the backend it names — "not in our console" is also what a child that failed to
 /// register, or was never spawned at all, would look like.
-#[test]
+#[skuld::test]
 fn a_plain_child_joins_the_callers_console_via_sync_argv() {
     assert_plain_control(Backend::SyncArgv);
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn a_plain_child_joins_the_callers_console_via_sync_executable() {
     assert_plain_control(Backend::SyncExecutable);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn a_plain_child_joins_the_callers_console_via_async_argv() {
     assert_plain_control(Backend::AsyncArgv);
 }
 
+#[cfg(windows)]
 #[cfg(feature = "tokio")]
-#[test]
+#[skuld::test]
 fn a_plain_child_joins_the_callers_console_via_async_executable() {
     assert_plain_control(Backend::AsyncExecutable);
 }
 
+#[cfg(windows)]
 /// Each raw backend builds its own `Prepared` literal, so its cooperative-signal derivation is a
 /// SEPARATE site from `prepare`'s: the std-path twin passing says nothing about this one.
 ///
 /// Two children, so neither a constant nor an unwired derivation passes: a derivation reading
 /// only the containment half of the word reports `ConsoleGroup` for both.
-#[test]
+#[skuld::test]
 fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend() {
     use cosca::GracefulMechanism;
 
@@ -314,9 +338,10 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
     }
 }
 
+#[cfg(windows)]
 /// The async raw backend has a `Prepared` literal of its own — a third derivation site.
 #[cfg(feature = "tokio")]
-#[tokio::test]
+#[skuld::test]
 async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend() {
     use cosca::GracefulMechanism;
 
@@ -362,4 +387,14 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
         let _ = child.kill_tree();
         child.wait().await.expect("reap");
     }
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }

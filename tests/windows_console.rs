@@ -7,27 +7,36 @@
 //! The flag-matrix tests at the top measure what the creation-flag word does and does not
 //! settle about console membership, and their discriminating power comes from the control legs
 //! disagreeing with the exclusion legs — not from a before/after.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::io::Read;
+#[cfg(windows)]
 use std::net::TcpListener;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::process::Command;
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 /// `DETACHED_PROCESS`: the new process gets NO console and does not inherit ours — the
 /// GUI-app / service / detached-spawn caller these tests run against.
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+#[cfg(windows)]
 /// The three creation flags that keep a child out of the spawner's console, and the group flag
 /// whose presence is what makes a child individually addressable at all. Raw constants because
 /// `CommandExt::creation_flags` takes a plain `u32` (winbase.h).
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(windows)]
 /// Spawn `exe` with exactly `flags`, block on its 1-byte tag, and hand back the child and its
 /// socket. The tag is the load-bearing part: console registration is not synchronous with
 /// `CreateProcess` returning, so a membership probe taken before it reads "absent" for every
@@ -48,6 +57,7 @@ fn spawn_tagged_with_flags(exe: &str, args: &[&str], flags: u32) -> (std::proces
     (child, sock)
 }
 
+#[cfg(windows)]
 /// Kill and reap a flag-matrix child, dropping its socket first so a child blocked on the read
 /// can also exit on EOF.
 fn end(mut child: std::process::Child, sock: std::net::TcpStream) {
@@ -56,11 +66,12 @@ fn end(mut child: std::process::Child, sock: std::net::TcpStream) {
     child.wait().expect("reap flag-matrix child");
 }
 
+#[cfg(windows)]
 /// The control: membership does NOT come from `CREATE_NEW_PROCESS_GROUP`, and it does not come
 /// from passing no flags either. Both legs must read present, which is what makes the exclusion
 /// tests below discriminating rather than vacuous — and what fails if the tag handshake above
 /// stopped being a real happens-before edge.
-#[test]
+#[skuld::test]
 fn console_group_flag_keeps_a_child_in_our_console() {
     for flags in [CREATE_NEW_PROCESS_GROUP, 0] {
         let (child, sock) = spawn_tagged_with_flags(env!("CARGO_BIN_EXE_cosca_testbin"), &["control-block"], flags);
@@ -74,9 +85,10 @@ fn console_group_flag_keeps_a_child_in_our_console() {
     }
 }
 
+#[cfg(windows)]
 /// Each of the three detaching/suppressing flags excludes the child from our console, under the
 /// same post-handshake timing the control above measures as present.
-#[test]
+#[skuld::test]
 fn console_detaching_flags_leave_a_child_outside_our_console() {
     for flag in [DETACHED_PROCESS, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW] {
         let (child, sock) = spawn_tagged_with_flags(
@@ -96,10 +108,11 @@ fn console_detaching_flags_leave_a_child_outside_our_console() {
     }
 }
 
+#[cfg(windows)]
 /// A GUI-subsystem image is outside our console under the exact flag word that keeps a
 /// console-subsystem image inside it. This is why the creation-flag word is a sound negative
 /// and an unsound positive: no flag can establish membership.
-#[test]
+#[skuld::test]
 fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
     let (child, sock) = spawn_tagged_with_flags(env!("CARGO_BIN_EXE_cosca_testbin_gui"), &[], CREATE_NEW_PROCESS_GROUP);
     let seen = common::in_our_console(child.id());
@@ -111,6 +124,7 @@ fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
     end(child, sock);
 }
 
+#[cfg(windows)]
 /// Run the `report-console-terminate` helper and return its one-line report.
 ///
 /// The helper is launched DIRECTLY, never through a shell or launcher: a wrapper would be the
@@ -140,6 +154,7 @@ fn run_probe(detached: bool) -> String {
     report
 }
 
+#[cfg(windows)]
 /// Exact value of one `key=value` field. Substring matching is not safe here: `console=0` is a
 /// substring of `c1_in_console=0`, so a `contains` guard could be satisfied by the wrong field
 /// entirely.
@@ -150,7 +165,8 @@ fn field<'a>(report: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no field {key} in report: {report}"))
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
     let r = run_probe(true);
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
@@ -195,7 +211,8 @@ fn tree_graceful_ops_report_no_console_from_a_console_less_caller() {
     assert_eq!(field(&r, "graceful_cleanup"), "Ok", "{r}");
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     // Positive control. `terminate_break=1` is load-bearing: the child acknowledges the
     // CTRL_BREAK over its own socket, so this cannot pass on a return code alone —
@@ -226,6 +243,7 @@ fn tree_graceful_ops_work_from_a_caller_that_has_a_console() {
     );
 }
 
+#[cfg(windows)]
 /// Sibling of [`run_probe`] driving the `report-console-lone` mode — the LONE graceful ops
 /// (`terminate` / `graceful_shutdown`) against a contained root, instead of the tree ops. Same
 /// direct-launch discipline and same connect-before-work EOF guarantee; see [`run_probe`].
@@ -249,7 +267,8 @@ fn run_lone_probe(detached: bool) -> String {
     report
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
     let r = run_lone_probe(true);
     // A MEASURED absence — the helper reports `?` if its own probe failed — so this guard
@@ -287,7 +306,8 @@ fn lone_graceful_ops_report_no_console_from_a_console_less_caller() {
     assert_eq!(field(&r, "cleanup"), "Ok", "hard teardown needs no console: {r}");
 }
 
-#[test]
+#[cfg(windows)]
+#[skuld::test]
 fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     // Positive control. `break=1` is load-bearing: the child acknowledges the CTRL_BREAK over
     // its own socket, so this cannot pass on a return code alone. `graceful_code=1` names the
@@ -308,4 +328,14 @@ fn lone_graceful_ops_work_from_a_caller_that_has_a_console() {
     assert_eq!(field(&r, "graceful_code"), "1", "the escalation's kill: {r}");
     assert_eq!(field(&r, "alive_after_graceful"), "dead", "{r}");
     assert_eq!(field(&r, "cleanup"), "Ok", "{r}");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }
