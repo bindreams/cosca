@@ -27,7 +27,7 @@ jobs:
         env:
           MUTANT: ${{ matrix.mutant }}
         run: |
-          python3 .github/k6-mutate.py
+          python .github/k6-mutate.py
           git diff --stat
       - name: Test
         shell: bash
