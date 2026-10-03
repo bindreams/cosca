@@ -1,0 +1,52 @@
+name: k6-red
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  mut:
+    name: ${{ matrix.mutant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [none, drop-extra, extra-first]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Mutate
+        shell: bash
+        env:
+          MUTANT: ${{ matrix.mutant }}
+        run: |
+          python3 - <<'PY'
+          import os
+          p='tests/windows_elevation_routes/harness.rs'
+          s=open(p).read()
+          loop='''    for (k, v) in extra {
+        map.insert(EnvKeyIgnoreCase::new(k), v.clone());
+    }
+'''
+          assert loop in s
+          m=os.environ['MUTANT']
+          if m=='drop-extra':
+              s=s.replace(loop,'')
+          elif m=='extra-first':
+              s=s.replace(loop,'')
+              anchor='    let mut map: BTreeMap<EnvKeyIgnoreCase, String> = BTreeMap::new();\n'
+              assert anchor in s
+              s=s.replace(anchor,anchor+loop)
+          open(p,'w').write(s)
+          PY
+          git diff --stat
+      - name: Test
+        shell: bash
+        run: cargo nextest run --locked --target x86_64-pc-windows-msvc --test windows_elevation_routes --profile ci --no-fail-fast
