@@ -26,9 +26,8 @@ fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
 
 /// A marker pipe: `(read_end, write_end)`, both owned by this process. Built with
 /// `std::io::pipe()` (CLOEXEC by default, matching `fdmarker::create_pipe`'s own convention) —
-/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because under a plain `cargo
-/// test --lib`, which runs every test in this crate in one shared process, tests run concurrently
-/// on separate threads of that process, and a non-CLOEXEC test pipe fd would be inherited by any
+/// NOT `nix::unistd::pipe()` (raw POSIX semantics, not CLOEXEC) — because when trials overlap
+/// in one process (`--nocapture` with `--test-threads` > 1), a non-CLOEXEC test pipe fd would be inherited by any
 /// OTHER concurrently-running test's spawned child, keeping that child a spurious extra "holder"
 /// of a pipe this test never intended to share.
 fn marker_pipe() -> (OwnedFd, OwnedFd) {
@@ -79,7 +78,7 @@ fn fionread(fd: BorrowedFd<'_>) -> i32 {
 #[path = "marker_eof_tests/deadline.rs"]
 mod deadline;
 
-#[test]
+#[skuld::test]
 fn probe_reports_drained_when_the_last_write_end_is_gone() {
     let _serialize = test_spawn_lock();
     let (r, w) = marker_pipe();
@@ -87,7 +86,7 @@ fn probe_reports_drained_when_the_last_write_end_is_gone() {
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
-#[test]
+#[skuld::test]
 fn probe_reports_drained_even_with_bytes_still_buffered() {
     // kqueue(2): EV_EOF is set once the write end is closed even with data pending — checked
     // and returned before any read happens (`interpret_read_event`'s EV_EOF branch), so this
@@ -101,7 +100,7 @@ fn probe_reports_drained_even_with_bytes_still_buffered() {
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
-#[test]
+#[skuld::test]
 fn drain_kqueue_reports_spurious_for_an_armed_empty_pipe() {
     // Nothing is pending, so `interpret_read_event` never runs.
     let (_child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
@@ -113,7 +112,7 @@ fn drain_kqueue_reports_spurious_for_an_armed_empty_pipe() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
     let (marker_r, marker_w) = std::io::pipe().expect("pipe");
     let queued = fill_pipe_to_capacity(marker_r.as_fd(), marker_w.as_fd());
@@ -141,7 +140,7 @@ fn drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn drain_kqueue_reports_drained_once_the_write_end_is_closed() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     let kq = arm(marker.as_fd(), false).expect("arm");
@@ -154,13 +153,13 @@ fn drain_kqueue_reports_drained_once_the_write_end_is_closed() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn probe_reports_members_remain_while_the_write_end_is_open() {
     let (_child, marker, _stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(probe(marker.as_fd()).expect("probe"), TreeDrain::MembersRemain);
 }
 
-#[test]
+#[skuld::test]
 fn probe_on_an_invalid_descriptor_reports_an_io_error() {
     // A borrowed fd the caller passed after it was already invalid must fail loudly, never
     // silently report a verdict.
@@ -171,7 +170,7 @@ fn probe_on_an_invalid_descriptor_reports_an_io_error() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn block_until_drained_with_a_past_deadline_behaves_like_a_one_shot_probe() {
     let (child, marker, stdin) = spawn_marker_holder("exec cat >/dev/null");
     assert_eq!(
@@ -186,7 +185,7 @@ fn block_until_drained_with_a_past_deadline_behaves_like_a_one_shot_probe() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tree() {
     // The equivalence the test above cannot pin: there the true state at the deadline is
     // `MembersRemain`, so a buggy short-circuit that returns `MembersRemain` without ever
@@ -205,7 +204,7 @@ fn block_until_drained_with_a_past_deadline_still_reports_an_already_drained_tre
     );
 }
 
-#[test]
+#[skuld::test]
 fn arm_on_an_invalid_descriptor_reports_an_io_error() {
     // Exercises `ensure_nonblocking`'s guard inside `arm` — the actual reachable failure mode
     // for a bad descriptor. `add_with_receipt`'s own EV_ERROR branch (for EVFILT_READ,
@@ -219,7 +218,7 @@ fn arm_on_an_invalid_descriptor_reports_an_io_error() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
     // Measured: with the supervisor's own copy of the write end open, the edge NEVER fires
     // though every member exited. A wait here could only ever burn the caller's deadline, so
@@ -233,14 +232,14 @@ fn a_retained_supervisor_write_end_is_refused_not_waited_on() {
         "expected Error::Containment, got {err:?}"
     );
     drop(w);
-    // NOT `assert_eq!(..., Clear)`: under a plain `cargo test` (see `marker_pipe`'s doc), this
-    // process's fd table is being churned by every other test running at the same moment. The
+    // NOT `assert_eq!(..., Clear)`: when trials overlap (see `marker_pipe`'s doc), this
+    // process's fd table is being churned by every other running test. The
     // property under test is that a CLEARED write end is never mistaken for a still-held one.
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
     assert_eq!(probe(r.as_fd()).expect("probe"), TreeDrain::AllMarkersClosed);
 }
 
-#[test]
+#[skuld::test]
 fn write_end_check_ignores_unrelated_pipes_this_process_holds() {
     // The check must key on the marker's own kernel object, not on "this process holds some
     // pipe write end" — a supervisor holds many (every child's stdin). Same concurrency note
@@ -252,7 +251,7 @@ fn write_end_check_ignores_unrelated_pipes_this_process_holds() {
     assert_ne!(super::write_end_check(r.as_fd()), super::WriteEndCheck::HeldByUs);
 }
 
-#[test]
+#[skuld::test]
 fn write_end_check_is_unassessable_for_a_descriptor_that_is_not_a_pipe() {
     // proc_pidfdinfo(PROC_PIDFDPIPEINFO) on a non-pipe fd fails (wrong type) — the check must
     // say "inconclusive", never misreport it as Clear (which `probe`/`arm` would then trust).
@@ -260,7 +259,7 @@ fn write_end_check_is_unassessable_for_a_descriptor_that_is_not_a_pipe() {
     assert_eq!(super::write_end_check(f.as_fd()), super::WriteEndCheck::Unassessable);
 }
 
-#[test]
+#[skuld::test]
 fn an_unassessable_write_end_check_refuses_only_an_unbounded_wait() {
     // `Unassessable` is not evidence of a bug (an ordinary transient
     // scan gap under concurrent spawning), so a BOUNDED wait proceeds — its own deadline
@@ -285,7 +284,7 @@ fn an_unassessable_write_end_check_refuses_only_an_unbounded_wait() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_live_member_holds_the_edge_shut_and_releases_it_on_exit() {
     // `cat` blocks on stdin and holds the inherited fd 3; closing our stdin write end is the
     // only thing that ends it, so the drain is caused by an event, never awaited on a clock.
@@ -303,7 +302,7 @@ fn a_live_member_holds_the_edge_shut_and_releases_it_on_exit() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn the_edge_is_sticky_for_a_waiter_that_arrives_late() {
     // kqueue EVFILT_READ is level-triggered on a pipe: a kqueue armed after the drain
     // reports EV_EOF immediately, so a late waiter can never miss the edge.
@@ -316,7 +315,7 @@ fn the_edge_is_sticky_for_a_waiter_that_arrives_late() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_member_that_closes_the_marker_leaves_the_set_early() {
     // The documented limit, pinned as behaviour rather than prose: `exec 3>&-` drops the
     // descriptor, so the edge fires while the member is demonstrably still running.
@@ -335,7 +334,7 @@ fn a_member_that_closes_the_marker_leaves_the_set_early() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     // The population no other mechanism on this platform can see. `sh` backgrounds `cat`,
     // reports its pid on fd 4 and exits, so `cat` is reparented to launchd (ppid == 1) while
@@ -389,7 +388,7 @@ fn an_orphan_reparented_to_launchd_holds_the_edge_shut() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
     // Every test above this one has exactly ONE write-end holder at a time, so none of them can
     // tell "some closed" from "all closed" apart — a bug that reported `AllMarkersClosed` the
@@ -438,7 +437,7 @@ fn all_markers_closed_requires_every_simultaneous_holder_to_exit() {
         .expect("reap the root sh, which itself waited for both background cats");
 }
 
-#[test]
+#[skuld::test]
 fn small_bytes_from_a_member_are_not_a_drain() {
     // The verdict-level half of the NOTE_LOWAT claim: a handful of buffered bytes must never
     // read as a drain, gated or not (`interpret_read_event`'s non-EOF branch reports
@@ -479,7 +478,7 @@ fn small_bytes_from_a_member_are_not_a_drain() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp() {
     // The lower-level half of the claim the test above cannot reach: a write under the clamp
     // must not even make the kqueue itself ready, not merely "ready but harmlessly
@@ -526,7 +525,7 @@ fn note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp() {
     child.wait().expect("reap");
 }
 
-#[test]
+#[skuld::test]
 fn bytes_past_the_low_water_clamp_are_drained_without_a_wrong_verdict() {
     // Exercises `interpret_read_event`'s discard branch for real (below the clamp it is never
     // entered at all — a handful of bytes, as in the test above, cannot reach it). The member

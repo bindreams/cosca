@@ -11,7 +11,7 @@ use crate::containment::cgroup::{log_degrade, LeafError, NotEntered, NotPlaced, 
 /// The reason is asserted as the source error's own rendering, not as `strerror` text: the same
 /// raw code renders differently per host (13 is "Permission denied" on Linux and macOS, "The data
 /// is invalid." on Windows), and "carried verbatim" is the claim.
-#[test]
+#[skuld::test]
 fn leaf_error_names_step_path_and_reason() {
     let reason = |code: i32| std::io::Error::from_raw_os_error(code).to_string();
     let cases: Vec<(LeafError, &[&str], Option<String>)> = vec![
@@ -78,7 +78,7 @@ fn leaf_error_names_step_path_and_reason() {
 
 /// The child's own self-placement outcome is reported verbatim, errno included — the one
 /// step whose reason lives in the forked child and is otherwise unobservable to the parent.
-#[test]
+#[skuld::test]
 fn placement_report_renders_the_childs_errno() {
     assert!(PlacementReport::WriteFailed(16).to_string().contains("errno 16"));
     let busy = std::io::Error::from_raw_os_error(16).to_string();
@@ -91,7 +91,7 @@ fn placement_report_renders_the_childs_errno() {
 
 /// A child whose write failed renders the pid, the leaf path, the file's actual contents, its
 /// errno and its state — and never claims a membership that never began.
-#[test]
+#[skuld::test]
 fn placement_absent_renders_every_observed_fact() {
     let absent = NotPlaced::Absent {
         pid: 4242,
@@ -121,7 +121,7 @@ fn placement_absent_renders_every_observed_fact() {
 }
 
 /// A child whose `pre_exec` closure never ran made no write at all, and is reported as such.
-#[test]
+#[skuld::test]
 fn placement_absent_renders_a_child_that_reported_nothing() {
     let rendered = NotPlaced::Absent {
         pid: 4242,
@@ -137,7 +137,7 @@ fn placement_absent_renders_a_child_that_reported_nothing() {
 
 /// A live child that is nonetheless not a member is a different diagnosis from a zombie one,
 /// and must not be described as having exited.
-#[test]
+#[skuld::test]
 fn placement_absent_distinguishes_a_live_child() {
     let rendered = NotPlaced::Absent {
         pid: 4242,
@@ -153,7 +153,7 @@ fn placement_absent_distinguishes_a_live_child() {
 }
 
 /// An unreadable `cgroup.procs` is reported with its own error, not as an empty file.
-#[test]
+#[skuld::test]
 fn placement_unreadable_names_the_io_error() {
     let rendered = NotPlaced::Unreadable {
         pid: 4242,
@@ -168,7 +168,7 @@ fn placement_unreadable_names_the_io_error() {
 
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading
 /// CI output needs to tell WHICH step failed from the bare fact that containment degraded.
-#[test]
+#[skuld::test]
 fn degrade_logs_the_reason_at_warn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -188,7 +188,7 @@ fn degrade_logs_the_reason_at_warn() {
 }
 
 /// A repeated reason warns each time; nothing remembers earlier reports.
-#[test]
+#[skuld::test]
 fn a_repeated_degrade_reason_warns_every_time() {
     crate::log_capture::install();
     let reason = || LeafError::KillUnsupported {
@@ -208,7 +208,7 @@ fn a_repeated_degrade_reason_warns_every_time() {
 
 /// `NotPlaced::Unwaitable` — a `pidfd_open` failure — is a degrade reason like any other, logged
 /// at `warn`. The pid is the marker: `Unwaitable`'s `Display` carries no path to embed one in.
-#[test]
+#[skuld::test]
 fn an_unwaitable_verdict_logs_at_warn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -232,7 +232,7 @@ fn an_unwaitable_verdict_logs_at_warn() {
 
 /// The summary keeps every fact that separates a v1-only host from an unmounted unified
 /// hierarchy from an empty file, and drops every path.
-#[test]
+#[skuld::test]
 fn no_unified_line_reports_the_shape_of_the_file_not_its_paths() {
     let real = concat!(
         "12:freezer:/kubepods/burstable/pod4f8c1e2a-9d3b-11ee-b9d1-0242ac120002/\
@@ -269,7 +269,7 @@ fn no_unified_line_reports_the_shape_of_the_file_not_its_paths() {
 }
 
 /// An empty `/proc/self/cgroup` is its own diagnosis and must still read as one.
-#[test]
+#[skuld::test]
 fn no_unified_line_summarizes_an_empty_file() {
     let (line_count, controllers) = crate::containment::cgroup::summarize_cgroup_controllers("");
     assert_eq!(line_count, 0);
@@ -285,7 +285,7 @@ fn no_unified_line_summarizes_an_empty_file() {
 /// a path reports that path in full, identifiers and all. It is the one path the syscall
 /// touched, it is the diagnosis, and a record without it says only that some mkdir somewhere
 /// was refused.
-#[test]
+#[skuld::test]
 fn the_leaf_path_reaches_the_record_verbatim() {
     let leaf = "/sys/fs/cgroup/kubepods/pod4f8c1e2a-9d3b-11ee-b9d1-0242ac120002/cosca-7-0";
     let rendered = LeafError::CreateLeafDir {
@@ -302,7 +302,7 @@ fn the_leaf_path_reaches_the_record_verbatim() {
 
 /// A line the kernel format does not explain is reported as unparseable, never quoted: an
 /// unrecognized line is exactly the case where cosca cannot know which part is a path.
-#[test]
+#[skuld::test]
 fn no_unified_line_never_quotes_a_line_it_could_not_parse() {
     let (line_count, controllers) =
         crate::containment::cgroup::summarize_cgroup_controllers("nonsense-with-no-colons\n");

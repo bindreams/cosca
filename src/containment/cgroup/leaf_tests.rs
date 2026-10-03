@@ -8,7 +8,7 @@ use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, Pl
 /// `ENODEV` — a syscall through an fd opened before the leaf was removed, once the kernel
 /// deactivates the underlying kernfs node — is proof of drain.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn enodev_is_removed_after_drain() {
     let e = std::io::Error::from_raw_os_error(libc::ENODEV);
     assert!(crate::containment::cgroup::removed_after_drain(&e));
@@ -16,7 +16,7 @@ fn enodev_is_removed_after_drain() {
 
 /// `ENOENT` — a fresh `open` through the now-unlinked leaf directory — is proof of drain too.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn enoent_is_removed_after_drain() {
     let e = std::io::Error::from_raw_os_error(libc::ENOENT);
     assert!(crate::containment::cgroup::removed_after_drain(&e));
@@ -26,7 +26,7 @@ fn enoent_is_removed_after_drain() {
 /// guessed drain verdict. `EACCES` (permission denied) and `EIO` (real device/backing-store
 /// failure) are both plausible `cgroup.events` failures unrelated to removal.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn unrelated_errnos_are_not_removed_after_drain() {
     for errno in [libc::EACCES, libc::EIO, libc::EBUSY, libc::EPERM] {
         let e = std::io::Error::from_raw_os_error(errno);
@@ -43,7 +43,7 @@ fn unrelated_errnos_are_not_removed_after_drain() {
 /// `Block` carries the caller's deadline instant unchanged, so the wait can arm against it
 /// directly. Structural: no clock or thread needed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drain_step_block_carries_the_original_deadline_instant() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use std::time::{Duration, Instant};
@@ -87,7 +87,7 @@ fn drain_step_block_carries_the_original_deadline_instant() {
 /// the frozen test clock rather than a real one: one nanosecond before the deadline still takes
 /// `Block`; at the deadline takes the shortcut.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drain_step_pins_the_exact_zero_remaining_boundary() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use std::time::Duration;
@@ -122,7 +122,7 @@ fn drain_step_pins_the_exact_zero_remaining_boundary() {
 /// populated leaf that never drains must answer `MembersRemain` no earlier than the caller's own
 /// deadline. No upper bound is asserted — only that it never answers early.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn wait_drained_through_wait_deadline_never_answers_early() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf, WaitDeadlineArgGuard};
     use crate::containment::TreeDrain;
@@ -168,7 +168,7 @@ fn wait_drained_through_wait_deadline_never_answers_early() {
 /// block is announced, `wait_drained` returns, and the test fails on "did not panic" instead of
 /// the loop spinning forever.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "no progress")]
 fn wait_drained_panics_when_its_advance_is_dropped() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf, WaitObserver};
@@ -216,7 +216,7 @@ fn wait_drained_panics_when_its_advance_is_dropped() {
 /// Mutant: drop the `advance_by_elapsed_if_frozen` call in `wait_drained` -> the second round
 /// panics with "no progress" instead of re-arming forever.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn wait_drained_terminates_under_a_frozen_clock() {
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use crate::containment::TreeDrain;
@@ -246,7 +246,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 /// (`fault::set_pump_batch_notifier`) against every park that woke, not just that the wait call
 /// returned.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::{
@@ -441,7 +441,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 /// open; any other program this process starts meanwhile must not inherit a writable
 /// `cgroup.procs`, through which it could move itself into the leaf and be killed with it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -486,7 +486,7 @@ fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
 /// is uid-independent, and the step maps every errno the same way — it carries the kernel's
 /// reason rather than classifying it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_a_refused_mkdir() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parent = dir.path().join("no-such-slice");
@@ -508,7 +508,7 @@ fn create_leaf_under_reports_a_refused_mkdir() {
 /// A writable directory with no `cgroup.kill` in the created leaf (i.e. not a cgroupfs, or a
 /// kernel older than 5.14) reports THAT, and leaves no stray directory behind.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_a_missing_cgroup_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
     let err = match crate::containment::cgroup::create_leaf_under(dir.path()) {
@@ -530,7 +530,7 @@ fn create_leaf_under_reports_a_missing_cgroup_kill() {
 /// A degrade whose leaf cannot be removed says so, the way `Drop` does for a leaf it could not
 /// remove: a stray `cosca-*` cgroup stays on the host, and this record is all anyone will have.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -566,7 +566,7 @@ fn create_leaf_under_reports_a_leaf_its_unwind_could_not_remove() {
 /// through the held leaf directory, where a temp directory yields only `ENOENT`, so the fault
 /// seam supplies the errno.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parent = dir.path().to_path_buf();
@@ -600,7 +600,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
 /// `Attached::hard_kill` arm, exactly as every sibling mechanism's failure does. Swallowing it
 /// makes `Child::kill_tree()` return `Ok(())` over a tree that is still running.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn hard_kill_propagates_a_kill_the_kernel_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-refused-kill");
@@ -635,13 +635,13 @@ fn hard_kill_propagates_a_kill_the_kernel_refused() {
 /// leaf succeeds only once the leaf is empty, so its absence is proof every member had already
 /// exited. It must stay `Ok`, and must not be narrated at `warn` — nothing was reduced.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
 
     // Its OWN leaf name, not the shared placeholder: `log_capture` is process-wide and
-    // libtest runs this file in parallel, so a marker a sibling test also emits makes the
+    // trials can overlap (`--nocapture` with `--test-threads` > 1), so a marker a sibling test also emits makes the
     // count below a count of whatever else happened to run alongside.
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
         "/nonexistent/cosca-hard-kill-already-gone",
@@ -658,7 +658,7 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
 
 /// `terminate` reads an already-removed leaf as a completed teardown, as `hard_kill` does.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
     // Its own leaf name, for the reason `hard_kill`'s twin above gives.
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
@@ -684,7 +684,7 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
 /// A leaf the host refuses to remove is reported through the real `Drop`. Real filesystem, any
 /// Linux host: a leaf directory holding a subdirectory refuses both `rmdir`s.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_reports_a_leaf_it_could_not_remove() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -707,7 +707,7 @@ fn drop_reports_a_leaf_it_could_not_remove() {
 /// (see the module's report contract). Before the verdict, `Drop` abandons the exchange first,
 /// which makes what was received final: nothing received then means the child never execs.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
     crate::log_capture::install();
     let reports = [
@@ -767,7 +767,7 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
 /// A disarmed leaf never writes `cgroup.kill`, and leaves the occupied directory alone. The
 /// occupant stands in for the detached tree; a real leaf refuses both `rmdir`s while one runs.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -800,7 +800,7 @@ fn a_disarmed_leaf_does_not_kill_the_tree_it_was_detached_from() {
 /// The same leaf, left armed, DOES fire `cgroup.kill` — so the test above pins the disarm, not
 /// an inert path.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_armed_leaf_still_kills_the_tree_on_drop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-armed-leaf");
@@ -820,7 +820,7 @@ fn an_armed_leaf_still_kills_the_tree_on_drop() {
 /// A disarmed leaf whose tree has already gone still removes the empty directory: detach gives
 /// up the KILL, not the tidying. cosca does not come back for a leaf it left.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-detached-empty-leaf");
@@ -846,7 +846,7 @@ fn a_disarmed_leaf_still_removes_itself_once_it_is_empty() {
 /// `occupant` and `cgroup.kill` files left in the directory, a genuine leftover unrelated to the
 /// drain. It is reported once, at `warn`, like every other leaf `Drop` fails to remove.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_once() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -876,7 +876,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_but_still_refuses_rmdir_is_reported_onc
 /// A SIGTERM is catchable, so `terminate_tree()` proves no teardown: a disarmed leaf whose tree
 /// ignored it is a live opted-out tree keeping its leaf, reported at `debug`, not a leak.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
     use std::os::fd::AsRawFd;
 
@@ -926,7 +926,7 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak() {
 /// path already reads it that way, and a detached leaf's one `rmdir` is the only reading it
 /// gets.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
     crate::log_capture::install();
     let leaf = entered_leaf_at(std::path::PathBuf::from("/nonexistent/cosca-detached-gone-leaf"));
@@ -948,7 +948,7 @@ fn a_disarmed_leaf_that_is_already_gone_reports_nothing() {
 /// All four combinations, each against an occupied leaf whose verdict is taken: only both-set
 /// writes `cgroup.kill`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
     for (entered, armed) in [(true, true), (true, false), (false, true), (false, false)] {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1015,7 +1015,7 @@ fn on_each_drain_block(mut act: impl FnMut(usize) + Send + 'static) -> impl Drop
 /// An armed `Drop` that kills through its leaf removes it only once the leaf has drained: no
 /// `rmdir` after the `cgroup.kill` write sees `populated 1`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1057,7 +1057,7 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
 /// Deterministic, no sleeps: `on_each_drain_block` drives the fake leaf's `populated` flag from
 /// another thread, released only once `Drop`'s wait is actually blocked on it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1097,7 +1097,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
 /// and cgroup.kill`) — cannot make `Drop` wait on a drain nothing is driving. A stale `killed` flag
 /// must not by itself excuse `Drop` from killing again.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1148,7 +1148,7 @@ fn a_disarmed_drop_re_fires_the_kill_before_waiting_on_a_repopulated_leaf() {
 /// `populated 0` is `Drop`'s cue to sweep that child cgroup away and retry, exactly as the killed
 /// path already does, rather than reporting — or silently keeping — a leaf nothing is running in.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_never_killed_leaf_sweeps_and_retries_once_it_has_already_drained() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1190,7 +1190,7 @@ fn a_disarmed_never_killed_leaf_sweeps_and_retries_once_it_has_already_drained()
 /// keeps the old single-`rmdir`, debug-only behaviour — the caller asked for the tree to be left
 /// running, and `Drop` must not sweep a child cgroup a still-live tree may yet be using.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_never_killed_leaf_still_populated_does_not_sweep() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1240,7 +1240,7 @@ fn a_disarmed_never_killed_leaf_still_populated_does_not_sweep() {
 /// promises: the caller was told the opposite of the truth if this is buried at `debug`. It is
 /// reported exactly as loudly as the armed path reports its own kill failure.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1274,7 +1274,7 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
 /// cgroup cancels a `populated` notification the kernel had postponed (see `DrainWatch`), so a
 /// third party can remove a drained leaf while the wait still reads it populated.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -1297,7 +1297,7 @@ fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
 /// The same for a `Drop` killing through its leaf: it wakes, finds the leaf gone, and reports
 /// nothing, since nothing was left behind.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1325,7 +1325,7 @@ fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
 /// then reports the leaf once, naming what can have held it. A retry would only make a third
 /// party's race rarer, never impossible.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_armed_drop_reports_an_rmdir_refused_after_its_drain_once_without_retrying() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1369,7 +1369,7 @@ fn an_armed_drop_reports_an_rmdir_refused_after_its_drain_once_without_retrying(
 
 /// A child-cgroup sweep of a leaf that is already gone removes nothing, and is no failure.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(
@@ -1488,7 +1488,7 @@ fn drop_under_a_mount(
 /// asked. `Drop` kills the real tree through the held leaf, and reports the leaf it cannot remove
 /// rather than retrying forever.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
     if !crate::test_support::require_group("CGROUP") {
@@ -1517,7 +1517,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
 /// no longer reaches the leaf, which says nothing about whether the leaf is gone. `Drop` kills the
 /// real tree through the held leaf, and reports the leaf it cannot remove.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
     if !crate::test_support::require_group("CGROUP") {
@@ -1565,7 +1565,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 /// A mount over the leaf's parent: the leaf's path finds nothing, which says nothing about the
 /// leaf. `Drop` kills, drains and removes the real leaf through the held directories.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
     use std::os::unix::process::ExitStatusExt as _;
     if !crate::test_support::require_group("CGROUP") {
@@ -1596,7 +1596,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
 /// the spawn degrades as for any other failed step, rather than leaving a leaf whose teardown
 /// could not be watched. The half-made leaf is removed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -1631,7 +1631,7 @@ fn signal_when_blocking(tx: std::sync::mpsc::Sender<()>) {
 /// A wait polled once and then never again holds nothing another wait needs: a second wait on
 /// the same leaf, already blocked when the leaf drains, still returns.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
+#[skuld::test]
 fn a_parked_async_wait_does_not_hold_up_another() {
     use std::future::Future as _;
 
@@ -1673,7 +1673,7 @@ fn a_parked_async_wait_does_not_hold_up_another() {
 /// A sync and an async wait on one leaf both return once it drains, on the leaf's one watch: no
 /// second inotify instance is armed.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
+#[skuld::test]
 fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -1718,7 +1718,7 @@ fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
 
 /// A cancelled async wait leaves the others waiting as before.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
+#[skuld::test]
 fn a_cancelled_async_wait_leaves_the_others_waiting() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -1754,7 +1754,7 @@ fn a_cancelled_async_wait_leaves_the_others_waiting() {
 
 /// A wait whose deadline has passed answers from the leaf's state at once.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -1797,7 +1797,7 @@ fn blocked_wait(
 /// The pump starts with the first wait that blocks, and dropping the leaf stops and joins it
 /// before `drop` returns.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn dropping_the_leaf_stops_and_joins_its_pump() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1843,7 +1843,7 @@ fn dropping_the_leaf_stops_and_joins_its_pump() {
 
 /// A drained leaf is answered from one read: no pump is started for it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_drained_leaf_is_answered_without_a_pump() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1874,7 +1874,7 @@ fn a_drained_leaf_is_answered_without_a_pump() {
 
 /// A pump that stops on its own wakes every wait, and each reports why.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_pump_wakes_every_wait_with_its_error() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1898,7 +1898,7 @@ fn a_failed_pump_wakes_every_wait_with_its_error() {
 
 /// A sibling's removal reaches the pump, which wakes no wait for it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_siblings_removal_wakes_no_wait() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1929,7 +1929,7 @@ fn a_siblings_removal_wakes_no_wait() {
 /// A pump started with no watch fails, waking its waits with the reason, rather than exiting
 /// silently. Debug builds also assert it: every leaf that can be waited on holds a watch.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_pump_without_a_watch_fails_loudly() {
     use event_listener::Listener as _;
 
@@ -1953,7 +1953,7 @@ fn a_pump_without_a_watch_fails_loudly() {
 
 /// The pump's thread name fits Linux's 15 bytes, which would truncate it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn the_pump_thread_name_fits_the_kernels_limit() {
     assert!(crate::containment::cgroup::PUMP_THREAD.len() <= 15);
 }
@@ -1963,7 +1963,7 @@ fn the_pump_thread_name_fits_the_kernels_limit() {
 /// is nothing left on this host, so `Drop` must not report one — `hard_kill`'s own `debug` note
 /// that the leaf is gone is the whole of what this path may say.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1990,7 +1990,7 @@ fn drop_reports_nothing_for_a_leaf_that_is_already_gone() {
 /// with it. The leaf must not survive the degrade: a stray `cosca-*` cgroup is permanent on the
 /// host, since nothing ever revisits it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
@@ -2022,7 +2022,7 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
 /// `OpenReportChannel` is a condition that did not exist before the placement report did, so the
 /// step it names, and the fact it leaves nothing behind, are both worth pinning.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::containment::cgroup::fault::set_force_kill_supported(true);
@@ -2051,7 +2051,7 @@ fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf()
 
 /// A `cgroup.procs` that cannot be read is reported with the read's own error.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn take_placement_reports_an_unreadable_cgroup_procs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unreadable-procs");
@@ -2078,7 +2078,7 @@ fn take_placement_reports_an_unreadable_cgroup_procs() {
 /// A child that reported a failed write is diagnosed from the real `cgroup.procs` and its real
 /// `/proc` state. The child is a zombie — exited, not yet reaped — so its state is known.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-absent-procs");
@@ -2126,7 +2126,7 @@ fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter()
 /// makes the child a zombie only once the read has begun, and lets the read finish only after.
 /// Read first, the state is the live child's; read second, it would be `Z`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn take_placement_reads_the_childs_state_before_cgroup_procs() {
     use std::io::Write;
 
@@ -2188,7 +2188,7 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
 /// `degrade_tests::an_unwaitable_verdict_logs_at_warn` covers the `Unwaitable` log path with its
 /// own unique marker instead.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unwaitable");
@@ -2213,7 +2213,7 @@ fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
 
 /// A report already sent is final, pidfd or not, and the leaf is left alone.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn without_a_pidfd_a_report_already_sent_decides() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-sent");
@@ -2230,7 +2230,7 @@ fn without_a_pidfd_a_report_already_sent_decides() {
 /// A `Placed` that arrives after the report was checked, from a child whose tree has since
 /// exited: the leaf is gone, and the verdict is still the child's own report.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-late");
@@ -2251,7 +2251,7 @@ fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
 /// ends its chance to enter. The child's report is then final, and the leaf is killed through
 /// only if it says `Placed` — otherwise nothing in it came from the child.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -2307,7 +2307,7 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
 /// A child already in its real leaf is contained, pidfd or not: `rmdir` refuses an occupied leaf
 /// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
@@ -2348,7 +2348,7 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
 /// so the spawn fails and its child is killed. Its report then proves it never entered, so
 /// nothing in the leaf is cosca's to kill: the occupant survives.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it() {
     use std::io::{Read, Write};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -2411,7 +2411,7 @@ fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killi
 
 /// A failed placement whose report is delivered lets the spawn proceed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_proceeds_past_a_failed_placement() {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     // SAFETY: fd -1 is never writable, so the placement fails with EBADF; the channel is open.
@@ -2425,7 +2425,7 @@ fn placement_hook_proceeds_past_a_failed_placement() {
 
 /// A report that cannot be sent to a parent still waiting for it fails the spawn.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_fails_when_its_report_cannot_be_sent() {
     let sink = std::fs::OpenOptions::new()
         .write(true)
@@ -2456,7 +2456,7 @@ fn placement_hook_fails_when_its_report_cannot_be_sent() {
 /// the socket open past the parent's close — the child's send would then queue, and the child
 /// carry on having written its placement: a decision honoured, but not the branch under test.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, IntoRawFd};
@@ -2531,7 +2531,7 @@ fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
 /// and the hook fails the spawn with `ECANCELED` before touching the leaf — so the child exits
 /// instead of exec'ing.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_fails_a_spawn_the_parent_abandoned_before_touching_the_leaf() {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (_end, slot) = childs_copy(&channel);
@@ -2559,7 +2559,7 @@ fn placement_hook_fails_a_spawn_the_parent_abandoned_before_touching_the_leaf() 
 /// error channel had, a stdio slot once `std` returned early. A regression exits 0 here (the
 /// forked body's own `_exit`).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
     use std::io::Write;
     use std::os::fd::{AsRawFd, IntoRawFd};
@@ -2601,7 +2601,7 @@ fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
 /// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
 /// parent would misread as never placed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
     use std::os::unix::process::CommandExt;
 
@@ -2629,7 +2629,7 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
 /// `ESRCH` is injected, and "not this process's child" is a live grandchild, which its own parent
 /// has not reaped, so its number cannot be reused.
 #[cfg(all(target_os = "linux", not(debug_assertions)))]
-#[test]
+#[skuld::test]
 fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
     use std::io::{BufRead, Read, Write};
 
@@ -2680,7 +2680,7 @@ fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
 /// A leaf dropped before its verdict, with no report received and nothing in it, is removed: a
 /// removed leaf admits no member, so the in-flight report cannot matter.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-in-flight-empty");
@@ -2693,7 +2693,7 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 /// abandoned exchange received nothing, so nothing of the child's is there, and the occupant is
 /// not cosca's to kill. It survives — proven by an echo — and the leaf is reported, not killed.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child() {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -2740,7 +2740,7 @@ fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child() 
 /// `cgroup.kill` returns — it may have left the leaf. Here `cgroup.kill` is a directory, so the
 /// leaf's kill fails for real.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails() {
     use std::os::unix::process::CommandExt;
 
@@ -2849,7 +2849,7 @@ fn spawn_placing(
 /// killed and reaped, named by the `/proc/self` directory it sent: a handle on that process, not on
 /// its number.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-no-pidfd");
@@ -2888,7 +2888,7 @@ fn an_abandoned_child_without_a_pidfd_is_killed_and_reaped_through_its_proc_dire
 /// when the number names a live child of this process: that child is not this spawn's. Out of
 /// reach, and said so.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_intent_without_a_handle_is_never_signalled() {
     use std::io::{Read, Write};
 
@@ -2935,7 +2935,7 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
 /// A real spawn whose child could open neither a pidfd nor its `/proc` directory sends an intent
 /// with no handle: its abandoned child is out of reach, and is not signalled.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-no-handle-spawn");
@@ -2972,7 +2972,7 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
 /// abandoned exchange then holds that child's `/proc` directory, which no longer opens anything:
 /// the child is gone, and nothing is signalled — whatever process the number names by now.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -3006,7 +3006,7 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
 /// A spawn abandoned before its child sent anything cannot tell whether it forked: a child that
 /// exists exits at its first send, but nothing holds its pid to reap it. That is not `Ended`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-silent");
@@ -3025,7 +3025,7 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
 /// contract forbids — is signalled through its handle, which now names nothing: no other process
 /// can be hit. The kill finds it gone, and nothing is reaped twice.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-window");
@@ -3053,7 +3053,7 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
 /// An abandoned child cosca may not kill is out of reach, and still never left a zombie: a
 /// background reaper waits for its exit, however that comes — here, the test's own kill.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-refuses");
@@ -3103,7 +3103,7 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
 /// so `rest` is non-empty and the test fails at once rather than hanging. `drop(leaf)` may also
 /// return before the hook's fire point, so the test fires it itself afterwards.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     use std::io::{BufRead, Read};
 
@@ -3154,7 +3154,7 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
 /// `an_abandoned_child_is_killed_with_the_group_it_leads` for the `set_before_exit_wait` release
 /// that makes a skipped kill fail at once instead of hanging in `fail_closed`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fail_closed_kills_the_childs_whole_process_group() {
     use std::io::{BufRead, Read};
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
@@ -3211,7 +3211,7 @@ fn fail_closed_kills_the_childs_whole_process_group() {
 /// would block for that program's whole life. It exec'd, so its report is final: the spawn fails
 /// at once, and the child, which cosca could not kill, is left running.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -3263,7 +3263,7 @@ fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
 /// An occupied leaf whose child's membership cannot be read is undecided, not "not the child":
 /// the spawn fails closed — its child killed — and the read's own error is the reason given.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
@@ -3344,7 +3344,7 @@ fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fau
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -3356,7 +3356,7 @@ fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -3370,7 +3370,7 @@ fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
 /// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
 /// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let sink = std::fs::OpenOptions::new()
@@ -3393,7 +3393,7 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 /// flight must remove the empty child cgroups itself rather than kill-and-retry forever. A
 /// regression hangs this test in `drop`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
     if !crate::test_support::require_group("CGROUP") {
         return;
@@ -3421,7 +3421,7 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
 /// credential check stands in `cgroup.kill`'s way. The error must say so, not that it is left
 /// running.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fail_closed_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_placed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandon-eperm-placed");
@@ -3452,7 +3452,7 @@ fn fail_closed_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when
 /// is final only because nothing it sends later is accepted. Its late intent fails, so it exits with
 /// `ABANDONED_EXIT` before touching the leaf, rather than enter a leaf the spawn was told it had not.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_send_after_fail_closed_read_the_report_is_refused() {
     use std::os::fd::{AsRawFd, IntoRawFd};
 
@@ -3508,7 +3508,7 @@ fn a_send_after_fail_closed_read_the_report_is_refused() {
 /// `Drop`'s own kill-and-drain reports it — never dropped. A `cgroup.events` that is a directory
 /// opens but cannot be read, so the watch fails for real.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fail_closed_reports_a_drain_it_could_not_watch() {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -3543,7 +3543,7 @@ fn fail_closed_reports_a_drain_it_could_not_watch() {
 /// A leaf's name carries 64 random bits past the pid and sequence number, which repeat across
 /// pid namespaces sharing a delegated parent, and across processes reusing a pid.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
     let suffix = |name: String| {
         let parts = name.split('-').collect::<Vec<_>>();
@@ -3570,7 +3570,7 @@ fn leaf_names_carry_random_bits_past_the_pid_and_sequence() {
 ///
 /// Mutant: drop the assert from `end_child`.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
+#[skuld::test]
 fn end_child_refuses_inside_a_section() {
     let received = crate::containment::cgroup::Received {
         report: None,
@@ -3588,7 +3588,7 @@ fn end_child_refuses_inside_a_section() {
 ///
 /// Mutant: drop the assert from `fail_closed`.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
-#[test]
+#[skuld::test]
 fn fail_closed_refuses_inside_a_section() {
     use std::os::unix::process::CommandExt;
 

@@ -1,7 +1,7 @@
 //! Unit tests for Windows Job Object containment helpers.
 //! Substantive runtime coverage is in the integration tests (tests/spawn_io.rs).
 
-#[test]
+#[skuld::test]
 fn job_handle_debug_does_not_panic() {
     // Verify the Debug impl compiles and runs cleanly for a consumed (raw == null) handle.
     // `port` is never a legal null, so there is no struct-literal shortcut to that state: go
@@ -20,7 +20,7 @@ fn job_handle_debug_does_not_panic() {
 /// never a guessed `AllMembersExited` — the handle is gone, so nothing here re-checked whether
 /// every member actually finished exiting (`TerminateJobObject`/`CloseHandle` are not
 /// documented as synchronous with member process teardown).
-#[test]
+#[skuld::test]
 fn wait_drained_on_a_consumed_handle_is_unassessable() {
     use super::JobHandle;
     let h = JobHandle::create_empty_for_test();
@@ -40,7 +40,7 @@ fn wait_drained_on_a_consumed_handle_is_unassessable() {
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
 /// path `wait_drained_raw` relies on to return `AllMembersExited` without ever opening a
 /// process handle.
-#[test]
+#[skuld::test]
 fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
@@ -51,7 +51,7 @@ fn query_job_pid_list_is_empty_for_an_unpopulated_job() {
 
 /// `wait_drained_raw`'s empty-job fast path: no member was ever assigned, so the very first
 /// re-enumeration already reports `AllMembersExited`, with no wait and no deadline needed.
-#[test]
+#[skuld::test]
 fn wait_drained_raw_reports_drained_for_an_empty_job() {
     use super::JobHandle;
     let job = JobHandle::create_empty_for_test();
@@ -67,7 +67,7 @@ fn wait_drained_raw_reports_drained_for_an_empty_job() {
 /// pid must be visible in the job before `wait_drained_raw` can find it to wait on at all), and
 /// — once the child is let go and reaped — the live re-enumeration that turns a real exit into
 /// `AllMembersExited`, synchronized on `Child::wait()` rather than on any elapsed time.
-#[test]
+#[skuld::test]
 fn wait_drained_raw_tracks_a_real_member_through_exit() {
     use std::os::windows::io::AsRawHandle;
 
@@ -140,7 +140,7 @@ fn let_member_exit(mut child: std::process::Child) {
 ///
 /// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
 /// Mutant: ignore the site's deadline -> `requested` is not 5ms.
-#[test]
+#[skuld::test]
 fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     use std::time::{Duration, Instant};
     let (child, job) = spawn_job_member();
@@ -172,7 +172,7 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
 /// re-arms and reports the real drain.
 ///
 /// Mutant: return `MembersRemain` on the first `WAIT_TIMEOUT` -> one arm, wrong verdict.
-#[test]
+#[skuld::test]
 fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     use std::time::{Duration, Instant};
     let (mut child, job) = spawn_job_member();
@@ -196,7 +196,7 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
 ///
 /// Mutant: return `MembersRemain` on the first `WAIT_TIMEOUT` -> one arm, wrong verdict.
 /// Mutant: hoist `remaining` above the loop -> `remaining` does not shrink.
-#[test]
+#[skuld::test]
 fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     use std::time::{Duration, Instant};
     let (mut child, job) = spawn_job_member();
@@ -221,7 +221,7 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
 /// the fault seam exercised below. This test does NOT guard the integration test against
 /// vacuity — that binary carries its own `console=0` / `console=1` assertions, measured inside
 /// the helper itself.
-#[test]
+#[skuld::test]
 fn caller_has_console_is_true_under_cargo_test() {
     assert!(
         matches!(super::caller_has_console(), Ok(true)),
@@ -232,7 +232,7 @@ fn caller_has_console_is_true_under_cargo_test() {
 /// The `Err` arm's production, via the fault seam — a live `GetConsoleProcessList` cannot be
 /// made to fail. This exercises the fault-injection scaffolding, not a real API failure; the
 /// consumption side is covered by `invalid_handle_with_a_failed_probe_stays_io`.
-#[test]
+#[skuld::test]
 fn console_probe_error_surfaces() {
     super::fault::set_force_console_probe_error(true);
     assert!(super::caller_has_console().is_err());
@@ -253,7 +253,7 @@ fn io_err(hresult: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(hresult)
 }
 
-#[test]
+#[skuld::test]
 fn invalid_handle_with_no_console_is_typed_no_console() {
     let e = super::classify_ctrl_event_failure(4242, io_err(E_INVALID_HANDLE), Ok(false));
     let crate::error::Error::NoConsole { detail } = e else {
@@ -266,21 +266,21 @@ fn invalid_handle_with_no_console_is_typed_no_console() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn invalid_handle_with_a_console_attached_stays_io() {
     // The probe contradicts the code: never claim a cause we just measured to be false.
     let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), Ok(true));
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
-#[test]
+#[skuld::test]
 fn invalid_handle_with_a_failed_probe_stays_io() {
     let probe = Err(std::io::Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
     let e = super::classify_ctrl_event_failure(1, io_err(E_INVALID_HANDLE), probe);
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_different_failure_code_stays_io_whatever_the_probe_says() {
     for console in [Ok(true), Ok(false)] {
         let e = super::classify_ctrl_event_failure(1, io_err(E_ACCESS_DENIED), console);
@@ -290,7 +290,7 @@ fn a_different_failure_code_stays_io_whatever_the_probe_says() {
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
-#[test]
+#[skuld::test]
 fn the_no_console_signature_matches_the_real_win32_mapping() {
     // Pins the HRESULT the live path will see against the constant above, so a windows-rs
     // change to the io::Error conversion cannot silently un-classify the error.
@@ -312,22 +312,22 @@ mod mechanism_from_flags_tests {
     use crate::graceful::GracefulMechanism;
     use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_none_for_no_flags() {
         assert_eq!(mechanism_from_flags(0), GracefulMechanism::None);
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_console_group_for_group_flags() {
         assert_eq!(mechanism_from_flags(group_flags()), GracefulMechanism::ConsoleGroup);
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_console_group_for_root_flags() {
         assert_eq!(mechanism_from_flags(root_flags()), GracefulMechanism::ConsoleGroup);
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_other_console_group_for_group_plus_detached() {
         assert_eq!(
             mechanism_from_flags(group_flags() | DETACHED_PROCESS.0),
@@ -335,7 +335,7 @@ mod mechanism_from_flags_tests {
         );
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_other_console_group_for_group_plus_new_console() {
         assert_eq!(
             mechanism_from_flags(group_flags() | CREATE_NEW_CONSOLE.0),
@@ -343,7 +343,7 @@ mod mechanism_from_flags_tests {
         );
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_other_console_group_for_group_plus_no_window() {
         assert_eq!(
             mechanism_from_flags(group_flags() | CREATE_NO_WINDOW.0),
@@ -351,17 +351,17 @@ mod mechanism_from_flags_tests {
         );
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_none_for_detached_without_a_group() {
         assert_eq!(mechanism_from_flags(DETACHED_PROCESS.0), GracefulMechanism::None);
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_none_for_a_new_console_without_a_group() {
         assert_eq!(mechanism_from_flags(CREATE_NEW_CONSOLE.0), GracefulMechanism::None);
     }
 
-    #[test]
+    #[skuld::test]
     fn mechanism_from_flags_reports_none_for_no_window_without_a_group() {
         assert_eq!(mechanism_from_flags(CREATE_NO_WINDOW.0), GracefulMechanism::None);
     }
@@ -373,7 +373,7 @@ mod mechanism_from_flags_tests {
 /// call in the probe can be made to fail on a live system, so the seam is the only route to that
 /// arm's production — and without the seam the probe reports a real verdict, which is what makes
 /// this assertion about the arm rather than about the constant.
-#[test]
+#[skuld::test]
 fn probe_reports_unknown_when_the_query_fails() {
     use crate::containment::windows::{fault, probe_job_breakaway, JobBreakaway};
     assert_ne!(
@@ -408,7 +408,7 @@ const JOB_BREAKAWAY_PROBE_FIXTURE_MARKER: &str = "COSCA_FIXTURE_JOB_BREAKAWAY_PR
 /// membership atomically at `CreateProcess`, and nothing assigns it to a job afterward, so both
 /// reads taken INSIDE it always agree with each other, whichever way the ambient membership
 /// happens to fall.
-#[test]
+#[skuld::test]
 fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
     let exe = std::env::current_exe().expect("current_exe");
     let fixture = crate::test_child::fixture_path!(fixture_reports_job_breakaway_probe);
@@ -437,7 +437,7 @@ fn probe_agrees_with_an_independent_is_process_in_job_measurement() {
 /// unset there). Re-executed via `current_exe() --exact` with that var set, it performs the real
 /// measurement — see the driver's own doc for why it must run here, in a freshly spawned process,
 /// rather than in the driver itself.
-#[test]
+#[skuld::test]
 fn fixture_reports_job_breakaway_probe() {
     if std::env::var_os(JOB_BREAKAWAY_PROBE_FIXTURE_MARKER).is_none() {
         return; // picked up by an ordinary suite run — deliberately inert
@@ -571,7 +571,7 @@ fn finish_child(spawned: Result<crate::Child, crate::error::Error>) {
 /// another process (a reused id) must not be resumed, and must not fail the spawn. The helper's
 /// main thread has suspend count 1; suspending it again returns the previous count, so 1 proves
 /// nothing resumed it and 0 proves something did.
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
     use crate::containment::windows::Visit;
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
@@ -602,7 +602,7 @@ fn windows_resume_initial_threads_never_resumes_a_foreign_thread() {
 }
 
 /// The owner filter drops a snapshot entry listed under another pid before any thread is opened.
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_drops_an_entry_owned_by_another_pid() {
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
@@ -621,7 +621,7 @@ fn windows_resume_initial_threads_drops_an_entry_owned_by_another_pid() {
 /// `ERROR_INVALID_PARAMETER`, and must not fail the spawn. The kernel masks an id's low two bits
 /// before the lookup, so id 1 resolves to CID 0, which is never allocated to any thread or
 /// process: the lookup always fails, whatever ids are live or reused.
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_skips_a_thread_id_that_no_longer_exists() {
     use crate::containment::windows::Visit;
 
@@ -642,7 +642,7 @@ fn windows_resume_initial_threads_skips_a_thread_id_that_no_longer_exists() {
 /// `ERROR_ACCESS_DENIED` on the query-only open marks the id as someone else's: the child's own
 /// threads are openable by its creator. Forced onto the child's first thread, that leaves nothing
 /// resumed, and the spawn fails with the stale-walk error rather than an open failure.
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_treats_a_denied_query_open_as_stale() {
     use crate::containment::windows::fault::{force_next, Step};
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -674,7 +674,7 @@ fn assert_forced_failure_fails_the_spawn(step: crate::containment::windows::faul
     assert!(!text.contains("was stale"), "a failure is not a stale skip: {text}");
 }
 
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_fails_the_spawn_when_the_query_open_fails() {
     use crate::containment::windows::fault::Step;
     const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
@@ -682,21 +682,21 @@ fn windows_resume_initial_threads_fails_the_spawn_when_the_query_open_fails() {
 }
 
 /// A denied suspend/resume open of a thread that IS the child's is a failure, not a skip.
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_fails_the_spawn_when_the_resume_open_is_denied() {
     use crate::containment::windows::fault::Step;
     const ERROR_ACCESS_DENIED: u32 = 5;
     assert_forced_failure_fails_the_spawn(Step::ResumeOpen, ERROR_ACCESS_DENIED, "OpenThread(suspend/resume)");
 }
 
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_fails_the_spawn_when_the_owner_is_unreadable() {
     use crate::containment::windows::fault::Step;
     const ERROR_INVALID_HANDLE: u32 = 6;
     assert_forced_failure_fails_the_spawn(Step::Owner, ERROR_INVALID_HANDLE, "GetProcessIdOfThread");
 }
 
-#[test]
+#[skuld::test]
 fn windows_resume_initial_threads_fails_the_spawn_when_resume_thread_fails() {
     use crate::containment::windows::fault::Step;
     const ERROR_INVALID_HANDLE: u32 = 6;
@@ -704,7 +704,7 @@ fn windows_resume_initial_threads_fails_the_spawn_when_resume_thread_fails() {
 }
 
 /// The walk keeps the FIRST failure: it is the root cause, and later ones only follow from it.
-#[test]
+#[skuld::test]
 fn walk_verdict_returns_the_first_failure() {
     use super::{walk_verdict, Walk};
     let mut walk = Walk::default();
@@ -719,7 +719,7 @@ fn walk_verdict_returns_the_first_failure() {
 }
 
 /// When every listed thread was stale the walk fails, and the error names the last skip.
-#[test]
+#[skuld::test]
 fn walk_verdict_with_only_skips_names_the_last_skip() {
     use super::{walk_verdict, Walk};
     let mut walk = Walk::default();
@@ -735,7 +735,7 @@ fn walk_verdict_with_only_skips_names_the_last_skip() {
     assert!(text.contains("listed no threads"), "{text}");
 }
 
-#[test]
+#[skuld::test]
 fn walk_verdict_accepts_a_walk_that_resumed_a_thread() {
     use super::{walk_verdict, Walk};
     let mut walk = Walk {
@@ -747,7 +747,7 @@ fn walk_verdict_accepts_a_walk_that_resumed_a_thread() {
 }
 
 /// `GetProcessId` answers 0 for a handle that is not a process.
-#[test]
+#[skuld::test]
 fn process_pid_of_rejects_a_handle_that_names_no_process() {
     let result = super::process_pid_of(windows::Win32::Foundation::HANDLE::default());
     assert!(result.is_err(), "a null handle names no process: {result:?}");
@@ -760,7 +760,7 @@ fn process_pid_of_rejects_a_handle_that_names_no_process() {
 
 /// A handle that names no process breaks the caller's contract. Debug builds assert it.
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "live process handle")]
 fn resume_initial_threads_asserts_its_handle_contract_in_debug() {
     _ = super::resume_initial_threads(std::ptr::null_mut());
@@ -768,7 +768,7 @@ fn resume_initial_threads_asserts_its_handle_contract_in_debug() {
 
 /// Release builds return the error instead. Runs in the release lane.
 #[cfg(not(debug_assertions))]
-#[test]
+#[skuld::test]
 fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
     let err = super::resume_initial_threads(std::ptr::null_mut()).expect_err("a null handle names no process");
     assert!(err.to_string().contains("GetProcessId"), "{err}");

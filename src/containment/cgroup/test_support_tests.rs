@@ -4,7 +4,7 @@ use super::{fork_running, reap, reap_status};
 /// during unwind. Checked via an independent pidfd, which reports `ECHILD` once the child is
 /// reaped. If the kill regresses, this hangs (bounded by `nextest.toml`).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_panic_after_fork_running_still_reaps_the_child() {
     use std::cell::RefCell;
     use std::os::fd::AsFd;
@@ -37,7 +37,7 @@ fn a_panic_after_fork_running_still_reaps_the_child() {
 /// Dropping a guard normally (no panic) must reap the child too — the non-unwinding half of the
 /// sibling test above. Checked the same way: an independent probe pidfd reports `ECHILD`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_without_a_panic_reaps_the_child() {
     use std::os::fd::AsFd;
 
@@ -65,7 +65,7 @@ fn drop_without_a_panic_reaps_the_child() {
 /// deterministically through a fault seam: a real signal landing mid-syscall would make this test
 /// itself racy, exactly what this suite avoids elsewhere.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_retries_waitid_on_eintr() {
     use std::os::fd::AsFd;
 
@@ -97,7 +97,7 @@ fn drop_retries_waitid_on_eintr() {
 /// A failed `pidfd_send_signal` must not block on a `waitid` for a child the kill may never have
 /// reached — checked by confirming the child is left alive and unreaped, not by timing.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_reports_a_kill_failure_without_blocking() {
     use std::os::fd::AsFd;
 
@@ -144,7 +144,7 @@ fn drop_reports_a_kill_failure_without_blocking() {
 /// must still kill and reap the child before panicking. Probed via the failure path's recorded
 /// pidfd, since the pid is never returned.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_pidfd_open_failure_still_reaps_the_child() {
     use std::os::fd::AsFd;
 
@@ -185,7 +185,7 @@ fn a_pidfd_open_failure_still_reaps_the_child() {
 /// failed the main one). That must not skip the kill/reap: the panic still names the original
 /// failure, with no "cleanup also failed" suffix, and nothing is recorded for a later test to read.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_probe_pidfd_open_failure_does_not_skip_the_cleanup() {
     crate::containment::cgroup::fault::set_force_fork_running_pidfd_failure(true);
     crate::containment::cgroup::fault::set_force_fork_running_probe_pidfd_failure(true);
@@ -230,7 +230,7 @@ fn a_probe_pidfd_open_failure_does_not_skip_the_cleanup() {
 /// is left to write). Cleanup runs through an independent probe pidfd *before* that assertion, so
 /// a failure here can't leak the child regardless of which outcome triggered it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn defuse_disarms_the_guard() {
     use std::io::Write;
     use std::os::fd::{AsFd, AsRawFd};
@@ -292,7 +292,7 @@ fn read_report_byte(pipe: &mut impl std::io::Read) -> Option<u8> {
 
 /// A `read` interrupted by a signal is retried, not reported as a failure.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn read_report_byte_retries_an_interrupted_read() {
     struct InterruptedOnce(bool);
     impl std::io::Read for InterruptedOnce {
@@ -347,7 +347,7 @@ fn set_nonblocking(fd: std::os::fd::RawFd) {
 /// The read end is `O_NONBLOCK` and the child is reaped before the read: once reaped, its byte is
 /// in the pipe or never will be, and a missing byte answers `WouldBlock` instead of hanging.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fork_running_holds_spawn_lock_across_the_fork() {
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
@@ -393,7 +393,7 @@ fn fork_running_holds_spawn_lock_across_the_fork() {
 /// A failed report `write` in the child is not swallowed: the child exits with
 /// `REPORT_WRITE_FAILED_EXIT`, which the reaped status shows.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fork_running_child_exits_with_a_dedicated_code_when_its_report_write_fails() {
     use std::os::fd::AsRawFd;
 
@@ -431,7 +431,7 @@ enum LockProbe {
 /// the fork did not run ahead, and the holder's release flag is set before its unlock, so a fork
 /// that waited for the lock always sees it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fork_running_waits_for_a_held_spawn_lock() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
@@ -494,7 +494,7 @@ fn fork_running_waits_for_a_held_spawn_lock() {
 /// The `pidfd_open`-failure path releases `spawn_lock` before it kills and reaps the child, not
 /// at scope exit or unwind. Observed from the cleanup hook, which runs on the forking thread.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
     use std::sync::mpsc;
 
@@ -522,7 +522,7 @@ fn a_pidfd_open_failure_releases_spawn_lock_before_cleanup() {
 /// `fork_running` takes `spawn_lock` itself, and the mutex is not reentrant: a caller that already
 /// holds it must get a named panic, not a hang.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn fork_running_under_an_outer_spawn_lock_panics_naming_the_reentry() {
     let outer = crate::child::spawn::spawn_lock();
     let unwound = std::panic::catch_unwind(|| {

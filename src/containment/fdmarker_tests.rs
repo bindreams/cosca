@@ -1,8 +1,8 @@
 //! Sweep tests. Every one runs against the real host process table with real descriptors —
 //! nothing here is faked, because a sweep fired at a synthetic table proves nothing.
 //!
-//! Three rules these tests obey, because under a plain `cargo test`, which runs every test in
-//! this crate in one shared process, the unit suite runs in parallel in ONE process:
+//! Three rules these tests obey, because trials overlap in one process under `--nocapture`
+//! with `--test-threads` > 1 (nextest runs each test in its own process):
 //! never clear `FD_CLOEXEC` on a descriptor of the test process (a concurrent fork+exec on
 //! another thread would leak it into an unrelated child); never key a log assertion on the
 //! shared pid alone (every test shares it) — key on the marker handle; and every test that
@@ -45,8 +45,7 @@ fn all_pids() -> Vec<crate::identity::RawPid> {
 
 /// See the module docs above: held for the WHOLE body of every test that both installs a
 /// marker and spawns a real child, so no such test's fork can land inside another's marker
-/// window in this shared, parallel-test process (under a plain `cargo test`, which runs every
-/// test in this crate in one shared process). Delegates to the SAME lock production code
+/// window when trials overlap (`--nocapture` with `--test-threads` > 1). Delegates to the SAME lock production code
 /// uses, not a private one, so it also excludes every other cosca-originated spawn elsewhere
 /// in this test binary.
 fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
@@ -62,7 +61,7 @@ fn test_spawn_lock() -> crate::child::spawn::SpawnLockGuard {
 
 /// A real pipe has a readable handle; the two ends are distinct kernel objects with distinct
 /// handles, so matching on the write end's handle cannot match a process holding only a read end.
-#[test]
+#[skuld::test]
 fn a_live_pipe_has_a_nonzero_handle_distinct_per_end() {
     let (r, w) = std::io::pipe().expect("pipe");
     let hw = pipe_handle_of(w.as_fd()).expect("the write end is a pipe");
@@ -79,8 +78,7 @@ fn a_live_pipe_has_a_nonzero_handle_distinct_per_end() {
 /// handles) on an unconstrained shell (see the final report). THIS test deliberately uses far
 /// fewer: macOS's launchd-inherited soft `RLIMIT_NOFILE` defaults to 256 (measured on this host
 /// via `launchctl limit maxfiles`), which is what a CI runner gets unless a step raises it, and
-/// under a plain `cargo test`, which runs every test in this crate in one shared process, this
-/// suite runs every unit test in parallel in ONE process — parking thousands of
+/// when trials overlap in one process (`--nocapture` with `--test-threads` > 1) — parking thousands of
 /// descriptors here would both risk this test's own `pipe()` calls panicking with `EMFILE` and
 /// starve concurrently-running sibling tests' `pipe()`/`File::open` calls into spurious `EMFILE`
 /// failures. `N = 50` (100 descriptors) leaves comfortable headroom under even the unraised
@@ -88,8 +86,8 @@ fn a_live_pipe_has_a_nonzero_handle_distinct_per_end() {
 /// pairwise" — weaker statistical power than the one-off 20,000-pipe measurement, but a
 /// regression-pinning unit test's job here is to catch a REVERSION of the property (e.g. a
 /// kernel/SDK change that reintroduces collisions), not to reproduce the full-scale measurement
-/// inside a shared, resource-constrained test process (again, under a plain `cargo test`).
-#[test]
+/// inside a resource-constrained test process.
+#[skuld::test]
 fn many_simultaneously_live_pipes_never_share_a_handle() {
     const N: usize = 50;
     let mut pipes = Vec::with_capacity(N);
@@ -113,7 +111,7 @@ fn many_simultaneously_live_pipes_never_share_a_handle() {
 }
 
 /// A non-pipe descriptor is reported as "not a pipe", never as handle 0.
-#[test]
+#[skuld::test]
 fn a_non_pipe_descriptor_has_no_pipe_handle() {
     let f = std::fs::File::open("/dev/null").expect("open /dev/null");
     assert!(
@@ -127,7 +125,7 @@ fn a_non_pipe_descriptor_has_no_pipe_handle() {
 /// the supervisor holds the read end, no newly created pipe on this host can ever carry the
 /// marker's handle. (With BOTH ends closed the handle is re-issued to the very next pipe,
 /// every time, which is why `Marker` owns the read end for its whole life.)
-#[test]
+#[skuld::test]
 fn holding_the_read_end_keeps_the_handle_from_being_reissued() {
     let (read, write) = std::io::pipe().expect("pipe");
     let handle = pipe_handle_of(write.as_fd()).expect("write end handle");
@@ -148,7 +146,7 @@ fn holding_the_read_end_keeps_the_handle_from_being_reissued() {
 }
 
 /// The sweep must find this process, which really does hold the write end.
-#[test]
+#[skuld::test]
 fn the_sweep_finds_this_process_holding_the_marker() {
     let (_r, w) = std::io::pipe().expect("pipe");
     let handle = pipe_handle_of(w.as_fd()).expect("write end handle");
@@ -170,7 +168,7 @@ fn the_sweep_finds_this_process_holding_the_marker() {
 /// (launchd, root-owned) queried directly is the oracle; this crate's CI and dev hosts run
 /// unprivileged, matching every other test here that assumes pid 1 is launchd and unreachable
 /// as a signal target.
-#[test]
+#[skuld::test]
 fn proc_pidlistfds_denial_returns_zero_with_eperm_not_negative() {
     // SAFETY: the sizing form takes a null buffer; `__error()` returns this thread's own errno
     // cell, which writing 0 into is always defined.
@@ -197,7 +195,7 @@ fn proc_pidlistfds_denial_returns_zero_with_eperm_not_negative() {
 /// `fd_pipe_info`'s `Absent` classification cannot silently drift from what the kernel actually
 /// reports. Measured directly on this host: a never-opened fd, a closed-then-reused-numerically
 /// pipe fd, and an open regular-file fd all produced identical `(0, EBADF)`.
-#[test]
+#[skuld::test]
 fn proc_pidfdinfo_on_a_non_pipe_fd_returns_zero_with_ebadf_not_a_type_specific_code() {
     let me = std::process::id() as libc::c_int;
     let mut info: PipeFdInfo = unsafe { std::mem::zeroed() };
@@ -236,7 +234,7 @@ fn proc_pidfdinfo_on_a_non_pipe_fd_returns_zero_with_ebadf_not_a_type_specific_c
 /// oracle `proc_pidlistfds_denial_returns_zero_with_eperm_not_negative` already establishes —
 /// no fault injection needed for this one, since a real, always-available denial exists. The
 /// handle value passed is irrelevant: the denial happens before any per-fd handle comparison.
-#[test]
+#[skuld::test]
 fn holds_marker_query_reports_denied_not_not_held_for_an_unqueryable_pid() {
     assert_eq!(
         holds_marker_query(1, 0),
@@ -248,10 +246,10 @@ fn holds_marker_query_reports_denied_not_not_held_for_an_unqueryable_pid() {
 
 /// A handle naming no live pipe finds nobody, and must not panic or mis-match. `0` is never a
 /// valid `pipe_handle` (established above by `a_live_pipe_has_a_nonzero_handle_distinct_per_end`)
-/// and cannot become one through any amount of churn (this suite churns pipes across many tests
-/// running in parallel in ONE process, under a plain `cargo test`), so this is race-free by
+/// and cannot become one through any amount of churn (overlapping trials churn pipes in one
+/// process), so this is race-free by
 /// construction rather than by timing luck.
-#[test]
+#[skuld::test]
 fn a_dead_handle_finds_no_holders() {
     assert!(
         !holds_marker(std::process::id(), 0),
@@ -267,7 +265,7 @@ fn a_dead_handle_finds_no_holders() {
 /// marker on one of those numbers would be silently clobbered and the tree would silently
 /// lose membership. `F_DUPFD_CLOEXEC` never overwrites an open descriptor, so only `child_fd`
 /// values are hazards; std `dup2`s the stdio slots before any pre_exec hook runs, so 0-2 are too.
-#[test]
+#[skuld::test]
 fn the_marker_fd_is_chosen_clear_of_reserved_child_fds_stdio_and_the_conventional_shell_range() {
     use super::{safe_marker_fd, HIGH_FLOOR};
     assert_eq!(
@@ -303,7 +301,7 @@ fn the_marker_fd_is_chosen_clear_of_reserved_child_fds_stdio_and_the_conventiona
 /// THIS process that stays open for the rest of the test's body (module docs above) — the
 /// fork-bystander exposure the lock guards against does not depend on this specific test ever
 /// spawning, only on the write end being open while ANY sibling test forks.
-#[test]
+#[skuld::test]
 fn install_places_the_marker_above_every_reserved_child_fd() {
     let _serialize = test_spawn_lock();
     let reserved = [3, 4, 5, 6, 7, 8, 9, 10];
@@ -318,7 +316,7 @@ fn install_places_the_marker_above_every_reserved_child_fd() {
 
 /// The same contract end to end, against a REAL colliding mapping: the child gets an fd
 /// mapping on the number the marker would naturally have taken, and must still be a holder.
-#[test]
+#[skuld::test]
 fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
     let _serialize = test_spawn_lock();
     use crate::child::spawn::fd_map::{self, FdMapping};
@@ -368,7 +366,7 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
 
 /// A real spawn through the real installer: the child must be a holder, and the SUPERVISOR
 /// must not be — it hands the write end away, so it is never a member of its own tree.
-#[test]
+#[skuld::test]
 fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -410,14 +408,13 @@ fn install_hands_the_marker_to_the_child_and_keeps_the_supervisor_out() {
 /// already un-CLOEXEC'd) rather than by mutating this process's own fd table, which a concurrent
 /// fork+exec on another thread would leak. The assertion keys on the per-pid message
 /// (`fd marker {handle:#x}: holder pid {kid} will lose the marker…`), not on the handle alone:
-/// under a plain `cargo test`, which runs every test in this crate in one shared process, unit
-/// tests run in parallel in ONE process, and the marker write end is open in that shared
-/// process from `install()` until `drop(cmd)` — a SIBLING test's `Command::spawn()` forking in
+/// when trials overlap in one process (`--nocapture` with `--test-threads` > 1), the marker
+/// write end is open in that shared process from `install()` until `drop(cmd)` — a SIBLING test's `Command::spawn()` forking in
 /// that window transiently inherits this fd into a not-yet-`exec`'d bystander (documented in
 /// "Holding the read end is a precondition of soundness"), whose CLOEXEC-armed copy of THIS
 /// handle would satisfy a handle-only negative check by accident. Keying on the child's own pid
 /// too makes that bystander unable to satisfy or spoil the assertion.
-#[test]
+#[skuld::test]
 fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
     let _serialize = test_spawn_lock();
     crate::log_capture::install();
@@ -475,7 +472,7 @@ fn a_child_holding_a_non_cloexec_marker_produces_no_exec_warning() {
 /// needed, so this does not touch the "never clear FD_CLOEXEC on this process's own
 /// descriptors" rule (that rule is about CLEARING an existing flag; this relies on the
 /// default, never-cleared SET state).
-#[test]
+#[skuld::test]
 fn a_cloexec_holder_is_reported_and_warned_about() {
     crate::log_capture::install();
     let (_r, w) = std::io::pipe().expect("pipe");
@@ -509,7 +506,7 @@ fn a_cloexec_holder_is_reported_and_warned_about() {
 /// child instead blocks on its own `read` immediately after printing `$$`, and only the
 /// PARENT'S write releases it into the close — so the first `holds_marker` check is guaranteed
 /// to run while the descriptor is still open, not merely likely to.
-#[test]
+#[skuld::test]
 fn a_child_that_closes_the_marker_leaves_the_holder_set() {
     let _serialize = test_spawn_lock();
     let mut cmd = high_fd_shell();
@@ -565,8 +562,7 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
 /// three syscalls (`pipe()`, `F_DUPFD_CLOEXEC`, and "the marker pipe has no readable handle")
 /// are genuinely hard to fail for real inside this suite without collateral damage.
 /// `RLIMIT_NOFILE` (the textbook way to force `pipe()`/`fcntl` to fail) is PROCESS-WIDE, and
-/// under a plain `cargo test`, which runs every test in this crate in one shared process, this
-/// suite runs every unit test in parallel in ONE process — lowering it would spuriously
+/// when trials overlap in one process (`--nocapture` with `--test-threads` > 1), lowering it would spuriously
 /// fail any concurrently-running sibling test that happens to open a file or pipe at that
 /// moment. The third arm (`pipe_handle_of` returning `None`) has no realistic real-world
 /// trigger at all on a healthy pipe. The seam exercises exactly the code adjacent to each
@@ -577,7 +573,7 @@ fn a_child_that_closes_the_marker_leaves_the_holder_set() {
 /// compile, log the right message, and degrade to `None` — it does NOT prove `install` degrades
 /// correctly under a genuine OS-level `pipe()`/`fcntl`/`proc_pidfdinfo` failure (`EMFILE`,
 /// `ENFILE`, …), whose exact errno/shape this seam does not attempt to reproduce.
-#[test]
+#[skuld::test]
 fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
     use super::fault::{set_fault, Fault};
     // Held for the whole test: these log lines carry no per-call discriminator, so this test
@@ -614,7 +610,7 @@ fn each_install_failure_arm_falls_back_and_says_which_step_failed() {
 /// The sweep must never signal the supervisor or pid 1. Asserted on the filter directly, not
 /// inferred from "the test process is still alive" — which would pass by luck if the filter
 /// were wrong and the signal merely failed.
-#[test]
+#[skuld::test]
 fn the_kill_filter_excludes_this_process_and_pid_one() {
     assert!(
         !super::is_signalable(std::process::id()),
@@ -646,7 +642,7 @@ fn the_kill_filter_excludes_this_process_and_pid_one() {
 ///
 /// The orphan is a `cat` blocked on a held stdin (see `test_child::BLOCKER_ARGV` for the
 /// backgrounding idiom), so only `hard_kill()` can end it.
-#[test]
+#[skuld::test]
 fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -716,7 +712,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
 /// closes the marker, confirms the close over the SAME pipe (ordering the sweep strictly
 /// after, not racing it), then proves it is still alive by echoing back what the
 /// test writes to it AFTER `hard_kill()` returns.
-#[test]
+#[skuld::test]
 fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
     let _serialize = test_spawn_lock();
     let mut cmd = high_fd_shell();
@@ -773,7 +769,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
 /// `dispatch.rs`) is a standing gap for the marker's whole life: `hard_kill` must report
 /// `incomplete` even on a pass that converges immediately with nothing else to signal — proving
 /// the flag actually reaches `finish_sweep`, not merely that `Marker::new` accepts it.
-#[test]
+#[skuld::test]
 fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_signal() {
     let (read, write) = std::io::pipe().expect("pipe");
     let handle = super::pipe_handle_of(write.as_fd()).expect("handle");
@@ -798,7 +794,7 @@ fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_sign
 /// currently-live member of its own group, and rejects both a mismatched pgid and a pid that
 /// has already exited (the `getpgid` call itself fails `ESRCH` for a gone pid, which is the
 /// whole reason no separate liveness check is needed — see the function's doc).
-#[test]
+#[skuld::test]
 fn pid_is_live_group_member_confirms_membership_and_rejects_mismatch_or_death() {
     let _serialize = test_spawn_lock();
     #[allow(
@@ -880,7 +876,7 @@ fn high_fd_shell() -> std::process::Command {
 /// "the kernel still lists a zombie in its process group" fact `group_tests.rs`'s `await_zombie`
 /// already relies on, applied here to keep `pgid` allocated across the gap instead of to query
 /// it.
-#[test]
+#[skuld::test]
 fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_member() {
     let _serialize = test_spawn_lock();
     crate::log_capture::install();
@@ -1015,7 +1011,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
 /// pid 1 to an unprivileged caller, and that fallback is documented to succeed for exactly this
 /// case — a `Resolved::Unknown` here would mean that documented fallback regressed, which this
 /// test must fail loudly on, not quietly skip past.
-#[test]
+#[skuld::test]
 fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -1046,7 +1042,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 /// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
 /// `root: None, pgid: None` keeps every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
-#[test]
+#[skuld::test]
 fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -1071,7 +1067,7 @@ use super::is_teardown_mechanism_failure;
 // because they classify oppositely: `source: None` (an ordinary "member unconfirmed" outcome
 // from group::decide) is NOT a mechanism failure; `source: Some(_)` (group::state's listing
 // itself failed) IS one.
-#[test]
+#[skuld::test]
 fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable() {
     assert!(!is_teardown_mechanism_failure(&crate::error::Error::Containment {
         detail: "refused".into()
@@ -1085,7 +1081,7 @@ fn teardown_mechanism_failure_excludes_containment_and_per_member_unassessable()
     )));
 }
 
-#[test]
+#[skuld::test]
 fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
     assert!(is_teardown_mechanism_failure(&crate::error::Error::Unassessable {
         detail: "process group 372 could not be listed after SIGKILL".into(),
@@ -1109,7 +1105,7 @@ fn marker_without_holders(
 
 /// `root_denied` is a gap in the channel that names the root, which a holders-only sweep does not
 /// run. Mutant: the fold is not gated on `by_root_number`.
-#[test]
+#[skuld::test]
 fn a_holders_only_sweep_does_not_report_a_denied_root_as_a_gap() {
     let _serialize = test_spawn_lock();
     let marker = marker_without_holders(None, None, true);
@@ -1125,7 +1121,7 @@ fn a_holders_only_sweep_does_not_report_a_denied_root_as_a_gap() {
 /// The drop's skip names only what the marker would have done by the root's number. A marker with
 /// neither a group nor a root (it exited before attach, in `TreeWalk` mode) would have done
 /// nothing, so it warns of nothing. Mutant: the rule ignores the root.
-#[test]
+#[skuld::test]
 fn a_marker_with_neither_a_group_nor_a_root_is_not_named_by_the_roots_number() {
     let _serialize = test_spawn_lock();
     crate::log_capture::install();

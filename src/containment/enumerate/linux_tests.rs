@@ -28,7 +28,7 @@ fn assert_unassessable_naming(got: Result<Vec<(u32, u32)>, crate::error::Error>,
 /// signals by pid: the snapshot is `Unassessable` naming the view (and logged at `warn`), never
 /// an empty list a walk would read as "no descendants". Mutants: "scan `/proc` by path whatever
 /// the view"; "return an empty snapshot for a view that is not `Same`".
-#[test]
+#[skuld::test]
 fn a_diverged_view_is_unassessable_and_warned_about() {
     let (got, records) = snapshot_with(ForcedView::Diverged);
     assert_unassessable_naming(got, "outer pid namespace");
@@ -40,7 +40,7 @@ fn a_diverged_view_is_unassessable_and_warned_about() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
     let (got, records) = snapshot_with(ForcedView::Unassessable);
     assert_unassessable_naming(got, "forced by a test");
@@ -53,7 +53,7 @@ fn an_unassessable_view_is_unassessable_and_warned_about_naming_the_cause() {
 }
 
 /// The ordinary snapshot lists this process under its real parent.
-#[test]
+#[skuld::test]
 fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
     let me = std::process::id();
     let ppid = std::os::unix::process::parent_id();
@@ -63,7 +63,7 @@ fn the_ordinary_snapshot_lists_this_process_with_its_parent() {
 /// Without `openat2` no view can be checked: the snapshot is `Unsupported`, naming the requirement
 /// as a spawn does, and logged at `warn` with it. Mutant: "report every unreadable view as
 /// `Unassessable`" - the requirement is missing from both the error and the warning.
-#[test]
+#[skuld::test]
 fn a_snapshot_without_openat2_is_unsupported_naming_it_and_warned_about() {
     for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         crate::log_capture::install();
@@ -93,7 +93,7 @@ fn a_snapshot_without_openat2_is_unsupported_naming_it_and_warned_about() {
 
 /// Another `/proc` open failure is not the requirement. Mutant: "every open failure is
 /// `Unsupported`".
-#[test]
+#[skuld::test]
 fn a_snapshot_with_another_open_failure_is_not_unsupported() {
     let forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOENT);
     let got = process_parents();
@@ -108,7 +108,7 @@ use crate::identity::pid_stat::fault::force_stat_read;
 /// A pid that exited mid-scan (`ENOENT`, `ESRCH`) or that `hidepid` hides (`EACCES`, and `EPERM`
 /// while the checked directory still answers) is absent, and the snapshot is still a snapshot.
 /// Mutant: "fail the snapshot on every read error".
-#[test]
+#[skuld::test]
 fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
     for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
         let _forced = force_stat_read(errno, None);
@@ -121,7 +121,7 @@ fn a_pid_whose_stat_is_gone_or_hidden_is_skipped() {
 /// walk: the snapshot is `Unassessable` naming `<pid>/stat` and the errno. Mutants: "skip every
 /// read error" (an `EMFILE` from a full fd table hits every pid and yields `Ok(vec![])`); "a mount
 /// crossing is skipped".
-#[test]
+#[skuld::test]
 fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
     for errno in [
         libc::EXDEV,
@@ -158,7 +158,7 @@ fn any_other_stat_read_failure_is_unassessable_naming_pid_and_errno() {
 /// `EPERM` is `hidepid`'s answer and also a seccomp filter's for an `openat2` installed mid-scan;
 /// only the checked directory still answering tells them apart. Mutant: "skip `EPERM` without the
 /// re-check".
-#[test]
+#[skuld::test]
 fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
     for recheck in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
         let _forced = force_stat_read(libc::EPERM, Some(recheck));
@@ -177,7 +177,7 @@ fn eperm_is_unassessable_when_the_checked_directory_also_refuses() {
 
 /// A failed `/proc` listing is `Unassessable` naming it and the errno, never an empty table.
 /// Mutant: "an unlistable `/proc` is an empty snapshot".
-#[test]
+#[skuld::test]
 fn an_unlistable_proc_is_unassessable_naming_the_errno() {
     let _forced = crate::identity::proc_view_fault::force_pids_errno(libc::EIO);
     match process_parents() {
@@ -192,7 +192,7 @@ fn an_unlistable_proc_is_unassessable_naming_the_errno() {
 /// The kernel prints a parseable `stat` for every pid, so an unparsable one is a contract
 /// violation, not an absence: the snapshot names the pid instead of dropping it. Mutant: "an
 /// unparsable `stat` drops the pid".
-#[test]
+#[skuld::test]
 fn an_unparsable_stat_is_unassessable_naming_the_pid() {
     match super::ppid_of_stat(4242, b"4242 (no closing paren S 1") {
         Err(crate::error::Error::Unassessable { detail, .. }) => assert!(detail.contains("4242/stat"), "{detail}"),
@@ -204,7 +204,7 @@ fn an_unparsable_stat_is_unassessable_naming_the_pid() {
 /// The kernel prints a parseable `stat` for every pid, so an unparsable one reaching the snapshot
 /// is a contract violation: asserted in debug. Mutant: "remove the assertion".
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "the kernel printed an unparseable stat")]
 fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
     let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
@@ -214,7 +214,7 @@ fn an_unparsable_stat_in_the_scan_is_asserted_in_debug() {
 /// Without the assertion (release), the scan still refuses to drop the pid. Mutant: "an unparsable
 /// `stat` drops the pid".
 #[cfg(not(debug_assertions))]
-#[test]
+#[skuld::test]
 fn an_unparsable_stat_in_the_scan_is_unassessable_in_release() {
     let _forced = crate::identity::pid_stat::fault::force_stat_bytes(b"garbage");
     match process_parents() {

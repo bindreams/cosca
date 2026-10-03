@@ -9,7 +9,7 @@ fn armed(fake: &FakeLeaf) -> DrainWatch {
 }
 
 /// A sibling's removal is queued on the parent's watch, and bears on nothing here.
-#[test]
+#[skuld::test]
 fn a_siblings_removal_is_not_a_change_to_the_leaf() {
     let fake = FakeLeaf::new("cosca-watched", true);
     let mut watch = armed(&fake);
@@ -22,7 +22,7 @@ fn a_siblings_removal_is_not_a_change_to_the_leaf() {
 }
 
 /// A write to `cgroup.events`, and the leaf's own removal, are each a change.
-#[test]
+#[skuld::test]
 fn an_events_write_and_the_leafs_removal_are_changes() {
     let fake = FakeLeaf::new("cosca-watched", true);
     let mut watch = armed(&fake);
@@ -47,7 +47,7 @@ fn an_events_write_and_the_leafs_removal_are_changes() {
 /// with the sysctl, and so does kernel memory: each queued event is a 48-byte kmalloc (a 32-byte
 /// `inotify_event_info` plus the 16-byte name "cosca-sibling-a" with its NUL), which lands in
 /// kmalloc-64 — about 64 MiB at 1048576 (128 MiB on arm64 before 6.5).
-#[test]
+#[skuld::test]
 fn an_overflowed_queue_is_a_change() {
     let max: usize = std::fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
         .expect("read fs.inotify.max_queued_events")

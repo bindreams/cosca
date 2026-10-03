@@ -8,7 +8,7 @@ use crate::test_child::{await_member_ready, fixture_path, member_command};
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: the snapshot is
 /// `Unassessable`, neither the outer namespace's processes nor an empty list. Mutants: "scan
 /// `/proc` whatever the view"; "return an empty snapshot".
-#[test]
+#[skuld::test]
 fn namespaces_an_outer_procfs_is_unassessable() {
     if !ns::enabled() {
         return;
@@ -16,7 +16,7 @@ fn namespaces_an_outer_procfs_is_unassessable() {
     ns::run(fixture_path!(fixture_enumerate_outer));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_enumerate_outer() {
     if !ns::is_child() {
         return;
@@ -25,7 +25,7 @@ fn fixture_enumerate_outer() {
     ns::run(fixture_path!(fixture_enumerate_inner));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_enumerate_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -42,7 +42,7 @@ fn fixture_enumerate_inner() {
 /// left out (its subtree would go with it): the snapshot is `Unassessable` naming the pid and the
 /// mount. Mutants: "read `stat` with a plain `openat`"; "skip a pid whose `stat` lies beyond a
 /// mount".
-#[test]
+#[skuld::test]
 fn namespaces_a_stat_mounted_over_is_unassessable() {
     if !ns::enabled() {
         return;
@@ -50,7 +50,7 @@ fn namespaces_a_stat_mounted_over_is_unassessable() {
     ns::run(fixture_path!(fixture_enumerate_stat_overmount));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_enumerate_stat_overmount() {
     if !ns::is_child() {
         return;

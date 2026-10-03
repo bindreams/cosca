@@ -5,7 +5,7 @@ use crate::containment::cgroup::PlacementReport;
 /// cgroup-free: fd -1 is never writable, so the child's `write` always fails with `EBADF`,
 /// and the parent must read back that exact errno rather than a guess.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_report_crosses_fork_with_the_childs_errno() {
     use std::os::unix::process::CommandExt;
 
@@ -41,7 +41,7 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
 /// A successful self-placement is reported too — the fact that separates "the write failed"
 /// from "the write worked and the child then left the set".
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn placement_report_records_a_successful_write() {
     use std::os::unix::process::CommandExt;
 
@@ -75,7 +75,7 @@ fn placement_report_records_a_successful_write() {
 /// Ordered by a primitive, not by timing: the child is held on a gate, the wait signals just
 /// before it blocks, and only then is the gate opened.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -108,7 +108,7 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
 ///
 /// A regression hangs this test rather than failing it: the wait has no timeout by design.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_childs_end() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -133,7 +133,7 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
 /// either. (That they sit at fd 3 or above matters only with 0, 1 or 2 closed, which
 /// `tests/spawn_io.rs` covers in a process of its own.)
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn report_channel_is_close_on_exec() {
     use std::os::fd::AsRawFd;
 
@@ -149,7 +149,7 @@ fn report_channel_is_close_on_exec() {
 /// Everything the child sent before the parent abandoned the exchange is still read, pidfd
 /// included: the shut cuts off only what comes after.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (_end, slot) = childs_copy(&channel);
@@ -179,7 +179,7 @@ fn an_abandoned_exchange_still_reads_what_was_sent_before_it() {
 /// A send landing after the abandonment read what was queued, but before the channel closed, must
 /// fail: a send that succeeded there would be discarded unread while its child went on to `exec`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_send_after_the_abandonment_read_fails_rather_than_go_unread() {
     let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (end, slot) = childs_copy(&channel);
@@ -224,7 +224,7 @@ fn reset_by_the_parent(proceed: bool) -> (std::os::fd::OwnedFd, crate::containme
 /// decision, none an abandonment. A child that took it for an error would fail a decided spawn. Run
 /// [`alone`].
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
     if !alone("containment::cgroup::channel::channel_tests::a_reset_channel_ends_the_exchange_as_a_closed_one_does") {
         return;
@@ -255,7 +255,7 @@ fn a_reset_channel_ends_the_exchange_as_a_closed_one_does() {
 /// reset: `proceed` reads what was queued before it closes. The child's next send then fails with
 /// `EPIPE`, and finds *proceed*. Run [`alone`].
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn proceed_reads_what_was_sent_before_it_closes() {
     if !alone("containment::cgroup::channel::channel_tests::proceed_reads_what_was_sent_before_it_closes") {
         return;
