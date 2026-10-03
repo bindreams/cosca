@@ -26,6 +26,8 @@ arch_x86_64 = []
 arch_aarch64 = []
 # Enables nothing: a clean run that is not the empty feature combination.
 quiet = []
+# Compiles under `cargo check` but fails in codegen: the guard must not codegen.
+post_mono = []
 
 [dependencies]
 
@@ -40,6 +42,12 @@ doctest = false
 [[test]]
 name = "it"
 path = "tests/it.rs"
+harness = false
+
+# Only `post_mono`: a test target whose guard run holds no finding, so a codegen failure is not masked.
+[[test]]
+name = "pm"
+path = "tests/pm.rs"
 harness = false
 
 # Default harness: the guard must refuse it unless it is listed in the unflipped file.

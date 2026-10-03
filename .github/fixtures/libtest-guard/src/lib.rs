@@ -20,7 +20,7 @@ fn main() {}
 #[cfg(all(test, feature = "os_windows", windows))] #[tokio::test] async fn os_windows() {}
 #[cfg(all(test, feature = "ps_a", not(feature = "ps_b")))] #[tokio::test] async fn ps_only_a() {}
 #[cfg(all(test, feature = "ps_b", not(feature = "ps_a")))] #[tokio::test] async fn ps_only_b() {}
-#[cfg(all(test, not(any(feature = "plain", feature = "tokio_test", feature = "prelude_path", feature = "cfg_attr_test", feature = "renamed", feature = "macro_rules", feature = "shared", feature = "release_only", feature = "os_linux", feature = "os_macos", feature = "os_windows", feature = "bin_test_false", feature = "ps_a", feature = "ps_b", feature = "crate_allow", feature = "type_error", feature = "arch_x86_64", feature = "arch_aarch64", feature = "quiet"))))] #[tokio::test] async fn ps_none() {}
+#[cfg(all(test, not(any(feature = "plain", feature = "tokio_test", feature = "prelude_path", feature = "cfg_attr_test", feature = "renamed", feature = "macro_rules", feature = "shared", feature = "release_only", feature = "os_linux", feature = "os_macos", feature = "os_windows", feature = "bin_test_false", feature = "ps_a", feature = "ps_b", feature = "crate_allow", feature = "type_error", feature = "arch_x86_64", feature = "arch_aarch64", feature = "quiet", feature = "post_mono"))))] #[tokio::test] async fn ps_none() {}
 #[cfg(all(test, feature = "crate_allow"))] #[test] fn crate_allowed() {}
 #[cfg(all(test, feature = "type_error"))] fn broken() -> u32 { "not a u32" }
 #[cfg(all(test, feature = "arch_x86_64", target_arch = "x86_64"))] #[tokio::test] async fn arch_x86_64() {}
