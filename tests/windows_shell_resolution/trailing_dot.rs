@@ -7,6 +7,8 @@
 //! Both halves have to hold. A dot that suppresses PATHEXT but fails to open the intended file is
 //! useless, and a dot that opens the file but still extends it closes nothing.
 
+use crate::test_groups::{shell_probes, Group};
+use crate::test_harness::ISOLATED_TRAILING_DOT;
 use std::path::PathBuf;
 
 use windows::core::HRESULT;
@@ -26,10 +28,7 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// either file's setup could silently make the two probes' conclusions stop actually comparing the
 /// same thing.
 #[skuld::test]
-fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile(#[fixture(shell_probes)] _group: &Group) {
     let (dir, marker) = probe_dir("dot-suppress");
     let bat = dir.path().join("tool.bat");
     plant_batch(&bat, &marker);
@@ -149,11 +148,8 @@ fn does_a_trailing_dot_suppress_pathext_on_an_absolute_lpfile() {
 /// `shell_execute_bounded` instead, bounded by `SHELL_EXECUTE_BOUND`. Hitting that bound is a hard
 /// failure here, never a conclusion about whether the dotted spelling opens the file: see
 /// `SHELL_EXECUTE_BOUND`'s doc.
-#[skuld::test]
-fn does_a_trailing_dot_still_open_the_extensionless_file() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+#[skuld::test(labels = [ISOLATED_TRAILING_DOT])]
+fn does_a_trailing_dot_still_open_the_extensionless_file(#[fixture(shell_probes)] _group: &Group) {
     let (dir, marker) = probe_dir("dot-opens");
     let image_bin = PathBuf::from(env!("CARGO_BIN_EXE_cosca_testbin_image"));
     let extensionless = dir.path().join("tool");

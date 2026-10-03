@@ -39,10 +39,10 @@
 //! # Why they are gated, and the two safety gates
 //!
 //! They create processes with derived tokens, and two of them change machine state. They are the
-//! `WINDOWS_EXECUTING_PROBES` group (principle 9). Opt in:
+//! `ELEVATION_ROUTES` group (principle 9). Opt in:
 //!
 //! ```text
-//! COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT=1 cargo nextest run --test windows_elevation_routes --no-capture
+//! COSCA_TEST_ELEVATION_ROUTES_CONSENT=1 cargo nextest run --test windows_elevation_routes --no-capture
 //! ```
 //!
 //! Three probes additionally refuse to run — loudly, by panicking, never by skipping — unless an
@@ -85,10 +85,21 @@ mod scheduled_task;
 #[path = "windows_elevation_routes/token_filtering.rs"]
 mod token_filtering;
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    match harness::helper_from_args(std::env::args_os().skip(1)) {
+        Ok(Some(harness::Helper::MeasureToken)) => return token_filtering::measure_this_token(),
+        Ok(None) => {}
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(2);
+        }
+    }
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

@@ -13,7 +13,7 @@
 //! (`src/elevation/shell_file.rs`) stay conservative until the consent route is measured, and do
 //! not rest on these results.
 //!
-//! It ELEVATES, so it is the `WINDOWS_ELEVATING_PROBES` group, which only the `windows-probes`
+//! It ELEVATES, so it is the `SHELL_EXECUTE` group, which only the `windows-probes`
 //! workflow turns on, in a step of its own, on a runner whose process is already elevated (GitHub's
 //! Windows runners are), so `runas` raises no prompt. It launches only copies of
 //! `cosca_testbin_image` — never a batch file — and registers one volatile App Paths key in HKLM and
@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(windows)]
+use crate::test_groups::{shell_execute, Group};
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
@@ -409,10 +411,7 @@ fn last_component(path: &str) -> String {
 /// `.exe`, and a `.com` too — and finds nothing by a bare name, in `lpDirectory` or on `PATH`,
 /// where the same launch without the class finds both. `comfile` has no `runas` verb.
 #[skuld::test]
-fn classname_runas_needs_a_full_path() {
-    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
-        return;
-    }
+fn classname_runas_needs_a_full_path(#[fixture(shell_execute)] _group: &Group) {
     let _serial = serial();
     let l = layout();
     let mut failures: Vec<String> = Vec::new();
@@ -504,10 +503,7 @@ fn classname_runas_needs_a_full_path() {
 /// and `open` alike, and loads the registered image — but not when launched as `exefile`. An HKCU
 /// registration is not consulted at all; that is printed, not asserted.
 #[skuld::test]
-fn exefile_skips_the_app_paths_lookup() {
-    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
-        return;
-    }
+fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) {
     let _serial = serial();
     let l = layout();
     let app = OsStr::new(APP);
@@ -543,10 +539,7 @@ fn exefile_skips_the_app_paths_lookup() {
 /// alike: with `COSCA_PROBE_PCT=exp` set, `…\%COSCA_PROBE_PCT%\…` loads from, and runs in, the
 /// directory literally named that, not `…\exp\…`.
 #[skuld::test]
-fn exefile_takes_percent_literally() {
-    if !crate::common::require_group("WINDOWS_ELEVATING_PROBES") {
-        return;
-    }
+fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
     let _serial = serial();
     let l = layout();
     let literal_name = "%COSCA_PROBE_PCT%";
@@ -594,6 +587,8 @@ fn exefile_takes_percent_literally() {
     windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

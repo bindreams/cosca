@@ -1,6 +1,7 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test and one real `ROOT` test under chosen environments. Neither body runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
+use crate::test_harness::{DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, SHELL_EXECUTE, SHELL_PROBES};
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
@@ -103,6 +104,21 @@ fn require_consent_grants_only_on_exactly_1() {
             why.contains("does a thing") && why.contains("COSCA_TEST_X_CONSENT=1"),
             "{why}"
         );
+    }
+}
+
+/// Mutant: a row's fixture carries no label, or another row's, so `SKULD_LABELS=<label>` selects none of its tests (or someone else's).
+#[skuld::test]
+fn every_group_fixture_carries_exactly_its_label() {
+    for (fixture, label) in [
+        ("namespaces", NAMESPACES),
+        ("drive_mapping", DRIVE_MAPPING),
+        ("path_probes", PATH_PROBES),
+        ("shell_execute", SHELL_EXECUTE),
+        ("shell_probes", SHELL_PROBES),
+        ("elevation_routes", ELEVATION_ROUTES),
+    ] {
+        assert_eq!(skuld::fixture::collect_fixture_labels(&[fixture]), [label], "{fixture}");
     }
 }
 
