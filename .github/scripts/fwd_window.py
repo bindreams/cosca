@@ -12,7 +12,8 @@ Scenarios (each through the real forward.py, with the test's own sequence: stopp
            between the last eval-breaker check and read(2).
   pycheck  the command stops itself with os.kill and then calls os.read: an eval-breaker check runs
            between the two.
-  default  as `window`, but TERM is left at its default action (the proposed fix).
+  wakeupfd as `window`, but the command waits with signal.set_wakeup_fd and a wait on both fds (the fix).
+  default  as `window`, but TERM is left at its default action.
 Usage: fwd_window.py <runs-per-scenario>
 """
 import ctypes, os, select, signal, subprocess, sys, tempfile, time
@@ -25,7 +26,13 @@ BOUND = 10.0
 HELPER_C = r"""
 #include <signal.h>
 #include <unistd.h>
+#include <poll.h>
 long stop_then_read(int fd) { char c; raise(SIGSTOP); return (long)read(fd, &c, 1); }
+long stop_then_poll(int fd, int wake) {
+    struct pollfd p[2] = {{fd, POLLIN, 0}, {wake, POLLIN, 0}};
+    raise(SIGSTOP);
+    return (long)poll(p, 2, -1);
+}
 """
 
 def build(tmp):
@@ -42,6 +49,11 @@ def command(kind, lib):
     head += "fd = os.open(work + '/release', os.O_RDWR)\n"
     if kind == "pycheck":
         head += "os.kill(os.getpid(), signal.SIGSTOP)\nos.read(fd, 1)\n"
+    elif kind == "wakeupfd":
+        # The proposed fix: the C trampoline writes the wakeup fd, so a wait that includes it cannot miss
+        # a signal delivered before the wait began; the handler runs at the check after the call returns.
+        head = head.replace("os.write(os.open(work + '/up'", "r, w = os.pipe()\nos.set_blocking(w, False)\nsignal.set_wakeup_fd(w)\nos.write(os.open(work + '/up'")
+        head += f"ctypes.CDLL({lib!r}).stop_then_poll(fd, r)\n"
     else:
         head += f"ctypes.CDLL({lib!r}).stop_then_read(fd)\n"
     return head + "sys.exit(7)\n"
@@ -95,7 +107,10 @@ def one(kind, lib):
             proc.send_signal(signal.SIGTERM)
             if not read_until(err, b"relayed SIGTERM", buf, BOUND):
                 return "no relay: " + buf[0].decode()
-            os.kill(cmd, signal.SIGCONT)
+            try:
+                os.kill(cmd, signal.SIGCONT)
+            except ProcessLookupError:
+                return f"the command was gone before SIGCONT (TERM's default action killed it while stopped); forwarder exit {proc.wait(timeout=BOUND)}"
             try:
                 status = proc.wait(timeout=BOUND)
                 return f"exit {status}"
@@ -122,7 +137,7 @@ def main():
     n = int(sys.argv[1])
     with tempfile.TemporaryDirectory() as tmp:
         lib = build(tmp)
-        for kind in ("window", "pycheck", "default"):
+        for kind in ("window", "pycheck", "wakeupfd", "default"):
             outcomes = {}
             for _ in range(n):
                 o = one(kind, lib)

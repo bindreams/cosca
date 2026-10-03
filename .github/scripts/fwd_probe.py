@@ -23,6 +23,8 @@ HERE = Path(__file__).resolve().parent
 FORWARD = str(HERE / "forward.py")
 STALL = float(os.environ.get("PROBE_STALL", "30"))
 OBSERVE = float(os.environ.get("PROBE_OBSERVE", "90"))
+JITTER_NS = int(float(os.environ.get("PROBE_JITTER_US", "0")) * 1000)
+import random
 
 CMD = (
     "import os, signal, sys\n"
@@ -119,13 +121,34 @@ def one(i, tag, results):
             if not rd.until("started the command", f_exit, STALL):
                 rec["error"] = "no start line"
                 return rec
-            if not select.select([up, f_exit], [], [], STALL)[0]:
-                rec["error"] = "no up"
-                return rec
-            cmd = int(os.read(up, 32))
-            c_exit = exit_kq(cmd)
-            t["stop"] = time.monotonic()
-            os.kill(cmd, signal.SIGSTOP)
+            if JITTER_NS:
+                # Spin on `up` so the stop can land microseconds after the command's write, then sweep.
+                os.set_blocking(up, False)
+                give_up = time.monotonic() + STALL
+                data = b""
+                while not data.endswith(b"\n") and time.monotonic() < give_up:
+                    try:
+                        data += os.read(up, 32)
+                    except BlockingIOError:
+                        pass
+                if not data.endswith(b"\n"):
+                    rec["error"] = "no up"
+                    return rec
+                cmd = int(data)
+                spin = time.perf_counter_ns() + random.randrange(JITTER_NS)
+                while time.perf_counter_ns() < spin:
+                    pass
+                t["stop"] = time.monotonic()
+                os.kill(cmd, signal.SIGSTOP)
+                c_exit = exit_kq(cmd)  # the command cannot exit while stopped and unreleased
+            else:
+                if not select.select([up, f_exit], [], [], STALL)[0]:
+                    rec["error"] = "no up"
+                    return rec
+                cmd = int(os.read(up, 32))
+                c_exit = exit_kq(cmd)
+                t["stop"] = time.monotonic()
+                os.kill(cmd, signal.SIGSTOP)
             if not rd.until("is still running", f_exit, STALL):
                 rec["error"] = "no still-running"
                 rec["log"] = rd.drain()
