@@ -31,13 +31,13 @@ agent can't run that step locally either — it only runs in CI.
 
 Two test groups run only as root (principles 9 and 10 in `docs/principles.md`):
 
-- `ROOT` (`COSCA_TEST_ROOT`): the library tests that need a DAC bypass.
+- `ROOT` (`COSCA_TEST_ROOT`): the library tests that need a DAC bypass (`SKULD_LABELS=root`).
 - `UID_SWITCH` (`COSCA_TEST_UID_SWITCH`): `foreign_kill_surfaces_permission_denied` in
   `tests/process_root.rs`. It runs as real root, spawns children under two other real uids and
   re-execs itself as one of them.
 
-For each group, `=0` turns it off: its tests return early and report as passed. Otherwise
-`COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
+For each group, `=0` turns it off: `ROOT`'s tests report as ignored, `UID_SWITCH`'s return early and
+report as passed. Otherwise `COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
 (unprivileged) run sets both switches to `0`. CI does this workflow-wide; the root lanes in
 `.github/workflows/ci.yaml` turn `ROOT` on, and turn `UID_SWITCH` on only in the lanes that are real
 root (Linux root, `DAC_READ_SEARCH`, foreign `TMPDIR`, and macOS).
@@ -69,11 +69,12 @@ docker run --rm --network none \
     -v cosca-root-test-target:/target \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_NET_OFFLINE=true \
+    -e SKULD_LABELS=root \
     -e COSCA_TEST_ROOT_CONSENT=1 \
     -e COSCA_TEST_UID_SWITCH_CONSENT=1 \
     -w /repo \
     rust:1 \
-    cargo nextest run --offline -E "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"
+    cargo nextest run --offline --no-tests=fail -E "binary(cosca) | binary(process_root)"
 )
 docker volume rm cosca-root-test-cargo-home cosca-root-test-target
 ```

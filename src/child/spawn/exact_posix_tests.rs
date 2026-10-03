@@ -1,6 +1,8 @@
 //! `raw_executable()` on the POSIX std backend, spawned for real: which `tool` a child loads is
 //! read back from its exit code (see [`crate::test_child::cwd_and_path_tools`]).
 
+skuld::default_labels!(crate::test_harness::ROOT);
+
 use crate::command::Command;
 use crate::error::Error;
 use crate::test_child::{cwd_and_path_tools, CWD_TOOL_EXIT, PATH_TOOL_EXIT};

@@ -14,25 +14,14 @@ mod setuid_lane_check_tests;
 #[path = "test_privilege/setuid_protocol_tests.rs"]
 mod setuid_protocol_tests;
 
-/// Whether the tests that only mean something with a DAC bypass run: the `COSCA_TEST_ROOT` group of
-/// `docs/principles.md`'s "Tests fail loudly and never silently skip" and "System-affecting tests
-/// run in a sandbox" sections. On unless `COSCA_TEST_ROOT=0`. An enabled group fails, rather than
-/// skips, when the caller has no DAC bypass (see [`holds_dac_bypass`]) or has not given
-/// `COSCA_TEST_ROOT_CONSENT=1`. CI's ordinary jobs opt out; the root jobs (#218) do not.
-pub(crate) fn root_tests_enabled() -> bool {
-    if std::env::var("COSCA_TEST_ROOT").is_ok_and(|v| v == "0") {
-        return false;
-    }
+/// Fails unless the caller holds a DAC bypass (see [`holds_dac_bypass`]). Off-switch and consent belong
+/// to the `ROOT` group (`test_groups.rs`).
+pub(crate) fn assert_holds_dac_bypass() {
     assert!(
         holds_dac_bypass(),
         "the root tests need a DAC bypass (CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH effective on Linux, uid 0 elsewhere): \
          run the suite as root or with that capability in a sandbox, or set COSCA_TEST_ROOT=0 to opt out"
     );
-    assert!(
-        std::env::var("COSCA_TEST_ROOT_CONSENT").is_ok_and(|v| v == "1"),
-        "the root tests run as root: set COSCA_TEST_ROOT_CONSENT=1 (in a sandbox) or COSCA_TEST_ROOT=0"
-    );
-    true
 }
 
 /// Whether this thread can bypass DAC: an effective DAC capability on Linux, so a non-root caller
