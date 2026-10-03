@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use super::ProcHandle;
 use super::{std_teardown_action, StdTeardown};
 
@@ -69,29 +68,8 @@ mod own_reap {
         assert!(h.is_reaped());
     }
 
-    /// `is_reaped` is read from the state that records the reap, so it is `true` while the waiter
-    /// that made the reap is still on its way out of `wait`.
-    ///
-    /// Mutant: `is_reaped` read from a flag stored after `wait` returns.
-    #[test]
-    fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
-        use crate::child::shared::seams;
-        let h = killed_zombie();
-        let (gate, reached, release) = seams::park_gate();
-        std::thread::scope(|scope| {
-            let a = scope.spawn(|| {
-                let _armed = seams::park_after_reap_recorded_on(gate);
-                h.wait().expect("wait")
-            });
-            reached.recv().expect("the reap was recorded");
-            let seen = h.is_reaped();
-            release.send(()).expect("release");
-            a.join().expect("join");
-            assert!(seen, "the reap was recorded, but is_reaped answered false");
-        });
-    }
-
-    /// [`is_reaped_is_true_as_soon_as_the_reap_is_recorded`], for the `try_wait` reap.
+    /// `is_reaped` is read from the state that records the reap, so it is `true` while the
+    /// `try_wait` that made the reap is still on its way out.
     ///
     /// Mutant: `is_reaped` read from a flag stored after `try_wait` returns.
     #[test]
@@ -144,6 +122,38 @@ mod own_reap {
             .is_some());
         assert!(h.is_reaped());
     }
+}
+
+// The reap is visible before the waiter returns =====
+
+/// `is_reaped` is read from the state that records the reap, so it is `true` while the waiter
+/// that made the reap is still on its way out of `wait`.
+///
+/// Mutant: `is_reaped` read from a flag stored after `wait` returns.
+#[test]
+fn is_reaped_is_true_as_soon_as_the_reap_is_recorded() {
+    use crate::child::shared::seams;
+    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
+        .expect("spawn the blocker");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let id = crate::identity::ProcessId::of(child.id()).found().expect("identity");
+    let shared = crate::child::shared::SharedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let h = ProcHandle::std(shared);
+    assert!(!h.is_reaped());
+    let (gate, reached, release) = seams::park_gate();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            let _armed = seams::park_after_reap_recorded_on(gate);
+            h.wait().expect("wait")
+        });
+        // The blocker exits cleanly once its stdin closes; `wait` is blocked on that real exit.
+        drop(stdin);
+        reached.recv().expect("the reap was recorded");
+        let seen = h.is_reaped();
+        release.send(()).expect("release");
+        a.join().expect("join");
+        assert!(seen, "the reap was recorded, but is_reaped answered false");
+    });
 }
 
 // The reap after a successful kill =====
