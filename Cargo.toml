@@ -142,6 +142,51 @@ rustix = { version = "1", default-features = false, features = ["mount", "pty"] 
 harness = false
 
 [[test]]
+name = "block_on_socket"
+path = "tests/block_on_socket.rs"
+harness = false
+
+[[test]]
+name = "elevation"
+path = "tests/elevation.rs"
+harness = false
+
+[[test]]
+name = "elevation_pkexec_version"
+path = "tests/elevation_pkexec_version.rs"
+harness = false
+
+[[test]]
+name = "foundation_smoke"
+path = "tests/foundation_smoke.rs"
+harness = false
+
+[[test]]
+name = "graceful"
+path = "tests/graceful.rs"
+harness = false
+
+[[test]]
+name = "identity_lifecycle"
+path = "tests/identity_lifecycle.rs"
+harness = false
+
+[[test]]
+name = "payload_race"
+path = "tests/payload_race.rs"
+harness = false
+
+[[test]]
+name = "spawn_lock_reentry"
+path = "tests/spawn_lock_reentry.rs"
+harness = false
+
+[[test]]
+name = "tokio_foreign"
+path = "tests/tokio_foreign.rs"
+harness = false
+
+[[test]]
 name = "process"
 path = "tests/process.rs"
 harness = false

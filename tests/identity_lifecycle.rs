@@ -23,7 +23,7 @@ const BLOCK_VAR: &str = "COSCA_IDENTITY_TEST_BLOCK";
 /// When this integration-test binary is re-spawned with `BLOCK_VAR` set, this
 /// "test" blocks reading stdin until the parent closes the pipe. In a normal
 /// run the var is unset and it returns immediately.
-#[test]
+#[skuld::test]
 fn helper_block_on_stdin() {
     if std::env::var_os(BLOCK_VAR).is_none() {
         return;
@@ -45,7 +45,7 @@ fn spawn_blocking_child() -> Child {
     .expect("spawn blocking child")
 }
 
-#[test]
+#[skuld::test]
 fn child_is_alive_while_running_then_not_after_exit() {
     let mut child = spawn_blocking_child();
     let pid = child.id();
@@ -81,7 +81,7 @@ fn child_is_alive_while_running_then_not_after_exit() {
     drop(child);
 }
 
-#[test]
+#[skuld::test]
 fn created_at_is_present_and_not_in_the_future() {
     let me = ProcessId::current();
     let created = me.created_at().expect("current process has a creation time");
@@ -92,7 +92,7 @@ fn created_at_is_present_and_not_in_the_future() {
 
 /// An exited-but-unreaped (zombie) child must still resolve by identity on EVERY platform.
 /// Exit is proven by stdout EOF — the child's write end closes at process exit.
-#[test]
+#[skuld::test]
 fn identity_resolves_an_exited_unreaped_child() {
     // RAW std::process::Command: argv[0] is the exe path, so the testbin mode is args[1].
     let mut child = common::spawn_locked(
@@ -123,7 +123,7 @@ fn identity_resolves_an_exited_unreaped_child() {
 /// `is_running`'s reused-PID guard depends on. `common::block_until_zombie` pins the zombie:
 /// it returns only once the child IS a zombie and leaves it unreaped.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn identity_survives_the_alive_to_zombie_transition() {
     // _sock must stay alive: dropping our socket end would unblock the child early.
     let (child, _sock) = common::spawn_blocker();
@@ -161,7 +161,7 @@ const RECORD_READY: &str = "COSCA_RECORD_WRITTEN";
 /// exit. The record is produced by a genuinely different process — a real cross-process
 /// restart, not a round trip inside one test. Inert in a normal run, like
 /// `helper_block_on_stdin` above.
-#[test]
+#[skuld::test]
 #[cfg(feature = "serde")]
 fn helper_write_own_record() {
     let Some(path) = std::env::var_os(RECORD_VAR) else {
@@ -184,20 +184,20 @@ fn helper_write_own_record() {
 }
 
 #[cfg(feature = "serde")]
-#[test]
+#[skuld::test]
 fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
     let stream = format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n");
     assert!(common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
 #[cfg(feature = "serde")]
-#[test]
+#[skuld::test]
 fn a_stream_without_the_marker_is_not_ready() {
     let stream = "running 1 test\ntest helper_write_own_record ... \n";
     assert!(!common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
-#[test]
+#[skuld::test]
 #[cfg(feature = "serde")]
 fn an_identity_written_by_another_process_restores_and_names_that_process() {
     use cosca::Process;
@@ -250,4 +250,13 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let status = child.wait().expect("wait");
     assert!(status.success(), "the helper failed: {status}");
     assert_eq!(restored.is_alive(), Liveness::Dead);
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

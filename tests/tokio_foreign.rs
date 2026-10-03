@@ -1,15 +1,18 @@
 //! Async foreign `Process` integration tests — mirrors tests/process.rs and the process_*
 //! cases of tests/graceful.rs. Same death-proof discipline: control-socket EOF or an
 //! inspected ExitStatus on an OWNED handle — never sleep/poll/wall-clock.
-#![cfg(feature = "tokio")]
 
+#[cfg(feature = "tokio")]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(feature = "tokio")]
 use std::io::Read;
 
+#[cfg(feature = "tokio")]
 use cosca::tokio::Process;
 
+#[cfg(feature = "tokio")]
 fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
     match s.read(&mut buf) {
@@ -19,7 +22,8 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     }
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_wait_resolves_on_exit() {
     let (child, mut sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -33,7 +37,8 @@ async fn async_foreign_wait_resolves_on_exit() {
     let _ = child.wait();
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_wait_timeout_zero_is_deterministic() {
     let (child, _sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -45,7 +50,8 @@ async fn async_foreign_wait_timeout_zero_is_deterministic() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_wait_timeout_observes_an_exit() {
     let (child, mut sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -58,7 +64,8 @@ async fn async_foreign_wait_timeout_observes_an_exit() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_introspection_delegates() {
     let (child, _sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -70,7 +77,8 @@ async fn async_foreign_introspection_delegates() {
     child.wait().expect("reap");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_kill_terminates_the_process() {
     let (child, mut sock) = common::spawn_blocker();
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -80,8 +88,9 @@ async fn async_foreign_kill_terminates_the_process() {
     assert!(!status.success(), "killed child cannot report success, got {status:?}");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (child, mut sock) = common::spawn_blocker();
@@ -92,8 +101,9 @@ async fn async_foreign_terminate_sends_sigterm() {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -107,8 +117,9 @@ async fn async_foreign_graceful_shutdown_graceful_path() {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_graceful_shutdown_escalates() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -122,7 +133,8 @@ async fn async_foreign_graceful_shutdown_escalates() {
     assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_foreign_kill_tree_tears_down_tree() {
     let (child, mut socks) = common::spawn_grandchild(false);
     let p = Process::from_pid(child.id().pid()).found().expect("resolves");
@@ -138,8 +150,9 @@ async fn async_foreign_kill_tree_tears_down_tree() {
     let _ = child.wait();
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
     use std::time::Duration;
     let (child, mut socks) = common::spawn_grandchild(false);
@@ -158,8 +171,9 @@ async fn async_foreign_graceful_shutdown_tree_tears_down_tree() {
     let _ = child.wait();
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     use std::time::Duration;
     let (child, _sock) = common::spawn_blocker();
@@ -179,4 +193,13 @@ async fn async_foreign_unix_only_ops_are_unsupported_on_windows() {
     ));
     child.kill().expect("cleanup");
     let _ = child.wait();
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

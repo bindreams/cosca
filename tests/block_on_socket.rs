@@ -51,7 +51,7 @@ fn spawn_payload(addr: &str, nonce: &str) -> Spawned {
     Spawned(SharedChild::spawn(&mut c).expect("spawn block-on-socket"))
 }
 
-#[test]
+#[skuld::test]
 fn the_payload_reports_its_own_pid_under_the_nonce_and_stays_blocked() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
@@ -61,7 +61,7 @@ fn the_payload_reports_its_own_pid_under_the_nonce_and_stays_blocked() {
     assert_eq!(payload.pid, child.id());
 }
 
-#[test]
+#[skuld::test]
 fn a_killed_payload_is_eof_on_its_socket() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
@@ -80,7 +80,7 @@ fn a_killed_payload_is_eof_on_its_socket() {
     payload.release();
 }
 
-#[test]
+#[skuld::test]
 fn the_payload_exits_when_its_peer_hangs_up() {
     let (l, addr) = bind();
     let nonce = fresh_nonce();
@@ -92,4 +92,13 @@ fn the_payload_exits_when_its_peer_hangs_up() {
         None => panic!("the payload was still running {EXIT_BOUND:?} after its peer hung up"),
     }
     payload.release();
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

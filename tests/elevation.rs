@@ -35,7 +35,7 @@ fn testbin() -> PathBuf {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_elevated_child_runs_as_root_and_captures_uid() {
     if !gated() {
         return;
@@ -53,7 +53,7 @@ fn posix_elevated_child_runs_as_root_and_captures_uid() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_child_self_detects_elevation() {
     if !gated() {
         return;
@@ -76,7 +76,7 @@ fn posix_child_self_detects_elevation() {
 // stdin is /dev/null. The probe must then report `1` — impossible for an isatty(STDIN) impl,
 // since stdin is not a tty. Gated to the `pty` CI leg so it never ships a CI-vacuous assert.
 #[cfg(all(target_os = "linux", feature = "pty"))]
-#[test]
+#[skuld::test]
 fn controlling_terminal_probe_consults_ctty_not_stdin() {
     use std::os::fd::{AsFd, OwnedFd};
 
@@ -126,7 +126,7 @@ fn controlling_terminal_probe_consults_ctty_not_stdin() {
 // Linux-only (macOS ships no `setsid` binary; the probe itself is tested cross-platform
 // in the unit suite).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn controlling_terminal_probe_is_false_after_setsid() {
     let exe = testbin();
     let mut c = cosca::Command::new();
@@ -143,7 +143,7 @@ fn controlling_terminal_probe_is_false_after_setsid() {
 // test, so its death is EOF on that socket. run0 authenticates via polkit;
 // `--no-ask-password` (Auth::NonInteractive) suppresses the prompt.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn run0_client_kill_propagates_to_the_transient_unit() {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
@@ -203,7 +203,7 @@ fn run0_client_kill_propagates_to_the_transient_unit() {
 
 // GATED: Auth::Stdin feeds the real password to `sudo -S`; the elevated child is root.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_stdin_auth_reaches_root() {
     if !gated() {
         return;
@@ -225,7 +225,7 @@ fn posix_stdin_auth_reaches_root() {
 
 // GATED: Auth::Askpass delivers the password via a trivial SUDO_ASKPASS helper script.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_askpass_auth_reaches_root() {
     if !gated() {
         return;
@@ -262,7 +262,7 @@ fn posix_askpass_auth_reaches_root() {
 // setresuid(2)d to root and a kill() would still succeed. Dropping the socket at the end
 // releases the payload without needing a privileged kill.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     if !gated() {
         return;
@@ -313,7 +313,7 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
 
 // GATED: the allowed (already-elevated) spawn path reports elevation() honestly.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn already_elevated_inherit_spawn_reports_already_elevated() {
     if !gated() || !cosca::elevation::is_elevated() {
         return; // deterministic only when the gated runner is itself elevated.
@@ -329,7 +329,7 @@ fn already_elevated_inherit_spawn_reports_already_elevated() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_elevated_child_writes_admin_marker() {
     if !gated() {
         return;
@@ -358,7 +358,7 @@ fn windows_elevated_child_writes_admin_marker() {
 }
 
 #[cfg(all(unix, feature = "tokio"))]
-#[tokio::test]
+#[skuld::test]
 async fn async_posix_elevated_child_runs_as_root() {
     if !gated() {
         return;
@@ -373,7 +373,7 @@ async fn async_posix_elevated_child_runs_as_root() {
 // GATED (Windows): a non-contained runas child a medium parent cannot
 // PROCESS_TERMINATE returns the typed Unkillable, and Drop does not hang.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     if !gated() {
         return;
@@ -412,7 +412,7 @@ fn windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
 // MANUAL-TIER async Windows elevation (4c785f26): mirrors the sync marker test. Runs only
 // under the same gated, UAC-auto-approve manual tier documented in issue #9.
 #[cfg(all(windows, feature = "tokio"))]
-#[tokio::test]
+#[skuld::test]
 async fn async_windows_elevated_child_writes_admin_marker() {
     if !gated() {
         return;
@@ -447,7 +447,7 @@ async fn async_windows_elevated_child_writes_admin_marker() {
 // (never a false Ok), and async Drop must not block — locking the sync/async parity of the
 // runas-aware kill path.
 #[cfg(all(windows, feature = "tokio"))]
-#[tokio::test]
+#[skuld::test]
 async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
     if !gated() {
         return;
@@ -507,7 +507,7 @@ async fn async_windows_elevated_child_is_unkillable_and_drop_does_not_hang() {
 // unattended — a human must be at the keyboard to approve it. It is here so the path
 // is verifiable at all, not so CI can verify it.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn gui_elevated_child_runs_as_root() {
     // Already root means the planner short-circuits to RunAsIs and reports
     // AlreadyElevated: osascript never runs, so the assertions below would fail on
@@ -533,4 +533,13 @@ fn gui_elevated_child_runs_as_root() {
         "0",
         "the relayed stdout must show the elevated child ran as root"
     );
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

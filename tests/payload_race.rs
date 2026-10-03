@@ -91,7 +91,7 @@ fn accepted(rx: &mpsc::Receiver<Msg>) -> Payload {
 
 // Which peer is accepted =====
 
-#[test]
+#[skuld::test]
 fn accepts_the_peer_with_the_nonce_and_reports_its_pid() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -100,7 +100,7 @@ fn accepts_the_peer_with_the_nonce_and_reports_its_pid() {
     assert_eq!(p.pid, 4242);
 }
 
-#[test]
+#[skuld::test]
 fn rejects_a_wrong_nonce_and_keeps_accepting() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -109,7 +109,7 @@ fn rejects_a_wrong_nonce_and_keeps_accepting() {
     assert_eq!(accepted(&rx).pid, 7);
 }
 
-#[test]
+#[skuld::test]
 fn rejects_a_line_without_a_pid() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -118,7 +118,7 @@ fn rejects_a_line_without_a_pid() {
     assert_eq!(accepted(&rx).pid, 9);
 }
 
-#[test]
+#[skuld::test]
 fn the_accepted_socket_is_the_payloads_not_the_first_peers() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -139,7 +139,7 @@ fn the_accepted_socket_is_the_payloads_not_the_first_peers() {
     assert_eq!(&got, b"x");
 }
 
-#[test]
+#[skuld::test]
 fn a_stray_peer_that_never_writes_does_not_block_the_real_one() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -148,7 +148,7 @@ fn a_stray_peer_that_never_writes_does_not_block_the_real_one() {
     assert_eq!(accept_payload(l, "n0nce", exit).pid, 11);
 }
 
-#[test]
+#[skuld::test]
 fn a_peer_that_hangs_up_without_writing_is_rejected() {
     let (l, addr) = listener();
     let (_keep, exit) = client();
@@ -159,7 +159,7 @@ fn a_peer_that_hangs_up_without_writing_is_rejected() {
 
 // What a stranger can send =====
 
-#[test]
+#[skuld::test]
 fn bytes_after_the_line_are_left_in_the_socket_and_do_not_panic() {
     let (mut peer, accepted) = pair();
     peer.write_all(b"wrong 1\nextra bytes").expect("write");
@@ -175,14 +175,14 @@ fn bytes_after_the_line_are_left_in_the_socket_and_do_not_panic() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_line_that_is_not_utf8_is_that_peers_rejection() {
     let (mut peer, accepted) = pair();
     peer.write_all(b"\xff\xfe\n").expect("write");
     assert!(matches!(read_peer(accepted), Event::Line(_, Err(_))));
 }
 
-#[test]
+#[skuld::test]
 fn a_peer_that_hangs_up_mid_line_is_that_peers_rejection() {
     let (mut peer, accepted) = pair();
     peer.write_all(b"n0nce 5").expect("write");
@@ -192,7 +192,7 @@ fn a_peer_that_hangs_up_mid_line_is_that_peers_rejection() {
 
 // The deciding loop =====
 
-#[test]
+#[skuld::test]
 fn the_launcher_exiting_first_is_the_verdict() {
     let (_peer, stray) = pair();
     let events = [
@@ -203,7 +203,7 @@ fn the_launcher_exiting_first_is_the_verdict() {
     assert!(message.contains("client exited (gone)"), "{message}");
 }
 
-#[test]
+#[skuld::test]
 fn the_socket_decided_on_is_the_payloads_not_the_first_peers() {
     let (_stray_peer, stray) = pair();
     let (right_peer, right) = pair();
@@ -220,7 +220,7 @@ fn the_socket_decided_on_is_the_payloads_not_the_first_peers() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_failed_accept_is_the_verdict() {
     let events = [Event::AcceptFailed(std::io::Error::other("boom"))];
     let message = decide("n0nce", events).expect_err("no payload arrived");
@@ -230,7 +230,7 @@ fn a_failed_accept_is_the_verdict() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn events_that_run_out_are_a_verdict_not_a_wait() {
     let message = decide("n0nce", []).expect_err("no payload arrived");
     assert!(message.contains("hung up without a verdict"), "{message}");
@@ -238,7 +238,7 @@ fn events_that_run_out_are_a_verdict_not_a_wait() {
 
 // The launcher watch is wired to the deciding loop =====
 
-#[test]
+#[skuld::test]
 fn a_custom_watch_reports_the_launchers_exit_to_the_deciding_loop() {
     let (l, _addr) = listener();
     let events = Sources::start(l, ExitWatch::custom(|| "the fake launcher exited".into())).settle();
@@ -248,14 +248,14 @@ fn a_custom_watch_reports_the_launchers_exit_to_the_deciding_loop() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn an_unobservable_watch_reports_nothing() {
     let (l, _addr) = listener();
     let events = Sources::start(l, ExitWatch::Unobservable).settle();
     assert!(events.is_empty(), "{events:?}");
 }
 
-#[test]
+#[skuld::test]
 fn a_process_watch_reports_the_process_exit_once_it_is_armed() {
     use std::process::{Command, Stdio};
     let (l, _addr) = listener();
@@ -277,7 +277,7 @@ fn a_process_watch_reports_the_process_exit_once_it_is_armed() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn release_joins_the_exit_watch() {
     let (l, addr) = listener();
     let (tx, exit) = client();
@@ -286,4 +286,13 @@ fn release_joins_the_exit_watch() {
     tx.send(()).expect("wake the exit watch");
     // Only a join can hand back what the watch returned.
     assert_eq!(p.release().as_deref(), Some("test client exit"));
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

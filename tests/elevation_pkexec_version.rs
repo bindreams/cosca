@@ -7,15 +7,19 @@
 //!
 //! Linux only: cosca launches pkexec on Linux alone, and that pkexec is never run elsewhere is
 //! pinned by `detect_opens_and_probes_only_for_a_request_that_launches_pkexec` and the planner.
-#![cfg(target_os = "linux")]
 
+#[cfg(target_os = "linux")]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
 /// What the testbin reported, each line the fake `pkexec` logged (empty: never run; see
 /// `fake_pkexec` in testbin), the fake's real file, and the directory the launch named.
 struct Outcome {
@@ -24,6 +28,7 @@ struct Outcome {
     real: String,
 }
 
+#[cfg(target_os = "linux")]
 /// What the elevated spawn names: an absolute program, or a relative `raw_executable("tool")` in
 /// a `target/` directory holding `tool`.
 #[derive(Clone, Copy)]
@@ -32,6 +37,7 @@ enum Launch {
     RelativeRaw,
 }
 
+#[cfg(target_os = "linux")]
 /// Run the `elevate-pkexec-report` mode with a fake `pkexec` that prints `version_line`.
 ///
 /// This process may be root, so it never writes through a path another user could swap. The
@@ -139,6 +145,7 @@ fn elevate_with_fake_pkexec(version_line: &str, launch: Launch) -> Outcome {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// A new file `name` in `dir`, created relative to a descriptor held on `dir` itself
 /// (`O_CREAT | O_EXCL | O_NOFOLLOW`), so no path component is resolved twice.
 fn create_in(dir: &Path, name: &std::ffi::CStr, mode: libc::c_uint) -> std::fs::File {
@@ -163,9 +170,11 @@ fn create_in(dir: &Path, name: &std::ffi::CStr, mode: libc::c_uint) -> std::fs::
     unsafe { std::fs::File::from_raw_fd(fd) }
 }
 
+#[cfg(target_os = "linux")]
 /// `S_ISVTX`, the same bit everywhere; `libc`'s constant differs in type between Linux and macOS.
 const STICKY: u32 = 0o1000;
 
+#[cfg(target_os = "linux")]
 /// The uid and gid a root run's testbin drops to: 65534 where this user namespace maps it, else
 /// the first other id it maps. Fails, naming the cause, where it maps none (`unshare -r`, a
 /// rootless container with no subordinate ids): no non-root caller can exist there.
@@ -182,9 +191,11 @@ fn drop_target() -> (u32, u32) {
     (pick("/proc/self/uid_map"), pick("/proc/self/gid_map"))
 }
 
+#[cfg(target_os = "linux")]
 /// `nobody`, preferred wherever it is mapped.
 const NOBODY: u32 = 65534;
 
+#[cfg(target_os = "linux")]
 /// A non-zero id `map` (a `/proc/self/{uid,gid}_map`: lines of `inside outside count`) maps:
 /// [`NOBODY`] if it does, else the lowest non-zero one.
 fn mapped_non_root(map: &str) -> Option<u32> {
@@ -209,7 +220,8 @@ fn mapped_non_root(map: &str) -> Option<u32> {
         .map(|id| u32::try_from(id).expect("a mapped id fits in u32"))
 }
 
-#[test]
+#[cfg(target_os = "linux")]
+#[skuld::test]
 fn mapped_non_root_prefers_nobody_then_the_lowest_other_id() {
     assert_eq!(mapped_non_root("         0          0 4294967295\n"), Some(NOBODY));
     assert_eq!(mapped_non_root("         0       1000          1\n"), None);
@@ -220,6 +232,7 @@ fn mapped_non_root_prefers_nobody_then_the_lowest_other_id() {
     assert_eq!(mapped_non_root(""), None);
 }
 
+#[cfg(target_os = "linux")]
 /// `dir` is owned by root and sticky, so no other user can rename or replace an entry this
 /// process creates in it.
 fn assert_root_owned_and_sticky(dir: &Path) {
@@ -235,6 +248,7 @@ fn assert_root_owned_and_sticky(dir: &Path) {
     );
 }
 
+#[cfg(target_os = "linux")]
 /// Every directory from `/` to `dir` lets any uid through, so the child can reach the fake once
 /// it has dropped root.
 fn assert_traversable_by_everyone(dir: &Path) {
@@ -248,13 +262,15 @@ fn assert_traversable_by_everyone(dir: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_log(log: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(log).unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
     text.lines().map(str::to_owned).collect()
 }
 
+#[cfg(target_os = "linux")]
 /// A pkexec older than polkit 121 is asked only its version, and the spawn is refused.
-#[test]
+#[skuld::test]
 fn an_old_pkexec_is_refused_after_only_being_asked_its_version() {
     let o = elevate_with_fake_pkexec("pkexec version 0.105", Launch::BinTrue);
     assert!(o.report.starts_with("UNSUPPORTED "), "{}", o.report);
@@ -262,9 +278,10 @@ fn an_old_pkexec_is_refused_after_only_being_asked_its_version() {
     assert_eq!(o.pkexec_argvs, [format!("argv0={0} exe={0} args=--version", o.real)]);
 }
 
+#[cfg(target_os = "linux")]
 /// A pkexec of polkit 121 or later is launched with `--keep-cwd`: the same file the probe ran
 /// (`exe`), with the canonical path as `argv[0]`.
-#[test]
+#[skuld::test]
 fn a_new_pkexec_is_launched_with_keep_cwd() {
     let o = elevate_with_fake_pkexec("pkexec version 121", Launch::BinTrue);
     assert_eq!(o.report, "OK", "the fake pkexec exits 0");
@@ -281,12 +298,22 @@ fn a_new_pkexec_is_launched_with_keep_cwd() {
     );
 }
 
+#[cfg(target_os = "linux")]
 /// A relative `raw_executable()` is refused before detection, so pkexec is never run, not even to
 /// ask its version.
-#[test]
+#[skuld::test]
 fn a_relative_raw_executable_is_refused_before_pkexec_runs() {
     let o = elevate_with_fake_pkexec("pkexec version 121", Launch::RelativeRaw);
     assert!(o.report.starts_with("UNSUPPORTED "), "{}", o.report);
     assert!(o.report.contains("absolute program path"), "{}", o.report);
     assert!(o.pkexec_argvs.is_empty(), "{:?}", o.pkexec_argvs);
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }
