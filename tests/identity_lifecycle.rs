@@ -3,8 +3,8 @@
 //! timing: a hidden in-binary "test" blocks on stdin only when an env var is
 //! set, so the parent ends it deterministically by closing the pipe.
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead as _, BufReader, Read};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use cosca::identity::ProcessId;
@@ -19,35 +19,95 @@ use cosca::identity::{Existence, Liveness, ProcessIdRecord};
 mod common;
 
 const BLOCK_VAR: &str = "COSCA_IDENTITY_TEST_BLOCK";
+const BLOCK_READY: &str = "COSCA_IDENTITY_BLOCK_READY";
+
+/// A re-exec'd helper's stdout. It keeps every byte read while waiting for a marker, so the
+/// runner's JSON events survive for [`HelperOut::finish`].
+struct HelperOut {
+    reader: BufReader<ChildStdout>,
+    seen: Vec<u8>,
+}
+
+impl HelperOut {
+    fn new(stdout: ChildStdout) -> Self {
+        Self {
+            reader: BufReader::new(stdout),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Reads lines until one carries `marker`; `false` if the stream ends first. Borrows the
+    /// pipe, so the child keeps a reader.
+    fn wait_for(&mut self, marker: &str) -> bool {
+        loop {
+            let mut line = Vec::new();
+            let n = self
+                .reader
+                .read_until(b'\n', &mut line)
+                .expect("read the helper's stdout");
+            if n == 0 {
+                return false;
+            }
+            self.seen.extend_from_slice(&line);
+            if common::marker_seen(line.as_slice(), marker) {
+                return true;
+            }
+        }
+    }
+
+    /// The helper's whole output, once it has exited with `status`.
+    fn finish(mut self, status: ExitStatus) -> Output {
+        self.reader
+            .read_to_end(&mut self.seen)
+            .expect("read the helper's stdout");
+        Output {
+            status,
+            stdout: self.seen,
+            stderr: Vec::new(),
+        }
+    }
+}
 
 /// When this integration-test binary is re-spawned with `BLOCK_VAR` set, this
-/// "test" blocks reading stdin until the parent closes the pipe. In a normal
-/// run the var is unset and it returns immediately.
+/// "test" announces `BLOCK_READY`, then blocks reading stdin until the parent closes the pipe.
+/// In a normal run the var is unset and it returns immediately.
 #[skuld::test]
 fn helper_block_on_stdin() {
     if std::env::var_os(BLOCK_VAR).is_none() {
         return;
     }
+    println!("{BLOCK_READY}");
+    use std::io::Write;
+    std::io::stdout().flush().expect("flush");
     let mut buf = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
 
-fn spawn_blocking_child() -> Child {
+/// The helper, with its stdout for [`HelperOut::wait_for`]. Callers wait for `BLOCK_READY`, which
+/// proves the filter matched and the body is running.
+fn spawn_blocking_child() -> (Child, HelperOut) {
     let exe = std::env::current_exe().expect("current_exe");
-    common::spawn_locked(
-        common::test_reexec::command(exe)
-            .args(["--exact", "helper_block_on_stdin"])
+    let mut cmd = common::test_reexec::command(exe);
+    common::test_reexec::with_json_events(&mut cmd);
+    let mut child = common::spawn_locked(
+        cmd.args(["--exact", "helper_block_on_stdin", common::test_reexec::NOCAPTURE])
             .env(BLOCK_VAR, "1")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null()),
     )
-    .expect("spawn blocking child")
+    .expect("spawn blocking child");
+    let out = HelperOut::new(child.stdout.take().expect("piped stdout"));
+    (child, out)
 }
 
 #[skuld::test]
 fn child_is_alive_while_running_then_not_after_exit() {
-    let mut child = spawn_blocking_child();
+    let (mut child, mut out) = spawn_blocking_child();
+    assert!(
+        out.wait_for(BLOCK_READY),
+        "helper_block_on_stdin never ran: the --exact filter matched nothing"
+    );
     let pid = child.id();
 
     let id = ProcessId::of(pid).found().expect("a running child has an identity");
@@ -65,7 +125,7 @@ fn child_is_alive_while_running_then_not_after_exit() {
 
     // End the child deterministically: close its stdin (EOF) and reap it.
     drop(child.stdin.take());
-    let _ = child.wait().expect("reap child");
+    let status = child.wait().expect("reap child");
     // Do NOT drop `child` yet: keeping its handle open prevents PID reuse, so
     // is_alive checks exactly our (now-exited) process. is_alive reads the
     // signaled state on Windows / `/proc` absence on Unix, so it is false
@@ -77,6 +137,7 @@ fn child_is_alive_while_running_then_not_after_exit() {
         cosca::identity::Liveness::Dead,
         "child must read not-running immediately after it exits"
     );
+    common::test_reexec::suite_passed_exactly_one(&out.finish(status)).expect("the helper ran and passed");
 
     drop(child);
 }
@@ -185,15 +246,15 @@ fn helper_write_own_record() {
 
 #[cfg(feature = "serde")]
 #[skuld::test]
-fn the_marker_is_found_after_libtests_banner_on_the_same_line() {
-    let stream = format!("running 1 test\ntest helper_write_own_record ... {RECORD_READY}\n");
+fn the_marker_is_found_after_other_output_on_the_same_line() {
+    let stream = format!("first line\nother output {RECORD_READY}\n");
     assert!(common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
 #[cfg(feature = "serde")]
 #[skuld::test]
 fn a_stream_without_the_marker_is_not_ready() {
-    let stream = "running 1 test\ntest helper_write_own_record ... \n";
+    let stream = "first line\nother output\n";
     assert!(!common::marker_seen(stream.as_bytes(), RECORD_READY));
 }
 
@@ -205,11 +266,13 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("id.json");
     let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = common::test_reexec::command(exe);
+    common::test_reexec::with_json_events(&mut cmd);
     let mut child = common::spawn_locked(
-        common::test_reexec::command(exe)
+        cmd
             // The filter is mandatory: an unfiltered re-exec runs the whole suite recursively.
-            // `--nocapture` is what lets the helper's marker reach our pipe at all, and one test
-            // thread makes libtest print its `test <name> ... ` banner ahead of it on every host.
+            // `--nocapture` lets the helper's marker reach our pipe; one test thread keeps the
+            // test banner ahead of it on every host.
             .args([
                 "helper_write_own_record",
                 "--exact",
@@ -224,9 +287,10 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     .expect("spawn helper");
 
     // Synchronise on the pipe, not on time. EOF without the marker means the helper died first.
-    // Borrowed, so the pipe stays open: libtest in the helper reports after the body and fails if
+    // Borrowed, so the pipe stays open: the helper's runner reports after the body and fails if
     // stdout is closed.
-    let ready = common::marker_seen(child.stdout.as_mut().expect("piped stdout"), RECORD_READY);
+    let mut out = HelperOut::new(child.stdout.take().expect("piped stdout"));
+    let ready = out.wait_for(RECORD_READY);
     assert!(ready, "the helper exited without writing its record");
 
     let json = std::fs::read_to_string(&path).expect("the record file is complete by now");
@@ -250,6 +314,7 @@ fn an_identity_written_by_another_process_restores_and_names_that_process() {
     let status = child.wait().expect("wait");
     assert!(status.success(), "the helper failed: {status}");
     assert_eq!(restored.is_alive(), Liveness::Dead);
+    common::test_reexec::suite_passed_exactly_one(&out.finish(status)).expect("the helper ran and passed");
 }
 
 #[path = "../src/test_harness.rs"]
