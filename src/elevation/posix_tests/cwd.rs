@@ -196,15 +196,18 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     let dir = root.path().join("gone");
     std::fs::create_dir(&dir).expect("mkdir");
     let mut child = crate::test_spawn::spawn(
-        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
-            .args(crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
-                fixture_elevated_exact_in_an_unlinked_cwd
-            )))
-            .env(FIXTURE_UNLINKED_CWD_ENV, "1")
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
+        crate::test_reexec::with_json_events(
+            crate::test_reexec::command(std::env::current_exe().expect("current_exe")).args(
+                crate::test_reexec::fixture_args(crate::test_child::fixture_path!(
+                    fixture_elevated_exact_in_an_unlinked_cwd
+                )),
+            ),
+        )
+        .env(FIXTURE_UNLINKED_CWD_ENV, "1")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped()),
     )
     .expect("spawn the fixture");
     std::fs::remove_dir(&dir).expect("rmdir the fixture's cwd");
@@ -216,11 +219,9 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
         .expect("release the fixture");
     let out = child.wait_with_output().expect("wait");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains("test result: ok. 1 passed;"),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&out) {
+        panic!("{why}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    }
 }
 
 /// sudo, doas and run0 are started in the caller's directory, as given, handed `./tool`, and run
