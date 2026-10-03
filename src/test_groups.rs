@@ -77,7 +77,7 @@ macro_rules! test_group {
 
 test_group!(NAMESPACES => namespaces, env = "COSCA_TEST_NAMESPACES", consent = "unshares namespaces and mounts");
 
-test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "creates scratch files and a suspended process");
+test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "creates scratch files, launches copies of cosca_testbin_image and creates a suspended process");
 test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
 test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx");
 test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task");

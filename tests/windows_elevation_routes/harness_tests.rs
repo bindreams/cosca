@@ -17,6 +17,24 @@ fn inherited(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
     pairs.iter().map(|&(k, v)| (k.into(), v.into())).collect()
 }
 
+/// A child under another account gets its report path and scratch `TEMP` only through `extra`.
+/// Mutants: the `extra` loop is dropped (the entry never arrives); it runs before the inherited
+/// loop (the caller's own `TEMP` wins). The key keeps the inherited spelling (`Temp`).
+#[skuld::test]
+fn extra_reaches_the_block_and_overrides_an_inherited_key() {
+    let block = env_block_from(
+        inherited(&[("PATH", "p"), ("Temp", r"C:\caller")]),
+        &[
+            ("TEMP", r"C:\scratch".to_owned()),
+            ("COSCA_PROBE_REPORT_TO", r"C:\scratch\r.txt".to_owned()),
+        ],
+    );
+    assert_eq!(
+        entries(&block),
+        [r"COSCA_PROBE_REPORT_TO=C:\scratch\r.txt", "PATH=p", r"Temp=C:\scratch"]
+    );
+}
+
 /// The child is a helper that never runs skuld, so it has no use for the parent's coordination directory.
 #[skuld::test]
 fn an_inherited_skuld_db_dir_is_not_forwarded() {
