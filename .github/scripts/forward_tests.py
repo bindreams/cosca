@@ -30,6 +30,18 @@ FORWARD = str(HERE / "forward.py")
 BOUND = 30
 TAIL = 65536  # bytes of a forwarder's log that a failure message keeps
 
+# Prologue for test commands that catch TERM in Python and then block. A TERM landing between
+# CPython's last signal check and the read(2) in `os.read` is consumed without running the handler,
+# and the read blocks forever. The wakeup fd is written by the C-level handler, so `select` on it
+# returns. Install before `signal.signal`; block with `WAIT.format(path)`, never `os.read`.
+WAKEUP = (
+    "import os, select, signal\n"
+    "_wake, _wake_w = os.pipe()\n"
+    "os.set_blocking(_wake_w, False)\n"
+    "signal.set_wakeup_fd(_wake_w)\n"
+)
+WAIT = "select.select([os.open({}, os.O_RDWR), _wake], [], [])\n"
+
 
 def python(code, *args):
     return [sys.executable, "-c", code, *args]
@@ -334,7 +346,8 @@ class Relay(Workdir):
         self.addCleanup(os.write, self.release, b"xx")  # whatever a failed test left waiting ends
         script = self.work / "tree.py"
         script.write_text(
-            "import os, signal, subprocess, sys\n"
+            WAKEUP
+            + "import subprocess, sys\n"
             "work = sys.argv[1]\n"
             "def finish(name, how):\n"
             "    open(f'{work}/{name}', 'w').write(how)\n"
@@ -346,8 +359,8 @@ class Relay(Workdir):
             "        os._exit(9)\n"
             "    signal.signal(signal.SIGTERM, handler)\n"
             "    os.write(os.open(f'{work}/up', os.O_RDWR), b'x')\n"
-            "    os.read(os.open(f'{work}/release', os.O_RDWR), 1)\n"
-            "    finish(name, 'released')\n"
+            "    " + WAIT.format("f'{work}/release'")
+            + "    finish(name, 'released')\n"
             "if len(sys.argv) > 2:\n"
             "    hold('grandchild')\n"
             "    sys.exit(0)\n"
@@ -391,24 +404,29 @@ class Relay(Workdir):
     def test_the_other_stage_of_a_pipeline_is_not_signalled(self):
         reader = self.work / "reader.py"
         reader.write_text(
-            "import os, signal, sys\n"
+            WAKEUP
+            + "import sys\n"
             "def note(*_):\n"
             "    open(sys.argv[1] + '/reader', 'w').write('term')\n"
             "    os._exit(0)\n"
             "signal.signal(signal.SIGTERM, note)\n"
             "os.write(os.open(sys.argv[1] + '/reader-up', os.O_RDWR), b'x')\n"
-            "sys.stdin.read()\n"
+            "while True:  # until EOF\n"
+            "    select.select([0, _wake], [], [])\n"
+            "    if not os.read(0, 65536):\n"
+            "        break\n"
         )
         _, reader_up = self.fifo("reader-up")
         up_path, up = self.fifo("up")
         release_path, release = self.fifo("release")
         self.addCleanup(os.write, release, b"x")
         command = python(
-            "import os, signal, sys\n"
+            WAKEUP
+            + "import sys\n"
             "work = sys.argv[1]\n"
             "signal.signal(signal.SIGTERM, lambda *_: os._exit(9))\n"
             "os.write(os.open(work + '/up', os.O_RDWR), b'x')\n"
-            "os.read(os.open(work + '/release', os.O_RDWR), 1)\n",
+            + WAIT.format("work + '/release'"),
             str(self.work),
         )
         first = subprocess.Popen([sys.executable, FORWARD, *command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=lambda: os.setpgid(0, 0))
@@ -437,12 +455,13 @@ class Waiting(Workdir):
         self.addCleanup(os.write, self.release, b"x")
         process = self.start(
             python(
-                "import os, signal, sys\n"
+                WAKEUP
+                + "import sys\n"
                 "work = sys.argv[1]\n"
                 "signal.signal(signal.SIGTERM, lambda *_: os._exit(9))\n"
                 "os.write(os.open(work + '/up', os.O_RDWR), str(os.getpid()).encode() + b'\\n')\n"
-                "os.read(os.open(work + '/release', os.O_RDWR), 1)\n"
-                "sys.exit(7)\n",
+                + WAIT.format("work + '/release'")
+                + "sys.exit(7)\n",
                 str(self.work),
             )
         )
@@ -528,9 +547,9 @@ class SpawnWindow(Workdir):
         release_path, release = self.fifo("release")
         self.addCleanup(os.write, release, b"x")
         command = (
-            "import os, signal\n"
-            "signal.signal(signal.SIGTERM, lambda *_: os._exit(9))\n"
-            f"os.read(os.open({str(release_path)!r}, os.O_RDWR), 1)\n"
+            WAKEUP
+            + "signal.signal(signal.SIGTERM, lambda *_: os._exit(9))\n"
+            + WAIT.format(repr(str(release_path)))
         )
         script = (
             "import os, signal, subprocess, sys\n"
