@@ -329,7 +329,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard`, taken at the top of this block"
         )]
-        let (c, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io))?;
+        let (c, unique) = report
+            .run(|| std_cmd.spawn().map_err(Error::Io))
+            .map_err(|(e, refused)| refused.map_or(e, unique_report::refused_error))?;
         drop(std_cmd);
         (prepared, c, unique)
     };

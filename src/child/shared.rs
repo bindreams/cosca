@@ -139,8 +139,9 @@ pub(crate) struct SharedChild {
     /// reaped elsewhere at adoption.
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
-    /// The child's unique id, the one identity every by-pid check on macOS uses (see
-    /// [`crate::signal::read_identity`]). `None`: the child was already reaped when it was read.
+    /// The child's unique id, the one identity every by-pid check on macOS uses. The spawn passes
+    /// the id the child reported before `exec` (`adopt_verified`), so it is `Some`; `None` is only
+    /// what the test-only by-pid `adopt` read when the pid had no process.
     #[cfg(target_os = "macos")]
     identity: Option<u64>,
     /// A duplicate of the std `Child`'s process handle, usable unlocked.

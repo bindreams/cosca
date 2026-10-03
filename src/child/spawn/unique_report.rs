@@ -21,6 +21,10 @@
 //! The pipe is made under `spawn_lock`, `FD_CLOEXEC` on both ends, and sits at fd 3 or above. The
 //! hook is registered before every other, so `fd_map`'s `dup2` onto a number cannot come first.
 //!
+//! If the child's own read is refused, the hook reports the errno and then fails, so `exec` never
+//! runs: the spawn is an `Err`, std collects the child, and the program did not start. The parent
+//! maps that to [`refused_error`].
+//!
 //! The parent reads exactly one report. `spawn()` returning `Ok` means the child execed, so its hook
 //! wrote the report first; the read does not wait for anything else. A report that never came (EOF)
 //! is [`UNREPORTED`].
@@ -40,8 +44,9 @@ const REPORT_ID: u32 = 1;
 const REPORT_ERRNO: u32 = 2;
 /// A report is a native-endian `u32` tag, then a native-endian `u64` value.
 const REPORT_LEN: usize = 12;
-/// The errno of a report that never came: the pipe ended before the child wrote it.
-pub(crate) const UNREPORTED: i32 = libc::EPIPE;
+/// The "errno" of a report that never came (the pipe ended before the child wrote it): negative, so
+/// no real errno equals it.
+pub(crate) const UNREPORTED: i32 = -1;
 
 /// What the hook reads in the child: an fd number, published before the fork and withdrawn after.
 struct Shared {
@@ -51,6 +56,9 @@ struct Shared {
     /// fails it instead.
     live: AtomicBool,
 }
+
+/// The child's report: its unique id, or the errno of a read that failed or never came.
+pub(crate) type Reported = Result<u64, i32>;
 
 /// The hook is registered; the pipe is not yet made. See [`register`].
 pub(crate) struct Pending {
@@ -97,6 +105,7 @@ impl Pending {
         let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
         let read_end = above_stdio_cloexec(read_end)?;
         let write_end = above_stdio_cloexec(write_end)?;
+        set_nonblocking(&read_end)?;
         self.shared.write_fd.store(write_end.as_raw_fd(), Ordering::Relaxed);
         self.shared.live.store(true, Ordering::Release);
         Ok(Channel {
@@ -119,11 +128,35 @@ fn above_stdio_cloexec(fd: OwnedFd) -> Result<OwnedFd, Error> {
     Ok(unsafe { OwnedFd::from_raw_fd(moved) })
 }
 
+/// The read end never blocks: a report is read only after the child wrote it or is gone, but a copy
+/// of the write end held by a fork without `exec` must not be able to hang the read.
+fn set_nonblocking(fd: &OwnedFd) -> Result<(), Error> {
+    // SAFETY: `fcntl` on an fd this function owns.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(Error::Io(crate::error::io_context("fcntl", io::Error::last_os_error())));
+    }
+    Ok(())
+}
+
+/// The error for a spawn whose child could not read its own unique id (`errno`): the hook failed
+/// before `exec`, so the program did not start. It is a refusal, not a vanish.
+pub(crate) fn refused_error(errno: i32) -> Error {
+    Error::Unassessable {
+        detail: format!(
+            "the spawned child could not read its own unique id (errno {errno}); it was stopped before exec, so the program did not start"
+        ),
+        source: Some(io::Error::from_raw_os_error(errno)),
+    }
+}
+
 impl Channel {
-    /// Runs `spawn` with the pipe published, then reads the child's report. An `Err` from `spawn` is
-    /// returned as it is. The report is the child's unique id, or the errno of its own failed read
-    /// ([`UNREPORTED`] when none came).
-    pub(crate) fn run<T, E>(self, spawn: impl FnOnce() -> Result<T, E>) -> Result<(T, Result<u64, i32>), E> {
+    /// Runs `spawn` with the pipe published, then reads the child's report. Ok: the spawn's value
+    /// and the child's unique id, or the errno of a report that is missing ([`UNREPORTED`]). Err: the
+    /// spawn's error, and the errno when the child's own read was refused (the hook then failed
+    /// before `exec`; the error is to be mapped with [`refused_error`]).
+    pub(crate) fn run<T, E>(self, spawn: impl FnOnce() -> Result<T, E>) -> Result<(T, Reported), (E, Option<i32>)> {
         let Channel {
             read_end,
             write_end,
@@ -133,8 +166,10 @@ impl Channel {
         shared.live.store(false, Ordering::Release);
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
-        let child = spawned?;
-        Ok((child, read_report(&read_end)))
+        match spawned {
+            Ok(child) => Ok((child, read_report(&read_end))),
+            Err(e) => Err((e, read_report(&read_end).err().filter(|errno| *errno != UNREPORTED))),
+        }
     }
 }
 
@@ -149,8 +184,10 @@ fn read_report(read_end: &OwnedFd) -> Result<u64, i32> {
             n if n > 0 => got += n as usize,
             _ => {
                 let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EINTR) {
-                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => return Err(UNREPORTED),
+                    other => return Err(other.unwrap_or(libc::EIO)),
                 }
             }
         }
@@ -192,7 +229,11 @@ fn report(shared: &Shared, #[cfg(test)] forced_errno: i32) -> io::Result<()> {
         // SAFETY: `buf` is valid for `REPORT_LEN` bytes.
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), REPORT_LEN) };
         if n == REPORT_LEN as isize {
-            return Ok(());
+            // A refused read stops the child here, before `exec`: the program never runs.
+            return match tag {
+                REPORT_ERRNO => Err(io::Error::from_raw_os_error(value as i32)),
+                _ => Ok(()),
+            };
         }
         let e = io::Error::last_os_error();
         if n < 0 && e.raw_os_error() == Some(libc::EINTR) {
