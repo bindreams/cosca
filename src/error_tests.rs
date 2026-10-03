@@ -1,6 +1,6 @@
 use crate::error::{Error, QuoteError, QuoteErrorKind};
 
-#[test]
+#[skuld::test]
 fn containment_error_displays_detail() {
     let e = Error::Containment {
         detail: "cgroup leaf not writable".into(),
@@ -8,7 +8,7 @@ fn containment_error_displays_detail() {
     assert!(e.to_string().contains("cgroup leaf not writable"), "{e}");
 }
 
-#[test]
+#[skuld::test]
 fn no_console_error_names_the_cause() {
     let e = Error::NoConsole {
         detail: "CTRL_BREAK to group 1234".into(),
@@ -19,13 +19,13 @@ fn no_console_error_names_the_cause() {
     assert!(matches!(e, Error::NoConsole { .. }));
 }
 
-#[test]
+#[skuld::test]
 fn quote_error_displays_kind_and_offset() {
     let e = QuoteError::new(7, QuoteErrorKind::UnterminatedSingleQuote);
     assert_eq!(e.to_string(), "unterminated single quote at offset 7");
 }
 
-#[test]
+#[skuld::test]
 fn quote_error_kinds_have_distinct_messages() {
     assert_eq!(
         QuoteErrorKind::UnterminatedDoubleQuote.to_string(),
@@ -52,14 +52,14 @@ fn quote_error_kinds_have_distinct_messages() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn error_wraps_quote_error_via_from() {
     let e: Error = QuoteError::new(0, QuoteErrorKind::TrailingBackslash).into();
     assert!(matches!(e, Error::Quote(_)));
     assert!(e.to_string().contains("trailing backslash"));
 }
 
-#[test]
+#[skuld::test]
 fn unsupported_displays_op_platform_and_detail() {
     let e = Error::Unsupported {
         op: "fd 3".into(),
@@ -72,7 +72,7 @@ fn unsupported_displays_op_platform_and_detail() {
     assert!(s.contains("raw backend"), "{s}");
 }
 
-#[test]
+#[skuld::test]
 fn elevation_error_displays_kind_and_detail() {
     use crate::error::ElevationErrorKind;
     let e = Error::Elevation {
@@ -90,7 +90,7 @@ fn elevation_error_displays_kind_and_detail() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn command_too_long_names_the_host_not_the_platform() {
     // The wording matters: this verdict is per-host and per-command, so it must not
     // read like a permanent platform limitation.
@@ -98,7 +98,7 @@ fn command_too_long_names_the_host_not_the_platform() {
     assert_eq!(m, "the elevation command is too long for this host");
 }
 
-#[test]
+#[skuld::test]
 fn elevation_error_kinds_have_distinct_messages() {
     use crate::error::ElevationErrorKind::*;
     let all = [
@@ -117,7 +117,7 @@ fn elevation_error_kinds_have_distinct_messages() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn untracked_message_does_not_assert_termination() {
     // The kind's Display is neutral; termination status lives in `detail`.
     use crate::error::ElevationErrorKind::Untracked;
@@ -128,7 +128,7 @@ fn untracked_message_does_not_assert_termination() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
     // Display describes the signal denial; whether the child lives is in `detail`.
     use crate::error::ElevationErrorKind::Unkillable;
@@ -143,7 +143,7 @@ fn unkillable_message_is_about_the_failed_signal_not_the_childs_fate() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn unassessable_reads_as_a_refusal_not_a_failure() {
     let e = crate::error::Error::Unassessable {
         detail: "pid 4 could not be opened".into(),
@@ -159,7 +159,7 @@ fn unassessable_reads_as_a_refusal_not_a_failure() {
     assert!(std::error::Error::source(&e).is_some(), "source is preserved");
 }
 
-#[test]
+#[skuld::test]
 fn unassessable_carries_no_source_when_there_is_no_os_error() {
     let e = crate::error::Error::Unassessable {
         detail: "identity could not be confirmed".into(),
@@ -170,7 +170,7 @@ fn unassessable_carries_no_source_when_there_is_no_os_error() {
 
 /// Context added to an OS error keeps the OS error as its `source`, so the code a caller branches
 /// on survives: several OS codes share one `ErrorKind`.
-#[test]
+#[skuld::test]
 fn io_context_keeps_the_os_error_as_its_source() {
     // Access denied: `ERROR_ACCESS_DENIED` on Windows, `EACCES` elsewhere.
     let code = if cfg!(windows) { 5 } else { 13 };

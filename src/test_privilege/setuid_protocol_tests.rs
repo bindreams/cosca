@@ -71,7 +71,7 @@ mod linux {
         unsafe { libc::geteuid() }
     }
 
-    #[test]
+    #[skuld::test]
     fn setuid_testbin_modes_reach_their_triples() {
         let Some(helper) = setuid_helper() else { return };
         let c = caller();
@@ -90,7 +90,7 @@ mod linux {
 
     /// From every mode the caller's and root's uid are still among the current ids, so `d` then
     /// `r` succeed and are acknowledged only once the kernel shows the new triple.
-    #[test]
+    #[skuld::test]
     fn setuid_testbin_credential_commands_ack_after_their_syscall_in_every_mode() {
         let Some(helper) = setuid_helper() else { return };
         let c = caller();
@@ -111,7 +111,7 @@ mod linux {
     /// The new user namespace maps no uid, so a `setresuid` after `n` fails with `EINVAL`. That is
     /// the only evidence from outside that `n` created a namespace (the helper's
     /// `/proc/<pid>/ns/user` is closed to this caller), and the failed command must not be acked.
-    #[test]
+    #[skuld::test]
     fn setuid_testbin_unshare_creates_a_namespace_where_credential_commands_fail() {
         let Some(helper) = setuid_helper() else { return };
         let mut h = Helper::start(&helper, "root");
@@ -128,7 +128,7 @@ mod linux {
         );
     }
 
-    #[test]
+    #[skuld::test]
     fn setuid_testbin_rejects_an_unknown_mode_and_command() {
         let Some(helper) = setuid_helper() else { return };
         let mut h = Helper::start(&helper, "bogus");
@@ -147,7 +147,7 @@ mod linux {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn setuid_testbin_modes_reach_their_triples() {
     let Some(helper) = setuid_helper() else { return };
     let mut h = Helper::start(&helper, "root");

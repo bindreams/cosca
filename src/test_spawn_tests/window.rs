@@ -196,7 +196,7 @@ fn run(spawner: Spawner) -> Outcome {
 /// A raw spawn that skips `spawn_lock` lets a lock-respecting fork happen mid-spawn, and that
 /// fork's child inherits the raw child's `Stdio::piped()` write end. A reader of that pipe would
 /// wait for the fork to exit as well.
-#[test]
+#[skuld::test]
 fn an_unlocked_raw_spawn_leaks_its_piped_end_into_a_concurrent_fork() {
     let outcome = run(Spawner::Unlocked);
     assert!(!outcome.raw_forked_under_the_lock, "the control spawn takes no lock");
@@ -225,13 +225,13 @@ fn assert_fork_waits_out_the_spawn(spawner: Spawner) {
 }
 
 /// Locked helper: a fork under the lock waits out the spawn and inherits nothing.
-#[test]
+#[skuld::test]
 fn a_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
     assert_fork_waits_out_the_spawn(Spawner::TestSpawn);
 }
 
 /// The same for the integration tests' `spawn_locked`, compiled from its real source.
-#[test]
+#[skuld::test]
 fn a_spawn_locked_raw_spawn_keeps_a_concurrent_fork_out_of_its_window() {
     assert_fork_waits_out_the_spawn(Spawner::Common);
 }

@@ -12,7 +12,7 @@ impl Probe for B {
 }
 
 /// Mutant: make `notify` a no-op -> nothing arrives.
-#[test]
+#[skuld::test]
 fn a_notification_reaches_the_installed_channel() {
     let (tx, rx) = channel();
     let _guard = install::<A>(tx);
@@ -21,7 +21,7 @@ fn a_notification_reaches_the_installed_channel() {
 }
 
 /// Mutant: make `Guard::drop` a no-op -> the notification still arrives.
-#[test]
+#[skuld::test]
 fn a_guard_uninstalls_on_drop() {
     let (tx, rx) = channel();
     drop(install::<A>(tx));
@@ -32,7 +32,7 @@ fn a_guard_uninstalls_on_drop() {
 
 /// Mutant: delete the `debug_assert!` in `insert` -> no panic.
 #[cfg(debug_assertions)]
-#[test]
+#[skuld::test]
 #[should_panic(expected = "nested on the same thread")]
 fn installing_twice_on_one_thread_panics() {
     let (tx, _rx) = channel();
@@ -42,7 +42,7 @@ fn installing_twice_on_one_thread_panics() {
 
 /// Mutant: key `install` by `TypeId::of::<()>()` for every probe -> `B`'s install trips the
 /// nesting assert.
-#[test]
+#[skuld::test]
 fn distinct_probes_do_not_share_a_slot() {
     let (a_tx, a_rx) = channel();
     let (b_tx, b_rx) = channel();
@@ -55,7 +55,7 @@ fn distinct_probes_do_not_share_a_slot() {
 }
 
 /// Mutant: make the slot process-global -> the other thread's notification arrives.
-#[test]
+#[skuld::test]
 fn another_thread_does_not_see_this_threads_probe() {
     let (tx, rx) = channel();
     let _guard = install::<A>(tx);
@@ -72,7 +72,7 @@ fn another_thread_does_not_see_this_threads_probe() {
 ///
 /// Mutant: make `capture` skip one probe -> the other thread lacks it.
 /// Mutant: make `RelayGuard::drop` a no-op -> the pool thread keeps its probes.
-#[test]
+#[skuld::test]
 fn a_relay_carries_every_probe_for_the_guards_scope() {
     let (a_tx, a_rx) = channel();
     let (b_tx, b_rx) = channel();
@@ -97,7 +97,7 @@ fn a_relay_carries_every_probe_for_the_guards_scope() {
 }
 
 /// Mutant: make `capture` remove what it reads -> the arming thread loses its probe.
-#[test]
+#[skuld::test]
 fn capturing_leaves_the_arming_threads_probe_installed() {
     let (tx, rx) = channel();
     let _guard = install::<A>(tx);
@@ -112,7 +112,7 @@ fn capturing_leaves_the_arming_threads_probe_installed() {
 /// Mutant: let `insert` overwrite an occupied slot -> the outer channel stops receiving.
 /// Mutant: let a guard that inserted nothing remove the id -> the outer channel stops receiving
 /// once the inner guard drops (release only; in debug the inner guard is never built).
-#[test]
+#[skuld::test]
 fn a_rejected_nested_install_leaves_the_outer_channel_receiving() {
     let (outer_tx, outer_rx) = channel();
     let (inner_tx, inner_rx) = channel();
@@ -129,7 +129,7 @@ fn a_rejected_nested_install_leaves_the_outer_channel_receiving() {
 ///
 /// Mutant: build the `RelayGuard` after the insert loop -> `A` stays installed after the panic.
 /// Mutant: record an id before its insert succeeds -> `B`'s original entry is removed.
-#[test]
+#[skuld::test]
 fn a_reinstall_onto_an_occupied_slot_touches_only_what_it_inserted() {
     let (a_tx, a_rx) = channel::<u8>();
     let (b_relay_tx, b_relay_rx) = channel::<&'static str>();
@@ -156,7 +156,7 @@ fn a_reinstall_onto_an_occupied_slot_touches_only_what_it_inserted() {
 /// A slot whose entry is not `P`'s sender is a broken contract, not an absent probe.
 ///
 /// Mutant: make `current` swallow a failed downcast -> it returns `None` instead of panicking.
-#[test]
+#[skuld::test]
 fn a_slot_holding_the_wrong_sender_type_panics() {
     let (wrong_tx, _wrong_rx) = channel::<&'static str>();
     assert!(insert(TypeId::of::<A>(), Box::new(wrong_tx)));

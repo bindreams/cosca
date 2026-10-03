@@ -19,7 +19,7 @@ use super::namespaces as ns;
 /// `$test` (the entry, which skips under `COSCA_TEST_NAMESPACES=0`) and its two fixtures.
 macro_rules! in_fresh_pid_ns {
     ($test:ident, $driver:ident, $init:ident, $body:path) => {
-        #[test]
+        #[skuld::test]
         fn $test() {
             if !crate::test_child::namespaces::enabled() {
                 return;
@@ -27,7 +27,7 @@ macro_rules! in_fresh_pid_ns {
             crate::test_child::namespaces::run(crate::test_child::fixture_path!($driver));
         }
 
-        #[test]
+        #[skuld::test]
         fn $driver() {
             if !crate::test_child::namespaces::is_child() {
                 return;
@@ -36,7 +36,7 @@ macro_rules! in_fresh_pid_ns {
             crate::test_child::namespaces::run(crate::test_child::fixture_path!($init));
         }
 
-        #[test]
+        #[skuld::test]
         fn $init() {
             if !crate::test_child::namespaces::is_child_in_new_pid_ns() {
                 return;

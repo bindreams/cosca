@@ -30,14 +30,14 @@ fn assert_denied_with_eacces(r: Result<(), TraversalError>) {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_reachable_directory_is_ok() {
     let dir = scratch_dir();
     let r = check(dir.path());
     assert!(r.is_ok(), "{r:?}");
 }
 
-#[test]
+#[skuld::test]
 fn search_only_for_owner_and_other_is_ok() {
     let dir = scratch_dir();
     let _restore = RestoreMode::new(dir.path(), 0o755);
@@ -46,7 +46,7 @@ fn search_only_for_owner_and_other_is_ok() {
     assert!(r.is_ok(), "{r:?}");
 }
 
-#[test]
+#[skuld::test]
 fn world_searchable_only_is_ok() {
     let dir = scratch_dir();
     let _restore = RestoreMode::new(dir.path(), 0o755);
@@ -56,7 +56,7 @@ fn world_searchable_only_is_ok() {
 }
 
 /// Readable, but no `x` bit anywhere: a read check would pass it, `access(X_OK)` refuses it.
-#[test]
+#[skuld::test]
 fn read_only_with_no_execute_bit_is_denied() {
     let dir = scratch_dir();
     let _restore = RestoreMode::new(dir.path(), 0o755);
@@ -67,7 +67,7 @@ fn read_only_with_no_execute_bit_is_denied() {
 /// The kernel follows a symlink at an intermediate component, so `real`'s mode governs
 /// `link/inner`, not the link's own permissive mode. A hand-rolled check of the link's bits would
 /// pass it. The positive control shows the path resolves before `real` is locked.
-#[test]
+#[skuld::test]
 fn a_symlinked_ancestor_is_denied_by_the_kernel_not_modelled() {
     let base = scratch_dir();
     let real = base.path().join("real");

@@ -4,7 +4,7 @@ use super::GracefulMechanism;
 
 // The four strings are a stable, distinct vocabulary. Exact, not `contains`: a refactor that
 // collapsed two variants onto one string would still satisfy a substring check.
-#[test]
+#[skuld::test]
 fn graceful_mechanism_display_is_stable_and_distinct() {
     let all = [
         (GracefulMechanism::Process, "process"),
@@ -28,7 +28,7 @@ fn graceful_mechanism_display_is_stable_and_distinct() {
 
 // `None` is the one mechanism the crate refuses up front, and it refuses with the remedy: a
 // wildcard arm that fell through to the console call would return something else entirely.
-#[test]
+#[skuld::test]
 fn signal_refuses_a_child_with_no_mechanism() {
     let id = crate::identity::ProcessId::current();
     let err = super::signal(GracefulMechanism::None, id).expect_err("no group to address");
@@ -46,7 +46,7 @@ fn signal_refuses_a_child_with_no_mechanism() {
 // refuse, and `wait::terminate` — the only other path out of `signal` — is itself `Unsupported`
 // on Windows.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
     let (child, _stdin) = crate::test_child::windows_blocker();
     let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.id());
@@ -71,7 +71,7 @@ fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
 // assertion below is what separates the two worlds — and the misfire lands on a child this test
 // already owns rather than a stranger.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn signal_refuses_a_child_cosca_did_not_create() {
     let (child, _stdin) = crate::test_child::windows_blocker();
     let mechanism = crate::containment::Attachment::uac_elevated().graceful;

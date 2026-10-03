@@ -43,7 +43,7 @@ fn spawn_term_ignoring_blocker() -> std::process::Child {
 // A watch failure must not strand the foreign process between the soft signal and the
 // escalation: the kill still runs, then the watch error surfaces. With the old
 // `block_until_exit(..)?` shape the SIGTERM-ignoring child would survive the op.
-#[test]
+#[skuld::test]
 fn foreign_graceful_lone_watch_error_still_escalates() {
     let mut child = spawn_term_ignoring_blocker();
     let p = crate::Process::from_pid(child.id()).found().expect("resolves");
@@ -69,7 +69,7 @@ fn foreign_graceful_lone_watch_error_still_escalates() {
 // The TREE twin of the same invariant: the hard sweep must still run after a watch failure
 // (the old shape propagated it before `kill_tree`, stranding the whole tree). A tree of one
 // suffices — the ordering, not the walk's reach, is under test (tests/graceful.rs covers reach).
-#[test]
+#[skuld::test]
 fn foreign_graceful_tree_watch_error_still_sweeps() {
     let mut child = spawn_term_ignoring_blocker();
     let p = crate::Process::from_pid(child.id()).found().expect("resolves");
@@ -113,7 +113,7 @@ const ESCALATION_CASES: [([Option<rustix::io::Errno>; 3], &str, bool); 3] = [
 /// Mutants: the escalation is `wait::terminate`, or names another `PidfdOp`; the grace wait
 /// names another `PidfdOp`; a refused wait skips the escalation.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_refused_pidfd_open_during_graceful_shutdown_names_the_step_that_hit_it() {
     for (script, op, killed) in ESCALATION_CASES {
         let mut child = spawn_term_ignoring_blocker();

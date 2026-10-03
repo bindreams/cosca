@@ -43,7 +43,7 @@ fn refusal(flags: FlagsRequest) -> String {
 
 /// A caller's raw word reaches an uncontained spawn untouched — the shape `prepare` composes
 /// the word for above its `mode.is_none()` early return.
-#[test]
+#[skuld::test]
 fn an_uncontained_std_request_carries_only_the_callers_flags() {
     let flags = FlagsRequest {
         raw: IDLE_PRIORITY_CLASS.0,
@@ -58,7 +58,7 @@ fn an_uncontained_std_request_carries_only_the_callers_flags() {
 
 /// The containment decision and the caller's intent are ORed, not chosen between: a `Strongest`
 /// root keeps its suspend and its process group while also getting the caller's suppression.
-#[test]
+#[skuld::test]
 fn contained_root_flags_and_caller_flags_compose() {
     let flags = FlagsRequest {
         no_window: true,
@@ -77,7 +77,7 @@ fn contained_root_flags_and_caller_flags_compose() {
 /// **This pins a cosca-side difference only.** Per `library/std/src/sys/process/windows.rs`, std
 /// ORs `CREATE_UNICODE_ENVIRONMENT` into whatever word it was given at spawn time, so this test
 /// does not say the OS receives a `Std` word without it — only that cosca does not supply it.
-#[test]
+#[skuld::test]
 fn cosca_supplies_the_structural_bits_only_on_the_raw_backend() {
     let flags = FlagsRequest {
         no_window: true,
@@ -94,7 +94,7 @@ fn cosca_supplies_the_structural_bits_only_on_the_raw_backend() {
 
 /// Both intents are emitted; neither normalizes the other away. Measured: a child with both
 /// behaves as detached, and cosca reports what it asked for rather than second-guessing it.
-#[test]
+#[skuld::test]
 fn detached_and_no_window_both_appear() {
     let flags = FlagsRequest {
         detached: true,
@@ -109,7 +109,7 @@ fn detached_and_no_window_both_appear() {
 /// a probe taken before the spawn could go stale in the gap, and omitting the bit would silently
 /// leave the child in a job the caller asked it to escape. Asserted for both backends and both
 /// root-nesses so no backend can drop it.
-#[test]
+#[skuld::test]
 fn a_breakaway_request_always_emits_the_bit() {
     let flags = FlagsRequest {
         breakaway_from_job: true,
@@ -129,7 +129,7 @@ fn a_breakaway_request_always_emits_the_bit() {
 
 /// An uncontained word does not depend on the root marker at all, which is what licenses
 /// `prepare` composing the word once, above its containment branch.
-#[test]
+#[skuld::test]
 fn an_uncontained_word_ignores_is_root() {
     let flags = FlagsRequest {
         no_window: true,
@@ -148,7 +148,7 @@ fn an_uncontained_word_ignores_is_root() {
 /// The list is written out here rather than read from the production table, so dropping a row
 /// from that table fails this test instead of silently un-reserving a bit. The length equality
 /// closes the other direction: a row ADDED to that table cannot land uncovered.
-#[test]
+#[skuld::test]
 fn each_reserved_bit_is_refused_by_name() {
     let reserved = [
         (DEBUG_PROCESS.0, "DEBUG_PROCESS"),
@@ -178,7 +178,7 @@ fn each_reserved_bit_is_refused_by_name() {
 
 /// Two reserved bits at once name both, so a caller fixes one call instead of iterating through
 /// a refusal per bit.
-#[test]
+#[skuld::test]
 fn several_reserved_bits_are_all_named() {
     let detail = refusal(FlagsRequest {
         raw: CREATE_SUSPENDED.0 | CREATE_NO_WINDOW.0,
@@ -190,7 +190,7 @@ fn several_reserved_bits_are_all_named() {
 
 /// The two bits the raw backend supplies structurally are themselves reserved, so a caller can
 /// never set one and have it doubled — or clear one the backend cannot spawn without.
-#[test]
+#[skuld::test]
 fn the_structural_bits_are_reserved() {
     for (bit, name) in [
         (CREATE_UNICODE_ENVIRONMENT.0, "CREATE_UNICODE_ENVIRONMENT"),
@@ -207,7 +207,7 @@ fn the_structural_bits_are_reserved() {
 /// The three containment shapes must not all report the same cooperative-signal mechanism: an
 /// uncontained spawn leads no group, while both contained shapes do. Asserted on the COMPOSED
 /// word, which is the only word any spawn path derives a mechanism from.
-#[test]
+#[skuld::test]
 fn the_composed_word_reports_a_different_mechanism_for_each_containment_shape() {
     use crate::containment::windows::mechanism_from_flags;
     use crate::graceful::GracefulMechanism;
@@ -270,7 +270,7 @@ fn io_err(code: i32) -> Error {
 /// Breaking away while contained is refused for a ROOT and a NESTED request alike, so the verdict
 /// is order- and root-independent: making it depend on root-ness would mean the identical
 /// `Command` succeeds in one process and fails in a nested one.
-#[test]
+#[skuld::test]
 fn breakaway_with_containment_is_refused() {
     for is_root in [true, false] {
         let err = windows_spawn(&contained(), breakaway(), is_root, SpawnBackend::Std)
@@ -288,7 +288,7 @@ fn breakaway_with_containment_is_refused() {
 /// The detail names the measured limit, the request, and the first-refusal qualifier. It must not
 /// claim the request was the spawn's only problem: the breakaway check runs before the image is
 /// resolved, so a genuine "no such program" is masked by it.
-#[test]
+#[skuld::test]
 fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
     for code in access_denied_encodings() {
         let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::Forbidden);
@@ -306,7 +306,7 @@ fn a_forbidding_job_turns_access_denied_into_a_typed_containment_error() {
 /// breakaway request can reach the classifier from such a job at all. The verdict exists solely
 /// to stop that job being misread as `Forbidden`, whose message would be wrong about the world —
 /// a silent-breakaway job does not forbid children from leaving, it removes them itself.
-#[test]
+#[skuld::test]
 fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
     for code in access_denied_encodings() {
         let out = super::classify_spawn_denial(io_err(code), breakaway(), JobBreakaway::SilentBreakaway);
@@ -316,7 +316,7 @@ fn the_silent_breakaway_verdict_keeps_the_raw_io_error() {
 
 /// The typed variant must never assert a cause the process just measured to be false — nor
 /// one it could not measure at all.
-#[test]
+#[skuld::test]
 fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
     for job in [JobBreakaway::Permitted, JobBreakaway::NotInJob, JobBreakaway::Unknown] {
         for code in access_denied_encodings() {
@@ -327,7 +327,7 @@ fn a_contradicted_or_unmeasurable_probe_keeps_the_raw_io_error() {
 }
 
 /// An unrelated failure code stays itself whatever the ambient job looks like.
-#[test]
+#[skuld::test]
 fn an_unrelated_failure_code_is_never_reclassified() {
     let not_found = windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 as i32;
     for job in [
@@ -345,7 +345,7 @@ fn an_unrelated_failure_code_is_never_reclassified() {
 /// The classifier's opening `let-else` returns every non-`Io` error unchanged, in the one
 /// configuration that would otherwise rewrite it — a breakaway request plus a forbidding job. A
 /// broadening of that pattern would reclassify one error kind as another in silence.
-#[test]
+#[skuld::test]
 fn a_non_io_error_is_returned_unchanged() {
     let out = super::classify_spawn_denial(
         Error::Unsupported {
@@ -368,7 +368,7 @@ fn a_non_io_error_is_returned_unchanged() {
 /// The other half: an access-denied spawn with NO breakaway request is never blamed on a job.
 /// Without this, an unrelated denial would be rewritten into a containment error naming a flag
 /// that was never submitted to anything.
-#[test]
+#[skuld::test]
 fn a_spawn_denial_without_a_breakaway_request_is_never_reclassified() {
     for job in [
         JobBreakaway::Forbidden,

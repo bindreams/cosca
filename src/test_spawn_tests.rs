@@ -43,7 +43,7 @@ fn lock_held_at_fork(spawn: impl FnOnce(&mut Command)) -> Option<bool> {
     (report_read.read(&mut byte).expect("read the report") == 1).then(|| byte[0] == 1)
 }
 
-#[test]
+#[skuld::test]
 fn spawn_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         super::spawn(cmd).expect("spawn").wait().expect("wait");
@@ -51,7 +51,7 @@ fn spawn_forks_under_the_lock() {
     assert_eq!(held, Some(true), "the fork must run under spawn_lock");
 }
 
-#[test]
+#[skuld::test]
 fn output_captured_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         super::output_captured(cmd).expect("output");
@@ -59,7 +59,7 @@ fn output_captured_forks_under_the_lock() {
     assert_eq!(held, Some(true), "the fork must run under spawn_lock");
 }
 
-#[test]
+#[skuld::test]
 fn status_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         super::status(cmd).expect("status");
@@ -69,7 +69,7 @@ fn status_forks_under_the_lock() {
 
 /// Control: a plain `Command::spawn` reports unlocked, so the tests above measure the helpers, not
 /// ambient state.
-#[test]
+#[skuld::test]
 fn a_plain_spawn_forks_outside_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         #[allow(clippy::disallowed_methods, reason = "control: the deliberately unlocked raw spawn")]
@@ -143,7 +143,7 @@ async fn lock_held_at_fork_tokio(
 
 // The integration tests' wrappers =====
 
-#[test]
+#[skuld::test]
 fn spawn_locked_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         locked::spawn_locked(cmd).expect("spawn").wait().expect("wait");
@@ -151,7 +151,7 @@ fn spawn_locked_forks_under_the_lock() {
     assert_eq!(held, Some(true), "the fork must run under spawn_lock");
 }
 
-#[test]
+#[skuld::test]
 fn output_locked_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         locked::output_locked(cmd).expect("output");
@@ -159,7 +159,7 @@ fn output_locked_forks_under_the_lock() {
     assert_eq!(held, Some(true), "the fork must run under spawn_lock");
 }
 
-#[test]
+#[skuld::test]
 fn status_locked_forks_under_the_lock() {
     let held = lock_held_at_fork(|cmd| {
         locked::status_locked(cmd).expect("status");
@@ -202,7 +202,7 @@ fn chatty() -> Command {
     cmd
 }
 
-#[test]
+#[skuld::test]
 fn output_captured_returns_the_streams_and_the_exit_status() {
     let out = super::output_captured(&mut chatty()).expect("output_captured");
     assert_eq!(out.stdout, b"out\n");
@@ -210,7 +210,7 @@ fn output_captured_returns_the_streams_and_the_exit_status() {
     assert_eq!(out.status.code(), Some(3));
 }
 
-#[test]
+#[skuld::test]
 fn output_captured_overrides_the_callers_stdio() {
     let mut cmd = Command::new("/bin/sh");
     // `cat` sees the null stdin as EOF; the caller's inherited stdout and stderr are replaced.
@@ -225,7 +225,7 @@ fn output_captured_overrides_the_callers_stdio() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn status_returns_the_exit_code() {
     let mut cmd = chatty();
     cmd.stdout(std::process::Stdio::null())
@@ -273,14 +273,14 @@ fn true_command() -> Command {
     Command::new("/usr/bin/true")
 }
 
-#[test]
+#[skuld::test]
 fn output_captured_releases_the_lock_before_the_wait() {
     let (held, _armed) = record_lock_held_at_wait();
     super::output_captured(&mut true_command()).expect("output_captured");
     assert_eq!(held.get(), Some(false), "the lock must not be held across the wait");
 }
 
-#[test]
+#[skuld::test]
 fn status_releases_the_lock_before_the_wait() {
     let (held, _armed) = record_lock_held_at_wait();
     super::status(&mut true_command()).expect("status");
