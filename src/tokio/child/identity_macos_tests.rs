@@ -6,7 +6,8 @@ use std::rc::Rc;
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
-    arm_launchd_hold, end_unsignalled_and_reap, has_not_exited, other_unique_id, reap_by_pid, vanished,
+    arm_launchd_hold, assert_program_did_not_run, end_unsignalled_and_reap, has_not_exited, other_unique_id,
+    reap_by_pid, vanished,
 };
 use crate::child::spawn::unique_report;
 use crate::error::Error;
@@ -151,11 +152,11 @@ async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_p
     child.wait().await.expect("wait");
 }
 
-/// As the sync twin: a refused own read is `Unassessable`, the child is left running.
+/// As the sync twin: a refused own read is `Unassessable` and the program does not run.
 ///
-/// Mutant: the refusal maps to `Gone`; the unverified child is killed.
+/// Mutant: the hook execs anyway.
 #[skuld::test]
-async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_leaves_the_child() {
+async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut cmd, _writer) = tokio_blocker();
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
@@ -164,10 +165,5 @@ async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_leaves_th
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    // The refused arm returns before any hook; the spawn captured the child it left.
-    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
-        panic!("the refused arm must have captured the child's identity")
-    };
-    assert!(has_not_exited(id.pid()), "nothing may have signalled or reaped the pid");
-    end_unsignalled_and_reap(id.pid());
+    assert_program_did_not_run();
 }

@@ -319,7 +319,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         )]
         let (c, unique) = match report.run(|| tcmd.spawn().map_err(Error::Io)) {
             Ok(spawned) => spawned,
-            Err(e) => {
+            Err((e, refused)) => {
+                let e = refused.map_or(e, crate::child::spawn::unique_report::refused_error);
                 warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
                 return Err(e);
             }
@@ -487,12 +488,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // it, and a panic unwinds through `ProcSource`'s `Drop`.
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
-        // macOS: the unique id read at spawn found no process, so there is nothing to check a pid
-        // against, and the child is not read by pid.
-        #[cfg(target_os = "macos")]
-        None => Resolved::Gone,
-        #[cfg(not(target_os = "macos"))]
-        None => unreachable!("a freshly spawned tokio child holds its handle"),
+        // Contract: a freshly spawned child holds its handle. Linux has its pidfd; macOS has the
+        // unique id the child reported (a missing one returned above) and a pid; Windows has tokio's
+        // process handle.
+        None => {
+            debug_assert!(false, "a freshly spawned tokio child holds its handle");
+            Resolved::Unknown
+        }
     };
     let id = match resolved {
         Resolved::Found(id) => id,
