@@ -51,7 +51,7 @@ pub(crate) enum ProcSource {
         /// this process for good, so a signal through it cannot reach a process that later reuses
         /// the pid.
         #[cfg(target_os = "linux")]
-        pidfd: std::os::fd::OwnedFd,
+        pidfd: PinnedPidfd,
         /// The child's unique id, read right after the spawn (see
         /// [`crate::signal::read_identity`]): the only identity a by-pid signal on macOS is checked
         /// against. `None`: the child was already reaped when it was read, or the read was refused;
@@ -73,6 +73,53 @@ pub(crate) enum ProcSource {
     #[cfg(windows)]
     Raw(crate::tokio::spawn::windows_raw::RawAsyncChild),
 }
+
+/// The backend's pidfd. A [`ProcSource`] has a `Drop`, so a field cannot be moved out of it; this
+/// lets the teardown take the original (never a duplicate, which can fail at the fd limit) and hand
+/// it on. Taken only by the hand-off, which forgets the backend at once.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct PinnedPidfd(Option<std::os::fd::OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl PinnedPidfd {
+    fn take(&mut self) -> std::os::fd::OwnedFd {
+        self.0
+            .take()
+            .expect("the pidfd was taken by a hand-off that forgot the backend")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for PinnedPidfd {
+    type Target = std::os::fd::OwnedFd;
+    fn deref(&self) -> &std::os::fd::OwnedFd {
+        self.0
+            .as_ref()
+            .expect("the pidfd was taken by a hand-off that forgot the backend")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsRawFd for PinnedPidfd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&**self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for PinnedPidfd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&**self)
+    }
+}
+
+/// What becomes of a child whose teardown kill was refused, for the warning that names it.
+const REFUSED_KILL_FATE: &str = if cfg!(target_os = "linux") {
+    "it is handed to the pidfd teardown"
+} else {
+    "it is not waited on"
+};
 
 /// tokio's `Child`, which on Unix reaps by pid on drop, when the pid may name another process by
 /// now. It is dropped only through [`ProcSource::release`], leaked only through
@@ -184,7 +231,7 @@ impl ProcSource {
             stdin,
             stdout,
             stderr,
-            pidfd,
+            pidfd: PinnedPidfd(Some(pidfd)),
         }
     }
 
@@ -673,8 +720,10 @@ impl ProcSource {
     /// is what bounds the wait, so a caller that has ALREADY killed uses
     /// [`wait_and_reap`](ProcSource::wait_and_reap) instead.
     ///
-    /// A refused kill is not waited on: a child its handle does not show reaped elsewhere is
-    /// released to the runtime's orphan reaper, and one that is shown so is forgotten. Consumes the
+    /// A refused kill is not waited on here. Linux: the child goes to the pidfd teardown (another
+    /// kill, then a reap through the pidfd, or a background reap once it exits) and tokio's `Child` is
+    /// forgotten. Elsewhere: a child its handle does not show reaped elsewhere is released to the
+    /// runtime's orphan reaper. A child shown reaped elsewhere is forgotten either way. Consumes the
     /// backend, so every path ends in [`release`](ProcSource::release) or
     /// [`forget`](ProcSource::forget). **Invariant:** no `wait()` future for this child is in flight
     /// when this runs.
@@ -692,7 +741,7 @@ impl ProcSource {
             self.hand_to_pidfd_reaper(pid);
             #[cfg(not(target_os = "linux"))]
             self.release();
-            log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
+            log::warn!("teardown kill of child {pid} failed ({e}); {REFUSED_KILL_FATE}");
             // `EPERM` is a setuid child refusing the kill, reachable without a bug: it alone is not
             // asserted.
             debug_assert!(
@@ -723,23 +772,17 @@ impl ProcSource {
     /// A child whose teardown kill was refused (a setuid child answers `EPERM`) and that is not
     /// shown reaped elsewhere: tokio's `Child` is forgotten, never dropped or released, because
     /// tokio would reap it later with `waitpid(pid)` from its orphan queue, when the number may
-    /// name another process. The child goes to the same teardown the sync spawn uses, through a
-    /// duplicate of its pidfd: another kill, then a reap through the pidfd, or one non-blocking
+    /// name another process. The child goes to the same teardown the sync spawn uses, through its own
+    /// pidfd, moved out of the backend: another kill, then a reap through the pidfd, or one non-blocking
     /// look and a background reap through the pidfd once it exits. Nothing is left if the backend is
     /// already forgotten.
     #[cfg(target_os = "linux")]
     fn hand_to_pidfd_reaper(mut self, pid: u32) {
-        let ProcSource::Tokio { pidfd, .. } = &self else {
+        let ProcSource::Tokio { pidfd, .. } = &mut self else {
             return;
         };
-        let pidfd = match pidfd.try_clone() {
-            Ok(pidfd) => pidfd,
-            Err(e) => {
-                log::warn!("child {pid}: its pidfd could not be duplicated ({e}); it is left as it is");
-                self.forget_because("could not be handed to the pidfd teardown");
-                return;
-            }
-        };
+        // The original, moved out: a duplicate could fail at the fd limit and strand the child.
+        let pidfd = pidfd.take();
         self.forget_because("had its teardown kill refused and is handed to the pidfd teardown");
         crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd);
     }
@@ -757,7 +800,7 @@ impl ProcSource {
         if let Err(e) = self.teardown_kill() {
             self.forget_if_foreign();
             self.hand_to_pidfd_reaper(pid);
-            log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
+            log::warn!("teardown kill of child {pid} failed ({e}); {REFUSED_KILL_FATE}");
             debug_assert!(
                 matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
                 "the teardown kill of an owned child failed: {e}"

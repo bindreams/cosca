@@ -1079,7 +1079,8 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 ///   reap is irreversible, so the pid named our child throughout); `Foreign` is `Gone`; a failed
 ///   peek is `Unknown`, warned.
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
-///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`).
+///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
+///   (held by launchd after its tracer died) is `Unknown` too.
 /// - **Windows:** the process handle pins the pid, so the read stands.
 ///
 /// On macOS the `through` id itself was read by pid alone, so a reap and reuse before that first
