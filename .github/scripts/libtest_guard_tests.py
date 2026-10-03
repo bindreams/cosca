@@ -200,8 +200,8 @@ with tempfile.TemporaryDirectory() as tmp:
             sys.exit(f"::error::the sccache server on port {port} does not use {cache_dir}: {done.stdout}")
         return stats["stats"]
 
-    subprocess.run([sccache, "--stop-server"], env=cache_env, stdin=subprocess.DEVNULL, capture_output=True)
     subprocess.run([sccache, "--start-server"], env=cache_env, stdin=subprocess.DEVNULL, check=True)
+    sccache_stats()  # exits unless the server on the port is the one just started
     try:
         hits = {}
         for pass_name in ("cold", "warm"):
