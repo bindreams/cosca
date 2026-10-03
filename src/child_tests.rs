@@ -15,7 +15,7 @@ fn id(pid: u32, token: u64) -> ProcessId {
     ProcessId::from_parts_for_test(pid, token)
 }
 
-#[test]
+#[skuld::test]
 fn recycled_root_pid_resolving_gone_is_not_recycled() {
     let original = id(100, 1);
     // Regardless of the liveness reading passed in (there is nothing to read a liveness OF
@@ -24,7 +24,7 @@ fn recycled_root_pid_resolving_gone_is_not_recycled() {
     assert!(!root_pid_was_recycled(original, Resolved::Gone, Liveness::Alive));
 }
 
-#[test]
+#[skuld::test]
 fn recycled_root_pid_unknown_resolution_is_not_recycled() {
     let original = id(100, 1);
     // The OS refused the query — positive evidence, not absence of counter-evidence, is what
@@ -32,7 +32,7 @@ fn recycled_root_pid_unknown_resolution_is_not_recycled() {
     assert!(!root_pid_was_recycled(original, Resolved::Unknown, Liveness::Unknown));
 }
 
-#[test]
+#[skuld::test]
 fn recycled_root_pid_resolving_back_to_the_same_identity_is_not_recycled() {
     let original = id(100, 1);
     // The pid resolves to itself again (an unreaped zombie the caller hasn't reaped yet, or a
@@ -44,7 +44,7 @@ fn recycled_root_pid_resolving_back_to_the_same_identity_is_not_recycled() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn recycled_root_pid_a_different_but_dead_identity_is_not_recycled() {
     let original = id(100, 1);
     let different = id(100, 2); // same pid, different start token — a zombie, not yet reaped
@@ -62,7 +62,7 @@ fn recycled_root_pid_a_different_but_dead_identity_is_not_recycled() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn recycled_root_pid_a_different_live_identity_is_recycled() {
     let original = id(100, 1);
     let different = id(100, 2); // same pid, different start token, confirmed running
@@ -92,7 +92,7 @@ fn recycled_root_pid_a_different_live_identity_is_recycled() {
 /// other otherwise-untriggerable branches already are (`force_blind_snapshot_for_next_call` and
 /// friends).
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_classifier_path() {
     let mut child = crate::Command::new()
         .executable("/usr/bin/true")
@@ -126,7 +126,7 @@ fn kill_tree_reports_an_ordinary_group_refusal_through_the_real_dispatch_and_cla
 /// `hard_kill_propagates_a_kill_the_kernel_refused` (`containment/cgroup/leaf_tests.rs`):
 /// `open(O_WRONLY)` on a directory always fails.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");

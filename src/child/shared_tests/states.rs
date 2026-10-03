@@ -33,7 +33,7 @@ fn is_echild(e: &io::Error) -> bool {
 /// threads.
 ///
 /// Mutant: `lock().unwrap()`, which panics on the poison.
-#[test]
+#[skuld::test]
 fn a_poisoned_lock_neither_aborts_nor_hangs() {
     let mut b = Blocker::spawn();
     let poisoner = std::thread::spawn({
@@ -75,7 +75,7 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
 ///
 /// Mutant: `Debug` through `SharedChild::lock()`, which the test build's owner check turns into a
 /// panic in the hook, instead of a deadlock on its own thread.
-#[test]
+#[skuld::test]
 fn debug_inside_a_blocked_waiter_does_not_block() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -108,7 +108,7 @@ fn debug_inside_a_blocked_waiter_does_not_block() {
 ///
 /// Mutant: no `W` check, so the second waiter becomes a second holder; it panics in its (forced)
 /// unlocked wait and its hook never fires.
-#[test]
+#[skuld::test]
 fn a_second_wait_blocks_behind_the_holder() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -127,7 +127,7 @@ fn a_second_wait_blocks_behind_the_holder() {
 ///
 /// Mutant: `adopt` fails on `ESRCH`.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn adopt_on_esrch_takes_the_echild_path() {
     super::fixtures::assert_adoption_is_gone(|| {
         crate::wait::backend::fault::force_pidfd_open_errno_once(rustix::io::Errno::SRCH)
@@ -139,7 +139,7 @@ fn adopt_on_esrch_takes_the_echild_path() {
 /// S4: `try_wait` reaps an exited child once and caches it: a second call reaps nothing.
 ///
 /// Mutant: no `E` write, so the second call reaps again and gets the forced `EIO`.
-#[test]
+#[skuld::test]
 fn try_wait_reaps_an_exited_child_once() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -152,7 +152,7 @@ fn try_wait_reaps_an_exited_child_once() {
 /// S4: a reap error that is not `ECHILD` is returned as it is, and the state stays `N`.
 ///
 /// Mutant: a non-`ECHILD` errno taken for the `ECHILD` path.
-#[test]
+#[skuld::test]
 fn a_try_wait_reap_error_returns_it_and_stays_n() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -170,7 +170,7 @@ fn a_try_wait_reap_error_returns_it_and_stays_n() {
 /// holder then reaps the killed child.
 ///
 /// Mutant: `kill` blocks on the `Condvar` while `W`; the kill thread's hook panics.
-#[test]
+#[skuld::test]
 fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
     let b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -200,7 +200,7 @@ fn kill_during_a_parked_wait_signals_and_the_holder_reaps() {
 ///
 /// Mutant: the `Condvar::wait` without a timeout; a waiter that returns `None` by peeking,
 /// without blocking; a wait armed with anything but the time remaining.
-#[test]
+#[skuld::test]
 fn a_deadline_waiter_behind_a_parked_holder_returns_none_at_its_deadline() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -245,7 +245,7 @@ fn a_deadline_waiter_behind_a_parked_holder_returns_none_at_its_deadline() {
 ///
 /// Mutant: blocking until the holder writes (shared_child's `wait_deadline` calls `self.wait()`
 /// past its deadline): the waiter's hook panics.
-#[test]
+#[skuld::test]
 fn a_deadline_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -270,7 +270,7 @@ fn a_deadline_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_withou
 /// reaping or blocking.
 ///
 /// Mutant: shared_child's `try_wait`, which blocks in `wait()` on an exit under a holder.
-#[test]
+#[skuld::test]
 fn try_wait_during_a_parked_wait_returns_the_peeked_status_without_reaping() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -291,7 +291,7 @@ fn try_wait_during_a_parked_wait_returns_the_peeked_status_without_reaping() {
 /// S8: `try_wait` during a parked wait on a running child returns `None`.
 ///
 /// Mutant: the exit-record branch taken for "running".
-#[test]
+#[skuld::test]
 fn try_wait_during_a_parked_wait_on_a_running_child_returns_none() {
     let b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || ());
@@ -312,7 +312,7 @@ fn try_wait_during_a_parked_wait_on_a_running_child_returns_none() {
 /// released with *deadline passed*, finds its own `W` on the re-read (a `debug_assert!`).
 ///
 /// Mutant: S9 writes `N`, so the holder's re-read finds a foreign state and its assert fires.
-#[test]
+#[skuld::test]
 fn a_non_holder_peek_that_gets_echild_returns_it_and_writes_nothing() {
     let b = Blocker::spawn();
     let holder = park_holder(&b.shared, Some(far()), || {
@@ -335,7 +335,7 @@ fn a_non_holder_peek_that_gets_echild_returns_it_and_writes_nothing() {
 /// the unlocked wait.
 ///
 /// Mutant: no `E` write, so the second `wait` runs the unlocked wait and panics.
-#[test]
+#[skuld::test]
 fn an_exit_seen_is_reaped_once_under_the_lock() {
     let mut b = Blocker::spawn();
     b.end_child();
@@ -346,7 +346,7 @@ fn an_exit_seen_is_reaped_once_under_the_lock() {
 
 /// S10, S12, S15: a holder's normal return leaves the next holder alone. A regression test, with
 /// no RED claimed: `finish` consumes the guard, so the hazard it guards is unrepresentable.
-#[test]
+#[skuld::test]
 fn a_holders_normal_return_leaves_the_next_holder_alone() {
     let b = Blocker::spawn();
     let holder = park_holder(&b.shared, Some(far()), || {
@@ -382,7 +382,7 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
 /// blocked waiter becomes the holder.
 ///
 /// Mutant: a `?` return that leaves `W`: the waiter never wakes.
-#[test]
+#[skuld::test]
 fn a_non_echild_reap_error_restores_n_and_wakes_the_waiters() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -406,7 +406,7 @@ fn a_non_echild_reap_error_restores_n_and_wakes_the_waiters() {
 /// real status.
 ///
 /// Mutant: `N` written without `notify_all`: the waiter never wakes.
-#[test]
+#[skuld::test]
 fn an_expired_holder_hands_off_to_a_blocked_wait() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, Some(far()), || {
@@ -423,7 +423,7 @@ fn an_expired_holder_hands_off_to_a_blocked_wait() {
 /// S13: a holder that sees *gone* takes the `ECHILD` path and restores `N`.
 ///
 /// Mutant: *gone* taken for *deadline passed*: `Ok(None)`.
-#[test]
+#[skuld::test]
 fn a_holder_that_sees_gone_takes_the_echild_path() {
     let b = Blocker::spawn();
     let _gone = seams::force_unlocked_wait(ForcedWait::Gone);
@@ -435,7 +435,7 @@ fn a_holder_that_sees_gone_takes_the_echild_path() {
 /// S14: an error from the unlocked wait restores `N`, wakes the waiters and returns the error.
 ///
 /// Mutant: a `?` return that leaves `W`: the waiter never wakes.
-#[test]
+#[skuld::test]
 fn an_unlocked_wait_error_restores_n_and_wakes_the_waiters() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || seams::force_unlocked_wait(ForcedWait::Errno(5)));
@@ -451,7 +451,7 @@ fn an_unlocked_wait_error_restores_n_and_wakes_the_waiters() {
 /// S15: a holder that panics in its wait restores `N` and wakes the waiters.
 ///
 /// Mutant: no guard: the waiter never wakes.
-#[test]
+#[skuld::test]
 fn a_holder_that_panics_in_its_wait_restores_n_and_wakes_the_waiters() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || seams::force_unlocked_wait(ForcedWait::Panic));
@@ -472,7 +472,7 @@ fn a_holder_that_panics_in_its_wait_restores_n_and_wakes_the_waiters() {
 ///
 /// Mutant: a guard that re-locks instead of using its own `MutexGuard` (self-deadlock), or a
 /// `Condvar` result that is `unwrap()`ped (the waiter panics).
-#[test]
+#[skuld::test]
 fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
     let mut b = Blocker::spawn();
     let holder = park_holder(&b.shared, None, || {
@@ -497,7 +497,7 @@ fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
 /// S16: a cached status never reaches the unlocked wait, for any method.
 ///
 /// Mutant: no `E` check: the unlocked wait panics.
-#[test]
+#[skuld::test]
 fn a_cached_status_never_reaches_the_unlocked_wait() {
     let mut b = Blocker::spawn();
     b.end_child();
@@ -511,7 +511,7 @@ fn a_cached_status_never_reaches_the_unlocked_wait() {
 /// S17: `kill` after the reap sends nothing.
 ///
 /// Mutant: a `kill` by pid, or by pidfd, after `E`.
-#[test]
+#[skuld::test]
 fn kill_after_the_reap_sends_nothing() {
     let mut b = Blocker::spawn();
     b.end_child();
@@ -525,7 +525,7 @@ fn kill_after_the_reap_sends_nothing() {
 ///
 /// Mutant: `kill_sent` reports `Delivered` for a child reaped behind the handle's back.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn kill_sent_after_a_foreign_reap_is_gone() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -543,7 +543,7 @@ fn kill_sent_after_a_foreign_reap_is_gone() {
 ///
 /// Mutant: `kill_sent` reports `Delivered`, or signals, after `E`.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn kill_sent_after_our_own_reap_is_gone() {
     let mut b = Blocker::spawn();
     b.end_child();
@@ -560,7 +560,7 @@ fn kill_sent_after_our_own_reap_is_gone() {
 ///
 /// Mutant: `kill_sent` reports `Gone` for a live child.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn kill_sent_on_a_live_child_is_delivered() {
     let b = Blocker::spawn();
     assert_eq!(
@@ -578,7 +578,7 @@ fn kill_sent_on_a_live_child_is_delivered() {
 /// Mutant: a panic before the `E` write: the state stays `W` and the guard restores `N` over a
 /// reaped pid.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn an_unreadable_consuming_record_is_cached_and_acts_by_no_pid() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
@@ -618,7 +618,7 @@ fn an_unreadable_consuming_record_is_cached_and_acts_by_no_pid() {
 /// `clamp_block` caps every timed block below the value the platforms read as `INFINITE`.
 ///
 /// Mutant: an unclamped `wait_timeout`.
-#[test]
+#[skuld::test]
 fn clamp_block_caps_every_timed_block_below_infinite() {
     let cap = Duration::from_millis(0xFFFF_FFFE);
     for huge in [
@@ -641,7 +641,7 @@ fn clamp_block_caps_every_timed_block_below_infinite() {
 ///
 /// Mutant: shared_child's `SharedChild::new`, which reaps an exited child on adoption.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn adopt_never_reaps() {
     let (child, stdin) = super::fixtures::spawn_std_blocker();
     let id = super::fixtures::identity_of(&child);

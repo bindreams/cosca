@@ -364,7 +364,7 @@ fn assert_agreement(mut tally: Tally) -> Tally {
 /// Exact agreement but for one declared over-refusal: the gate is allowed to refuse a directory
 /// and is not allowed to refuse `y\x.bat\..`, which loads `y`. Carries the no-regression property
 /// at this length as well — nothing the rule it replaced refused may come out accepted.
-#[test]
+#[skuld::test]
 fn the_gate_agrees_with_a_component_level_resolver() {
     let tally = assert_agreement(compare_gate_with_oracle(&COMPONENTS, 1, 5));
     // One that never reached the declared over-refusal would never have exercised a UNC root
@@ -375,7 +375,7 @@ fn the_gate_agrees_with_a_component_level_resolver() {
 /// The same comparison over [`COMPONENTS`] plus [`DRIVE_SPELLINGS`]: every path up to four
 /// components, and at five a drive spelling in the share or device slot (`\\.\1:\..` is
 /// `["", "", ".", "1:", ".."]`). Adding them to the depth-five run above would triple its cost.
-#[test]
+#[skuld::test]
 fn the_gate_agrees_on_every_drive_spelling() {
     let vocab: Vec<(&str, Comp)> = COMPONENTS.iter().chain(&DRIVE_SPELLINGS).copied().collect();
     assert_agreement(compare_gate_with_oracle(&vocab, 1, 4));
@@ -384,7 +384,7 @@ fn the_gate_agrees_on_every_drive_spelling() {
 
 /// The oracle's UNC model, pinned on the rows the gate once got wrong: an oracle without it
 /// accepts them, and then agreeing with it proves nothing about them.
-#[test]
+#[skuld::test]
 fn the_oracle_models_a_unc_root_of_its_own() {
     let name = |batch| Comp::Name { batch };
     let e = Comp::Empty;
@@ -417,7 +417,7 @@ fn the_oracle_models_a_unc_root_of_its_own() {
 
 /// The oracle's device root, pinned on the rows where a UNC-shaped root disagrees with the
 /// measured one: `..` pops the device name, and the bare `\\.\` names no file.
-#[test]
+#[skuld::test]
 fn the_oracle_models_a_device_root_of_its_own() {
     let name = |batch| Comp::Name { batch };
     let (e, dot, q) = (Comp::Empty, Comp::Skip, Comp::QuestionMark);
@@ -447,7 +447,7 @@ fn the_oracle_models_a_device_root_of_its_own() {
 /// The oracle's reading of `.. ` and of an interior dots-and-spaces segment, pinned for the same
 /// reason as its UNC root: the gate got both wrong once, and an oracle that shared the mistake
 /// would have agreed with it.
-#[test]
+#[skuld::test]
 fn the_oracle_reads_dots_and_spaces_on_its_own_terms() {
     let name = |batch| Comp::Name { batch };
     // `x.bat\y\.. ` — final, so it drops out and `y` is the name.

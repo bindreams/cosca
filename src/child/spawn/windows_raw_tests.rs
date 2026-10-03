@@ -54,7 +54,7 @@ fn commands_with_token(token: &OsString) -> Vec<(&'static str, Command)> {
 /// `C:\tools\setup` + NUL + `.bat`. Win32 truncates it to `C:\tools\setup`, which is no batch file
 /// at all, so neither gate may blame CVE-2024-24576 — the caller would be sent to audit a vector
 /// they do not carry, over a token that launches a program they did not name.
-#[test]
+#[skuld::test]
 fn a_nul_before_a_batch_extension_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     let token = nul_between(r"C:\tools\setup", ".bat");
     // Premise: the shared gate refuses this as a NUL as well, never as a batch file — so an
@@ -75,7 +75,7 @@ fn a_nul_before_a_batch_extension_is_diagnosed_as_a_nul_not_a_batch_refusal() {
 
 /// The batch gate must still refuse a clean `.bat`. Without this leg the ordering could be
 /// "satisfied" by deleting the gate outright and every NUL test here would stay green.
-#[test]
+#[skuld::test]
 fn a_clean_batch_token_is_still_refused_as_a_batch() {
     for (via, c) in commands_with_token(&OsString::from(r"C:\tools\setup.bat")) {
         assert!(
@@ -89,7 +89,7 @@ fn a_clean_batch_token_is_still_refused_as_a_batch() {
 /// checker with the environment-block builder, so a message hardcoded to the environment sends the
 /// caller off to audit `env()` over a defect in `args()` or `executable()` — the same class of
 /// misattribution the NUL-before-batch ordering exists to prevent, one field over.
-#[test]
+#[skuld::test]
 fn a_nul_in_the_program_token_is_not_blamed_on_the_environment() {
     let token = nul_between("setup.bat", "junk");
     // Premise: the shared gate refuses this too, so the assertions below are about WHICH FIELD the
@@ -114,7 +114,7 @@ fn a_nul_in_the_program_token_is_not_blamed_on_the_environment() {
 /// A NUL in a middle argv element must name WHICH element. By the time `CreateProcessW` reads it
 /// the command line is one joined string, so an unindexed label leaves the caller to bisect
 /// `args([..])` by hand — and `args(["a", "b\0c", "d"])` would name no element at all.
-#[test]
+#[skuld::test]
 fn a_nul_in_an_argument_is_blamed_on_its_index() {
     let mut c = Command::new();
     c.args([OsString::from("a"), nul_between("b", "c"), OsString::from("d")]);
@@ -137,7 +137,7 @@ fn a_nul_in_an_argument_is_blamed_on_its_index() {
 // with no `executable()` silently produced `app_name: None` (`lpApplicationName == NULL`)
 // instead of erroring.
 
-#[test]
+#[skuld::test]
 fn raw_program_and_line_rejects_an_empty_command_line_with_no_executable_set() {
     let mut cmd = Command::new();
     cmd.commandline("");
@@ -145,7 +145,7 @@ fn raw_program_and_line_rejects_an_empty_command_line_with_no_executable_set() {
     assert!(matches!(err, Error::Io(_)), "{err:?}");
 }
 
-#[test]
+#[skuld::test]
 fn raw_program_and_line_rejects_a_whitespace_only_command_line_with_no_executable_set() {
     let mut cmd = Command::new();
     cmd.commandline("   ");
@@ -153,7 +153,7 @@ fn raw_program_and_line_rejects_a_whitespace_only_command_line_with_no_executabl
     assert!(matches!(err, Error::Io(_)), "{err:?}");
 }
 
-#[test]
+#[skuld::test]
 fn raw_program_and_line_allows_an_empty_command_line_when_executable_is_set() {
     let mut cmd = Command::new();
     // executable() alone still supplies lpApplicationName, so an empty command line here is not
@@ -164,7 +164,7 @@ fn raw_program_and_line_allows_an_empty_command_line_when_executable_is_set() {
     assert!(raw_program_and_line(&cmd).is_ok());
 }
 
-#[test]
+#[skuld::test]
 fn raw_program_and_line_allows_a_non_empty_command_line_with_no_executable_set() {
     let mut cmd = Command::new();
     cmd.commandline("tool --flag");
@@ -173,7 +173,7 @@ fn raw_program_and_line_allows_a_non_empty_command_line_with_no_executable_set()
 
 /// The containment marker is an op after the user's, so it takes the name std gives it: after a
 /// user's `env_remove("__cosca_group_root")`, that spelling, as on the std path.
-#[test]
+#[skuld::test]
 fn the_containment_marker_is_named_as_std_names_it() {
     let removed = "__cosca_group_root";
     let mut std_cmd = std::process::Command::new("unused");
@@ -206,7 +206,7 @@ fn image_on(cmd: &Command) -> Result<Option<PathBuf>, Error> {
 
 const EXACT_CWD: &str = r"C:\cosca-process-cwd";
 
-#[test]
+#[skuld::test]
 fn target_completes_an_exact_program_without_searching_it() {
     // The contract in one assertion: a BARE name, which `executable()` would look up on PATH and
     // append `.exe` to, is only completed against this process's cwd, as the loader would.
@@ -231,7 +231,7 @@ const OTHER_FAILURE: i32 = 21;
 /// spawns `raw_executable(PROBE)` with that `current_dir()` from whatever cwd its spawner gave it,
 /// and exits with [`LOADED`], [`FILE_NOT_FOUND`] or [`OTHER_FAILURE`]. The spawner sets the cwd,
 /// so no process in the test moves its own.
-#[test]
+#[skuld::test]
 fn fixture_load_exact_probe() {
     let Some(current_dir) = std::env::var_os(FIXTURE_LOAD_EXACT_PROBE_ENV) else {
         return;
@@ -279,7 +279,7 @@ fn load_exact_probe(process_cwd: &Path, current_dir: &Path) -> Option<i32> {
 /// `a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path` and
 /// `a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path`, where the child's directory
 /// decides instead.
-#[test]
+#[skuld::test]
 fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
     let (with, without) = (
         tempfile::tempdir().expect("tempdir"),
@@ -294,7 +294,7 @@ fn an_exact_image_is_loaded_from_the_process_cwd_not_current_dir() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn target_resolves_a_search_program_to_an_absolute_path() {
     // The other half, so the test pair proves a DIFFERENCE rather than one arm in isolation:
     // the same bare name through `executable()` is resolved and absolute. `cmd` is chosen because
@@ -309,7 +309,7 @@ fn target_resolves_a_search_program_to_an_absolute_path() {
     assert_ne!(image, Path::new("cmd"), "it must actually have been resolved");
 }
 
-#[test]
+#[skuld::test]
 fn target_rejects_an_empty_exact_program() {
     // An empty `lpApplicationName` is a pointer to a lone NUL, not the NULL pointer, and whether
     // CreateProcessW treats the two alike is undocumented. Fail closed rather than find out.
@@ -323,7 +323,7 @@ fn target_rejects_an_empty_exact_program() {
 
 /// End to end, the batch gate's token check runs first, and it refuses a name that names no file
 /// with the same `InvalidInput` `raw_executable()` and `executable()` document.
-#[test]
+#[skuld::test]
 fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
     for n in [r"C:\t\dir\", ".", "..", "C:", r"x\.."] {
         let mut exact = Command::new();
@@ -342,7 +342,7 @@ fn a_spawn_of_a_program_that_names_no_file_is_invalid_input() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn target_rejects_an_exact_program_that_names_no_file() {
     // The raw backend's `Exact` arm passes the path through untouched, so a directory would reach
     // `lpApplicationName` verbatim. `CreateProcessW` would refuse it anyway, but as an OS error
@@ -359,7 +359,7 @@ fn target_rejects_an_exact_program_that_names_no_file() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn target_completes_an_exact_program_as_the_loader_does() {
     // Completed by `GetFullPathNameW`'s rules, which the loader applies to `lpApplicationName`:
     // the trailing dot goes, as it would there.
@@ -374,7 +374,7 @@ fn target_completes_an_exact_program_as_the_loader_does() {
 /// `CreateProcessW` loads the name Win32 normalises the token to, so a batch file reached only
 /// through normalisation is refused as a plainly-spelled one is — by the token gate, the raw
 /// backend's one batch check, which judges that name.
-#[test]
+#[skuld::test]
 fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
     // Trailing dot; one trailing space; a file named `.bat`, which has no extension to `Path`.
     for n in ["setup.bat.", "setup.bat ", r"C:\t\.bat"] {
@@ -391,7 +391,7 @@ fn the_token_gate_refuses_an_exact_batch_reached_through_win32_normalisation() {
 }
 
 /// Negative control: a name that merely contains `.bat` loads, completed.
-#[test]
+#[skuld::test]
 fn target_completes_an_exact_program_that_is_not_a_batch_file() {
     for n in ["setup.exe", "setup.bat.exe"] {
         let mut cmd = Command::new();
@@ -400,7 +400,7 @@ fn target_completes_an_exact_program_that_is_not_a_batch_file() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn target_falls_back_to_the_program_token_when_no_executable_is_set() {
     // The fd>=3 route: neither setter was called, so `lpApplicationName` would be NULL without
     // this fallback — and a NULL makes CreateProcessW search, including the calling process's cwd.
@@ -424,7 +424,7 @@ fn high_fd_command() -> Command {
 /// The argv arm reads `argv.first()`. Probes put the batch name FIRST with clean names after it,
 /// and a clean name first with a batch name after it — a lone element cannot tell `first()` from
 /// `last()` or from "any".
-#[test]
+#[skuld::test]
 fn program_token_reads_the_first_argv_element() {
     let mut refused = high_fd_command();
     refused.args(["x.bat", "ordinary.exe", "tail.exe"]);
@@ -444,7 +444,7 @@ fn program_token_reads_the_first_argv_element() {
 /// The command-line arm reads `first_token_wide` — different extraction code from the argv arm,
 /// with quoting of its own. A whole-line read would judge `x.bat --flag` (no batch suffix) and let
 /// the first probe through; a last-token read would miss it the same way.
-#[test]
+#[skuld::test]
 fn program_token_reads_the_first_command_line_token() {
     for (line, token) in [
         ("x.bat --flag", "x.bat"),
@@ -468,7 +468,7 @@ fn program_token_reads_the_first_command_line_token() {
 }
 
 /// End to end on the same route: `spawn()` must refuse before any child exists.
-#[test]
+#[skuld::test]
 fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
     let mut by_argv = high_fd_command();
     by_argv.args(["x.bat", "--flag"]);
@@ -482,7 +482,7 @@ fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
 
 /// The raw backend runs the child in the directory its image was resolved against: one read of the
 /// process cwd serves both, so a `set_current_dir` in between cannot split them.
-#[test]
+#[skuld::test]
 fn target_pins_the_resolved_directory_as_the_childs() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -512,7 +512,7 @@ fn target_pins_the_resolved_directory_as_the_childs() {
 }
 
 /// A share-less UNC `current_dir` is refused with `InvalidInput`, never a panic in the resolver.
-#[test]
+#[skuld::test]
 fn target_refuses_a_share_less_unc_current_dir() {
     let mut cmd = Command::new();
     cmd.executable(r".\tool.exe")
@@ -527,7 +527,7 @@ fn target_refuses_a_share_less_unc_current_dir() {
 
 /// `raw_executable()` completes against this process's cwd, not `current_dir`, as `CreateProcessW`
 /// does; `current_dir` is completed against the same one read and is the child's directory.
-#[test]
+#[skuld::test]
 fn target_completes_an_exact_program_and_its_current_dir_from_one_read() {
     let mut cmd = Command::new();
     cmd.raw_executable("tool.exe").args(["tool.exe"]).current_dir("sub");
@@ -543,7 +543,7 @@ fn target_completes_an_exact_program_and_its_current_dir_from_one_read() {
 }
 
 /// `current_dir("")` gets one verdict on both arms: it names no directory.
-#[test]
+#[skuld::test]
 fn an_empty_current_dir_is_refused_on_both_arms() {
     let mut search = Command::new();
     search.executable("tool").args(["tool"]).current_dir("");
@@ -562,7 +562,7 @@ fn an_empty_current_dir_is_refused_on_both_arms() {
 
 /// With no `current_dir`, the child runs in the one read of this process's cwd, whatever the
 /// program: `lpCurrentDirectory` is never left for `CreateProcessW` to read again.
-#[test]
+#[skuld::test]
 fn target_pins_the_process_cwd_for_every_program() {
     let mut cmd = Command::new();
     cmd.executable("cmd").args(["cmd"]);

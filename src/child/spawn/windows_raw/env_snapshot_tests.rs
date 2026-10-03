@@ -12,7 +12,7 @@ pub(crate) fn snapshot_of(entries: &[&str]) -> EnvSnapshot {
 /// Duplicates, an entry with no `=`, and a drive-cwd entry whose name starts with `=`.
 const MESSY: [&str; 6] = ["Path=a", "JUNK", "PATH=b", "=C:=C:\\x", "ß=1", "SS=2"];
 
-#[test]
+#[skuld::test]
 fn vars_parse_the_block_as_vars_os_does() {
     let got: Vec<(OsString, OsString)> = snapshot_of(&MESSY).vars().collect();
     let want: Vec<(OsString, OsString)> = [("Path", "a"), ("PATH", "b"), ("=C:", "C:\\x"), ("ß", "1"), ("SS", "2")]
@@ -22,13 +22,13 @@ fn vars_parse_the_block_as_vars_os_does() {
     assert_eq!(got, want);
 }
 
-#[test]
+#[skuld::test]
 fn an_empty_block_is_a_double_nul() {
     assert_eq!(EnvSnapshot::from_block(vec![0]).block(), [0, 0]);
     assert_eq!(snapshot_of(&[]).vars().count(), 0);
 }
 
-#[test]
+#[skuld::test]
 fn read_copies_this_process_block() {
     let snapshot = EnvSnapshot::read().unwrap();
     assert!(snapshot.block().ends_with(&[0, 0]));
@@ -72,7 +72,7 @@ fn ntdll_var(block: &[u16], name: &str) -> Option<OsString> {
 }
 
 /// `var` picks the entry ntdll picks: the first match, names split as ntdll splits them.
-#[test]
+#[skuld::test]
 fn var_matches_ntdll() {
     let snapshot = snapshot_of(&MESSY);
     for name in ["PATH", "path", "Path", "JUNK", "=C:", "ß", "SS", "ss", "s", "K", "a=b"] {

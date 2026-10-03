@@ -3,7 +3,7 @@
 /// `win32_effective_file_name` is only *called* under `cfg!(windows)`, so mutating its internals
 /// is invisible to the other four CI lanes. Testing it directly is what keeps the `..` collapse
 /// and the trailing-character order gated everywhere rather than only on the Windows runners.
-#[test]
+#[skuld::test]
 fn win32_effective_file_name_collapses_the_way_win32_resolves() {
     use std::path::Path;
     for (probe, want) in [
@@ -121,7 +121,7 @@ fn win32_effective_file_name_collapses_the_way_win32_resolves() {
 /// An interior dots-and-spaces segment is kept as a name, which a later `..` pops instead of the
 /// component before it — measured on x64 and arm64 runners, for segments ending in a period and in
 /// a space alike, by `tests/windows_path_resolution/dots_and_spaces.rs`'s `an_interior_segment_loses_only_a_single_trailing_period`. A final one drops out.
-#[test]
+#[skuld::test]
 fn an_interior_dots_segment_is_a_name_a_later_pop_removes() {
     use std::path::Path;
     for (probe, want) in [

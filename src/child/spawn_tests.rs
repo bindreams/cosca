@@ -57,7 +57,7 @@ fn raw_status(raw: u32) -> std::process::ExitStatus {
     std::os::windows::process::ExitStatusExt::from_raw(raw)
 }
 
-#[test]
+#[skuld::test]
 fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
     fault::record_teardown_reap(1, raw_status(9));
     let recorder = fault::record_teardown_reaps();
@@ -74,7 +74,7 @@ fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
 // was reaped. On macOS those arms leave the child alone instead (see `macos_*` below).
 
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn identity_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
     fault::set_force_identity_vanished(true);
@@ -91,7 +91,7 @@ fn identity_failure_reaps_the_spawned_child() {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn attach_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
     fault::set_force_attach_failure(true);
@@ -111,7 +111,7 @@ fn attach_failure_reaps_the_spawned_child() {
 /// to reap it, as it does after any successful kill. The child here exits by itself (its stdin is
 /// already closed), so nothing but the reap can account for it in the recorder.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
     let mut cmd = Command::new();
     #[cfg(unix)]
@@ -154,7 +154,7 @@ fn a_kill_error_for_an_already_exited_child_still_reaps_it() {
 /// Each leg's forced error carries its own marker, and records are scanned from a mark taken just
 /// before, so a concurrent test's warning cannot satisfy this one.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn a_failed_teardown_reap_is_logged_on_both_arms() {
     a_failed_teardown_step_is_logged_on_both_arms(
         ["cosca-reap-fail-attach-7c1e", "cosca-reap-fail-identity-b93d"],
@@ -169,7 +169,7 @@ fn a_failed_teardown_reap_is_logged_on_both_arms() {
 /// the reap step was never reached. Any failure but EPERM is also `debug_assert`ed; EPERM is
 /// reachable without a bug.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
     use std::io::ErrorKind;
     crate::log_capture::install();
@@ -218,7 +218,7 @@ fn a_failed_teardown_kill_is_logged_and_skips_the_blocking_reap_on_both_arms() {
 /// that reaps it once it exits on its own. Here it is blocked reading stdin, and exits when the
 /// failed spawn drops the pipe's parent end; the thread signals the reap on a channel.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     use crate::stdio::Stdio;
     let mut cmd = Command::new();
@@ -292,7 +292,7 @@ fn a_failed_teardown_step_is_logged_on_both_arms(
 /// exited child is reaped at once, and one not yet exited is handed to the background reaper.
 /// Either way it ends reaped.
 #[cfg(not(target_os = "macos"))]
-#[test]
+#[skuld::test]
 fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
     let mut cmd = Command::new();
     #[cfg(unix)]
@@ -323,7 +323,7 @@ fn a_child_whose_kill_failed_after_it_exited_is_reaped() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
-#[test]
+#[skuld::test]
 fn spawn_unelevated_runs_a_plain_child() {
     let mut c = crate::command::Command::new();
     #[cfg(unix)]
@@ -337,7 +337,7 @@ fn spawn_unelevated_runs_a_plain_child() {
 
 // A NON-elevated command must reach spawn_unelevated unchanged: the elevation branch
 // is gated on `elevation_request().enabled`, so a plain command never routes through it.
-#[test]
+#[skuld::test]
 fn non_elevated_spawn_skips_the_elevation_branch() {
     let mut c = crate::command::Command::new();
     #[cfg(unix)]
@@ -349,7 +349,7 @@ fn non_elevated_spawn_skips_the_elevation_branch() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
     // DETERMINISTIC (no ambient-privilege branch): the honest config gate now runs BEFORE
     // the already-elevated short-circuit, so a piped elevated child is
@@ -376,7 +376,7 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
 /// shipped Windows high-descriptor test also sets an explicit `executable()`, which
 /// short-circuits the rule before the fd term is ever evaluated.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     use crate::stdio::Stdio;
 
@@ -428,7 +428,7 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsRawFd;
@@ -526,7 +526,7 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
 /// and permanent, so any earlier contained spawn in this binary would already have made that
 /// observation meaningless.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
@@ -559,7 +559,7 @@ fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
 /// An environment key with an embedded NUL is refused before the process-global handle mutation
 /// too. The seam's wiring is proven by the positive leg of the test above.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
@@ -588,7 +588,7 @@ fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
 /// Argv-only and no `executable()`, asserted through `routes_to_raw_backend` so a future routing
 /// change cannot quietly turn this into a third raw-backend test.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
     use crate::containment::windows::observe;
 
@@ -643,7 +643,7 @@ fn attach_entered_leaf(leaf_path: &std::path::Path) {
 /// Until the spawn commits, a `kill_on_drop(false)` handle's leaf still kills on drop; once
 /// committed, it does not.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
     for commit in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -678,7 +678,7 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
 /// A failed password write tears the tree down through the leaf, even when the leaf's own `Drop`
 /// would not: the root alone is not the tree.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_kills_the_contained_tree() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -728,7 +728,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
 ///
 /// Mutant: the leaf's `Drop` does not wait for the drain (`block_until_drained` returns at once).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     use crate::containment::cgroup::fault as leaf_fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
@@ -778,7 +778,7 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
 /// A tree-teardown failure during a failed password write is logged at `warn`, naming the leaf
 /// and the OS reason, like other teardown-mechanism failures (e.g. `warn_leaf_left_behind`).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -824,7 +824,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
 /// A root that was killed but whose reap failed is not reported as terminated: the failure is
 /// logged at `warn` naming the pid, and the note says it was not reaped.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_reports_a_failed_root_reap() {
     crate::log_capture::install();
     let (mut cmd, teardown) = teardown_blocker();
@@ -859,7 +859,7 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown
 /// at `warn` and in the returned note, and nothing when the teardown worked or was not tried.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
     crate::log_capture::install();
     let failed = || Some(Err(Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR))));
@@ -909,7 +909,7 @@ fn failed_write() -> Result<(), Error> {
 /// A `Delegated` spawn has no tree teardown of its own, but its root is still this spawn's child:
 /// a failed password write kills and reaps it.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     fault::set_attachment_override(crate::containment::Attachment {
         containment: crate::containment::Containment::Delegated,
@@ -935,7 +935,7 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
 
 /// A tree kill that fails does not stop the root's own kill and reap: the two are separate.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-unkillable-leaf");
@@ -973,7 +973,7 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
 /// Mutant: an `adopt` that `.expect()`s the duplication (the test panics instead of getting
 /// `Err((e, child))` and a torn-down child).
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     let (mut cmd, teardown) = teardown_blocker();
     let forced = crate::child::shared::seams::force_duplicate_handle_error_once();
@@ -993,7 +993,7 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
 /// Mutant: the arm tears the child down by pid (it is killed and reaped); `Unassessable` mapped to
 /// `Io`; a spawn that succeeds with no identity.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn adopt_on_a_refused_identity_read_is_unassessable_and_leaves_the_child_alone() {
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     crate::log_capture::install();
@@ -1084,7 +1084,7 @@ fn open_fd_count() -> usize {
 ///
 /// Mutant: the arm forgets the child (`mem::forget`), which leaks its pipe ends.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_identity_gone_closes_our_pipe_ends() {
     macos_failed_spawn_closes_our_pipe_ends(
         || fault::set_force_identity_vanished(true),
@@ -1094,7 +1094,7 @@ fn macos_identity_gone_closes_our_pipe_ends() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_identity_unknown_closes_our_pipe_ends() {
     macos_failed_spawn_closes_our_pipe_ends(
         || fault::set_force_identity_unknown(true),
@@ -1104,7 +1104,7 @@ fn macos_identity_unknown_closes_our_pipe_ends() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_attach_failure_closes_our_pipe_ends() {
     macos_failed_spawn_closes_our_pipe_ends(
         || {
@@ -1143,7 +1143,7 @@ fn macos_failed_spawn_closes_our_pipe_ends(arm: impl FnOnce(), disarm: impl FnOn
 /// Mutant: `kill`'s `Ok` for a gone child is read as "killed" (the detail says "killed but could not
 /// be reaped (ECHILD)"), or the `Gone` outcome falls into the `Err` arm.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
     let (mut cmd, writer) = blocker_with_held_stdin();
     let child = cmd.spawn().expect("spawn");
@@ -1160,7 +1160,7 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
 ///
 /// Mutant: `finish_elevated` runs `hard_kill_marking` before it learns the root was reaped.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group() {
     let recorder = crate::containment::unix::fault::record_kill_group();
     let (mut cmd, writer) = blocker_with_held_stdin();
@@ -1218,7 +1218,7 @@ fn finish_elevated_detail(child: crate::Child) -> String {
 ///
 /// Mutant: the arm tears the child down by pid.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_identity_gone_forgets_the_child_and_signals_nothing() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -1237,7 +1237,7 @@ fn macos_identity_gone_forgets_the_child_and_signals_nothing() {
 ///
 /// Mutant: the arm tears the child down by pid.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_identity_unknown_leaves_the_child_alone() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -1258,14 +1258,14 @@ fn macos_identity_unknown_leaves_the_child_alone() {
 ///
 /// Mutant: the attach arm kills and waits on the child by pid (`child.kill()`, then `child.wait()`).
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_a_tree_walk_attach_with_a_gone_identity_leaves_the_child_alone() {
     macos_tree_walk_attach_fails(true);
 }
 
 /// As above, with an identity that cannot be read (`Unknown`).
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn macos_a_tree_walk_attach_with_an_unknown_identity_leaves_the_child_alone() {
     macos_tree_walk_attach_fails(false);
 }
@@ -1308,7 +1308,7 @@ fn macos_tree_walk_attach_fails(gone: bool) {
 }
 
 /// The spawn pid is readable only inside a hook: a stale one from an earlier spawn must not answer.
-#[test]
+#[skuld::test]
 fn spawn_pid_is_cleared_once_the_hook_has_run() {
     fault::run_at(fault::SpawnPoint::BeforeIdentity, 4242);
     assert!(

@@ -10,7 +10,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 
 /// The mutex is not reentrant: a nested `spawn_lock()` on the holding thread must be a named
 /// panic, not a hang. Platform-independent: the guard lives in `acquire_spawn_lock`.
-#[test]
+#[skuld::test]
 fn a_nested_spawn_lock_panics_naming_the_reentry() {
     let outer = spawn_lock();
     let unwound = std::panic::catch_unwind(|| {
@@ -26,7 +26,7 @@ fn a_nested_spawn_lock_panics_naming_the_reentry() {
 }
 
 /// Dropping the guard clears the held flag, so the next acquire on this thread succeeds.
-#[test]
+#[skuld::test]
 fn dropping_the_guard_clears_the_held_flag() {
     assert!(!spawn_lock_held_by_this_thread());
     let guard = spawn_lock();
@@ -37,7 +37,7 @@ fn dropping_the_guard_clears_the_held_flag() {
 }
 
 /// The flag is per thread: another thread waits for the lock rather than tripping the guard.
-#[test]
+#[skuld::test]
 fn another_thread_blocks_rather_than_panics() {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -57,7 +57,7 @@ fn another_thread_blocks_rather_than_panics() {
 
 /// Discarding the guard releases the lock at once. `expect` makes clippy fail this file if either
 /// lint stops firing, so the protection `MutexGuard` gave (rustc's `let_underscore_lock`) is kept.
-#[test]
+#[skuld::test]
 fn discarding_the_guard_is_linted() {
     #[expect(
         unused_must_use,

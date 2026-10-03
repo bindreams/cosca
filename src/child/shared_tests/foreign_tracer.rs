@@ -59,7 +59,7 @@ fn waitpid_status(pid: libc::pid_t) -> libc::c_int {
 ///
 /// It seizes with no options, so no `PTRACE_O_TRACEEXIT`: the kill is not delayed by an exit stop,
 /// and the pidfd turns readable at the zombie.
-#[test]
+#[skuld::test]
 fn foreign_tracer_helper() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
         return;
@@ -190,14 +190,14 @@ enum Wait {
 
 /// A zombie held by a foreign tracer is running to `try_wait`; `wait` blocks, unlocked, in
 /// `waitid` (no polling, no `WNOHANG`) until the tracer reaps it, then returns the kill.
-#[test]
+#[skuld::test]
 fn a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait() {
     hand_back(REAP, Wait::Unbounded, false);
 }
 
 /// As [`a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait`], but the tracer lets
 /// go by exiting without reaping, as a debugger that quits does.
-#[test]
+#[skuld::test]
 fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait() {
     hand_back(EXIT, Wait::Unbounded, false);
 }
@@ -206,7 +206,7 @@ fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait
 /// it running. The kill and the hand-back then go as above.
 ///
 /// Mutant: a peek that finds no record reads as an exit (the holder goes on to reap).
-#[test]
+#[skuld::test]
 fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit() {
     hand_back(REAP, Wait::Unbounded, true);
 }
@@ -216,7 +216,7 @@ fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit() {
 /// that found no record has to have been read as "still running".
 ///
 /// Mutants: a deadline holder that re-polls, or reads the missing record as the child gone.
-#[test]
+#[skuld::test]
 fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back() {
     hand_back(REAP, Wait::Deadline, false);
 }

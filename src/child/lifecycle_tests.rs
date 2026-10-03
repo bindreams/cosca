@@ -39,7 +39,7 @@ fn long_lived_contained_child() -> (crate::Child, std::io::PipeWriter) {
 /// that fully exits on its own reports the mechanism-correct drained verdict
 /// (`expected_drained_verdict`). On a mechanism with no kernel drain edge, the SAME call must
 /// fail `Unsupported` instead — both are real, exercised assertions.
-#[test]
+#[skuld::test]
 fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
     let child = quick_contained_child();
     let containment = child.containment();
@@ -61,7 +61,7 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
 /// Deadline-not-met case: on a drain-observable mechanism, `wait_tree_timeout` against a tree
 /// that is still alive at expiry reports `MembersRemain` — NOT an error, per its own doc. On a
 /// non-drainable mechanism the same call must still fail `Unsupported`.
-#[test]
+#[skuld::test]
 fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
     let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
@@ -83,7 +83,7 @@ fn wait_tree_timeout_reports_members_remain_before_the_deadline() {
 /// `crate::wait::deadline_from`/`remaining`'s own docs) — `MembersRemain`, not an error, and
 /// returned without ever entering the backend's blocking wait (every `wait_drained`
 /// implementation checks `remaining == Duration::ZERO` before its first blocking syscall).
-#[test]
+#[skuld::test]
 fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
     let (child, _stdin) = long_lived_contained_child();
     let drainable = child.containment().can_observe_drain();
@@ -107,7 +107,7 @@ fn wait_tree_timeout_zero_reports_members_remain_on_a_live_tree() {
 /// on why a past deadline still performs exactly one check). The unbounded `wait_tree()` call
 /// first is the genuine happens-before edge that the tree has fully drained before the ZERO
 /// probe below ever runs.
-#[test]
+#[skuld::test]
 fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained() {
     let child = quick_contained_child();
     let containment = child.containment();
@@ -146,7 +146,7 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
 /// requested mode, so this asserts something real and non-tautological on every platform: the
 /// `Unsupported` refusal where `TreeWalk` is honored as non-drainable, and — on macOS — that
 /// an explicit `TreeWalk` request still drains correctly through the marker it was promoted to.
-#[test]
+#[skuld::test]
 fn wait_tree_is_unsupported_on_a_non_drainable_mechanism() {
     let mut cmd = crate::Command::new();
     #[cfg(unix)]
@@ -193,7 +193,7 @@ fn spawn_never_exiting() -> (crate::Child, std::io::PipeWriter) {
 /// A deadline in the past against an already-exited child still reports the exit.
 ///
 /// Mutant: return `None` when `remaining` is zero before asking the backend.
-#[test]
+#[skuld::test]
 fn wait_deadline_in_the_past_reports_an_exited_child() {
     let child = quick_contained_child();
     let waited = child.wait().expect("wait");
@@ -215,7 +215,7 @@ fn assert_consecutive_frozen_waits_never_early(child: &crate::Child) {
 }
 
 /// Mutant (Windows): a second clock advance around the `Raw` backend's own `wait_until`.
-#[test]
+#[skuld::test]
 fn std_child_consecutive_frozen_waits_never_return_early() {
     let (child, _stdin) = spawn_never_exiting();
     assert_consecutive_frozen_waits_never_early(&child);
@@ -224,7 +224,7 @@ fn std_child_consecutive_frozen_waits_never_return_early() {
 /// Mutant: wrap `RawChild::wait_deadline` in the recheck helper, which advances the frozen clock a
 /// second time.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn raw_child_consecutive_frozen_waits_never_return_early() {
     let mut cmd = crate::Command::new();
     let findstr = std::path::Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot"))

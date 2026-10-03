@@ -109,7 +109,7 @@ fn wait_for_exit_unrecorded(handle: HANDLE) {
 ///
 /// Mutants: `is_reaped` polls the process handle (fails the first assertion); `wait` never records
 /// (fails the last).
-#[test]
+#[skuld::test]
 fn raw_is_reaped_only_once_its_own_wait_returns() {
     let child = spawn_suspended();
     assert!(!child.is_reaped());
@@ -123,7 +123,7 @@ fn raw_is_reaped_only_once_its_own_wait_returns() {
 /// [`raw_is_reaped_only_once_its_own_wait_returns`], through the `ProcHandle::Raw` arm.
 ///
 /// Mutants: the arm polls the handle; the arm answers `false`.
-#[test]
+#[skuld::test]
 fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
     use crate::child::proc_handle::ProcHandle;
     let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
@@ -139,7 +139,7 @@ fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
 }
 
 /// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
-#[test]
+#[skuld::test]
 fn runas_kill_of_a_killable_child_returns_and_reaps() {
     let child = spawn_suspended_runas();
     // Keeps a no-op `kill` from hanging its denied-arm wait; see `end_with_code_zero`.
@@ -158,7 +158,7 @@ fn runas_kill_of_a_killable_child_returns_and_reaps() {
 
 /// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
 /// `ERROR_ACCESS_DENIED`; the wait after an accepted terminate dropped.
-#[test]
+#[skuld::test]
 fn runas_teardown_on_drop_returns_promptly() {
     let child = spawn_suspended_runas();
     // Keeps a no-op terminate from hanging teardown's wait; see `end_with_code_zero`.
@@ -177,7 +177,7 @@ fn runas_teardown_on_drop_returns_promptly() {
 /// the denial means exit is underway, so teardown reaps.
 ///
 /// Mutant: drop `&& !self.can_terminate()`, so a terminable runas child is left running.
-#[test]
+#[skuld::test]
 fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
@@ -195,7 +195,7 @@ fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
 /// As above, for `kill`.
 ///
 /// Mutant: drop `&& !self.can_terminate()` in `kill`, so it returns `ERROR_ACCESS_DENIED`.
-#[test]
+#[skuld::test]
 fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
@@ -209,7 +209,7 @@ fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
 /// The runas `ERROR_ACCESS_DENIED` arm with a child we cannot terminate: never block.
 ///
 /// Mutant: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`.
-#[test]
+#[skuld::test]
 fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
@@ -226,7 +226,7 @@ fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
 /// As above, for `kill`: surfaces the denial.
 ///
 /// Mutant: reap in the `runas && !can_terminate()` arm of `kill`.
-#[test]
+#[skuld::test]
 fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
@@ -241,7 +241,7 @@ fn runas_kill_of_an_unterminable_child_surfaces_the_denial_without_blocking() {
 
 /// A Win32 failure wrapped as `HRESULT_FROM_WIN32` comes back as its Win32 code, as std's own
 /// spawn reports it, so `kind()` classifies it. Any other HRESULT is kept whole.
-#[test]
+#[skuld::test]
 fn win32_io_error_unwraps_a_win32_hresult() {
     use windows::core::{Error, HRESULT};
     let dir = win32_io_error(Error::from_hresult(HRESULT(0x8007_010Bu32 as i32)));
@@ -252,7 +252,7 @@ fn win32_io_error_unwraps_a_win32_hresult() {
 }
 
 /// `CreateProcessW` refusing a working directory surfaces `ERROR_DIRECTORY`, not its HRESULT.
-#[test]
+#[skuld::test]
 fn a_refused_cwd_is_reported_as_its_win32_code() {
     let base = tempfile::tempdir().unwrap();
     let missing: Vec<u16> = base
@@ -288,7 +288,7 @@ fn a_refused_cwd_is_reported_as_its_win32_code() {
 ///
 /// Mutant: truncate in `win32_timeout_ms` -> `ms` is 0. Mutant: add slack -> `ms` is above 1.
 /// Mutant: ignore the caller's deadline -> `requested` is not 5ms.
-#[test]
+#[skuld::test]
 fn wait_deadline_arms_the_ceiling_of_the_remaining_duration() {
     let child = spawn_suspended();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
@@ -315,7 +315,7 @@ fn wait_deadline_arms_the_ceiling_of_the_remaining_duration() {
 /// re-arms and reports the real exit.
 ///
 /// Mutant: return `None` on the first `WAIT_TIMEOUT` -> one arm, wrongly reports running.
-#[test]
+#[skuld::test]
 fn wait_deadline_never_reports_still_running_before_the_deadline() {
     let child = spawn_suspended();
     let raw_handle = child.handle(); // Copy; valid until `child` drops after the call
@@ -339,7 +339,7 @@ fn wait_deadline_never_reports_still_running_before_the_deadline() {
 ///
 /// Mutant: return `None` on the first `WAIT_TIMEOUT` -> one arm, wrongly reports running.
 /// Mutant: hoist `remaining` above the loop -> `remaining` does not shrink.
-#[test]
+#[skuld::test]
 fn wait_deadline_re_arms_past_a_clamped_timeout() {
     let child = spawn_suspended();
     let raw_handle = child.handle();

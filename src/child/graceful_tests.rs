@@ -84,7 +84,7 @@ fn cleanup(child: &mut crate::Child) {
 // all Unix — procfs and `sysctl KERN_PROC` are both zombie-inclusive, so a swept-but-unreaped
 // root would still be exists()-visible. (Windows runs the same body but skips that assert:
 // exists() stays true there while `child` still holds the process handle.)
-#[test]
+#[skuld::test]
 fn graceful_tree_watch_error_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id();
@@ -122,7 +122,7 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
 // die by our SIGTERM but stay a zombie — `exists()` catches exactly that on all Unix
 // (procfs / `sysctl KERN_PROC` are both zombie-inclusive).
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn graceful_lone_watch_error_still_escalates_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id();
@@ -161,7 +161,7 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
 // nonzero grace the watch WOULD really block for the full window, synchronizing on time. `ZERO` is
 // documented (`graceful_shutdown`'s own rustdoc) as "signals, polls once, then escalates",
 // which is exactly the ordering this test needs and nothing more.
-#[test]
+#[skuld::test]
 fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id();
@@ -214,7 +214,7 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
 // per-member-unconfirmed shape). Mirrors the test above almost exactly; kept as a fully
 // separate test (not parameterized) matching this file's existing convention of one test
 // per forced-error shape.
-#[test]
+#[skuld::test]
 fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
     let id = child.id();
@@ -262,7 +262,7 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 // `Child::drop`. Regression test: folding this shape into the same hold-and-continue arm as
 // the ordinary per-member case would silently disagree with the classifier for the same
 // underlying error.
-#[test]
+#[skuld::test]
 fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
     let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
@@ -291,7 +291,7 @@ fn graceful_tree_unassessable_mechanism_failure_fails_fast() {
 // the child has not registered with the console (Windows) or installed its disposition (Unix)
 // when the signal arrives, and what the test measures is an abrupt death during startup rather
 // than the cooperative path it is named for.
-#[test]
+#[skuld::test]
 fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() {
     use std::io::Read;
 
@@ -426,7 +426,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // The `exec 3<&0; cat <&3 3<&- &` idiom is explained at `test_child::BLOCKER_ARGV`. Without a
 // kernel drain edge, the fixture still exercises the root-only watch, asserted below.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::{Read, Write};
 
@@ -522,7 +522,7 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
 // whole test: dropping it would deliver EOF and let the grandchild exit on its own, defeating
 // the MembersRemain fixture.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
     use std::io::Read;
     use std::net::TcpListener;
@@ -584,7 +584,7 @@ fn windows_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
 // waiting forever. The contained fixture matches no test, so it exits at once and leaves no
 // descendant.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_anything_connects() {
     use std::net::TcpListener;
 
@@ -620,7 +620,7 @@ fn death_watch_windows_accept_or_signalled_panics_when_the_tree_drains_before_an
 // rewrite it (see this task's "Scope correction" note above). `Duration::ZERO` here too: the
 // point is that the function returns before ever reaching the watch, at all, regardless of
 // the requested grace, so there is nothing to synchronize on.
-#[test]
+#[skuld::test]
 fn graceful_tree_non_containment_terminate_error_fails_fast() {
     let (mut child, stdin) = blocker();
     term_fault::set_force_terminate(term_fault::Forced::Unsupported);

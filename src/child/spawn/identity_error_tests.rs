@@ -7,7 +7,7 @@ use crate::identity::proc_view_fault::force_openat2_errno;
 
 /// Mutant: "`spawn_identity_error` reports every `Unknown` as the OS refusing" - the
 /// `Unassessable` that names no cause.
-#[test]
+#[skuld::test]
 fn a_spawn_where_openat2_is_unavailable_is_unsupported_naming_it() {
     for (errno, name) in [(rustix::io::Errno::NOSYS, "ENOSYS"), (rustix::io::Errno::PERM, "EPERM")] {
         let (mut cmd, teardown) = teardown_blocker();

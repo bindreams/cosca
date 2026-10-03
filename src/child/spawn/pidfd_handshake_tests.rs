@@ -83,7 +83,7 @@ fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
 
 /// Mutant: a handshake that leaves the child held forever (the spawn hangs: bounded by the nextest
 /// override) or aborts it.
-#[test]
+#[skuld::test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -102,7 +102,7 @@ fn a_normal_spawn_runs_the_program_and_forks_once() {
 /// A refusal before the fork is `Unsupported` naming `spawn`, and no child is ever forked.
 ///
 /// Mutant: the probe is skipped (the refusal then lands after the fork, so `spawns()` is 1).
-#[test]
+#[skuld::test]
 fn a_refused_probe_fails_unsupported_and_forks_nothing() {
     for (errno, name) in [
         (Errno::PERM, "EPERM"),
@@ -133,7 +133,7 @@ fn a_refused_probe_fails_unsupported_and_forks_nothing() {
 
 /// A transient failure of the probe itself fails the spawn as `Io` naming `pidfd_open`, before any
 /// fork.
-#[test]
+#[skuld::test]
 fn a_probe_that_hits_emfile_fails_io_and_forks_nothing() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -155,7 +155,7 @@ fn a_probe_that_hits_emfile_fails_io_and_forks_nothing() {
 /// naming `pidfd_open`, and the program never ran. std collected the child.
 ///
 /// Mutants: the child execs despite its failed `pidfd_open`; the parent ignores its errno report.
-#[test]
+#[skuld::test]
 fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -176,7 +176,7 @@ fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
 
 /// A refusal that only shows in the child is still `Unsupported` naming `spawn`, and the program
 /// never ran.
-#[test]
+#[skuld::test]
 fn a_refusal_in_the_child_is_unsupported_and_the_program_never_runs() {
     let (mut cmd, reader) = marker_command();
     fault::reset_spawns();
@@ -200,7 +200,7 @@ fn a_refusal_in_the_child_is_unsupported_and_the_program_never_runs() {
 
 /// A report whose descriptor the kernel could not install is an error; a well-formed report is
 /// its pidfd, its errno, or EOF.
-#[test]
+#[skuld::test]
 fn a_truncated_report_is_an_error_and_a_whole_one_is_read() {
     let fd = || OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"));
     let message = |tag: i32, value: i32| {
@@ -247,7 +247,7 @@ fn a_truncated_report_is_an_error_and_a_whole_one_is_read() {
 /// fails the spawn.
 ///
 /// Mutant: every send error is taken as the child being gone.
-#[test]
+#[skuld::test]
 fn only_a_closed_end_makes_an_undelivered_go_mean_gone() {
     assert!(matches!(classify_send(Ok(1)), Some(Delivery::Delivered)));
     assert!(classify_send(Err(Errno::INTR)).is_none(), "EINTR must send again");
@@ -267,7 +267,7 @@ fn only_a_closed_end_makes_an_undelivered_go_mean_gone() {
 ///
 /// Mutants: the helper does not shut the parent's end (the child would wait forever on the copy);
 /// every send error is taken as the child being gone (the error would be the child's abort).
-#[test]
+#[skuld::test]
 fn an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait() {
     let (mut cmd, reader) = marker_command();
     let holder = fault::arm_fork_holder();
@@ -297,7 +297,7 @@ fn an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait() {
 /// spawn fails, and the child is reaped through its pidfd.
 ///
 /// Mutant: `Gone` is a successful spawn.
-#[test]
+#[skuld::test]
 fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     let (mut cmd, reader) = marker_command();
     let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
@@ -321,7 +321,7 @@ fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
 /// the handshake kills and reaps it through the pidfd it sent.
 ///
 /// Mutant: the pidfd is dropped when the spawn fails.
-#[test]
+#[skuld::test]
 fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -366,7 +366,7 @@ fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
 
 /// A hook after the handshake's fails: std reports it and collects the child, so there is nothing
 /// left to kill.
-#[test]
+#[skuld::test]
 fn a_later_hook_failure_leaves_nothing_to_kill() {
     let (mut std_cmd, pending) = raw_command("true");
     // SAFETY: returns an error; nothing else.
@@ -406,7 +406,7 @@ fn a_later_hook_failure_leaves_nothing_to_kill() {
 ///
 /// Mutant: the spawning thread keeps its copy of the child's end open past `spawn()` (the helper
 /// then never reads EOF).
-#[test]
+#[skuld::test]
 fn a_child_that_fails_before_reporting_ends_the_spawn() {
     let (mut cmd, reader) = marker_command();
     let armed = fault::arm_child_fault(ChildFault::Fail);
@@ -429,7 +429,7 @@ fn a_child_that_fails_before_reporting_ends_the_spawn() {
 ///
 /// Mutant: the parent does not force EOF after a failed spawn (the helper would wait forever on
 /// the copy).
-#[test]
+#[skuld::test]
 fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
     let (mut cmd, reader) = marker_command();
     let holder = fault::arm_fork_holder();
@@ -455,7 +455,7 @@ fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
 ///
 /// Mutant: the parent never watches the child, so it never forces EOF (the helper would wait
 /// forever on the copy).
-#[test]
+#[skuld::test]
 fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
     let (mut cmd, reader) = marker_command();
     fault::reset_leaked_pid();
@@ -489,7 +489,7 @@ fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
 ///
 /// Precondition: std returns from `spawn()` before the child's hooks run, so the child is gated
 /// inside `spawn()` until the release; a std that blocks until `exec` hangs the test, not fails it.
-#[test]
+#[skuld::test]
 fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
     use std::io::{Seek, Write};
     use std::os::fd::AsRawFd;
@@ -552,7 +552,7 @@ fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
 /// A child killed before it reports: std reads the closed status pipe as success, the helper
 /// reads EOF. The child is dead, unreaped and pidless-to-us, so it is left unreaped and named,
 /// and the spawn fails.
-#[test]
+#[skuld::test]
 fn a_child_killed_before_reporting_is_left_unreaped_and_named() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -620,7 +620,7 @@ fn killed_child_with_a_failing_watch(fault_kind: fault::WatchFault) -> String {
 ///
 /// Mutants: any such failure (open, move, peek or poll) only warns and returns "keep waiting" (the spawn then waits on the
 /// holder, and the end probes shut the channel and report no forced EOF).
-#[test]
+#[skuld::test]
 fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
     for fault_kind in [
         fault::WatchFault::Open(Errno::MFILE),
@@ -645,7 +645,7 @@ fn a_watch_that_cannot_be_set_up_forces_eof_and_names_the_cause() {
 
 /// A watch that finds the number names no child of this process (`ESRCH`; `ENOENT` or `EINVAL`
 /// where a thread took it) means the child is gone: EOF is forced, and the death is the cause.
-#[test]
+#[skuld::test]
 fn a_number_that_names_no_child_forces_eof() {
     for errno in [Errno::SRCH, Errno::NOENT, Errno::INVAL] {
         let said = killed_child_with_a_failing_watch(fault::WatchFault::Open(errno));
@@ -656,7 +656,7 @@ fn a_number_that_names_no_child_forces_eof() {
 /// A spawn that fails before any fork still ends the helper thread: `run` returns.
 ///
 /// Mutant: the spawning thread keeps its copy of the child's end open (`run` hangs).
-#[test]
+#[skuld::test]
 fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let (_std_cmd, pending) = raw_command("true");
     let guard = super::super::spawn_lock();
@@ -678,7 +678,7 @@ fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
 /// Mutant: the helper is detached (a `thread::spawn` that is never joined). The probe holds the
 /// helper at its very end until the join point opens its gate, so an unjoined helper is never
 /// released and never finishes.
-#[test]
+#[skuld::test]
 fn the_helper_is_joined_before_the_spawn_returns() {
     let (mut cmd, reader) = marker_command();
     let probe = fault::arm_helper_probe();
@@ -696,7 +696,7 @@ fn the_helper_is_joined_before_the_spawn_returns() {
 ///
 /// Mutant: the hook fires only on the normal path (a panic leaves the held child gated, and the
 /// scope joins a helper that waits for it).
-#[test]
+#[skuld::test]
 fn a_panic_after_the_spawn_still_fires_the_wait_over_hook() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -719,7 +719,7 @@ fn a_panic_after_the_spawn_still_fires_the_wait_over_hook() {
 ///
 /// Mutant: the gate opens only at the join (a panic before it leaves the helper held at its end,
 /// and the scope waits for it).
-#[test]
+#[skuld::test]
 fn a_panic_after_the_spawn_still_opens_the_helper_probe() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -744,7 +744,7 @@ fn a_panic_after_the_spawn_still_opens_the_helper_probe() {
 ///
 /// Mutant: no forced EOF on unwind (the helper waits on the copy; the unwind checks shut the
 /// channel and record that EOF was not reached).
-#[test]
+#[skuld::test]
 fn a_panic_after_the_spawn_forces_eof_through_a_held_copy() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -771,7 +771,7 @@ fn a_panic_after_the_spawn_forces_eof_through_a_held_copy() {
 /// not only the after-spawn hook.
 ///
 /// Mutant: the guard is disarmed once the after-spawn hook has run.
-#[test]
+#[skuld::test]
 fn a_panic_inside_the_wait_forces_eof_through_a_held_copy() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -810,7 +810,7 @@ fn own_procfs() {
 ///
 /// Mutant: the child sends its pid number, and the parent opens a pidfd on that number (it opens
 /// the reuser, then kills and reaps it as the child that never ran).
-#[test]
+#[skuld::test]
 fn namespaces_a_reused_number_never_reaches_the_handshake() {
     if !ns::enabled() {
         return;
@@ -818,7 +818,7 @@ fn namespaces_a_reused_number_never_reaches_the_handshake() {
     ns::run(fixture_path!(fixture_reused_number_driver));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_reused_number_driver() {
     if !ns::is_child() {
         return;
@@ -828,7 +828,7 @@ fn fixture_reused_number_driver() {
 }
 
 /// Pid 1 of a fresh pid namespace, where only this fixture allocates numbers.
-#[test]
+#[skuld::test]
 fn fixture_reused_number_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -893,7 +893,7 @@ fn fixture_reused_number_init() {
 ///
 /// Mutant: the spawning thread keeps its copy of the child's end past `spawn()` (the probe finds it
 /// held; without the probe the spawn blocks until the reuser exits).
-#[test]
+#[skuld::test]
 fn namespaces_a_reused_number_never_holds_the_spawn_when_the_child_dies_unreported() {
     if !ns::enabled() {
         return;
@@ -901,7 +901,7 @@ fn namespaces_a_reused_number_never_holds_the_spawn_when_the_child_dies_unreport
     ns::run(fixture_path!(fixture_unreported_death_driver));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_unreported_death_driver() {
     if !ns::is_child() {
         return;
@@ -911,7 +911,7 @@ fn fixture_unreported_death_driver() {
 }
 
 /// Pid 1 of a fresh pid namespace, where only this fixture allocates numbers.
-#[test]
+#[skuld::test]
 fn fixture_unreported_death_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -982,7 +982,7 @@ fn fixture_unreported_death_init() {
 ///
 /// Mutant: the gate is opened only after the hook returns. This test then hangs, bounded by the
 /// nextest override; `the_verdict_hook_runs_under_a_guard_that_opens_the_hold` fails at once.
-#[test]
+#[skuld::test]
 #[should_panic(expected = "the verdict hook panicked on purpose")]
 fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
     let (mut cmd, _reader) = marker_command();
@@ -997,7 +997,7 @@ fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
 /// fast twin of the test above: without the guard, that one can only hang.
 ///
 /// Mutant: the gate is opened only after the hook returns.
-#[test]
+#[skuld::test]
 fn the_verdict_hook_runs_under_a_guard_that_opens_the_hold() {
     let (mut cmd, _reader) = marker_command();
     let guarded = Rc::new(Cell::new(None));
@@ -1016,7 +1016,7 @@ fn the_verdict_hook_runs_under_a_guard_that_opens_the_hold() {
 
 /// A thread that unshared its pid namespace for children cannot start threads, so it cannot run
 /// the handshake: the spawn fails before any fork, naming that cause.
-#[test]
+#[skuld::test]
 fn namespaces_a_spawn_from_a_thread_that_unshared_its_pid_namespace_names_the_cause() {
     if !ns::enabled() {
         return;
@@ -1024,7 +1024,7 @@ fn namespaces_a_spawn_from_a_thread_that_unshared_its_pid_namespace_names_the_ca
     ns::run(fixture_path!(fixture_unshared_thread));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_unshared_thread() {
     if !ns::is_child() {
         return;
@@ -1074,7 +1074,7 @@ fn help_with_report(seams: &fault::HelperSeams) -> Outcome {
 /// the child can be reaped through it.
 ///
 /// Mutant: the pidfd is dropped when its move fails.
-#[test]
+#[skuld::test]
 fn a_pidfd_that_cannot_move_above_stdio_is_still_handed_on() {
     let seams = fault::HelperSeams::failing_move(Errno::MFILE);
     match help_with_report(&seams) {
@@ -1085,7 +1085,7 @@ fn a_pidfd_that_cannot_move_above_stdio_is_still_handed_on() {
 }
 
 /// A child left unreaped is worded by why, not always as a death before its report.
-#[test]
+#[skuld::test]
 fn an_abandoned_child_is_worded_by_its_cause() {
     struct Recorder(std::rc::Rc<RefCell<Option<String>>>);
     impl super::Spawned for Recorder {
@@ -1122,7 +1122,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 ///
 /// Mutant: only `ESRCH` means gone (the spawn waits on the holder; the end probes shut the channel
 /// and report no forced EOF).
-#[test]
+#[skuld::test]
 fn namespaces_a_thread_taking_the_number_never_holds_the_spawn() {
     if !ns::enabled() {
         return;
@@ -1130,7 +1130,7 @@ fn namespaces_a_thread_taking_the_number_never_holds_the_spawn() {
     ns::run(fixture_path!(fixture_thread_reuse_driver));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_thread_reuse_driver() {
     if !ns::is_child() {
         return;
@@ -1140,7 +1140,7 @@ fn fixture_thread_reuse_driver() {
 }
 
 /// Pid 1 of a fresh pid namespace, where only this fixture allocates numbers.
-#[test]
+#[skuld::test]
 fn fixture_thread_reuse_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;

@@ -9,7 +9,7 @@ fn exit_code(c: &mut Command) -> Option<i32> {
     c.spawn().expect("spawn").wait().expect("wait").code()
 }
 
-#[test]
+#[skuld::test]
 fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     let (cwd, on_path) = cwd_and_path_tools();
     let mut c = Command::new();
@@ -20,7 +20,7 @@ fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
     assert_eq!(exit_code(&mut c), Some(CWD_TOOL_EXIT));
 }
 
-#[test]
+#[skuld::test]
 fn a_bare_exact_name_missing_from_the_childs_cwd_is_not_found_on_path() {
     let (_cwd, on_path) = cwd_and_path_tools();
     let empty = tempfile::tempdir().expect("tempdir");
@@ -35,7 +35,7 @@ fn a_bare_exact_name_missing_from_the_childs_cwd_is_not_found_on_path() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_exact_name_that_names_no_file_is_refused_on_posix() {
     let (cwd, on_path) = cwd_and_path_tools();
     std::fs::create_dir(cwd.path().join("dir")).expect("mkdir");
@@ -53,7 +53,7 @@ fn an_exact_name_that_names_no_file_is_refused_on_posix() {
 }
 
 /// Negative control: `executable()` still searches `PATH` for a bare name, and never the cwd.
-#[test]
+#[skuld::test]
 fn a_bare_search_name_still_loads_the_file_on_path() {
     let (cwd, on_path) = cwd_and_path_tools();
     let mut c = Command::new();
@@ -65,7 +65,7 @@ fn a_bare_search_name_still_loads_the_file_on_path() {
 }
 
 /// The commandline arm reaches the same completion as the argv arm.
-#[test]
+#[skuld::test]
 fn a_bare_exact_name_with_a_commandline_loads_the_childs_cwd_file() {
     let (cwd, on_path) = cwd_and_path_tools();
     let mut c = Command::new();
@@ -109,7 +109,7 @@ const SPAWN_FAILED: i32 = 91;
 /// Inert in an ordinary suite run. Re-executed by [`spawn_exact_tool_in_an_unreachable_cwd`], it
 /// waits for one byte on stdin — sent once its directory's parent is unsearchable — then spawns
 /// `raw_executable("tool")` and exits with that child's code.
-#[test]
+#[skuld::test]
 fn fixture_spawn_exact_tool_in_an_unreachable_cwd() {
     use std::io::Read;
     let Some(own_path) = std::env::var_os(FIXTURE_UNREACHABLE_CWD_ENV) else {
@@ -229,7 +229,7 @@ fn spawn_exact_tool_in_an_unreachable_cwd(current_dir: Option<&str>, already_ele
 
 /// A cwd with no usable path still runs a bare `raw_executable()`, as `./tool` does under std:
 /// the child resolves the name against the cwd it inherits, and is left in it.
-#[test]
+#[skuld::test]
 fn an_exact_program_runs_in_a_cwd_that_has_no_path() {
     let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(None, false);
     assert_eq!(code, Some(CWD_TOOL_EXIT), "{stderr}");
@@ -237,7 +237,7 @@ fn an_exact_program_runs_in_a_cwd_that_has_no_path() {
 
 /// An already-root `.elevate()` runs no backend, so it spawns as the unelevated path does and
 /// needs no path to the cwd either.
-#[test]
+#[skuld::test]
 fn an_already_elevated_exact_program_runs_in_a_cwd_that_has_no_path() {
     for (dir, want) in [(None, CWD_TOOL_EXIT), (Some("sub"), PATH_TOOL_EXIT)] {
         let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(dir, true);
@@ -247,14 +247,14 @@ fn an_already_elevated_exact_program_runs_in_a_cwd_that_has_no_path() {
 
 /// A relative `current_dir` is entered from the inherited cwd too, and the program is loaded from
 /// there: `sub/tool`, run in `sub`.
-#[test]
+#[skuld::test]
 fn a_relative_current_dir_is_entered_from_a_cwd_that_has_no_path() {
     let (code, stderr) = spawn_exact_tool_in_an_unreachable_cwd(Some("sub"), false);
     assert_eq!(code, Some(PATH_TOOL_EXIT), "{stderr}");
 }
 
 /// `current_dir("")` fails `chdir` for a `Search` program; an `Exact` one fails the same way.
-#[test]
+#[skuld::test]
 fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
     let (cwd, _on_path) = cwd_and_path_tools();
     let kind = |c: &mut Command| match c.spawn() {
@@ -275,7 +275,7 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
 /// The directory is entered by cosca's hook, not std: std leaves a relative program with a
 /// `current_dir` "platform specific and unstable". Its hook cannot be inspected, so this pins that
 /// std is handed no directory to apply; the unreachable-cwd tests pin that the hook enters it.
-#[test]
+#[skuld::test]
 fn a_relative_exact_program_hands_std_no_current_dir() {
     for dir in ["sub", "/work"] {
         let mut c = Command::new();
@@ -288,7 +288,7 @@ fn a_relative_exact_program_hands_std_no_current_dir() {
 
 /// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`
 /// is left for the child to read at the fork.
-#[test]
+#[skuld::test]
 fn a_search_programs_relative_cwd_is_passed_through() {
     let mut c = Command::new();
     c.executable("tool").args(["tool"]).current_dir("sub");
@@ -300,7 +300,7 @@ fn a_search_programs_relative_cwd_is_passed_through() {
 
 /// An empty argv gives the child the name as written, as a non-empty one does, not the completed
 /// path. `sh` reading its script from stdin reports `argv[0]` as `$0`.
-#[test]
+#[skuld::test]
 fn an_exact_program_with_an_empty_argv_gets_the_written_name_as_argv0() {
     let mut c = Command::new();
     c.raw_executable("sh").args(Vec::<&str>::new()).current_dir("/bin");

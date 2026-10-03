@@ -42,7 +42,7 @@ fn read_fd(fd: RawFd) -> String {
 
 // Basic mapping =====
 
-#[test]
+#[skuld::test]
 fn a_simple_mapping_lands_the_parent_fd_on_the_requested_child_number() {
     let f = file_with("hello-fd5");
     let out = run_sh(
@@ -55,14 +55,14 @@ fn a_simple_mapping_lands_the_parent_fd_on_the_requested_child_number() {
     assert_eq!(out, "hello-fd5");
 }
 
-#[test]
+#[skuld::test]
 fn empty_mappings_installs_nothing_and_spawns_normally() {
     assert_eq!(run_sh("echo ok", vec![]).trim(), "ok");
 }
 
 // The "already on the right number" branch: CLOEXEC cleared in place, fd survives exec =====
 
-#[test]
+#[skuld::test]
 fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("self-mapped");
     let owned: OwnedFd = f.into();
@@ -84,7 +84,7 @@ fn a_mapping_onto_its_own_current_number_clears_cloexec_so_the_fd_survives_exec(
 /// test). This only checks the externally visible outcome (each file's own content, uncorrupted);
 /// it does not observe the shuffle itself, since any mechanism that resolves the collision without
 /// corrupting either file's content would pass it too.
-#[test]
+#[skuld::test]
 fn colliding_mappings_deliver_each_files_own_content() {
     let a = file_with("AAA");
     let b = file_with("BBB");
@@ -114,7 +114,7 @@ fn colliding_mappings_deliver_each_files_own_content() {
 
 /// Three-way rotation (A->B, B->C, C->A): the simple two-mapping swap above cannot catch a
 /// shuffle that only handles ONE collision at a time.
-#[test]
+#[skuld::test]
 fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
     let a = file_with("AAA");
     let b = file_with("BBB");
@@ -156,7 +156,7 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
 /// in release, `Plan::apply`'s pass 2 would dup2 both mappings onto fd 5 in order, so the second
 /// mapping's source silently wins and the first is silently misrouted with no error and no crash
 /// — a strictly weaker disposition than an explicit `Err`.
-#[test]
+#[skuld::test]
 fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
     let a = file_with("A");
     let b = file_with("B");
@@ -186,7 +186,7 @@ fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
 // preserved_fds equivalent =====
 
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
     let f = file_with("preserved");
     let owned: OwnedFd = f.into();
@@ -204,7 +204,7 @@ fn install_preserved_clears_cloexec_so_the_fd_survives_exec() {
 /// test is actually exercising the CLOEXEC-clearing code path, not passing by accident (e.g.
 /// because `/bin/sh` itself happened to inherit the fd some other way).
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn without_install_preserved_the_fd_is_closed_at_exec() {
     let f = file_with("not-preserved");
     let owned: OwnedFd = f.into();
@@ -224,7 +224,7 @@ fn without_install_preserved_the_fd_is_closed_at_exec() {
 /// `F_DUPFD_CLOEXEC` search starts at 3 and never computes `i32::MAX + 1` at all — and fails only
 /// later, in the child, at `dup2`: an ordinary `EBADF`, not a parent-side refusal and not an
 /// abort.
-#[test]
+#[skuld::test]
 fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
     let mut cmd = Command::new("/bin/sh");
@@ -257,7 +257,7 @@ fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
 /// `ulimit -n`. Without it, this would depend on the runner: on Linux, a soft limit raised past
 /// `1_000_000` is entirely ordinary (see `tests/common::RestoreRlimitNofile`'s doc), so the same
 /// `dup2` this test expects to fail could instead succeed.
-#[test]
+#[skuld::test]
 fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
     let mut cmd = Command::new("/bin/sh");
@@ -303,7 +303,7 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
 /// so fd 255 is the highest valid number), this module's per-mapping `F_DUPFD_CLOEXEC(fd, 3)`
 /// search must resolve the swap using a low temporary, independent of the numerically distant
 /// 255 target.
-#[test]
+#[skuld::test]
 fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rlimit() {
     let a = file_with("AAA");
     let b = file_with("BBB");
@@ -376,7 +376,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// pipe (now sitting at fd 2) instead of the mapping's actual source. Reproduces the bug measured
 /// on tokio: `close(2)`, `stderr(pipe())` + `fd(3, null)` delivered the stderr pipe's bytes
 /// through fd 3 instead of the mapping's real source.
-#[test]
+#[skuld::test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
     let Some(done) = own_process(
         test_path!(a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it),
@@ -437,7 +437,7 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
 /// which can then claim that same number in the parent and collide with a dup2 std performs in
 /// the child before any `pre_exec` hook runs — so the freed number ends up serving two different
 /// purposes across the fork, corrupting whichever one loses.
-#[test]
+#[skuld::test]
 fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
     let Some(done) = own_process(
         test_path!(a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops),
