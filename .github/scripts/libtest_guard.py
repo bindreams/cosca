@@ -19,9 +19,12 @@ stripped), so such a test would silently never run. Two checks:
    `--message-format=json`. The lint is forbidden (-F), so a crate-level `allow` is a compile
    error rather than a silencer, and a compile that fails without a finding fails the guard.
 
-The final link of the checked unit is replaced by `true`: nothing runs the binary. The rest of the
-build is real, so a cross-triple run needs a cross linker and C compiler for build scripts and
-helper bins.
+A `test = true` target is type-checked, not built: the lint needs the expanded program, and code
+generation for every such target in every feature combination is the one cost that grows with each
+target flipped to `harness = false`. Every other kind is built in the debug test profile, with the
+final link replaced by `true`, so a cross-triple run needs a cross linker and C compiler for build
+scripts and helper bins. The release profile is that same profile with debug assertions off, which
+is the only difference in `cfg` between the two (the workspace sets no `[profile]` keys).
 
 Limit: the guard compiles each target with cfg(test) on. Code written to hide a test from
 cfg(test), such as `#[cfg_attr(not(test), test)]`, is not seen.
@@ -105,13 +108,16 @@ def plan(packages: list[dict], unflipped: set[str]) -> tuple[list[Target], list[
 
 
 def commands(args: argparse.Namespace, t: Target, release: bool) -> list[list[str]]:
-    # A `test = true` target is compiled in the profile that makes it a test target; the other
-    # kinds are test-compiled by `--profile test` (debug) or `--profile bench` (release).
-    if t.flag.startswith("--test="):
-        profile = "release" if release else "check"
-    else:
-        profile = "bench" if release else "test"
-    tail = ["--locked", "--manifest-path", t.manifest, "--message-format=json", t.flag, "--profile", profile]
+    # A `test = true` target is type-checked (`--profile check`): its test-mode unit is all the guard
+    # needs, and code generation for each target in each feature combination is what made the guard
+    # grow with every target flipped to `harness = false`. The other kinds are test-compiled by
+    # `--profile test`, which also brings in the dev-dependencies a check-mode unit would lack.
+    # Release differs from debug here in `cfg(debug_assertions)` alone (no `[profile]` in this
+    # workspace sets `panic`, the one other profile setting a cfg can see), so release is the same
+    # profile with debug assertions off, not an optimised build.
+    profile = "check" if t.flag.startswith("--test=") else "test"
+    config = ["--config", "profile.dev.debug-assertions=false"] if release else []
+    tail = [*config, "--locked", "--manifest-path", t.manifest, "--message-format=json", t.flag, "--profile", profile]
     if args.target:
         tail = ["--target", args.target, *tail]
     # A `harness = true` target here is `test = false`: cargo already passes `--test` for it, and

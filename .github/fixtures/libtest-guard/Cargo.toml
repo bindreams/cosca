@@ -26,6 +26,8 @@ arch_x86_64 = []
 arch_aarch64 = []
 # Enables nothing: a clean run that is not the empty feature combination.
 quiet = []
+# Compiles under `cargo check` but fails in codegen: the guard must not codegen.
+post_mono = []
 
 [dependencies]
 
