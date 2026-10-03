@@ -49,7 +49,7 @@ pub(crate) fn build(shape: &str, root: &str, seg: &str) -> String {
 /// Each case is also run under two sibling roots of EQUAL length, one created on disk and one not,
 /// so "does the directory have to exist?" is settled by comparing two strings rather than by
 /// trusting the documentation's claim that this is pure string manipulation.
-#[test]
+#[skuld::test]
 fn which_segment_positions_get_trimmed() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -145,7 +145,7 @@ pub(crate) fn cross_root(prefix: &str, shape: &str, seg: &str, root_e: &str, roo
 /// nothing is relative. A trimmed `String` cannot say whether Win32 produced that or the probe cut
 /// it short, so this reports the raw UTF-16 units, the length Win32 returned, an independent size
 /// query, and where `lpFilePart` lands in the buffer.
-#[test]
+#[skuld::test]
 fn the_verbatim_parent_result_is_raw_or_truncated() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -178,7 +178,7 @@ fn the_verbatim_parent_result_is_raw_or_truncated() {
 /// `dots_and_spaces::only_dot_and_dotdot_are_refused_as_verbatim_file_names` gives each spelling
 /// its own directory; here every step touches the same one and says so, so the plain and verbatim
 /// `x<sp>` can be seen coexisting.
-#[test]
+#[skuld::test]
 fn x_space_measured_in_a_single_directory() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;

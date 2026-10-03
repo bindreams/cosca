@@ -19,7 +19,7 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// `tool.bat` beside it runs through `cmd.exe`, past a batch gate that only ever saw the token
 /// `tool`. The "an absolute `lpFile` is taken verbatim" fact this crate relies on was measured on
 /// an existing `.exe`, which cannot distinguish the two behaviours.
-#[test]
+#[skuld::test]
 fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -79,7 +79,7 @@ fn does_shellexecute_apply_pathext_to_an_absolute_extensionless_lpfile() {
 /// Control for the probe above: an absolute path to a real `.bat` must launch. If this does not
 /// run, the probe harness itself is broken — the shell is not launching anything in this
 /// environment — and the negative result above would be meaningless.
-#[test]
+#[skuld::test]
 fn control_an_absolute_batch_path_does_launch() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -128,7 +128,7 @@ fn control_an_absolute_batch_path_does_launch() {
 /// No `lpClass` is set on this call. See
 /// `does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile` below for the same
 /// question measured under production's own `SEE_MASK_CLASSNAME`/`lpClass = "exefile"`.
-#[test]
+#[skuld::test]
 fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -198,7 +198,7 @@ fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile() {
 /// of these extensions it lists first, and which one that is is itself part of what this probe
 /// measures rather than something to assume — see each `Waited` arm below for how the conclusion is
 /// scoped to whichever file actually self-reports having run.
-#[test]
+#[skuld::test]
 fn does_shellexecute_search_lpdirectory_for_a_pathless_lpfile_as_exefile() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;

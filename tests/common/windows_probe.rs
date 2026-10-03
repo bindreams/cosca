@@ -23,7 +23,7 @@ pub(crate) fn mark_test_passed(env_var: &str) {
     };
     let name = std::thread::current()
         .name()
-        .expect("libtest names each test's thread")
+        .expect("skuld names each test's thread")
         .replace("::", ".");
     std::fs::write(Path::new(&dir).join(name), b"")
         .unwrap_or_else(|e| panic!("could not write the {env_var} marker: {e}"));

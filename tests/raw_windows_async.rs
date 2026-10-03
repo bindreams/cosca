@@ -1,17 +1,19 @@
 //! Async (tokio) raw-`CreateProcessW` backend tests (Plan 12 Tasks 7-8). Windows + tokio only: the
 //! raw backend is a Windows concern, and its async mirror needs the tokio runtime.
-#![cfg(all(windows, feature = "tokio"))]
 
+#[cfg(all(windows, feature = "tokio"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(all(windows, feature = "tokio"))]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `executable_independent_of_argv0_on_windows`: the raw backend loads
 /// `executable()` while argv[0] is the command line's first token. `argv0-report` echoes both,
 /// proving the loaded image (`testbin`) differs from the reported argv[0] (`pretend-name`). The
 /// stdout pipe is served by the tokio overlapped-named-pipe machinery.
-#[tokio::test]
+#[skuld::test]
 async fn async_executable_independent_of_argv0() {
     let exe = common::testbin();
     let mut c = cosca::tokio::Command::new();
@@ -31,10 +33,11 @@ async fn async_executable_independent_of_argv0() {
 
 // Async raw fd >= 3 via the MSVCRT lpReserved2 table (Plan 12 Task 8) =====
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `fd3_pipe_out_delivers_child_bytes`: a child-writes pipe on fd 3 delivers the
 /// child's bytes to the parent's async read end (`AsyncReadExt`). The fd-table wired fd 3 into the
 /// child's CRT; EOF (child closing fd 3 on exit) bounds the read — no timer.
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_pipe_out_delivers_child_bytes() {
     let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
@@ -49,10 +52,11 @@ async fn async_fd3_pipe_out_delivers_child_bytes() {
     assert_eq!(s, "hi-fd3");
 }
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `fd3_pipe_in_feeds_child`: a parent-writes pipe on fd 3 feeds the child
 /// (`AsyncWriteExt`). The child copies fd 3 to stdout, so dropping the parent's write end (EOF)
 /// makes it echo exactly what was written. EOF bounds both reads — no timer.
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_pipe_in_feeds_child() {
     let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
@@ -71,11 +75,12 @@ async fn async_fd3_pipe_in_feeds_child() {
     assert_eq!(s, "ping3");
 }
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`: an argv-only
 /// tokio `Command` (no `.executable()`) that maps fd >= 3 still routes through the ASYNC raw
 /// backend. Same proof shape as the sync `argv_only_fd3_routes_through_the_raw_backend_and_works`
 /// (see its doc for why fd 3 delivery proves raw-backend routing).
-#[tokio::test]
+#[skuld::test]
 async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut c = cosca::tokio::Command::new();
     c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
@@ -89,13 +94,14 @@ async fn async_argv_only_fd3_routes_through_the_raw_backend_and_works() {
     assert_eq!(s, "argv-only-fd3");
 }
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of the sync `commandline_only_fd3_routes_through_the_raw_backend_and_works`: a tokio
 /// `Command` built with `.commandline(...)` instead of `.args(...)`, no `.executable()`, that maps
 /// fd >= 3 — exercising `program_token`'s `CommandLine` arm (`first_token_wide`) through the ASYNC
 /// raw backend, a different code path from the argv-only test above. Same proof shape as
 /// `argv_only_fd3_routes_through_the_raw_backend_and_works` (see its doc for why fd 3 delivery
 /// proves raw-backend routing).
-#[tokio::test]
+#[skuld::test]
 async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
 
@@ -111,12 +117,13 @@ async fn async_commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 
 // Async containment over the raw backend (Plan 12 Task 8) =====
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `contained_raw_child_is_in_our_job_and_kill_tree_reaps`: a CONTAINED child
 /// loaded via `executable()` (with fd >= 3) routes through the async raw backend AND lands in OUR
 /// Job Object — `test_job_handle_contains_self()` confirms membership (immutable once assigned).
 /// fd 3 delivers the child's bytes over the async read end, and `kill_tree()` tears the tree down.
 /// EOF (child closing fd 3 on exit) bounds the read — no timer.
-#[tokio::test]
+#[skuld::test]
 async fn async_contained_raw_child_is_in_our_job() {
     let mut c = cosca::tokio::Command::new();
     c.executable(common::testbin())
@@ -135,6 +142,7 @@ async fn async_contained_raw_child_is_in_our_job() {
     child.kill_tree().expect("kill_tree");
 }
 
+#[cfg(all(windows, feature = "tokio"))]
 /// Async twin of sync `fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd`: a
 /// `Command` with no `.executable()` still routes to the async raw backend purely via fd >= 3, so
 /// `image` used to be `None` and `lpApplicationName` NULL. `CreateProcessW`'s own search for a
@@ -166,7 +174,7 @@ async fn async_contained_raw_child_is_in_our_job() {
 /// since the decoy lives ONLY in this tempdir cwd, never `System32` or the Windows directory
 /// either, the resolver's system-directory search step cannot accidentally find it and mask a
 /// cwd-search regression this test would otherwise catch.
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let decoy_program = "cosca_testbin_b2_cwd_decoy";
@@ -187,4 +195,13 @@ async fn async_fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cw
     child.stdout().unwrap().read_to_string(&mut s).await.unwrap();
     child.wait().await.unwrap();
     assert_eq!(s.trim(), "notfound", "helper report: {s}");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

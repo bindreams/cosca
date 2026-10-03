@@ -32,7 +32,7 @@ use windows::Win32::System::Threading::{
 /// `QueryFullProcessImageNameW`; the canary opens that path verbatim and compares file identity
 /// with the planted copy, so a spawn that ran any other file fails. Its `module=` line, the name
 /// the loader recorded, is printed only.
-#[test]
+#[skuld::test]
 fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -211,7 +211,7 @@ pub(crate) fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
 /// with `QueryFullProcessImageNameW` and compared by file identity with the planted payload, and
 /// the process is terminated before its first instruction runs. So `cmd.exe`, when std picks it,
 /// never runs.
-#[test]
+#[skuld::test]
 fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;

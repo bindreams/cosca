@@ -10,3 +10,12 @@ mod pure_tests;
 mod verdict;
 #[path = "windows_path_resolution/verdict_tests.rs"]
 mod verdict_tests;
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
+}

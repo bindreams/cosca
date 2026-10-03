@@ -33,7 +33,7 @@ pub(crate) const ERROR_INVALID_NAME: i32 = 123;
 ///
 /// Relative inputs, so each is compared against the current directory `GetFullPathNameW` resolves
 /// them in.
-#[test]
+#[skuld::test]
 fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -122,7 +122,7 @@ fn a_final_dots_and_spaces_component_drops_out_and_pops_nothing() {
 /// the plain one behind `\\?\`, except for a final `..`: plain `C:\dir\..` is `C:\`, verbatim
 /// `\\?\C:\dir\..` is `\\?\C:` naming `C:`. `C:\dir\x` must come back untouched, or the probe
 /// itself is broken.
-#[test]
+#[skuld::test]
 fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -180,7 +180,7 @@ fn a_final_dots_and_spaces_component_is_stripped_even_verbatim() {
 /// The plain-spelling rows, `GetFullPathNameW` and the listings are printed, not asserted. Each
 /// (name, spelling) pair gets its OWN directory, so a listing can never be ambiguous about which
 /// attempt produced which entry.
-#[test]
+#[skuld::test]
 fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -285,7 +285,7 @@ fn only_dot_and_dotdot_are_refused_as_verbatim_file_names() {
 ///
 /// Each file holds its own name, so reading a spelling back says exactly which entry it reached.
 /// **Nothing here is executed**: the files are text, not images.
-#[test]
+#[skuld::test]
 fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;
@@ -381,7 +381,7 @@ fn a_trailing_dot_or_space_reaches_the_batch_file_only_when_plain() {
 /// behave alike. This differs from the FINAL-component rule
 /// ([`a_final_dots_and_spaces_component_drops_out_and_pops_nothing`]), so a model of path
 /// normalisation needs both.
-#[test]
+#[skuld::test]
 fn an_interior_segment_loses_only_a_single_trailing_period() {
     if !crate::common::require_group("WINDOWS_PATH_CANARY") {
         return;

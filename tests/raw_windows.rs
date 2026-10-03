@@ -1,21 +1,24 @@
 //! Smoke tests for the testbin helper modes the raw-`CreateProcessW` backend tests rely on
 //! (`read-fd` / `write-fd` / `argv0-report` / `isatty-fd`). Windows-only: the raw backend and
-//! its fd/argv[0]/CRT-device proofs are a Windows concern, so the whole crate is `#![cfg(windows)]`.
+//! its fd/argv[0]/CRT-device proofs are a Windows concern.
 //! These prove the four modes EXIST and emit their documented output over std pipes; the
 //! executable-vs-argv[0] independence itself is proven later via the crate's own `Command`.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::io::Write;
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 /// `argv0-report` emits both an `argv0=` and an `image=` line. Spawned via a RAW
 /// `std::process::Command`, so argv[0] is the exe path and the mode is `args[0]` — do NOT
 /// prepend "cosca_testbin" (that convention is the crate's own `Command`). This asserts
 /// only that the mode works; the argv[0]≠exe behavior is proven later via `cosca::Command`.
-#[test]
+#[skuld::test]
 fn testbin_argv0_report_emits_argv0_and_image() {
     let mut cmd = Command::new(common::testbin());
     cmd.args(["argv0-report"]);
@@ -24,9 +27,10 @@ fn testbin_argv0_report_emits_argv0_and_image() {
     assert!(s.contains("argv0=") && s.contains("image="), "got: {s}");
 }
 
+#[cfg(windows)]
 /// `write-fd <n> <text>` writes `text` straight to CRT fd `n`. Targeting fd 1 (stdout) with a
 /// piped stdout proves the fd→`File` path reaches the intended handle.
-#[test]
+#[skuld::test]
 fn testbin_write_fd_writes_to_the_target_fd() {
     let mut cmd = Command::new(common::testbin());
     cmd.args(["write-fd", "1", "hello-fd1"]);
@@ -34,10 +38,11 @@ fn testbin_write_fd_writes_to_the_target_fd() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello-fd1");
 }
 
+#[cfg(windows)]
 /// `read-fd <n>` copies CRT fd `n` to stdout. Feeding a piped stdin (fd 0) and reading it back
 /// on stdout proves the read direction of the fd→`File` path. The child sees EOF when the write
 /// end drops — a real close event, not a timer.
-#[test]
+#[skuld::test]
 fn testbin_read_fd_copies_the_source_fd_to_stdout() {
     // The lock is held for the spawn only: the window it closes (std marking its child-side pipe
     // handles inheritable and calling CreateProcessW with bInheritHandles=TRUE, while a concurrent
@@ -61,9 +66,10 @@ fn testbin_read_fd_copies_the_source_fd_to_stdout() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "payload-fd0");
 }
 
+#[cfg(windows)]
 /// `isatty-fd <n>` reports `isatty=<0|1>` via `libc::isatty`. A piped fd is not a console, so a
 /// piped stdout (fd 1) must classify as `isatty=0`.
-#[test]
+#[skuld::test]
 fn testbin_isatty_fd_reports_zero_for_a_pipe() {
     let mut cmd = Command::new(common::testbin());
     cmd.args(["isatty-fd", "1"]);
@@ -74,10 +80,11 @@ fn testbin_isatty_fd_reports_zero_for_a_pipe() {
 
 // Raw `CreateProcessW` backend, sync path (Plan 12 Task 4) =====
 
+#[cfg(windows)]
 /// The raw backend loads `executable()` while the child's argv[0] is the command line's first
 /// token — the independence std cannot express on Windows. `argv0-report` echoes both, proving
 /// the loaded image (`testbin`) differs from the reported argv[0] (`pretend-name`).
-#[test]
+#[skuld::test]
 fn executable_independent_of_argv0_on_windows() {
     let exe = common::testbin();
     let mut c = cosca::Command::new();
@@ -95,9 +102,10 @@ fn executable_independent_of_argv0_on_windows() {
     );
 }
 
+#[cfg(windows)]
 /// An embedded NUL in the command line cannot reach `CreateProcessW` (it would truncate the
 /// wide buffer); the raw backend rejects it up front as an `Io` error.
-#[test]
+#[skuld::test]
 fn embedded_nul_in_commandline_is_rejected() {
     let e = cosca::Command::new()
         .executable(common::testbin())
@@ -110,9 +118,10 @@ fn embedded_nul_in_commandline_is_rejected() {
     assert!(e.to_string().contains("command line"), "{e}");
 }
 
+#[cfg(windows)]
 /// An embedded NUL in the working directory is rejected the same way (it would truncate the
 /// wide `lpCurrentDirectory`).
-#[test]
+#[skuld::test]
 fn embedded_nul_in_cwd_is_rejected() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -123,11 +132,12 @@ fn embedded_nul_in_cwd_is_rejected() {
     assert!(e.to_string().contains("working directory"), "{e}");
 }
 
+#[cfg(windows)]
 /// `current_dir("")` fails on both Windows backends, with different kinds: the raw backend refuses
 /// it as `NotFound`, and the std backend hands `""` to `CreateProcessW`. The raw backend takes a
 /// command with an `executable()`, a `raw_executable()` or a descriptor from 3 up, even one whose
 /// program is only its argv.
-#[test]
+#[skuld::test]
 fn an_empty_current_dir_fails_on_both_backends() {
     let mut exe = cosca::Command::new();
     exe.executable(common::testbin())
@@ -154,9 +164,10 @@ fn an_empty_current_dir_fails_on_both_backends() {
     assert_eq!(kind(std_backend), std::io::ErrorKind::InvalidFilename, "std backend");
 }
 
+#[cfg(windows)]
 /// A `.bat`/`.cmd` reached via `executable()` is rejected BEFORE resolution (CVE-2024-24576): a
 /// batch program has cmd.exe escaping semantics the raw quoter does not implement.
-#[test]
+#[skuld::test]
 fn batch_script_via_executable_is_unsupported() {
     let dir = tempfile::tempdir().unwrap();
     let bat = dir.path().join("x.bat");
@@ -169,6 +180,7 @@ fn batch_script_via_executable_is_unsupported() {
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
+#[cfg(windows)]
 /// A token routed raw by fd 3, via `executable()` and via argv[0].
 fn raw_routed(token: &std::path::Path) -> [(&'static str, cosca::Command); 2] {
     let mut exe = cosca::Command::new();
@@ -181,9 +193,10 @@ fn raw_routed(token: &std::path::Path) -> [(&'static str, cosca::Command); 2] {
     [("executable()", exe), ("argv[0]", argv0)]
 }
 
+#[cfg(windows)]
 /// A batch file that only Win32's normalisation exposes resolves (the file exists) and must still
 /// be refused: `Path::extension()` reads `""`, `"bat "` and `None` for these three.
-#[test]
+#[skuld::test]
 fn a_batch_reached_through_normalisation_is_refused_on_the_raw_backend() {
     let dir = tempfile::tempdir().unwrap();
     for f in ["x.bat", ".bat"] {
@@ -206,8 +219,9 @@ fn a_batch_reached_through_normalisation_is_refused_on_the_raw_backend() {
     }
 }
 
+#[cfg(windows)]
 /// Controls: a `.exe` whose stem merely contains `.bat` runs, as does a plain one.
-#[test]
+#[skuld::test]
 fn an_exe_named_like_a_batch_still_runs_on_the_raw_backend() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["x.bat.exe", "tool.exe"] {
@@ -220,6 +234,7 @@ fn an_exe_named_like_a_batch_still_runs_on_the_raw_backend() {
     }
 }
 
+#[cfg(windows)]
 /// End-to-end proof of the gate's ORDERING, through `spawn()` rather than the gate alone. A token
 /// carrying an interior NUL must come back as the NUL whichever side of the batch rule it falls:
 ///
@@ -229,7 +244,7 @@ fn an_exe_named_like_a_batch_still_runs_on_the_raw_backend() {
 ///   without the NUL check, the refusal degrades to resolution's `NotFound`.
 ///
 /// Both refusals precede resolution, so nothing is spawned and no batch file need exist.
-#[test]
+#[skuld::test]
 fn a_nul_bearing_program_token_is_refused_as_a_nul_on_either_side_of_the_batch_rule() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -262,10 +277,11 @@ fn a_nul_bearing_program_token_is_refused_as_a_nul_on_either_side_of_the_batch_r
 
 // Raw backend, sync fd >= 3 via the MSVCRT lpReserved2 table (Plan 12 Task 5) =====
 
+#[cfg(windows)]
 /// A child-writes pipe on fd 3 delivers the child's bytes to the parent's read end — proving the
 /// fd-table wired fd 3 into the child's CRT and the parent kept the read end. EOF (from the child
 /// closing fd 3 on exit) bounds the read; no timer.
-#[test]
+#[skuld::test]
 fn fd3_pipe_out_delivers_child_bytes() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -279,9 +295,10 @@ fn fd3_pipe_out_delivers_child_bytes() {
     assert_eq!(s, "hi-fd3");
 }
 
+#[cfg(windows)]
 /// A parent-writes pipe on fd 3 feeds the child: the child copies fd 3 to stdout, so dropping the
 /// parent's write end (EOF) makes the child echo exactly what was written. EOF bounds both reads.
-#[test]
+#[skuld::test]
 fn fd3_pipe_in_feeds_child() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -300,9 +317,10 @@ fn fd3_pipe_in_feeds_child() {
     assert_eq!(s, "ping3");
 }
 
+#[cfg(windows)]
 /// `Stdio::inherit()` on fd >= 3 has no defined parent stream to dup — the raw path rejects it via
 /// the hardened `inherit_end` arm.
-#[test]
+#[skuld::test]
 fn inherit_on_fd3_is_unsupported() {
     let e = cosca::Command::new()
         .executable(common::testbin())
@@ -314,9 +332,10 @@ fn inherit_on_fd3_is_unsupported() {
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
+#[cfg(windows)]
 /// A regular file on fd 3 classifies as a disk file (`FILE_TYPE_DISK` -> no `FDEV`), so the child's
 /// `_isatty(3)` reports 0. Deterministic device-class coverage with no console needed.
-#[test]
+#[skuld::test]
 fn fd3_file_is_not_a_tty() {
     let f = tempfile::tempfile().expect("tempfile");
     let mut c = cosca::Command::new();
@@ -333,10 +352,11 @@ fn fd3_file_is_not_a_tty() {
     assert!(s.contains("isatty=0"), "file on fd3 is not a tty: {s}");
 }
 
+#[cfg(windows)]
 /// NUL is `FILE_TYPE_CHAR` -> `classify` = `CharDev` -> `FDEV`, so the child's `_isatty(3)` is
 /// nonzero (MSVCRT returns the raw `FDEV` bit, `0x40`, not a normalized 1 — the file/pipe case
 /// still returns 0). Deterministic `CharDev` coverage without allocating a real console.
-#[test]
+#[skuld::test]
 fn fd3_nul_is_a_char_device() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -357,9 +377,10 @@ fn fd3_nul_is_a_char_device() {
     assert_ne!(val, 0, "NUL on fd3 is a char device (tty), got {s}");
 }
 
+#[cfg(windows)]
 /// A descriptor whose dense fd table would exceed the `WORD`-sized `cbReserved2` field is rejected
 /// up front (before any allocation), as `Unsupported`.
-#[test]
+#[skuld::test]
 fn oversized_fd_is_unsupported() {
     let e = cosca::Command::new()
         .executable(common::testbin())
@@ -371,12 +392,13 @@ fn oversized_fd_is_unsupported() {
     assert!(matches!(e, cosca::error::Error::Unsupported { .. }), "{e:?}");
 }
 
+#[cfg(windows)]
 /// An argv-only command (no `.executable()`) that maps fd >= 3 still routes to the raw backend —
 /// `routes_to_raw_backend`'s OTHER trigger, independent of `executable()`. std has no way to hand a
 /// child fd >= 3 on Windows at all: `spawn_unelevated`'s fd >= 3 collection loop is
 /// `#[cfg(unix)]`-gated (`src/child/spawn.rs`), so fd 3 actually delivering the marker bytes below
 /// is itself proof this went through the raw backend.
-#[test]
+#[skuld::test]
 fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
     let mut c = cosca::Command::new();
     c.args([common::testbin(), "write-fd", "3", "argv-only-fd3"])
@@ -389,13 +411,14 @@ fn argv_only_fd3_routes_through_the_raw_backend_and_works() {
     assert_eq!(s, "argv-only-fd3");
 }
 
+#[cfg(windows)]
 /// The `CommandLine` arm of `program_token` (no `.executable()`, built with `.commandline(...)`
 /// instead of `.args(...)`) that maps fd >= 3: a different code path from the argv-only test
 /// above — `program_token` re-derives its token via `first_token_wide` on this arm rather than
 /// reusing `Argv`'s `argv.first()` (see `program_token`'s doc in `src/child/spawn/windows_raw.rs`).
 /// Same proof shape as `argv_only_fd3_routes_through_the_raw_backend_and_works` (see its doc for
 /// why fd 3 delivery proves raw-backend routing).
-#[test]
+#[skuld::test]
 fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
     let line = common::commandline_from(&[common::testbin(), "write-fd", "3", "commandline-only-fd3"]);
 
@@ -410,12 +433,13 @@ fn commandline_only_fd3_routes_through_the_raw_backend_and_works() {
 
 // Containment over the raw backend (Plan 12 Task 6) =====
 
+#[cfg(windows)]
 /// A CONTAINED child with fd >= 3 routes through the raw backend AND lands in OUR Job Object:
 /// `test_job_handle_contains_self()` confirms membership (immutable once assigned, so it is
 /// deterministic for a handle-pinned child regardless of run state), fd 3 delivers the child's
 /// bytes, and `kill_tree()` tears the tree down cleanly. EOF (child closing fd 3 on exit) bounds
 /// the read; no timer.
-#[test]
+#[skuld::test]
 fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -433,9 +457,10 @@ fn contained_raw_child_is_in_our_job_and_kill_tree_reaps() {
     child.kill_tree().expect("kill_tree");
 }
 
+#[cfg(windows)]
 /// An UNCONTAINED executable spawn (no `.contain()`) reports `Containment::None` — the raw backend
 /// wires containment only when requested; without it the child is a lone process.
-#[test]
+#[skuld::test]
 fn uncontained_raw_child_has_no_containment() {
     let mut c = cosca::Command::new();
     c.executable(common::testbin())
@@ -445,6 +470,7 @@ fn uncontained_raw_child_has_no_containment() {
     assert!(matches!(c.spawn().unwrap().containment(), cosca::Containment::None));
 }
 
+#[cfg(windows)]
 /// A `Command` with NO `.executable()` set still routes to the raw backend purely because it wires
 /// fd >= 3 (`routes_to_raw_backend`'s other trigger, independent of `executable()`). With no
 /// `executable()`, `image` used to be `None`, handing `CreateProcessW` a NULL `lpApplicationName`
@@ -483,7 +509,7 @@ fn uncontained_raw_child_has_no_containment() {
 /// lives ONLY in this tempdir cwd, never `System32` or the Windows directory either, the
 /// resolver's system-directory search step cannot accidentally find it and mask a cwd-search
 /// regression this test would otherwise catch.
-#[test]
+#[skuld::test]
 fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let decoy_program = "cosca_testbin_b2_cwd_decoy";
@@ -504,4 +530,13 @@ fn fd3_only_routing_does_not_load_a_binary_planted_in_the_process_cwd() {
     std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut s).unwrap();
     child.wait().unwrap();
     assert_eq!(s.trim(), "notfound", "helper report: {s}");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

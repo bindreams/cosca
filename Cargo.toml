@@ -151,6 +151,56 @@ name = "process_root"
 path = "tests/process_root.rs"
 harness = false
 
+[[test]]
+name = "raw_windows"
+path = "tests/raw_windows.rs"
+harness = false
+
+[[test]]
+name = "raw_windows_async"
+path = "tests/raw_windows_async.rs"
+harness = false
+
+[[test]]
+name = "windows_elevation_routes"
+path = "tests/windows_elevation_routes.rs"
+harness = false
+
+[[test]]
+name = "windows_env_block"
+path = "tests/windows_env_block.rs"
+harness = false
+
+[[test]]
+name = "windows_path_logic"
+path = "tests/windows_path_logic.rs"
+harness = false
+
+[[test]]
+name = "windows_path_resolution"
+path = "tests/windows_path_resolution.rs"
+harness = false
+
+[[test]]
+name = "windows_process_cwd"
+path = "tests/windows_process_cwd.rs"
+harness = false
+
+[[test]]
+name = "windows_shell_execute"
+path = "tests/windows_shell_execute.rs"
+harness = false
+
+[[test]]
+name = "windows_shell_resolution"
+path = "tests/windows_shell_resolution.rs"
+harness = false
+
+[[test]]
+name = "windows_testbin_ack"
+path = "tests/windows_testbin_ack.rs"
+harness = false
+
 [[bin]]
 name = "cosca_testbin"
 path = "testbin/main.rs"

@@ -9,18 +9,23 @@
 //!   `.env(ACK_ENV, ..)` the child dies and the mode cannot report.
 //! - `die`: the mode's child exits before connecting. The mode must fail naming the death instead
 //!   of blocking in a plain `accept()`.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use std::io::Read;
+#[cfg(windows)]
 use std::net::TcpListener;
 
+#[cfg(windows)]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(windows)]
 use common::Target;
 
+#[cfg(windows)]
 const SEAM_ENV: &str = "COSCA_TEST_ACK_SEAM";
 
+#[cfg(windows)]
 /// How a mode is launched and read.
 struct Case {
     /// The mode's argv after the executable, given the report address.
@@ -31,17 +36,20 @@ struct Case {
     one_line: bool,
 }
 
+#[cfg(windows)]
 struct Run {
     report: String,
     success: bool,
     stderr: String,
 }
 
+#[cfg(windows)]
 enum Helper {
     Std(std::process::Child),
     Cosca(cosca::Child),
 }
 
+#[cfg(windows)]
 impl Target for Helper {
     fn pid(&self) -> u32 {
         match self {
@@ -58,6 +66,7 @@ impl Target for Helper {
     }
 }
 
+#[cfg(windows)]
 fn run(case: &Case, seam: &str) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -107,13 +116,14 @@ fn run(case: &Case, seam: &str) -> Run {
     }
 }
 
+#[cfg(windows)]
 macro_rules! mode_tests {
     ($($module:ident: $case:expr;)*) => {$(
         mod $module {
             use super::*;
 
             /// The mode's child exits before connecting: the mode fails naming the death.
-            #[test]
+            #[skuld::test]
             fn death_watch_accept_or_die_fails_when_the_modes_child_dies_before_connecting() {
                 let r = run(&$case, "die");
                 assert!(!r.success, "the mode must fail, stderr: {}", r.stderr);
@@ -126,7 +136,7 @@ macro_rules! mode_tests {
             }
 
             /// The mode does not inherit the opt-in, so its own explicit one is what reaches the child.
-            #[test]
+            #[skuld::test]
             fn death_watch_accept_or_die_child_is_opted_in_by_the_mode_not_inherited() {
                 let r = run(&$case, "strict");
                 assert!(r.success, "the mode failed, stderr: {}", r.stderr);
@@ -136,27 +146,34 @@ macro_rules! mode_tests {
     )*};
 }
 
+#[cfg(windows)]
 fn nested_terminate_args(addr: &str) -> Vec<String> {
     ["cosca_testbin", "report-nested-terminate", addr]
         .map(String::from)
         .to_vec()
 }
+#[cfg(windows)]
 fn console_terminate_args(addr: &str) -> Vec<String> {
     ["report-console-terminate", addr].map(String::from).to_vec()
 }
+#[cfg(windows)]
 fn console_lone_args(addr: &str) -> Vec<String> {
     ["report-console-lone", addr].map(String::from).to_vec()
 }
+#[cfg(windows)]
 fn breakaway_raw_args(addr: &str) -> Vec<String> {
     ["report-breakaway", addr, "permit", "raw"].map(String::from).to_vec()
 }
+#[cfg(windows)]
 fn breakaway_argv_args(addr: &str) -> Vec<String> {
     ["report-breakaway", addr, "permit", "argv"].map(String::from).to_vec()
 }
+#[cfg(windows)]
 fn breakaway_exec_args(addr: &str) -> Vec<String> {
     ["report-breakaway", addr, "permit", "exec"].map(String::from).to_vec()
 }
 
+#[cfg(windows)]
 mode_tests! {
     report_nested_terminate: Case { args: nested_terminate_args, contained: true, one_line: false };
     report_console_terminate: Case { args: console_terminate_args, contained: false, one_line: false };
@@ -164,4 +181,13 @@ mode_tests! {
     report_breakaway_raw: Case { args: breakaway_raw_args, contained: false, one_line: true };
     report_breakaway_argv: Case { args: breakaway_argv_args, contained: false, one_line: true };
     report_breakaway_exec: Case { args: breakaway_exec_args, contained: false, one_line: true };
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
 }

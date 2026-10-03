@@ -35,7 +35,7 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// immediately after this call returns would only race whatever the shell handed the file off to,
 /// and could neither prove nor disprove anything about what runs after this call — nothing observed
 /// after a no-handle handoff is measured by this probe.
-#[test]
+#[skuld::test]
 fn does_pathext_outrank_an_existing_extensionless_file() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;
@@ -143,7 +143,7 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 /// No marker is read on those arms — a read taken immediately after the call returns would only
 /// race whatever the shell handed the file off to, and no wait, sleep or poll here would turn that
 /// race into proof.
-#[test]
+#[skuld::test]
 fn does_an_existing_extensionless_file_ever_launch_directly() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;

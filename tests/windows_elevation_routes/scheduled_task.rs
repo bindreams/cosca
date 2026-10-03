@@ -15,7 +15,7 @@ use crate::windows_probe::mark_test_passed;
 /// Deliberately does NOT run the task. Observing the resulting process's integrity would mean
 /// waiting on the Task Scheduler service with no handle to wait on, and the registration answer is
 /// the one that decides the route.
-#[test]
+#[skuld::test]
 fn can_this_caller_register_a_runlevel_highest_task() {
     if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
         return;

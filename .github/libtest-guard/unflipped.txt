@@ -10,8 +10,6 @@ test:linux_pidfd_refused
 test:linux_pidfd_wait
 test:macos_fdmarker
 test:payload_race
-test:raw_windows
-test:raw_windows_async
 test:spawn_io
 test:spawn_lock_reentry
 test:test_enablement
@@ -22,13 +20,5 @@ test:windows_breakaway
 test:windows_console
 test:windows_console_identity
 test:windows_creation_flags
-test:windows_elevation_routes
-test:windows_env_block
 test:windows_false_success
 test:windows_job_object
-test:windows_path_logic
-test:windows_path_resolution
-test:windows_process_cwd
-test:windows_shell_execute
-test:windows_shell_resolution
-test:windows_testbin_ack

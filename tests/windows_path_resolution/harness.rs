@@ -24,7 +24,7 @@ fn mark_canary_passed() {
     let name = std::thread::current()
         .name()
         .map(marker_file_name)
-        .expect("libtest names each test's thread");
+        .expect("skuld names each test's thread");
     let path = std::path::Path::new(&dir).join(&name);
     std::fs::write(&path, b"").unwrap_or_else(|e| panic!("could not write the canary marker {path:?}: {e}"));
 }

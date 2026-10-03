@@ -148,8 +148,8 @@ pub fn all_succeeded(steps: impl IntoIterator<Item = (&'static str, Result<(), S
     }
 }
 
-/// The marker file for the libtest test `test_name`: `::` is not allowed in a Windows file name,
-/// so module separators become `.`.
+/// The marker file for the test `test_name` (skuld's libtest-style trial name): `::` is not
+/// allowed in a Windows file name, so module separators become `.`.
 pub fn marker_file_name(test_name: &str) -> String {
     test_name.replace("::", ".")
 }
