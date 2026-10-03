@@ -1105,6 +1105,15 @@ pub(crate) fn resolve_identity(
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
             Ok(Peek::Running | Peek::Exit(_)) => read,
+            // macOS: held by launchd after its tracer died. It is neither shown reaped nor shown
+            // ours, so it is unverifiable, not "reaped by another party".
+            #[cfg(target_os = "macos")]
+            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => {
+                log::warn!(
+                    "child {pid}: launchd holds it, so its tracer died; it cannot be shown to be ours or reaped"
+                );
+                Resolved::Unknown
+            }
             Ok(Peek::Foreign(_)) => Resolved::Gone,
             Err(e) => {
                 log::warn!("child {pid}: its identity could not be checked against its handle ({e}); it is not shown to be ours");
@@ -1345,7 +1354,7 @@ impl Unadopted for HeldStdChild {
 /// already collected: std reaps the child of a spawn it fails; tokio can fail a spawn after std's
 /// succeeded, and drops the child neither killed nor reaped.
 #[cfg(target_os = "linux")]
-pub(super) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
+pub(crate) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
     use crate::wait::exit_only::{peek, Peek};
 
     let child = PidfdChild::new(pid, pidfd);

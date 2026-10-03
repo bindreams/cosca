@@ -474,3 +474,88 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
         "the child is reaped already: nothing is left for the test to reap"
     );
 }
+
+/// A teardown whose kill is refused (`EPERM`, as a setuid child answers) while the child is still
+/// ours must not hand tokio's `Child` to its drop: tokio would reap it later with `waitpid(pid)`
+/// from its orphan queue, when the number may name another process. tokio's `Child` is forgotten
+/// and the child goes to the pidfd teardown (another kill, then a reap through the pidfd). The
+/// seam refuses only the first kill, so that teardown's kill lands and its reap is recorded.
+///
+/// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
+/// recorded); the arm forgets it and does nothing else (no teardown reap is recorded).
+#[cfg(target_os = "linux")]
+fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box<dyn std::any::Any>>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::spawn::fault;
+
+    let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
+    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let (slot, armed) = (Rc::clone(&slot), Rc::clone(&armed));
+        move || {
+            *slot.borrow_mut() = Some(Witness::new(fault::spawn_pid()));
+            // Armed here, not before `spawn()`: the handshake's own peeks run first.
+            *armed.borrow_mut() = armed_in_hook.map(|arm| arm());
+        }
+    });
+    fault::set_force_attach_failure(attach_failure);
+    fault::set_force_kill_failure_leaving_child_alive_as("teardown refused", std::io::ErrorKind::PermissionDenied);
+    let forgets = super::drop_fault::record();
+    let backend_drops = super::fault::count_backend_drops();
+    let reaps = fault::record_teardown_reaps();
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("stdin");
+
+    let err = cmd.spawn().err();
+
+    fault::set_force_attach_failure(false);
+    drop(armed);
+    assert!(err.is_some(), "the forced failure fails the spawn");
+    assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
+    assert_eq!(
+        backend_drops.get(),
+        0,
+        "tokio's Child must not have been released to its drop"
+    );
+    let recorded = reaps.recorded();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the pidfd teardown must have reaped the child: {recorded:?}"
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&recorded[0].1),
+        Some(libc::SIGKILL)
+    );
+    let witness = slot.borrow_mut().take().expect("the hook ran");
+    assert!(witness.reap().is_err(), "the child is reaped already");
+}
+
+/// `reap_now`'s refused-kill arm (a forced attach failure).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn reap_now_after_a_refused_kill_on_a_live_child_reaps_through_the_pidfd() {
+    crate::tokio::test_runtime::assert_current_thread();
+    refused_kill_teardown(true, None);
+}
+
+/// `teardown_through_pidfd`'s refused-kill arm (a failed identity peek).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_failed_identity_peek_with_a_refused_kill_reaps_through_the_pidfd() {
+    use crate::wait::exit_only::seams::force_peeks;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    refused_kill_teardown(
+        false,
+        Some(|| {
+            Box::new(force_peeks([Err(std::io::Error::other(
+                "forced identity-check failure 77a1",
+            ))]))
+        }),
+    );
+}

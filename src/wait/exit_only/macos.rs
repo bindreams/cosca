@@ -120,11 +120,13 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
         // `kern_exit.c:2612-2613` and `:2748`, which sends the `SIGCHLD` to launchd). It comes
         // back to us only if launchd waits on it: `reap_child_locked` then finds `p_oppid`, hands
         // it back and re-sends `NOTE_EXIT` (`:2864-2912`). On CI launchd never did, in a 30 s
-        // window, so this is taken for reaped. The sync child's later `wait` or `try_wait` still
-        // reaps the zombie if that hand-back ever comes; the tokio backend forgets it.
+        // window, so it is reported apart, as `Orphaned`: not ours to reap and not shown reaped.
+        // The sync child's later `wait` or `try_wait` still reaps the zombie if that hand-back
+        // ever comes; the tokio backend forgets it. A spawn that meets it fails unverifiable, and
+        // its child (dropped or forgotten) is not reaped by pid, so a hand-back leaves the zombie.
         Peek::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
             Held::Other => Ok(Peek::Foreign(Foreign::Other)),
-            Held::Parent(ppid) if ppid == LAUNCHD => Ok(peeked),
+            Held::Parent(ppid) if ppid == LAUNCHD => Ok(Peek::Foreign(Foreign::Orphaned)),
             Held::Parent(_) => Ok(Peek::Running),
             // `ESRCH` with `arg = 1` is a reap: a process resolves from `P_REF_DEAD` until then.
             Held::Gone => Ok(peeked),
@@ -136,7 +138,7 @@ pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<Peek>
                 format!("pid {pid}: its identity could not be read (errno {errno}); it cannot be shown to be reaped"),
             )),
         },
-        Peek::Foreign(Foreign::Other) => Ok(peeked),
+        Peek::Foreign(Foreign::Other | Foreign::Orphaned) => Ok(peeked),
     }
 }
 

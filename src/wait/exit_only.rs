@@ -72,6 +72,12 @@ pub(crate) enum Foreign {
     /// The pid names another process now: its start time differs from the child's.
     #[cfg(target_os = "macos")]
     Other,
+    /// `ECHILD` for a pid that still names the child, held by launchd: its tracer died and XNU
+    /// reparented it. It is not this process's to reap, and the caller cannot tell it from a reap, so
+    /// it stays unverifiable rather than "reaped by another party". Nothing is signalled or reaped
+    /// by pid.
+    #[cfg(target_os = "macos")]
+    Orphaned,
 }
 
 /// What [`peek`] saw.

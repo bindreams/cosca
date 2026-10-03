@@ -468,18 +468,21 @@ fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
 /// A by-pid `ECHILD` for a pid that still names the child but that launchd owns: a zombie whose
 /// tracer died and which XNU reparented to launchd. Only a wait by launchd would hand it back.
 ///
-/// Mutant: the parent ignored: `Running`.
+/// Mutant: the parent ignored: `Running`; the launchd hold mapped to `Gone` (a reap).
 #[skuld::test]
-fn an_echild_for_a_pid_orphaned_to_launchd_is_foreign() {
+fn an_echild_for_a_pid_orphaned_to_launchd_is_orphaned() {
     let (pid, unique) = echild_yet_resolvable();
     let target = Target::pid(pid, Some(unique));
     let forced = orphaned_to_launchd();
-    assert_eq!(exit_only::peek(&target).expect("peek"), Peek::Foreign(Foreign::Gone));
+    assert_eq!(
+        exit_only::peek(&target).expect("peek"),
+        Peek::Foreign(Foreign::Orphaned)
+    );
     drop(forced);
     let _forced = orphaned_to_launchd();
     assert_eq!(
         exit_only::try_reap(&target).expect("try_reap"),
-        exit_only::Reap::Foreign(Foreign::Gone)
+        exit_only::Reap::Foreign(Foreign::Orphaned)
     );
 }
 

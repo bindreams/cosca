@@ -6,7 +6,7 @@ use std::rc::Rc;
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
-    exists, kill_and_reap, other_unique_id, reap_by_pid, record_pid, vanished,
+    arm_launchd_hold, has_not_exited, kill_and_reap, other_unique_id, reap_by_pid, record_pid, vanished,
 };
 use crate::error::Error;
 use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
@@ -63,6 +63,28 @@ async fn macos_tokio_spawn_identity_with_a_different_unique_id_is_gone() {
     assert!(vanished(&err), "another unique id is Gone, not Unassessable: {err:?}");
 }
 
+/// As the sync twin: a launchd hold at the re-read is `Unassessable`, not a vanish.
+///
+/// Mutant: the launchd hold maps to `Gone`.
+#[skuld::test]
+async fn macos_tokio_spawn_identity_held_by_launchd_is_unassessable() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, writer) = tokio_blocker();
+    let pid = Rc::new(Cell::new(0));
+    let armed: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::default();
+    let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
+        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        move || arm_launchd_hold(&pid, &armed, writer)
+    });
+    let outcome = cmd.spawn();
+    drop(armed);
+    let err = outcome.expect_err("a launchd hold cannot be shown to be ours");
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "a hold by launchd is unverifiable, not a vanish: {err:?}"
+    );
+}
+
 /// As the sync twin: the failed re-read fails the spawn `Unassessable` and warns. Nothing pins
 /// the pid, so the child is left running and unsignalled, and tokio's `Child` is forgotten.
 ///
@@ -104,7 +126,7 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
     assert!(
-        exists(pid.get()),
+        has_not_exited(pid.get()),
         "the child must be left running, unsignalled and unreaped"
     );
     kill_and_reap(pid.get());
@@ -124,7 +146,10 @@ async fn macos_tokio_spawn_first_read_gone_is_gone_and_leaves_the_child() {
         .spawn()
         .expect_err("a first read that finds nothing fails the spawn");
     assert!(vanished(&err), "no process is Gone, not Unassessable: {err:?}");
-    assert!(exists(pid.get()), "nothing may have signalled or reaped the pid");
+    assert!(
+        has_not_exited(pid.get()),
+        "nothing may have signalled or reaped the pid"
+    );
     kill_and_reap(pid.get());
 }
 
@@ -145,6 +170,6 @@ async fn macos_tokio_spawn_first_read_refused_is_unassessable_and_leaves_the_chi
     let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
         panic!("the refused arm must have captured the child's identity")
     };
-    assert!(exists(id.pid()), "nothing may have signalled or reaped the pid");
+    assert!(has_not_exited(id.pid()), "nothing may have signalled or reaped the pid");
     kill_and_reap(id.pid());
 }

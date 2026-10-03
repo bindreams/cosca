@@ -676,22 +676,17 @@ impl ProcSource {
     /// when this runs.
     pub(crate) fn reap_now(mut self, pid: u32) {
         crate::bounded::assert_may_block("reap_now");
-        #[cfg(test)]
-        let forced = crate::child::spawn::fault::take_force_kill_failure();
-        #[cfg(not(test))]
-        let forced: Option<(&str, std::io::ErrorKind, bool)> = None;
-        let killed = match forced {
-            // The sync seam's "leave it alive" form is the only one this path honours: it replaces
-            // the kill, so the child really is left unsignalled.
-            Some((marker, kind, _)) => Err(Error::Io(std::io::Error::new(kind, marker))),
-            None => self.signal(Sig::Kill),
-        };
+        let killed = self.teardown_kill();
         if let Err(e) = &killed {
             // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten.
             #[cfg(unix)]
             self.forget_if_foreign();
-            // Released before the log and the assertion: a panic from either must not strand a
-            // child that is ours, which tokio's orphan reaper would otherwise never see.
+            // Handed off before the log and the assertion: a panic from either must not strand a
+            // child that is ours. Linux: through its pidfd, never to tokio's orphan queue, whose
+            // `waitpid(pid)` could one day reap a reused pid.
+            #[cfg(target_os = "linux")]
+            self.hand_to_pidfd_reaper(pid);
+            #[cfg(not(target_os = "linux"))]
             self.release();
             log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
             // `EPERM` is a setuid child refusing the kill, reachable without a bug: it alone is not
@@ -711,19 +706,53 @@ impl ProcSource {
         self.release();
     }
 
+    /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
+    /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
+    fn teardown_kill(&self) -> Result<Sent, Error> {
+        #[cfg(test)]
+        if let Some((marker, kind, _)) = crate::child::spawn::fault::take_force_kill_failure() {
+            return Err(Error::Io(std::io::Error::new(kind, marker)));
+        }
+        self.signal(Sig::Kill)
+    }
+
+    /// A child whose teardown kill was refused (a setuid child answers `EPERM`) and that is not
+    /// shown reaped elsewhere: tokio's `Child` is forgotten, never dropped or released, because
+    /// tokio would reap it later with `waitpid(pid)` from its orphan queue, when the number may
+    /// name another process. The child goes to the same teardown the sync spawn uses, through a
+    /// duplicate of its pidfd: another kill, then a reap through the pidfd, or one non-blocking
+    /// look and a background reap through the pidfd once it exits. Nothing is left if the backend is
+    /// already forgotten.
+    #[cfg(target_os = "linux")]
+    fn hand_to_pidfd_reaper(mut self, pid: u32) {
+        let ProcSource::Tokio { pidfd, .. } = &self else {
+            return;
+        };
+        let pidfd = match pidfd.try_clone() {
+            Ok(pidfd) => pidfd,
+            Err(e) => {
+                log::warn!("child {pid}: its pidfd could not be duplicated ({e}); it is left as it is");
+                self.forget_foreign();
+                return;
+            }
+        };
+        self.forget_foreign();
+        crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd);
+    }
+
     /// Linux teardown of a spawn whose identity check could not answer: kill the child through its
     /// pidfd, which pins it whatever any peek said, then reap it through the same pidfd, and forget
     /// tokio's `Child` (its drop would reap a pid that is already collected). Consumes the backend.
-    /// A refused kill is handled as in [`reap_now`](ProcSource::reap_now). **Invariant:** no `wait()`
-    /// future for this child is in flight.
+    /// A refused kill is handled as in [`reap_now`](ProcSource::reap_now): the child goes to the
+    /// pidfd reaper. **Invariant:** no `wait()` future for this child is in flight.
     #[cfg(target_os = "linux")]
     pub(crate) fn teardown_through_pidfd(mut self, pid: u32) {
         use crate::wait::exit_only::{self, Target};
 
         crate::bounded::assert_may_block("teardown_through_pidfd");
-        if let Err(e) = self.signal(Sig::Kill) {
+        if let Err(e) = self.teardown_kill() {
             self.forget_if_foreign();
-            self.release();
+            self.hand_to_pidfd_reaper(pid);
             log::warn!("teardown kill of child {pid} failed ({e}); it is not waited on");
             debug_assert!(
                 matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
