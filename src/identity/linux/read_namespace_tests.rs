@@ -15,7 +15,7 @@ use crate::test_child::namespaces as ns;
 /// "`read_stat` ignores the view" — `of(1)` resolves the outer init; "an unavailable view
 /// resolves a live child to `Gone`" - `of(child)` is `Gone`; "`spawn_identity_error` names no
 /// cause" - the spawn's error carries no view.
-#[test]
+#[skuld::test]
 fn namespaces_an_outer_procfs_gives_current_its_own_token_and_reads_unknown() {
     if !ns::enabled() {
         return;
@@ -23,7 +23,7 @@ fn namespaces_an_outer_procfs_gives_current_its_own_token_and_reads_unknown() {
     ns::run(fixture_path!(fixture_outer_procfs_outer));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_outer_procfs_outer() {
     if !ns::is_child() {
         return;
@@ -32,7 +32,7 @@ fn fixture_outer_procfs_outer() {
     ns::run(fixture_path!(fixture_outer_procfs_inner));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_outer_procfs_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;

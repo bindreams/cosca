@@ -1,10 +1,10 @@
-#[test]
+#[skuld::test]
 fn detect_reports_windows_os() {
     let h = crate::elevation::plan::Host::detect(crate::elevation::Backend::Auto, &crate::elevation::Auth::Interactive);
     assert_eq!(h.os, crate::elevation::plan::Os::Windows);
 }
 
-#[test]
+#[skuld::test]
 fn integrity_level_is_always_answerable() {
     // Every Windows process has a mandatory integrity label; a `None` here means the
     // aligned two-call token read is broken, not that the runner lacks an answer. Fail
@@ -15,7 +15,7 @@ fn integrity_level_is_always_answerable() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn is_elevated_agrees_with_integrity_level() {
     // Privilege-independent invariant (never assume ambient privilege): a full
     // (elevated) token runs at High+ integrity; a filtered token is Medium. This
@@ -51,7 +51,7 @@ fn unsupported_detail<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
     }
 }
 
-#[test]
+#[skuld::test]
 fn piped_stdio_is_unsupported() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
@@ -59,7 +59,7 @@ fn piped_stdio_is_unsupported() {
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
 
-#[test]
+#[skuld::test]
 fn null_and_merge_stdio_are_unsupported() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
@@ -72,7 +72,7 @@ fn null_and_merge_stdio_are_unsupported() {
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
 
-#[test]
+#[skuld::test]
 fn high_fd_is_unsupported() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
@@ -80,7 +80,7 @@ fn high_fd_is_unsupported() {
     assert!(is_unsupported(super::reject_unsupported_config(&c)));
 }
 
-#[test]
+#[skuld::test]
 fn env_and_contain_are_unsupported() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().env("FOO", "bar");
@@ -91,7 +91,7 @@ fn env_and_contain_are_unsupported() {
     assert!(is_unsupported(super::reject_unsupported_config(&c2)));
 }
 
-#[test]
+#[skuld::test]
 fn inherit_only_is_accepted() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
@@ -127,7 +127,7 @@ fn nul_between(prefix: &str, suffix: &str) -> std::ffi::OsString {
     )
 }
 
-#[test]
+#[skuld::test]
 fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privilege() {
     // Piped stdio must fail with Unsupported and never prompt — the gate runs BEFORE the
     // already-elevated short-circuit, so the verdict is identical for elevated=false/true.
@@ -142,7 +142,7 @@ fn launch_runas_rejects_bad_config_before_the_short_circuit_regardless_of_privil
     }
 }
 
-#[test]
+#[skuld::test]
 fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -154,7 +154,7 @@ fn commandline_elevated_is_unsupported_on_windows_regardless_of_privilege() {
 /// An argv-less command is not a `commandline()` one. Both of these are reachable from the public
 /// builder and neither calls `.commandline()`, so naming it sends the caller to audit a line of
 /// their code that does not exist — and says nothing about the program they actually failed to set.
-#[test]
+#[skuld::test]
 fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
     let mut by_executable = Command::new();
     by_executable.executable("x.exe").elevate();
@@ -184,7 +184,7 @@ fn an_argv_less_command_is_not_reported_as_a_commandline_command() {
 /// still pass against a seam that refused everything — and "no consent prompt ever happens" is not
 /// the property this file is pinning. A clean inherit-only request on an UNELEVATED host must
 /// reach `Launch`, with every `SHELLEXECUTEINFOW` string built and NUL-terminated.
-#[test]
+#[skuld::test]
 fn a_clean_unelevated_request_plans_a_launch() {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -217,7 +217,7 @@ fn a_clean_unelevated_request_plans_a_launch() {
 
 /// A `%` in `current_dir()` is refused, whatever the caller's privilege: whether the consent
 /// launch expands it in `lpDirectory` is unmeasured.
-#[test]
+#[skuld::test]
 fn a_percent_in_current_dir_is_refused() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -235,7 +235,7 @@ fn a_percent_in_current_dir_is_refused() {
 }
 
 /// The affirmative leg with a `current_dir()`: `lpDirectory` carries it, wide and NUL-terminated.
-#[test]
+#[skuld::test]
 fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"])
@@ -253,7 +253,7 @@ fn a_clean_request_with_a_current_dir_plans_a_launch_in_it() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn already_elevated_inherit_only_is_run_as_is() {
     // The RunAsIs branch: an inherit-only elevated request on an already-elevated host
     // passes the gate and short-circuits (no ShellExecuteEx).
@@ -268,7 +268,7 @@ fn already_elevated_inherit_only_is_run_as_is() {
 /// Kills replacing `elevated_program`'s `Exact` arm with `let program = token;`, which hands
 /// `ShellExecuteEx` a path-less `lpFile` to search (see `absolutise_exact`'s doc): the result must
 /// be absolute, and for a relative input must DIFFER from the token as written.
-#[test]
+#[skuld::test]
 fn elevated_exact_program_is_completed_to_an_absolute_path() {
     let mut c = Command::new();
     c.raw_executable("tool.exe").args(["tool.exe"]).elevate();
@@ -292,7 +292,7 @@ fn elevated_exact_program_is_completed_to_an_absolute_path() {
 /// extensionless `lpFile` may still be PATHEXT-completed by `ShellExecuteEx` (measured without a
 /// class, unmeasured for the `exefile` consent launch). Relative too, since completion does not add
 /// an extension.
-#[test]
+#[skuld::test]
 fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
     for n in [r"C:\tools\setup", "setup", r"C:\tools\setup.bat.exe.lnk"] {
         let mut c = Command::new();
@@ -312,7 +312,7 @@ fn an_extensionless_exact_program_is_refused_on_the_consent_path() {
 /// The allowlist is part of `shell_file::reject_elevated_program`, which runs above the
 /// short-circuit, so an already-elevated caller gets the same refusal though it re-spawns through
 /// `CreateProcessW`, which assumes no default extension.
-#[test]
+#[skuld::test]
 fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
     let mut c = Command::new();
     c.raw_executable(r"C:\tools\setup").args([r"C:\tools\setup"]).elevate();
@@ -320,7 +320,7 @@ fn an_extensionless_exact_program_is_refused_when_already_elevated_too() {
 }
 
 /// Negative control: a loadable image name still plans a launch.
-#[test]
+#[skuld::test]
 fn an_exact_exe_or_com_program_plans_a_launch() {
     for n in [r"C:\tools\setup.exe", r"C:\tools\SETUP.COM", "setup.exe"] {
         let mut c = Command::new();
@@ -336,7 +336,7 @@ fn an_exact_exe_or_com_program_plans_a_launch() {
 /// token is passed to `ShellExecuteEx` as written, so an extensionless one could be
 /// PATHEXT-completed. The bare `whoami` is not fully qualified either; the allowlist refuses it
 /// first.
-#[test]
+#[skuld::test]
 fn an_extensionless_search_program_is_refused_on_the_consent_path() {
     for (via, c) in search_commands(&[r"C:\tools\setup", "whoami"]) {
         match super::plan_runas(&c, &win_host(false)) {
@@ -353,7 +353,7 @@ fn an_extensionless_search_program_is_refused_on_the_consent_path() {
 
 /// Negative control for the `Search` and argv[0] arms. Fully qualified: a bare `whoami.exe` is
 /// refused (see `launch_runas_refuses_a_program_that_is_not_fully_qualified`).
-#[test]
+#[skuld::test]
 fn a_search_exe_or_com_program_plans_a_launch() {
     for (via, c) in search_commands(&[r"C:\tools\setup.exe", r"C:\Windows\System32\WHOAMI.COM"]) {
         assert!(
@@ -365,7 +365,7 @@ fn a_search_exe_or_com_program_plans_a_launch() {
 
 /// The batch gate applies to every arm, before the planner, and judges the name Win32 normalises
 /// the token to — a stream piece included, on a token ending in `.exe`/`.com`.
-#[test]
+#[skuld::test]
 fn a_search_batch_reached_through_normalisation_is_refused_regardless_of_privilege() {
     let probes = [
         r"C:\t\setup.bat.",
@@ -404,7 +404,7 @@ fn search_commands(names: &[&str]) -> Vec<(String, Command)> {
 /// `ShellExecuteEx` takes a show-command and no creation-flag word, so this is the only knob the
 /// consent launch has for the window-suppression intent. Two inputs, two values: a constant
 /// implementation fails one of the pair.
-#[test]
+#[skuld::test]
 fn runas_hides_the_window_when_no_window_is_requested() {
     use crate::command::flags::FlagsRequest;
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -415,7 +415,7 @@ fn runas_hides_the_window_when_no_window_is_requested() {
     assert_eq!(super::runas_show_command(&flags), SW_HIDE);
 }
 
-#[test]
+#[skuld::test]
 fn runas_shows_the_window_by_default() {
     use crate::command::flags::FlagsRequest;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -425,7 +425,7 @@ fn runas_shows_the_window_by_default() {
 /// The consent launch accepts no creation flags at all, so a raw word is refused rather than
 /// silently dropped. Stated over the RECORDED state, not "a method was called": `creation_flags(0)`
 /// requests nothing, so there is nothing to refuse.
-#[test]
+#[skuld::test]
 fn elevation_rejects_raw_creation_flags() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"])
@@ -435,14 +435,14 @@ fn elevation_rejects_raw_creation_flags() {
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
-#[test]
+#[skuld::test]
 fn elevation_accepts_a_zero_creation_flags_word() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().creation_flags(0);
     assert!(super::reject_unsupported_config(&c).is_ok());
 }
 
-#[test]
+#[skuld::test]
 fn elevation_rejects_detached() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().detached();
@@ -450,7 +450,7 @@ fn elevation_rejects_detached() {
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
-#[test]
+#[skuld::test]
 fn elevation_rejects_breakaway() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"])
@@ -463,7 +463,7 @@ fn elevation_rejects_breakaway() {
 /// The one flag intent that survives the gate — which is the whole of the elevated half of the
 /// window-suppression feature. Without this leg, a future tightening could take it away again in
 /// silence, and the three rejections above would all still pass.
-#[test]
+#[skuld::test]
 fn elevation_accepts_no_window() {
     let mut c = Command::new();
     c.args([r"C:\Windows\System32\whoami.exe"]).elevate().no_window();
@@ -483,7 +483,7 @@ fn elevation_accepts_no_window() {
 ///
 /// Tested directly on the builder rather than through `ShellExecuteExW`, so it needs no UAC
 /// prompt and no elevated child.
-#[test]
+#[skuld::test]
 fn wide_nul_refuses_an_interior_nul_in_any_value() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -517,7 +517,7 @@ fn wide_nul_refuses_an_interior_nul_in_any_value() {
 
 /// The ordinary case still works, so the guard above is gating NULs rather than rejecting
 /// everything — and the result really is NUL-TERMINATED, which is what `PCWSTR` requires.
-#[test]
+#[skuld::test]
 fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
     let w = super::wide_nul("program path", std::ffi::OsStr::new("C:\\tools\\app.exe")).unwrap();
     assert_eq!(w.last(), Some(&0), "the buffer must be NUL-terminated: {w:?}");
@@ -547,7 +547,7 @@ fn wide_nul_accepts_an_ordinary_value_and_terminates_it() {
 ///
 /// Run for both privilege levels because the check now sits above the short-circuit: an
 /// already-elevated caller must get the same refusal, not a silent `AlreadyElevated`.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -604,7 +604,7 @@ fn launch_runas_refuses_a_truncating_nul_regardless_of_privilege() {
 /// interior NUL for the same reason on the same field, and restating it per path is what let
 /// "elevated program path" drift away from "program path" — a wording difference a caller reads as
 /// two different defects.
-#[test]
+#[skuld::test]
 fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
     let token = nul_between(r"C:\tools\x.exe", "junk");
 
@@ -638,7 +638,7 @@ fn the_elevated_and_raw_paths_word_the_nul_refusal_identically() {
 /// Privilege-independent for the same reason as the config gate: the already-elevated caller
 /// falls through to a backend that refuses this, so refusing it here keeps the verdict a property
 /// of the request rather than of the host.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
     for elevated in [false, true] {
         for probe in ["setup.bat", "setup.cmd", "SETUP.BAT"] {
@@ -654,7 +654,7 @@ fn launch_runas_refuses_a_batch_program_regardless_of_privilege() {
 
 /// An `Exact` batch file reached only through Win32 normalisation is refused as the batch file it
 /// is, before the planner, so the verdict does not depend on privilege.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_of_privilege() {
     for elevated in [false, true] {
         // Trailing dot; one trailing space; a file named `.bat`.
@@ -673,7 +673,7 @@ fn launch_runas_refuses_an_exact_batch_reached_through_normalisation_regardless_
 /// A token ShellExecuteEx would complete by lookup is refused: an extension-less one can become
 /// `setup.bat` (`PathResolveW` with `PRF_TRYPROGRAMEXTENSIONS`), and any other extension runs
 /// through its association.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
     for elevated in [false, true] {
         for probe in [
@@ -695,7 +695,7 @@ fn launch_runas_refuses_a_program_not_ending_in_exe_or_com() {
 
 /// An elevated program that is not fully qualified is refused: a relative or bare token leaves
 /// ShellExecuteEx a lookup to make, App Paths included, which is unmeasured for the consent launch.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
     for elevated in [false, true] {
         for probe in ["whoami.exe", r"tools\setup.exe", r"\tools\setup.exe", "C:setup.exe"] {
@@ -712,7 +712,7 @@ fn launch_runas_refuses_a_program_that_is_not_fully_qualified() {
 /// A token ShellExecuteEx rewrites before it opens it is refused, whatever it rewrites to: a
 /// quoted batch path and a percent-encoded `file:` URL both open `setup.bat`. The quote is refused
 /// as a quote; the rest end in no `.exe`/`.com`.
-#[test]
+#[skuld::test]
 fn launch_runas_refuses_a_token_shell_execute_rewrites() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -736,7 +736,7 @@ fn launch_runas_refuses_a_token_shell_execute_rewrites() {
 /// launches `C:\tools\setup`, a different program than the caller named and no batch file at all.
 /// Whichever gate refuses it must therefore say NUL and not CVE-2024-24576, or the caller is sent
 /// to audit a vector they do not carry while the wrong image still runs elevated.
-#[test]
+#[skuld::test]
 fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -791,7 +791,7 @@ fn nul_bearing_batch_looking_path_is_diagnosed_as_a_nul_not_a_batch_refusal() {
 /// The mirror shape: `setup.bat` + NUL + `junk`, which Win32 truncates back to the real batch file
 /// `setup.bat`. Its extension is the one the batch rule could plausibly claim, so this pins that
 /// the caller is still told about the NUL — their actual defect — and not about batch escaping.
-#[test]
+#[skuld::test]
 fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -841,7 +841,7 @@ fn a_nul_after_a_batch_extension_is_blamed_on_the_nul_not_the_batch_gate() {
 /// `args(["setup.bat\0junk", "x\0y"])` came back "argument 1" and never mentioned that the program
 /// path — the field deciding which image runs ELEVATED — is truncating too. NUL on the program
 /// path first, for attribution, as on the raw backend.
-#[test]
+#[skuld::test]
 fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -872,7 +872,7 @@ fn a_poisoned_program_path_is_named_before_a_poisoned_argument_or_cwd() {
 /// program too, so the program's own check short-circuits before `lpDirectory` is ever built. A
 /// clean `.bat` with a truncating `current_dir()` is a NUL the caller can fix, and "batch escaping
 /// is not implemented" would never mention that `lpDirectory` truncates as well.
-#[test]
+#[skuld::test]
 fn a_poisoned_working_directory_is_named_before_the_batch_gate() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -902,7 +902,7 @@ fn a_poisoned_working_directory_is_named_before_the_batch_gate() {
 /// The other side of that ordering: the batch gate must not jump ahead of a poisoned ARGUMENT
 /// either. A clean `.bat` with a truncating argument is a NUL the caller can fix, and
 /// "batch escaping is not implemented" would hide it.
-#[test]
+#[skuld::test]
 fn a_poisoned_argument_is_named_before_the_batch_gate() {
     for elevated in [false, true] {
         let mut c = Command::new();
@@ -925,7 +925,7 @@ fn a_poisoned_argument_is_named_before_the_batch_gate() {
 /// does for a process handle. `0x3` is a handle that cannot be one: the kernel ignores a handle's
 /// low two bits, so this closes handle 0, which fails `ERROR_INVALID_HANDLE` without touching any
 /// real handle — and `is_invalid()` screens only 0 and -1.
-#[test]
+#[skuld::test]
 fn a_failed_token_close_is_logged() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();

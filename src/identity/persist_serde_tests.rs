@@ -29,13 +29,13 @@ fn linux_record() -> ProcessIdRecord {
     }
 }
 
-#[test]
+#[skuld::test]
 fn the_version_is_one() {
     // The wire literals below hard-code v1; a bump must come with a format decision.
     assert_eq!(RECORD_VERSION, 1);
 }
 
-#[test]
+#[skuld::test]
 fn a_windows_record_serializes_to_the_documented_json() {
     let json = serde_json::to_string(&windows_record()).expect("serialize");
     assert_eq!(
@@ -44,7 +44,7 @@ fn a_windows_record_serializes_to_the_documented_json() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_linux_record_serializes_to_the_documented_json() {
     let json = serde_json::to_string(&linux_record()).expect("serialize");
     assert_eq!(
@@ -53,7 +53,7 @@ fn a_linux_record_serializes_to_the_documented_json() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn the_token_survives_json_without_precision_loss() {
     // Windows tokens exceed 2^53 (9007199254740992), so a JSON *number* would be corrupted
     // by any consumer with double-precision numbers. It is a decimal string on the wire.
@@ -64,7 +64,7 @@ fn the_token_survives_json_without_precision_loss() {
     assert_eq!(back, windows_record());
 }
 
-#[test]
+#[skuld::test]
 fn records_round_trip_through_json() {
     for r in [windows_record(), linux_record()] {
         let json = serde_json::to_string(&r).expect("serialize");
@@ -73,7 +73,7 @@ fn records_round_trip_through_json() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_unknown_platform_tag_decodes_rather_than_failing() {
     // Forward compatibility: a record from a newer cosca on a platform this build does not
     // know must reach VALIDATION (which rejects it with a reason), not die in the decoder.
@@ -82,14 +82,14 @@ fn an_unknown_platform_tag_decodes_rather_than_failing() {
     assert_eq!(r.platform, Platform::Other("freebsd".into()));
 }
 
-#[test]
+#[skuld::test]
 fn an_unknown_version_decodes_rather_than_failing() {
     let json = r#"{"v":999,"platform":"linux","pid":7,"token":"99"}"#;
     let r: ProcessIdRecord = serde_json::from_str(json).expect("an unknown version must still decode");
     assert_eq!(r.version, 999);
 }
 
-#[test]
+#[skuld::test]
 fn unknown_fields_are_ignored() {
     // A v1 reader must tolerate additive fields from a later writer well enough to reach
     // the version check.
@@ -98,13 +98,13 @@ fn unknown_fields_are_ignored() {
     assert_eq!(r.pid, 7);
 }
 
-#[test]
+#[skuld::test]
 fn a_non_numeric_token_string_is_a_decode_error() {
     let json = r#"{"v":1,"platform":"linux","pid":7,"token":"not-a-number"}"#;
     assert!(serde_json::from_str::<ProcessIdRecord>(json).is_err());
 }
 
-#[test]
+#[skuld::test]
 fn a_foreign_platform_record_is_refused_after_a_json_round_trip() {
     // Cross-platform rejection driven entirely through the wire format, on whatever host
     // this test runs on: the record names the OTHER platform, so it must never restore.
@@ -124,7 +124,7 @@ fn a_foreign_platform_record_is_refused_after_a_json_round_trip() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_newer_version_record_is_refused_after_a_json_round_trip() {
     // Version is checked FIRST, before platform, precisely because a future format may
     // reuse these fields with different meanings — so the record below names THIS platform
@@ -147,7 +147,7 @@ fn a_newer_version_record_is_refused_after_a_json_round_trip() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_live_identity_survives_a_json_round_trip_on_this_host() {
     use crate::identity::ProcessId;
     let me = ProcessId::current();

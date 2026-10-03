@@ -18,7 +18,7 @@ const STAT_STARTED_AT_424242: &[u8] = b"4242 (x) S 1 4242 4242 0 -1 0 0 0 0 0 0 
 
 /// Mutant: "read `stat` by path whatever the view" - the unavailable view is ignored and the
 /// live process resolves.
-#[test]
+#[skuld::test]
 fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
     for view in UNAVAILABLE_VIEWS {
         let _forced = force_proc_view_once(view);
@@ -29,7 +29,7 @@ fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
 
 /// `kill(pid, 0)` answering `ESRCH` resolves the pid in this process's own namespace, so it is
 /// `Gone` whatever `/proc` shows. Mutant: "an unavailable view is always Unknown".
-#[test]
+#[skuld::test]
 fn of_a_pid_no_process_can_hold_is_gone_whatever_the_view() {
     for view in UNAVAILABLE_VIEWS {
         let _forced = force_proc_view_once(view);
@@ -39,7 +39,7 @@ fn of_a_pid_no_process_can_hold_is_gone_whatever_the_view() {
 }
 
 /// Mutant: "`exists`/`is_alive` map an unavailable view to `Gone`/`Dead`".
-#[test]
+#[skuld::test]
 fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailable() {
     let id = ProcessId::current();
     for view in UNAVAILABLE_VIEWS {
@@ -53,7 +53,7 @@ fn exists_and_is_alive_are_unknown_for_a_live_process_when_the_view_is_unavailab
 }
 
 /// Mutant: "`exists`/`is_alive` ask `/proc` only, so an unavailable view hides an `ESRCH`".
-#[test]
+#[skuld::test]
 fn exists_and_is_alive_are_gone_and_dead_for_a_pid_no_process_can_hold_whatever_the_view() {
     let id = ProcessId::from_parts_for_test(NO_PROCESS_CAN_HOLD, 1);
     for view in UNAVAILABLE_VIEWS {
@@ -67,7 +67,7 @@ fn exists_and_is_alive_are_gone_and_dead_for_a_pid_no_process_can_hold_whatever_
 }
 
 /// The ordinary view still resolves this process.
-#[test]
+#[skuld::test]
 fn a_live_process_is_present_and_alive_under_the_ordinary_view() {
     let id = ProcessId::current();
     assert_eq!(id.exists(), Existence::Present);
@@ -78,7 +78,7 @@ fn a_live_process_is_present_and_alive_under_the_ordinary_view() {
 /// the seam feeds that read is the one it carries, under every view.
 /// Mutants: "`current_token` reads by pid through the view" (`Unknown` under an unavailable
 /// view, so `current()` panics); "`current_token` reads `/proc` some other way" (ignores the seam).
-#[test]
+#[skuld::test]
 fn current_carries_the_token_read_from_self_under_every_view() {
     for view in UNAVAILABLE_VIEWS.map(Some).into_iter().chain([None]) {
         let _self_stat = force_self_stat_once(STAT_STARTED_AT_424242);
@@ -92,7 +92,7 @@ fn current_carries_the_token_read_from_self_under_every_view() {
 /// A host where `openat2` answers `ENOSYS` (kernel before 5.6) or `EPERM` (a seccomp filter): no
 /// view can be established, yet `/proc` is mounted and `current()` must still work.
 /// Mutant: "`current_token` opens the checked `/proc` when the view is not `Same`".
-#[test]
+#[skuld::test]
 fn current_works_where_openat2_is_unavailable() {
     let ordinary = ProcessId::current();
     for errno in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
@@ -103,7 +103,7 @@ fn current_works_where_openat2_is_unavailable() {
 
 /// Without `openat2` there is no view, so a by-pid read of a live pid is `Unknown`, and a pid
 /// no process can hold is still `Gone`.
-#[test]
+#[skuld::test]
 fn by_pid_reads_are_unknown_or_gone_where_openat2_is_unavailable() {
     let id = ProcessId::current();
     let _forced = force_openat2_errno(rustix::io::Errno::NOSYS);
@@ -115,7 +115,7 @@ fn by_pid_reads_are_unknown_or_gone_where_openat2_is_unavailable() {
 
 /// The exact text a caller sees when `openat2` is missing. Mutant: "the errno is dropped from
 /// the reason".
-#[test]
+#[skuld::test]
 fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
     let _forced = force_openat2_errno(rustix::io::Errno::NOSYS);
     let err = unknown_identity_error("the spawned child").expect("no openat2 is an error");
@@ -130,7 +130,7 @@ fn the_error_for_a_host_without_openat2_names_the_requirement_and_the_errno() {
 
 /// A diverged view keeps `Unassessable` and carries the view's reason, not the OS refusing.
 /// Mutant: "the cause is replaced by the generic refusal".
-#[test]
+#[skuld::test]
 fn the_error_for_a_diverged_view_carries_the_view() {
     let _forced = force_proc_view_once(ForcedView::Diverged);
     let err = unknown_identity_error("the spawned child").expect("a diverged view is an error");
@@ -142,13 +142,13 @@ fn the_error_for_a_diverged_view_carries_the_view() {
 }
 
 /// With a fine view, an `Unknown` is the OS's (`hidepid`, a racing exit) and has no view to blame.
-#[test]
+#[skuld::test]
 fn no_error_is_blamed_on_a_fine_view() {
     assert!(unknown_identity_error("the spawned child").is_none());
 }
 
 /// An armed alias answers only a read that found a `stat`: it never turns `Gone` into `Found`.
-#[test]
+#[skuld::test]
 fn alias_token_aliases_only_a_found_stat() {
     use super::fault::alias_token;
     use super::start_token_from;
@@ -173,7 +173,7 @@ fn alias_token_aliases_only_a_found_stat() {
 
 /// Dropping the guard ends the alias, and only its own pid's. Mutant: `AliasGuard::drop` removes
 /// nothing, or every pid's alias.
-#[test]
+#[skuld::test]
 fn dropping_the_alias_guard_ends_that_alias_only() {
     use super::fault::alias_token;
     use super::start_token_from;

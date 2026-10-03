@@ -44,13 +44,13 @@ fn assert_rejected(c: &Command, needle: &str) {
 
 // ===== composition =====
 
-#[test]
+#[skuld::test]
 fn the_shell_command_execs_the_quoted_argv() {
     // `exec` so the payload replaces /bin/sh rather than sitting under it.
     assert_eq!(shell("/usr/bin/id", &["-u"], None), "exec /usr/bin/id -u");
 }
 
-#[test]
+#[skuld::test]
 fn every_argv_element_is_shell_quoted() {
     // Hand-derived from the POSIX quoter's documented rule (single-quote wrap, `'`
     // written as '"'"'), not from running the code.
@@ -60,7 +60,7 @@ fn every_argv_element_is_shell_quoted() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_working_directory_becomes_an_explicit_cd() {
     // `do shell script` does not carry a cwd across the authorization trampoline,
     // so the cwd is stated in the command rather than assumed.
@@ -70,7 +70,7 @@ fn a_working_directory_becomes_an_explicit_cd() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn the_script_is_a_single_do_shell_script_statement() {
     let cmd = build_shell_command(OsStr::new("/usr/bin/id"), &args(&["-u"]), None).unwrap();
     assert_eq!(
@@ -80,7 +80,7 @@ fn the_script_is_a_single_do_shell_script_statement() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn both_quoting_layers_compose() {
     // Layer 1 wraps the argument in single quotes; layer 2 escapes the embedded
     // double quotes. Derived by hand from the two grammars.
@@ -92,7 +92,7 @@ fn both_quoting_layers_compose() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn non_utf8_argv_is_rejected_before_it_can_be_mangled() {
     #[cfg(unix)]
     {
@@ -109,7 +109,7 @@ fn non_utf8_argv_is_rejected_before_it_can_be_mangled() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn non_ascii_passes_through_unaltered() {
     // A CJK-named file argument to an ASCII-named tool is an ordinary macOS
     // command, not an exotic one. The bytes must reach the script verbatim; that
@@ -127,7 +127,7 @@ fn non_ascii_passes_through_unaltered() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn an_os_string_with_no_byte_form_is_a_typed_error_not_a_panic() {
     // The `not(unix)` arm of `os_bytes` exists to turn a WTF-16 OsString that has
     // no byte form into a typed error. Windows is the only place it is live, so it
@@ -169,7 +169,7 @@ fn script_len_for_arg(n: usize) -> usize {
     wrap_do_shell_script(&cmd, None).unwrap().len()
 }
 
-#[test]
+#[skuld::test]
 fn the_length_guard_accepts_exactly_arg_max_and_rejects_one_more() {
     let n = 1000;
     let exact = script_len_for_arg(n);
@@ -190,7 +190,7 @@ fn the_length_guard_accepts_exactly_arg_max_and_rejects_one_more() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn an_unknown_arg_max_disables_the_guard_rather_than_guessing() {
     let cmd = build_shell_command(OsStr::new("/bin/echo"), &[OsString::from("x".repeat(9_000))], None).unwrap();
     assert!(wrap_do_shell_script(&cmd, None).is_ok());
@@ -198,7 +198,7 @@ fn an_unknown_arg_max_disables_the_guard_rather_than_guessing() {
 
 // ===== structural gate =====
 
-#[test]
+#[skuld::test]
 fn a_plain_argv_command_is_accepted() {
     // `gui_cmd()` is default-constructed, so kill_on_drop is already `true`. This
     // pins that the default does NOT make the whole path unreachable.
@@ -206,7 +206,7 @@ fn a_plain_argv_command_is_accepted() {
     assert!(gate(&gui_cmd()).is_ok());
 }
 
-#[test]
+#[skuld::test]
 fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
     let mut c = Command::new();
     c.args(["mytool", "--apply"])
@@ -214,7 +214,7 @@ fn a_relative_program_is_rejected_so_roots_path_never_chooses_the_binary() {
     assert_rejected(&c, "absolute");
 }
 
-#[test]
+#[skuld::test]
 fn an_elevated_exact_program_that_names_no_file_is_refused() {
     for n in ["", ".", "dir/"] {
         let mut c = Command::new();
@@ -228,7 +228,7 @@ fn an_elevated_exact_program_that_names_no_file_is_refused() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     // `/usr/bin/id` must be accepted and `C:\tool.exe` rejected on EVERY host —
     // `Path::is_absolute` gets both backwards on Windows.
@@ -243,7 +243,7 @@ fn absoluteness_is_judged_by_posix_rules_not_the_build_hosts() {
     assert_rejected(&windows_style, "absolute");
 }
 
-#[test]
+#[skuld::test]
 fn a_relative_working_directory_is_rejected() {
     // It would resolve against two different bases: this process's directory for
     // osascript, and the trampoline's for the `cd -P --` inside the script.
@@ -252,28 +252,28 @@ fn a_relative_working_directory_is_rejected() {
     assert_rejected(&c, "absolute");
 }
 
-#[test]
+#[skuld::test]
 fn containment_is_rejected_because_the_payload_leaves_our_tree() {
     let mut c = gui_cmd();
     c.contain();
     assert_rejected(&c, "trampoline");
 }
 
-#[test]
+#[skuld::test]
 fn env_forwarding_is_rejected() {
     let mut c = gui_cmd();
     c.env("A", "1");
     assert_rejected(&c, "environment");
 }
 
-#[test]
+#[skuld::test]
 fn a_high_fd_is_rejected() {
     let mut c = gui_cmd();
     c.fd(3, crate::Stdio::null()).unwrap();
     assert_rejected(&c, "fd >= 3");
 }
 
-#[test]
+#[skuld::test]
 fn only_null_and_inherit_are_accepted_on_stdin() {
     // Every resolution with content behind it, including the `Merge` that
     // `Stdio::merge` produces — an allow-list, so nothing new slips through.
@@ -298,7 +298,7 @@ fn only_null_and_inherit_are_accepted_on_stdin() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn stdout_and_stderr_may_be_captured_because_they_carry_the_relay() {
     // These are osascript's OWN streams. Capturing them is how the caller sees the
     // relayed stdout at all, so `.output()` and `.read()` must work.
@@ -309,14 +309,14 @@ fn stdout_and_stderr_may_be_captured_because_they_carry_the_relay() {
     assert!(gate(&c).is_ok(), "output()/read() must be usable");
 }
 
-#[test]
+#[skuld::test]
 fn a_commandline_command_is_rejected() {
     let mut c = Command::new();
     c.commandline("id -u").elevation_auth(crate::elevation::Auth::Gui);
     assert_rejected(&c, "argv");
 }
 
-#[test]
+#[skuld::test]
 fn an_empty_command_is_rejected() {
     // BOTH internal spellings of "no program", which are separately reachable: a
     // fresh Command is `CommandInput::Empty`, while `.args([])` takes the `_ =>`
@@ -336,7 +336,7 @@ fn an_empty_command_is_rejected() {
     assert_rejected(&empty_argv, "program");
 }
 
-#[test]
+#[skuld::test]
 fn an_argv0_distinct_from_executable_is_rejected() {
     let mut c = Command::new();
     c.executable("/usr/bin/id")
@@ -346,7 +346,7 @@ fn an_argv0_distinct_from_executable_is_rejected() {
 }
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
     // Not as "not absolute": the leading-slash test cannot even run on an OsStr
     // with no byte form, so the gate must surface the real reason.
@@ -361,7 +361,7 @@ fn the_gate_reports_a_byte_formless_program_as_a_quote_error() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_matching_executable_yields_that_program_and_the_remaining_args() {
     // The `Some(exe)` success arm substitutes `exe` for argv[0] and slices the
     // tail; pin the returned pair, not merely the absence of a rejection.
@@ -376,7 +376,7 @@ fn a_matching_executable_yields_that_program_and_the_remaining_args() {
 
 // ===== derived command =====
 
-#[test]
+#[skuld::test]
 fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
     let mut c = gui_cmd();
     let (derived, report) = build(&mut c, None).unwrap();
@@ -398,7 +398,7 @@ fn the_derived_command_is_osascript_dash_e_with_one_script_argument() {
     assert!(report.stripped_env.is_empty(), "no env crosses, so none is stripped");
 }
 
-#[test]
+#[skuld::test]
 fn the_derived_command_carries_no_elevation_request() {
     // Otherwise spawning the derived command would re-enter the elevation branch.
     let mut c = gui_cmd();
@@ -406,7 +406,7 @@ fn the_derived_command_carries_no_elevation_request() {
     assert!(!derived.elevation_request().enabled);
 }
 
-#[test]
+#[skuld::test]
 fn kill_on_drop_reaches_the_derived_command() {
     // The async spawn recurses and re-reads this flag off the derived command, so a
     // caller opting out must not be silently overridden by the builder default.
@@ -418,7 +418,7 @@ fn kill_on_drop_reaches_the_derived_command() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     // The builder default sets the flag, so this is the DEFAULT path: dropping the
     // child SIGKILLs osascript while the root payload keeps running, unobservable.
@@ -453,7 +453,7 @@ fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
 
 /// A bare `raw_executable()` is accepted, and root's shell enters its directory and runs it as
 /// `./tool`, which no shell searches.
-#[test]
+#[skuld::test]
 fn a_bare_exact_program_is_completed_rather_than_refused() {
     let mut c = Command::new();
     c.raw_executable("tool")
@@ -474,7 +474,7 @@ fn a_bare_exact_program_is_completed_rather_than_refused() {
 
 /// With no `current_dir`, the payload must still run in the directory the program was completed
 /// against: root's shell starts wherever the trampoline puts it.
-#[test]
+#[skuld::test]
 fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_against() {
     let mut c = Command::new();
     c.raw_executable("tool")
@@ -497,7 +497,7 @@ fn a_bare_exact_program_without_a_cwd_runs_in_the_directory_it_was_completed_aga
     assert_eq!(derived.cwd(), Some(Path::new("/proc-cwd")));
 }
 
-#[test]
+#[skuld::test]
 fn the_cwd_reaches_both_osascript_and_the_payload() {
     let mut c = gui_cmd();
     c.current_dir("/tmp");
@@ -516,7 +516,7 @@ fn the_cwd_reaches_both_osascript_and_the_payload() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn the_length_guard_is_enforced_through_the_rewrite() {
     let mut c = gui_cmd();
     let e = build(&mut c, Some(10)).unwrap_err();
@@ -532,7 +532,7 @@ fn the_length_guard_is_enforced_through_the_rewrite() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn the_rewrite_preserves_the_callers_argv_and_moves_its_fds() {
     // Non-destructive on `input`/`env_ops`, matching the POSIX rewrite's contract —
     // but the fd table is deliberately MOVED, because `ResolvedStdio::File` is not
@@ -569,7 +569,7 @@ fn crate_script_without_the_privilege_clause(program: &OsStr, args: &[OsString])
 // parser and the real /bin/sh, with no elevation and no dialog. A bug in either
 // layer shows up as a mangled argv here.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn both_quoting_layers_survive_a_real_osascript_round_trip() {
     let nasty = [
         "a b",
@@ -662,7 +662,7 @@ fn both_quoting_layers_survive_a_real_osascript_round_trip() {
 // goes to a real temp file: `osacompile` creates its `-o` target as a file, so a
 // device path would risk failing for reasons unrelated to the script.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn the_administrator_script_compiles() {
     let shell_command = build_shell_command(OsStr::new("/usr/bin/id"), &args(&["-u"]), None).unwrap();
     let script = wrap_do_shell_script(&shell_command, None).unwrap();
@@ -697,7 +697,7 @@ fn the_administrator_script_compiles() {
 // `wrap_do_shell_script` must emit a timeout clause (or surface the bound as a typed
 // error), with this test as the evidence.
 #[cfg(target_os = "macos")]
-#[test]
+#[skuld::test]
 fn a_timeout_clause_does_not_bound_do_shell_script() {
     let shell_command = build_shell_command(OsStr::new("/bin/sleep"), &args(&["5"]), None).unwrap();
     let body = crate::quote::applescript::escape_literal(&shell_command).unwrap();
@@ -727,7 +727,7 @@ end timeout"
 
 /// Every relative `raw_executable()` reaches the script `./`-prefixed, so none is read as an
 /// option to `exec` — bash's `exec` takes `-x/tool` for its own `-x` flag.
-#[test]
+#[skuld::test]
 fn a_relative_exact_program_reaches_the_script_dot_slash_prefixed() {
     for (program, want) in [("-x/tool", "./-x/tool"), ("bin/tool", "./bin/tool"), ("tool", "./tool")] {
         let mut c = Command::new();
@@ -767,7 +767,7 @@ fn exit_tool(path: &Path, code: i32) {
 
 /// The composed script runs a leading-dash program through the real `/bin/sh`.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_leading_dash_program_survives_the_real_shell() {
     let dir = tempfile::tempdir().expect("tempdir");
     exit_tool(&dir.path().join("-x").join("tool"), 11);
@@ -785,7 +785,7 @@ fn a_leading_dash_program_survives_the_real_shell() {
 /// `cd`, which reads `link/..` as the directory holding `link` rather than the target's parent.
 /// osascript itself, and the unelevated spawn, `chdir` by the kernel's rule.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn the_script_enters_a_symlink_dotdot_directory_as_the_kernel_does() {
     let root = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(root.path().join("real").join("inner")).expect("mkdir");

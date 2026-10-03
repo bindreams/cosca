@@ -15,7 +15,7 @@ fn parsed(version: &str, release: Option<u32>) -> PkexecVersion {
     }
 }
 
-#[test]
+#[skuld::test]
 fn the_measured_outputs_parse() {
     assert_eq!(parse(UBUNTU_22_04), parsed("0.105", None));
     assert_eq!(parse(ROCKY_9), parsed("0.117", None));
@@ -25,12 +25,12 @@ fn the_measured_outputs_parse() {
 }
 
 /// Pins [`KEEP_CWD_SINCE`] against an accidental edit.
-#[test]
+#[skuld::test]
 fn keep_cwd_arrived_in_121() {
     assert_eq!(KEEP_CWD_SINCE, 121);
 }
 
-#[test]
+#[skuld::test]
 fn only_121_and_later_is_runnable() {
     for (out, ok) in [
         (UBUNTU_22_04, false),
@@ -47,7 +47,7 @@ fn only_121_and_later_is_runnable() {
 }
 
 /// Anything but exactly `pkexec version <V>\n` is not a version.
-#[test]
+#[skuld::test]
 fn the_pattern_is_strict() {
     for out in [
         "",
@@ -72,7 +72,7 @@ fn the_pattern_is_strict() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn non_utf8_output_is_its_own_case() {
     assert_eq!(
         parse(b"pkexec version \xff\n"),
@@ -92,7 +92,7 @@ fn refusal_detail(v: PkexecVersion) -> String {
 
 /// Each refusal says which case it is, carries the raw text where there is one, and names the way
 /// out.
-#[test]
+#[skuld::test]
 fn each_refusal_names_its_case_and_the_raw_text() {
     let cases = [
         (parse(UBUNTU_22_04), "reports version 0.105"),

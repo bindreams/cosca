@@ -28,7 +28,7 @@ fn sh(script: &Path) -> std::process::Command {
 
 /// The runner clears the probe's environment: `HOME` is set on the probe's own command before
 /// the runner sees it, and the script prints a version only with `HOME` gone.
-#[test]
+#[skuld::test]
 fn the_probe_runs_in_an_empty_environment() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pkexec = script(
@@ -48,7 +48,7 @@ fn the_probe_runs_in_an_empty_environment() {
 
 /// The probe execs the pinned file itself, `/proc/self/fd/N`, with `--version`: the file the
 /// launch will exec too, whatever the canonical path names by then.
-#[test]
+#[skuld::test]
 fn the_probe_execs_the_pinned_file_with_dash_dash_version() {
     use std::os::fd::AsRawFd;
     let file = std::fs::File::open("/dev/null").expect("open");
@@ -65,7 +65,7 @@ fn the_probe_execs_the_pinned_file_with_dash_dash_version() {
 
 /// Only `Backend::Pkexec` with `Auth::Gui`, from a caller not already root, on Linux, launches
 /// pkexec: every other request is refused by the planner, runs another backend, or runs none.
-#[test]
+#[skuld::test]
 fn only_a_linux_gui_pkexec_request_from_a_non_root_caller_launches_pkexec() {
     assert!(launches_pkexec(Os::Linux, Backend::Pkexec, &Auth::Gui, false));
     for backend in [Backend::Auto, Backend::Sudo, Backend::Doas, Backend::Run0] {
@@ -88,7 +88,7 @@ fn only_a_linux_gui_pkexec_request_from_a_non_root_caller_launches_pkexec() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn a_probe_that_cannot_run_says_so() {
     let v = run_version_probe(std::process::Command::new("/nonexistent/pkexec"));
     assert!(
@@ -97,7 +97,7 @@ fn a_probe_that_cannot_run_says_so() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn a_probe_that_fails_keeps_its_status_and_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pkexec = script(dir.path(), "echo 'pkexec version 127'; echo 'no agent' >&2; exit 3");
@@ -125,7 +125,7 @@ fn linked_pkexec() -> (tempfile::TempDir, PathBuf, PathBuf) {
 
 /// `detect` pins the canonical file, not the link, and probes that pinned file: the launch then
 /// execs the same file through the same descriptor.
-#[test]
+#[skuld::test]
 fn detect_stores_the_pkexec_it_probed() {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -173,7 +173,7 @@ fn detect_stores_the_pkexec_it_probed() {
 
 /// A request that does not launch pkexec neither opens nor runs it: the PATH match is stored as
 /// found, for the planner's verdict.
-#[test]
+#[skuld::test]
 fn detect_opens_and_probes_only_for_a_request_that_launches_pkexec() {
     let (_root, bin, _real) = linked_pkexec();
     for (os, backend, auth, elevated) in [
@@ -201,7 +201,7 @@ fn detect_opens_and_probes_only_for_a_request_that_launches_pkexec() {
 
 /// A PATH match whose real file cannot be found is neither stored nor probed, and the reason is
 /// kept for the planner's refusal.
-#[test]
+#[skuld::test]
 fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
     let (_root, bin, _real) = linked_pkexec();
     let host = detect_with(
@@ -229,7 +229,7 @@ fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
 
 /// The pin never follows a symlink: a canonical path that is a link by the time it is opened
 /// (here, a canonicalize that returns the link itself) is not pinned, probed or stored.
-#[test]
+#[skuld::test]
 fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
     let (_root, bin, _real) = linked_pkexec();
     let host = detect_with(
@@ -251,7 +251,7 @@ fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
 
 /// A FIFO renamed over the canonical path is neither waited on nor pinned: the open does not block
 /// and the file is not regular.
-#[test]
+#[skuld::test]
 fn a_fifo_at_the_canonical_path_is_not_pinned() {
     let (root, bin, _real) = linked_pkexec();
     let fifo = root.path().join("fifo");

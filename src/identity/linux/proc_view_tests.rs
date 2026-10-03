@@ -23,7 +23,7 @@ fn unreachable_ns_pid() -> io::Result<bool> {
 /// namespace's exactly when it numbers this namespace's pid 1 as `1`. An outer procfs numbers
 /// that init otherwise (its own `1` is its own init, in another namespace), and one that cannot
 /// see it prints `0`. Comparing this thread's own ids instead can coincide.
-#[test]
+#[skuld::test]
 fn proc_view_matches_how_proc_numbers_our_own_init() {
     let dir = ProcDir::open().expect("/proc opens");
     let init = rustix::process::pidfd_open(
@@ -40,19 +40,19 @@ fn proc_view_matches_how_proc_numbers_our_own_init() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn one_nspid_entry_is_same() {
     let verdict = classify_status("Name:\tcosca\nNSpid:\t1234\nState:\tR\n", unreachable_ns_pid);
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
 }
 
-#[test]
+#[skuld::test]
 fn several_nspid_entries_are_diverged() {
     let verdict = classify_status("NSpid:\t99\t5\t1\n", unreachable_ns_pid);
     assert!(matches!(verdict, Verdict::Diverged), "got {verdict:?}");
 }
 
-#[test]
+#[skuld::test]
 fn an_empty_nspid_line_is_unassessable() {
     let verdict = classify_status("NSpid:\t\n", unreachable_ns_pid);
     assert!(matches!(verdict, Verdict::Unassessable(_)), "got {verdict:?}");
@@ -61,7 +61,7 @@ fn an_empty_nspid_line_is_unassessable() {
 /// A kernel without `CONFIG_PID_NS` has no `NSpid` and no `self/ns/pid`: no namespace to
 /// diverge into, so `Same`. Mutant: "an absent NSpid is always Unassessable" (the regression
 /// that made every live foreign wait fail on such kernels).
-#[test]
+#[skuld::test]
 fn no_nspid_and_no_ns_pid_is_same() {
     let verdict = classify_status("Name:\tcosca\nState:\tR\n", ns_pid(Ok(false)));
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
@@ -69,13 +69,13 @@ fn no_nspid_and_no_ns_pid_is_same() {
 
 /// gVisor: no `NSpid` but pid namespaces exist, so the status file alone cannot decide; the
 /// stat cross-check does. Mutant: "an absent NSpid is always Same".
-#[test]
+#[skuld::test]
 fn no_nspid_but_ns_pid_exists_needs_the_cross_check() {
     let verdict = classify_status("Name:\tcosca\n", ns_pid(Ok(true)));
     assert!(matches!(verdict, Verdict::NoNspid), "got {verdict:?}");
 }
 
-#[test]
+#[skuld::test]
 fn no_nspid_and_an_unreadable_ns_pid_is_unassessable_with_the_cause() {
     let Verdict::Unassessable(why) = classify_status(
         "Name:\tcosca\n",
@@ -87,7 +87,7 @@ fn no_nspid_and_an_unreadable_ns_pid_is_unassessable_with_the_cause() {
     assert!(why.to_string().contains("could not be checked"), "{why}");
 }
 
-#[test]
+#[skuld::test]
 fn fdinfo_pid_is_parsed() {
     assert_eq!(
         parse_fdinfo_pid("pos:\t0\nflags:\t02000000\nPid:\t4321\nNSpid:\t4321\n"),
@@ -100,26 +100,26 @@ fn fdinfo_pid_is_parsed() {
 
 /// The kernel prints `Pid: -1` when the pidfd's target was reaped (`pidfd_show_fdinfo`). Mutant:
 /// "a negative `Pid:` is unparseable".
-#[test]
+#[skuld::test]
 fn fdinfo_pid_minus_one_is_reaped() {
     assert_eq!(parse_fdinfo_pid("Pid:\t-1\n"), Some(PidfdTarget::Reaped));
 }
 
 /// Only `-1` is the kernel's reaped marker. Mutant: "any negative is Reaped".
-#[test]
+#[skuld::test]
 fn fdinfo_pid_other_negatives_are_unparseable() {
     assert_eq!(parse_fdinfo_pid("Pid:\t-2\n"), None);
     assert_eq!(parse_fdinfo_pid("Pid:\t-4294967296\n"), None);
 }
 
 /// Mutant: "truncate to u32" would turn 2^32 into pid 0.
-#[test]
+#[skuld::test]
 fn fdinfo_pid_beyond_u32_is_unparseable() {
     assert_eq!(parse_fdinfo_pid("Pid:\t4294967296\n"), None);
     assert_eq!(parse_fdinfo_pid("Pid:\t4294967295\n"), Some(PidfdTarget::Pid(u32::MAX)));
 }
 
-#[test]
+#[skuld::test]
 fn fdinfo_pid_with_an_empty_value_is_unparseable() {
     assert_eq!(parse_fdinfo_pid("Pid:\n"), None);
     assert_eq!(parse_fdinfo_pid("Pid:\t\n"), None);
@@ -127,7 +127,7 @@ fn fdinfo_pid_with_an_empty_value_is_unparseable() {
 
 /// Only the exact `Pid:` key counts: `NSpid:` and `Pidfd:`-like keys carry other numbers. Mutant:
 /// "match any line containing `Pid:`".
-#[test]
+#[skuld::test]
 fn fdinfo_pid_ignores_similarly_prefixed_keys() {
     assert_eq!(parse_fdinfo_pid("NSpid:\t9\nPidx:\t8\nxPid:\t7\n"), None);
     assert_eq!(
@@ -137,7 +137,7 @@ fn fdinfo_pid_ignores_similarly_prefixed_keys() {
 }
 
 /// A forced `Same` still opens the real `/proc`, so the dirfd it carries is usable.
-#[test]
+#[skuld::test]
 fn a_forced_same_view_carries_the_real_proc_dirfd() {
     let forced = force_proc_view_once(ForcedView::Same);
     let ProcView::Same(dir) = proc_view() else {
@@ -149,7 +149,7 @@ fn a_forced_same_view_carries_the_real_proc_dirfd() {
 }
 
 /// The forced seam overrides the real read exactly once, then falls back to it.
-#[test]
+#[skuld::test]
 fn a_forced_view_is_consumed_once() {
     let forced = force_proc_view_once(ForcedView::Diverged);
     assert!(matches!(proc_view(), ProcView::Diverged));
@@ -161,7 +161,7 @@ fn a_forced_view_is_consumed_once() {
 }
 
 /// The guard disarms on drop even if the forced view was never consumed.
-#[test]
+#[skuld::test]
 fn a_forced_view_disarms_on_drop_even_if_unconsumed() {
     drop(force_proc_view_once(ForcedView::Unassessable));
     assert!(
@@ -172,7 +172,7 @@ fn a_forced_view_disarms_on_drop_even_if_unconsumed() {
 
 // Checked /proc dirfd =====
 
-#[test]
+#[skuld::test]
 fn the_proc_dir_reads_a_file_beneath_it() {
     let status = ProcDir::open()
         .expect("/proc opens")
@@ -183,7 +183,7 @@ fn the_proc_dir_reads_a_file_beneath_it() {
 
 /// A path that leaves the directory it is opened under is refused. Mutant: "plain `openat`
 /// without `RESOLVE_BENEATH`" — `..` reaches `/`.
-#[test]
+#[skuld::test]
 fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
     let dir = ProcDir::open().expect("/proc opens");
     let err = dir.read("../etc/passwd").expect_err("must not leave /proc");
@@ -192,7 +192,7 @@ fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
 
 /// An absolute path names another tree entirely. Mutant: "no `RESOLVE_BENEATH`" — the path
 /// resolves from the root, and `NO_XDEV` alone allows it (the root filesystem is one mount).
-#[test]
+#[skuld::test]
 fn the_proc_dir_refuses_an_absolute_path() {
     let dir = ProcDir::open().expect("/proc opens");
     let err = dir.read("/etc/passwd").expect_err("must not leave /proc");
@@ -201,7 +201,7 @@ fn the_proc_dir_refuses_an_absolute_path() {
 
 /// A magic link (`self/exe`, `self/fd/N`) jumps out of the tree, so it is refused. Mutant:
 /// "no `RESOLVE_NO_MAGICLINKS`".
-#[test]
+#[skuld::test]
 fn the_proc_dir_refuses_a_magic_link() {
     let dir = ProcDir::open().expect("/proc opens");
     let err = dir.read("self/exe").expect_err("a magic link must not be followed");
@@ -216,20 +216,20 @@ fn link(target: &str) -> io::Result<Vec<u8>> {
     Ok(target.as_bytes().to_vec())
 }
 
-#[test]
+#[skuld::test]
 fn a_procfs_whose_pid_1_shares_this_threads_namespace_is_same() {
     let verdict = classify_ns_links(link("pid:[4026531836]"), || link("pid:[4026531836]"));
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
 }
 
 /// Mutant: "any two readable links are Same".
-#[test]
+#[skuld::test]
 fn a_procfs_whose_pid_1_is_in_another_namespace_is_diverged() {
     let verdict = classify_ns_links(link("pid:[4026532831]"), || link("pid:[4026532830]"));
     assert!(matches!(verdict, Verdict::Diverged), "got {verdict:?}");
 }
 
-#[test]
+#[skuld::test]
 fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
     let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || {
         Err(io::Error::from_raw_os_error(libc::EACCES))
@@ -241,7 +241,7 @@ fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
 }
 
 /// An unreadable own link is reported as such, and the pid 1 link is then not read.
-#[test]
+#[skuld::test]
 fn an_unreadable_own_link_is_unassessable_without_reading_pid_1() {
     let Verdict::Unassessable(why) = classify_ns_links(Err(io::Error::from_raw_os_error(libc::ENOENT)), || {
         panic!("pid 1's link must not be read once the own link failed")
@@ -253,7 +253,7 @@ fn an_unreadable_own_link_is_unassessable_without_reading_pid_1() {
 
 /// Two equal non-namespace targets (say, both empty) prove nothing. Mutant: "compare the raw
 /// targets".
-#[test]
+#[skuld::test]
 fn a_link_that_names_no_pid_namespace_is_unassessable() {
     for (own, init) in [("", ""), ("net:[1]", "net:[1]"), ("pid:[1]", "pid:[1")] {
         let verdict = classify_ns_links(link(own), || link(init));
@@ -265,7 +265,7 @@ fn a_link_that_names_no_pid_namespace_is_unassessable() {
 }
 
 /// The real links through the real `/proc` read as pid namespace links.
-#[test]
+#[skuld::test]
 fn this_threads_own_namespace_link_reads_through_the_proc_dir() {
     let dir = ProcDir::open().expect("/proc opens");
     let own = dir.read_link("thread-self/ns/pid").expect("read own link");
@@ -275,7 +275,7 @@ fn this_threads_own_namespace_link_reads_through_the_proc_dir() {
 // pidfd fdinfo =====
 
 /// A pidfd whose target has been reaped prints `Pid: -1` (real kernel, no forcing).
-#[test]
+#[skuld::test]
 fn the_fdinfo_of_a_reaped_targets_pidfd_is_reaped() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     child.wait().expect("reap the child");
@@ -285,7 +285,7 @@ fn the_fdinfo_of_a_reaped_targets_pidfd_is_reaped() {
 }
 
 /// Before the reap the same pidfd names the child under its pid.
-#[test]
+#[skuld::test]
 fn the_fdinfo_of_an_unreaped_targets_pidfd_names_its_pid() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     let dir = ProcDir::open().expect("/proc opens");
@@ -310,7 +310,7 @@ fn spawn_exited_child_with_pidfd() -> (std::process::Child, rustix::fd::OwnedFd)
 /// has no such fd (or a different file at that number).
 ///
 /// In the namespaces group: `unshare` is refused by default container seccomp profiles.
-#[test]
+#[skuld::test]
 fn namespaces_the_fdinfo_is_read_through_the_calling_threads_fd_table() {
     if !ns::enabled() {
         return;
@@ -318,7 +318,7 @@ fn namespaces_the_fdinfo_is_read_through_the_calling_threads_fd_table() {
     ns::run(fixture_path!(fixture_fdinfo_after_unshare_files));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_fdinfo_after_unshare_files() {
     if !ns::is_child() {
         return;
@@ -348,7 +348,7 @@ fn fixture_fdinfo_after_unshare_files() {
 /// exactly as `gettid()` does: the numbers agree, the namespaces do not. `Diverged`.
 ///
 /// Mutant: "compare `thread-self/stat`'s id with `gettid()`" — the coincidence reads as `Same`.
-#[test]
+#[skuld::test]
 fn namespaces_no_nspid_under_an_outer_procfs_numbering_this_thread_alike_is_diverged() {
     if !ns::enabled() {
         return;
@@ -356,7 +356,7 @@ fn namespaces_no_nspid_under_an_outer_procfs_numbering_this_thread_alike_is_dive
     ns::run(fixture_path!(fixture_coinciding_tid_driver));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_coinciding_tid_driver() {
     if !ns::is_child() {
         return;
@@ -368,7 +368,7 @@ fn fixture_coinciding_tid_driver() {
 /// Pid 1 of a fresh namespace P with P's own procfs on `/proc`; its next child is pid 1 of a
 /// namespace C below P and keeps P's procfs. P holds only this fixture chain, so nothing else
 /// allocates pids in it.
-#[test]
+#[skuld::test]
 fn fixture_coinciding_tid_outer_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -379,7 +379,7 @@ fn fixture_coinciding_tid_outer_init() {
     ns::run(fixture_path!(fixture_coinciding_tid_inner));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_coinciding_tid_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -410,7 +410,7 @@ fn fixture_coinciding_tid_inner() {
 /// Mutants: "an absent NSpid with namespaces present is Unassessable" (the first half);
 /// "compare `thread-self/stat`'s id with `gettid()`" (the second: it needs no permission, so it
 /// answers `Same`).
-#[test]
+#[skuld::test]
 fn namespaces_no_nspid_under_this_namespaces_own_procfs_is_same() {
     if !ns::enabled() {
         return;
@@ -418,7 +418,7 @@ fn namespaces_no_nspid_under_this_namespaces_own_procfs_is_same() {
     ns::run(fixture_path!(fixture_own_procfs_driver));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_own_procfs_driver() {
     if !ns::is_child() {
         return;
@@ -427,7 +427,7 @@ fn fixture_own_procfs_driver() {
     ns::run(fixture_path!(fixture_own_procfs_init));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_own_procfs_init() {
     if !ns::is_child_in_new_pid_ns() {
         return;
@@ -442,7 +442,7 @@ fn fixture_own_procfs_init() {
     ns::run_dropping_to_nobody(fixture_path!(fixture_own_procfs_unprivileged));
 }
 
-#[test]
+#[skuld::test]
 fn fixture_own_procfs_unprivileged() {
     if !ns::is_child() {
         return;
@@ -467,7 +467,7 @@ fn fixture_own_procfs_unprivileged() {
 
 /// The real `/proc` holds `self`, `thread-self`, `net`, `sys`, ...; listing it must skip them, not
 /// fail on them. Mutant: "every entry is a pid" — the first non-numeric name aborts the listing.
-#[test]
+#[skuld::test]
 fn pids_lists_the_numeric_entries_including_this_process() {
     let pids = ProcDir::open().expect("/proc opens").pids().expect("list");
     assert!(pids.contains(&std::process::id()), "{pids:?}");
@@ -479,7 +479,7 @@ fn names(list: &[&[u8]]) -> Vec<io::Result<Vec<u8>>> {
 
 /// Non-pid names are excluded, not errors. Mutant: "keep every name that parses" / "abort on the
 /// first name that is not a pid".
-#[test]
+#[skuld::test]
 fn collect_pids_excludes_names_that_are_not_pids() {
     let listed: &[&[u8]] = &[
         b"1",
@@ -500,7 +500,7 @@ fn collect_pids_excludes_names_that_are_not_pids() {
 
 /// An all-digit name that is no `u32` is a corrupt listing, never a member dropped in silence.
 /// Mutant: "`.parse().ok()` drops it".
-#[test]
+#[skuld::test]
 fn collect_pids_is_an_error_for_an_all_digit_name_that_overflows() {
     for name in [&b"4294967296"[..], b"99999999999999999999"] {
         let err = collect_pids(names(&[b"1", name])).expect_err("a corrupt listing is an error");
@@ -510,7 +510,7 @@ fn collect_pids_is_an_error_for_an_all_digit_name_that_overflows() {
 }
 
 /// A listing failure part-way is the listing's failure, not a shorter list.
-#[test]
+#[skuld::test]
 fn collect_pids_propagates_a_listing_error() {
     let items = vec![Ok(b"1".to_vec()), Err(io::Error::from_raw_os_error(libc::EIO))];
     let err = collect_pids(items).expect_err("listing error");
@@ -518,7 +518,7 @@ fn collect_pids_propagates_a_listing_error() {
 }
 
 /// `into_dir` yields the directory of a `Same` view and names the cause of any other.
-#[test]
+#[skuld::test]
 fn into_dir_names_why_a_view_is_not_usable() {
     let same = ProcView::Same(ProcDir::open().expect("/proc opens"));
     assert!(same.into_dir().is_ok());

@@ -53,7 +53,7 @@ fn unix_host(available: BackendSet, elevated: bool, has_tty: bool) -> Host {
     }
 }
 
-#[test]
+#[skuld::test]
 fn unprivileged_target_runs_as_is() {
     let h = unix_host(all_backends(), false, true);
     assert!(matches!(
@@ -62,7 +62,7 @@ fn unprivileged_target_runs_as_is() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn already_elevated_runs_as_is() {
     let h = unix_host(all_backends(), true, true);
     assert!(matches!(
@@ -71,7 +71,7 @@ fn already_elevated_runs_as_is() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn auto_prefers_sudo_then_doas() {
     // run0 present but Auto ignores it -> sudo.
     let h = unix_host(all_backends(), false, true);
@@ -103,7 +103,7 @@ fn auto_prefers_sudo_then_doas() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn auto_never_selects_run0_or_pkexec() {
     // Only run0 + pkexec available: Auto must reject (BackendUnavailable), not pick either.
     let h = unix_host(
@@ -123,7 +123,7 @@ fn auto_never_selects_run0_or_pkexec() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn resolved_transition_carries_the_absolute_backend_path() {
     let h = unix_host(all_backends(), false, true);
     match h.plan(Privilege::Elevated, Backend::Doas, Auth::Interactive) {
@@ -138,7 +138,7 @@ fn resolved_transition_carries_the_absolute_backend_path() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn windows_unprivileged_elevates_via_uac() {
     let h = Host {
         elevated: false,
@@ -155,7 +155,7 @@ fn windows_unprivileged_elevates_via_uac() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn structural_posix_matrix_is_privilege_independent() {
     let cases: &[(Backend, Auth)] = &[
         (Backend::Doas, Auth::Askpass(PathBuf::from("/x"))),
@@ -181,7 +181,7 @@ fn structural_posix_matrix_is_privilege_independent() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn structural_windows_matrix_is_privilege_independent() {
     for elevated in [false, true] {
         assert!(is_unsupported(win_host(elevated).plan(
@@ -207,7 +207,7 @@ fn structural_windows_matrix_is_privilege_independent() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn windows_accepts_only_interactive_and_gui() {
     assert!(matches!(
         win_host(false).plan(Privilege::Elevated, Backend::Auto, Auth::Interactive),
@@ -219,7 +219,7 @@ fn windows_accepts_only_interactive_and_gui() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn interactive_without_tty_is_no_tty() {
     let h = unix_host(all_backends(), false, /* has_tty */ false);
     let e = reject_error(h.plan(Privilege::Elevated, Backend::Sudo, Auth::Interactive));
@@ -235,7 +235,7 @@ fn interactive_without_tty_is_no_tty() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn noninteractive_without_tty_is_allowed() {
     let h = unix_host(all_backends(), false, false);
     assert!(matches!(
@@ -247,7 +247,7 @@ fn noninteractive_without_tty_is_allowed() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn auto_resolving_to_doas_rejects_stdin() {
     // Privilege-independent: Auto resolving to a non-sudo backend must reject
     // Auth::Stdin identically whether or not we're already elevated (the
@@ -275,7 +275,7 @@ fn auto_resolving_to_doas_rejects_stdin() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn pkexec_with_gui_is_accepted() {
     let h = unix_host(all_backends(), false, true);
     assert!(matches!(
@@ -289,7 +289,7 @@ fn pkexec_with_gui_is_accepted() {
 
 /// cosca launches pkexec through Linux's `/proc`, so a non-Linux Unix refuses it up front, naming
 /// that, whatever pkexec's version.
-#[test]
+#[skuld::test]
 fn pkexec_off_linux_is_refused_naming_linux() {
     for elevated in [false, true] {
         let h = Host {
@@ -307,7 +307,7 @@ fn pkexec_off_linux_is_refused_naming_linux() {
 }
 
 /// A pkexec found on PATH whose real file could not be found is reported as that, not as missing.
-#[test]
+#[skuld::test]
 fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
     let mut h = unix_host(
         BackendSet {
@@ -360,7 +360,7 @@ fn unsupported_platform(t: Transition) -> &'static str {
     }
 }
 
-#[test]
+#[skuld::test]
 fn macos_pkexec_is_unsupported_not_backend_unavailable() {
     // pkexec can never exist on macOS, so a "backend not on PATH" verdict would
     // wrongly invite installing it. Even with a fabricated pkexec path present,
@@ -373,7 +373,7 @@ fn macos_pkexec_is_unsupported_not_backend_unavailable() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn macos_run0_is_unsupported_not_backend_unavailable() {
     // Same reasoning as pkexec: run0 ships with systemd, so "not on PATH" would
     // invite installing something that does not exist for this platform.
@@ -390,7 +390,7 @@ fn macos_run0_is_unsupported_not_backend_unavailable() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn macos_keeps_the_backends_that_really_do_run_there() {
     // sudo and doas are portable and DO exist on macOS, so they must not be swept
     // into the impossible-backend guard alongside pkexec/run0.
@@ -407,7 +407,7 @@ fn macos_keeps_the_backends_that_really_do_run_there() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn macos_sudo_still_works_like_other_unix() {
     let h = macos_host(false, true);
     assert!(matches!(
@@ -419,7 +419,7 @@ fn macos_sudo_still_works_like_other_unix() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn non_macos_unix_gui_still_requires_pkexec() {
     let h = unix_host(all_backends(), false, true);
     assert!(matches!(
@@ -432,7 +432,7 @@ fn non_macos_unix_gui_still_requires_pkexec() {
     assert!(is_unsupported(h.plan(Privilege::Elevated, Backend::Sudo, Auth::Gui)));
 }
 
-#[test]
+#[skuld::test]
 fn macos_gui_resolves_to_the_osascript_transition() {
     let h = macos_host(false, /* has_tty */ false);
     match h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui) {
@@ -444,7 +444,7 @@ fn macos_gui_resolves_to_the_osascript_transition() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn macos_gui_needs_no_controlling_terminal() {
     // A windowed app has no controlling terminal, so Auth::Gui must not trip the
     // NoTty gate the way Auth::Interactive does.
@@ -462,7 +462,7 @@ fn macos_gui_needs_no_controlling_terminal() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
     // Auth::Gui names Authorization Services on macOS; no CLI wrapper is involved,
     // so a forced sudo/doas/run0 is a config error, not something osascript runs.
@@ -480,7 +480,7 @@ fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
     }
 }
 
-#[test]
+#[skuld::test]
 fn macos_gui_without_osascript_is_a_backend_problem_not_a_platform_one() {
     // Here BackendUnavailable is honest: /usr/bin/osascript really can be absent
     // or non-executable on a stripped system.
@@ -495,7 +495,7 @@ fn macos_gui_without_osascript_is_a_backend_problem_not_a_platform_one() {
     ));
 }
 
-#[test]
+#[skuld::test]
 fn macos_gui_already_elevated_runs_as_is() {
     let h = macos_host(true, false);
     assert!(matches!(
