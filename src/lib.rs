@@ -145,6 +145,10 @@ mod test_child;
 mod test_groups;
 
 #[cfg(test)]
+#[path = "test_groups_tests.rs"]
+mod test_groups_tests;
+
+#[cfg(test)]
 mod test_harness;
 
 #[cfg(test)]

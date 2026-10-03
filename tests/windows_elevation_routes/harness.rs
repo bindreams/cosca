@@ -331,8 +331,7 @@ impl Eq for EnvKeyIgnoreCase {}
 /// caller happens to have set — including any secrets a CI runner exports — into a child running
 /// as, or purporting to measure, someone else. Only what a freshly logged-on account needs to run
 /// anything at all (`SystemRoot`, `PATH`, `TEMP`/`TMP`, `COMSPEC`, `PATHEXT`), plus any
-/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus the
-/// `WINDOWS_EXECUTING_PROBES` gate and consent (the re-run test calls `require_group`), plus
+/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus
 /// whatever the caller passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that
 /// `COSCA_PROBE_*` pass-through: it names a directory this process's OWN account can write to, and a child spawned
 /// here under a different account (the whole point of several of these routes) cannot create or
@@ -352,18 +351,12 @@ fn env_block_from(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     extra: &[(&str, String)],
 ) -> Vec<u16> {
-    const GROUP_GATE: [&str; 2] = [
-        "COSCA_TEST_WINDOWS_EXECUTING_PROBES",
-        "COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT",
-    ];
     const ALLOWLIST: [&str; 6] = ["SYSTEMROOT", "PATH", "TEMP", "TMP", "COMSPEC", "PATHEXT"];
     let mut map: BTreeMap<EnvKeyIgnoreCase, String> = BTreeMap::new();
     for (k, v) in environment {
         let k = k.to_string_lossy().into_owned();
         let upper = k.to_ascii_uppercase();
-        if ALLOWLIST.contains(&upper.as_str())
-            || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
-            || GROUP_GATE.contains(&upper.as_str())
+        if ALLOWLIST.contains(&upper.as_str()) || (upper.starts_with("COSCA_PROBE_") && upper != "COSCA_PROBE_MARKERS")
         {
             map.insert(EnvKeyIgnoreCase::new(&k), v.to_string_lossy().into_owned());
         }
@@ -380,22 +373,38 @@ fn env_block_from(
     block
 }
 
-/// The `extra` entry giving a child under another account or lowered token a skuld coordination
-/// directory it can write (it cannot write beside the executable). Not forwarded from this process's
-/// environment, for the reason [`env_block`] gives: that directory belongs to this process's own
-/// account.
-pub(crate) fn skuld_db_dir(dir: &Path) -> (&'static str, String) {
-    ("SKULD_DB_DIR", dir.display().to_string())
+/// The argument that makes this test binary run a helper instead of its tests.
+const HELPER_FLAG: &str = "--cosca-probe-helper";
+
+/// A job this test binary does for a probe that re-executes it, in place of running tests.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Helper {
+    /// [`crate::token_filtering::measure_this_token`].
+    MeasureToken,
 }
 
-/// The command line that re-runs this test binary's `token_filtering::measure_this_token`.
-/// `--exact` pins it to that one test, so a child never re-enters the spawning probes and
-/// recursion is structural rather than bounded by a counter.
+impl Helper {
+    const MEASURE_TOKEN: &'static str = "measure-token";
+}
+
+/// The helper `args` (this binary's arguments after its name) ask for: `Ok(None)` when they ask for
+/// none, so the tests run; `Err` for a helper flag that names no helper.
+pub(crate) fn helper_from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Option<Helper>, String> {
+    let mut args = args.into_iter();
+    if args.next().is_none_or(|first| first != HELPER_FLAG) {
+        return Ok(None);
+    }
+    match args.next() {
+        Some(name) if name == Helper::MEASURE_TOKEN => Ok(Some(Helper::MeasureToken)),
+        Some(name) => Err(format!("{HELPER_FLAG}: unknown helper {name:?}")),
+        None => Err(format!("{HELPER_FLAG}: no helper named")),
+    }
+}
+
+/// The command line that re-runs this test binary as [`Helper::MeasureToken`]. It runs before skuld
+/// starts, so a child never re-enters the spawning probes, and needs no coordination directory.
 pub(crate) fn report_cmdline(exe: &Path) -> String {
-    format!(
-        "\"{}\" token_filtering::measure_this_token --exact --nocapture --test-threads=1",
-        exe.display()
-    )
+    format!("\"{}\" {HELPER_FLAG} {}", exe.display(), Helper::MEASURE_TOKEN)
 }
 
 pub(crate) fn self_report_cmdline() -> String {
@@ -775,7 +784,6 @@ fn spawn_attempts_with(out: &mut String, which: &str, token: HANDLE, ancestor_co
         let block = env_block(&[
             ("COSCA_PROBE_REPORT_TO", report.display().to_string()),
             ("COSCA_PROBE_CHILD", "1".into()),
-            skuld_db_dir(dir.path()),
         ]);
         let mut cmd = wide(&self_report_cmdline());
         let si = STARTUPINFOW {

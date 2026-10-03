@@ -3,6 +3,7 @@
 use crate::dots_and_spaces::WEIRD_NAMES;
 use crate::harness::canary;
 use crate::pure::{all_succeeded, payload_outcome, reap_after_terminate, verbatim_spelling, PayloadOutcome};
+use crate::test_groups::{path_probes, Group};
 use crate::winapi::{outcome, wide};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0};
@@ -33,10 +34,7 @@ use windows::Win32::System::Threading::{
 /// with the planted copy, so a spawn that ran any other file fails. Its `module=` line, the name
 /// the loader recorded, is printed only.
 #[skuld::test]
-fn a_verbatim_dots_and_spaces_file_exists_and_loads() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn a_verbatim_dots_and_spaces_file_exists_and_loads(#[fixture(path_probes)] _group: &Group) {
     canary("Windows and Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().to_str().expect("temp path is not UTF-8").to_string();
@@ -212,10 +210,7 @@ pub(crate) fn file_identity(path: &str) -> Result<(u64, [u8; 16]), String> {
 /// the process is terminated before its first instruction runs. So `cmd.exe`, when std picks it,
 /// never runs.
 #[skuld::test]
-fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself() {
-    if !crate::common::require_group("WINDOWS_PATH_CANARY") {
-        return;
-    }
+fn std_runs_a_verbatim_trailing_dot_or_space_batch_name_itself(#[fixture(path_probes)] _group: &Group) {
     canary("Rust's std::process", |facts, failures| {
         let root = tempfile::tempdir().expect("tempdir");
         let root = root.path().to_str().expect("temp path is not UTF-8").to_string();

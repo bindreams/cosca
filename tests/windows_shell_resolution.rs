@@ -80,10 +80,10 @@
 //!
 //! Most of them execute a batch file. That is the exact vector `reject_batch_path` exists to
 //! refuse, so it must never happen incidentally during `cargo nextest run`. They are the
-//! `WINDOWS_EXECUTING_PROBES` group (principle 9). Opt in explicitly:
+//! `SHELL_PROBES` group (principle 9). Opt in explicitly:
 //!
 //! ```text
-//! COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT=1 cargo nextest run --test windows_shell_resolution --no-capture
+//! COSCA_TEST_SHELL_PROBES_CONSENT=1 cargo nextest run --test windows_shell_resolution --no-capture
 //! ```
 //!
 //! Or, from any host OS and without a local Windows VM, dispatch the `windows-probes` workflow with
@@ -109,6 +109,9 @@ mod windows_probe;
 #[path = "windows_shell_resolution/harness.rs"]
 mod harness;
 #[cfg(windows)]
+#[path = "windows_shell_resolution/isolated_labels.rs"]
+mod isolated_labels;
+#[cfg(windows)]
 #[path = "windows_shell_resolution/pathext.rs"]
 mod pathext;
 #[cfg(windows)]
@@ -118,6 +121,8 @@ mod precedence;
 #[path = "windows_shell_resolution/trailing_dot.rs"]
 mod trailing_dot;
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

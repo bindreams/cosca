@@ -35,9 +35,9 @@ on:
       - "tests/windows_path_resolution/**"
       - "tests/windows_shell_execute.rs"
       - "tests/common/windows_probe.rs"
-      # The probes' group gate, and the shared module every probe binary reaches it through.
-      - "tests/common/test_enablement.rs"
-      - "tests/common/mod.rs"
+      # The probes' group declarations and labels.
+      - "src/test_groups.rs"
+      - "src/test_harness.rs"
       # The canary's payload is built from here.
       - "testbin/**"
       # Which `windows` crate features are enabled decides what the probes can call.
@@ -90,9 +90,10 @@ concurrency:
 env:
   # The probe groups (principle 9) are off unless a step below opts in; each runner is the sandbox
   # that consent requires.
-  COSCA_TEST_WINDOWS_PATH_CANARY: "0"
-  COSCA_TEST_WINDOWS_ELEVATING_PROBES: "0"
-  COSCA_TEST_WINDOWS_EXECUTING_PROBES: "0"
+  COSCA_TEST_PATH_PROBES: "0"
+  COSCA_TEST_SHELL_EXECUTE: "0"
+  COSCA_TEST_SHELL_PROBES: "0"
+  COSCA_TEST_ELEVATION_ROUTES: "0"
   # `.config/nextest.toml`, ci.yaml and the devvm provision scripts carry the same nextest
   # version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.146"
@@ -131,11 +132,12 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-          COSCA_TEST_WINDOWS_PATH_CANARY: "1"
-          COSCA_TEST_WINDOWS_PATH_CANARY_CONSENT: "1"
+          COSCA_TEST_PATH_PROBES: "1"
+          COSCA_TEST_PATH_PROBES_CONSENT: "1"
+          SKULD_LABELS: path_probes
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --no-capture --no-tests=fail)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -156,11 +158,12 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-          COSCA_TEST_WINDOWS_ELEVATING_PROBES: "1"
-          COSCA_TEST_WINDOWS_ELEVATING_PROBES_CONSENT: "1"
+          COSCA_TEST_SHELL_EXECUTE: "1"
+          COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
+          SKULD_LABELS: shell_execute
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --no-capture)
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --no-capture --no-tests=fail)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -211,8 +214,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
-      COSCA_TEST_WINDOWS_EXECUTING_PROBES: "1"
-      COSCA_TEST_WINDOWS_EXECUTING_PROBES_CONSENT: "1"
+      COSCA_TEST_SHELL_PROBES: "1"
+      COSCA_TEST_SHELL_PROBES_CONSENT: "1"
+      COSCA_TEST_ELEVATION_ROUTES: "1"
+      COSCA_TEST_ELEVATION_ROUTES_CONSENT: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -233,7 +238,7 @@ jobs:
       # for `windows_elevation_routes` ever ran.
       #
       # The three probes that hand `ShellExecuteExW` an EXISTING extensionless target are excluded
-      # here (`-E`) and run below instead, each in its own nextest invocation, consecutively, after
+      # here (`SKULD_LABELS`) and run below instead, each in its own nextest invocation, consecutively, after
       # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
       # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
       # candidate explanation for the intermittent hang; the module doc has what was measured about
@@ -247,12 +252,13 @@ jobs:
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
+          SKULD_LABELS: "(shell_probes | elevation_routes) & !isolated_trailing_dot & !isolated_pathext_precedence & !isolated_existing_extensionless"
           COSCA_PROBE_ALLOW_ACCOUNTS: "1"
           COSCA_PROBE_ALLOW_STATE: "1"
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --no-capture --no-tests=warn -E 'not test(does_a_trailing_dot_still_open_the_extensionless_file) and not test(does_pathext_outrank_an_existing_extensionless_file) and not test(does_an_existing_extensionless_file_ever_launch_directly)')
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --no-capture --no-tests=warn)
           if [[ -n "${FILTER}" ]]; then
             args+=("${FILTER}")
           fi
@@ -280,6 +286,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+          SKULD_LABELS: isolated_trailing_dot
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='trailing_dot::does_a_trailing_dot_still_open_the_extensionless_file'
@@ -287,7 +294,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
       - name: OpenWith.exe after trailing-dot probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -304,6 +311,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+          SKULD_LABELS: isolated_pathext_precedence
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='precedence::does_pathext_outrank_an_existing_extensionless_file'
@@ -311,7 +319,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
       - name: OpenWith.exe after pathext-precedence probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -328,6 +336,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
+          SKULD_LABELS: isolated_existing_extensionless
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
           NAME='precedence::does_an_existing_extensionless_file_ever_launch_directly'
@@ -335,7 +344,7 @@ jobs:
             echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
             exit 0
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture -E "test(${NAME})"
+          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
       - name: OpenWith.exe after existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
         continue-on-error: true

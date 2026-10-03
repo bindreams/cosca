@@ -232,10 +232,11 @@ new member takes the gate and that prefix. So does
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane, whose names contain `cgroup`
 so that lane selects them): CI turns it off workflow-wide and the cgroup step opts in. So do the
-Windows groups: `COSCA_TEST_WINDOWS_DRIVE_MAP` (`windows_process_cwd`'s drive mapping),
-`COSCA_TEST_WINDOWS_PATH_CANARY` (the `windows_path_resolution` canaries and surveys),
-`COSCA_TEST_WINDOWS_ELEVATING_PROBES` (`windows_shell_execute`) and
-`COSCA_TEST_WINDOWS_EXECUTING_PROBES` (`windows_shell_resolution` and `windows_elevation_routes`).
+Windows groups: `COSCA_TEST_WINDOWS_DRIVE_MAP` (`windows_process_cwd`'s drive mapping);
+`COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries and surveys),
+`COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
+(`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
+are `test_group!` rows like `namespaces`, and which `windows-probes.yaml` selects by label.
 CI turns each off workflow-wide and opts in only in the step or job that runs it. Some
 system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
 

@@ -61,11 +61,13 @@ macro_rules! test_group {
     };
     (@declare $label:ident, $fixture:ident, $env:literal, $setup:expr) => {
         mod $fixture {
+            #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
             pub(super) fn enabled() -> Result<(), String> {
                 super::require_enabled($env, |name| std::env::var(name).ok())
             }
         }
 
+        #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
         #[skuld::fixture(requires = [$fixture::enabled], labels = [crate::test_harness::$label])]
         pub(crate) fn $fixture() -> Result<Group, String> {
             $setup
@@ -75,6 +77,7 @@ macro_rules! test_group {
 
 test_group!(NAMESPACES => namespaces, env = "COSCA_TEST_NAMESPACES", consent = "unshares namespaces and mounts");
 
-#[cfg(test)]
-#[path = "test_groups_tests.rs"]
-mod test_groups_tests;
+test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "creates scratch files and a suspended process");
+test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
+test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx");
+test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task");
