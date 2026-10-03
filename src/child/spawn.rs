@@ -1092,8 +1092,8 @@ pub(crate) fn resolve_identity(
     };
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::AfterIdentityRead, pid);
-    // MUTANT: macOS does not re-read.
-    #[cfg(target_os = "macos")]
+    // MUTANT: macOS does not re-read (tokio feature only, so the default lane passes and the tokio lane runs).
+    #[cfg(all(target_os = "macos", feature = "tokio"))]
     if true {
         return read;
     }
