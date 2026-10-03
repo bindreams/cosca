@@ -134,9 +134,10 @@ def commands(args: argparse.Namespace, t: Target, release: bool) -> list[list[st
 
 
 def execute(cmd: list[str], conf_dir: Path) -> Run:
-    # A compiler cache (RUSTC_WRAPPER=sccache, as CI sets it) stays in front of rustc and clippy-driver:
-    # a finding is a compile error, which sccache never caches, so no cache hit can hide one. The
-    # self-test runs every case on a cold and then a warm sccache.
+    # A compiler cache (RUSTC_WRAPPER=sccache, as CI sets it) stays in front of rustc and clippy-driver.
+    # sccache 0.18.0 cannot cache a `clippy-driver rustc ...` call (its argument parser sees multiple
+    # inputs), so workspace crates always compile; only dependencies are served from the cache. A
+    # finding is a compile error, which is never cached either.
     env = {
         **os.environ,
         "CLIPPY_CONF_DIR": str(conf_dir),
