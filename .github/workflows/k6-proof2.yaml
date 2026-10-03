@@ -1,0 +1,74 @@
+name: k6-proof2
+on:
+  pull_request:
+permissions:
+  contents: read
+env:
+  NEXTEST_VERSION: "0.9.146"
+jobs:
+  side:
+    name: ${{ matrix.side }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { side: base, ref: 492a951862235805d598877754b5f13712dd1d74 }
+          - { side: head, ref: 5da41f404a5cbafdb1e9ca2661667eda17a61de7 }
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      COSCA_TEST_ROOT: "0"
+      COSCA_TEST_UID_SWITCH: "0"
+      COSCA_TEST_NAMESPACES: "0"
+      COSCA_TEST_SETUID: "0"
+      COSCA_TEST_CGROUP: "0"
+      COSCA_TEST_WINDOWS_DRIVE_MAP: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Listings and results
+        shell: bash
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          if [ "$SIDE" = base ]; then
+            export COSCA_TEST_WINDOWS_PATH_CANARY=0 COSCA_TEST_WINDOWS_ELEVATING_PROBES=0 COSCA_TEST_WINDOWS_EXECUTING_PROBES=0
+          else
+            export COSCA_TEST_PATH_PROBES=0 COSCA_TEST_SHELL_EXECUTE=0 COSCA_TEST_SHELL_PROBES=0 COSCA_TEST_ELEVATION_ROUTES=0
+          fi
+          T=x86_64-pc-windows-msvc
+          lst() { name=$1; shift; cargo nextest list --locked --target $T --message-format json "$@" > "$OUT/list-$name.json"; }
+          lst tests
+          lst pty --features pty
+          lst tokio --features tokio
+          lst serde --features serde
+          lst release --release --lib
+          lst release-tokio --release --lib --features tokio
+          if [ "$SIDE" = head ]; then
+            (unset COSCA_TEST_PATH_PROBES COSCA_TEST_SHELL_EXECUTE COSCA_TEST_SHELL_PROBES COSCA_TEST_ELEVATION_ROUTES; lst red-unset-tests)
+          else
+            (unset COSCA_TEST_WINDOWS_PATH_CANARY COSCA_TEST_WINDOWS_ELEVATING_PROBES COSCA_TEST_WINDOWS_EXECUTING_PROBES; lst red-unset-tests)
+          fi
+          run() { name=$1; shift; cargo nextest run --locked --target $T --profile ci --no-fail-fast "$@" || echo "run $name exit $?"; cp target/nextest/ci/junit.xml "$OUT/junit-$name.xml"; }
+          run tests
+          run pty --features pty
+          run tokio --features tokio
+          run serde --features serde
+          run release --release --lib
+          run release-tokio --release --lib --features tokio
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: out-${{ matrix.side }}
+          path: ${{ runner.temp }}/out
