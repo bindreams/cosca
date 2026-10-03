@@ -4,15 +4,13 @@
 use super::process_parents;
 use crate::test_child::namespaces as ns;
 use crate::test_child::{await_member_ready, fixture_path, member_command};
+use crate::test_groups::{namespaces, Group};
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: the snapshot is
 /// `Unassessable`, neither the outer namespace's processes nor an empty list. Mutants: "scan
 /// `/proc` whatever the view"; "return an empty snapshot".
 #[skuld::test]
-fn namespaces_an_outer_procfs_is_unassessable() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_an_outer_procfs_is_unassessable(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_enumerate_outer));
 }
 
@@ -43,10 +41,7 @@ fn fixture_enumerate_inner() {
 /// mount. Mutants: "read `stat` with a plain `openat`"; "skip a pid whose `stat` lies beyond a
 /// mount".
 #[skuld::test]
-fn namespaces_a_stat_mounted_over_is_unassessable() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_stat_mounted_over_is_unassessable(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_enumerate_stat_overmount));
 }
 

@@ -492,6 +492,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 
+      # The namespaces group has its own step below. `spawn_io` and `tokio_io` are libtest binaries (they ignore `SKULD_LABELS`) with no namespace tests.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
@@ -504,10 +505,30 @@ jobs:
             echo $$ > "$CG/cgroup.procs"
             # The cgroup tests: a delegated cgroup on a throwaway runner, so consent is given.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
+            status=0
+            SKULD_LABELS="!namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))" || status=1
+            # Hand the target dir back so later steps can write to it.
+            chown -R "$2" "$PWD/target"
+            exit "$status"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
+
+      # The namespaces group (`COSCA_TEST_NAMESPACES`, off workflow-wide), selected by its label.
+      # `-E binary(cosca)`: the only binary with namespace tests; libtest binaries ignore `SKULD_LABELS` and would run whole.
+      - name: Run namespace tests (Linux)
+        if: matrix.os == 'linux'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
+          exec python3 .github/scripts/run-nextest.py namespaces sudo -E "$(command -v python3)" .github/scripts/forward.py bash -uxc '
+            CG=/sys/fs/cgroup/cosca-ci
+            mkdir -p "$CG"
+            echo $$ > "$CG/cgroup.procs"
+            export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
-            "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture -E "(((binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))) | (binary(cosca) & test(/namespaces_/)))" || status=1
+            SKULD_LABELS=namespaces "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca)" || status=1
             # Hand the target dir back so later steps can write to it.
             chown -R "$2" "$PWD/target"
             exit "$status"

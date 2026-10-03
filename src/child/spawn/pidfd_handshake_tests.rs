@@ -19,6 +19,7 @@ use crate::error::Error;
 use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
+use crate::test_groups::{namespaces, Group};
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -811,10 +812,7 @@ fn own_procfs() {
 /// Mutant: the child sends its pid number, and the parent opens a pidfd on that number (it opens
 /// the reuser, then kills and reaps it as the child that never ran).
 #[skuld::test]
-fn namespaces_a_reused_number_never_reaches_the_handshake() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_reused_number_never_reaches_the_handshake(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_reused_number_driver));
 }
 
@@ -894,10 +892,9 @@ fn fixture_reused_number_init() {
 /// Mutant: the spawning thread keeps its copy of the child's end past `spawn()` (the probe finds it
 /// held; without the probe the spawn blocks until the reuser exits).
 #[skuld::test]
-fn namespaces_a_reused_number_never_holds_the_spawn_when_the_child_dies_unreported() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_reused_number_never_holds_the_spawn_when_the_child_dies_unreported(
+    #[fixture(namespaces)] _group: &Group,
+) {
     ns::run(fixture_path!(fixture_unreported_death_driver));
 }
 
@@ -1017,10 +1014,9 @@ fn the_verdict_hook_runs_under_a_guard_that_opens_the_hold() {
 /// A thread that unshared its pid namespace for children cannot start threads, so it cannot run
 /// the handshake: the spawn fails before any fork, naming that cause.
 #[skuld::test]
-fn namespaces_a_spawn_from_a_thread_that_unshared_its_pid_namespace_names_the_cause() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_spawn_from_a_thread_that_unshared_its_pid_namespace_names_the_cause(
+    #[fixture(namespaces)] _group: &Group,
+) {
     ns::run(fixture_path!(fixture_unshared_thread));
 }
 
@@ -1123,10 +1119,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 /// Mutant: only `ESRCH` means gone (the spawn waits on the holder; the end probes shut the channel
 /// and report no forced EOF).
 #[skuld::test]
-fn namespaces_a_thread_taking_the_number_never_holds_the_spawn() {
-    if !ns::enabled() {
-        return;
-    }
+fn namespaces_a_thread_taking_the_number_never_holds_the_spawn(#[fixture(namespaces)] _group: &Group) {
     ns::run(fixture_path!(fixture_thread_reuse_driver));
 }
 

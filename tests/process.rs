@@ -1075,6 +1075,11 @@ fn death_watch_an_exit_wins_over_a_ready_source() {
     assert_eq!(common::first_ready(false, false), None);
 }
 
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
 fn main() {
-    skuld::run_all();
+    let mut runner = skuld::TestRunner::new();
+    runner.require_known_labels();
+    runner.run()
 }

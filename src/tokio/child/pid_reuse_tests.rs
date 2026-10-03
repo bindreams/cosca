@@ -13,6 +13,7 @@ use crate::signal::Sig;
 use crate::test_child::pid_reuse::{
     in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_peek, sigusr1_and_wait, wait_pollin,
 };
+use crate::test_groups::namespaces;
 use crate::tokio::Command;
 
 fn runtime() -> tokio::runtime::Runtime {

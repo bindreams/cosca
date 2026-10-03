@@ -3,3 +3,7 @@
 /// Marks a test run under a label selection, to check that selection does not leak into re-exec'd children.
 #[skuld::label]
 pub const REEXEC_SELFCHECK: skuld::Label;
+
+/// Selects the tests that unshare namespaces and mounts (the `NAMESPACES` group).
+#[skuld::label]
+pub const NAMESPACES: skuld::Label;
