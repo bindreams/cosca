@@ -450,7 +450,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
         // warning naming it, and left running.
         proc.reap_now(pid);
-        return Err(crate::signal::identity_unreadable(pid, errno));
+        let _ = errno; // MUTANT M5
+        return Err(crate::child::spawn::spawn_identity_error(crate::identity::Resolved::Gone));
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
@@ -501,10 +502,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             }
             // macOS: nothing pins the pid, so a child the handle still cannot show ours is
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
-            #[cfg(target_os = "macos")]
-            if matches!(other, Resolved::Unknown) {
-                proc.forget_foreign();
-            }
+            // MUTANT M2: no forget on macOS
+
             proc.reap_now(pid);
             return Err(crate::child::spawn::spawn_identity_error(other));
         }
