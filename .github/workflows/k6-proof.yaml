@@ -1,0 +1,62 @@
+name: k6-proof
+on:
+  pull_request:
+permissions:
+  contents: read
+env:
+  NEXTEST_VERSION: "0.9.146"
+  BASE: 492a951862235805d598877754b5f13712dd1d74
+jobs:
+  list:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Base worktree
+        shell: bash
+        run: git worktree add "$RUNNER_TEMP/base" "$BASE"
+      - name: Lane listings, base and head
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          SEL='[.["rust-suites"][] | .["binary-id"] as $b | .testcases | to_entries[] | select(.value["filter-match"].status == "matches") | [$b, .key]] | sort'
+          ISO='!isolated_trailing_dot & !isolated_pathext_precedence & !isolated_existing_extensionless'
+          A='does_a_trailing_dot_still_open_the_extensionless_file'; B='does_pathext_outrank_an_existing_extensionless_file'; C='does_an_existing_extensionless_file_ever_launch_directly'
+          old() { name=$1; shift; (cd "$RUNNER_TEMP/base" && cargo nextest list --locked --message-format json "$@" > "$OUT/$name.json") ; jq -S "$SEL" "$OUT/$name.json" > "$OUT/$name.set"; }
+          new() { name=$1; shift; cargo nextest list --locked --message-format json "$@" > "$OUT/$name.json" ; jq -S "$SEL" "$OUT/$name.json" > "$OUT/$name.set"; }
+          cmp() { echo "=== $1: base $(jq length "$OUT/old-$1.set") tests, head $(jq length "$OUT/new-$1.set") tests"; echo "--- base-only"; comm -23 <(jq -c '.[]' "$OUT/old-$1.set") <(jq -c '.[]' "$OUT/new-$1.set"); echo "--- head-only"; comm -13 <(jq -c '.[]' "$OUT/old-$1.set") <(jq -c '.[]' "$OUT/new-$1.set"); }
+          old old-path --test windows_path_resolution
+          export COSCA_TEST_PATH_PROBES=1 COSCA_TEST_PATH_PROBES_CONSENT=1
+          SKULD_LABELS=path_probes new new-path --test windows_path_resolution
+          cmp path
+          old old-se --test windows_shell_execute
+          export COSCA_TEST_SHELL_EXECUTE=1 COSCA_TEST_SHELL_EXECUTE_CONSENT=1
+          SKULD_LABELS=shell_execute new new-se --test windows_shell_execute
+          cmp se
+          old old-exec --test windows_shell_resolution --test windows_elevation_routes -E "not test($A) and not test($B) and not test($C)"
+          export COSCA_TEST_SHELL_PROBES=1 COSCA_TEST_SHELL_PROBES_CONSENT=1 COSCA_TEST_ELEVATION_ROUTES=1 COSCA_TEST_ELEVATION_ROUTES_CONSENT=1
+          SKULD_LABELS="(shell_probes | elevation_routes) & $ISO" new new-exec --test windows_shell_resolution --test windows_elevation_routes
+          cmp exec
+          for pair in "trailing_dot:$A:isolated_trailing_dot" "pathext:$B:isolated_pathext_precedence" "ext:$C:isolated_existing_extensionless"; do
+            IFS=: read -r k n l <<<"$pair"
+            old "old-$k" --test windows_shell_resolution -E "test($n)"
+            SKULD_LABELS="$l" new "new-$k" --test windows_shell_resolution
+            cmp "$k"
+          done
+          echo "=== RED: the new lane on the base tree (labels not declared there)"
+          export SKULD_LABELS=path_probes
+          set +e
+          (cd "$RUNNER_TEMP/base" && cargo nextest list --locked --message-format json --test windows_path_resolution > "$OUT/red.json" 2> "$OUT/red.err"); echo "exit $?"
+          tail -5 "$OUT/red.err"
+          jq -S "$SEL" "$OUT/red.json" 2>/dev/null | jq length
