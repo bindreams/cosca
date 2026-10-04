@@ -440,9 +440,8 @@ jobs:
       # delegated cgroup, with the `unshare` that container seccomp profiles refuse permitted. The
       # tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
       #
-      # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the two
-      # `graceful_tree_members_remain_still_reaps_an_already_exited_root` tests, whose
-      # `MembersRemain` branch only runs against a real cgroup v2 here), `cgroup_drop` (the drop-after-wait
+      # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the tests
+      # labelled `cgroup` explicitly because they need a real cgroup v2 here), `cgroup_drop` (the drop-after-wait
       # tests) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
       # throwaway runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
       #

@@ -52,7 +52,7 @@ pub const ISOLATED_PATHEXT_PRECEDENCE: skuld::Label;
 #[skuld::label]
 pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
 
-/// Selects the `CGROUP` group's tests, and the tests whose names contain `cgroup`.
+/// Selects the `CGROUP` group's tests and the other tests that need the delegated cgroup lane.
 #[skuld::label]
 pub const CGROUP: skuld::Label;
 
