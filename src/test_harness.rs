@@ -4,6 +4,10 @@
 #[skuld::label]
 pub const REEXEC_SELFCHECK: skuld::Label;
 
+/// Selects the root lanes' tests: the `ROOT` group, and the modules whose tests those lanes run whole.
+#[skuld::label]
+pub const ROOT: skuld::Label;
+
 /// Selects the tests that unshare namespaces and mounts (the `NAMESPACES` group).
 #[skuld::label]
 pub const NAMESPACES: skuld::Label;

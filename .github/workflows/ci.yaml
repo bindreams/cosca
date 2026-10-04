@@ -19,9 +19,9 @@ env:
   COSCA_TEST_ROOT: "0"
   # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml and the devvm provision scripts carry the same nextest version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.146"
-  # The tests the root lanes run: the modules gated on `COSCA_TEST_ROOT`, and `process_root`,
-  # gated on `COSCA_TEST_UID_SWITCH`.
-  PRIVILEGE_TESTS: "test(/resolve_base_tests|exact_posix_tests|test_child/) | binary(process_root)"
+  # The root lanes' binaries, narrowed by `SKULD_LABELS=root`. Name only skuld binaries: a libtest
+  # binary ignores `SKULD_LABELS` and would run whole. `process_root` is gated by `COSCA_TEST_UID_SWITCH`.
+  PRIVILEGE_TESTS: "binary(cosca) | binary(process_root)"
   # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
   COSCA_TEST_UID_SWITCH: "0"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
@@ -837,7 +837,7 @@ jobs:
           exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
-            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" -E "$PRIVILEGE_TESTS"
+            SKULD_LABELS=root "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "$PRIVILEGE_TESTS"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
 
 
