@@ -330,8 +330,8 @@ pub(crate) fn reject_structural_gui_config(cmd: &Command) -> Result<(), Error> {
     // kill_on_drop is deliberately NOT rejected. `Command::default()` sets it to
     // `true` and offers no way to distinguish that default from an explicit request,
     // so rejecting it would reject every default-constructed command and make this
-    // path unreachable. Its real reach (the osascript front-end only) is documented
-    // on `ElevatedVia::MacosOsascript` instead.
+    // path unreachable. What a kill and a drop do to it (nothing: osascript is a
+    // front) is documented on `ElevatedVia::MacosOsascript` instead.
     Ok(())
 }
 
@@ -389,14 +389,14 @@ pub(crate) fn build_rewrite(
     // path while honoring it on the sync one.
     derived.kill_on_drop(cmd.kill_on_drop_flag());
     // …and when it is set, SAY SO — the default must not be silent (see
-    // `ElevatedVia::MacosOsascript` for why killing the front-end can't stop the
-    // payload). The program is named so a test can assert on its OWN record in the
-    // process-global capture buffer.
+    // `ElevatedVia::MacosOsascript` for why nothing can kill the payload). The program is
+    // named so a test can assert on its OWN record in the process-global capture buffer.
     if cmd.kill_on_drop_flag() {
         log::warn!(
-            "kill_on_drop is set on a macOS graphically-elevated child ({program:?}): killing or \
-             dropping it reaches only the osascript front-end, and the root program keeps running \
-             with its exit status unobservable. Call .kill_on_drop(false) and wait() if that matters."
+            "kill_on_drop is set on a macOS graphically-elevated child ({program:?}), which cannot be \
+             killed: dropping it early leaves the root program and its osascript front-end running, \
+             with the program's exit status unobservable. Call .kill_on_drop(false) and wait() if that \
+             matters."
         );
     }
     // Containment IS rejected by the structural gate, so there is nothing else to carry.

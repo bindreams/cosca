@@ -457,6 +457,21 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
+    /// Whether the child is still running, read without reaping it: `false` once it has exited,
+    /// been reaped by us or by someone else, or was gone when adopted.
+    #[cfg(unix)]
+    pub(crate) fn is_running(&self) -> io::Result<bool> {
+        // Held across the peek, so no reap of ours lands in between.
+        let lock = self.lock();
+        if matches!(lock.state, State::E(_)) {
+            return Ok(false);
+        }
+        let Some(target) = self.target() else {
+            return Ok(false);
+        };
+        Ok(matches!(exit_only::peek(&target)?, Peek::Running))
+    }
+
     /// Hard-kill the child; already gone is success.
     pub(crate) fn kill(&self) -> io::Result<()> {
         #[cfg(unix)]

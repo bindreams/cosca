@@ -50,9 +50,12 @@ pub enum ElevationErrorKind {
     /// Interactive auth requested but there is no controlling terminal to prompt on.
     #[error("no controlling terminal for interactive elevation")]
     NoTty,
-    /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
-    /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
-    #[error("could not terminate an elevated child: permission denied")]
+    /// An unprivileged parent could not kill its elevated child: the OS refused the signal
+    /// (EPERM on POSIX, ACCESS_DENIED on Windows), or the tracked process is a front that a kill
+    /// would orphan the elevated program from, so nothing was sent (see
+    /// [`Child::kill`](crate::Child::kill)). `detail` says which, and whether the child is still
+    /// running.
+    #[error("could not kill an elevated child")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to
     /// manage it. Whether it was terminated is reported in the error `detail`.

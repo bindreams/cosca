@@ -255,18 +255,93 @@ fn posix_askpass_auth_reaches_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// GATED (POSIX): dropping a non-contained elevated long-lived child must
-// RETURN (no hang), and kill() on it must return the typed Unkillable error.
+// GATED (POSIX): `kill()` on an uncontained `sudo`/`doas` child is the typed `Unkillable`, and
+// sends nothing. The tracked process is the wrapper's front, which runs as the caller: a signal
+// to it would be allowed, and would orphan the root program rather than end it (issue #14).
 //
-// Waiting for the payload's readiness line closes the window in which `sudo` has not yet
-// setresuid(2)d to root and a kill() would still succeed. Dropping the socket at the end
-// releases the payload without needing a privileged kill.
+// Waiting for the payload's readiness line closes the window in which `sudo` has not yet started
+// the program. Dropping the socket at the end releases the payload without a privileged kill.
+//
+// Mutant: `kill()` signals the front (it answers `Ok` with the program alive). The drop's own
+// mutants are `child::front_kill_tests`'.
 #[cfg(unix)]
 #[skuld::test]
 fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     if !gated() {
         return;
     }
+    let (child, mut payload) = spawn_elevated_payload();
+    let killed = child.kill();
+    // Checked first, so a false `Ok` reads as one: the program survived it.
+    payload.assert_blocked();
+    assert_unkillable(killed);
+    // The front is alive and `kill()` left it so: a `Drop` that waited for it would block here.
+    drop(child);
+    payload.assert_blocked();
+    payload.release();
+}
+
+// GATED (POSIX): after the refused `kill()`, `wait()` still returns only once the elevated
+// program has exited, with its status: the front was left alone. Mutant: `kill()` signals the
+// front, which `wait()` then reports as killed while the program runs on.
+#[cfg(unix)]
+#[skuld::test]
+fn posix_uncontained_elevated_child_is_unkillable_and_wait_reports_the_programs_exit() {
+    if !gated() {
+        return;
+    }
+    let (child, mut payload) = spawn_elevated_payload();
+    let killed = child.kill();
+    payload.assert_blocked();
+    assert_unkillable(killed);
+    // The watch returns once the front has exited, which it does only after the program.
+    payload.release();
+    let status = child.wait().expect("wait for the front");
+    assert!(
+        status.success(),
+        "the front should exit as the released program did (0), not by a signal: {status:?}"
+    );
+}
+
+// GATED (POSIX, tokio): the async twin of `posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang`.
+#[cfg(all(unix, feature = "tokio"))]
+#[skuld::test]
+async fn async_posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
+    if !gated() {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let nonce = common::payload::fresh_nonce();
+    let exe = testbin();
+    let mut c = cosca::tokio::Command::new();
+    c.executable(&exe)
+        .args([
+            exe.clone().into_os_string(),
+            "block-on-socket".into(),
+            addr.into(),
+            nonce.clone().into(),
+        ])
+        .elevation_auth(cosca::elevation::Auth::NonInteractive);
+    let mut child = c.spawn().expect("async elevated block-on-socket");
+    let pid = child.id().pid();
+    let mut payload = tokio::task::spawn_blocking(move || {
+        common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(pid))
+    })
+    .await
+    .expect("accept the payload");
+    let killed = child.kill();
+    payload.assert_blocked();
+    assert_unkillable(killed);
+    drop(child);
+    payload.assert_blocked();
+    payload.release();
+}
+
+/// An elevated `block-on-socket` payload, launched non-interactively by the detected backend
+/// (`sudo` before `doas`), and connected.
+#[cfg(unix)]
+fn spawn_elevated_payload() -> (cosca::Child, common::payload::Payload) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind readiness listener");
     let addr = listener.local_addr().expect("local_addr").to_string();
     let nonce = common::payload::fresh_nonce();
@@ -281,34 +356,26 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
         ])
         .elevation_auth(cosca::elevation::Auth::NonInteractive);
     let child = c.spawn().expect("elevated block-on-socket");
-    // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
-    // is the `Drop` under test and not a reference count going down.
+    // Watched by pid, not through `child`: the test owns the only `Child`, so its `drop` is the
+    // `Drop` under test.
     let payload =
         common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
+    (child, payload)
+}
 
-    // kill() outcome depends on the backend's process topology:
-    //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
-    //    child the root process itself, so an unprivileged parent's signal is EPERM → the typed
-    //    `Unkillable`.
-    //  - sudo WITH `use_pty` (increasingly the distro default) keeps the tracked child as sudo's
-    //    same-uid monitor and runs root under a pty grandchild, so kill() SUCCEEDS on the monitor.
-    //    Tearing down that grandchild is the deferred "un-killable elevated child / sudo pty
-    //    monitor" teardown contract (issue #14), out of this plan's scope.
-    // Either way is contract-correct here; the load-bearing Decision-A guarantee this test exists
-    // for is that neither kill() nor the Drop below BLOCKS. A raw untyped Io on the EPERM path
-    // would be the real defect.
-    match child.kill() {
-        Ok(()) => {}
-        Err(cosca::error::Error::Elevation {
-            kind: cosca::error::ElevationErrorKind::Unkillable,
-            ..
-        }) => {}
-        other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
-    }
-    // The payload is alive and `kill()` could not reap it, so a `Drop` that waited for the child
-    // would block here until the test ended.
-    drop(child);
-    payload.release();
+#[cfg(unix)]
+#[track_caller]
+fn assert_unkillable(killed: Result<(), cosca::error::Error>) {
+    assert!(
+        matches!(
+            killed,
+            Err(cosca::error::Error::Elevation {
+                kind: cosca::error::ElevationErrorKind::Unkillable,
+                ..
+            })
+        ),
+        "kill() of an uncontained wrapper-elevated child must be the typed Unkillable, got {killed:?}"
+    );
 }
 
 // GATED: the allowed (already-elevated) spawn path reports elevation() honestly.

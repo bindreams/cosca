@@ -196,6 +196,11 @@ impl Child {
     pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {
         self.elevation.clone()
     }
+    /// What a forced kill of this child may do (see [`crate::elevation::front`]).
+    #[cfg(unix)]
+    pub(super) fn front_gate(&self) -> crate::elevation::front::Gate {
+        front_gate(self.elevation.as_ref(), &self.os, self.id.pid())
+    }
     /// Is this a wrapper-elevated child a plain parent may be unable to signal?
     /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
     fn is_elevated_wrapper(&self) -> bool {
@@ -493,6 +498,11 @@ impl Child {
     /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
     /// else.
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
+    ///
+    /// **An elevated child behind a front** is never signalled while the front runs: in a Linux
+    /// cgroup this kills the tree through `cgroup.kill` first, and otherwise it sends nothing and
+    /// returns [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable). See
+    /// the sync [`Child::kill`](crate::Child::kill).
     pub fn kill(&mut self) -> Result<(), Error> {
         self.kill_sent().map(|_| ())
     }
@@ -504,6 +514,12 @@ impl Child {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
+        }
+        #[cfg(unix)]
+        match self.front_gate() {
+            crate::elevation::front::Gate::Open => {}
+            crate::elevation::front::Gate::CgroupFirst => self.os.attached.hard_kill_marking(&self.tree_killed)?,
+            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
         }
         // A plain child is unaffected (the mapping only fires on an elevated wrapper child whose
         // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
@@ -549,6 +565,9 @@ impl Child {
     ///
     /// **Kernel requirement.** As for the sync [`Child::kill_tree`](crate::Child::kill_tree): the
     /// `cgroup.kill` fork-race fix, see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
+    ///
+    /// **An elevated child behind a front** is reached only through a cgroup, as for the sync
+    /// [`Child::kill_tree`](crate::Child::kill_tree).
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
@@ -571,6 +590,12 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
+        // A live front outside a cgroup is not signalled, by its group or otherwise. In a cgroup the
+        // backstop below is `kill()`, which signals the front only after its own cgroup kill succeeds.
+        #[cfg(unix)]
+        if let crate::elevation::front::Gate::Closed(unkillable) = self.front_gate() {
+            return Err(unkillable);
+        }
         let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
@@ -821,6 +846,10 @@ mod bypass_drop_tests;
 mod macos_kill_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/front_kill_tests.rs"]
+mod front_kill_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;
 
@@ -876,6 +905,9 @@ impl Child {
 ///   (`TerminateJobObject`, then `CloseHandle`); one opted out of teardown is closed with
 ///   `KILL_ON_JOB_CLOSE` cleared, and nothing kills it. Other mechanisms drop in place.
 ///
+/// An elevated child behind a front (see [`kill`](Child::kill)) is never signalled while the
+/// front runs: outside a cgroup, or when the cgroup kill fails, the drop signals nothing, and warns.
+///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
 /// handle also makes the drop forget tokio's `Child`, armed or not, so tokio cannot reap by that
@@ -916,8 +948,19 @@ impl Drop for Child {
             view
         };
         if self.kill_on_drop {
+            // A live elevation front is never signalled: it is left running, and named.
             #[cfg(unix)]
-            signal_on_drop(self.id, view, &mut os);
+            match front_gate(self.elevation.as_ref(), &os, self.id.pid()) {
+                crate::elevation::front::Gate::Closed(unkillable) => {
+                    log::warn!("Child::drop: the elevated child is left running: {unkillable}");
+                }
+                gate => signal_on_drop(
+                    self.id,
+                    view,
+                    matches!(gate, crate::elevation::front::Gate::CgroupFirst),
+                    &mut os,
+                ),
+            }
             #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
         }
@@ -938,10 +981,27 @@ impl Drop for Child {
     }
 }
 
-/// The signals of a kill-on-drop drop: the tree, then the root.
+/// What a forced kill of the child may do (see [`crate::elevation::front`]).
+#[cfg(unix)]
+fn front_gate(
+    elevation: Option<&crate::elevation::ElevationReport>,
+    os: &OsResources,
+    pid: u32,
+) -> crate::elevation::front::Gate {
+    crate::elevation::front::gate(
+        elevation.map(|r| &r.via),
+        pid,
+        os.attached.kills_across_credentials(),
+        || os.proc.as_ref().map_or(Ok(false), ProcSource::is_running),
+    )
+}
+
+/// The signals of a kill-on-drop drop: the tree, then the root. `cgroup_first`: the root is an
+/// elevation front, signalled only if the tree's cgroup kill succeeded.
 fn signal_on_drop(
     id: ProcessId,
     #[cfg(unix)] view: crate::containment::DropView,
+    #[cfg(unix)] cgroup_first: bool,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
 ) {
@@ -980,6 +1040,14 @@ fn signal_on_drop(
     }
     #[cfg(not(unix))]
     if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
+        return;
+    }
+    #[cfg(unix)]
+    if cgroup_first && tree.is_err() {
+        log::warn!(
+            "Child::drop: elevation front pid {pid} is left running: its cgroup kill failed, so the elevated program \
+             may still run, and killing the front would orphan it"
+        );
         return;
     }
     let Some(proc) = os.proc.as_mut() else {

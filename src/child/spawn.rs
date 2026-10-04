@@ -94,6 +94,9 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
 /// would name the tree by that number (a process group, a ppid walk), and the note says so.
+///
+/// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
+/// kill is the typed `Unkillable`, and the note says so.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -101,7 +104,10 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     };
     let view = crate::containment::DropView::read(child.id, child.proc.is_reaped(), &child.tree_killed);
     let mut skipped = None;
-    let tree = child.containment().can_teardown().then(|| {
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let front_closed = matches!(child.front_gate(), crate::elevation::front::Gate::Closed(_));
+    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
             .hard_kill_marking_unless_reaped(view, &child.tree_killed)

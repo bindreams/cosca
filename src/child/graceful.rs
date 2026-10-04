@@ -97,6 +97,10 @@ impl Child {
     /// A watch failure never skips the kill and reap; it surfaces only after they run, and a
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
+    ///
+    /// The escalation is [`kill`](Child::kill), so an elevated child behind a front that outlives
+    /// the grace is left running and answers
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
 
@@ -110,7 +114,7 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;

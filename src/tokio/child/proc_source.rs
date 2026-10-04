@@ -585,6 +585,24 @@ impl ProcSource {
         }
     }
 
+    /// Whether the child is still running, read without reaping it: `false` once it is reaped, by
+    /// tokio or by someone else, or has exited. On macOS a child with no unique id cannot be read.
+    #[cfg(unix)]
+    pub(crate) fn is_running(&self) -> std::io::Result<bool> {
+        if self.is_reaped() {
+            return Ok(false);
+        }
+        let Some(target) = self.target() else {
+            return Err(std::io::Error::other(
+                "the child's unique id is unknown, so nothing shows its pid still names it",
+            ));
+        };
+        Ok(matches!(
+            crate::wait::exit_only::peek(&target)?,
+            crate::wait::exit_only::Peek::Running
+        ))
+    }
+
     /// `true` once the backend has collected the child's status, so no reap remains.
     pub(crate) fn is_reaped(&self) -> bool {
         match self {

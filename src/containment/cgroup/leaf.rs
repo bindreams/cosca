@@ -626,7 +626,15 @@ impl CgroupLeaf {
     /// see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        match self.dir.write("cgroup.kill", KILL_PAYLOAD) {
+        #[cfg(test)]
+        let written = if fault::kill_writes_fail() {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            self.dir.write("cgroup.kill", KILL_PAYLOAD)
+        };
+        #[cfg(not(test))]
+        let written = self.dir.write("cgroup.kill", KILL_PAYLOAD);
+        match written {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());

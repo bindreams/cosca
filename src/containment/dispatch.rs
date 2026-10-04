@@ -222,6 +222,17 @@ impl Attached {
         format!("{self:?}")
     }
 
+    /// Whether this mechanism's kill reaches every member whatever its credentials: `cgroup.kill`
+    /// does. A signal to a group or to walked members is subject to the kernel's permission check.
+    #[cfg(unix)]
+    pub(crate) fn kills_across_credentials(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Attached::Cgroup(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         self.hard_kill_report().0
