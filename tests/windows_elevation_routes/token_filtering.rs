@@ -33,29 +33,22 @@ use crate::harness::{
 };
 use crate::windows_probe::mark_test_passed;
 
-/// The body a child runs when a spawning probe re-execs this binary: `COSCA_PROBE_REPORT_TO` names
-/// the file to answer through, and `COSCA_PROBE_CHILD` suppresses the nested spawn attempts so a
-/// child never recurses. [`crate::logon_routes::logon_one_account`] and [`unelevated_caller_view`]
-/// both deliberately spawn their child WITHOUT `COSCA_PROBE_CHILD` set — see each function's doc
-/// comment — so that child runs the full chain, the same as [`linked_token_chain_here`] does when
-/// run directly.
+/// The helper a spawning probe re-execs this binary as (`--cosca-probe-helper measure-token`):
+/// `COSCA_PROBE_REPORT_TO` names the file to answer through, and `COSCA_PROBE_CHILD` suppresses the
+/// nested spawn attempts so a child never recurses. [`crate::logon_routes::logon_one_account`] and
+/// [`unelevated_caller_view`] deliberately spawn their child WITHOUT `COSCA_PROBE_CHILD`, so that
+/// child runs the full chain, the same as [`linked_token_chain_here`] does when run directly.
 ///
-/// `COSCA_PROBE_ANCESTOR_CONTAINED=1` is a THIRD, separate marker those same two spawn sites also
-/// set, and is read independently of the branch below: whether this process runs the whole chain is
-/// decided by `COSCA_PROBE_REPORT_TO`/`COSCA_PROBE_CHILD` alone, but whether it is actually nested
-/// inside a `contain()`-created job is a different question that condition cannot answer on its
-/// own — a human running `COSCA_PROBE_REPORT_TO=... <test binary> --cosca-probe-helper measure-token`
-/// directly at the top level satisfies that same condition without ever being contained. Only
-/// `logon_one_account` and `unelevated_caller_view` actually wrap their child in `contain` (before
-/// ever resuming it, `CREATE_SUSPENDED`) before it can reach here, so only they set this marker;
-/// deriving `ancestor_contained` from anything else would mislabel a manual, uncontained run as
-/// contained.
+/// `COSCA_PROBE_ANCESTOR_CONTAINED=1` is a separate marker those same two spawn sites set: it says
+/// whether this process is nested inside a `contain()`-created job, which `COSCA_PROBE_REPORT_TO` and
+/// `COSCA_PROBE_CHILD` cannot say. Only those two sites wrap their child in `contain` (before ever
+/// resuming it, `CREATE_SUSPENDED`), so only they set it.
 ///
-/// A direct, unspawned run (no `COSCA_PROBE_REPORT_TO`) has no report destination to
-/// answer through and nothing spawned it, so it is given its own, narrower purpose here rather than
-/// duplicating [`linked_token_chain_here`]'s whole-chain probe: report just this process's own
-/// token, nothing more.
+/// Panics without `COSCA_PROBE_REPORT_TO`: the helper serves only a spawned child, and has nothing
+/// to answer through otherwise.
 pub(crate) fn measure_this_token() {
+    let dest = std::env::var_os("COSCA_PROBE_REPORT_TO")
+        .expect("measure-token runs only as a spawned child: COSCA_PROBE_REPORT_TO names its report file");
     let mut out = String::new();
     // `ShellExecuteEx` cannot carry an environment at all, so whether an explicitly built block
     // survives a token-based spawn is one of the capabilities being measured. The canary is only
@@ -63,20 +56,12 @@ pub(crate) fn measure_this_token() {
     if let Ok(v) = std::env::var("COSCA_PROBE_ENV_CANARY") {
         let _ = writeln!(out, "  env block: the caller's COSCA_PROBE_ENV_CANARY arrived as {v:?}");
     }
-    let report_to = std::env::var_os("COSCA_PROBE_REPORT_TO");
-    if report_to.is_some() && std::env::var_os("COSCA_PROBE_CHILD").is_none() {
-        // Spawned by `logon_one_account` or `unelevated_caller_view`, or a manual top-level run that
-        // set `COSCA_PROBE_REPORT_TO` by hand: either way, the child runs the whole chain. Only the
-        // former is actually nested inside a `contain()`-created job, so `ancestor_contained` is read
-        // from its own explicit marker below — set only by those two spawn sites — rather than
-        // inferred from this branch's own condition, which a manual run can satisfy without ever
-        // being contained. See this function's doc comment.
+    if std::env::var_os("COSCA_PROBE_CHILD").is_none() {
         let ancestor_contained = std::env::var_os("COSCA_PROBE_ANCESTOR_CONTAINED").is_some_and(|v| v == "1");
         measure(&mut out, ancestor_contained);
     } else {
-        // Either a child of `spawn_attempts_with` (`COSCA_PROBE_CHILD` is set, so it does not
-        // recurse into more spawn attempts of its own), or a direct, unspawned run
-        // with nothing to answer through — both get the same minimal, own-purpose report.
+        // A child of `spawn_attempts_with` does not recurse into more spawn attempts of its own:
+        // it reports just this process's own token.
         let _ = writeln!(out, "=== token report (pid {}) ===", std::process::id());
         match open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE) {
             Ok(t) => describe(&mut out, "current process token", t.0),
@@ -84,27 +69,12 @@ pub(crate) fn measure_this_token() {
                 let _ = writeln!(out, "  current process token: <{e}>");
             }
         }
-        if report_to.is_none() {
-            // A direct, unspawned run: nothing else asserts this report says
-            // anything, so assert it here — a printed report that never actually describes a
-            // token is not a measurement.
-            assert!(
-                out.contains("integrity="),
-                "this process's own token could not be described, so nothing was measured"
-            );
-        }
     }
     print!("{out}");
-    if let Some(dest) = report_to {
-        // Spawned by another probe (possibly under a different account): that probe's own
-        // marker call already covers it, and this process may not even be able to reach the
-        // marker directory — see `env_block`'s doc.
-        std::fs::write(&dest, &out)
-            .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
-    } else {
-        // A direct, unspawned run: nothing else marks this one passed.
-        mark_test_passed("COSCA_PROBE_MARKERS");
-    }
+    // The spawning probe's own marker call covers this child, which may not even reach the marker
+    // directory (see `env_block`'s doc).
+    std::fs::write(&dest, &out)
+        .unwrap_or_else(|e| panic!("could not write the report to {}: {e}", PathBuf::from(&dest).display()));
 }
 
 /// Read ANOTHER process's token, named by PID in `COSCA_PROBE_INSPECT_PID`.

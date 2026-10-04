@@ -277,9 +277,8 @@ jobs:
         run: &openwith_diagnostic >-
           Get-CimInstance Win32_Process -Filter "Name = 'OpenWith.exe'" | Select-Object ProcessId, CreationDate, CommandLine | Format-Table -AutoSize
       # Isolated so no other probe's `ShellExecuteExW` call runs in this process, immediately before
-      # or after this one. `NAME` must match `probe_filter` (a blank filter matches everything, same
-      # substring semantics as `${FILTER}` above) or this step skips with a message instead of
-      # letting nextest fail on zero matches.
+      # or after this one. The label alone names the probe; a `probe_filter` that excludes it makes the
+      # step warn instead of letting nextest fail on zero matches.
       - name: Run trailing-dot probe (isolated)
         if: ${{ !cancelled() }}
         shell: bash
@@ -289,12 +288,15 @@ jobs:
           SKULD_LABELS: isolated_trailing_dot
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='trailing_dot::does_a_trailing_dot_still_open_the_extensionless_file'
-          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
-            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
-            exit 0
+          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
+          none=fail
+          args=()
+          if [[ -n "${FILTER}" ]]; then
+            none=warn
+            args+=("${FILTER}")
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
+          cargo "${args[@]}"
       - name: OpenWith.exe after trailing-dot probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -314,12 +316,15 @@ jobs:
           SKULD_LABELS: isolated_pathext_precedence
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='precedence::does_pathext_outrank_an_existing_extensionless_file'
-          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
-            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
-            exit 0
+          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
+          none=fail
+          args=()
+          if [[ -n "${FILTER}" ]]; then
+            none=warn
+            args+=("${FILTER}")
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
+          cargo "${args[@]}"
       - name: OpenWith.exe after pathext-precedence probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -339,12 +344,15 @@ jobs:
           SKULD_LABELS: isolated_existing_extensionless
         run: |
           mkdir -p "$COSCA_PROBE_MARKERS"
-          NAME='precedence::does_an_existing_extensionless_file_ever_launch_directly'
-          if [[ -n "${FILTER}" && "${NAME}" != *"${FILTER}"* ]]; then
-            echo "skipping ${NAME}: does not match probe_filter '${FILTER}'"
-            exit 0
+          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
+          none=fail
+          args=()
+          if [[ -n "${FILTER}" ]]; then
+            none=warn
+            args+=("${FILTER}")
           fi
-          cargo nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture --no-tests=fail
+          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
+          cargo "${args[@]}"
       - name: OpenWith.exe after existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
         continue-on-error: true

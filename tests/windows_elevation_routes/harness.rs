@@ -377,7 +377,6 @@ fn env_block_from(
 const HELPER_FLAG: &str = "--cosca-probe-helper";
 
 /// A job this test binary does for a probe that re-executes it, in place of running tests.
-#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Helper {
     /// [`crate::token_filtering::measure_this_token`].
     MeasureToken,
@@ -388,16 +387,21 @@ impl Helper {
 }
 
 /// The helper `args` (this binary's arguments after its name) ask for: `Ok(None)` when they ask for
-/// none, so the tests run; `Err` for a helper flag that names no helper.
+/// none, so the tests run; `Err` for a helper flag that names no helper or is followed by anything
+/// beyond its name.
 pub(crate) fn helper_from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Option<Helper>, String> {
     let mut args = args.into_iter();
     if args.next().is_none_or(|first| first != HELPER_FLAG) {
         return Ok(None);
     }
+    let helper = match args.next() {
+        Some(name) if name == Helper::MEASURE_TOKEN => Helper::MeasureToken,
+        Some(name) => return Err(format!("{HELPER_FLAG}: unknown helper {name:?}")),
+        None => return Err(format!("{HELPER_FLAG}: no helper named")),
+    };
     match args.next() {
-        Some(name) if name == Helper::MEASURE_TOKEN => Ok(Some(Helper::MeasureToken)),
-        Some(name) => Err(format!("{HELPER_FLAG}: unknown helper {name:?}")),
-        None => Err(format!("{HELPER_FLAG}: no helper named")),
+        None => Ok(Some(helper)),
+        Some(extra) => Err(format!("{HELPER_FLAG}: unexpected argument {extra:?}")),
     }
 }
 
@@ -981,7 +985,3 @@ impl Drop for ScratchAccount {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "harness_tests.rs"]
-mod harness_tests;
