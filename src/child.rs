@@ -234,8 +234,9 @@ impl Child {
     /// [`wait`](Child::wait) still returns only once the program has exited. A child contained in
     /// a Linux cgroup ([`Containment::CgroupV2`]) is not covered by this: its kill signals the
     /// tracked process as any child's does.
-    /// [`terminate`](Child::terminate) reaches the program through `sudo` and `doas`, which relay
-    /// `SIGTERM`, and is refused for osascript, which does not.
+    /// [`terminate`](Child::terminate) sends `SIGTERM` to the tracked process: `sudo` and `doas`
+    /// relay it to the program, and with direct exec the root program itself refuses it (`EPERM`).
+    /// For osascript, which would end without relaying it, `terminate` is refused.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {

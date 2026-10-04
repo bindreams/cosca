@@ -334,3 +334,62 @@ fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgr
         assert_eq!(reap(pid), None, "the teardown reaps it");
     }
 }
+
+/// A child that is not a front outside a cgroup keeps `main`'s refused escalation: the raw `Io`,
+/// not `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its kill is refused by a
+/// seam, and it ignores `SIGTERM`, so the escalation runs. Mutant: the escalation goes through
+/// `kill()`, whose mapping makes a wrapper child's refusal `Unkillable`.
+#[skuld::test]
+fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_mains_refusal() {
+    let mut cmd = Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Pkexec));
+    let mut ready = [0u8; 6];
+    child
+        .stdout()
+        .expect("stdout pipe")
+        .read_exact(&mut ready)
+        .expect("read `ready`");
+    {
+        let _refused = crate::signal::seams::refuse_kills();
+        match child.graceful_shutdown(Duration::ZERO) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+            other => panic!("expected main's Io(PermissionDenied), got {other:?}"),
+        }
+    }
+    assert_ends_unsignalled(&child, stdin);
+}
+
+/// macOS: a failed attach whose read of the front's identity found it gone, reaped by someone else,
+/// says it could not be waited on, not that it is left unreaped. Mutant: the arm always says the
+/// front is left unreaped.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_a_failed_attach_that_found_the_front_gone_does_not_claim_it_unreaped() {
+    use crate::child::spawn::fault;
+    let mut cmd = cat();
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+        Backend::Sudo,
+    ))));
+    fault::set_force_attach_failure(true);
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().map(drop);
+    fault::set_force_attach_failure(false);
+    fault::set_force_identity_vanished(false);
+    let text = err.expect_err("the forced attach failure fails the spawn").to_string();
+    assert!(text.contains("what sudo left"), "{text}");
+    assert!(text.contains("could not be waited on"), "{text}");
+    assert!(!text.contains("left unreaped"), "{text}");
+}
+
+/// A child left unverified because someone else reaped it is unaccounted for, never "left
+/// unreaped"; one whose identity was refused is left unreaped. Mutant: either maps to the other.
+#[skuld::test]
+fn an_unverified_childs_fate_follows_its_identity() {
+    use crate::child::spawn::FrontFate;
+    use crate::containment::RootIdentity;
+    assert_eq!(FrontFate::of_unverified(RootIdentity::Gone), FrontFate::Unaccounted);
+    assert_eq!(FrontFate::of_unverified(RootIdentity::Unknown), FrontFate::LeftUnreaped);
+}

@@ -54,8 +54,9 @@ impl Child {
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
     /// is refused with [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
-    /// while osascript runs: a `SIGTERM` would end osascript, not the program. `sudo` and `doas`
-    /// relay it to the program, so theirs is sent.
+    /// while osascript runs: a `SIGTERM` would end osascript, not the program. A `sudo` or `doas`
+    /// child's is sent: the wrapper relays it to the program, and with direct exec the tracked
+    /// process is the root program itself, which refuses it (`EPERM`).
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
@@ -107,8 +108,8 @@ impl Child {
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
     ///
-    /// The escalation is [`kill`](Child::kill), so an elevated child behind a front that outlives
-    /// the grace is left running and answers
+    /// An elevated child behind a front outside a cgroup (see [`kill`](Child::kill)) that outlives
+    /// the grace is not killed: it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
@@ -123,7 +124,20 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
+        // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
+        // refused kill stays the raw `Io` it is on `main`.
+        #[cfg(unix)]
+        match self.kill_gate() {
+            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
+            // An exit is permanent, so a refused signal to an exited front changes nothing.
+            crate::elevation::front::Gate::Exited => {
+                _ = self.proc.kill();
+            }
+            crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
+        }
+        #[cfg(not(unix))]
+        self.proc.kill().map_err(Error::Io)?;
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;

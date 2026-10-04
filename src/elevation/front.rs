@@ -12,8 +12,9 @@
 //! A child contained in a Linux cgroup is not gated: its forced kills signal the tracked process
 //! as any child's do.
 //!
-//! A `SIGTERM` is gated only for osascript. sudo and doas relay it to the program; osascript would
-//! end, leaving the program running, so `terminate()` on it is refused like a kill.
+//! A `SIGTERM` is gated only for osascript, which would end and leave the program running, so
+//! `terminate()` on it is refused like a kill. A sudo or doas front relays it to the program; with
+//! direct exec the tracked process is the root program itself, which refuses it (`EPERM`).
 //!
 //! pkexec, a UAC child and an already-elevated child track the program itself and are signalled
 //! like any child.

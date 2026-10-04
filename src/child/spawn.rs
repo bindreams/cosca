@@ -448,8 +448,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                     e.identity.is_some(),
                     "a macOS attach fails only on the root's identity read"
                 );
-                leave_unverified_child(child, e.identity.unwrap_or(crate::containment::RootIdentity::Unknown));
-                FrontFate::LeftUnreaped
+                let identity = e.identity.unwrap_or(crate::containment::RootIdentity::Unknown);
+                leave_unverified_child(child, identity);
+                FrontFate::of_unverified(identity)
             };
             #[cfg(not(target_os = "macos"))]
             let fate = teardown_unadopted_or_front(child, front);
@@ -478,20 +479,13 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         other => {
             #[cfg(target_os = "macos")]
             let fate = {
-                let gone = matches!(other, crate::identity::Resolved::Gone);
-                leave_unverified_child(
-                    child,
-                    if gone {
-                        crate::containment::RootIdentity::Gone
-                    } else {
-                        crate::containment::RootIdentity::Unknown
-                    },
-                );
-                if gone {
-                    FrontFate::Unaccounted
+                let identity = if matches!(other, crate::identity::Resolved::Gone) {
+                    crate::containment::RootIdentity::Gone
                 } else {
-                    FrontFate::LeftUnreaped
-                }
+                    crate::containment::RootIdentity::Unknown
+                };
+                leave_unverified_child(child, identity);
+                FrontFate::of_unverified(identity)
             };
             #[cfg(not(target_os = "macos"))]
             let fate = teardown_unadopted_or_front(child, front);
@@ -1225,8 +1219,13 @@ pub(crate) fn attach_or_fault_typed(
             error: Error::Containment {
                 detail: "forced attach failure (test seam)".into(),
             },
-            // A real macOS attach fails only on the root's identity read.
-            identity: cfg!(target_os = "macos").then_some(crate::containment::RootIdentity::Unknown),
+            // A real macOS attach fails only on the root's identity read: refused, or (with the
+            // vanish seam also set) found gone.
+            identity: cfg!(target_os = "macos").then_some(if fault::force_identity_vanished() {
+                crate::containment::RootIdentity::Gone
+            } else {
+                crate::containment::RootIdentity::Unknown
+            }),
         });
     }
     #[cfg(all(test, target_os = "linux"))]
@@ -1414,6 +1413,19 @@ pub(crate) enum FrontFate {
 }
 
 impl FrontFate {
+    /// The fate of a child left unverified (macOS: `leave_unverified_child`): one reaped by someone
+    /// else is unaccounted for, and any other is left unreaped.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS leaves a child unverified")
+    )]
+    pub(crate) fn of_unverified(identity: crate::containment::RootIdentity) -> FrontFate {
+        match identity {
+            crate::containment::RootIdentity::Gone => FrontFate::Unaccounted,
+            crate::containment::RootIdentity::Unknown => FrontFate::LeftUnreaped,
+        }
+    }
+
     /// A failed spawn's `error`, with what became of the front `pid` (unknown: `None`) noted, its
     /// variant and kind kept (see [`Error::with_note`]). Not a front's: `error` itself.
     pub(crate) fn note(self, error: Error, front: Option<crate::elevation::front::Front>, pid: Option<u32>) -> Error {

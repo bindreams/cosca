@@ -758,18 +758,29 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
-/// Combines the fork's answer with the helper's. A child left unreaped by a failed `spawn()` is
-/// torn down through its pidfd, unless it is the elevation `front`, which is sent nothing.
+/// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
+/// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
+/// tokio dropped it after it ran the program, so it is sent nothing. A child std already
+/// collected never ran the program (its exec failed): it is not a front.
 fn conclude<T: Spawned>(
     spawned: io::Result<T>,
     outcome: Outcome,
     front: Option<crate::elevation::front::Front>,
 ) -> Result<Held<T>, Error> {
-    let teardown = |pidfd: OwnedFd, error: Error| match front {
-        Some(front) => super::leave_front_through_pidfd(None, pidfd, front).note(error, Some(front), None),
-        None => {
-            super::teardown_through_pidfd(None, pidfd);
-            error
+    let opened_teardown = |pidfd: OwnedFd, error: Error| {
+        use std::os::fd::AsFd as _;
+        let collected = matches!(
+            crate::wait::exit_only::peek(&crate::wait::exit_only::Target::PidFd(pidfd.as_fd())),
+            Ok(crate::wait::exit_only::Peek::Foreign(_))
+        );
+        match front {
+            Some(front) if !collected => {
+                super::leave_front_through_pidfd(None, pidfd, front).note(error, Some(front), None)
+            }
+            _ => {
+                super::teardown_through_pidfd(None, pidfd);
+                error
+            }
         }
     };
     match (spawned, outcome) {
@@ -800,12 +811,19 @@ fn conclude<T: Spawned>(
         }
         // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
         // fail one after std's succeeded, and drops that child neither killed nor reaped.
-        (Err(e), Outcome::Opened(pidfd) | Outcome::Gone(pidfd)) => Err(teardown(pidfd, Error::Io(e))),
+        (Err(e), Outcome::Opened(pidfd)) => Err(opened_teardown(pidfd, Error::Io(e))),
+        // Not told to go, so it never ran the program.
+        (Err(e), Outcome::Gone(pidfd)) => {
+            super::teardown_through_pidfd(None, pidfd);
+            Err(Error::Io(e))
+        }
         // The helper's error explains the abort std reports.
-        (Err(_), Outcome::Failed(e, pidfd)) => Err(match pidfd {
-            Some(pidfd) => teardown(pidfd, e),
-            None => e,
-        }),
+        (Err(_), Outcome::Failed(e, pidfd)) => {
+            if let Some(pidfd) = pidfd {
+                super::teardown_through_pidfd(None, pidfd);
+            }
+            Err(e)
+        }
         (Ok(child), Outcome::Unwatched(cause)) => {
             let named = super::named(child.pid());
             child.abandon_unreported("it sent no pidfd, and its exit could not be watched");

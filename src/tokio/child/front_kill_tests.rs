@@ -249,3 +249,24 @@ async fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixtu
         assert_eq!(reap(pid), None, "the teardown reaps it");
     }
 }
+
+/// A front whose exec fails never ran the program: std collected the child, so its error carries no
+/// note that the program may be running. The exec fails on an argument longer than
+/// `MAX_ARG_STRLEN` (`E2BIG`). Mutant: a collected child is taken for a dropped front, and noted.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_front_whose_exec_fails_is_not_noted() {
+    let mut cmd = crate::command::Command::new();
+    cmd.args(["true".to_owned(), "x".repeat(256 * 1024)]);
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+        Backend::Sudo,
+    ))));
+    let err = crate::tokio::spawn::spawn(&mut cmd)
+        .map(drop)
+        .expect_err("an argument over MAX_ARG_STRLEN fails the exec");
+    let crate::error::Error::Io(io) = &err else {
+        panic!("an exec failure is an Io error: {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), Some(libc::E2BIG), "{io}");
+    assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
+}
