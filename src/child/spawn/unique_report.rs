@@ -166,7 +166,7 @@ pub(crate) struct NotAdopted {
 pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     let dead = |error| NotAdopted {
         error,
-        died_before_exec: true,
+        died_before_exec: false, // MUTANT
     };
     let unknown = |error| NotAdopted {
         error,
