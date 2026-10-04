@@ -23,7 +23,7 @@ jobs:
       - name: macOS residual (leaked listener answering A)
         if: always()
         timeout-minutes: 5
-        run: python3 probe/scenarios.py leaked_listener_answers
+        run: python3 probe/scenarios.py leaked_listener_answers_macos
       - name: mutants
         if: always()
         timeout-minutes: 15

@@ -788,13 +788,30 @@ def read_until(f, pred):
 
 
 def s_code_123_before_answer():
+    """Item 9: cosca dies before answering while a fork copy keeps its listener (so no EOF/reset reaches the
+    shim): only the owner watch can tell. The copy then closes the listener, which ends the wait either way
+    (T5): 123 if the owner watch acted, 124 if it did not."""
     d = workdir()
-    pid, front, _ = fork_cosca(d, lambda c: (c.shimlog.has("owner verified"), "ok")[1], mode="42", acceptor_gate=threading.Event())
+    r, w = os.pipe(); go_r, go_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        c = setup(SUDO, d=d, mode="42", acceptor_gate=threading.Event())
+        c.shimlog.has("owner verified")
+        copy = os.fork()
+        if copy == 0:
+            os.read(go_r, 1)
+            os._exit(0)  # closes its copy of the listener
+        os.write(w, b"%d\n" % copy)
+        signal.pause()
+    os.close(w)
+    copy = int(os.read(r, 64))
     f = shim_log_reader(d); sfd = os.open(os.path.join(d, "siglog"), os.O_RDONLY | os.O_NONBLOCK)
     os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
+    os.write(go_w, b"x")
     lines = read_until(f, lambda l: l.startswith("refused") or l.startswith("program pid="))
     os.close(sfd)
-    result("123: cosca exits before answering", any("refused 123" in l for l in lines), f"{lines[-1:]}")
+    result("123: cosca exits before answering (listener copy alive)", any("refused 123" in l for l in lines), f"{lines[-1:]}")
 
 
 def s_code_123_after_a():
@@ -841,32 +858,63 @@ def s_wrong_euid():
     p = subprocess.Popen(SUDO + ["/usr/bin/env", "SHIM_LOG=" + shimlog.path, SHIM, "--cosca-elevation-shim=1", link.path,
                                 str(os.getpid()), str(identity()), "4242", "--", "/bin/true"], stderr=subprocess.DEVNULL)
     p.wait(); log = shimlog.unblock_if_never_opened(); link.release(False)
-    result("listener uid must be argv's euid", any("refused 122" in l and "pid or uid" in l for l in log), str(refusal(log)))
+    want = "token is not cosca's" if MACOS else "pid or uid"
+    result("listener uid must be argv's euid", any("refused 122" in l and want in l for l in log), str(refusal(log)))
 
 
-def s_leaked_listener_answers():
-    """Items 2/6: a process holding a copy of cosca's listener accepts the shim and answers A (Linux: the
-    answer's SCM_CREDENTIALS are not cosca's -> 122)."""
+def leaked_answer_case(name, accept_first):
+    """A process holding a copy of cosca's listener accepts the shim and answers A. accept_first: the leak
+    accepts before the shim reads the listener's identity (shim held at a seam); otherwise after the shim
+    has verified the identity and waits for its first byte."""
     g = threading.Event()
-    c = setup(SUDO, mode="42", acceptor_gate=g)
+    d = workdir()
+    before = Gate(d, "before_id")
+    c = setup(SUDO, d=d, mode="42", acceptor_gate=g, seams_extra={"SHIM_GATE_BEFORE_ID": before.path})
+    go_r, go_w = os.pipe(); done_r, done_w = os.pipe()
     leak = os.fork()
-    if leak == 0:  # poll, then a non-blocking accept: the listener's file description stays non-blocking
-        p = select.poll(); p.register(c.link.listener.fileno(), select.POLLIN); p.poll()
-        conn, _ = c.link.listener.accept()
-        conn.setblocking(True)
-        conn.send(b"A")
+    if leak == 0:
         try:
+            os.read(go_r, 1)
+            p = select.poll(); p.register(c.link.listener.fileno(), select.POLLIN); p.poll()
+            conn, _ = c.link.listener.accept()
+            conn.setblocking(True)
+            os.write(done_w, b"a")
+            os.read(go_r, 1)
+            conn.send(b"A")
             conn.recv(1)
-        except OSError:
+        except BaseException:
             pass
         os._exit(0)
-    lines = c.shimlog.wait_for(lambda ls: any(l.startswith("refused") or l.startswith("program pid=") for l in ls))
+    if accept_first:
+        c.shimlog.has("shim pid=")  # connected or about to: the leak accepts while the shim is held
+        os.write(go_w, b"1"); os.read(done_r, 1)
+        before.open()
+        c.shimlog.wait_for(lambda ls: any(l.startswith("owner verified") or l.startswith("refused") for l in ls))
+        os.write(go_w, b"2")
+    else:
+        before.open()
+        c.shimlog.has("owner verified")  # identity read and passed; the shim now waits for its first byte
+        os.write(go_w, b"1"); os.read(done_r, 1); os.write(go_w, b"2")
     log = c.shimlog.eof(); os.waitpid(leak, 0); g.set()
     ran = any(l.startswith("program pid=") for l in log)
     outcome(c.wait); c.link.release(False)
-    result("leaked listener answering A is refused" if not MACOS else "leaked listener answering A (macOS residual)",
-           (not ran and any("refused 122" in l for l in log)) if not MACOS else True,
-           f"program started={ran}; {refusal(log)}")
+    return ran, refusal(log)
+
+
+def s_leaked_listener_answers():
+    """Items 2/6, Linux: refused in both orders (SCM_CREDENTIALS on the first byte)."""
+    for order in (True, False):
+        ran, ref = leaked_answer_case("", order)
+        result("leaked listener answers A (%s)" % ("accept before identity read" if order else "accept after identity read"),
+               not ran and any("122" in r for r in ref), f"program started={ran}; {ref}")
+
+
+def s_leaked_listener_answers_macos():
+    """Items 2/6, macOS: measure both orders; report what happens (the residual of owner question [6/6])."""
+    for order in (True, False):
+        ran, ref = leaked_answer_case("", order)
+        result("macOS leaked listener answers A (%s): MEASURED %s" % ("accept before identity read" if order else "accept after identity read",
+               "STARTED" if ran else "refused"), True, f"program started={ran}; {ref}")
 
 
 def s_reverse_rebind():

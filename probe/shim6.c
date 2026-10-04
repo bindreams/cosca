@@ -133,6 +133,7 @@ int main(int argc, char **argv) {
     struct sockaddr_un sa; memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX;
     snprintf(sa.sun_path, sizeof sa.sun_path, "%s/s", dir);
     if (connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) { lg("connect: %s\n", strerror(errno)); return refuse(E_NO_ANSWER, "could not reach cosca"); }
+    gate("SHIM_GATE_BEFORE_ID"); /* seam: order the identity read against a leaked listener's accept */
 
     /* --- who is cosca --- */
 #ifdef __linux__
