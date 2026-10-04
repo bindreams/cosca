@@ -2,7 +2,7 @@
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 use crate::test_harness::{
-    DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, SETUID, SHELL_EXECUTE, SHELL_PROBES,
+    DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
 };
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -113,6 +113,7 @@ fn require_consent_grants_only_on_exactly_1() {
 #[skuld::test]
 fn every_group_fixture_carries_exactly_its_label() {
     for (fixture, label) in [
+        ("root", ROOT),
         ("namespaces", NAMESPACES),
         ("drive_mapping", DRIVE_MAPPING),
         ("setuid", SETUID),
