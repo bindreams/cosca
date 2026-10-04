@@ -4,6 +4,8 @@
 //! outranks an existing extensionless file, then the `Search` arm carries the same hazard as
 //! `Exact`, and no amount of resolving fixes it.
 
+use crate::test_groups::{shell_probes, Group};
+use crate::test_harness::{ISOLATED_EXISTING_EXTENSIONLESS, ISOLATED_PATHEXT_PRECEDENCE};
 use std::path::PathBuf;
 
 use windows::core::HRESULT;
@@ -35,11 +37,8 @@ use crate::windows_probe::{mark_test_passed, same_file};
 /// immediately after this call returns would only race whatever the shell handed the file off to,
 /// and could neither prove nor disprove anything about what runs after this call — nothing observed
 /// after a no-handle handoff is measured by this probe.
-#[skuld::test]
-fn does_pathext_outrank_an_existing_extensionless_file() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+#[skuld::test(labels = [ISOLATED_PATHEXT_PRECEDENCE])]
+fn does_pathext_outrank_an_existing_extensionless_file(#[fixture(shell_probes)] _group: &Group) {
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let exe_marker = dir.path().join("precedence-exe.txt");
     let bat_marker = dir.path().join("precedence-bat.txt");
@@ -143,11 +142,8 @@ fn does_pathext_outrank_an_existing_extensionless_file() {
 /// No marker is read on those arms — a read taken immediately after the call returns would only
 /// race whatever the shell handed the file off to, and no wait, sleep or poll here would turn that
 /// race into proof.
-#[skuld::test]
-fn does_an_existing_extensionless_file_ever_launch_directly() {
-    if !crate::common::require_group("WINDOWS_EXECUTING_PROBES") {
-        return;
-    }
+#[skuld::test(labels = [ISOLATED_EXISTING_EXTENSIONLESS])]
+fn does_an_existing_extensionless_file_ever_launch_directly(#[fixture(shell_probes)] _group: &Group) {
     let dir = tempfile::tempdir().expect("probe needs a temp dir");
     let exe_marker = dir.path().join("no-bat-marker.txt");
 
