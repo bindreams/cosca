@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::io;
 
-use super::{gate, Gate};
+use super::{kill_gate, terminate_gate, Gate};
 use crate::elevation::{Backend, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error};
 
@@ -13,18 +13,42 @@ const FRONTS: [(ElevatedVia, &str); 3] = [
     (ElevatedVia::MacosOsascript, "osascript"),
 ];
 
-/// Runs `gate`, counting how often it asked whether the front is running.
-fn gate_counting(via: Option<&ElevatedVia>, cgroup: bool, running: io::Result<bool>) -> (Gate, u32) {
-    let asked = Cell::new(0);
-    let mut running = Some(running);
-    let g = gate(via, PID, cgroup, || {
-        asked.set(asked.get() + 1);
-        running.take().expect("asked once")
-    });
-    (g, asked.get())
+const NOT_FRONTS: [Option<ElevatedVia>; 5] = [
+    None,
+    Some(ElevatedVia::Wrapped(Backend::Pkexec)),
+    Some(ElevatedVia::Wrapped(Backend::Run0)),
+    Some(ElevatedVia::WindowsUac),
+    Some(ElevatedVia::AlreadyElevated),
+];
+
+/// What a gate asked, in order: `r` for `running`, `c` for `in_cgroup`.
+fn kill_gate_asking(
+    via: Option<&ElevatedVia>,
+    running: io::Result<bool>,
+    in_cgroup: io::Result<bool>,
+) -> (Gate, String) {
+    let asked = Cell::new(String::new());
+    let note = |c: char| {
+        let mut s = asked.take();
+        s.push(c);
+        asked.set(s);
+    };
+    let g = kill_gate(
+        via,
+        PID,
+        || {
+            note('r');
+            running
+        },
+        || {
+            note('c');
+            in_cgroup
+        },
+    );
+    (g, asked.take())
 }
 
-fn unkillable_detail(g: Gate) -> String {
+fn refusal_detail(g: Gate) -> String {
     match g {
         Gate::Closed(Error::Elevation {
             kind: ElevationErrorKind::Unkillable,
@@ -34,74 +58,107 @@ fn unkillable_detail(g: Gate) -> String {
     }
 }
 
-/// Mutants: a front is signalled (`Open`); the front check is skipped; the detail names neither.
+/// Mutants: a front is signalled (`Open`); the detail names neither the pid nor the front; it
+/// claims a sudo pid is the wrapper when, with direct exec, it may be the program.
 #[skuld::test]
-fn a_live_uncontained_front_is_closed_with_unkillable_naming_it() {
+fn a_live_front_outside_a_cgroup_is_closed_with_unkillable_naming_it() {
     for (via, name) in FRONTS {
-        let (g, asked) = gate_counting(Some(&via), false, Ok(true));
-        assert_eq!(asked, 1, "{via:?}");
-        let detail = unkillable_detail(g);
-        assert!(detail.contains(&format!("pid {PID} is {name}")), "{detail}");
-        assert!(detail.contains("nothing was sent"), "{detail}");
+        let (g, asked) = kill_gate_asking(Some(&via), Ok(true), Ok(false));
+        assert_eq!(asked, "rc", "{via:?}");
+        let detail = refusal_detail(g);
+        assert!(detail.contains(&format!("pid {PID} is")), "{detail}");
+        assert!(detail.contains(name), "{detail}");
+        assert!(detail.contains("no kill was sent"), "{detail}");
+        assert_eq!(
+            detail.contains("direct exec"),
+            name != "osascript",
+            "only a wrapper may track the program itself: {detail}"
+        );
     }
 }
 
-/// An exited front has nothing left to orphan: a kill of it answers as any child's does, in a
-/// cgroup too. Mutants: the exit is ignored, so a kill after the program finished is `Unkillable`;
-/// a cgroup kill runs for a front that has exited.
+/// A front that has left its cgroup (pam_systemd moving sudo into a session scope) is outside it.
+/// Mutant: any front of a cgroup-contained child is killed through the cgroup.
 #[skuld::test]
-fn an_exited_front_is_open() {
+fn a_live_front_that_left_its_cgroup_is_closed() {
+    let (g, _) = kill_gate_asking(Some(&ElevatedVia::Wrapped(Backend::Sudo)), Ok(true), Ok(false));
+    refusal_detail(g);
+}
+
+/// An exited front has nothing left to orphan, and its cgroup is not asked about. Mutants: the
+/// exit is ignored; a cgroup kill runs for an exited front.
+#[skuld::test]
+fn an_exited_front_is_exited() {
     for (via, _) in FRONTS {
-        for cgroup in [false, true] {
-            let (g, asked) = gate_counting(Some(&via), cgroup, Ok(false));
-            assert_eq!(asked, 1, "{via:?}");
-            assert!(matches!(g, Gate::Open), "{via:?} cgroup={cgroup}: {g:?}");
-        }
+        let (g, asked) = kill_gate_asking(Some(&via), Ok(false), Ok(true));
+        assert_eq!(asked, "r", "{via:?}");
+        assert!(matches!(g, Gate::Exited), "{via:?}: {g:?}");
     }
 }
 
-/// A front whose state cannot be read is treated as live, and the reason is kept. Mutant: an
-/// unreadable state opens the gate.
-#[skuld::test]
-fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
-    let (g, _) = gate_counting(
-        Some(&ElevatedVia::Wrapped(Backend::Sudo)),
-        false,
-        Err(io::Error::other("peek refused")),
-    );
-    let detail = unkillable_detail(g);
-    assert!(detail.contains("could not be read: peek refused"), "{detail}");
-}
-
-/// A cgroup kill reaches the program whatever its credentials, so a live front, or one whose
+/// A cgroup kill reaches a member whatever its credentials, so a live front in one, or one whose
 /// state cannot be read, is killed through it. Mutant: a contained front is closed too.
 #[skuld::test]
-fn a_live_front_in_a_cgroup_is_killed_through_the_cgroup_first() {
+fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
     for (via, _) in FRONTS {
         for running in [Ok(true), Err(io::Error::other("peek refused"))] {
-            let (g, asked) = gate_counting(Some(&via), true, running);
-            assert_eq!(asked, 1, "{via:?}");
-            assert!(matches!(g, Gate::CgroupFirst), "{via:?}: {g:?}");
+            let (g, asked) = kill_gate_asking(Some(&via), running, Ok(true));
+            assert_eq!(asked, "rc", "{via:?}");
+            assert!(matches!(g, Gate::CgroupOnly), "{via:?}: {g:?}");
         }
     }
+}
+
+/// A front whose state or membership cannot be read is closed, and says why. Mutants: either
+/// unreadable answer opens the gate; the reason is dropped.
+#[skuld::test]
+fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
+    let sudo = ElevatedVia::Wrapped(Backend::Sudo);
+    let (g, _) = kill_gate_asking(Some(&sudo), Err(io::Error::other("peek refused")), Ok(false));
+    assert!(refusal_detail(g).contains("could not be read: peek refused"));
+    let (g, _) = kill_gate_asking(Some(&sudo), Ok(true), Err(io::Error::other("procs refused")));
+    assert!(refusal_detail(g).contains("could not be read: procs refused"));
 }
 
 /// The tracked process is the program itself, or there is no elevation: signalled like any child,
-/// with no state read. Mutant: pkexec or UAC counted as a front.
+/// with nothing read. Mutant: pkexec or UAC counted as a front.
 #[skuld::test]
 fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
-    let not_fronts = [
-        None,
-        Some(ElevatedVia::Wrapped(Backend::Pkexec)),
-        Some(ElevatedVia::Wrapped(Backend::Run0)),
-        Some(ElevatedVia::WindowsUac),
-        Some(ElevatedVia::AlreadyElevated),
-    ];
-    for via in &not_fronts {
-        for cgroup in [false, true] {
-            let (g, asked) = gate_counting(via.as_ref(), cgroup, Ok(true));
-            assert_eq!(asked, 0, "{via:?}");
-            assert!(matches!(g, Gate::Open), "{via:?} cgroup={cgroup}: {g:?}");
+    for via in &NOT_FRONTS {
+        for in_cgroup in [false, true] {
+            let (g, asked) = kill_gate_asking(via.as_ref(), Ok(true), Ok(in_cgroup));
+            assert_eq!(asked, "", "{via:?}");
+            assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
+            let g = terminate_gate(via.as_ref(), PID, || panic!("not asked"));
+            assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
         }
     }
+}
+
+/// sudo and doas relay `SIGTERM` to the program: never gated. Mutant: every front's `SIGTERM` is
+/// refused.
+#[skuld::test]
+fn a_sigterm_to_a_relaying_front_is_open() {
+    for via in [ElevatedVia::Wrapped(Backend::Sudo), ElevatedVia::Wrapped(Backend::Doas)] {
+        let g = terminate_gate(Some(&via), PID, || panic!("not asked"));
+        assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
+    }
+}
+
+/// A `SIGTERM` would end osascript and orphan the program: refused while osascript runs, sent
+/// once it has exited. Mutants: osascript's `SIGTERM` is sent; its exit is ignored.
+#[skuld::test]
+fn a_sigterm_to_a_live_osascript_is_closed() {
+    let osascript = ElevatedVia::MacosOsascript;
+    let detail = refusal_detail(terminate_gate(Some(&osascript), PID, || Ok(true)));
+    assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
+    assert!(detail.contains("no SIGTERM was sent"), "{detail}");
+    let detail = refusal_detail(terminate_gate(Some(&osascript), PID, || {
+        Err(io::Error::other("peek refused"))
+    }));
+    assert!(detail.contains("peek refused"), "{detail}");
+    assert!(matches!(
+        terminate_gate(Some(&osascript), PID, || Ok(false)),
+        Gate::Open
+    ));
 }

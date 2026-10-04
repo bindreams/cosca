@@ -101,6 +101,18 @@ impl ProcHandle {
         }
     }
 
+    /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
+    #[cfg(unix)]
+    pub(crate) fn reap_after_tree_kill(&self) {
+        match self {
+            ProcHandle::Std(s) => {
+                if let Err(e) = s.wait() {
+                    log_teardown_wait_failure(s.id(), &e);
+                }
+            }
+        }
+    }
+
     /// The OS process id.
     pub(crate) fn id(&self) -> u32 {
         match self {

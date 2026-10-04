@@ -255,11 +255,10 @@ fn posix_askpass_auth_reaches_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// GATED (POSIX): dropping a non-contained elevated long-lived child must
-// RETURN (no hang), and kill() on it must return the typed Unkillable error.
+// GATED (POSIX): kill() on a non-contained elevated long-lived child is the typed Unkillable, with
+// the payload still alive, and dropping the child RETURNS (no hang).
 //
-// Waiting for the payload's readiness line closes the window in which `sudo` has not yet
-// setresuid(2)d to root and a kill() would still succeed. Dropping the socket at the end
+// Waiting for the payload's readiness line means the program runs. Dropping the socket at the end
 // releases the payload without needing a privileged kill.
 #[cfg(unix)]
 #[skuld::test]
@@ -283,28 +282,25 @@ fn posix_uncontained_elevated_child_is_unkillable_and_drop_does_not_hang() {
     let child = c.spawn().expect("elevated block-on-socket");
     // Watched by pid, not through `child`: this test owns the only `Child`, so the `drop` below
     // is the `Drop` under test and not a reference count going down.
-    let payload =
+    let mut payload =
         common::payload::accept_live_payload(listener, &nonce, common::payload::ExitWatch::Process(child.id().pid()));
 
-    // kill() outcome depends on the backend's process topology:
-    //  - direct-exec backends (doas, run0, sudo WITHOUT `Defaults use_pty`) make the tracked
-    //    child the root process itself, so an unprivileged parent's signal is EPERM → the typed
-    //    `Unkillable`.
-    //  - sudo WITH `use_pty` (increasingly the distro default) keeps the tracked child as sudo's
-    //    same-uid monitor and runs root under a pty grandchild, so kill() SUCCEEDS on the monitor.
-    //    Tearing down that grandchild is the deferred "un-killable elevated child / sudo pty
-    //    monitor" teardown contract (issue #14), out of this plan's scope.
-    // Either way is contract-correct here; the load-bearing Decision-A guarantee this test exists
-    // for is that neither kill() nor the Drop below BLOCKS. A raw untyped Io on the EPERM path
-    // would be the real defect.
-    match child.kill() {
-        Ok(()) => {}
-        Err(cosca::error::Error::Elevation {
-            kind: cosca::error::ElevationErrorKind::Unkillable,
-            ..
-        }) => {}
-        other => panic!("expected Ok (use_pty monitor) or typed Unkillable (direct exec), got {other:?}"),
-    }
+    // sudo and doas leave this process tracking a front: sudo itself, which outlives the root
+    // program it launched (a kill would orphan it), or, with direct exec, the root program, whose
+    // kill is refused. Either way kill() sends nothing and answers the typed `Unkillable`; an `Ok`
+    // here is a false kill. The payload is checked first, so a false `Ok` reads as one.
+    let killed = child.kill();
+    payload.assert_blocked();
+    assert!(
+        matches!(
+            killed,
+            Err(cosca::error::Error::Elevation {
+                kind: cosca::error::ElevationErrorKind::Unkillable,
+                ..
+            })
+        ),
+        "kill() of an uncontained wrapper-elevated child must be the typed Unkillable, got {killed:?}"
+    );
     // The payload is alive and `kill()` could not reap it, so a `Drop` that waited for the child
     // would block here until the test ended.
     drop(child);

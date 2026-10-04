@@ -1,19 +1,18 @@
 //! Async twins of `child/front_kill_tests.rs`: no forced kill of a `cosca::tokio::Child` may
-//! signal a live elevation front. The front is an ordinary `cat`, reported as launched by `sudo`,
-//! that exits 0 once its stdin closes and dies of `SIGKILL` if it was killed first.
+//! signal a live elevation front, and no `SIGTERM` a live osascript. The front is an ordinary `cat`,
+//! reported as launched by `sudo` or `osascript`, that exits 0 once its stdin closes and dies of a
+//! signal if it was sent one first. The cgroup lane's cases are in `front_cgroup_tests.rs`.
 
 use std::time::Duration;
 
-use crate::child::front_kill_tests::{assert_unkillable_front, report};
+use crate::child::front_kill_tests::{assert_refused_by, assert_unkillable_front, report};
 use crate::containment::unix::fault::record_kill_group;
 use crate::elevation::{Backend, ElevatedVia};
-#[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
 
-fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (Child, ChildStdin) {
+pub(super) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (Child, ChildStdin) {
     cmd.stdin(Stdio::pipe()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
     child.set_elevation(report(via));
@@ -21,14 +20,14 @@ fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (Child, ChildStdin) {
     (child, stdin)
 }
 
-fn cat() -> Command {
+pub(super) fn cat() -> Command {
     let mut cmd = Command::new();
     cmd.args(["cat"]);
     cmd
 }
 
 /// Closes the `cat`'s stdin and reaps it: it must exit 0, so nothing signalled it.
-async fn assert_ends_unsignalled(child: &mut Child, stdin: ChildStdin) {
+pub(super) async fn assert_ends_unsignalled(child: &mut Child, stdin: ChildStdin) {
     drop(stdin);
     let status = child.wait().await.expect("wait");
     assert!(status.success(), "the front was signalled: {status:?}");
@@ -112,82 +111,10 @@ async fn drop_of_a_live_front_signals_nothing_and_warns() {
     let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert_eq!(warns[0].0, log::Level::Warn);
-    assert!(warns[0].1.contains(&format!("pid {pid} is sudo")), "{warns:?}");
-}
-
-/// In a cgroup the kill goes through `cgroup.kill`.
-/// Mutants: a front in a cgroup is refused; its kill signals the front alone.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn cgroup_kill_of_a_front_goes_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
-    use std::os::unix::process::ExitStatusExt as _;
-    let mut cmd = cat();
-    cmd.contain_with(ContainMode::Strongest);
-    let (mut child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    assert_eq!(child.containment(), Containment::CgroupV2);
-    child.kill().expect("the cgroup kill reaches the program");
-    assert!(child.tree_killed.is_set(), "the kill must go through the cgroup");
-    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
-}
-
-/// Mutant: the front is signalled after a failed cgroup kill.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
-    let mut cmd = cat();
-    cmd.contain_with(ContainMode::Strongest);
-    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    assert_eq!(child.containment(), Containment::CgroupV2);
-    {
-        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
-        assert!(child.kill().is_err(), "the forced cgroup.kill failure surfaces");
-        assert!(child.kill_tree().is_err(), "the forced cgroup.kill failure surfaces");
-    }
-    assert_ends_unsignalled(&mut child, stdin).await;
-}
-
-/// The drop, too, leaves a front alone when its cgroup kill fails. The front's end is read through
-/// a pidfd without reaping it: tokio owns the reap, and this test does not yield to its runtime
-/// before reading. Mutant: the drop kills the front after a failed cgroup kill.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
-    use std::os::fd::AsFd as _;
-    crate::tokio::test_runtime::assert_current_thread();
-    let roots = drop_fault::record();
-    let mut cmd = cat();
-    cmd.contain_with(ContainMode::Strongest);
-    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
-    let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {
-        panic!("expected a cgroup leaf, got {:?}", child.os.attached);
-    };
-    let leaf = leaf.path().to_path_buf();
-    let pid = rustix::process::Pid::from_raw(child.id().pid() as i32).expect("a positive pid");
-    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
-    {
-        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
-        drop(child);
-    }
-    assert_eq!(roots.kills(), 0, "the drop must not kill the front");
-    drop(stdin);
-    let status = loop {
-        match rustix::process::waitid(
-            rustix::process::WaitId::PidFd(pidfd.as_fd()),
-            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
-        ) {
-            Ok(Some(status)) => break status,
-            Ok(None) => unreachable!("a blocking waitid returns a status"),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => panic!("waitid on the front's pidfd (ECHILD: the drop reaped a killed front): {e}"),
-        }
-    };
-    assert_eq!(
-        (status.exit_status(), status.terminating_signal()),
-        (Some(0), None),
-        "the drop signalled the front"
+    assert!(
+        warns[0].1.contains(&format!("pid {pid} is what sudo left")),
+        "{warns:?}"
     );
-    // The failed kill left the leaf behind; it is empty once the front has exited.
-    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
 /// Async twin of the sync `a_failed_password_write_signals_neither_a_live_front_nor_its_group`.
@@ -219,5 +146,47 @@ async fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
         panic!("expected an Elevation error, got {err:?}");
     };
     assert!(detail.contains("could not be terminated"), "{detail}");
-    assert!(detail.contains(&format!("pid {pid} is sudo")), "{detail}");
+    assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
+}
+
+/// Mutant: osascript's `SIGTERM` is sent.
+#[skuld::test]
+async fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
+    let pid = child.id().pid();
+    assert_refused_by(child.terminate(), &format!("pid {pid} is osascript"));
+    assert_ends_unsignalled(&mut child, stdin).await;
+}
+
+/// Mutants: the graceful path signals osascript; a kill after it does.
+#[skuld::test]
+async fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
+    let pid = child.id().pid();
+    assert_refused_by(
+        child.graceful_shutdown(Duration::ZERO).await,
+        &format!("pid {pid} is osascript"),
+    );
+    assert_refused_by(child.kill(), &format!("pid {pid} is osascript"));
+    assert_ends_unsignalled(&mut child, stdin).await;
+}
+
+/// Mutant: every front's `SIGTERM` is refused.
+#[skuld::test]
+async fn terminate_of_a_live_sudo_front_is_sent() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let (mut child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    child.terminate().expect("sudo relays SIGTERM");
+    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
+}
+
+/// Async twin of the sync `a_failed_spawn_leaves_an_elevation_front_running_and_says_so`.
+/// Mutants: the teardown kills the front; the error does not say so.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
+    use crate::child::front_kill_tests::{assert_front_left_running, failed_front_spawns};
+    for (err, status) in failed_front_spawns(|cmd| crate::tokio::spawn::spawn(cmd).map(drop)) {
+        assert_front_left_running(&err, status);
+    }
 }

@@ -222,15 +222,21 @@ impl Attached {
         format!("{self:?}")
     }
 
-    /// Whether this mechanism's kill reaches every member whatever its credentials: `cgroup.kill`
-    /// does. A signal to a group or to walked members is subject to the kernel's permission check.
+    /// Whether this mechanism's kill reaches `pid` whatever its credentials: only a cgroup's
+    /// `cgroup.kill` does, and only while `pid` is in it. A signal to a group or to walked members is
+    /// subject to the kernel's permission check, so it is `false` for every other mechanism.
+    /// `pid` must be this process's unreaped child, so its number is not reused.
     #[cfg(unix)]
-    pub(crate) fn kills_across_credentials(&self) -> bool {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    pub(crate) fn kill_reaches_across_credentials(&self, pid: u32) -> std::io::Result<bool> {
         #[cfg(target_os = "linux")]
-        if matches!(self, Attached::Cgroup(_)) {
-            return true;
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.holds_member(pid);
         }
-        false
+        Ok(false)
     }
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).

@@ -52,6 +52,11 @@ impl Child {
     /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
+    /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
+    /// is refused with [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
+    /// while osascript runs: a `SIGTERM` would end osascript, not the program. `sudo` and `doas`
+    /// relay it to the program, so theirs is sent.
+    ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
     /// delivered in that window ends it during loader init rather than through its own handler.
@@ -61,6 +66,10 @@ impl Child {
     /// before it has run at all should use [`kill`](Child::kill), which is honest about being
     /// forced.
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
+            return Err(unkillable);
+        }
         crate::graceful::signal(self.graceful, self.id)
     }
 

@@ -491,6 +491,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
+            #[cfg(unix)]
+            if let Some(front) = cmd.elevation_front() {
+                proc.leave_front(pid, front);
+                return Err(crate::child::spawn::front_left_running(e, Some(front), pid));
+            }
             proc.reap_now(pid);
             return Err(e);
         }
@@ -511,6 +516,20 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path above: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
         other => {
+            // An elevation front is sent nothing (see `ProcSource::leave_front`).
+            #[cfg(unix)]
+            if let Some(front) = cmd.elevation_front() {
+                #[cfg(target_os = "macos")]
+                if matches!(other, Resolved::Unknown) {
+                    proc.forget_foreign();
+                }
+                proc.leave_front(pid, front);
+                return Err(crate::child::spawn::front_left_running(
+                    crate::child::spawn::spawn_identity_error(other),
+                    Some(front),
+                    pid,
+                ));
+            }
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -559,7 +578,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
-    let front_closed = matches!(child.front_gate(), crate::elevation::front::Gate::Closed(_));
+    let front_closed = matches!(child.kill_gate(), crate::elevation::front::Gate::Closed(_));
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         skipped = child.kill_tree_members_unless_reaped()?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop

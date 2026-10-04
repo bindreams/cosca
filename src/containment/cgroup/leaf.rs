@@ -421,6 +421,22 @@ impl CgroupLeaf {
         Err(self.fail_closed(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
+    /// Whether `pid` is in this leaf or a cgroup under it, for a kill through it. The leaf's own
+    /// `cgroup.procs` is read first: it lists a member whatever its credentials, where a root
+    /// member's `/proc` entry may be hidden (`hidepid`). A pid not listed there is looked up through
+    /// `/proc`, for a member that moved into a cgroup under the leaf.
+    pub(crate) fn holds_member(&self, pid: u32) -> io::Result<bool> {
+        #[cfg(test)]
+        if fault::take_force_membership_unreadable() {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        let listed = self.dir.read("cgroup.procs")?;
+        if listed.lines().any(|line| line.trim().parse() == Ok(pid)) {
+            return Ok(true);
+        }
+        self.holds(pid)
+    }
+
     /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
     /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
     ///

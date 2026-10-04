@@ -783,6 +783,33 @@ impl ProcSource {
         self.release();
     }
 
+    /// [`reap_now`](ProcSource::reap_now) for an elevation front: a kill of it would orphan the
+    /// elevated program, so it is sent nothing. On Linux it goes to the sync spawn's front teardown
+    /// through its pidfd, which reaps it once it exits, and tokio's `Child` is forgotten. Elsewhere
+    /// tokio's `Child` is released to the runtime's orphan reaper, unless its handle shows it reaped
+    /// elsewhere, when it is forgotten. **Invariant:** no `wait()` future for this child is in flight.
+    #[cfg(unix)]
+    pub(crate) fn leave_front(mut self, pid: u32, front: crate::elevation::front::Front) {
+        self.forget_if_foreign();
+        #[cfg(target_os = "linux")]
+        {
+            let ProcSource::Tokio { pidfd, .. } = &mut self else {
+                return;
+            };
+            let pidfd = pidfd.take();
+            self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
+            crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            log::warn!(
+                "spawn teardown left elevation front {pid} ({}) running, unsignalled, for tokio's reaper",
+                front.name
+            );
+            self.release();
+        }
+    }
+
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
     /// sync seam's "leave it alive" form, which replaces the kill so the child is really left alone.
     fn teardown_kill(&self) -> Result<Sent, Error> {

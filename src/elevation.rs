@@ -268,8 +268,9 @@ pub enum ElevatedVia {
     ///   [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
     ///   while osascript runs, and the drop-kill that [`crate::Command::kill_on_drop`]
     ///   performs, which is **on by default**, leaves osascript running and unreaped,
-    ///   with a `warn`. [`crate::Child::terminate`] still sends osascript `SIGTERM`,
-    ///   which ends osascript, not the program: once the front-end is gone the
+    ///   with a `warn`. [`crate::Child::terminate`] and
+    ///   [`crate::Child::graceful_shutdown`] are refused the same way: a `SIGTERM`
+    ///   would end osascript, not the program, and once the front-end is gone the
     ///   program's completion and its exit status are unobservable.
     /// - `wait` reports **osascript's** exit status. It is zero if and only if the
     ///   elevated program exited zero; a non-zero code is osascript's, not the

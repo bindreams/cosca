@@ -1,73 +1,154 @@
-//! A forced kill of a child whose tracked process is an elevation *front*.
+//! Signalling a child whose tracked process an elevation wrapper chose: a *front*.
 //!
 //! `sudo` and `doas` without a pty, and macOS `osascript`, leave cosca tracking a process that runs
 //! as the caller and outlives the elevated program it launched. A `SIGKILL` to that front is
-//! allowed, and orphans the program instead of ending it. So no forced kill signals a live front:
-//! it goes through a cgroup, whose `cgroup.kill` reaches the program whatever its credentials, or
-//! it sends nothing and answers `Unkillable`. The front is left alone, so `wait()` still returns
-//! only once the program is gone. `terminate()` is not gated: `sudo` and `doas` relay `SIGTERM`.
+//! allowed, and orphans the program instead of ending it. With direct exec (`!use_pty`,
+//! `!pam_session`, or doas without PAM) the tracked process is the root program itself, whose
+//! signal is refused. Which of the two cosca holds is not known at spawn.
 //!
-//! `sudo` with a pty would end the program when its front dies, and `sudo` with direct exec tracks
-//! the root program itself, whose signal is refused. Neither is known at spawn, so both are
-//! treated as fronts; for direct exec that is the answer the refused signal gives. pkexec, a UAC
-//! child and an already-elevated child track the program itself and are signalled like any child.
+//! So a forced kill never signals a live front. It goes through a cgroup whose `cgroup.kill`
+//! reaches the tracked process whatever its credentials, and nothing is signalled after it, since
+//! that kill is complete. Without one, nothing is sent and the answer is `Unkillable`. Either way
+//! `wait()` returns only once the program is gone.
+//!
+//! A `SIGTERM` is gated only for osascript. sudo and doas relay it to the program; osascript would
+//! end, leaving the program running, so `terminate()` on it is refused like a kill.
+//!
+//! pkexec, a UAC child and an already-elevated child track the program itself and are signalled
+//! like any child.
 
 use std::io;
 
 use super::{Backend, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error};
 
-/// How a forced kill of a child may go.
+/// How a signal to a child may go.
 #[derive(Debug)]
 pub(crate) enum Gate {
-    /// Not a front, or a front that has exited: kill it like any child.
+    /// Not a front: signal it like any child.
     Open,
-    /// A live front in a cgroup: kill the cgroup, and signal the front only if that succeeded.
-    CgroupFirst,
+    /// A front that has exited: nothing is left to orphan. A kill answers `Ok`, as for any exited
+    /// child, even where the signal to it would be refused (a root zombie keeps its credentials).
+    Exited,
+    /// A live front in a cgroup: kill the cgroup, and signal nothing after it.
+    CgroupOnly,
     /// A live front that nothing reaches past: send nothing, and answer this `Unkillable`.
     Closed(Error),
 }
 
-/// The front `via`'s tracked process is, if it is one.
-pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<&'static str> {
+/// A front, and what a signal to it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Front {
+    pub(crate) name: &'static str,
+    /// The tracked process may be the program itself (direct exec), not the wrapper.
+    may_be_the_program: bool,
+    /// A `SIGTERM` to the front reaches the program.
+    relays_term: bool,
+}
+
+/// The front `via` leaves this process tracking, if it does.
+pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
+    let wrapper = |name| Front {
+        name,
+        may_be_the_program: true,
+        relays_term: true,
+    };
     match via? {
-        ElevatedVia::Wrapped(Backend::Sudo) => Some("sudo"),
-        ElevatedVia::Wrapped(Backend::Doas) => Some("doas"),
-        ElevatedVia::MacosOsascript => Some("osascript"),
+        ElevatedVia::Wrapped(Backend::Sudo) => Some(wrapper("sudo")),
+        ElevatedVia::Wrapped(Backend::Doas) => Some(wrapper("doas")),
+        ElevatedVia::MacosOsascript => Some(Front {
+            name: "osascript",
+            may_be_the_program: false,
+            relays_term: false,
+        }),
         // pkexec execs the program, and a report never names `Auto`. run0 is left as it was: its
         // backend is being removed (#354).
         ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
     }
 }
 
-/// The gate for a forced kill of the child `pid` that `via` launched. `cgroup`: its tree is a
-/// cgroup. `running` reads, without reaping, whether the tracked process is still running; it is
-/// asked only about a front. A front that cannot be read is taken to be running.
-pub(crate) fn gate(
+/// The gate for a forced kill of the child `pid` that `via` launched. `running` reads, without
+/// reaping, whether the tracked process still runs; `in_cgroup` whether it is in a cgroup whose
+/// kill reaches it. Both are asked only about a front, and `in_cgroup` only about one that may run:
+/// one that cannot be read is taken to run.
+pub(crate) fn kill_gate(
     via: Option<&ElevatedVia>,
     pid: u32,
-    cgroup: bool,
     running: impl FnOnce() -> io::Result<bool>,
+    in_cgroup: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
     let Some(front) = front(via) else {
         return Gate::Open;
     };
-    match running() {
-        Ok(false) => Gate::Open,
-        _ if cgroup => Gate::CgroupFirst,
-        Ok(true) => Gate::Closed(unkillable(front, pid, None)),
-        Err(e) => Gate::Closed(unkillable(front, pid, Some(e))),
+    let running = match running() {
+        Ok(false) => return Gate::Exited,
+        Ok(true) => None,
+        Err(e) => Some(format!("whether it had exited could not be read: {e}")),
+    };
+    match in_cgroup() {
+        Ok(true) => Gate::CgroupOnly,
+        Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, running)),
+        Err(e) => {
+            let why = format!("whether its cgroup kill reaches it could not be read: {e}");
+            let why = running.map_or(why.clone(), |r| format!("{r}; {why}"));
+            Gate::Closed(refused(front, pid, Signal::Kill, Some(why)))
+        }
     }
 }
 
-fn unkillable(front: &str, pid: u32, unread: Option<io::Error>) -> Error {
-    let mut detail = format!(
-        "pid {pid} is {front}, which runs as this user and outlives the elevated program it launched; killing it \
-         would orphan the program, not end it, so nothing was sent. Only cgroup containment (Linux) reaches the \
-         program"
-    );
-    if let Some(e) = unread {
-        detail.push_str(&format!(". Whether {front} had exited could not be read: {e}"));
+/// The gate for a `SIGTERM` to the child `pid` that `via` launched: closed only for a live front
+/// that does not relay it. `running` is asked only about such a front.
+pub(crate) fn terminate_gate(via: Option<&ElevatedVia>, pid: u32, running: impl FnOnce() -> io::Result<bool>) -> Gate {
+    let Some(front) = front(via).filter(|f| !f.relays_term) else {
+        return Gate::Open;
+    };
+    match running() {
+        Ok(false) => Gate::Open,
+        Ok(true) => Gate::Closed(refused(front, pid, Signal::Term, None)),
+        Err(e) => Gate::Closed(refused(
+            front,
+            pid,
+            Signal::Term,
+            Some(format!("whether it had exited could not be read: {e}")),
+        )),
+    }
+}
+
+/// What a front's detail names, for a child left running elsewhere (a failed spawn's teardown).
+pub(crate) fn describe(front: Front, pid: u32) -> String {
+    if front.may_be_the_program {
+        format!(
+            "pid {pid} is what {name} left this process tracking: {name} itself, which runs as this user and \
+             outlives the elevated program it launched, so a kill would orphan the program, or, with direct exec, \
+             the root program itself, whose kill is refused",
+            name = front.name
+        )
+    } else {
+        format!(
+            "pid {pid} is {name}, which runs as this user and outlives the elevated program it launched, so a signal \
+             would end {name} and orphan the program",
+            name = front.name
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Kill,
+    Term,
+}
+
+fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Error {
+    let what = match signal {
+        Signal::Kill => "no kill",
+        Signal::Term => "no SIGTERM",
+    };
+    let mut detail = format!("{}; {what} was sent.", describe(front, pid));
+    if matches!(signal, Signal::Kill) {
+        detail.push_str(" Only a cgroup (Linux containment) that holds it reaches the program.");
+    }
+    if let Some(why) = unread {
+        detail.push_str(&format!(" ({why})"));
     }
     Error::Elevation {
         kind: ElevationErrorKind::Unkillable,
