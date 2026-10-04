@@ -27,6 +27,14 @@ mod lifecycle;
 #[path = "child/graceful.rs"]
 mod graceful;
 
+#[cfg(all(target_os = "macos", test))]
+impl Child {
+    /// The unique id the handle checks its by-pid actions against.
+    pub(crate) fn adopted_unique(&self) -> Option<u64> {
+        self.proc.adopted_unique()
+    }
+}
+
 #[cfg(test)]
 #[path = "child_tests.rs"]
 mod child_tests;

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
 use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
@@ -126,7 +126,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(target_os = "linux")]
     let (std_cmd, handshake) =
         crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let (std_cmd, report) =
+        crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::unique_report::register)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let std_cmd = build_std_command(cmd)?;
     let mut tcmd = ::tokio::process::Command::new(std::ffi::OsStr::new(""));
     *tcmd.as_std_mut() = std_cmd;
@@ -278,7 +281,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // (dropping `tcmd` here drops the inner `std::process::Command` it wraps, which is what
     // actually owns the marker write end's supervisor-side copy).
     #[cfg(target_os = "macos")]
-    let (mut prepared, child) = {
+    let (mut prepared, child, unique) = {
         let _guard = crate::child::spawn::spawn_lock();
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
@@ -288,6 +291,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
+        let report = report.open(&_guard)?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -310,15 +314,28 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard` at the top of this function"
         )]
-        let c = match tcmd.spawn().map_err(Error::Io) {
+        let (spawned, unique) = report.run(|| tcmd.spawn().map_err(Error::Io));
+        let c = match spawned {
             Ok(c) => c,
             Err(e) => {
-                warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
+                let e = crate::child::spawn::unique_report::failed_spawn_error(e, &unique);
+                // Without an id the program never ran, but who collected the child is open: a signal
+                // after the refusal makes std return `Ok`, and tokio's own setup can then drop the
+                // child unreaped. With an id, or a report that could not be read or was malformed,
+                // the program may have run, and may still be running only if tokio's own setup failed
+                // after std returned `Ok`: a std `Err` has already collected the child.
+                use crate::child::spawn::unique_report::Report;
+                use crate::containment::AbandonedChild;
+                let abandoned = match unique {
+                    Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
+                    _ => prepared.abandon_before_verdict(),
+                };
+                warn_for_abandoned_child(abandoned, &e);
                 return Err(e);
             }
         };
         drop(tcmd);
-        (prepared, c)
+        (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
     let (prepared, child) = {
@@ -421,17 +438,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let proc_handle = child
         .raw_handle()
         .expect("a freshly spawned tokio child has a raw handle");
-    // macOS: the unique id every by-pid signal to this child is checked against. It is read by pid
-    // alone, so a foreign reap and a reuse of the pid before it make it the stranger's id. A refused
-    // read leaves the backend with no id, so it acts on the pid never, and the spawn fails below
-    // once the backend exists.
+    // macOS: the unique id every by-pid signal to this child is checked against. Without one the
+    // backend acts on the pid never, and the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
-    let (identity, identity_refused) = match crate::signal::read_identity(pid) {
-        Ok(identity) => (identity, None),
-        Err(errno) => (None, Some(errno)),
+    let (identity, not_adopted) = match crate::child::spawn::unique_report::adopted_id(unique, pid) {
+        Ok(unique) => (Some(unique), None),
+        Err(not_adopted) => (None, Some(not_adopted)),
     };
-    // Built first so failure arms tear the child down through its handle, not its pid. A refused id
-    // read leaves it id-less; the spawn fails below.
+    // Built first so failure arms tear the child down through its handle, not its pid. On macOS a
+    // child with no adopted id is id-less, and the spawn fails below.
     #[cfg(target_os = "linux")]
     let proc = {
         // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.
@@ -443,14 +458,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(windows)]
     let proc = ProcSource::new(child);
     #[cfg(target_os = "macos")]
-    if let Some(errno) = identity_refused {
+    if let Some(not_adopted) = not_adopted {
         #[cfg(test)]
         crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
         prepared.settle_verdict(pid);
-        // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
-        // warning naming it, and left running.
-        proc.reap_now(pid);
-        return Err(crate::signal::identity_unreadable(pid, errno));
+        if not_adopted.died_before_exec {
+            // Only a corpse is left, and tokio's `Child` must not reap it by pid.
+            proc.forget_because("died before exec");
+        } else {
+            // With no id the backend neither signals nor waits by pid: the child is forgotten, with
+            // a warning naming it, and left running.
+            proc.reap_now(pid);
+        }
+        return Err(not_adopted.error);
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
@@ -480,12 +500,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // it, and a panic unwinds through `ProcSource`'s `Drop`.
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
-        // macOS: the unique id read at spawn found no process, so there is nothing to check a pid
-        // against, and the child is not read by pid.
-        #[cfg(target_os = "macos")]
-        None => Resolved::Gone,
-        #[cfg(not(target_os = "macos"))]
-        None => unreachable!("a freshly spawned tokio child holds its handle"),
+        // Contract: a freshly spawned child holds its handle on every platform.
+        None => {
+            debug_assert!(false, "a freshly spawned tokio child holds its handle");
+            Resolved::Unknown
+        }
     };
     let id = match resolved {
         Resolved::Found(id) => id,
@@ -637,12 +656,12 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
     let consequence = match child {
         AbandonedChild::Ended => return,
         AbandonedChild::MaybeUnreaped => {
-            "the child exits before `exec` but was left unreaped: it never reached the point where it \
-             names itself, so nothing holds its pid"
+            "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
+             never reached the point where it names itself and nothing holds its pid"
         }
         AbandonedChild::MaybeUnreachable => {
-            "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
-             without the child's pid"
+            "unless its spawn collected it, the child was left running and nothing \
+             can reach it: only a cgroup v2 leaf is killed without the child's pid"
         }
     };
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");

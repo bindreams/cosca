@@ -26,9 +26,10 @@
 //!   `kevent` timeout's own cap), and after every wake `crate::wait::now() >= deadline` decides
 //!   expiry, never the primitive's own "timed out".
 //!
-//! `pidfd: None` (Linux), and an identity read that said `ESRCH` at adoption (macOS), mean the child
-//! was already reaped elsewhere when it was adopted: every wait answers `ECHILD`, and `kill` is
-//! success.
+//! Two states, both test-only, mean the child was already reaped elsewhere when it was adopted:
+//! Linux `pidfd: None` (`SharedChild::adopt` is `#[cfg(any(windows, test))]`, and `adopt_opened`
+//! always sets `Some`), and macOS, where the identity read said `ESRCH` at adoption. In both,
+//! every wait answers `ECHILD`, and `kill` is success.
 
 use std::fmt;
 use std::io;
@@ -139,8 +140,8 @@ pub(crate) struct SharedChild {
     /// reaped elsewhere at adoption.
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
-    /// The child's unique id, the one identity every by-pid check on macOS uses (see
-    /// [`crate::signal::read_identity`]). `None`: the child was already reaped when it was read.
+    /// The child's unique id, the one identity every by-pid check on macOS uses. `None`: no id is
+    /// held, so the pid is acted on never.
     #[cfg(target_os = "macos")]
     identity: Option<u64>,
     /// A duplicate of the std `Child`'s process handle, usable unlocked.
@@ -277,6 +278,12 @@ impl SharedChild {
     #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lock().state, State::E(_))
+    }
+
+    /// The unique id this handle checks its by-pid actions against. Tests only.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn adopted_unique(&self) -> Option<u64> {
+        self.identity
     }
 
     /// The child's process id.

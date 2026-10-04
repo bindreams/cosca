@@ -1,5 +1,6 @@
 //! The skeleton of a `pre_exec` hook that talks to its parent over a descriptor made under
-//! `spawn_lock`, as [`pidfd_handshake`](super::pidfd_handshake) does.
+//! `spawn_lock`, as [`pidfd_handshake`](super::pidfd_handshake) and, on macOS,
+//! [`unique_report`](super::unique_report) do.
 //!
 //! A hook is registered on the command first and the channel is made later, under `spawn_lock`, so
 //! the descriptor numbers are published to the hook between the two. The hook reads only atomics.
@@ -28,6 +29,7 @@ impl Shared {
     }
 
     /// The parent's end, as inherited by the child.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn parent_end(&self) -> RawFd {
         self.parent_end.load(Ordering::Relaxed)
     }

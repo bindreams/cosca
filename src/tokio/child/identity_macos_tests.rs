@@ -6,10 +6,12 @@ use std::rc::Rc;
 use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
-    arm_launchd_hold, end_unsignalled_and_reap, has_not_exited, other_unique_id, reap_by_pid, record_pid, vanished,
+    arm_launchd_hold, assert_program_did_not_run, end_unsignalled_and_reap, has_not_exited, other_unique_id,
+    ran_marker, reap_by_pid, vanished, RAN_ARGV,
 };
+use crate::child::spawn::unique_report;
 use crate::error::Error;
-use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
 
 fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
@@ -132,44 +134,118 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
     end_unsignalled_and_reap(pid.get());
 }
 
-/// As the sync twin: no process at the first read is `Gone`, the child is left alone.
+/// As the sync twin: the unique id is the child's own report, and its only by-pid unique-id read
+/// is the running peek's.
 ///
-/// Mutant: the `None` target continues to the identity read.
+/// Mutant: the spawn reads the unique id by pid.
 #[skuld::test]
-async fn macos_tokio_spawn_first_read_gone_is_gone_and_leaves_the_child() {
+async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_its_unique_id_by_pid_only_in_the_running_peek() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut cmd, _writer) = tokio_blocker();
-    let pid = Rc::new(Cell::new(0));
-    let _hook = record_pid(&pid);
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Gone);
-    let err = cmd
-        .spawn()
-        .expect_err("a first read that finds nothing fails the spawn");
-    assert!(vanished(&err), "no process is Gone, not Unassessable: {err:?}");
-    assert!(
-        has_not_exited(pid.get()),
-        "nothing may have signalled or reaped the pid"
+    let (mut cmd, writer) = tokio_blocker();
+    let reads = uniq_fault::record();
+    let mut child = cmd.spawn().expect("the child's own report needs no by-pid read");
+    assert_eq!(
+        reads.purposes(),
+        [ReadPurpose::Running],
+        "the only by-pid read is the identity check's re-read, none to adopt the id"
     );
-    end_unsignalled_and_reap(pid.get());
+    drop(writer);
+    child.wait().await.expect("wait");
 }
 
-/// As the sync twin: a refused first read is `Unassessable`, the child is left running.
+/// As the sync twin: a refused own read is `Unassessable` and the program does not run.
 ///
-/// Mutant: the refusal maps to `Gone`.
+/// Mutants: the hook execs anyway; a refusal is mapped to `Ended` (no unreaped-child warning).
 #[skuld::test]
-async fn macos_tokio_spawn_first_read_refused_is_unassessable_and_leaves_the_child() {
+async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut cmd, _writer) = tokio_blocker();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
-    let err = cmd.spawn().expect_err("a refused first read fails the spawn");
+    crate::log_capture::install();
+    let (stdout, reader) = ran_marker();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(RAN_ARGV);
+    cmd.stdout(stdout).expect("set stdout");
+    let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    // The refused arm returns before any hook; the spawn captured the child it left.
-    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
-        panic!("the refused arm must have captured the child's identity")
+    assert_program_did_not_run(cmd, reader);
+    // Who collected the child is open: std may have returned `Ok` for a child killed after its refusal.
+    assert!(
+        crate::log_capture::contains_since(mark, "if its spawn did not collect it"),
+        "a refusal under tokio may leave an unreaped child, and the spawn must say so"
+    );
+}
+
+/// As the sync twin: a child killed before it reports is a child that died before exec, and
+/// tokio's `Child` is forgotten, not reaped by pid.
+///
+/// Mutant: a missing report is read as an errno.
+#[skuld::test]
+async fn macos_tokio_spawn_of_a_child_killed_before_its_report_says_it_died_before_exec() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, _writer) = tokio_blocker();
+    let _forced = unique_report::seams::force_child_killed_before_report();
+    let backend_drops = backend_fault::count_backend_drops();
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("a child that never reported cannot be adopted");
+    let Error::Io(e) = &err else {
+        panic!("a child that died before exec is an io error, not a refusal: {err:?}")
     };
-    assert!(has_not_exited(id.pid()), "nothing may have signalled or reaped the pid");
-    end_unsignalled_and_reap(id.pid());
+    assert!(e.to_string().contains("died before exec"), "{e}");
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must not be dropped");
+    assert!(
+        crate::log_capture::contains_since(mark, "died before exec; forgetting"),
+        "a dead child is forgotten as a corpse"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "may still be running"),
+        "a dead child is not reported as possibly running"
+    );
+}
+
+/// As the sync twin: the adopted id is the live child's own.
+///
+/// Mutant: the spawn adopts another process's id.
+#[skuld::test]
+async fn macos_tokio_spawn_adopts_the_live_childs_own_unique_id() {
+    use crate::tokio::child::ProcSource;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, writer) = tokio_blocker();
+    let mut child = cmd.spawn().expect("spawn");
+    let UniqRead::Found(info) = uniq_info(child.id().pid(), ReadPurpose::Kill) else {
+        panic!("the live child has a unique id")
+    };
+    let ProcSource::Tokio { identity, .. } = child.proc_mut() else {
+        panic!("a fresh child is a tokio backend")
+    };
+    assert_eq!(*identity, Some(info.unique_id));
+    drop(writer);
+    child.wait().await.expect("wait");
+}
+
+/// As the sync twin, and the abandoned-child warning must not claim a child is left running: a
+/// missing report on a failed spawn proves the program never ran.
+///
+/// Mutant: the failed spawn's warning treats a missing report like a child that may be running.
+#[skuld::test]
+async fn macos_tokio_spawn_failing_before_the_report_keeps_stds_error_and_does_not_warn_running() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, _writer) = tokio_blocker();
+    let _forced = unique_report::seams::force_hook_failure_before_report(libc::ENOENT);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("the hook fails the spawn");
+    assert!(
+        matches!(&err, Error::Io(e) if e.raw_os_error() == Some(libc::ENOENT)),
+        "std's error stays: {err:?}"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "left running"),
+        "the program never ran, so nothing is left running"
+    );
 }

@@ -73,7 +73,8 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 /// one read without touching the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadPurpose {
-    /// The child's identity, read at spawn.
+    /// The child's identity, read by pid at adoption (test-only).
+    #[cfg_attr(not(test), allow(dead_code, reason = "only the test-only by-pid read uses it"))]
     Adopt,
     /// The re-read just before a signal.
     Kill,
@@ -161,6 +162,8 @@ fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadE
 /// user's process, and it sees zombies.
 pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     #[cfg(test)]
+    uniq_fault::note(purpose);
+    #[cfg(test)]
     if let Some(forced) = uniq_fault::take(purpose) {
         return forced;
     }
@@ -174,6 +177,31 @@ pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
         }),
         Err(ReadErr::Gone) => UniqRead::Gone,
         Err(ReadErr::Refused(errno)) => UniqRead::Refused(errno),
+    }
+}
+
+/// The calling process's own unique id, for a child to report before `exec`. **Async-signal-safe**:
+/// no allocation, lock or logging. `Err` is the errno.
+pub(crate) fn own_unique_id() -> Result<u64, i32> {
+    // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
+    let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcUniqIdentifierInfo>() as libc::c_int;
+    // SAFETY: `getpid` has no preconditions; proc_pidinfo writes up to `size` bytes into `info`.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDUNIQIDENTIFIERINFO,
+            1,
+            (&mut info as *mut ProcUniqIdentifierInfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        Ok(info.p_uniqueid)
+    } else if n <= 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    } else {
+        Err(libc::EIO)
     }
 }
 
@@ -265,6 +293,40 @@ pub(crate) mod uniq_fault {
         fn drop(&mut self) {
             FORCED.with(|f| f.borrow_mut().clear());
         }
+    }
+
+    thread_local! {
+        static RECORDED: RefCell<Option<Vec<ReadPurpose>>> = const { RefCell::new(None) };
+    }
+
+    /// Records the purpose of every by-pid unique-id read on this thread until the guard drops.
+    pub(crate) fn record() -> Recorder {
+        RECORDED.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        Recorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct Recorder(());
+
+    impl Recorder {
+        /// The purposes recorded so far, in order.
+        pub(crate) fn purposes(&self) -> Vec<ReadPurpose> {
+            RECORDED.with(|r| r.borrow().clone().unwrap_or_default())
+        }
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            RECORDED.with(|r| *r.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn note(purpose: ReadPurpose) {
+        RECORDED.with(|r| {
+            if let Some(recorded) = r.borrow_mut().as_mut() {
+                recorded.push(purpose);
+            }
+        });
     }
 
     pub(super) fn take(purpose: ReadPurpose) -> Option<UniqRead> {

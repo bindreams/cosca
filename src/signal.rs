@@ -60,17 +60,11 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
     }
 }
 
-/// A child's identity, read the moment its handle is made: the 64-bit unique id, which is never
-/// reused and survives `exec`. It is the only identity macOS checks a by-pid action against.
-/// `Ok(None)` is a child already reaped when it was read (`ESRCH`); `Err(errno)` is a refused read.
-/// A handle built on a refused read holds no id and acts on its pid never.
-///
-/// The read is of our own child, which nothing reaps but us, unless something else does (a
-/// `SIG_IGN` host, another thread's `waitpid(-1)`) before the read: `None` then says the child is
-/// already reaped, and the handle acts on nothing by a bare pid. If it reaps the child and *any*
-/// process then reuses the pid before the read, the id is that process's, and the handle waits on
-/// it and `kill` signals it: macOS has no handle to pin the pid (principle 5).
-#[cfg(target_os = "macos")]
+/// A process's unique id by pid: the 64-bit id that is never reused and survives `exec`, which is
+/// the only identity macOS checks a by-pid action against. `Ok(None)` is a pid with no process
+/// (`ESRCH`); `Err(errno)` is a refused read. Tests only: production spawns take the child's own
+/// report (`child::spawn::unique_report`).
+#[cfg(all(target_os = "macos", test))]
 pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
     match uniq_info(pid, ReadPurpose::Adopt) {
@@ -80,10 +74,9 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     }
 }
 
-/// The adoption error for a child whose identity read was refused with `errno`: the child is not
-/// adopted. The sync spawn leaves it running, and the async spawn forgets it, with a warning;
-/// neither signals or waits on it by pid.
-#[cfg(target_os = "macos")]
+/// The error for adopting a child whose by-pid identity read was refused with `errno`. Tests
+/// only: a spawn takes the child's own report.
+#[cfg(all(target_os = "macos", test))]
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
         detail: format!("pid {pid}: its identity could not be read (errno {errno}); the child was not adopted"),
@@ -91,8 +84,8 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     }
 }
 
-/// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: the
-/// child was gone when adopted or its identity could not be read, so nothing is sent). Nothing is
+/// Send `sig` to `pid` by number, only while it still has the unique id `identity` (`None`: no id
+/// is held, so nothing is sent). Nothing is
 /// sent to a pid that is gone or reused. A refused re-read is an error carrying the errno, so an
 /// `EPERM` stays `PermissionDenied`. The window between the check and `kill(2)` is macOS's own: it
 /// has no handle to send through.
@@ -106,7 +99,7 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         )
     };
     let Some(expected) = identity else {
-        log::debug!("child {pid} was gone when adopted, or its identity could not be read; {sig:?} not sent");
+        log::debug!("child {pid} holds no unique id; {sig:?} not sent");
         return Ok(Sent::Gone);
     };
     match uniq_info(pid, ReadPurpose::Kill) {

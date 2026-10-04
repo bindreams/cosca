@@ -52,10 +52,8 @@ pub(crate) enum ProcSource {
         /// the pid.
         #[cfg(target_os = "linux")]
         pidfd: PinnedPidfd,
-        /// The child's unique id, read right after the spawn (see
-        /// [`crate::signal::read_identity`]): the only identity a by-pid signal on macOS is checked
-        /// against. `None`: the child was already reaped when it was read, or the read was refused;
-        /// either way nothing shows the pid names this child, and it is acted on never.
+        /// The child's unique id (see `child::spawn::unique_report`): the only identity a by-pid
+        /// signal on macOS is checked against. `None`: no id is held, so the pid is acted on never.
         #[cfg(target_os = "macos")]
         identity: Option<u64>,
     },
@@ -529,7 +527,7 @@ impl ProcSource {
     /// - **Linux:** a peek through the pidfd. Exact, with no start token to collide.
     /// - **macOS:** a peek that checks the pid's unique id, including that a running child's id can
     ///   be read ([`exit_only::peek_verified`](crate::wait::exit_only)). A child with no unique id
-    ///   was already reaped, or its read was refused: unknown.
+    ///   (a spawn whose unique id was not adopted, see `adopted_id`): unknown.
     ///
     /// A child tokio already reaped is `Ours`: nothing is left to drop wrongly.
     #[cfg(unix)]
@@ -613,8 +611,8 @@ impl ProcSource {
     ///   unique id), which never reaps. A child a tracer holds is waited for until the tracer
     ///   hands it back. Anything that cannot be shown to be ours is [`Waited::Foreign`]: a
     ///   foreign reap, a pid with another unique id, a launchd-held zombie, a refused read, a
-    ///   failed peek or kqueue (warned), and a child with no unique id (already reaped when the id
-    ///   was read, or the read was refused), which is not waited on at all. A reap and reuse
+    ///   failed peek or kqueue (warned), and a child with no unique id (a spawn whose unique id was
+    ///   not adopted, see `adopted_id`), which is not waited on at all. A reap and reuse
     ///   between the verified exit and tokio's reap is an accepted gap.
     /// - **Windows:** waits on tokio's process handle, which pins the child.
     ///
@@ -638,9 +636,8 @@ impl ProcSource {
                 if !still_ours(child) {
                     return Waited::Exited;
                 }
-                // No unique id: the child was already reaped when it was read, or the read was
-                // refused. Either way nothing shows the pid still names this child, so it is never
-                // waited on.
+                // No unique id is held, so nothing shows the pid names this child: it is never waited
+                // on.
                 let Some(identity) = identity else {
                     return Waited::Foreign;
                 };
@@ -678,7 +675,7 @@ impl ProcSource {
     /// [`forget_foreign`](ProcSource::forget_foreign) for any reason: `why` completes "child N ...",
     /// so the warning says what actually happened.
     #[cfg(unix)]
-    fn forget_because(&mut self, why: &str) {
+    pub(crate) fn forget_because(&mut self, why: &str) {
         let ProcSource::Tokio {
             child,
             stdin,
