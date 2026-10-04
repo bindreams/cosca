@@ -81,5 +81,5 @@ test_group!(DRIVE_MAPPING => drive_mapping, env = "COSCA_TEST_DRIVE_MAPPING", co
 test_group!(SETUID => setuid, env = "COSCA_TEST_SETUID", consent = "runs a setuid-root copy of cosca_testbin");
 test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent = "creates scratch files, launches copies of cosca_testbin_image and creates a suspended process");
 test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
-test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx");
-test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task");
+test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx and launches copies of cosca_testbin_image");
+test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task, launches copies of this test binary under derived tokens and scratch accounts, and plants a batch file that CreateProcessW may run");
