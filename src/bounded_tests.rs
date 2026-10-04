@@ -66,7 +66,7 @@ mod waits {
     ///
     /// Mutant: drop the assert from `CgroupLeaf::wait_drained`.
     #[cfg(target_os = "linux")]
-    #[skuld::test]
+    #[skuld::test(labels = [crate::test_harness::CGROUP])]
     #[should_panic(expected = "would block inside an async Drop")]
     fn cgroup_wait_drained_refuses_inside_a_section() {
         use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};

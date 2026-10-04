@@ -4,6 +4,8 @@
 
 use crate::child::spawn::fault;
 use crate::error::Error;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::tokio::Command;
 
 /// [`blocker`] for a kill-then-blocking-reap test; see [`fault::teardown_blocker_stdin`].
@@ -91,10 +93,7 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 /// running in a leaked leaf.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = blocker();
     cmd.contain();
     fault::set_force_post_fork_failure(true);
@@ -306,12 +305,9 @@ fn reaped_through(pidfd: &std::os::fd::OwnedFd) -> bool {
 /// kill and is outside its leaf is out of reach, and warned about; it is reaped once it exits.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() {
+async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::fault as cgroup_fault;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     crate::log_capture::install();
     for (placed, refuses) in [(true, false), (false, false), (false, true)] {
         let mut cmd = blocker();
@@ -361,10 +357,7 @@ async fn cgroup_a_post_fork_tokio_failure_warns_only_for_a_child_out_of_reach() 
 /// own reap for the same pid.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+async fn cgroup_an_identity_failure_leaves_the_child_to_tokio(#[fixture(cgroup)] _group: &Group) {
     let _ = crate::containment::cgroup::fault::take_reaped_orphans();
     fault::set_force_identity_vanished(true);
     let (mut cmd, teardown) = teardown_blocker();
@@ -392,10 +385,7 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio() {
 /// would mean the retried `rmdir` itself still failed once the leaf drained.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_tokio(#[fixture(cgroup)] _group: &Group) {
     let _ = crate::containment::cgroup::fault::take_reaped_orphans();
     fault::set_force_identity_vanished(true);
     fault::set_force_kill_failure_leaving_child_alive_as(
@@ -433,7 +423,7 @@ async fn cgroup_an_identity_failure_whose_kill_is_refused_leaves_the_child_to_to
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
+fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio(#[fixture(cgroup)] _group: &Group) {
     use std::io::{Read, Seek, Write};
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -441,9 +431,6 @@ fn cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio() {
     use crate::test_spawn::spawn;
     use crate::test_stdio::RestoreStdio;
 
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let Some(done) = own_process(
         test_path!(cgroup_an_abandoned_spawn_writes_nothing_into_the_childs_stdio),
         spawn,

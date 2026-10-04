@@ -1,8 +1,8 @@
-//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test and one real `ROOT` test under chosen environments. Neither body runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
+//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test, one real `ROOT` test and one real `CGROUP` test under chosen environments. None of the bodies runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 use crate::test_harness::{
-    DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
+    CGROUP, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
 };
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -121,6 +121,7 @@ fn every_group_fixture_carries_exactly_its_label() {
         ("shell_execute", SHELL_EXECUTE),
         ("shell_probes", SHELL_PROBES),
         ("elevation_routes", ELEVATION_ROUTES),
+        ("cgroup", CGROUP),
     ] {
         assert_eq!(skuld::fixture::collect_fixture_labels(&[fixture]), [label], "{fixture}");
     }
@@ -137,6 +138,11 @@ mod reexec {
     /// A real `ROOT` test: it needs a DAC bypass, so only a granted group may run it.
     const ROOT_TEST: &str = "resolve::resolve_base_tests::a_denied_candidate_is_denied_by_an_exec_child";
 
+    /// A real `CGROUP` test, outside `containment::cgroup`, so only its fixture labels it `cgroup`.
+    /// It makes cgroup leaves, so only a granted group may run it.
+    const CGROUP_TEST: &str =
+        "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
+
     struct Case {
         test: &'static str,
         var: &'static str,
@@ -152,6 +158,12 @@ mod reexec {
         test: ROOT_TEST,
         var: "COSCA_TEST_ROOT",
         label: "root",
+    };
+
+    const CGROUP: Case = Case {
+        test: CGROUP_TEST,
+        var: "COSCA_TEST_CGROUP",
+        label: "cgroup",
     };
 
     /// Re-execs this binary on exactly the case's test with the group's variables set as given (`None` removes them).
@@ -313,5 +325,42 @@ mod reexec {
     #[skuld::test]
     fn the_root_label_selects_its_tests() {
         assert_label_selects(&ROOT);
+    }
+
+    /// Mutant: the `CGROUP` row's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn cgroup_group_zero_reports_ignored() {
+        assert_group_zero_reports_ignored(&CGROUP);
+    }
+
+    /// Mutant: an enabled `CGROUP` group needs no consent. `=1` is not consent.
+    #[skuld::test]
+    fn cgroup_group_one_without_consent_fails() {
+        assert_consent_refused_with(&CGROUP, Some("1"), None);
+    }
+
+    /// Mutant: the `CGROUP` setup does not check consent.
+    #[skuld::test]
+    fn cgroup_unset_consent_fails() {
+        assert_consent_refused(&CGROUP, None);
+    }
+
+    /// Mutant: any non-empty consent counts for `CGROUP`.
+    #[skuld::test]
+    fn cgroup_consent_other_than_1_fails() {
+        assert_consent_refused(&CGROUP, Some("yes"));
+    }
+
+    /// Mutant: the `CGROUP` setup grants a group that is off.
+    #[skuld::test]
+    fn cgroup_group_zero_never_runs_the_body_under_run_ignored() {
+        assert_zero_never_runs_the_body_under_run_ignored(&CGROUP);
+    }
+
+    /// Mutant: the `CGROUP` fixture carries no label. The test sits outside `containment::cgroup`,
+    /// so the fixture's label alone selects it.
+    #[skuld::test]
+    fn the_cgroup_label_selects_its_tests() {
+        assert_label_selects(&CGROUP);
     }
 }

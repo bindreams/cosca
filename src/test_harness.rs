@@ -51,3 +51,8 @@ pub const ISOLATED_PATHEXT_PRECEDENCE: skuld::Label;
 /// Isolated `SHELL_PROBES` probe: whether an existing extensionless file ever launches.
 #[skuld::label]
 pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
+
+/// Selects the `CGROUP` group's tests, and keeps in the cgroup lane the other tests its old `test(/cgroup/)` name
+/// filter selected (most use fake leaves and also run in the main lanes).
+#[skuld::label]
+pub const CGROUP: skuld::Label;

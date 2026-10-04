@@ -1,5 +1,7 @@
 use crate::containment::cgroup::test_support::{block_on, childs_copy, entered_leaf_at, fork_running, reap};
 use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 // removed_after_drain tests -----
 // Linux-only: the function itself is `#[cfg(target_os = "linux")]` (it interprets raw kernel
@@ -235,9 +237,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 }
 
 // CgroupLeaf::wait_drained real-mechanism test -----
-// Linux + cgroup-v2 only. The `CGROUP` group (`crate::test_support`) runs them unless
-// `COSCA_TEST_CGROUP=0`, which CI's ordinary jobs set; enabled, they need
-// `COSCA_TEST_CGROUP_CONSENT=1` and fail loudly if no usable delegated cgroup v2 leaf exists.
+// Linux + cgroup-v2 only; each takes the `cgroup` fixture.
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
@@ -247,7 +247,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 /// returned.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
+fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::{
         assert_bounded_conclusion, Member, WaitDeadlineArgGuard, WaitObserver,
@@ -258,9 +258,6 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
         panic!(
             "the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created \
@@ -442,10 +439,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit() {
 /// `cgroup.procs`, through which it could move itself into the leaf and be killed with it.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_leaf_procs_fd_is_not_inherited_across_exec() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_leaf_procs_fd_is_not_inherited_across_exec(#[fixture(cgroup)] _group: &Group) {
     let leaf = crate::containment::cgroup::try_create_leaf().unwrap_or_else(|e| {
         panic!("the cgroup tests are enabled but no usable delegated cgroup v2 leaf could be created ({e})")
     });
@@ -1489,11 +1483,10 @@ fn drop_under_a_mount(
 /// rather than retrying forever.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf() {
+fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_the_leaf(
+    #[fixture(cgroup)] _group: &Group,
+) {
     use std::os::unix::process::ExitStatusExt as _;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
 
     let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
@@ -1518,11 +1511,10 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
 /// real tree through the held leaf, and reports the leaf it cannot remove.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf() {
+fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_the_tree_and_reports_the_leaf(
+    #[fixture(cgroup)] _group: &Group,
+) {
     use std::os::unix::process::ExitStatusExt as _;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
 
     crate::log_capture::install();
     let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
@@ -1566,11 +1558,8 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 /// leaf. `Drop` kills, drains and removes the real leaf through the held directories.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
+fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
 
     let (leaf, mut member, stdin) = entered_real_leaf();
     let leaf_path = leaf.leaf_path.clone();
@@ -1597,10 +1586,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf() {
 /// could not be watched. The half-made leaf is removed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created(#[fixture(cgroup)] _group: &Group) {
     crate::containment::cgroup::fault::set_force_inotify_failure(true);
     let result = crate::containment::cgroup::try_create_leaf();
     let consumed = !crate::containment::cgroup::fault::take_force_inotify_failure();
@@ -2308,13 +2294,10 @@ fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
 /// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
+fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::{CommandExt, ExitStatusExt as _};
 
     use crate::containment::TreeDrain;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     // The member reports through a channel of its own, so the leaf's has nothing queued.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the member's channel");
@@ -2349,14 +2332,13 @@ fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained() {
 /// nothing in the leaf is cosca's to kill: the occupant survives.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it() {
+fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it(
+    #[fixture(cgroup)] _group: &Group,
+) {
     use std::io::{Read, Write};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     use crate::containment::TreeDrain;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
@@ -2694,12 +2676,9 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
 /// not cosca's to kill. It survives — proven by an echo — and the leaf is reported, not killed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child() {
+fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[fixture(cgroup)] _group: &Group) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
     // The occupant reports through a channel of its own, so the leaf's receives nothing.
@@ -3264,13 +3243,10 @@ fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
 /// the spawn fails closed — its child killed — and the read's own error is the reason given.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed() {
+fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     use crate::containment::TreeDrain;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
     // The child reports through a channel of its own, so the leaf's has nothing queued.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the child's channel");
@@ -3345,10 +3321,7 @@ fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fau
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf(#[fixture(cgroup)] _group: &Group) {
     assert_a_non_same_proc_view_fails_closed(
         crate::identity::proc_view_fault::ForcedView::Diverged,
         "outer pid namespace",
@@ -3357,10 +3330,7 @@ fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf() {
 
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf(#[fixture(cgroup)] _group: &Group) {
     assert_a_non_same_proc_view_fails_closed(
         crate::identity::proc_view_fault::ForcedView::Unassessable,
         "could not be established",
@@ -3394,10 +3364,7 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 /// regression hangs this test in `drop`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_drop_removes_a_leaf_holding_child_cgroups() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &Group) {
     // Placed: killed through, drained, swept. Nothing received: swept without a kill.
     for placed in [true, false] {
         let leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");

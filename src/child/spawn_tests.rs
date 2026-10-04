@@ -7,6 +7,8 @@
 use super::fault;
 use crate::command::Command;
 use crate::error::Error;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 // A child only a real kill ends, so a teardown leak shows as an alive process at the assert
 // rather than a self-exit, and a mutant that skips the kill hangs instead of passing. See
@@ -429,7 +431,7 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
+fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio(#[fixture(cgroup)] _group: &Group) {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsRawFd;
 
@@ -438,9 +440,6 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio() {
     use crate::test_spawn::spawn;
     use crate::test_stdio::RestoreStdio;
 
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let Some(done) = own_process(
         test_path!(cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio),
         spawn,

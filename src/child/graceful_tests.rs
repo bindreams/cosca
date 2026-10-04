@@ -426,7 +426,7 @@ fn graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_authoritative() 
 // The `exec 3<&0; cat <&3 3<&- &` idiom is explained at `test_child::BLOCKER_ARGV`. Without a
 // kernel drain edge, the fixture still exercises the root-only watch, asserted below.
 #[cfg(unix)]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     use std::io::{Read, Write};
 

@@ -7,6 +7,8 @@ use std::io;
 use super::CgroupLeaf;
 use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
 use crate::identity::ProcDir;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// A leaf with a unified-hierarchy path but no cgroupfs behind it: `holds` never touches the leaf.
 fn pathed_leaf(dir: &tempfile::TempDir) -> CgroupLeaf {
@@ -66,12 +68,9 @@ fn holds_under_a_diverged_view_is_an_error() {
 ///
 /// Mutant: `holds_via` compares the member's path to the leaf's for equality.
 #[skuld::test]
-fn cgroup_holds_via_counts_a_member_nested_under_the_leaf() {
+fn cgroup_holds_via_counts_a_member_nested_under_the_leaf(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::test_support::occupied_leaf;
     use crate::containment::TreeDrain;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let (leaf, mut member, _own) = occupied_leaf();
     let pid = member.id();
     let nested = leaf.leaf_path.join("nested");

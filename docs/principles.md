@@ -192,8 +192,7 @@ A group names an environment, not a mechanism. `CGROUP` means the unconfined cgr
 delegated cgroup with `unshare` permitted.
 
 Today's gates take two shapes, neither matching this: some assert an opt-in variable
-(`COSCA_TEST_ELEVATION*`), and some return early instead (every `gated()` caller in
-`tests/elevation.rs`, and every `require_group` caller, in the library and in `tests/`).
+(`COSCA_TEST_ELEVATION*`), and some return early instead.
 [#234] tracks the migration, names the groups, and is the authoritative inventory of what's left.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
@@ -230,8 +229,9 @@ Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, an
 runs. So does
 `COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids): CI turns
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
-`COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane, whose names contain `cgroup`
-so that lane selects them): CI turns it off workflow-wide and the cgroup step opts in. So does
+`COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
+with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
+in. So does
 `COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with
 `#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So do the other
 Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries and surveys),

@@ -6,7 +6,7 @@ use crate::containment::TreeDrain;
 use crate::identity::ProcDir;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
-use crate::test_groups::{namespaces, Group};
+use crate::test_groups::{cgroup, namespaces, Group};
 
 /// The mount point `fixture_cleanup_over_mount` puts a tmpfs on, under the chroot root.
 const MOUNT_POINT_ENV: &str = "COSCA_FIXTURE_MOUNT_POINT";
@@ -14,21 +14,16 @@ const MOUNT_POINT_ENV: &str = "COSCA_FIXTURE_MOUNT_POINT";
 /// The empty directory `fixture_leaf_no_proc` chroots into, made and removed by its driver.
 const CHROOT_ROOT_ENV: &str = "COSCA_FIXTURE_CHROOT_ROOT";
 
-/// Whether to run: the `CGROUP` group is on. The `NAMESPACES` group is the tests' fixture.
-fn enabled() -> bool {
-    crate::test_support::require_group("CGROUP")
-}
-
 /// `holds_via` reads through the `/proc` dirfd it is given. The dirfd is opened, THEN a tmpfs is
 /// mounted over `/proc` whose `{pid}/cgroup` puts the member outside the leaf: the read must
 /// still see the real `/proc`, where the member is in the leaf.
 ///
 /// Mutant: `holds_via` reads `/proc/{pid}/cgroup` by absolute path.
 #[skuld::test]
-fn namespaces_cgroup_membership_is_read_through_the_given_proc_dirfd(#[fixture(namespaces)] _group: &Group) {
-    if !enabled() {
-        return;
-    }
+fn namespaces_cgroup_membership_is_read_through_the_given_proc_dirfd(
+    #[fixture(namespaces)] _namespaces: &Group,
+    #[fixture(cgroup)] _cgroup: &Group,
+) {
     ns::run(fixture_path!(fixture_leaf_overmount));
 }
 
@@ -67,10 +62,10 @@ fn fixture_leaf_overmount() {
 ///
 /// Mutant: `holds` keeps only the source's kind.
 #[skuld::test]
-fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc(#[fixture(namespaces)] _group: &Group) {
-    if !enabled() {
-        return;
-    }
+fn namespaces_cgroup_holds_keeps_the_os_error_behind_an_unopenable_proc(
+    #[fixture(namespaces)] _namespaces: &Group,
+    #[fixture(cgroup)] _cgroup: &Group,
+) {
     // `TMPDIR` is `scratch`, so anything the fixture leaves in the temp dir is caught below.
     let dirs = ns::ChrootScratch::new();
     ns::run_with_env(
