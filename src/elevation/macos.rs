@@ -4,7 +4,8 @@
 //! Everything here is PURE — no `cfg!`, and no syscalls beyond reading this process's cwd for a
 //! relative `raw_executable()` with no absolute `current_dir()` (see
 //! [`program_and_args`]) — so the whole module is compiled and unit-tested on every
-//! platform, exactly like [`super::plan`].
+//! platform, exactly like [`super::plan`]. The one exception is [`build_shim_script`], which is
+//! `cfg(unix)` because the shim's `ShimArgs` is.
 //!
 //! # The two quoting layers
 //!
@@ -161,6 +162,28 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
         }
     }
     Ok(script)
+}
+
+/// The AppleScript that runs the elevation shim (`shim_exe`, told `shim`) in place of the program.
+/// The shim's arguments are always hex ([`ShimArgs::to_argv`]), so the script is ASCII whenever
+/// `shim_exe` and `cwd` are.
+///
+/// Precondition: `shim_exe` is POSIX-absolute and `cwd` is as [`build_shell_command`] requires.
+#[cfg(unix)]
+#[allow(dead_code, reason = "no caller yet")]
+pub(crate) fn build_shim_script(
+    shim_exe: &OsStr,
+    shim: &super::shim::protocol::ShimArgs,
+    cwd: Option<&Path>,
+    arg_max: Option<usize>,
+) -> Result<String, Error> {
+    debug_assert!(
+        matches!(is_posix_absolute(shim_exe), Ok(true)),
+        "shim_exe must be POSIX-absolute"
+    );
+    let argv = shim.to_argv(shim_exe, true);
+    let shell_command = build_shell_command(&argv[0], &argv[1..], cwd)?;
+    wrap_do_shell_script(&shell_command, arg_max)
 }
 
 /// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets

@@ -255,6 +255,8 @@ fn terminator_protects_a_program_with_equals_or_leading_dash() {
 
 #[path = "posix_tests/pkexec_probe.rs"]
 mod pkexec_probe;
+#[path = "posix_tests/shim_argv.rs"]
+mod shim_argv;
 
 #[cfg(unix)]
 #[skuld::test]

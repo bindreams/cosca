@@ -4,12 +4,14 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
 use super::pkexec::PkexecVersion;
 use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
+use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
@@ -129,6 +131,63 @@ pub(crate) fn build_argv(
     argv.push(program.to_os_string());
     argv.extend(args.iter().cloned());
     Ok(argv)
+}
+
+/// polkit 123 and later shows the front's command line cut to this many bytes...
+const POLKIT_SHORT_LINE: usize = 80;
+/// ...keeping this many bytes of its head.
+const POLKIT_HEAD_CUT: usize = 38;
+
+/// `pkexec` shows the command line (the executable, then its arguments, space-separated) in a dialog.
+/// polkit cuts a line over [`POLKIT_SHORT_LINE`] bytes at byte [`POLKIT_HEAD_CUT`], so a character of
+/// `shim_exe` that straddles the cut leaves invalid UTF-8, and a non-UTF-8 `shim_exe` breaks the line
+/// itself. From polkit's source, not measured.
+fn refuse_polkit_exe(shim_exe: &OsStr, argv: &[OsString]) -> Result<(), Error> {
+    let refuse = |why: &str| Error::Unsupported {
+        op: "pkexec with this shim executable".into(),
+        platform: "unix",
+        detail: format!("polkit cannot show {shim_exe:?}: {why}; choose a shim path that is plain ASCII"),
+    };
+    let Some(exe) = shim_exe.to_str() else {
+        return Err(refuse("it is not valid UTF-8"));
+    };
+    let line = argv.iter().map(|a| a.len()).sum::<usize>() + argv.len() - 1;
+    if line > POLKIT_SHORT_LINE && !exe.is_char_boundary(POLKIT_HEAD_CUT.min(exe.len())) {
+        return Err(refuse("its command line is cut inside one of its characters"));
+    }
+    Ok(())
+}
+
+/// The argv that runs the elevation shim (`shim_exe`, told `shim`) through the front, in place of the
+/// program: the front's options, then the shim, whose own `--` precedes the program. `shim_exe` is
+/// absolute, so `pkexec`, which has no `--` shield, never meets a leading dash.
+///
+/// The shim's arguments are plain, except under `pkexec` when any holds a byte outside printable
+/// ASCII (0x20..=0x7e): then they are hex, because polkit's byte-count cut of the command line breaks
+/// multi-byte characters and non-UTF-8 (from polkit's source, not measured). `pkexec` also refuses a
+/// `shim_exe` that polkit cannot show ([`refuse_polkit_exe`]), the one word hex cannot protect. `sudo`
+/// and `doas` are always plain.
+#[allow(dead_code, reason = "no caller yet")]
+pub(crate) fn build_shim_argv(
+    backend: Backend,
+    backend_path: &OsStr,
+    auth: &Auth,
+    shim_exe: &OsStr,
+    shim: &ShimArgs,
+    env: &[(OsString, OsString)],
+) -> Result<Vec<OsString>, Error> {
+    debug_assert!(Path::new(shim_exe).is_absolute(), "shim_exe must be absolute");
+    let mut argv = shim.to_argv(shim_exe, false);
+    if backend == Backend::Pkexec {
+        if !argv[1..]
+            .iter()
+            .all(|a| a.as_bytes().iter().all(|b| (0x20..=0x7e).contains(b)))
+        {
+            argv = shim.to_argv(shim_exe, true);
+        }
+        refuse_polkit_exe(shim_exe, &argv)?;
+    }
+    build_argv(backend, backend_path, auth, &argv[0], &argv[1..], env)
 }
 
 /// Does `program` begin with `-`? (Only pkexec, which has no `--` shield, cares.)
