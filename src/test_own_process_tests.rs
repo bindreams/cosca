@@ -15,6 +15,14 @@ const PIDFILE: &str = "COSCA_TEST_OWN_PROCESS_FIXTURE_PIDFILE";
 
 // The gated body =====
 
+/// `test_path!` names an `async` test as well as a sync one.
+#[skuld::test]
+async fn test_path_names_an_async_test() {
+    assert!(
+        test_path!(test_path_names_an_async_test).ends_with("::test_own_process_tests::test_path_names_an_async_test")
+    );
+}
+
 #[skuld::test]
 fn the_body_runs_only_in_the_re_executed_process() {
     let Some(_done) = own_process(test_path!(the_body_runs_only_in_the_re_executed_process), spawn) else {

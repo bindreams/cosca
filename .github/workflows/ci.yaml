@@ -491,7 +491,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 
-      # The namespaces group has its own step below. `spawn_io` and `tokio_io` are libtest binaries (they ignore `SKULD_LABELS`) with no namespace tests.
+      # The namespaces group has its own step below; `spawn_io` and `tokio_io` have no namespace tests.
       - name: Run cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8

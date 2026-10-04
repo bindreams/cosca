@@ -1,17 +1,19 @@
 //! Async (tokio) I/O integration tests.
-#![cfg(feature = "tokio")]
 
+#[cfg(feature = "tokio")]
 #[path = "common/mod.rs"]
 mod common;
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_spawn_status_reports_exit_code() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "7"]);
     assert_eq!(cmd.status().await.expect("status").code(), Some(7));
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_id_is_a_real_stable_identity() {
     // id() returns the stored ProcessId — a real, resolvable identity that survives wait (tokio's
     // own Child::id() would be None after reap).
@@ -30,7 +32,8 @@ async fn async_id_is_a_real_stable_identity() {
     assert_eq!(child.id(), id, "id() stays the stable ProcessId after wait");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_try_wait_is_none_before_exit_then_some_after() {
     // A blocker child is structurally wedged on its never-written socket → still running.
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -47,7 +50,8 @@ async fn async_try_wait_is_none_before_exit_then_some_after() {
     );
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_env_reaches_child() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -57,7 +61,8 @@ async fn async_env_reaches_child() {
     assert_eq!(out.stdout, b"SP_PLAN8=async\n");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_output_captures_streams() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -68,7 +73,8 @@ async fn async_output_captures_streams() {
     assert!(out.status.success());
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_communicate_is_deadlock_free() {
     // tee-both copies stdin to BOTH stdout and stderr; a non-concurrent reader would deadlock
     // once a pipe buffer fills. Concurrent try_join! must complete with all bytes on both.
@@ -84,7 +90,8 @@ async fn async_communicate_is_deadlock_free() {
     assert_eq!(out.stderr, payload);
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_communicate_tolerates_early_stdin_close() {
     // A child that exits without reading all of stdin closes the pipe early; write_all then
     // yields BrokenPipe. communicate must treat that as EOF and still return captured output.
@@ -104,7 +111,8 @@ async fn async_communicate_tolerates_early_stdin_close() {
     assert!(out.status.success());
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_communicate_none_with_piped_stdin_signals_eof() {
     // Piped stdin + no input: the write future takes `Some(writer)`, skips the write, and drops the
     // writer to signal EOF. `tee-both` reads stdin to EOF, so with no input it must complete rather
@@ -126,7 +134,8 @@ async fn async_communicate_none_with_piped_stdin_signals_eof() {
     assert!(out.status.success());
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_read_errors_on_invalid_utf8() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -135,7 +144,8 @@ async fn async_read_errors_on_invalid_utf8() {
     assert!(matches!(err, cosca::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData));
 }
 
-#[test] // NOT #[tokio::test] — verifies the no-runtime guard returns Err (not panic / deferred failure)
+#[cfg(feature = "tokio")]
+#[skuld::test] // NOT #[tokio::test] — verifies the no-runtime guard returns Err (not panic / deferred failure)
 fn async_spawn_outside_runtime_errors() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin()).args(["cosca_testbin", "exit", "0"]);
@@ -145,8 +155,9 @@ fn async_spawn_outside_runtime_errors() {
 
 // An IO-disabled runtime is tokio's business and platform-specific (we cannot preflight it, so we
 // pin the actual behavior — see `Command::spawn`'s Runtime docs).
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
     // Build the runtime OUTSIDE the observed region, so only `cmd.spawn()`'s panic — not the
     // runtime `.build().expect()` — can satisfy this test.
@@ -176,8 +187,9 @@ fn async_spawn_on_io_disabled_runtime_panics_on_unix() {
     );
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -193,7 +205,8 @@ fn async_spawn_on_io_disabled_runtime_succeeds_on_windows() {
     );
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_chained_merge_is_unsupported() {
     // A merge whose target is itself a merge → Unsupported (mirrors the sync chained-merge test):
     // stderr -> stdout, and stdout -> stdin, so stdout's resolved kind is Merge.
@@ -205,7 +218,8 @@ async fn async_chained_merge_is_unsupported() {
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_run_builds_command_from_args() {
     // `run([...])` derives the program from the first arg (mirrors the sync run free fn).
     let s = cosca::tokio::run([common::testbin(), "echo-argv", "world"])
@@ -215,7 +229,8 @@ async fn async_run_builds_command_from_args() {
     assert_eq!(s, "world\n");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_run_line_round_trips() {
     // `run_line(line)` routes through `.commandline()`: POSIX splits via shlex, Windows passes the
     // line through and derives the program from the first token (mirrors the sync round-trip test).
@@ -224,17 +239,20 @@ async fn async_run_line_round_trips() {
     assert_eq!(s, "hello\n");
 }
 
+#[cfg(feature = "tokio")]
 /// The cgroup leaf a contained tree was placed in, if it got one. Read while the root is alive.
 #[cfg(target_os = "linux")]
 fn cgroup_leaf_of(child: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
     (child.containment() == cosca::Containment::CgroupV2).then(|| common::cgroup::cgroup_of(child.id().pid()))
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(not(target_os = "linux"))]
 fn cgroup_leaf_of(_: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(feature = "tokio")]
 /// Remove the leaf a test's tree left behind, once the tree drains. Call it only after every
 /// member has been released or killed.
 fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
@@ -246,7 +264,8 @@ fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
     let _ = leaf;
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
     let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
@@ -274,6 +293,7 @@ async fn async_drop_tears_down_a_contained_tree() {
     remove_leftover_leaf(leaf);
 }
 
+#[cfg(feature = "tokio")]
 /// Either the leaf `Drop` was given is gone and no warning names it, or it is still there and a
 /// warning at `warn` does. `Drop` writes `cgroup.kill` and reads the drain once: whether the kernel
 /// has finished the kill by then is not this test's to decide, and `Drop` waits for neither.
@@ -298,15 +318,17 @@ fn assert_leaf_gone_or_warned_about(leaf: &std::path::Path, mark: usize) {
 // The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep, a
 // Windows Job Object, and (in the cgroup lane) a cgroup. A process group does not, being named by
 // the root's number: see the Unix test below.
+#[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
-#[tokio::test]
+#[skuld::test]
 async fn async_drop_after_wait_still_tears_down_the_tree() {
     drop_after_wait_still_tears_down_the_tree().await;
 }
 
+#[cfg(feature = "tokio")]
 /// The cgroup lane's case of the test above. Off (`COSCA_TEST_CGROUP=0`) in every other lane.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree() {
     if !common::require_group("CGROUP") {
         return;
@@ -314,6 +336,7 @@ async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree() {
     drop_after_wait_still_tears_down_the_tree().await;
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
     // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
@@ -346,12 +369,13 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     remove_leftover_leaf(leaf);
 }
 
+#[cfg(feature = "tokio")]
 /// The contract for a bare process group: once the root is reaped its number may name an
 /// unrelated group, so the drop does not `killpg` it and the grandchild keeps running. The
 /// grandchild echoes a byte if it is alive and gives EOF if it was killed, so the round trip
 /// proves it, with no wait on a signal's delivery. It exits when its control socket closes.
 #[cfg(all(unix, not(target_os = "macos")))]
-#[tokio::test]
+#[skuld::test]
 async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
     let common::AsyncEchoTree {
         mut child,
@@ -370,11 +394,12 @@ async fn async_drop_after_wait_leaves_a_process_group_grandchild_running() {
     common::assert_echoes(&mut grand, "the grandchild of a reaped process-group root");
 }
 
+#[cfg(feature = "tokio")]
 /// `kill_tree()` before `wait()` is how a process-group tree is ended when the root will be waited
 /// on: the group kill happens while the live root still pins its number. The grandchild gives EOF
 /// (or a reset) once killed, so the read proves the teardown with no wait on a signal's delivery.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_kill_tree_before_wait_tears_down_the_tree() {
     use std::io::Read as _;
     let common::AsyncEchoTree {
@@ -397,7 +422,8 @@ async fn async_kill_tree_before_wait_tears_down_the_tree() {
     }
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
     let (mut child, mut root, grand) = common::spawn_grandchild_async(true).await;
@@ -423,7 +449,8 @@ async fn async_detach_leaves_the_tree_running() {
     remove_leftover_leaf(leaf);
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_on_drop_false_leaves_the_root_running() {
     // `kill_on_drop(false)` hits the async Drop early-return, so the teardown (hard_kill + the
     // root's kill) must not run and the root stays alive. Proven by positive liveness on the
@@ -450,7 +477,8 @@ async fn async_kill_on_drop_false_leaves_the_root_running() {
     );
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     // The spawn disarms the resource (see `Attached::honor_kill_on_drop`). On Linux outside the
     // cgroup lane this is a process group, whose disarm is a no-op;
@@ -480,10 +508,11 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
     remove_leftover_leaf(leaf);
 }
 
+#[cfg(feature = "tokio")]
 /// `detach()` must leave a cgroup-contained tree running: `CgroupLeaf::drop` kills an occupied
 /// leaf unless the detach disarmed it. Proven by a byte round trip through both members.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
     if !common::require_group("CGROUP") {
         return;
@@ -491,10 +520,11 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
     assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
 }
 
+#[cfg(feature = "tokio")]
 /// `kill_on_drop(false)` must leave a cgroup-contained tree running, as `detach()` does (see
 /// `Attached::honor_kill_on_drop`).
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     if !common::require_group("CGROUP") {
         return;
@@ -502,6 +532,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
     assert_async_opted_out_tree_survives(false, drop).await;
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain`
 /// in `spawn_io.rs`, with the wait made explicit: the async `Drop` never waits for a drain, so an
 /// opted-out handle that killed its tree removes the leaf only if the caller awaited the drain
@@ -510,7 +541,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
 /// `kill_tree()`, `wait()` for the root, and `wait_tree().await` for the drain. After it the leaf
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf() {
     if !common::require_group("CGROUP") {
         return;
@@ -544,6 +575,7 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
     drop((root, grand));
 }
 
+#[cfg(feature = "tokio")]
 /// `kill_tree()` is not called: the drop alone is the killer. A member the test itself spawned and
 /// placed in the leaf dies of `SIGKILL`, which the test reads by reaping it (a grandchild of the
 /// root cannot be reaped here, because tokio owns the root's children's parent).
@@ -551,7 +583,7 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 /// Whether the drain has finished by the drop's single read is a race this test does not depend
 /// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[skuld::test]
 async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover() {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
@@ -612,6 +644,7 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
     common::cgroup::drain_and_remove_leaf(&leaf);
 }
 
+#[cfg(feature = "tokio")]
 /// Shared body of the two async cgroup opt-out tests: assert the tree got `CgroupV2`, release
 /// the handle through `opt_out`, prove both members alive, then remove the leaf the tree keeps.
 #[cfg(target_os = "linux")]
@@ -652,11 +685,12 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
 
 // Arbitrary fd (n>=3) — Unix only, wired via fd_map (async mirror of spawn_io.rs) =====
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `unix_fd3_pipe_round_trips`: the testbin's `fd3-echo` mode reads fd 3
 /// and copies it to stdout. Write a known payload into the parent write end, close it (EOF),
 /// read stdout to EOF — no timers, fully deterministic.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_unix_fd3_pipe_round_trips() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cmd = cosca::tokio::Command::new();
@@ -678,10 +712,11 @@ async fn async_unix_fd3_pipe_round_trips() {
     assert_eq!(buf, b"hello fd3");
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `unix_fd3_null_is_accepted`: fd 3 as `Stdio::null()` spawns, the child
 /// reads immediate EOF from /dev/null and produces no output, exiting cleanly.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_unix_fd3_null_is_accepted() {
     use tokio::io::AsyncReadExt;
     let mut cmd = cosca::tokio::Command::new();
@@ -702,10 +737,11 @@ async fn async_unix_fd3_null_is_accepted() {
 // Its round-trips (both directions) + contained twin live in `tests/raw_windows_async.rs`,
 // alongside the rest of the raw-backend proofs.
 
+#[cfg(feature = "tokio")]
 /// fd 3 as pipe_out: the testbin's `fd3-write` mode writes a token to fd 3; the parent
 /// reads it back via the reactor-registered `fd_read_end`.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     use tokio::io::AsyncReadExt;
     let mut cmd = cosca::tokio::Command::new();
@@ -720,6 +756,7 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
     assert_eq!(buf, b"fd3-token");
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `unix_fd_out_of_range_fails_spawn_cleanly_not_abort`: an out-of-range but
 /// syscall-representable child fd (far beyond any real process' open-file limit) must fail the
 /// SPAWN with an ordinary `Err` — never `Ok` followed by the child dying of SIGABRT.
@@ -730,7 +767,7 @@ async fn async_unix_fd3_pipe_out_delivers_child_bytes() {
 /// process' `RLIMIT_NOFILE` first — see the sync twin's doc for why a fixed large value alone is
 /// runner-dependent on Linux.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     let Some(done) = common::test_own_process::own_process(
         common::test_own_process::test_path!(async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort),
@@ -758,12 +795,13 @@ async fn async_unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `unix_fd_i32_max_fails_spawn_cleanly_not_abort`: `fd(i32::MAX, ...)` must
 /// fail — never abort the child — with an ordinary `Err` from `spawn()`. `Command::fd()` itself
 /// accepts `i32::MAX`; the failure happens post-fork, at `dup2`, exactly like any other
 /// out-of-range child fd (`EBADF`).
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -783,13 +821,14 @@ async fn async_unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed`: with
 /// this process' own fd 2 closed and freed, a plain `fd(3, null)` mapping must not end up
 /// readable as the child's stderr just because `install()`'s own bookkeeping happens to source
 /// or park something at that exact number. `sh -c 'echo LEAK >&3'` writes to the child's fd 3;
 /// the parent's stderr pipe must receive nothing.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use tokio::io::AsyncReadExt;
 
@@ -818,6 +857,7 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of sync `relocating_a_low_parent_fd_keeps_spawn_errors_reported`: with this
 /// process' own fd 1 and fd 2 closed, `.stdout(Stdio::from_file(...))` and
 /// `.stderr(Stdio::from_file(...))`'s `try_clone`s land their dup'd targets at 3 or above (the
@@ -832,7 +872,7 @@ async fn async_a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed()
 /// done with it — see `fd_map::install`'s module docs. The spawn must fail cleanly (`Err`), and
 /// the stderr file must receive nothing (no leaked exec-error-pipe bytes).
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -876,11 +916,12 @@ async fn async_relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// A wrong-direction accessor must NOT consume the stashed end (the put-back arm): after
 /// the mismatched take returns `None`, the correctly-directioned accessor still yields a
 /// WORKING end — proven by a full round-trip, both directions.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_wrong_direction_take_puts_the_end_back() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // pipe_in: the read-accessor first (wrong) must not lose the write end.
@@ -929,7 +970,8 @@ async fn async_fd3_wrong_direction_take_puts_the_end_back() {
 
 // Merge into a piped target (all platforms; our-owned pipes) =====
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_merge_stderr_onto_stdout_combines_output() {
     use tokio::io::AsyncReadExt;
     let mut cmd = cosca::tokio::Command::new();
@@ -965,7 +1007,8 @@ async fn async_merge_stderr_onto_stdout_combines_output() {
     );
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_merge_into_unpiped_targets_still_works() {
     // Regression: merge into null stays on the existing (non-owned) path.
     let mut cmd = cosca::tokio::Command::new();
@@ -979,7 +1022,8 @@ async fn async_merge_into_unpiped_targets_still_works() {
     assert_eq!(status.code(), Some(0));
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_communicate_reads_a_merged_stream() {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(common::testbin())
@@ -998,7 +1042,8 @@ async fn async_communicate_reads_a_merged_stream() {
     assert!(out.stderr.is_empty(), "stderr was merged away");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_merged_stream_accessor_has_take_semantics() {
     // stdout() as a piped merge target: first take yields the reader, second is None
     // (take semantics, matching the tokio-owned branch).
@@ -1021,7 +1066,8 @@ async fn async_merged_stream_accessor_has_take_semantics() {
     let _ = child.wait().await;
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_non_merged_stream_accessor_has_take_semantics() {
     // Regression: the pre-pass skips slots it does not assign, so stdin/stdout/stderr keep
     // plain take-semantics in a non-merge config.
@@ -1042,7 +1088,8 @@ async fn async_non_merged_stream_accessor_has_take_semantics() {
     let _ = child.wait().await;
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_plain_piped_stream_accessor_has_take_semantics() {
     // The tokio-owned (non-merge) branch's take-semantics: stdout piped (no merge), so
     // tokio owns the internal pipe. Verifies parity with the merge-owned case above.
@@ -1058,13 +1105,14 @@ async fn async_plain_piped_stream_accessor_has_take_semantics() {
     let _ = child.wait().await;
 }
 
+#[cfg(feature = "tokio")]
 /// In-direction merge target on ALL platforms: stdin is piped and stderr merges into it,
 /// so the pre-pass owns stdin's pipe (tokio cannot share its internal one). The child's
 /// `stdin-split-echo` mode reads EXACTLY 3 bytes from fd 0, then fd 2 to EOF: dup'd
 /// descriptors share ONE pipe, so `abc|def` proves the merging slot's handle is a LIVE dup
 /// of that pipe — a silently skipped dup could not produce the tail. Parent writes via the
 /// OWNED stdin path (Windows `WinOwnedWrite`; Unix `pipe::Sender`), EOF by drop.
-#[tokio::test]
+#[skuld::test]
 async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cmd = cosca::tokio::Command::new();
@@ -1089,11 +1137,12 @@ async fn async_merge_into_piped_stdin_feeds_the_merged_child() {
     assert_eq!(buf, b"abc|def");
 }
 
+#[cfg(feature = "tokio")]
 /// fd >= 3 as a merge SOURCE into a piped Out target: the pre-pass routes the dup'd write
 /// end through fd_map (never silently dropped). testbin's `fd3-write` emits its token
 /// on fd 3 — a dup of stdout's owned pipe — so the token arrives on the stdout reader.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_source_merges_into_piped_stdout() {
     use tokio::io::AsyncReadExt;
     let mut cmd = cosca::tokio::Command::new();
@@ -1114,11 +1163,12 @@ async fn async_fd3_source_merges_into_piped_stdout() {
     assert_eq!(buf, b"fd3-merged");
 }
 
+#[cfg(feature = "tokio")]
 /// fd >= 3 as a merge SOURCE into a piped In target (one parent writer, several child read
 /// fds — the user-decided shape): fd 3 is a dup of the owned stdin read end; testbin's
 /// `fd3-echo` copies fd 3 to stdout, so the parent's stdin writes round-trip through the DUP.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_fd3_source_merges_into_piped_stdin() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cmd = cosca::tokio::Command::new();
@@ -1142,8 +1192,9 @@ async fn async_fd3_source_merges_into_piped_stdin() {
     assert_eq!(buf, b"via-the-dup");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_windows_contained_spawn_runs_then_job_tears_down() {
     // Verifies the CREATE_SUSPENDED + job-assign + out-of-band resume dance works under tokio.
     use std::io::Read as _;
@@ -1168,6 +1219,7 @@ async fn async_windows_contained_spawn_runs_then_job_tears_down() {
 
 // Death-watched accept =====
 
+#[cfg(feature = "tokio")]
 /// Awaits `fut` on this test's own thread and returns the message it panicked with. The runtime is
 /// `current_thread`, so a spawned task runs on this thread and the thread-local
 /// `common::last_reported_grandchild` is visible to the test.
@@ -1180,6 +1232,7 @@ async fn panic_message_of<T: Send + 'static>(fut: impl std::future::Future<Outpu
     common::panic_message(join_err.into_panic())
 }
 
+#[cfg(feature = "tokio")]
 fn assert_died_before_connecting(message: &str, pid: u32) {
     assert!(
         message.contains(&format!("the control target (pid {pid}) died before it connected")),
@@ -1187,21 +1240,24 @@ fn assert_died_before_connecting(message: &str, pid: u32) {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async sibling of the sync `death_watch_spawn_control_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`
 /// regression in `tests/process.rs` — same mutant coverage, for `spawn_control_async`.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_control_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(common::spawn_control_async("--not-a-real-mode", &[], false)).await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
 }
 
+#[cfg(feature = "tokio")]
 /// Async sibling of `death_watch_spawn_tree_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept`.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_tree_async_panics_if_its_death_watch_is_ever_reverted_to_a_plain_accept() {
     let message = panic_message_of(common::spawn_tree_async("--not-a-real-mode", |_| {})).await;
     assert!(message.contains("died before it connected"), "got: {message:?}");
 }
 
+#[cfg(feature = "tokio")]
 fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca::tokio::Child) {
     let (listener, addr) = common::bind_async_listener();
     let mut cmd = cosca::tokio::Command::new();
@@ -1214,8 +1270,9 @@ fn bind_and_spawn(args: &[&str], ack: bool) -> (::tokio::net::TcpListener, cosca
     (listener, cmd.spawn().expect("spawn"))
 }
 
+#[cfg(feature = "tokio")]
 /// A target that dies before connecting makes `accept_or_die_async` panic naming it, not hang.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_first() {
     let (listener, mut child) = bind_and_spawn(&["--not-a-real-mode"], false);
     let pid = child.id().pid();
@@ -1223,9 +1280,10 @@ async fn death_watch_accept_or_die_async_panics_loudly_when_the_target_dies_firs
     assert_died_before_connecting(&message, pid);
 }
 
+#[cfg(feature = "tokio")]
 /// A target that connects and exits without waiting for the ack is dead whether or not its
 /// connection reached the accept queue. The child has exited first (unreaped on Unix).
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exited_without_the_ack_as_dead() {
     let (listener, mut child) = bind_and_spawn(&["control-once", "{addr}", "R"], false);
     let pid = child.id().pid();
@@ -1238,8 +1296,9 @@ async fn death_watch_accept_or_die_async_reports_a_target_that_connected_and_exi
     assert_died_before_connecting(&message, pid);
 }
 
+#[cfg(feature = "tokio")]
 /// An opted-in target sends its tag only after `accept_or_die_async` wrote the ack.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_accept_or_die_async_acks_the_connection_it_accepts() {
     use std::io::{Read as _, Write as _};
     let (listener, mut child) = bind_and_spawn(&["control-block", "{addr}", "R"], true);
@@ -1251,8 +1310,9 @@ async fn death_watch_accept_or_die_async_acks_the_connection_it_accepts() {
     child.wait().await.expect("reap");
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `death_watch_accept_or_die_also_reports_a_gone_descendant_as_dead`.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead() {
     use std::process::Stdio;
     let (listener, _addr) = common::bind_async_listener();
@@ -1283,9 +1343,10 @@ async fn death_watch_accept_or_die_async_also_reports_a_gone_descendant_as_dead(
     drop(target_stdin);
 }
 
+#[cfg(feature = "tokio")]
 /// Only the GRANDCHILD dies (root alive, connected): the panic names the grandchild the root
 /// reported.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-dies", |_| {})).await;
     // The async `Child` was dropped by the unwind before `panic_message_of` returned; the drop only
@@ -1295,8 +1356,9 @@ async fn death_watch_spawn_tree_async_panics_when_the_grandchild_dies_before_con
     assert_died_before_connecting(&message, grandchild);
 }
 
+#[cfg(feature = "tokio")]
 /// [`spawn_echo_tree_async`]'s twin of the test above.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_echo_tree_async_panics_when_the_grandchild_dies_before_connecting_while_the_root_lives() {
     let message = panic_message_of(common::spawn_echo_tree_async_mode("spawn-grandchild-echo-dies", true)).await;
     common::wait_for_last_async_root();
@@ -1304,21 +1366,24 @@ async fn death_watch_spawn_echo_tree_async_panics_when_the_grandchild_dies_befor
     assert_died_before_connecting(&message, grandchild);
 }
 
+#[cfg(feature = "tokio")]
 /// The root reports a live grandchild, then exits without connecting: the main loop fails on the
 /// root.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_tree_async_panics_when_the_root_dies_after_reporting_before_connecting() {
     async_root_dies_after_reporting().await;
 }
 
+#[cfg(feature = "tokio")]
 /// The test above with the root's exit complete before the harness first looks at it.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_tree_async_panics_when_the_root_dies_after_reporting_before_the_harness_looks() {
     let seam = common::reapable_after_release();
     let message = async_root_dies_after_reporting().await;
     assert_died_before_connecting(&message, seam.root().expect("the seam waited on the released root"));
 }
 
+#[cfg(feature = "tokio")]
 /// Returns the helper's panic message. Contained so unwinding kills the orphaned grandchild. The
 /// unwind drops the `Child` before `panic_message_of` returns, but the drop only sends the kill, so
 /// wait for the exit by identity.
@@ -1340,8 +1405,9 @@ async fn async_root_dies_after_reporting() -> String {
     message
 }
 
+#[cfg(feature = "tokio")]
 /// The root connects to the report address and exits without reporting.
-#[tokio::test(flavor = "current_thread")]
+#[skuld::test]
 async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting_the_grandchild_pid() {
     let message = panic_message_of(common::spawn_tree_async("spawn-grandchild-report-eof", |_| {})).await;
     common::wait_for_last_async_root();
@@ -1349,4 +1415,14 @@ async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting
         message.contains("died before it reported the grandchild pid"),
         "got: {message:?}"
     );
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }

@@ -13,9 +13,9 @@ fn testbin() -> &'static str {
 ///
 /// Without a logger installed, `log` drops every record on the floor — so a containment
 /// degrade explains itself into nothing and a failing `assert_eq!(…, CgroupV2)` is as
-/// undiagnosable from CI output as it was before the reason existed. libtest captures a
-/// failing test's stderr and prints it with the failure (and the CI cgroup step runs with
-/// `--nocapture`), so with this installed the reason lands directly above the assertion.
+/// undiagnosable from CI output as it was before the reason existed. nextest prints a failing
+/// test's stderr with the failure, so with this installed the reason lands directly above the
+/// assertion.
 ///
 /// Unix-gated, not Linux-gated: BOTH Unix containment mechanisms that can degrade explain
 /// themselves through `log` — Linux's cgroup leaf (`cgroup::log_degrade`) and macOS's fd marker
@@ -34,7 +34,7 @@ mod stderr_log {
 
 // Basics =====
 
-#[test]
+#[skuld::test]
 fn spawn_and_status_exit_code() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "7"]);
@@ -43,7 +43,7 @@ fn spawn_and_status_exit_code() {
     assert_eq!(status.code(), Some(7));
 }
 
-#[test]
+#[skuld::test]
 fn spawned_child_has_live_identity() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
@@ -53,7 +53,7 @@ fn spawned_child_has_live_identity() {
     let _ = child.wait();
 }
 
-#[test]
+#[skuld::test]
 fn try_wait_returns_none_before_exit_and_some_after() {
     let mut cmd = Command::new();
     // tee-both blocks on stdin — the child won't exit until stdin is closed.
@@ -83,7 +83,7 @@ fn try_wait_returns_none_before_exit_and_some_after() {
     assert!(status_after.is_some(), "expected Some after child exits");
 }
 
-#[test]
+#[skuld::test]
 fn kill_terminates_running_child() {
     let mut cmd = Command::new();
     // tee-both blocks indefinitely on stdin.
@@ -102,7 +102,7 @@ fn kill_terminates_running_child() {
 
 // Pipe I/O =====
 
-#[test]
+#[skuld::test]
 fn stdout_pipe_captures_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -120,7 +120,7 @@ fn stdout_pipe_captures_output() {
     assert_eq!(buf, b"ooooo");
 }
 
-#[test]
+#[skuld::test]
 fn stderr_pipe_captures_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -138,7 +138,7 @@ fn stderr_pipe_captures_output() {
     assert_eq!(buf, b"eee");
 }
 
-#[test]
+#[skuld::test]
 fn stdin_pipe_is_writable() {
     let mut cmd = Command::new();
     // tee-both reads stdin and copies to stdout+stderr; we just need to confirm
@@ -161,7 +161,7 @@ fn stdin_pipe_is_writable() {
 
 // Merge (2>&1) =====
 
-#[test]
+#[skuld::test]
 fn merge_stderr_onto_stdout_combines_output() {
     let mut cmd = Command::new();
     // emit 3 bytes to stdout, 2 to stderr; merge stderr→stdout so both come
@@ -187,7 +187,7 @@ fn merge_stderr_onto_stdout_combines_output() {
 
 // Null =====
 
-#[test]
+#[skuld::test]
 fn null_stdout_discards_output() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -202,7 +202,7 @@ fn null_stdout_discards_output() {
 
 // Rejections =====
 
-#[test]
+#[skuld::test]
 fn merge_to_merge_is_rejected() {
     // stdout -> merge(stderr), stderr -> merge(stdout): chained merge.
     let mut cmd = Command::new();
@@ -218,7 +218,7 @@ fn merge_to_merge_is_rejected() {
 
 // Environment and cwd =====
 
-#[test]
+#[skuld::test]
 fn env_variable_reaches_child() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -235,7 +235,7 @@ fn env_variable_reaches_child() {
     assert_eq!(out.trim(), "COSCA_TEST_VAR=hello123");
 }
 
-#[test]
+#[skuld::test]
 fn current_dir_sets_working_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new();
@@ -260,7 +260,7 @@ fn current_dir_sets_working_directory() {
 
 // Windows commandline path =====
 
-#[test]
+#[skuld::test]
 #[cfg(windows)]
 fn commandline_mode_c1_fix_no_duplicate_program_token() {
     // This tests the C1 fix: when spawning via commandline(), the program token
@@ -288,7 +288,7 @@ fn commandline_mode_c1_fix_no_duplicate_program_token() {
 // POSIX argv0 preservation =====
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn posix_executable_override_preserves_argv0() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["custom-name", "argv0"]);
@@ -298,7 +298,7 @@ fn posix_executable_override_preserves_argv0() {
 
 // Pump / communicate =====
 
-#[test]
+#[skuld::test]
 fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     // > a pipe buffer (~64 KiB) in every direction: child copies stdin to BOTH
     // stdout and stderr while the parent writes stdin and reads both outputs.
@@ -316,7 +316,7 @@ fn communicate_does_not_deadlock_on_large_bidirectional_io() {
     assert_eq!(out.stderr, input);
 }
 
-#[test]
+#[skuld::test]
 fn output_captures_stdout_and_stderr_with_sizes() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "5", "3"]);
@@ -326,7 +326,7 @@ fn output_captures_stdout_and_stderr_with_sizes() {
     assert_eq!(out.stderr, b"eee");
 }
 
-#[test]
+#[skuld::test]
 fn read_returns_verbatim_utf8() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "echo-argv", "hello"]);
@@ -334,7 +334,7 @@ fn read_returns_verbatim_utf8() {
     assert_eq!(s, "hello\n"); // verbatim: trailing newline preserved
 }
 
-#[test]
+#[skuld::test]
 fn commandline_round_trips_through_split_or_passthrough() {
     // Exercises the .commandline()/run_line path on BOTH OSes: POSIX splits via
     // the shlex; Windows passes the line through and derives the program from
@@ -345,7 +345,7 @@ fn commandline_round_trips_through_split_or_passthrough() {
     assert_eq!(s, "hello\n");
 }
 
-#[test]
+#[skuld::test]
 fn merge_stderr_into_stdout() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "4", "4"]);
@@ -360,7 +360,7 @@ fn merge_stderr_into_stdout() {
     assert!(out.stderr.is_empty());
 }
 
-#[test]
+#[skuld::test]
 fn null_stdout_discards() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "emit", "100", "0"]);
@@ -376,7 +376,7 @@ fn null_stdout_discards() {
 /// a known payload into the parent write-end, close it, then read stdout to
 /// EOF — no timers, no polling, fully deterministic.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd3_pipe_round_trips() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -405,7 +405,7 @@ fn unix_fd3_pipe_round_trips() {
 /// The child reads from fd 3 (which is /dev/null) and gets immediate EOF,
 /// producing no stdout output. Confirms the null path reaches fd_map.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd3_null_is_accepted() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -429,7 +429,7 @@ fn unix_fd3_null_is_accepted() {
 /// Prove that Stdio::inherit() on fd 3 is rejected with Unsupported (no defined
 /// parent stream to dup for n>=3) — a retained design limit on every path.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd3_inherit_is_rejected() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -454,7 +454,7 @@ fn unix_fd3_inherit_is_rejected() {
 /// (`ulimit -n 1048576` or higher), so without the guard this fd number's validity would depend
 /// on the runner's own ambient ulimit.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
     let Some(done) = common::test_own_process::own_process(
         common::test_own_process::test_path!(unix_fd_out_of_range_fails_spawn_cleanly_not_abort),
@@ -488,7 +488,7 @@ fn unix_fd_out_of_range_fails_spawn_cleanly_not_abort() {
 ///
 /// Unit coverage for the same behavior lives in `child::spawn::fd_map::fd_map_tests`.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
     let mut cmd = Command::new();
     cmd.executable(testbin())
@@ -516,7 +516,7 @@ fn unix_fd_i32_max_fails_spawn_cleanly_not_abort() {
 /// `pre_exec` hook) clobbers exactly it, and the mapping ends up reading whatever std put there
 /// instead. `sh -c 'echo LEAK >&3'` writes to the child's fd 3; the stderr file must stay empty.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
     use std::io::{Seek, SeekFrom};
 
@@ -563,7 +563,7 @@ fn a_mapped_fd_does_not_leak_into_a_stderr_pipe_when_fd2_is_closed() {
 /// docs. The spawn must fail cleanly (`Err`), and the stderr file must receive nothing (no
 /// leaked exec-error-pipe bytes).
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
     use std::io::{Seek, SeekFrom};
 
@@ -610,7 +610,7 @@ fn relocating_a_low_parent_fd_keeps_spawn_errors_reported() {
 /// Prove that fd 3 configured as a file is passed through to the child:
 /// the child reads fd 3 and echoes it to stdout; we compare the payload.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_fd3_file_round_trips() {
     use std::io::{Seek, Write};
 
@@ -665,7 +665,7 @@ fn contain_with_fd3() -> (cosca::Containment, Vec<u8>) {
 /// "0" to a pre-opened `cgroup.procs` fd, and fd_map's `pre_exec` dup2's the user's fd onto
 /// child fd 3; if they collided, the "0" would land in the stream or the pipe would break.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_contain_with_fd3_delivers_the_exact_payload() {
     stderr_log::install();
     let (containment, buf) = contain_with_fd3();
@@ -681,7 +681,7 @@ fn linux_contain_with_fd3_delivers_the_exact_payload() {
 /// placement's `cgroup.procs` fd. A clobbered write degrades the spawn to a process group, so
 /// achieving `CgroupV2` is the proof.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
     if !common::require_group("CGROUP") {
         return;
@@ -696,13 +696,13 @@ fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
     assert_eq!(buf, b"FD3PAYLOAD", "fd 3 stream corrupted");
 }
 
-#[test]
+#[skuld::test]
 fn run_free_fn_builds_command_from_args() {
     let s = cosca::run([testbin(), "echo-argv", "world"]).read().expect("read");
     assert_eq!(s, "world\n");
 }
 
-#[test]
+#[skuld::test]
 fn read_errors_on_invalid_utf8() {
     let mut cmd = Command::new();
     // 0xff is not valid UTF-8.
@@ -716,7 +716,7 @@ fn read_errors_on_invalid_utf8() {
 
 // Drop policy =====
 
-#[test]
+#[skuld::test]
 fn drop_kills_and_reaps_the_child() {
     let mut cmd = Command::new();
     // tee-both with a piped (but never-written, never-closed) stdin blocks the
@@ -738,7 +738,7 @@ fn drop_kills_and_reaps_the_child() {
     );
 }
 
-#[test]
+#[skuld::test]
 fn detach_leaves_the_child_running() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "tee-both"]);
@@ -776,7 +776,7 @@ fn detach_leaves_the_child_running() {
 
 // Containment =====
 
-#[test]
+#[skuld::test]
 fn uncontained_child_reports_containment_none() {
     let mut cmd = Command::new();
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
@@ -918,7 +918,7 @@ fn assert_host_tree_containment(child: &cosca::Child) {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_host_tree_containment(&child);
@@ -935,7 +935,7 @@ fn unix_kill_tree_reaps_the_grandchild() {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_host_tree_containment(&child);
@@ -962,7 +962,7 @@ fn unix_terminate_tree_reaps_the_grandchild() {
 // Windows Job Object containment =====
 
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_kill_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::JobObject);
@@ -989,7 +989,7 @@ fn windows_kill_tree_reaps_the_grandchild() {
 /// console group and dies too. Proof of death: the grandchild's control socket
 /// EOFs / ConnectionReset — never a timer or an is_alive() race.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_terminate_tree_reaps_the_grandchild() {
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::JobObject);
@@ -1010,7 +1010,7 @@ fn windows_terminate_tree_reaps_the_grandchild() {
 /// Uses the test-only `Child::test_job_handle_contains_self()` accessor so `IsProcessInJob`
 /// asks about the handle we created, not an inherited one.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_child_is_inside_our_job_after_spawn() {
     let (child, _gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::JobObject);
@@ -1027,7 +1027,7 @@ fn windows_child_is_inside_our_job_after_spawn() {
 /// handle is released. Proof is a real byte round trip through BOTH members (see `EchoTree`),
 /// taken AFTER the detach.
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_detach_leaves_the_tree_running() {
     let EchoTree {
         child,
@@ -1049,7 +1049,7 @@ fn windows_detach_leaves_the_tree_running() {
 /// `kill_on_drop(false)` must leave a contained tree running, exactly as `detach()` does (see
 /// `Attached::honor_kill_on_drop`).
 #[cfg(windows)]
-#[test]
+#[skuld::test]
 fn windows_kill_on_drop_false_leaves_the_tree_running() {
     let EchoTree {
         child,
@@ -1102,7 +1102,7 @@ fn spawn_session_tree() -> (cosca::Child, std::net::TcpStream) {
 }
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_session_containment_reports_session() {
     let (child, mut gc_stream) = spawn_session_tree();
     let expected = if cfg!(target_os = "macos") {
@@ -1126,7 +1126,7 @@ fn unix_session_containment_reports_session() {
 /// leader in a new session). This distinguishes real `setsid` from a plain
 /// `process_group(0)` which would share the parent's session.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn unix_session_child_is_own_session_leader() {
     let parent_sid = unsafe { libc::getsid(0) };
 
@@ -1212,7 +1212,7 @@ fn spawn_treewalk_tree() -> (cosca::Child, std::net::TcpStream, std::net::TcpStr
 /// the root). Proof of death is the grandchild's control socket EOFing /
 /// ConnectionReset — never an is_alive() race or a timer.
 #[cfg(any(unix, windows))]
-#[test]
+#[skuld::test]
 fn treewalk_kill_tree_reaps_the_grandchild() {
     // Hold `_root_stream` for the whole test: it keeps the root alive so TreeWalk
     // enumerates the grandchild as a live descendant (not a reparented orphan).
@@ -1247,7 +1247,7 @@ fn treewalk_kill_tree_reaps_the_grandchild() {
 /// of death is the grandchild's control socket EOFing / ConnectionReset — never
 /// a timer or an is_alive() race.
 #[cfg(any(unix, windows))]
-#[test]
+#[skuld::test]
 fn treewalk_terminate_tree_reaps_the_grandchild() {
     // Hold `_root_stream` so the root stays alive through teardown (see
     // spawn_treewalk_tree): TreeWalk must enumerate a live root's descendants.
@@ -1278,7 +1278,7 @@ fn treewalk_terminate_tree_reaps_the_grandchild() {
 /// Unix-only (the escape uses `setsid`); EOF on the grandchild's control socket
 /// is the deterministic proof of death.
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn treewalk_kills_process_group_escapee() {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -1334,7 +1334,7 @@ fn treewalk_kills_process_group_escapee() {
 /// closes — either a graceful EOF (n==0) or a ConnectionReset; the match below
 /// accepts EITHER on ALL platforms (the OS may surface either form on any host).
 #[cfg(any(unix, windows))]
-#[test]
+#[skuld::test]
 fn drop_kills_contained_tree() {
     let (child, mut gc_stream) = spawn_contained_tree();
     // Assert containment was actually established BEFORE dropping, so a failure
@@ -1365,7 +1365,7 @@ fn drop_kills_contained_tree() {
 // cgroup and `COSCA_TEST_CGROUP_CONSENT=1`, which CI's cgroup lane provisions and sets. Enabled
 // without either, each fails loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
     if !common::require_group("CGROUP") {
         return;
@@ -1397,7 +1397,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 /// pid in cgroup.procs). The control-block grandchild has no SIGTERM handler so
 /// the default action kills it. Proof of death: grandchild socket EOF.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
     if !common::require_group("CGROUP") {
         return;
@@ -1428,7 +1428,7 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
 /// Same proof as `windows_detach_leaves_the_tree_running` (see there for why a write alone
 /// isn't enough).
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_detach_leaves_the_tree_running() {
     if !common::require_group("CGROUP") {
         return;
@@ -1441,7 +1441,7 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running() {
 /// does — `Command::kill_on_drop` documents the two as the same opt-out, and the leaf drops
 /// with the handle whatever the flag says.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
     if !common::require_group("CGROUP") {
         return;
@@ -1453,7 +1453,7 @@ fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
 /// An opted-out handle still removes the leaf of a tree that has fully exited, as
 /// `Command::kill_on_drop` says: `kill_tree` then `wait_tree` before the drop leaves nothing.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
     if !common::require_group("CGROUP") {
         return;
@@ -1499,7 +1499,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
 /// is what deterministically forces the race and proves `Drop` itself waits — no sleeps, no
 /// polling from the test.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain() {
     if !common::require_group("CGROUP") {
         return;
@@ -1612,7 +1612,7 @@ fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
 /// so the root is then absent from it although the kernel accepted its placement. Parent and
 /// child share one CPU here, which makes that the common outcome rather than a rare one.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
     use std::io::BufRead;
     if !common::require_group("CGROUP") {
@@ -1700,7 +1700,7 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
 /// `accept_or_signalled` must fail once the leaf drains with nothing having connected, not wait
 /// forever. The contained `sh` exits at once and leaves no descendant.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects() {
     if !common::require_group("CGROUP") {
         return;
@@ -1761,7 +1761,7 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 /// running it would hand their next `open` the slot, and with 2 closed a failing assertion's
 /// message would go nowhere.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
     use common::test_own_process::{child_completion, run, test_filter, test_path};
 
@@ -2007,7 +2007,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
 /// `cgroup.procs`: it is needed only for the child's own placement write, and one held per
 /// live child would spend the supervisor's fd limit on children it no longer needs it for.
 #[cfg(target_os = "linux")]
-#[test]
+#[skuld::test]
 fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
     if !common::require_group("CGROUP") {
         return;
@@ -2036,7 +2036,7 @@ fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
 // The process-global-state guards =====
 
 #[cfg(unix)]
-#[test]
+#[skuld::test]
 fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
     let Some(done) = common::test_own_process::own_process(
         common::test_own_process::test_path!(restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it),
@@ -2056,4 +2056,14 @@ fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
     assert_eq!(soft(), 100, "lower_to must lower the soft limit");
     drop(guard);
     assert_eq!(soft(), before, "drop must restore it");
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }

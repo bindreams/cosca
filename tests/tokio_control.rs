@@ -1,13 +1,15 @@
 //! Async control-op integration tests (kill / kill_tree / terminate_tree + builder mirror).
 //! Same death-proof discipline as tests/graceful.rs: control-socket EOF or an inspected
 //! ExitStatus signal — never sleep/poll/wall-clock.
-#![cfg(feature = "tokio")]
 
+#[cfg(feature = "tokio")]
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(feature = "tokio")]
 use std::io::Read;
 
+#[cfg(feature = "tokio")]
 fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
     match s.read(&mut buf) {
@@ -17,7 +19,8 @@ fn expect_eof(who: &str, s: &mut std::net::TcpStream) {
     }
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_terminates_the_child() {
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     child.kill().expect("kill");
@@ -26,7 +29,8 @@ async fn async_kill_terminates_the_child() {
     assert!(!status.success(), "killed child cannot report success, got {status:?}");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_after_wait_is_ok() {
     use std::io::Write;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -35,7 +39,8 @@ async fn async_kill_after_wait_is_ok() {
     child.kill().expect("kill after wait is Ok");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_on_exited_unreaped_child_is_ok() {
     use std::io::Write;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -45,7 +50,8 @@ async fn async_kill_on_exited_unreaped_child_is_ok() {
     child.wait().await.expect("reap");
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_tree_ops_unsupported_when_uncontained() {
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     let err = child.kill_tree().expect_err("uncontained kill_tree");
@@ -57,7 +63,8 @@ async fn async_tree_ops_unsupported_when_uncontained() {
     let _ = child.wait().await;
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_kill_tree_tears_down_tree() {
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     child.kill_tree().expect("kill_tree");
@@ -70,8 +77,9 @@ async fn async_kill_tree_tears_down_tree() {
     );
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_terminate_tree_soft_kills_the_group() {
     use std::os::unix::process::ExitStatusExt;
     // control-block honors SIGTERM: the group signal alone (signal-only op) tears it down.
@@ -86,7 +94,8 @@ async fn async_terminate_tree_soft_kills_the_group() {
     );
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_contain_with_treewalk_tears_down_tree() {
     // kill_tree on a TreeWalk-contained tree tears down BOTH members via the identity walk
     // (no kernel group needed). The builder mirror's value-sensitivity is the unit test's job
@@ -112,8 +121,9 @@ async fn async_contain_with_treewalk_tears_down_tree() {
 
 // Graceful-escalation trio (mirrors tests/graceful.rs child_* cases, async) =====
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -127,8 +137,9 @@ async fn async_terminate_sends_sigterm() {
     );
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let (mut child, mut sock) = common::spawn_blocker_async().await;
     assert_eq!(
@@ -145,8 +156,9 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let _ = child.wait().await;
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_graceful_path() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -165,8 +177,9 @@ async fn async_graceful_shutdown_graceful_path() {
     expect_eof("blocker", &mut sock);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_escalates() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -185,8 +198,9 @@ async fn async_graceful_shutdown_escalates() {
     expect_eof("blocker", &mut sock);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     use std::future::Future;
     use std::time::Duration;
@@ -227,8 +241,9 @@ async fn async_graceful_cancel_mid_grace_leaves_child_owned() {
     let _ = child.wait().await.expect("reap");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     use std::future::Future;
     use std::time::Duration;
@@ -261,13 +276,14 @@ async fn async_graceful_tree_cancel_does_not_escalate_on_windows() {
     expect_eof("root", &mut root);
     expect_eof("grandchild", &mut grand);
     let _ = child.wait().await.expect("reap after cancelled graceful");
-    // End-to-end release proof rides on test teardown: the #[tokio::test] runtime's drop
-    // JOINS blocking tasks, so if the dropped guard's cancel event failed to release the
-    // Duration::MAX watcher, this test would hang at shutdown — loudly, at the harness bound.
+    // Release proof rides on teardown: the test runtime's drop JOINS blocking tasks, so a
+    // cancel event that failed to release the Duration::MAX watcher hangs shutdown (bounded by
+    // the nextest override).
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_tree_cancel_does_not_escalate() {
     use std::future::Future;
     use std::time::Duration;
@@ -299,8 +315,9 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
     let _ = child.wait().await.expect("reap");
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     use std::time::Duration;
     // BOTH members ignore CTRL_BREAK, so whether or not the soft signal reaches this console
@@ -318,8 +335,9 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     expect_eof("grandchild", &mut grand);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -338,7 +356,8 @@ async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows
     let _ = child.wait().await;
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_graceful_shutdown_tree_tears_down_tree() {
     use std::time::Duration;
     // A contained 2-level tree: the group's graceful signal (SIGTERM / CTRL_BREAK) plus the
@@ -352,8 +371,9 @@ async fn async_graceful_shutdown_tree_tears_down_tree() {
     expect_eof("grandchild", &mut grand);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -372,8 +392,9 @@ async fn async_graceful_shutdown_tree_graceful_root_sigterm() {
     expect_eof("root", &mut sock);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
@@ -397,8 +418,9 @@ async fn async_graceful_shutdown_tree_escalates_with_surviving_grandchild() {
     expect_eof("grandchild", &mut grand);
 }
 
+#[cfg(feature = "tokio")]
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit() {
     use std::time::Duration;
     // The exact case the sweep-before-reap invariant protects: the root honors the group
@@ -429,7 +451,8 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
     expect_eof("grandchild", &mut grand);
 }
 
-#[tokio::test]
+#[cfg(feature = "tokio")]
+#[skuld::test]
 async fn async_graceful_tree_unsupported_when_uncontained() {
     use std::time::Duration;
     let (mut child, mut sock) = common::spawn_blocker_async().await;
@@ -445,9 +468,10 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 
 // The lone graceful ops on a console-group child — async twins of tests/graceful.rs's =====
 
+#[cfg(feature = "tokio")]
 /// Async twin of `child_terminate_delivers_ctrl_break_to_a_contained_root`.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     use cosca::GracefulMechanism;
 
@@ -466,9 +490,10 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let _ = child.wait().await;
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `child_graceful_shutdown_exits_via_ctrl_break_on_windows`.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     use std::time::Duration;
 
@@ -484,9 +509,10 @@ async fn async_child_graceful_shutdown_exits_via_ctrl_break_on_windows() {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `child_graceful_shutdown_escalates_when_the_break_is_ignored`.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
     use std::time::Duration;
 
@@ -502,6 +528,7 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
     );
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`.
 ///
 /// Unix-only, unlike its sync counterpart. The sync `Child` pins its pid for its whole life
@@ -510,7 +537,7 @@ async fn async_child_graceful_shutdown_escalates_when_the_break_is_ignored() {
 /// is refused rather than answered `Ok` — a pid this handle no longer pins is not one a console
 /// control event may be addressed to.
 #[cfg(unix)]
-#[tokio::test]
+#[skuld::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let (mut child, _sock) = common::spawn_control_async("control-block", &["R"], true).await;
     child.kill().expect("kill");
@@ -518,10 +545,11 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     child.terminate().expect("already-dead must be Ok");
 }
 
+#[cfg(feature = "tokio")]
 /// Async twin of `child_graceful_ops_report_success_for_a_child_that_shares_no_console` — the
 /// same known limitation, pinned on the async surface too.
 #[cfg(windows)]
-#[tokio::test]
+#[skuld::test]
 async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     use std::time::Duration;
 
@@ -554,10 +582,11 @@ async fn async_child_graceful_ops_report_success_for_a_child_that_shares_no_cons
     let _ = child.wait().await;
 }
 
+#[cfg(feature = "tokio")]
 /// The one assertion that catches a future divergence between the two hand-mirrored surfaces:
 /// the async query must report exactly what the sync side pins, for both an uncontained and a
 /// contained child.
-#[tokio::test]
+#[skuld::test]
 async fn async_graceful_mechanism_matches_the_sync_surface() {
     let (mut uncontained, _s1) = common::spawn_blocker_async().await;
     let (mut contained, _s2) = common::spawn_control_async("control-block", &["R"], true).await;
@@ -627,6 +656,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     }
 }
 
+#[cfg(feature = "tokio")]
 /// The comparable shape of a cooperative-signal outcome: `Error` is `#[non_exhaustive]` and not
 /// `PartialEq`, and the detail strings legitimately differ between the two surfaces.
 fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
@@ -636,4 +666,14 @@ fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
         Err(cosca::error::Error::Unassessable { .. }) => "unassessable",
         Err(_) => "other",
     }
+}
+
+#[path = "../src/test_harness.rs"]
+mod test_harness;
+
+fn main() {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.require_known_labels();
+    runner.run()
 }
