@@ -433,16 +433,18 @@ jobs:
       # create child cgroups under. We make a fresh leaf directly under the unified root cgroup:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
-      # leaf. We move our shell into it and run only the cgroup-named tests there
-      # (as root, single-threaded) — across the `spawn_io` integration binary, the
-      # `--lib` unit-test binary (which carries the white-box CgroupLeaf::wait_drained
-      # coverage in src/containment/cgroup_tests.rs, and with `tokio` the async spawn's
-      # post-fork failure path), and `tokio_io`. `CGROUP` means this lane: a delegated cgroup, with
-      # the `unshare` that container seccomp profiles refuse permitted. The tests assert
-      # CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
+      # leaf. We move our shell into it and run the labelled tests there (as root,
+      # single-threaded) — across the `--lib` unit-test binary (which carries the white-box
+      # CgroupLeaf::wait_drained coverage in src/containment/cgroup_tests.rs, and with `tokio` the
+      # async spawn's post-fork failure path), `spawn_io` and `tokio_io`. `CGROUP` means this lane: a
+      # delegated cgroup, with the `unshare` that container seccomp profiles refuse permitted. The
+      # tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
       #
-      # Also selected by exact name: the two `graceful_tree_members_remain_still_reaps_an_already_exited_root`
-      # tests, whose `MembersRemain` branch only runs against a real cgroup v2 here.
+      # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the two
+      # `graceful_tree_members_remain_still_reaps_an_already_exited_root` tests, whose
+      # `MembersRemain` branch only runs against a real cgroup v2 here), `cgroup_drop` (the drop-after-wait
+      # tests) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
+      # throwaway runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
       # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
@@ -453,8 +455,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 
-      # The namespaces group has its own step below; `spawn_io` and `tokio_io` have no namespace tests.
-      - name: Run cgroup v2 containment tests (Linux)
+      - name: Run cgroup v2 containment and namespace tests (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 8
         shell: bash
@@ -464,37 +465,15 @@ jobs:
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            # The cgroup tests: a delegated cgroup on a throwaway runner, so consent is given.
+            # A delegated cgroup and root on a throwaway runner, so consent is given.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
-            status=0
-            SKULD_LABELS="!namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "(binary(cosca) | binary(spawn_io) | binary(tokio_io)) & (test(/cgroup/) | test(=child::graceful::graceful_tests::graceful_tree_members_remain_still_reaps_an_already_exited_root) | test(=tokio::child::graceful::graceful_tests::async_graceful_tree_members_remain_still_reaps_an_already_exited_root))" || status=1
-            # Hand the target dir back so later steps can write to it.
-            chown -R "$2" "$PWD/target"
-            exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
-
-      # The namespaces group (`COSCA_TEST_NAMESPACES`, off workflow-wide), selected by its label.
-      # `-E binary(cosca)`: the only binary with namespace tests; libtest binaries ignore `SKULD_LABELS` and would run whole.
-      - name: Run namespace tests (Linux)
-        if: matrix.os == 'linux'
-        timeout-minutes: 8
-        shell: bash
-        run: |
-          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py namespaces sudo -E "$(command -v python3)" .github/scripts/forward.py bash -uxc '
-            CG=/sys/fs/cgroup/cosca-ci
-            mkdir -p "$CG"
-            echo $$ > "$CG/cgroup.procs"
-            export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
-            # Namespace tests: root here, on a throwaway runner, so consent is given.
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
-            SKULD_LABELS=namespaces "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca)" || status=1
+            SKULD_LABELS="cgroup | cgroup_drop | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.
             chown -R "$2" "$PWD/target"
             exit "$status"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
-
 
       # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
       # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become

@@ -51,3 +51,11 @@ pub const ISOLATED_PATHEXT_PRECEDENCE: skuld::Label;
 /// Isolated `SHELL_PROBES` probe: whether an existing extensionless file ever launches.
 #[skuld::label]
 pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
+
+/// Selects the `CGROUP` group's tests, and the tests whose names contain `cgroup`.
+#[skuld::label]
+pub const CGROUP: skuld::Label;
+
+/// Selects the tests that a drop after a reap still kills a cgroup's tree.
+#[skuld::label]
+pub const CGROUP_DROP: skuld::Label;

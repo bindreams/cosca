@@ -8,6 +8,8 @@
 
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::drop_fault;
 use crate::tokio::Command;
 use crate::{ContainMode, Containment};
@@ -411,14 +413,11 @@ mod cgroup_common;
 /// kill. The cgroup lane's counterpart of the sync test of the same name; `COSCA_TEST_CGROUP`
 /// is `0` everywhere else. Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
+#[skuld::test(labels = [crate::test_harness::CGROUP_DROP])]
+async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;
 
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     crate::log_capture::install();
     let mut cmd = Command::new();
     cmd.args(["sh", "-c", "exec 3<&0; cat <&3 3<&- & echo started; exit 0"]);

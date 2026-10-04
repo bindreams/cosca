@@ -581,7 +581,7 @@ fn leaf_listing_another_pid(dir: &std::path::Path) -> std::path::PathBuf {
 /// A child that reported its write accepted, and has since exited: `cgroup.procs` no longer
 /// lists it. Anything it forked is still in the leaf, so the leaf owns the tree.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = leaf_listing_another_pid(dir.path());
@@ -605,7 +605,7 @@ fn a_placed_report_outranks_a_cgroup_procs_that_omits_the_child() {
 /// Membership that cannot be read is unknown, not absent — and the child's own report already
 /// answers it.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 fn a_placed_report_outranks_an_unreadable_cgroup_procs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-decision-leaf");
@@ -715,7 +715,7 @@ fn cgroup_attachment_for_test(leaf_path: &std::path::Path) -> super::Attachment 
 /// `kill_on_drop(false)` must disarm the cgroup leaf. Without it the handle's own teardown is
 /// skipped and the leaf's `Drop` kills the tree anyway — the opposite of the opt-out.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 fn kill_on_drop_false_disarms_a_cgroup_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-false-leaf");
@@ -734,7 +734,7 @@ fn kill_on_drop_false_disarms_a_cgroup_leaf() {
 /// The same leaf under `kill_on_drop(true)` DOES fire `cgroup.kill`, so the test above pins
 /// the disarm rather than an inert path.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-kill-on-drop-true-leaf");

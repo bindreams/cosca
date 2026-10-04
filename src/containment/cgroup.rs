@@ -132,3 +132,7 @@ pub(crate) mod fault;
 #[cfg(all(target_os = "linux", test))]
 #[path = "cgroup/test_support.rs"]
 pub(crate) mod test_support;
+
+// Selection only: the cgroup lane runs this module's tests whole.
+#[cfg(test)]
+skuld::default_labels!(crate::test_harness::CGROUP);

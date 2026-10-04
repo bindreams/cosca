@@ -3,6 +3,8 @@
 #[cfg(feature = "tokio")]
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(all(feature = "tokio", target_os = "linux"))]
+use test_groups::{cgroup, Group};
 
 #[cfg(feature = "tokio")]
 #[skuld::test]
@@ -328,11 +330,8 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 #[cfg(feature = "tokio")]
 /// The cgroup lane's case of the test above. Off (`COSCA_TEST_CGROUP=0`) in every other lane.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+#[skuld::test(labels = [test_harness::CGROUP_DROP])]
+async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixture(cgroup)] _group: &Group) {
     drop_after_wait_still_tears_down_the_tree().await;
 }
 
@@ -513,10 +512,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
 /// leaf unless the detach disarmed it. Proven by a byte round trip through both members.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+async fn linux_cgroup_v2_async_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     assert_async_opted_out_tree_survives(true, |mut child| child.detach()).await;
 }
 
@@ -525,10 +521,7 @@ async fn linux_cgroup_v2_async_detach_leaves_the_tree_running() {
 /// `Attached::honor_kill_on_drop`).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     assert_async_opted_out_tree_survives(false, drop).await;
 }
 
@@ -542,10 +535,7 @@ async fn linux_cgroup_v2_async_kill_on_drop_false_leaves_the_tree_running() {
 /// reads `populated 0`, so the drop's one `rmdir` removes it, and nothing is warned.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf(#[fixture(cgroup)] _group: &Group) {
     common::install_log_capture();
     let common::AsyncEchoTree {
         mut child,
@@ -584,13 +574,10 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
 /// on: either the leaf is gone and nothing warned, or it is left and a warning names it.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover() {
+async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftover(#[fixture(cgroup)] _group: &Group) {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
 
-    if !common::require_group("CGROUP") {
-        return;
-    }
     common::install_log_capture();
     let common::AsyncEchoTree {
         child,
@@ -1417,6 +1404,8 @@ async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting
     );
 }
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

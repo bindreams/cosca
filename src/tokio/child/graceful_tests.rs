@@ -378,7 +378,7 @@ async fn async_graceful_tree_drained_skips_sweep_only_when_the_mechanism_is_auth
 // Async twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root`; see there for the
 // fixture's rationale (`wait_exit`, like `block_until_exit`, does not reap).
 #[cfg(unix)]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root() {
     crate::tokio::test_runtime::assert_current_thread();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

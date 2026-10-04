@@ -678,7 +678,7 @@ async fn a_watch_on_another_thread_does_not_notify_this_threads_observer() {
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
 /// `cgroup.events` — the removal can cancel the one notification a drain sends.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_populated_event() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -713,7 +713,7 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 /// `crate::wait::deadline_from` saturates it to unbounded before `drain_step` ever sees it, so
 /// this call takes the `listener.await` arm, never the bounded one.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
     use crate::containment::cgroup::test_support::FakeLeaf;
 
@@ -742,7 +742,7 @@ async fn cgroup_wait_tree_drained_does_not_panic_on_a_near_maximum_deadline() {
 /// needed): a populated leaf that never drains must answer `MembersRemain` no earlier than the
 /// caller's own deadline. No upper bound is asserted — only that it never answers early.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;
@@ -772,7 +772,7 @@ async fn cgroup_wait_tree_drained_through_arm_at_never_answers_early() {
 /// The Linux wait site is armed, through `arm_at`, with the caller's deadline instant exactly.
 /// Populated `FakeLeaf` (no real cgroup), so `drain_step` reaches its `Block` arm.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -793,7 +793,7 @@ async fn cgroup_wait_tree_drained_arms_the_callers_deadline_instant() {
 
 /// The async wait site's unbounded arm reports an unbounded park, and arms no timer.
 #[cfg(target_os = "linux")]
-#[skuld::test]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_parks_unbounded_with_no_timer() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::containment::cgroup::test_support::FakeLeaf;
@@ -1120,7 +1120,7 @@ async fn grace_wait_serves_its_full_grace_on_tokios_clock_after_an_advance() {
 /// Site 3 reads tokio's clock for "already expired": with virtual time far ahead of the real
 /// clock, a deadline past on tokio's clock answers `MembersRemain` at once, without arming.
 #[cfg(target_os = "linux")]
-#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused, labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_judges_expiry_on_tokios_clock() {
     use crate::containment::cgroup::test_support::FakeLeaf;
     use crate::containment::TreeDrain;

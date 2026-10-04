@@ -83,3 +83,4 @@ test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent 
 test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
 test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx and launches copies of cosca_testbin_image");
 test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task, launches copies of this test binary under derived tokens and scratch accounts, and plants a batch file that CreateProcessW may run");
+test_group!(CGROUP => cgroup, env = "COSCA_TEST_CGROUP", consent = "creates, kills and removes cgroup v2 leaves, runs process trees in them, and unshares file tables and mount namespaces to mount over them");

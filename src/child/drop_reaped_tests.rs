@@ -13,6 +13,8 @@ use crate::child::fault::record_root_teardowns;
 use crate::command::Command;
 use crate::containment::treewalk::fault::record_walks;
 use crate::containment::unix::fault::record_kill_group;
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 /// Every record of the drop's warn starts with this.
@@ -439,11 +441,8 @@ fn assert_skipped_at_debug(mark: usize) {
 /// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_CONSENT=1`.
 /// Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+#[skuld::test(labels = [crate::test_harness::CGROUP_DROP])]
+fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let mut cmd = root_that_leaves_a_cat();
     cmd.contain_with(ContainMode::Strongest);

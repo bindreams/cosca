@@ -4,6 +4,8 @@ use cosca::{Command, Fd, Stdio};
 
 #[path = "common/mod.rs"]
 mod common;
+#[cfg(target_os = "linux")]
+use test_groups::{cgroup, Group};
 
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
@@ -682,10 +684,7 @@ fn linux_contain_with_fd3_delivers_the_exact_payload() {
 /// achieving `CgroupV2` is the proof.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_contain_with_fd3_does_not_clobber_cgroup_procs_fd(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     let (containment, buf) = contain_with_fd3();
     assert_eq!(
@@ -1366,10 +1365,7 @@ fn drop_kills_contained_tree() {
 // without either, each fails loudly rather than pass having tested nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     // COSCA_TEST_CGROUP is set: a usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
@@ -1398,10 +1394,7 @@ fn linux_cgroup_v2_kill_tree_reaps_the_grandchild() {
 /// the default action kills it. Proof of death: grandchild socket EOF.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(
@@ -1429,10 +1422,7 @@ fn linux_cgroup_v2_terminate_tree_reaps_the_grandchild() {
 /// isn't enough).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_detach_leaves_the_tree_running() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_detach_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     assert_opted_out_tree_survives(|| spawn_contained_echo_tree(true), |child| child.detach());
 }
@@ -1442,10 +1432,7 @@ fn linux_cgroup_v2_detach_leaves_the_tree_running() {
 /// with the handle whatever the flag says.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     assert_opted_out_tree_survives(|| spawn_contained_echo_tree(false), drop);
 }
@@ -1454,10 +1441,7 @@ fn linux_cgroup_v2_kill_on_drop_false_leaves_the_tree_running() {
 /// `Command::kill_on_drop` says: `kill_tree` then `wait_tree` before the drop leaves nothing.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     let EchoTree {
         child,
@@ -1500,10 +1484,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree() {
 /// polling from the test.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drain(#[fixture(cgroup)] _group: &Group) {
     common::install_log_capture();
     let EchoTree {
         child,
@@ -1613,11 +1594,8 @@ fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
 /// child share one CPU here, which makes that the common outcome rather than a rare one.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
+fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited(#[fixture(cgroup)] _group: &Group) {
     use std::io::BufRead;
-    if !common::require_group("CGROUP") {
-        return;
-    }
 
     stderr_log::install();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -1701,10 +1679,9 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited() {
 /// forever. The contained `sh` exits at once and leaves no descendant.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects(
+    #[fixture(cgroup)] _group: &Group,
+) {
     stderr_log::install();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
     let mut cmd = Command::new();
@@ -1762,15 +1739,12 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 /// message would go nowhere.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child() {
+fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child(#[fixture(cgroup)] _group: &Group) {
     use common::test_own_process::{child_completion, run, test_filter, test_path};
 
     let path = test_path!(linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child);
 
     stderr_log::install();
-    if !common::require_group("CGROUP") {
-        return;
-    }
     if let Some(done) = child_completion(path) {
         let slots = std::env::var(CLOSED_SLOTS_ENV).unwrap_or_else(|e| panic!("{CLOSED_SLOTS_ENV}: {e}"));
         let deny_pidfd = std::env::var_os(DENY_PIDFD_ENV).is_some();
@@ -2008,10 +1982,7 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
 /// live child would spend the supervisor's fd limit on children it no longer needs it for.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor() {
-    if !common::require_group("CGROUP") {
-        return;
-    }
+fn linux_cgroup_v2_a_live_child_holds_no_cgroup_procs_fd_in_the_supervisor(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
     let (child, mut gc_stream) = spawn_contained_tree();
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
@@ -2058,6 +2029,8 @@ fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
     assert_eq!(soft(), before, "drop must restore it");
 }
 
+#[path = "../src/test_groups.rs"]
+mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

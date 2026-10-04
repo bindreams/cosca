@@ -67,9 +67,6 @@ inherits = "ci"
 [profile.ci-cgroup]
 inherits = "ci"
 
-[profile.ci-namespaces]
-inherits = "ci"
-
 [profile.ci-setuid]
 inherits = "ci"
 

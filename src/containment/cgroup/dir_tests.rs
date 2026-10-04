@@ -1,6 +1,8 @@
 use std::os::fd::AsRawFd;
 
 use super::{fd_path, LeafDir};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// `fd_path` names the calling thread's own descriptor, even in a thread that no longer shares
 /// the process's descriptor table: there `/proc/self/fd/<n>` is the thread-group leader's `<n>`.
@@ -8,10 +10,7 @@ use super::{fd_path, LeafDir};
 /// Container seccomp profiles refuse `unshare`, so it is gated on `CGROUP`, which means the
 /// unconfined cgroup lane: a delegated cgroup with `unshare` permitted.
 #[skuld::test]
-fn cgroup_fd_path_names_the_calling_threads_own_descriptor() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_fd_path_names_the_calling_threads_own_descriptor(#[fixture(cgroup)] _group: &Group) {
     let dir = tempfile::tempdir().expect("tempdir");
     let (leader_file, thread_file) = (dir.path().join("leader"), dir.path().join("thread"));
     std::fs::write(&leader_file, "").expect("create the leader's file");
@@ -72,10 +71,7 @@ fn a_leaf_that_cannot_be_held_after_its_mkdir_is_removed() {
 /// Mounts are never crossed by the child sweep. A bind mount inside a leaf keeps whatever it
 /// shows: an unprivileged run cannot mount, so the lane runs this one.
 #[skuld::test]
-fn cgroup_the_child_sweep_never_crosses_a_mount() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Group) {
     let victim = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(victim.path().join("keep/me")).expect("make the victim's empty dirs");
     let victim_path = victim.path().to_path_buf();
