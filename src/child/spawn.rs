@@ -1932,6 +1932,15 @@ pub(crate) use batch_gate::reject_batch_path;
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
 
+// The skeleton of every `pre_exec` hook that talks to its parent over a descriptor.
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "its only non-test user off Linux is the macOS unique-id report")
+)]
+#[path = "spawn/fd_channel.rs"]
+pub(crate) mod fd_channel;
+
 // Linux: holds a forked child before `exec` until the parent has its pidfd.
 #[cfg(target_os = "linux")]
 #[path = "spawn/pidfd_handshake.rs"]
