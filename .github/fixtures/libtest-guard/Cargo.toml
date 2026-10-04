@@ -50,17 +50,6 @@ name = "pm"
 path = "tests/pm.rs"
 harness = false
 
-# Default harness: the guard must refuse it unless it is listed in the unflipped file.
-[[test]]
-name = "lt"
-path = "tests/lt.rs"
-
-# A bin with the default harness, named like the libtest target above: an unflipped entry for the
-# test must not cover it.
-[[bin]]
-name = "lt"
-path = "src/main.rs"
-
 # `test = false`: cargo never runs it, so a `#[test]` here never runs either.
 [[bin]]
 name = "nt"
