@@ -270,3 +270,13 @@ async fn a_front_whose_exec_fails_is_not_noted() {
     assert_eq!(io.raw_os_error(), Some(libc::E2BIG), "{io}");
     assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
 }
+
+/// Async twin of the sync `macos_a_front_whose_report_read_fails_is_left_and_noted`. Mutant: no
+/// note.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
+    use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_report_read};
+    let (err, pid) = fail_a_front_report_read(|cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_unadopted_front_noted(&err, pid);
+}

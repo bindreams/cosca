@@ -270,7 +270,6 @@ pub(crate) fn failed_front_spawns(
 
 /// Reaps `pid`, this process's own child, and answers how it ended: `None` if something reaped it
 /// already.
-#[cfg(target_os = "linux")]
 pub(crate) fn reap(pid: u32) -> Option<std::process::ExitStatus> {
     let mut raw = 0;
     // SAFETY: `raw` is a valid out-parameter; `pid` is this process's own child.
@@ -392,4 +391,60 @@ fn an_unverified_childs_fate_follows_its_identity() {
     use crate::containment::RootIdentity;
     assert_eq!(FrontFate::of_unverified(RootIdentity::Gone), FrontFate::Unaccounted);
     assert_eq!(FrontFate::of_unverified(RootIdentity::Unknown), FrontFate::LeftUnreaped);
+}
+
+/// macOS: a spawn whose own read of the front's unique-id report fails cannot adopt it, and leaves
+/// it as any unadopted child: sent nothing, and unreaped. The error, its variant kept, says so. The
+/// `cat`'s stdin is a pipe this test owns, so the front is shown unsignalled by its exit. Mutant:
+/// no note.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
+    let (err, pid) = fail_a_front_report_read(|cmd| cmd.spawn().map(drop));
+    assert_unadopted_front_noted(&err, pid);
+}
+
+/// Spawns, through `spawn`, a `cat` front whose stdin is a pipe this function owns, with this
+/// process's read of its unique-id report failing, and returns the error with the front's pid once
+/// the front has been shown to end unsignalled, after its stdin closed.
+#[cfg(target_os = "macos")]
+pub(crate) fn fail_a_front_report_read(spawn: impl FnOnce(&mut Command) -> Result<(), Error>) -> (Error, u32) {
+    use std::os::fd::OwnedFd;
+
+    use crate::child::spawn::{fault, unique_report};
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let mut cmd = cat();
+    cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
+        .expect("stdin");
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+        Backend::Sudo,
+    ))));
+    let err = {
+        let _failing = unique_report::seams::fail_parent_read(libc::EIO);
+        spawn(&mut cmd).expect_err("the failed report read fails the spawn")
+    };
+    let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the spawn captured the child") else {
+        panic!("the spawn must capture a resolved identity");
+    };
+    drop(writer);
+    let status = reap(id.pid()).expect("the front was left unreaped");
+    assert!(status.success(), "the front was signalled: {status:?}");
+    (err, id.pid())
+}
+
+/// `err` keeps the failed read's `Unassessable` variant, and notes that the front `pid` is left
+/// unreaped.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub(crate) fn assert_unadopted_front_noted(err: &Error, pid: u32) {
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "the variant is kept: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+    assert!(
+        text.contains("the elevated program may be running; it is left unreaped"),
+        "{text}"
+    );
 }

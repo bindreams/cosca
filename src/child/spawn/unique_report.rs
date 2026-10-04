@@ -126,6 +126,10 @@ impl Channel {
 
 /// Reads one report from the non-blocking `read_end`.
 fn read_report(read_end: &OwnedFd) -> Report {
+    #[cfg(test)]
+    if let Some(errno) = seams::parent_read_fails() {
+        return Report::ReadFailed(io::Error::from_raw_os_error(errno));
+    }
     let mut buf = [0u8; REPORT_LEN];
     let mut got = 0;
     while got < REPORT_LEN {
@@ -278,6 +282,7 @@ pub(crate) mod seams {
 
     thread_local! {
         static FORCE: Cell<Force> = const { Cell::new(Force::None) };
+        static PARENT_READ_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     }
 
     /// What a hook registered on this thread was armed with.
@@ -331,6 +336,26 @@ pub(crate) mod seams {
     pub(crate) fn force_hook_failure_before_report(errno: i32) -> Forced {
         FORCE.with(|f| f.set(Force::FailBeforeReport(errno)));
         Forced(())
+    }
+
+    /// While the guard lives, this thread's own read of a spawn's report fails with `errno`, after
+    /// the child ran as it would: the parent cannot tell what the child is doing.
+    pub(crate) fn fail_parent_read(errno: i32) -> FailedParentRead {
+        PARENT_READ_ERRNO.with(|f| f.set(Some(errno)));
+        FailedParentRead(())
+    }
+
+    #[must_use = "the read succeeds again as soon as the guard is dropped"]
+    pub(crate) struct FailedParentRead(());
+
+    impl Drop for FailedParentRead {
+        fn drop(&mut self) {
+            PARENT_READ_ERRNO.with(|f| f.set(None));
+        }
+    }
+
+    pub(super) fn parent_read_fails() -> Option<i32> {
+        PARENT_READ_ERRNO.with(Cell::get)
     }
 
     /// The next spawns on this thread have their child killed by `SIGKILL` before it reports, as
