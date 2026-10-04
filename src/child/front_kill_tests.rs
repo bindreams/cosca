@@ -12,6 +12,8 @@ use crate::child::fault::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
@@ -142,14 +144,11 @@ fn drop_of_a_live_front_leaves_it_running_unreaped_and_warns() {
 }
 
 /// In a cgroup the kill goes through `cgroup.kill`, which reaches the program whatever its
-/// credentials. Needs a delegated cgroup: the cgroup lane. Mutants: a front in a cgroup is refused;
+/// credentials. Mutants: a front in a cgroup is refused;
 /// its kill signals the front alone (the tree is not marked killed).
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_kill_of_a_front_goes_through_the_cgroup() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_kill_of_a_front_goes_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Strongest);
     let (child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
@@ -163,10 +162,7 @@ fn cgroup_kill_of_a_front_goes_through_the_cgroup() {
 /// Mutant: the front is signalled after a failed cgroup kill.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Strongest);
     let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
@@ -183,10 +179,7 @@ fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone() {
 /// down after a failed cgroup kill.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let teardowns = record_root_teardowns();
     let mut cmd = cat();

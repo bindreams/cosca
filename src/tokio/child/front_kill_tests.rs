@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::child::front_kill_tests::{assert_unkillable_front, report};
 use crate::containment::unix::fault::record_kill_group;
 use crate::elevation::{Backend, ElevatedVia};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
@@ -113,15 +115,12 @@ async fn drop_of_a_live_front_signals_nothing_and_warns() {
     assert!(warns[0].1.contains(&format!("pid {pid} is sudo")), "{warns:?}");
 }
 
-/// In a cgroup the kill goes through `cgroup.kill`. Needs a delegated cgroup: the cgroup lane.
+/// In a cgroup the kill goes through `cgroup.kill`.
 /// Mutants: a front in a cgroup is refused; its kill signals the front alone.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_kill_of_a_front_goes_through_the_cgroup() {
+async fn cgroup_kill_of_a_front_goes_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Strongest);
     let (mut child, _stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
@@ -134,10 +133,7 @@ async fn cgroup_kill_of_a_front_goes_through_the_cgroup() {
 /// Mutant: the front is signalled after a failed cgroup kill.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone() {
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
+async fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = cat();
     cmd.contain_with(ContainMode::Strongest);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
@@ -155,11 +151,8 @@ async fn cgroup_a_failed_kill_of_a_front_leaves_the_front_alone() {
 /// before reading. Mutant: the drop kills the front after a failed cgroup kill.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone() {
+async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)] _group: &Group) {
     use std::os::fd::AsFd as _;
-    if !crate::test_support::require_group("CGROUP") {
-        return;
-    }
     crate::tokio::test_runtime::assert_current_thread();
     let roots = drop_fault::record();
     let mut cmd = cat();
