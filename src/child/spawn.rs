@@ -403,6 +403,14 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         through: PidfdChild::new(Some(child.id()), pidfd),
         child,
     };
+    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
+    // checked against and the shared child is adopted with. The report decides first: a child that
+    // died before `exec` is that, whatever an attach would find of its pid.
+    #[cfg(target_os = "macos")]
+    let unique = match unique_report::adopted_id(unique, child.id()) {
+        Ok(unique) => unique,
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
+    };
     let attachment = match attach_or_fault_typed(
         child.id(),
         #[cfg(windows)]
@@ -435,13 +443,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
-    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
-    // checked against and the shared child is adopted with.
-    #[cfg(target_os = "macos")]
-    let unique = match unique_report::adopted_id(unique, child.id()) {
-        Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
-    };
     #[cfg(target_os = "linux")]
     let through = child.through.target();
     #[cfg(target_os = "macos")]
@@ -1621,7 +1622,6 @@ pub(crate) mod fault {
     pub(crate) fn force_identity_vanished() -> bool {
         FORCE_VANISH.with(|f| f.get())
     }
-    #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
     pub(crate) fn set_force_attach_failure(on: bool) {
         FORCE_ATTACH_FAIL.with(|f| f.set(on));
     }

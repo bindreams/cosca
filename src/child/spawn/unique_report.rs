@@ -11,7 +11,8 @@
 //! before every other so `fd_map`'s `dup2` onto its number cannot come first.
 //!
 //! A refused read is reported, then the hook fails: `exec` never runs, the spawn is an `Err`, and
-//! std collects the child.
+//! std collects the child. A signal that kills the child between the report and std's own errno
+//! write makes the spawn `Ok` with the same report, and the same refusal.
 //!
 //! `spawn()` returning `Ok` does not mean the child execed: std reads EOF on its own close-on-exec
 //! pipe both after a successful `exec` and after a child killed by a signal before it. So the
@@ -174,15 +175,9 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     };
     match report {
         Report::Id(id) => Ok(id),
-        // The hook fails its spawn after reporting a refusal, so `spawn` returning `Ok` means the
-        // child either ran on (a contract break) or was killed between the report and std's own
-        // pipe. Nothing says which, so the program may have started.
-        Report::ChildRefused(errno) => Err(unknown(Error::Unassessable {
-            detail: format!(
-                "pid {pid}: its own unique-id read was refused (errno {errno}), yet the spawn returned Ok; the program may have started"
-            ),
-            source: Some(io::Error::from_raw_os_error(errno)),
-        })),
+        // The hook fails its spawn after reporting a refusal, so `Ok` is a child killed between its
+        // report and std's own errno write: the same refusal, with the program not started.
+        Report::ChildRefused(errno) => Err(dead(refused_error(errno))),
         Report::Missing => Err(dead(Error::Io(io::Error::other(format!(
             "the spawned child {pid} died before exec; the program did not start"
         ))))),
