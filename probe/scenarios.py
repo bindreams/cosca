@@ -170,6 +170,8 @@ def outcome(f):
         return ("acceptor-failed", str(e))
     except cp.SupervisionLost as e:
         return ("lost", e.status)
+    except Exception as e:  # any other error is an outcome the assertion then rejects
+        return ("exception", repr(e))
 
 
 def refusal(log):
