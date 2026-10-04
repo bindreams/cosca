@@ -163,6 +163,24 @@ pub(crate) fn wrap_do_shell_script(shell_command: &[u8], arg_max: Option<usize>)
     Ok(script)
 }
 
+/// The AppleScript that runs the elevation shim (`shim_exe`, told `shim`) in place of the program.
+/// Every shim argument is hex ([`ShimArgs::to_argv`]), so the script is ASCII wherever `shim_exe`
+/// and `cwd` are, whatever bytes the program and its arguments hold.
+///
+/// Precondition: `shim_exe` is POSIX-absolute and `cwd` is as [`build_shell_command`] requires.
+#[cfg(unix)]
+#[allow(dead_code, reason = "the shim is built bottom-up; its callers land later")]
+pub(crate) fn build_shim_script(
+    shim_exe: &OsStr,
+    shim: &super::shim::protocol::ShimArgs,
+    cwd: Option<&Path>,
+    arg_max: Option<usize>,
+) -> Result<String, Error> {
+    let argv = shim.to_argv(shim_exe, true);
+    let shell_command = build_shell_command(&argv[0], &argv[1..], cwd)?;
+    wrap_do_shell_script(&shell_command, arg_max)
+}
+
 /// The argv, refused unless it is one `do shell script` can exec. `exec`ing the program sets
 /// argv[0] to its own path, so an argv[0] distinct from a set `executable()` cannot survive.
 fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {

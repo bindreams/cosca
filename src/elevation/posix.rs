@@ -10,6 +10,7 @@ use zeroize::Zeroize;
 
 use super::pkexec::PkexecVersion;
 use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
+use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, EnvOp};
 use crate::error::{ElevationErrorKind, Error};
@@ -129,6 +130,24 @@ pub(crate) fn build_argv(
     argv.push(program.to_os_string());
     argv.extend(args.iter().cloned());
     Ok(argv)
+}
+
+/// The argv that runs the elevation shim (`shim_exe`, told `shim`) through the front, in place of the
+/// program: the front's options, then the shim, whose own `--` precedes the program. The program is
+/// never a front argument. `shim_exe` is absolute, so `pkexec`, which has no `--` shield, never
+/// meets a leading dash.
+// No caller until the sync spawn consults `ShimChoice`.
+#[allow(dead_code, reason = "the shim is built bottom-up; its callers land later")]
+pub(crate) fn build_shim_argv(
+    backend: Backend,
+    backend_path: &OsStr,
+    auth: &Auth,
+    shim_exe: &OsStr,
+    shim: &ShimArgs,
+    env: &[(OsString, OsString)],
+) -> Result<Vec<OsString>, Error> {
+    let argv = shim.to_argv(shim_exe, false);
+    build_argv(backend, backend_path, auth, &argv[0], &argv[1..], env)
 }
 
 /// Does `program` begin with `-`? (Only pkexec, which has no `--` shield, cares.)

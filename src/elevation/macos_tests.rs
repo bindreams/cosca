@@ -6,6 +6,10 @@ use crate::command::{Command, CommandInput};
 use crate::elevation::{ElevatedStdio, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error, QuoteErrorKind};
 
+#[cfg(unix)]
+#[path = "macos_tests/shim_script.rs"]
+mod shim_script;
+
 fn args(v: &[&str]) -> Vec<OsString> {
     v.iter().map(OsString::from).collect()
 }
