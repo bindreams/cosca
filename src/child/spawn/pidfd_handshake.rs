@@ -159,9 +159,6 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     // The child opens its own pidfd, where a thread-local seam cannot reach: take it here.
     #[cfg(test)]
     let scripted = crate::wait::backend::take_scripted_pidfd_open();
-    // The hook is async-signal-safe: it reads atomics and makes only direct syscalls (libc or
-    // rustix, see `open_self`) on integers and fd numbers. It allocates nothing and takes no lock,
-    // and `io::Error::from_raw_os_error` does not allocate.
     // SAFETY: the hook is async-signal-safe: it reads atomics and makes only direct syscalls (libc
     // or rustix, see `open_self`) on integers and fd numbers. It allocates nothing, takes no lock
     // and never panics, and `io::Error::from_raw_os_error` does not allocate.
@@ -832,9 +829,6 @@ fn hold_child(
     #[cfg(test)] fault: fault::ChildFault,
     #[cfg(test)] scripted: Option<Errno>,
 ) -> io::Result<()> {
-    if !shared.is_live() {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
     let child_end: RawFd = shared.child_end();
     let parent_end: RawFd = shared.parent_end();
     // The parent's end, inherited: it has nothing to do here.

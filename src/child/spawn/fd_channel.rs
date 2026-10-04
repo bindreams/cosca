@@ -3,9 +3,9 @@
 //!
 //! A hook is registered on the command first and the channel is made later, under `spawn_lock`, so
 //! the descriptor numbers are published to the hook between the two. The hook reads only atomics.
-//! [`Shared::is_live`] says the numbers name this spawn's channel: it is cleared when the spawn is
-//! over, so a command spawned again later fails in the hook instead of using whatever now owns the
-//! numbers.
+//! The channel is live from [`Shared::publish`] to [`Shared::withdraw`]: [`register`] fails a hook
+//! run outside that window with `EBADF` before the hook itself runs, so a command spawned again
+//! later never uses whatever now owns the numbers.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -34,7 +34,7 @@ impl Shared {
     }
 
     /// Whether the numbers name this spawn's channel. Async-signal-safe.
-    pub(crate) fn is_live(&self) -> bool {
+    fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }
 
@@ -52,7 +52,8 @@ impl Shared {
 }
 
 /// Registers `hook` as a `pre_exec` hook on `cmd`, with the channel not yet made: [`Shared::publish`]
-/// it later, under `spawn_lock`. A hook run while the channel is not live must fail its spawn.
+/// it later, under `spawn_lock`. While the channel is not live the spawn fails with `EBADF` and
+/// `hook` does not run.
 ///
 /// # Safety
 ///
@@ -71,7 +72,12 @@ pub(crate) unsafe fn register(
     // SAFETY: the caller guarantees the hook is async-signal-safe. `in_child` is owned by the
     // closure and only borrowed in the child, so no reference count changes there.
     unsafe {
-        cmd.pre_exec(move || hook(&in_child));
+        cmd.pre_exec(move || {
+            if !in_child.is_live() {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            hook(&in_child)
+        });
     }
     shared
 }

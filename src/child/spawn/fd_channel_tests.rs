@@ -1,19 +1,12 @@
 use super::register;
 
-/// Mutant: `withdraw` leaves the channel live, so a second spawn of the command uses stale numbers.
+/// Mutant: `register` does not gate on liveness, so the hook runs for a withdrawn channel (and the
+/// second spawn succeeds), or `withdraw` leaves the channel live.
 #[skuld::test]
-fn a_command_spawned_again_after_withdraw_fails_in_the_hook() {
+fn a_command_spawned_again_after_withdraw_fails_before_the_hook_runs() {
     let mut cmd = std::process::Command::new("true");
-    // SAFETY: the hook reads an atomic and returns.
-    let shared = unsafe {
-        register(&mut cmd, |shared| {
-            if shared.is_live() {
-                Ok(())
-            } else {
-                Err(std::io::Error::from_raw_os_error(libc::EBADF))
-            }
-        })
-    };
+    // SAFETY: the hook returns at once.
+    let shared = unsafe { register(&mut cmd, |_| Ok(())) };
     shared.publish(7, -1);
     let guard = crate::child::spawn::spawn_lock();
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
