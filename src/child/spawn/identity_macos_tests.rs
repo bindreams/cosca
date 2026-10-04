@@ -56,9 +56,8 @@ pub(crate) fn end_unsignalled_and_reap(pid: u32) {
     );
 }
 
-/// Asserts the failed spawn left no child behind: the spawn captures the identity of every child it
-/// tears down or leaves, and none was captured. A hook that execs anyway leaves one, which is ended
-/// here before the assertion fails.
+/// A failed spawn captures the identity of any child it leaves; none may exist. A stray one is
+/// reaped before the panic.
 pub(crate) fn assert_program_did_not_run() {
     if let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() {
         end_unsignalled_and_reap(id.pid());
@@ -236,8 +235,7 @@ pub(crate) fn arm_launchd_hold(
 
 // The child's own unique-id read =====
 
-/// The unique id is the child's own report, not a read by pid: a by-pid read made to fail is never
-/// reached, and the spawn still succeeds with an id that the re-read confirms.
+/// The spawn takes the child's own report: a forced by-pid refusal stays unconsumed.
 ///
 /// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), so the forced refusal is
 /// consumed and the spawn fails.
@@ -269,4 +267,44 @@ fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_the_program_does
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
     assert_program_did_not_run();
+}
+
+// A child killed before it reports =====
+
+/// A child killed by a signal before it reports makes std return `Ok`; the spawn must say the child
+/// died before exec, with no made-up errno, and must not claim it is left running.
+///
+/// Mutant: a missing report is read as an errno, so the spawn fails `Unassessable` and warns that
+/// the child is left running.
+#[skuld::test]
+fn macos_sync_spawn_of_a_child_killed_before_its_report_says_it_died_before_exec() {
+    crate::log_capture::install();
+    let (mut cmd, _writer) = sync_blocker();
+    let _forced = unique_report::seams::force_child_killed_before_report();
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("a child that never reported cannot be adopted");
+    let Error::Io(e) = &err else {
+        panic!("a child that died before exec is an io error, not a refusal: {err:?}")
+    };
+    assert!(e.to_string().contains("died before exec"), "{e}");
+    assert_eq!(e.raw_os_error(), None, "no errno is made up");
+    assert!(
+        !crate::log_capture::contains_since(mark, "leaving it running"),
+        "a dead child is not left running"
+    );
+}
+
+/// The id the spawn adopts is the unique id of the live child, read from outside.
+///
+/// Mutant: the spawn adopts another process's id.
+#[skuld::test]
+fn macos_sync_spawn_adopts_the_live_childs_own_unique_id() {
+    let (mut cmd, writer) = sync_blocker();
+    let child = cmd.spawn().expect("spawn");
+    let UniqRead::Found(info) = uniq_info(child.id().pid(), ReadPurpose::Kill) else {
+        panic!("the live child has a unique id")
+    };
+    assert_eq!(child.adopted_unique(), Some(info.unique_id));
+    drop(writer);
+    drop(child);
 }

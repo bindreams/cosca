@@ -73,8 +73,7 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> StartToken {
 /// one read without touching the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadPurpose {
-    /// The child's identity, read by pid at adoption (tests: production spawns take the child's
-    /// own report).
+    /// The child's identity, read by pid at adoption (test-only).
     #[cfg_attr(not(test), allow(dead_code, reason = "only the test-only by-pid read uses it"))]
     Adopt,
     /// The re-read just before a signal.
@@ -180,8 +179,7 @@ pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
 }
 
 /// The calling process's own unique id, for a child to report before `exec`. **Async-signal-safe**:
-/// one `proc_pidinfo` call (a direct `__proc_info` syscall) on a stack buffer, with no allocation,
-/// no lock and no logging. `Err` is the errno.
+/// no allocation, lock or logging. `Err` is the errno.
 pub(crate) fn own_unique_id() -> Result<u64, i32> {
     // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
     let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };

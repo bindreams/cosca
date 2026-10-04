@@ -62,9 +62,8 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
 
 /// A process's unique id by pid: the 64-bit id that is never reused and survives `exec`, which is
 /// the only identity macOS checks a by-pid action against. `Ok(None)` is a pid with no process
-/// (`ESRCH`); `Err(errno)` is a refused read. Tests only: a spawned child reports its own id before
-/// `exec` (see `child::spawn::unique_report`), because a by-pid read could name a stranger that
-/// took the pid.
+/// (`ESRCH`); `Err(errno)` is a refused read. Tests only: production spawns take the child's own
+/// report (`child::spawn::unique_report`).
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
@@ -77,8 +76,8 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
 
 /// The adoption error for a child whose identity read was refused with `errno`: the child is not
 /// adopted. The sync spawn leaves it running, and the async spawn forgets it, with a warning;
-/// neither signals or waits on it by pid.
-#[cfg(target_os = "macos")]
+/// neither signals or waits on it by pid. Tests only: a spawn takes the child's own report.
+#[cfg(all(target_os = "macos", test))]
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
         detail: format!("pid {pid}: its identity could not be read (errno {errno}); the child was not adopted"),
