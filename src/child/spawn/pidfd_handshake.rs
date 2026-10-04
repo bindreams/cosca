@@ -66,13 +66,13 @@
 //! naming that cause, before it forks.
 
 use std::io;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
-use super::fd_channel::{above_stdio, above_stdio_keeping, register as register_hook, Shared};
+use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::SpawnLockGuard;
 use crate::error::Error;
 
@@ -162,15 +162,20 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     // The hook is async-signal-safe: it reads atomics and makes only direct syscalls (libc or
     // rustix, see `open_self`) on integers and fd numbers. It allocates nothing and takes no lock,
     // and `io::Error::from_raw_os_error` does not allocate.
-    let shared = register_hook(cmd, move |shared| {
-        hold_child(
-            shared,
-            #[cfg(test)]
-            fault,
-            #[cfg(test)]
-            scripted,
-        )
-    });
+    // SAFETY: the hook is async-signal-safe: it reads atomics and makes only direct syscalls (libc
+    // or rustix, see `open_self`) on integers and fd numbers. It allocates nothing, takes no lock
+    // and never panics, and `io::Error::from_raw_os_error` does not allocate.
+    let shared = unsafe {
+        register_hook(cmd, move |shared| {
+            hold_child(
+                shared,
+                #[cfg(test)]
+                fault,
+                #[cfg(test)]
+                scripted,
+            )
+        })
+    };
     Pending { shared }
 }
 
@@ -182,9 +187,7 @@ impl Pending {
         let (parent_end, child_end) =
             rustix::net::socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)
                 .map_err(|e| Error::Io(crate::error::io_context("socketpair", e.into())))?;
-        let parent_end = above_stdio(parent_end)?;
-        let child_end = above_stdio(child_end)?;
-        self.shared.publish(child_end.as_raw_fd(), parent_end.as_raw_fd());
+        let (child_end, parent_end) = publish_ends(&self.shared, child_end, parent_end)?;
         Ok(Handshake {
             parent_end,
             child_end,

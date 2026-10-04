@@ -4,13 +4,16 @@ use super::register;
 #[skuld::test]
 fn a_command_spawned_again_after_withdraw_fails_in_the_hook() {
     let mut cmd = std::process::Command::new("true");
-    let shared = register(&mut cmd, |shared| {
-        if shared.is_live() {
-            Ok(())
-        } else {
-            Err(std::io::Error::from_raw_os_error(libc::EBADF))
-        }
-    });
+    // SAFETY: the hook reads an atomic and returns.
+    let shared = unsafe {
+        register(&mut cmd, |shared| {
+            if shared.is_live() {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            }
+        })
+    };
     shared.publish(7, -1);
     let guard = crate::child::spawn::spawn_lock();
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
@@ -31,13 +34,16 @@ fn a_command_spawned_again_after_withdraw_fails_in_the_hook() {
 #[skuld::test]
 fn the_hook_sees_the_published_numbers() {
     let mut cmd = std::process::Command::new("true");
-    let shared = register(&mut cmd, |shared| {
-        if shared.child_end() == 7 && shared.parent_end() == 8 {
-            Ok(())
-        } else {
-            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
-        }
-    });
+    // SAFETY: the hook reads an atomic and returns.
+    let shared = unsafe {
+        register(&mut cmd, |shared| {
+            if shared.child_end() == 7 && shared.parent_end() == 8 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+        })
+    };
     shared.publish(7, 8);
     let _guard = crate::child::spawn::spawn_lock();
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard`")]

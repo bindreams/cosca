@@ -1932,12 +1932,8 @@ pub(crate) use batch_gate::reject_batch_path;
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
 
-// The skeleton of every `pre_exec` hook that talks to its parent over a descriptor.
-#[cfg(unix)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "its only non-test user off Linux is the macOS unique-id report")
-)]
+// The skeleton of a `pre_exec` hook that talks to its parent over a descriptor.
+#[cfg(target_os = "linux")]
 #[path = "spawn/fd_channel.rs"]
 pub(crate) mod fd_channel;
 

@@ -1,10 +1,9 @@
-//! The skeleton shared by every `pre_exec` hook that talks to its parent over a descriptor made
-//! under `spawn_lock`: [`pidfd_handshake`](super::pidfd_handshake) and, on macOS,
-//! [`unique_report`](super::unique_report).
+//! The skeleton of a `pre_exec` hook that talks to its parent over a descriptor made under
+//! `spawn_lock`, as [`pidfd_handshake`](super::pidfd_handshake) does.
 //!
 //! A hook is registered on the command first and the channel is made later, under `spawn_lock`, so
 //! the descriptor numbers are published to the hook between the two. The hook reads only atomics.
-//! [`Shared::live`] says the numbers name this spawn's channel: it is cleared when the spawn is
+//! [`Shared::is_live`] says the numbers name this spawn's channel: it is cleared when the spawn is
 //! over, so a command spawned again later fails in the hook instead of using whatever now owns the
 //! numbers.
 
@@ -55,11 +54,11 @@ impl Shared {
 /// Registers `hook` as a `pre_exec` hook on `cmd`, with the channel not yet made: [`Shared::publish`]
 /// it later, under `spawn_lock`. A hook run while the channel is not live must fail its spawn.
 ///
-/// # Safety contract of `hook`
+/// # Safety
 ///
-/// It runs between `fork` and `exec`, so it must be async-signal-safe: atomics and direct syscalls
-/// only, with no allocation and no lock.
-pub(crate) fn register(
+/// `hook` runs between `fork` and `exec`, so it must be async-signal-safe: atomics and direct
+/// syscalls only, with no allocation, lock, panic or reference-count change.
+pub(crate) unsafe fn register(
     cmd: &mut std::process::Command,
     hook: impl Fn(&Shared) -> io::Result<()> + Send + Sync + 'static,
 ) -> Arc<Shared> {
@@ -69,11 +68,25 @@ pub(crate) fn register(
         live: AtomicBool::new(false),
     });
     let in_child = Arc::clone(&shared);
-    // SAFETY: the hook is async-signal-safe by this function's contract.
+    // SAFETY: the caller guarantees the hook is async-signal-safe. `in_child` is owned by the
+    // closure and only borrowed in the child, so no reference count changes there.
     unsafe {
         cmd.pre_exec(move || hook(&in_child));
     }
     shared
+}
+
+/// Moves a channel's two ends to 3 or above and publishes their numbers to the hook. Returns
+/// `(child_end, parent_end)`.
+pub(crate) fn publish_ends(
+    shared: &Shared,
+    child_end: OwnedFd,
+    parent_end: OwnedFd,
+) -> Result<(OwnedFd, OwnedFd), Error> {
+    let parent_end = above_stdio(parent_end)?;
+    let child_end = above_stdio(child_end)?;
+    shared.publish(child_end.as_raw_fd(), parent_end.as_raw_fd());
+    Ok((child_end, parent_end))
 }
 
 /// `fd`, moved to 3 or above: with 0, 1 or 2 closed, the lowest free number is one, and the
