@@ -437,8 +437,7 @@ fn assert_skipped_at_debug(mark: usize) {
 }
 
 /// A cgroup names its tree without the root's number, so the reaped root does not stop the drop's
-/// kill. Needs a delegated cgroup, so it belongs to the cgroup lane: `COSCA_TEST_CGROUP` is
-/// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_CONSENT=1`.
+/// kill.
 /// Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
 #[skuld::test]

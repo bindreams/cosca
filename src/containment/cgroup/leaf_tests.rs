@@ -237,9 +237,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 }
 
 // CgroupLeaf::wait_drained real-mechanism test -----
-// Linux + cgroup-v2 only. The `CGROUP` group (`crate::test_groups`) runs them unless
-// `COSCA_TEST_CGROUP=0`, which CI's ordinary jobs set; enabled, they need
-// `COSCA_TEST_CGROUP_CONSENT=1` and fail loudly if no usable delegated cgroup v2 leaf exists.
+// Linux + cgroup-v2 only; each takes the `cgroup` fixture.
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s

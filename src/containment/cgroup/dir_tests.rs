@@ -7,8 +7,7 @@ use crate::test_groups::{cgroup, Group};
 /// `fd_path` names the calling thread's own descriptor, even in a thread that no longer shares
 /// the process's descriptor table: there `/proc/self/fd/<n>` is the thread-group leader's `<n>`.
 ///
-/// Container seccomp profiles refuse `unshare`, so it is gated on `CGROUP`, which means the
-/// unconfined cgroup lane: a delegated cgroup with `unshare` permitted.
+/// Container seccomp profiles refuse `unshare`, which the unconfined cgroup lane permits.
 #[skuld::test]
 fn cgroup_fd_path_names_the_calling_threads_own_descriptor(#[fixture(cgroup)] _group: &Group) {
     let dir = tempfile::tempdir().expect("tempdir");

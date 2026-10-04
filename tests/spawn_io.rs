@@ -1360,14 +1360,12 @@ fn drop_kills_contained_tree() {
 }
 
 // cgroup v2 integration tests =====
-// Linux only. The `CGROUP` group runs them unless `COSCA_TEST_CGROUP=0`: they need a delegated
-// cgroup and `COSCA_TEST_CGROUP_CONSENT=1`, which CI's cgroup lane provisions and sets. Enabled
-// without either, each fails loudly rather than pass having tested nothing.
+// Linux only; each test takes the `cgroup` fixture.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_kill_tree_reaps_the_grandchild(#[fixture(cgroup)] _group: &Group) {
     stderr_log::install();
-    // COSCA_TEST_CGROUP is set: a usable delegated cgroup must exist.
+    // A usable delegated cgroup must exist.
     // If try_create_leaf() returns None, containment falls back to ProcessGroup
     // and the assert below will fail loudly — that's intentional.
     let (child, mut gc_stream) = spawn_contained_tree();

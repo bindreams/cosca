@@ -410,8 +410,7 @@ async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
 mod cgroup_common;
 
 /// A cgroup names its tree without the root's number, so the reaped root does not stop the drop's
-/// kill. The cgroup lane's counterpart of the sync test of the same name; `COSCA_TEST_CGROUP`
-/// is `0` everywhere else. Mutant: the skip applied to every mechanism, which logs the warn here.
+/// kill. The cgroup lane's counterpart of the sync test of the same name. Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
