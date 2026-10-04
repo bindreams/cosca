@@ -1,6 +1,7 @@
-//! The elevation shim (plan F): a small cosca-controlled executable that an elevation front runs
-//! in place of the elevated program, so that cosca can reach the program through a socket.
+//! The elevation shim: a small cosca-controlled executable that an elevation front runs in place of
+//! the elevated program, so that cosca can reach the program through a socket.
 //!
-//! Only the wire protocol lives here so far; its two directions are [`protocol`].
+//! [`protocol`] is the wire format between the two: the shim's argv, its frames to cosca, and
+//! cosca's commands to it.
 
 pub(crate) mod protocol;

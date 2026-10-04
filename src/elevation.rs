@@ -44,11 +44,11 @@ pub(crate) mod sanitize;
     )
 )]
 pub(crate) mod shell_file;
-// Plan F: no caller until the shim and the acceptor land (F3 and later).
+// No caller until the shim and the acceptor land.
 #[cfg(unix)]
 #[allow(
     dead_code,
-    reason = "plan F builds the shim bottom-up; the wire protocol lands before its users"
+    reason = "the shim is built bottom-up; the wire protocol lands before its users"
 )]
 pub(crate) mod shim;
 #[cfg(windows)]
