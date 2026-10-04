@@ -184,7 +184,7 @@ A test group whose environment support varies by host (root, cgroups, and the li
 declares its own `COSCA_TEST_<GROUP>` variable, on by default: any value but the literal `0` runs
 the group. Only an explicit `COSCA_TEST_<GROUP>=0` disables it, reported as `ignored` with a
 reason: the shape a `requires` predicate gives in [skuld](https://github.com/bindreams/skuld), the
-test harness cosca is migrating to ([#151]). Without that explicit `0` the test runs for real and
+test harness cosca runs on ([#151]). Without that explicit `0` the test runs for real and
 fails on whatever an environment without support produces: a failed support check never turns into
 a skip.
 

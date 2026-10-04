@@ -14,18 +14,42 @@ The design rules every change follows are in [docs/principles.md](docs/principle
 
 ## Running tests
 
-Use [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`), run as `cargo nextest
-run`. It's what CI runs, and it's the recommended way to run cosca's suite: nextest
-isolates each test in its own process, rather than sharing one process across the whole run the
-way plain `cargo test` does.
+Run the suite with [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`):
+`cargo nextest run`. It's what CI runs, and nextest isolates each test in its own process.
 
 The suite signals process groups and creates cgroup leaves and Job Objects, so run it in a VM
 ([`scripts/devvm`](scripts/README.md)), a container or CI, never directly on your machine. See
 [principle 10](docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
 
-nextest doesn't run doctests, so CI runs those separately with `cargo test --doc`. cosca has none
-today. Claude Code agents in this repo deny plain `cargo test` (`.claude/settings.json`), so an
-agent can't run that step locally either — it only runs in CI.
+### The harness
+
+The lib and every integration test target run on [skuld](https://github.com/bindreams/skuld)
+(`harness = false` in `Cargo.toml`), not libtest. Each target's `main` calls `libtest_names()`,
+so test names keep libtest's `module::path::name` shape for nextest filters, and
+`require_known_labels()`, so a name in `SKULD_LABELS` that the binary doesn't declare fails at
+startup instead of selecting nothing (or, negated, everything). Labels are declared in
+[`src/test_harness.rs`](src/test_harness.rs). `SKULD_LABELS=<label>` selects a lane's tests, and
+only skuld binaries honour it: libtest binaries ignore it and would run whole.
+
+Libtest's `#[test]` never runs in a `harness = false` target, so
+[`.github/scripts/libtest_guard.py`](.github/scripts/libtest_guard.py) (a prek hook, and a CI
+step per target and feature powerset) fails on any such test and on any `test = true` target left
+on the default harness.
+
+### Doc tests
+
+nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`, which still
+uses rustdoc. cosca has none today. Claude Code agents in this repo deny plain `cargo test`
+(`.claude/settings.json`), so an agent can't run that step locally either.
+
+### Test groups
+
+A test group is declared once in [`src/test_groups.rs`](src/test_groups.rs) and gates its tests
+the way [principles 9 and 10](docs/principles.md#9-tests-fail-loudly-and-never-silently-skip)
+describe: `COSCA_TEST_<GROUP>=0` turns the group off (its tests report as ignored), and a
+system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To keep a group off
+on your machine without exporting variables each time, set the `=0` switches in the `[env]`
+table of `~/.cargo/config.toml`.
 
 ### Tests that need root
 
