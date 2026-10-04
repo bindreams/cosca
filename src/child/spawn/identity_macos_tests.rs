@@ -56,13 +56,25 @@ pub(crate) fn end_unsignalled_and_reap(pid: u32) {
     );
 }
 
-/// A failed spawn captures the identity of any child it leaves; none may exist. A stray one is
-/// reaped before the panic.
-pub(crate) fn assert_program_did_not_run() {
-    if let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() {
-        end_unsignalled_and_reap(id.pid());
-        panic!("the program ran: a failed spawn left child {}", id.pid());
-    }
+/// The argv of a program that writes `ran` to its stdout if it runs.
+pub(crate) const RAN_ARGV: [&str; 2] = ["/bin/echo", "ran"];
+
+/// A stdout for [`RAN_ARGV`], and the read end of the pipe it writes to.
+pub(crate) fn ran_marker() -> (crate::stdio::Stdio, std::io::PipeReader) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let stdout = crate::stdio::Stdio::from_file(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
+    (stdout, reader)
+}
+
+/// Asserts the program of `cmd` did not run: nothing is on `reader` once every copy of the write end
+/// has closed. `cmd` is dropped first, since it holds one. A program that ran writes and exits, so
+/// the read ends.
+pub(crate) fn assert_program_did_not_run(cmd: impl Sized, mut reader: std::io::PipeReader) {
+    use std::io::Read;
+    drop(cmd);
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("read the marker pipe");
+    assert!(out.is_empty(), "the program ran: {out:?}");
 }
 
 pub(crate) fn vanished(err: &Error) -> bool {
@@ -259,14 +271,17 @@ fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
 /// Mutant: the hook execs anyway (the spawn still reports the refusal, but a child is left running).
 #[skuld::test]
 fn macos_sync_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
-    let (mut cmd, _writer) = sync_blocker();
+    let (stdout, reader) = ran_marker();
+    let mut cmd = crate::Command::new();
+    cmd.args(RAN_ARGV);
+    cmd.stdout(stdout).expect("set stdout");
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
     let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    assert_program_did_not_run();
+    assert_program_did_not_run(cmd, reader);
 }
 
 // A child killed before it reports =====
@@ -325,5 +340,23 @@ fn macos_sync_spawn_failing_before_the_report_keeps_stds_error() {
     assert!(
         matches!(&err, Error::Io(e) if e.raw_os_error() == Some(libc::ENOENT)),
         "std's error stays: {err:?}"
+    );
+}
+
+/// The spawn consults the child's report before it attaches the containment: a child that died
+/// before exec is that, whatever the attach would have said of its pid (with `SIGCHLD` ignored the
+/// tree-walk attach finds the zombie gone).
+///
+/// Mutant: the spawn attaches first, so the forced attach failure is the error.
+#[skuld::test]
+fn macos_sync_spawn_consults_the_report_before_attaching() {
+    let (mut cmd, _writer) = sync_blocker();
+    let _killed = unique_report::seams::force_child_killed_before_report();
+    fault::set_force_attach_failure(true);
+    let err = cmd.spawn().expect_err("a child that never reported cannot be adopted");
+    fault::set_force_attach_failure(false);
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("died before exec")),
+        "the report decides before the attach does: {err:?}"
     );
 }
