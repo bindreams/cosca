@@ -433,16 +433,16 @@ jobs:
       # create child cgroups under. We make a fresh leaf directly under the unified root cgroup:
       # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
       # rule does not apply and a cgroup may hold BOTH the test process and a child
-      # leaf. We move our shell into it and run the labelled tests there (as root,
-      # single-threaded) — across the `--lib` unit-test binary (which carries the white-box
-      # CgroupLeaf::wait_drained coverage in src/containment/cgroup_tests.rs, and with `tokio` the
+      # leaf. We move our shell into it and run the labelled tests there (as root, in
+      # parallel) — across the `--lib` unit-test binary (which carries the white-box
+      # CgroupLeaf::wait_drained coverage in src/containment/cgroup/leaf_tests.rs, and with `tokio` the
       # async spawn's post-fork failure path), `spawn_io` and `tokio_io`. `CGROUP` means this lane: a
       # delegated cgroup, with the `unshare` that container seccomp profiles refuse permitted. The
       # tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
       #
       # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the tests
-      # labelled `cgroup` explicitly because they need a real cgroup v2 here), `cgroup_drop` (the drop-after-wait
-      # tests) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
+      # labelled `cgroup` explicitly, which keep in this lane what the old `test(/cgroup/)` name filter selected;
+      # most use fake leaves and also run in the main lanes) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
       # throwaway runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
@@ -468,7 +468,7 @@ jobs:
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
-            SKULD_LABELS="cgroup | cgroup_drop | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
+            SKULD_LABELS="cgroup | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.
             chown -R "$2" "$PWD/target"
             exit "$status"

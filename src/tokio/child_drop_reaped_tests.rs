@@ -413,7 +413,7 @@ mod cgroup_common;
 /// kill. The cgroup lane's counterpart of the sync test of the same name; `COSCA_TEST_CGROUP`
 /// is `0` everywhere else. Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[skuld::test(labels = [crate::test_harness::CGROUP_DROP])]
+#[skuld::test]
 async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
     use ::tokio::io::AsyncReadExt as _;

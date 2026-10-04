@@ -330,7 +330,7 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 #[cfg(feature = "tokio")]
 /// The cgroup lane's case of the test above. Off (`COSCA_TEST_CGROUP=0`) in every other lane.
 #[cfg(target_os = "linux")]
-#[skuld::test(labels = [test_harness::CGROUP_DROP])]
+#[skuld::test]
 async fn linux_cgroup_v2_async_drop_after_wait_still_tears_down_the_tree(#[fixture(cgroup)] _group: &Group) {
     drop_after_wait_still_tears_down_the_tree().await;
 }

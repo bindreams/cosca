@@ -52,10 +52,7 @@ pub const ISOLATED_PATHEXT_PRECEDENCE: skuld::Label;
 #[skuld::label]
 pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
 
-/// Selects the `CGROUP` group's tests and the other tests that need the delegated cgroup lane.
+/// Selects the `CGROUP` group's tests, and keeps in the cgroup lane the other tests its old `test(/cgroup/)` name
+/// filter selected (most use fake leaves and also run in the main lanes).
 #[skuld::label]
 pub const CGROUP: skuld::Label;
-
-/// Selects the tests that a drop after a reap still kills a cgroup's tree.
-#[skuld::label]
-pub const CGROUP_DROP: skuld::Label;

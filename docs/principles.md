@@ -232,9 +232,8 @@ runs. So does
 it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
 with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
-in. That step's `SKULD_LABELS` is `cgroup | cgroup_drop | namespaces`: `cgroup` also selects every
-test of `containment::cgroup` and the other tests labelled for that lane, and `cgroup_drop` the
-tests that a drop after a reap still kills a cgroup's tree. So does
+in. That step's `SKULD_LABELS` is `cgroup | namespaces`: `cgroup` also selects every
+test of `containment::cgroup` and the other tests labelled for that lane. So does
 `COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with
 `#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So do the other
 Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries and surveys),

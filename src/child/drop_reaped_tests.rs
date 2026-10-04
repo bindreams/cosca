@@ -441,7 +441,7 @@ fn assert_skipped_at_debug(mark: usize) {
 /// `0` everywhere else, and the lane gives consent with `COSCA_TEST_CGROUP_CONSENT=1`.
 /// Mutant: the skip applied to every mechanism, which logs the warn here.
 #[cfg(target_os = "linux")]
-#[skuld::test(labels = [crate::test_harness::CGROUP_DROP])]
+#[skuld::test]
 fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let mut cmd = root_that_leaves_a_cat();

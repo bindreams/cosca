@@ -142,10 +142,6 @@ mod reexec {
     const CGROUP_TEST: &str =
         "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
 
-    /// A real `CGROUP_DROP` test.
-    const CGROUP_DROP_TEST: &str =
-        "child::drop_reaped_tests::cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn";
-
     struct Case {
         test: &'static str,
         var: &'static str,
@@ -167,11 +163,6 @@ mod reexec {
         test: CGROUP_TEST,
         var: "COSCA_TEST_CGROUP",
         label: "cgroup",
-    };
-    const CGROUP_DROP: Case = Case {
-        test: CGROUP_DROP_TEST,
-        var: "COSCA_TEST_CGROUP",
-        label: "cgroup_drop",
     };
 
     /// Re-execs this binary on exactly the case's test with the group's variables set as given (`None` removes them).
@@ -370,11 +361,5 @@ mod reexec {
     #[skuld::test]
     fn the_cgroup_label_selects_its_tests() {
         assert_label_selects(&CGROUP);
-    }
-
-    /// Mutant: the drop test drops its `cgroup_drop` label (the lane's `cgroup` label still selects it).
-    #[skuld::test]
-    fn the_cgroup_drop_label_selects_the_drop_test() {
-        assert_label_selects(&CGROUP_DROP);
     }
 }
