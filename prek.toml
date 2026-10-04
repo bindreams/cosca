@@ -32,6 +32,17 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+[[repos.hooks]]
+id = "libtest-guard"
+name = "libtest guard"
+# No test in a `harness = false` target uses the built-in `#[test]`. Host only, debug, default features;
+# CI's Test job runs it per target over the feature powerset in both profiles (and skips this hook).
+entry = "uv run --script .github/scripts/libtest_guard.py"
+language = "system"
+# The guard's inputs: sources, manifests, its config and itself.
+files = '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.github/libtest-guard/|^\.github/scripts/libtest_guard\.py$'
+pass_filenames = false
+
 # External hooks =======================================================================================================
 # Every external hook is pinned as `rev = "<40-hex commit SHA>" # frozen: <tag>`, with `repo` on the line
 # before `rev` (comment lines may sit between). `prek autoupdate --freeze` writes this form. Renovate's

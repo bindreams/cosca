@@ -26,9 +26,11 @@ MANIFEST = FIXTURE / "Cargo.toml"
 
 host_os = {"Linux": "linux", "Darwin": "macos"}.get(platform.system(), "windows")
 host_triple = subprocess.run(["rustc", "--print", "host-tuple"], check=True, capture_output=True, text=True).stdout.strip()
-host_arch, _, rest = host_triple.partition("-")
-other_arch = {"x86_64": "aarch64", "aarch64": "x86_64"}[host_arch]
-other_triple = f"{other_arch}-{rest}"
+host_arch = host_triple.partition("-")[0]
+# The other architecture's triple comes from the matrix (`matrix.other`); it must be installed.
+other_triple = os.environ.get("LIBTEST_GUARD_OTHER_TARGET") or sys.exit(
+    "::error::LIBTEST_GUARD_OTHER_TARGET is not set: the target triple of the other architecture")
+other_arch = other_triple.partition("-")[0]
 
 failures = 0
 checks = 0
