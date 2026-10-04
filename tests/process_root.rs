@@ -214,9 +214,10 @@ mod uid_switch_group {
         let (outcome, success, stdout) = run_uid_switch_test(&[], group, consent, None);
         assert_eq!((outcome.failed, outcome.passed, outcome.ignored), (1, 0, 0), "{stdout}");
         assert!(!success, "{stdout}");
-        // Only the fixture's refusal carries this message; a body that ran cannot.
+        // The fixture's own setup text. The consent variable's name alone would not do: the body's
+        // `assert_root_capable` panic names it too, so an unprivileged run would pass without the check.
         assert!(
-            failure_message(&stdout).contains("COSCA_TEST_UID_SWITCH_CONSENT=1"),
+            failure_message(&stdout).contains("setup failed: the group runs as real root"),
             "{stdout}"
         );
     }
