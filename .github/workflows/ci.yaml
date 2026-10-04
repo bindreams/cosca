@@ -191,8 +191,8 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # The slowest lane is windows/amd64: 1848 s, guard and self-test included. 50 min is 1.6x that.
-    # All lanes share this bound.
+    # The slowest lanes are darwin/amd64 (1971 s at most) and windows/amd64 (1848 s), guard and
+    # self-test included. 50 min is 1.5x the slowest. All lanes share this bound.
     timeout-minutes: 50
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
