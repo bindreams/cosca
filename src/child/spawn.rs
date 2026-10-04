@@ -508,7 +508,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
+fn teardown_after_attach_failure(mut child: std::process::Child, unique: u64) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
 
@@ -516,7 +516,9 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target),
+            Ok(Waited::Reapable) => {
+                let _ = child.wait();
+            }
             Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
             Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
             Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
@@ -542,8 +544,8 @@ fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
     };
     let orphaned = "launchd holds it, because its tracer died";
     match peek_verified(target) {
-        Err(e) => return unverifiable(&e),
-        Ok(Peek::Foreign(Foreign::Orphaned)) => return unverifiable(&orphaned),
+        Err(_) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+        Ok(Peek::Foreign(Foreign::Orphaned)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
         Ok(Peek::Foreign(_)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
         Ok(Peek::Running) => return log::warn!("spawn teardown: pid {pid} is still running"),
         Ok(Peek::Exit(_)) => {}
