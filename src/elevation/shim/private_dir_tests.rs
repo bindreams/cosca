@@ -308,3 +308,39 @@ fn a_fork_copys_drop_leaves_the_directory() {
     drop(dir);
     assert!(!path.exists(), "the creator's drop still removes it");
 }
+
+fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {
+    Err(rustix::io::Errno::IO)
+}
+
+/// Removes the directory itself, so the cleanup that follows fails with `ENOENT`.
+fn open_fails_after_removing(
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+) -> rustix::io::Result<rustix::fs::Stat> {
+    rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR)?;
+    Err(rustix::io::Errno::IO)
+}
+
+#[skuld::test]
+fn a_failure_after_mkdirat_removes_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails) else {
+        panic!("a failing open must be a Create error");
+    };
+    assert!(!path.exists(), "the half-made directory must not be left");
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[skuld::test]
+fn a_failed_cleanup_after_a_failure_warns() {
+    crate::log_capture::install();
+    let root = tempfile::tempdir().unwrap();
+    let mark = crate::log_capture::mark();
+    let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails_after_removing)
+    else {
+        panic!("a failing open must be a Create error");
+    };
+    let path_text = path.display().to_string();
+    assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
+}

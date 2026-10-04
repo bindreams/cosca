@@ -2,7 +2,7 @@
 //! umask says) with a random name in a temp directory no other user can tamper with, removed
 //! through file descriptors.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,22 @@ pub(crate) struct PrivateDir {
     removed: bool,
 }
 
+/// Opens the directory `name` in `parent`, makes it `0700` and returns its `stat`.
+type OpenMade = fn(&OwnedFd, &OsStr) -> rustix::io::Result<Stat>;
+
+fn open_and_harden(parent: &OwnedFd, name: &OsStr) -> rustix::io::Result<Stat> {
+    // `NOFOLLOW`: whatever now holds the name, we record the directory itself.
+    let dir = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    // `mkdirat`'s mode is masked by the umask; the descriptor's is not.
+    fchmod(&dir, Mode::RWXU)?;
+    fstat(&dir)
+}
+
 #[allow(
     clippy::unnecessary_cast,
     reason = "`st_dev` and `st_ino` have different widths per platform"
@@ -90,6 +106,12 @@ impl PrivateDir {
     /// In `tmp`, which must be absolute, and whose real path and every ancestor of it must pass
     /// [`check_facts`]; otherwise nothing is created.
     pub(crate) fn create_in(tmp: &Path) -> Result<Self, PrivateDirError> {
+        Self::create_with(tmp, open_and_harden)
+    }
+
+    /// [`create_in`](Self::create_in), where `open` opens the directory just made, in `parent`
+    /// under `name`, and returns its `stat`. A failure removes the directory.
+    fn create_with(tmp: &Path, open: OpenMade) -> Result<Self, PrivateDirError> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let tmp_err = |source| PrivateDirError::Tmpdir {
@@ -138,18 +160,7 @@ impl PrivateDir {
                     })
                 }
             }
-            // `NOFOLLOW`: whatever now holds the name, we record the directory itself.
-            let made = openat(
-                &parent,
-                &name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .and_then(|dir| {
-                // `mkdirat`'s mode is masked by the umask; the descriptor's is not.
-                fchmod(&dir, Mode::RWXU)?;
-                fstat(&dir)
-            });
+            let made = open(&parent, &name);
             let id = match made {
                 Ok(st) => {
                     debug_assert_eq!(FileType::from_raw_mode(st.st_mode), FileType::Directory);
