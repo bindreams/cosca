@@ -1,42 +1,18 @@
-//! The private directory that holds the shim's socket (D14): a `0700` directory with a random
-//! name in a temp directory no other user can tamper with, removed through file descriptors.
+//! The private directory that holds the shim's socket (D14): a directory made `0700` (whatever the
+//! umask says) with a random name in a temp directory no other user can tamper with, removed
+//! through file descriptors.
 
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
+use rustix::fs::{fchmod, fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
 use rustix::io::Errno;
 
-const STICKY: u32 = 0o1000;
-const GROUP_OTHER_WRITE: u32 = 0o022;
+mod facts;
 
-/// What the path check looks at in a directory's `stat`.
-pub(crate) struct DirFacts {
-    pub(crate) uid: u32,
-    pub(crate) mode: u32,
-}
-
-impl DirFacts {
-    #[allow(
-        clippy::useless_conversion,
-        reason = "`st_mode` is `u16` on macOS and `u32` on Linux"
-    )]
-    fn of(st: &Stat) -> Self {
-        Self {
-            uid: st.st_uid,
-            mode: st.st_mode.into(),
-        }
-    }
-}
-
-/// True if no user but `euid` and root can rename an entry of this directory: it is owned by one of
-/// them, and either sticky (others may not rename entries they do not own) or not writable by
-/// group or others.
-pub(crate) fn check_facts(facts: &DirFacts, euid: u32) -> bool {
-    (facts.uid == 0 || facts.uid == euid) && (facts.mode & STICKY != 0 || facts.mode & GROUP_OTHER_WRITE == 0)
-}
+use facts::{check_facts, DirFacts};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PrivateDirError {
@@ -53,7 +29,8 @@ pub(crate) enum PrivateDirError {
     Create { path: PathBuf, source: io::Error },
 }
 
-/// What [`PrivateDir::remove`] found.
+/// What removing a [`PrivateDir`] found. Every outcome except `Removed` is logged: `Gone` at
+/// `debug`, the rest at `warn`, naming the path.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Removal {
     Removed,
@@ -69,13 +46,16 @@ pub(crate) enum Removal {
 
 /// A private directory, identified by `(dev, ino)` and removed only if the name still holds it.
 ///
-/// Dropping it closes its descriptors and leaves the directory; [`remove`](Self::remove) is the
-/// teardown, and only the pid that made it may call it.
+/// [`remove`](Self::remove) is the explicit teardown. `Drop` is the same removal, with the same
+/// logging, so no path leaks the directory silently. Only the pid that made the directory removes
+/// it: a fork copy's `Drop` closes its own descriptors and nothing else.
 pub(crate) struct PrivateDir {
     parent: OwnedFd,
     name: OsString,
     id: (u64, u64),
     path: PathBuf,
+    creator: u32,
+    removed: bool,
 }
 
 #[allow(
@@ -94,7 +74,7 @@ fn io_err(e: Errno) -> io::Error {
 fn unsafe_ancestor(real: &Path, euid: u32) -> io::Result<Option<PathBuf>> {
     for path in real.ancestors() {
         let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)?;
-        if !check_facts(&DirFacts::of(&st), euid) {
+        if !check_facts(&DirFacts::read(path, &st, euid)?, euid) {
             return Ok(Some(path.to_owned()));
         }
     }
@@ -136,7 +116,8 @@ impl PrivateDir {
         .map_err(|e| tmp_err(io_err(e)))?;
         // The path walk above may have raced a rename; the descriptor we hold is checked again.
         let st = fstat(&parent).map_err(|e| tmp_err(io_err(e)))?;
-        if !check_facts(&DirFacts::of(&st), euid) {
+        let facts = DirFacts::read(&real, &st, euid).map_err(tmp_err)?;
+        if !check_facts(&facts, euid) {
             return Err(unsafe_err(real));
         }
         loop {
@@ -158,15 +139,24 @@ impl PrivateDir {
                 }
             }
             // `NOFOLLOW`: whatever now holds the name, we record the directory itself.
-            let opened = openat(
+            let made = openat(
                 &parent,
                 &name,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .and_then(|dir| fstat(&dir));
-            let id = match opened {
-                Ok(st) => id_of(&st),
+            .and_then(|dir| {
+                // `mkdirat`'s mode is masked by the umask; the descriptor's is not.
+                fchmod(&dir, Mode::RWXU)?;
+                fstat(&dir)
+            });
+            let id = match made {
+                Ok(st) => {
+                    debug_assert_eq!(FileType::from_raw_mode(st.st_mode), FileType::Directory);
+                    debug_assert_eq!(st.st_uid, euid);
+                    debug_assert_eq!(u32::from(st.st_mode) & 0o7777, 0o700);
+                    id_of(&st)
+                }
                 Err(e) => {
                     if let Err(rm) = unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
                         log::warn!("cannot remove the private directory {}: {rm}", path.display());
@@ -177,7 +167,14 @@ impl PrivateDir {
                     });
                 }
             };
-            return Ok(Self { parent, name, id, path });
+            return Ok(Self {
+                parent,
+                name,
+                id,
+                path,
+                creator: std::process::id(),
+                removed: false,
+            });
         }
     }
 
@@ -186,9 +183,28 @@ impl PrivateDir {
     }
 
     /// Removes the directory if the name still holds the one we made, by `(dev, ino)`, with
-    /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Everything but "already
-    /// gone" is logged at `warn`, naming the path.
-    pub(crate) fn remove(self) -> Removal {
+    /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Logs as [`Removal`]
+    /// says. Only the pid that made the directory may call it.
+    pub(crate) fn remove(mut self) -> Removal {
+        debug_assert_eq!(
+            self.creator,
+            std::process::id(),
+            "removed by a pid that did not make it"
+        );
+        self.removed = true;
+        self.remove_by_fd()
+    }
+
+    /// `Drop`'s body, for `pid` as the current process: nothing unless `pid` made the directory
+    /// and it is not removed yet.
+    fn release(&mut self, pid: u32) {
+        if pid == self.creator && !self.removed {
+            self.removed = true;
+            self.remove_by_fd();
+        }
+    }
+
+    fn remove_by_fd(&self) -> Removal {
         let name = &self.name;
         let removal = match statat(&self.parent, name, AtFlags::SYMLINK_NOFOLLOW) {
             Err(Errno::NOENT) => Removal::Gone,
@@ -213,6 +229,12 @@ impl PrivateDir {
             Removal::Failed(e) => log::warn!("cannot remove the private directory {path}: {e}"),
         }
         removal
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        self.release(std::process::id());
     }
 }
 

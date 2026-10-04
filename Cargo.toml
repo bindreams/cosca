@@ -117,7 +117,7 @@ windows = { version = "0.62", features = [
 [target.'cfg(unix)'.dependencies]
 # 0.2.187 added `proc_bsdshortinfo` and `PROC_PIDT_SHORTBSDINFO`; 0.2.189 is what is locked.
 libc = "0.2.189"
-nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
+nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs", "user"] }
 # Typed `fcntl` wrappers: the raw call is variadic, and the right argument width differs per libc.
 rustix = { version = "1", features = ["fs"] }
 # The random part of a cgroup leaf's name and of the elevation shim's private directory's.
@@ -132,6 +132,10 @@ rustix = { version = "1", features = ["process", "event", "net", "thread"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Raw Mach threads for the tracer helper's thread-listing tests.
 mach2 = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Reads the ACL that decides who may rename entries of a directory the shim channel lives under.
+exacl = "0.13"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # `pty`: `ioctl_tiocgptpeer`.

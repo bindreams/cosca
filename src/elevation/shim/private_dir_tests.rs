@@ -36,11 +36,122 @@ fn path_check_accepts_sticky_root_and_own_0700_and_refuses_the_rest() {
     ];
     for (uid, mode, accepted) in table {
         assert_eq!(
-            check_facts(&DirFacts { uid, mode }, me),
+            check_facts(
+                &DirFacts {
+                    uid,
+                    mode,
+                    ignores_ownership: false,
+                    acl_grants_others: false
+                },
+                me
+            ),
             accepted,
             "owner {uid}, mode {mode:o}"
         );
     }
+}
+
+#[skuld::test]
+fn path_check_refuses_an_acl_grant_and_an_ownerless_volume() {
+    let facts = |ignores_ownership, acl_grants_others| DirFacts {
+        uid: 1000,
+        mode: 0o700,
+        ignores_ownership,
+        acl_grants_others,
+    };
+    assert!(check_facts(&facts(false, false), 1000));
+    assert!(!check_facts(&facts(false, true), 1000));
+    assert!(!check_facts(&facts(true, false), 1000));
+}
+
+/// Another test's `stat`, for the facts a `statfs` and an ACL are added to.
+#[cfg(target_os = "macos")]
+fn some_stat() -> rustix::fs::Stat {
+    rustix::fs::stat(std::env::temp_dir()).unwrap()
+}
+
+/// XNU reports every file as the caller's on a volume with `MNT_IGNORE_OWNERSHIP`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_ignore_ownership_volume_is_refused() {
+    let mut st = some_stat();
+    st.st_uid = euid();
+    st.st_mode = 0o40700;
+    let flags = libc::MNT_IGNORE_OWNERSHIP as u32;
+    assert!(check_facts(&DirFacts::from_parts(&st, 0, false), euid()));
+    assert!(!check_facts(&DirFacts::from_parts(&st, flags, false), euid()));
+    assert!(!check_facts(&DirFacts::from_parts(&st, flags | 1, false), euid()));
+}
+
+/// Under uid 99 XNU reports every file as the caller's, whatever the volume.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn euid_99_is_refused_on_macos() {
+    let facts = DirFacts {
+        uid: 99,
+        mode: 0o700,
+        ignores_ownership: false,
+        acl_grants_others: false,
+    };
+    assert!(!check_facts(&facts, 99));
+}
+
+#[cfg(target_os = "macos")]
+fn chmod_acl(dir: &Path, ace: &str) {
+    let out = crate::test_spawn::output_captured(std::process::Command::new("/bin/chmod").arg("+a").arg(ace).arg(dir))
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "chmod +a {ace:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn acl_dir(ace: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("tmp");
+    fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o700);
+    chmod_acl(&dir, ace);
+    (root, dir)
+}
+
+/// An allow entry for another user lets them rename entries whatever the mode bits say.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_acl_allow_entry_that_changes_entries_is_refused() {
+    for perm in ["add_file", "add_subdirectory", "delete_child", "writesecurity", "chown"] {
+        for flags in ["", ",file_inherit,directory_inherit,only_inherit"] {
+            let ace = format!("user:nobody allow {perm}{flags}");
+            let (_root, dir) = acl_dir(&ace);
+            let Err(PrivateDirError::Unsafe { offender, .. }) = PrivateDir::create_in(&dir) else {
+                panic!("{ace:?} must be refused");
+            };
+            assert_eq!(offender, fs::canonicalize(&dir).unwrap(), "{ace:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_acl_with_only_denials_reads_and_our_own_entries_is_accepted() {
+    for ace in [
+        "everyone deny delete",
+        "user:nobody deny add_file,delete_child",
+        "user:nobody allow list,search,readattr",
+    ] {
+        let (_root, dir) = acl_dir(ace);
+        let made = PrivateDir::create_in(&dir).unwrap_or_else(|e| panic!("{ace:?}: {e}"));
+        assert_eq!(made.remove(), Removal::Removed);
+    }
+    let me = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(euid()))
+        .unwrap()
+        .expect("the euid has a user name")
+        .name;
+    let (_root, dir) = acl_dir(&format!("user:{me} allow add_file"));
+    let made = PrivateDir::create_in(&dir).unwrap();
+    assert_eq!(made.remove(), Removal::Removed);
 }
 
 #[skuld::test]
@@ -144,4 +255,56 @@ fn relative_or_missing_tmpdir_is_an_error_naming_it() {
         panic!("a missing tmpdir must be refused");
     };
     assert!(e.to_string().contains(&missing.display().to_string()), "{e}");
+}
+
+#[skuld::test]
+fn the_directory_is_0700_whatever_the_umask_says() {
+    let Some(_done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_directory_is_0700_whatever_the_umask_says),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    // SAFETY: `umask` has no preconditions; this test runs alone in its process.
+    unsafe { libc::umask(0o277) };
+    let dir = PrivateDir::create_in(root.path()).unwrap();
+    assert_eq!(fs::symlink_metadata(dir.path()).unwrap().mode() & 0o7777, 0o700);
+}
+
+#[skuld::test]
+fn drop_in_the_owning_pid_removes_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    drop(dir);
+    assert!(!path.exists());
+}
+
+#[skuld::test]
+fn drop_logs_what_remove_logs() {
+    crate::log_capture::install();
+    let root = tempfile::tempdir().unwrap();
+    let dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    fs::write(path.join("leftover"), b"x").unwrap();
+    let mark = crate::log_capture::mark();
+    drop(dir);
+    assert!(path.join("leftover").exists());
+    let path_text = path.display().to_string();
+    assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
+}
+
+#[skuld::test]
+fn a_fork_copys_drop_leaves_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let mut dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    dir.release(std::process::id().wrapping_add(1));
+    assert!(
+        path.is_dir(),
+        "a pid that did not make the directory must not remove it"
+    );
+    drop(dir);
+    assert!(!path.exists(), "the creator's drop still removes it");
 }
