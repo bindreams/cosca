@@ -92,6 +92,24 @@ fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+/// An identity the OS refuses to report fails the spawn as `Unassessable`, and the child is still
+/// killed and reaped: a refusal says nothing against the child.
+///
+/// Mutant: the arm leaves the child running.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn identity_refusal_reaps_the_spawned_child() {
+    let (mut cmd, teardown) = teardown_blocker();
+    fault::set_force_identity_unknown(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_unknown(false);
+
+    let err = err.expect("a refused identity read must make spawn return Err");
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
+}
+
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn attach_failure_reaps_the_spawned_child() {
@@ -509,6 +527,53 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio(#[fixt
     file.rewind().expect("rewind the file");
     file.read_to_end(&mut written).expect("read the file");
     assert_eq!(written, b"", "nothing reached the child's stdio");
+}
+
+/// A spawn whose identity check fails ends the leaf's placement exchange before it kills the child:
+/// the leaf then answers only for the tree, as it does after an attach failure, and the kill never
+/// races the exchange's reads.
+///
+/// Mutant: the identity-failure arm settles the verdict after the kill, or not at all.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault as cgroup_fault;
+    use crate::send_log::Capture;
+    use crate::signal::Sig;
+
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain();
+    let capture = Rc::new(Capture::start());
+    let sends_at_settle = Rc::new(Cell::new(None));
+    let _hook = cgroup_fault::set_on_take_placement({
+        let (capture, sends_at_settle) = (Rc::clone(&capture), Rc::clone(&sends_at_settle));
+        move || sends_at_settle.set(Some(capture.entries().len()))
+    });
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    err.expect("a vanished identity must fail the spawn");
+
+    let Some(crate::identity::Resolved::Found(child)) = fault::take_captured() else {
+        panic!("the seam must capture the child's identity");
+    };
+    assert_eq!(
+        sends_at_settle.get(),
+        Some(0),
+        "the verdict must be settled, and before anything is sent to the child"
+    );
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|&(pid, sig, _)| pid == child.pid() && sig == Sig::Kill),
+        "the child must be killed after the verdict: {:?}",
+        capture.entries()
+    );
+    teardown.assert_killed();
 }
 
 // ===== A refused spawn leaves our handle inheritance alone =====
@@ -1103,16 +1168,10 @@ fn macos_identity_unknown_closes_our_pipe_ends() {
 
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_attach_failure_closes_our_pipe_ends() {
+fn macos_tree_walk_identity_failure_closes_our_pipe_ends() {
     macos_failed_spawn_closes_our_pipe_ends(
-        || {
-            crate::containment::fdmarker::fault::set_fault(Some(crate::containment::fdmarker::fault::Fault::Pipe));
-            fault::set_force_identity_unknown(true);
-        },
-        || {
-            fault::set_force_identity_unknown(false);
-            crate::containment::fdmarker::fault::set_fault(None);
-        },
+        || fault::set_force_identity_unknown(true),
+        || fault::set_force_identity_unknown(false),
         true,
     );
 }
@@ -1247,62 +1306,6 @@ fn macos_identity_unknown_leaves_the_child_alone() {
 
     assert!(matches!(err, Some(Error::Unassessable { .. })), "{err:?}");
     assert_left_alone(mark, "cannot be shown to be ours", &left);
-}
-
-/// macOS: the tree-walk root has no fd marker (its install is forced to fail), so the attach reads
-/// the root's identity itself, and that read is `Gone` (reaped by someone else; the pid may be
-/// reused). The attach fails and nothing is signalled or waited on by pid: the child is left alone,
-/// with a warning naming it.
-///
-/// Mutant: the attach arm kills and waits on the child by pid (`child.kill()`, then `child.wait()`).
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn macos_a_tree_walk_attach_with_a_gone_identity_leaves_the_child_alone() {
-    macos_tree_walk_attach_fails(true);
-}
-
-/// As above, with an identity that cannot be read (`Unknown`).
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn macos_a_tree_walk_attach_with_an_unknown_identity_leaves_the_child_alone() {
-    macos_tree_walk_attach_fails(false);
-}
-
-#[cfg(target_os = "macos")]
-fn macos_tree_walk_attach_fails(gone: bool) {
-    use crate::containment::fdmarker::fault::{set_fault, Fault};
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let mut cmd = blocker();
-    cmd.contain_with(crate::ContainMode::TreeWalk);
-    set_fault(Some(Fault::Pipe));
-    if gone {
-        fault::set_force_identity_vanished(true);
-    } else {
-        fault::set_force_identity_unknown(true);
-    }
-    let err = cmd.spawn().err();
-    fault::set_force_identity_vanished(false);
-    fault::set_force_identity_unknown(false);
-    set_fault(None);
-    let left = captured_child();
-
-    let err = err.expect("the failed attach fails the spawn");
-    // The error is the attach's own read of the root (`resolve_root_id`), not the spawn's later one.
-    match (&err, gone) {
-        (Error::Containment { detail }, true) => assert!(detail.contains("tree-walk root vanished"), "{detail}"),
-        (Error::Unassessable { detail, .. }, false) => assert!(detail.contains("tree-walk root pid"), "{detail}"),
-        _ => panic!("unexpected error {err:?}"),
-    }
-    assert_left_alone(
-        mark,
-        if gone {
-            "was reaped by someone else"
-        } else {
-            "cannot be shown to be ours"
-        },
-        &left,
-    );
 }
 
 /// The spawn pid is readable only inside a hook: a stale one from an earlier spawn must not answer.

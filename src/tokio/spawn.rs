@@ -338,7 +338,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, child) = {
+    let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -474,30 +474,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
-    // Attached before the identity is read and checked, as the sync spawn does: the attach reads
-    // the tree-walk root by pid, so a reap before the check makes that read name a stranger, and
-    // the check then fails the spawn `Gone`. Attached after, a reap in between would leave the
-    // attachment's root a stranger under an identity that passed.
-    #[cfg(test)]
-    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
-    let attach = crate::child::spawn::attach_or_fault(
-        pid,
-        #[cfg(windows)]
-        proc_handle,
-        prepared,
-    );
-    let attachment = match attach {
-        Ok(v) => v,
-        // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
-        // attach never leaks a live/suspended process.
-        Err(e) => {
-            proc.reap_now(pid);
-            return Err(e);
-        }
-    };
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
-    // it, and a panic unwinds through `ProcSource`'s `Drop`.
+    // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
+    // and reads nothing by pid.
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
@@ -508,9 +488,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     };
     let id = match resolved {
         Resolved::Found(id) => id,
-        // Mirror the attach-failure path above: tear the child down so a vanished-identity error
-        // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
+        // Tear the child down so a vanished-identity error never leaks a live (Windows: still
+        // CREATE_SUSPENDED) process.
         other => {
+            // The leaf's placement exchange ends before the kill, as an attach would end it.
+            prepared.settle_verdict(pid);
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -526,6 +508,23 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             }
             proc.reap_now(pid);
             return Err(crate::child::spawn::spawn_identity_error(other));
+        }
+    };
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
+    let attach = crate::child::spawn::attach_or_fault(
+        id,
+        #[cfg(windows)]
+        proc_handle,
+        prepared,
+    );
+    let attachment = match attach {
+        Ok(v) => v,
+        // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
+        // attach never leaks a live/suspended process.
+        Err(e) => {
+            proc.reap_now(pid);
+            return Err(e);
         }
     };
 

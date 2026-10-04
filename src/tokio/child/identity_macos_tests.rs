@@ -249,3 +249,30 @@ async fn macos_tokio_spawn_failing_before_the_report_keeps_stds_error_and_does_n
         "the program never ran, so nothing is left running"
     );
 }
+
+/// As the sync twin: the fd marker's root is the verified identity, and the attach reads nothing
+/// by pid.
+///
+/// Mutant: the attach reads the marker's root with `ProcessId::of(pid)`.
+#[skuld::test]
+async fn macos_tokio_fdmarker_attach_reads_nothing_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, _writer) = tokio_blocker();
+    cmd.contain();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_marker_root(),
+        Some(child.id()),
+        "the marker's root is the verified identity"
+    );
+}

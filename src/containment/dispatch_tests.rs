@@ -118,7 +118,7 @@ fn attached_fd_marker_carries_recyclable_pgid_tracks_its_own_pgid() {
             read_handle,
             fd: write.as_fd().as_raw_fd(),
         };
-        crate::containment::fdmarker::Marker::new(prepared, None, pgid, false)
+        crate::containment::fdmarker::Marker::new(prepared, crate::identity::ProcessId::current(), pgid)
     }
 
     assert!(Attached::FdMarker(marker_with_pgid(Some(1234))).carries_recyclable_pgid());
@@ -162,8 +162,11 @@ fn nested_attach_is_delegated() {
             use std::os::windows::io::AsRawHandle;
             child.as_raw_handle()
         };
+        let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+            panic!("the helper child must be readable");
+        };
         let attachment = attach(
-            child.id(),
+            id,
             #[cfg(windows)]
             proc_handle,
             prepared,
@@ -311,7 +314,7 @@ fn attached_fd_marker_is_actionable() {
         read_handle,
         fd: write.as_fd().as_raw_fd(),
     };
-    let marker = crate::containment::fdmarker::Marker::new(prepared, None, None, false);
+    let marker = crate::containment::fdmarker::Marker::new(prepared, crate::identity::ProcessId::current(), None);
     assert!(Attached::FdMarker(marker).is_actionable());
 }
 
@@ -395,52 +398,27 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
     );
 }
 
+/// The spawn's identity read tells an OS refusal from a vanished pid: denial must not read as
+/// vanishing, and absence must not read as denial.
 #[cfg(windows)]
 #[skuld::test]
-fn resolve_root_id_distinguishes_a_denied_pid_from_a_vanished_one() {
+fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
+    use crate::child::spawn::{resolve_identity_unchecked, spawn_identity_error};
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
 
-    let Err(super::AttachError {
-        error: crate::error::Error::Unassessable { detail, .. },
-        identity: _,
-    }) = super::resolve_root_id(child.pid())
-    else {
-        panic!("a pid we may not query must not resolve to a root identity");
-    };
+    let denied = spawn_identity_error(resolve_identity_unchecked(child.pid()));
     assert!(
-        detail.contains("identity could not be read"),
-        "denial must not read as vanishing: {detail}"
+        matches!(denied, crate::error::Error::Unassessable { .. }),
+        "a pid we may not query must not read as vanished: {denied:?}"
     );
 
     // Contrast: a pid no process holds.
-    let Err(super::AttachError {
-        error: crate::error::Error::Containment { detail },
-        identity: _,
-    }) = super::resolve_root_id(0xFFFF_FFF0)
-    else {
-        panic!("a nonexistent pid must not resolve");
-    };
-    assert!(detail.contains("vanished"), "absence must not read as denial: {detail}");
-}
-
-/// Where `openat2` is unavailable the root's identity cannot be read, and the error says why.
-/// Mutant: "`resolve_root_id` reports every `Unknown` as a bare `Unassessable`".
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn resolve_root_id_names_a_missing_openat2() {
-    let _forced = crate::identity::proc_view_fault::force_openat2_errno(rustix::io::Errno::NOSYS);
-    let Err(super::AttachError {
-        error: crate::error::Error::Unsupported { detail, .. },
-        identity: _,
-    }) = super::resolve_root_id(std::process::id())
-    else {
-        panic!("a host without openat2 must not resolve a root identity");
-    };
+    let absent = spawn_identity_error(resolve_identity_unchecked(0xFFFF_FFF0));
     assert!(
-        detail.starts_with(&crate::identity::openat2_refused_message("ENOSYS")),
-        "{detail}"
+        matches!(&absent, crate::error::Error::Io(e) if e.to_string().contains("reaped by another party")),
+        "absence must not read as denial: {absent:?}"
     );
 }
 
@@ -488,7 +466,7 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
         read_handle: handle,
         fd: 3,
     };
-    let attached = Attached::FdMarker(Marker::new(prepared, None, None, false));
+    let attached = Attached::FdMarker(Marker::new(prepared, crate::identity::ProcessId::current(), None));
 
     assert_eq!(
         attached
@@ -565,7 +543,7 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         is_root: true,
         cgroup_leaf: Some(leaf),
     };
-    super::attach_tree(std::process::id(), prepared).expect("attach_tree")
+    super::attach_tree(crate::identity::ProcessId::current(), prepared).expect("attach_tree")
 }
 
 /// A leaf directory whose `cgroup.procs` lists some OTHER pid, never this test's.
@@ -680,7 +658,8 @@ fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
     };
 
     crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    let (containment, attached) = super::attach_tree(std::process::id(), prepared).expect("attach_tree");
+    let (containment, attached) =
+        super::attach_tree(crate::identity::ProcessId::current(), prepared).expect("attach_tree");
 
     assert_eq!(containment, crate::containment::Containment::ProcessGroup);
     assert!(matches!(attached, super::Attached::ProcessGroup(_)), "got {attached:?}");
@@ -747,29 +726,5 @@ fn kill_on_drop_true_leaves_a_cgroup_leaf_armed() {
         std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
         b"1",
         "the default is still a kill-on-drop teardown"
-    );
-}
-
-/// The root's identity read hands its verdict back with the error, so a caller does not infer it
-/// from the error's variant.
-///
-/// Mutant: `resolve_root_id` drops the verdict (`identity: None`), or swaps `Gone` and `Unknown`.
-#[cfg(unix)]
-#[skuld::test]
-fn resolve_root_id_hands_back_the_identity_verdict() {
-    use super::RootIdentity;
-    use crate::child::spawn::fault;
-
-    fault::set_force_identity_vanished(true);
-    let gone = super::resolve_root_id(std::process::id());
-    fault::set_force_identity_vanished(false);
-    fault::set_force_identity_unknown(true);
-    let unknown = super::resolve_root_id(std::process::id());
-    fault::set_force_identity_unknown(false);
-
-    assert_eq!(gone.expect_err("a vanished root").identity, Some(RootIdentity::Gone));
-    assert_eq!(
-        unknown.expect_err("an unreadable root").identity,
-        Some(RootIdentity::Unknown)
     );
 }
