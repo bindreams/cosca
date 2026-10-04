@@ -1,0 +1,44 @@
+name: probe-gui
+on:
+  pull_request:
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Before the right is changed (runner user, 30s bound)
+        continue-on-error: true
+        run: |
+          set +e
+          sudo security authorizationdb read system.privilege.admin 2>&1 | head -20
+          /usr/bin/perl -e 'alarm 30; exec @ARGV' /usr/bin/osascript -e 'do shell script "id -u" with administrator privileges'
+          echo "osascript (before) rc=$?"
+      - name: Allow the right and try as the runner user (60s bound)
+        continue-on-error: true
+        run: |
+          set +e
+          sudo security authorizationdb write system.privilege.admin allow; echo "write rc=$?"
+          sudo security authorizationdb read system.privilege.admin 2>&1 | head -20
+          /usr/bin/perl -e 'alarm 60; exec @ARGV' /usr/bin/osascript -e 'do shell script "id -u" with administrator privileges'
+          echo "osascript (runner, after) rc=$?"
+      - name: Try as a throwaway non-admin user (60s bound)
+        continue-on-error: true
+        run: |
+          set +e
+          pw="Zq9-$(openssl rand -hex 8)"
+          sudo sysadminctl -addUser coscaelev -password "$pw" >/dev/null 2>&1; echo "addUser rc=$?"
+          sudo -u coscaelev -H /usr/bin/perl -e 'alarm 60; exec @ARGV' /usr/bin/osascript -e 'do shell script "id -u" with administrator privileges'
+          echo "osascript (coscaelev, after) rc=$?"
+          launchctl managername; echo "uid gui domain:"; launchctl print gui/$(id -u) 2>&1 | head -3
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: cosca's GUI test as the runner user (the step is bounded at 5 minutes)
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          COSCA_TEST_ELEVATION_GUI: "1"
+        run: cargo nextest run --locked --features tokio --test elevation -E 'test(=gui_elevated_child_runs_as_root)' --no-fail-fast --no-capture --failure-output immediate
