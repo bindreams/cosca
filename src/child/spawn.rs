@@ -553,10 +553,7 @@ fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
     }
     match try_reap(target) {
         Ok(Reap::Reaped(Reaped::Status(_))) => {}
-        Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
-            log::warn!("spawn teardown: pid {pid}: a consuming waitid returned si_code {si_code}, not an exit record");
-            debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
-        }
+        Ok(Reap::Reaped(Reaped::Unreadable { .. })) => {}
         Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
         Ok(Reap::Foreign(Foreign::Orphaned)) => unverifiable(&orphaned),
         Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),

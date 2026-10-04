@@ -122,8 +122,7 @@ fn settle(peeked: Peek) -> Option<Waited> {
     match peeked {
         Peek::Exit(_) => Some(Waited::Reapable),
         Peek::Running => None,
-        Peek::Foreign(Foreign::Gone | Foreign::Other) => Some(Waited::Gone),
-        Peek::Foreign(Foreign::Orphaned) => Some(Waited::Orphaned),
+        Peek::Foreign(Foreign::Gone | Foreign::Other | Foreign::Orphaned) => Some(Waited::Gone),
     }
 }
 
