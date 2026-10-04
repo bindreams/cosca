@@ -162,6 +162,8 @@ fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadE
 /// user's process, and it sees zombies.
 pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     #[cfg(test)]
+    uniq_fault::note(purpose);
+    #[cfg(test)]
     if let Some(forced) = uniq_fault::take(purpose) {
         return forced;
     }
@@ -293,9 +295,38 @@ pub(crate) mod uniq_fault {
         }
     }
 
-    /// How many forced reads for `purpose` this thread has not yet consumed.
-    pub(crate) fn unconsumed(purpose: ReadPurpose) -> usize {
-        FORCED.with(|f| f.borrow().iter().filter(|(p, _)| *p == purpose).count())
+    thread_local! {
+        static RECORDED: RefCell<Option<Vec<ReadPurpose>>> = const { RefCell::new(None) };
+    }
+
+    /// Records the purpose of every by-pid unique-id read on this thread until the guard drops.
+    pub(crate) fn record() -> Recorder {
+        RECORDED.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        Recorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct Recorder(());
+
+    impl Recorder {
+        /// The purposes recorded so far, in order.
+        pub(crate) fn purposes(&self) -> Vec<ReadPurpose> {
+            RECORDED.with(|r| r.borrow().clone().unwrap_or_default())
+        }
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            RECORDED.with(|r| *r.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn note(purpose: ReadPurpose) {
+        RECORDED.with(|r| {
+            if let Some(recorded) = r.borrow_mut().as_mut() {
+                recorded.push(purpose);
+            }
+        });
     }
 
     pub(super) fn take(purpose: ReadPurpose) -> Option<UniqRead> {

@@ -54,17 +54,20 @@ fn an_empty_pipe_at_eof_is_missing() {
     assert!(matches!(read_report(&r), Report::Missing));
 }
 
-/// A stray copy of the write end keeps the pipe open and empty: the read must not block.
+/// The channel's read end is non-blocking, so a stray copy of the write end (a foreign fork) cannot
+/// hang the read: an open, empty pipe reads as `Missing`.
 ///
-/// Mutant: a blocking read end hangs here, so this fails by the nextest bound only on that mutant;
-/// the assertion is on the non-blocking flag instead.
+/// Mutant: `open` does not call `set_nonblocking` (the read would block).
 #[skuld::test]
-fn an_empty_open_pipe_is_missing_and_does_not_block() {
-    let (r, _w) = pipe();
-    // SAFETY: `fcntl` on an fd this test owns.
-    let flags = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_GETFL) };
+fn the_channels_read_end_is_non_blocking() {
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    let pending = register(&mut cmd);
+    let guard = crate::child::spawn::spawn_lock();
+    let channel = pending.open(&guard).expect("open");
+    // SAFETY: `fcntl` on an fd the channel owns.
+    let flags = unsafe { libc::fcntl(channel.read_end.as_raw_fd(), libc::F_GETFL) };
     assert_ne!(flags & libc::O_NONBLOCK, 0, "the read end must be non-blocking");
-    assert!(matches!(read_report(&r), Report::Missing));
+    assert!(matches!(read_report(&channel.read_end), Report::Missing));
 }
 
 /// Mutant: an unknown tag reads as an id.
@@ -86,6 +89,20 @@ fn a_missing_report_is_a_child_that_died_before_exec() {
     };
     assert!(e.to_string().contains("died before exec"), "{e}");
     assert_eq!(e.raw_os_error(), None, "no errno is made up");
+}
+
+/// A refusal under `Ok` is not a child that provably did not start: the hook fails the spawn after
+/// reporting it, so either the child ran on or a signal raced std's pipe.
+///
+/// Mutant: it is reported as "did not start" and the child is treated as a corpse.
+#[skuld::test]
+fn a_refusal_under_an_ok_spawn_may_have_started_the_program() {
+    let not_adopted = adopted_id(Report::ChildRefused(libc::EPERM), 9).expect_err("no id");
+    assert!(!not_adopted.died_before_exec);
+    let Error::Unassessable { detail, .. } = not_adopted.error else {
+        panic!("an Ok spawn with a refusal is Unassessable")
+    };
+    assert!(detail.contains("may have started"), "{detail}");
 }
 
 /// Mutant: the parent's own read failure is taken for the child's refusal.

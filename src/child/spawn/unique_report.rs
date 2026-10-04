@@ -174,7 +174,15 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     };
     match report {
         Report::Id(id) => Ok(id),
-        Report::ChildRefused(errno) => Err(dead(refused_error(errno))),
+        // The hook fails its spawn after reporting a refusal, so `spawn` returning `Ok` means the
+        // child either ran on (a contract break) or was killed between the report and std's own
+        // pipe. Nothing says which, so the program may have started.
+        Report::ChildRefused(errno) => Err(unknown(Error::Unassessable {
+            detail: format!(
+                "pid {pid}: its own unique-id read was refused (errno {errno}), yet the spawn returned Ok; the program may have started"
+            ),
+            source: Some(io::Error::from_raw_os_error(errno)),
+        })),
         Report::Missing => Err(dead(Error::Io(io::Error::other(format!(
             "the spawned child {pid} died before exec; the program did not start"
         ))))),
@@ -198,6 +206,10 @@ pub(crate) fn failed_spawn_error(error: Error, report: &Report) -> Error {
     match report {
         Report::ChildRefused(errno) => refused_error(*errno),
         other => {
+            debug_assert!(
+                !matches!(other, Report::BadTag(_)),
+                "a unique-id report is malformed: {other:?}"
+            );
             log::debug!("the spawn failed ({error}); the child's unique-id report was {other:?}");
             error
         }
@@ -220,6 +232,10 @@ fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
     if !shared.is_live() {
         // The command is being spawned again after its spawn ended: the number is not ours.
         return Err(io::Error::from_raw_os_error(libc::ENOTCONN));
+    }
+    #[cfg(test)]
+    if let Some(errno) = seam.fail_before_report() {
+        return Err(io::Error::from_raw_os_error(errno));
     }
     #[cfg(test)]
     let read = seam.read();
@@ -265,6 +281,8 @@ pub(crate) mod seams {
         Errno(i32),
         /// The child is killed by `SIGKILL` before it reports.
         KillSelf,
+        /// The hook fails with this errno before it reports.
+        FailBeforeReport(i32),
     }
 
     thread_local! {
@@ -277,9 +295,16 @@ pub(crate) mod seams {
 
     impl Armed {
         /// The child's read, as the seam shapes it. Async-signal-safe.
+        pub(super) fn fail_before_report(self) -> Option<i32> {
+            match self.0 {
+                Force::FailBeforeReport(errno) => Some(errno),
+                _ => None,
+            }
+        }
+
         pub(super) fn read(self) -> Result<u64, i32> {
             match self.0 {
-                Force::None => crate::identity::own_unique_id(),
+                Force::None | Force::FailBeforeReport(_) => crate::identity::own_unique_id(),
                 Force::Errno(errno) => Err(errno),
                 Force::KillSelf => {
                     // SAFETY: `kill` and `getpid` are async-signal-safe; the child dies here.
@@ -307,6 +332,13 @@ pub(crate) mod seams {
     /// The next spawns on this thread have their child's own read fail with `errno`.
     pub(crate) fn force_child_read_errno(errno: i32) -> Forced {
         FORCE.with(|f| f.set(Force::Errno(errno)));
+        Forced(())
+    }
+
+    /// The next spawns on this thread have their hook fail with `errno` before it reports, as any
+    /// failure ahead of it (or std's own `chdir`) fails a spawn with no report written.
+    pub(crate) fn force_hook_failure_before_report(errno: i32) -> Forced {
+        FORCE.with(|f| f.set(Force::FailBeforeReport(errno)));
         Forced(())
     }
 

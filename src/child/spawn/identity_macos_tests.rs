@@ -242,12 +242,12 @@ pub(crate) fn arm_launchd_hold(
 #[skuld::test]
 fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
     let (mut cmd, writer) = sync_blocker();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let reads = uniq_fault::record();
     let child = cmd.spawn().expect("the child's own report needs no by-pid read");
     assert_eq!(
-        uniq_fault::unconsumed(ReadPurpose::Adopt),
-        1,
-        "nothing may have read the unique id by pid"
+        reads.purposes(),
+        [ReadPurpose::Running],
+        "the only by-pid read is the identity check's re-read, none to adopt the id"
     );
     drop(writer);
     drop(child);
@@ -307,4 +307,19 @@ fn macos_sync_spawn_adopts_the_live_childs_own_unique_id() {
     assert_eq!(child.adopted_unique(), Some(info.unique_id));
     drop(writer);
     drop(child);
+}
+
+/// A spawn that fails before its hook reports (here the hook itself fails) keeps std's own error:
+/// the report is missing, and it is not the child's refusal.
+///
+/// Mutant: a missing report on a failed spawn is mapped to the refusal.
+#[skuld::test]
+fn macos_sync_spawn_failing_before_the_report_keeps_stds_error() {
+    let (mut cmd, _writer) = sync_blocker();
+    let _forced = unique_report::seams::force_hook_failure_before_report(libc::ENOENT);
+    let err = cmd.spawn().expect_err("the hook fails the spawn");
+    assert!(
+        matches!(&err, Error::Io(e) if e.raw_os_error() == Some(libc::ENOENT)),
+        "std's error stays: {err:?}"
+    );
 }
