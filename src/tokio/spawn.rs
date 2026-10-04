@@ -127,7 +127,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(target_os = "linux")]
     let (std_cmd, handshake) =
         crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::pidfd_handshake::register)?;
-    // macOS: the child reports its own unique id before `exec`; see `unique_report`.
     #[cfg(target_os = "macos")]
     let (std_cmd, report) =
         crate::child::spawn::build_std_command_with(cmd, crate::child::spawn::unique_report::register)?;
@@ -293,7 +292,6 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
-        // Registered first (above), so `fd_map`'s `dup2` below cannot move the pipe from under it.
         let report = report.open(&_guard)?;
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
@@ -317,11 +315,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard` at the top of this function"
         )]
-        let (c, unique) = match report.run(|| tcmd.spawn().map_err(Error::Io)) {
-            Ok(spawned) => spawned,
-            Err((e, refused)) => {
-                let e = refused.map_or(e, crate::child::spawn::unique_report::refused_error);
-                warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
+        let (spawned, unique) = report.run(|| tcmd.spawn().map_err(Error::Io));
+        let c = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                let e = crate::child::spawn::unique_report::failed_spawn_error(e, &unique);
+                // A child whose own read was refused was collected by std, and its program never
+                // ran: nothing is left to warn about.
+                let abandoned = if matches!(unique, crate::child::spawn::unique_report::Report::ChildRefused(_)) {
+                    crate::containment::AbandonedChild::Ended
+                } else {
+                    prepared.abandon_before_verdict()
+                };
+                warn_for_abandoned_child(abandoned, &e);
                 return Err(e);
             }
         };
@@ -429,14 +435,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let proc_handle = child
         .raw_handle()
         .expect("a freshly spawned tokio child has a raw handle");
-    // macOS: the unique id every by-pid signal to this child is checked against, which the child
-    // reported itself before `exec` (see `unique_report`), so it is the id of the process this
-    // spawn forked. A refused read leaves the backend with no id, so it acts on the pid never, and
-    // the spawn fails below once the backend exists.
+    // macOS: the unique id every by-pid signal to this child is checked against. Without one the
+    // backend acts on the pid never, and the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
-    let (identity, identity_refused) = match unique {
+    let (identity, not_adopted) = match crate::child::spawn::unique_report::adopted_id(unique, pid) {
         Ok(unique) => (Some(unique), None),
-        Err(errno) => (None, Some(errno)),
+        Err(not_adopted) => (None, Some(not_adopted)),
     };
     // Built first so failure arms tear the child down through its handle, not its pid. A refused id
     // read leaves it id-less; the spawn fails below.
@@ -451,14 +455,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     #[cfg(windows)]
     let proc = ProcSource::new(child);
     #[cfg(target_os = "macos")]
-    if let Some(errno) = identity_refused {
+    if let Some(not_adopted) = not_adopted {
         #[cfg(test)]
         crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
         prepared.settle_verdict(pid);
-        // With no id the backend neither signals nor waits by pid: the child is forgotten, with a
-        // warning naming it, and left running.
-        proc.reap_now(pid);
-        return Err(crate::signal::identity_unreadable(pid, errno));
+        if not_adopted.died_before_exec {
+            // Only a corpse is left, and tokio's `Child` must not reap it by pid.
+            proc.forget_because("died before exec");
+        } else {
+            // With no id the backend neither signals nor waits by pid: the child is forgotten, with
+            // a warning naming it, and left running.
+            proc.reap_now(pid);
+        }
+        return Err(not_adopted.error);
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
@@ -488,9 +497,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // it, and a panic unwinds through `ProcSource`'s `Drop`.
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
-        // Contract: a freshly spawned child holds its handle. Linux has its pidfd; macOS has the
-        // unique id the child reported (a missing one returned above) and a pid; Windows has tokio's
-        // process handle.
+        // Contract: a freshly spawned child holds its handle on every platform.
         None => {
             debug_assert!(false, "a freshly spawned tokio child holds its handle");
             Resolved::Unknown
