@@ -513,7 +513,7 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
     use crate::wait::backend::{await_reapable, Waited};
 
     let pid = child.id();
-    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+    let target = crate::wait::exit_only::Target::pid(pid, None);
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
             Ok(Waited::Reapable) => reap_verified(pid, &target),
