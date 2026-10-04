@@ -587,8 +587,7 @@ fn exefile_takes_percent_literally(#[fixture(shell_execute)] _group: &Group) {
     windows_probe::mark_test_passed("COSCA_CANARY_MARKERS");
 }
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
+use common::test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
