@@ -321,8 +321,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 let e = crate::child::spawn::unique_report::failed_spawn_error(e, &unique);
                 // Without an id the program never ran, but who collected the child is open: a signal
                 // after the refusal makes std return `Ok`, and tokio's own setup can then drop the
-                // child unreaped. With an id the program may be running (exec failed, or tokio's
-                // setup failed after it).
+                // child unreaped. With an id the program may be running only if tokio's own setup
+                // failed after std returned `Ok`: a std `Err` has already collected the child.
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
                 let abandoned = match unique {
@@ -659,7 +659,7 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
              never reached the point where it names itself and nothing holds its pid"
         }
         AbandonedChild::MaybeUnreachable => {
-            "unless its spawn collected it (an `exec` failure), the child was left running and nothing \
+            "unless its spawn collected it, the child was left running and nothing \
              can reach it: only a cgroup v2 leaf is killed without the child's pid"
         }
     };
