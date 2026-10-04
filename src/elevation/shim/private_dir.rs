@@ -19,6 +19,10 @@ pub(crate) struct DirFacts {
 }
 
 impl DirFacts {
+    #[allow(
+        clippy::useless_conversion,
+        reason = "`st_mode` is `u16` on macOS and `u32` on Linux"
+    )]
     fn of(st: &Stat) -> Self {
         Self {
             uid: st.st_uid,
