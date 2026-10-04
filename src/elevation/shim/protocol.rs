@@ -106,15 +106,14 @@ impl ShimArgs {
     /// is not valid. `argv` includes `argv[0]`.
     pub(crate) fn parse(argv: &[OsString]) -> Result<Option<ShimArgs>, ShimArgsError> {
         let Some(flag) = argv.get(1) else { return Ok(None) };
-        let Some(version) = flag.as_bytes().strip_prefix(FLAG_PREFIX) else {
+        if !flag.as_bytes().starts_with(FLAG_PREFIX) {
             return Ok(None);
-        };
+        }
         let hex = if flag.as_bytes() == FLAG {
             false
         } else if flag.as_bytes() == FLAG_HEX {
             true
         } else {
-            debug_assert!(!version.is_empty() || flag.as_bytes() == FLAG_PREFIX);
             return Err(ShimArgsError::UnknownVersion);
         };
         if argv.len() <= SEPARATOR_AT + 1 {
