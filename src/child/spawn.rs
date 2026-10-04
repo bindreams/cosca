@@ -535,8 +535,8 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
 ///
 /// - **Windows:** its process handle could not be duplicated. The handle still pins the process, so
 ///   the child is torn down.
-/// - **macOS:** its unique id could not be read (a refusal that is not `ESRCH`), so it is left
-///   alone (see `leave_unverified_child`).
+/// - **macOS:** its unique-id report is not an id (unreadable or malformed), so it is left alone
+///   (see `leave_unverified_child`).
 ///
 /// Not on Linux, where the pidfd is opened before `exec` (see `pidfd_handshake`) and adoption
 /// cannot fail.

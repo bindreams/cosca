@@ -154,18 +154,25 @@ async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_p
 
 /// As the sync twin: a refused own read is `Unassessable` and the program does not run.
 ///
-/// Mutant: the hook execs anyway.
+/// Mutants: the hook execs anyway; a refusal is mapped to `Ended` (no unreaped-child warning).
 #[skuld::test]
 async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
     let (mut cmd, _writer) = tokio_blocker();
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
+    let mark = crate::log_capture::mark();
     let err = cmd.spawn().expect_err("a refused own read fails the spawn");
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
     assert_program_did_not_run();
+    // Who collected the child is open: std may have returned `Ok` for a child killed after its refusal.
+    assert!(
+        crate::log_capture::contains_since(mark, "was left unreaped"),
+        "a refusal under tokio may leave an unreaped child, and the spawn must say so"
+    );
 }
 
 /// As the sync twin: a child killed before it reports is a child that died before exec, and
@@ -187,8 +194,12 @@ async fn macos_tokio_spawn_of_a_child_killed_before_its_report_says_it_died_befo
     assert!(e.to_string().contains("died before exec"), "{e}");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not be dropped");
     assert!(
-        !crate::log_capture::contains_since(mark, "left running"),
-        "a dead child is not left running"
+        crate::log_capture::contains_since(mark, "died before exec; forgetting"),
+        "a dead child is forgotten as a corpse"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "may still be running"),
+        "a dead child is not reported as possibly running"
     );
 }
 

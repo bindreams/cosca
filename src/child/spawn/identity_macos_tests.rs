@@ -289,8 +289,12 @@ fn macos_sync_spawn_of_a_child_killed_before_its_report_says_it_died_before_exec
     assert!(e.to_string().contains("died before exec"), "{e}");
     assert_eq!(e.raw_os_error(), None, "no errno is made up");
     assert!(
-        !crate::log_capture::contains_since(mark, "leaving it running"),
-        "a dead child is not left running"
+        crate::log_capture::contains_since(mark, "died before exec; nothing is signalled or waited on by pid"),
+        "a dead child is abandoned as a corpse"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "may still be running"),
+        "a dead child is not reported as possibly running"
     );
 }
 
