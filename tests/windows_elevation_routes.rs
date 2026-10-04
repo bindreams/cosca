@@ -85,8 +85,8 @@ mod scheduled_task;
 #[path = "windows_elevation_routes/token_filtering.rs"]
 mod token_filtering;
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
+#[cfg(windows)]
+use common::test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

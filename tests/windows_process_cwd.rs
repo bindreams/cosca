@@ -11,7 +11,7 @@
 mod common;
 
 #[cfg(windows)]
-use test_groups::{drive_mapping, Group};
+use common::test_groups::{drive_mapping, Group};
 
 #[cfg(windows)]
 fn probe(mode: &str, child: &str) -> String {
@@ -263,8 +263,6 @@ mod drive_mapping_group {
     }
 }
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
