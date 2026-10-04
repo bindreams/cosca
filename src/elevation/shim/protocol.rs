@@ -16,6 +16,8 @@ const FLAG_PREFIX: &[u8] = b"--cosca-elevation-shim";
 const SEPARATOR: &str = "--";
 /// Index of [`SEPARATOR`]: `[exe, flag, dir, pid, identity, euid, search, "--", program, args…]`.
 const SEPARATOR_AT: usize = 7;
+/// The identity field is `uniq:ver` on macOS and `-` on Linux; the other form is an error.
+const IDENTITY_PRESENT: bool = cfg!(target_os = "macos");
 
 /// A raw `errno`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub(crate) struct Errno(pub(crate) i32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Signal(pub(crate) i32);
 
-/// macOS only: cosca's `p_uniqueid` and `p_idversion` (D2). Linux passes none.
+/// macOS: cosca's `p_uniqueid` and `p_idversion` (D2). Linux passes none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShimIdentity {
     pub(crate) unique_id: u64,
@@ -56,8 +58,11 @@ pub(crate) enum ShimArgsError {
     TooFewArguments,
     #[error("the separator `--` is missing")]
     MissingSeparator,
-    #[error("malformed hex argument")]
+    #[error("malformed hex argument (lowercase hex only)")]
     BadHex,
+    /// execve cannot carry a NUL, so neither form may.
+    #[error("an argument contains a NUL")]
+    EmbeddedNul,
     #[error("malformed number")]
     BadNumber,
     #[error("malformed identity")]
@@ -89,6 +94,19 @@ impl ShimArgs {
             self.cosca_euid.to_string().into(),
             search,
         ];
+        debug_assert!(
+            before
+                .iter()
+                .chain([&self.program])
+                .chain(&self.args)
+                .all(|a| !a.as_bytes().contains(&0)),
+            "execve cannot carry a NUL"
+        );
+        debug_assert_eq!(
+            self.cosca_identity.is_some(),
+            IDENTITY_PRESENT,
+            "identity is present exactly on macOS"
+        );
         let encode = |a: OsString| if hex { to_hex(&a) } else { a };
 
         let mut argv = Vec::with_capacity(SEPARATOR_AT + 1 + self.args.len() + 1);
@@ -134,6 +152,9 @@ impl ShimArgs {
         } else {
             &argv[2..]
         };
+        if fields.iter().any(|a| a.as_bytes().contains(&0)) {
+            return Err(ShimArgsError::EmbeddedNul);
+        }
         // `fields[i]` is `argv[i + 2]`.
         let [dir, pid, identity, euid, search, _separator, program, args @ ..] = fields else {
             return Err(ShimArgsError::TooFewArguments);
@@ -164,7 +185,11 @@ fn from_hex(a: &OsStr) -> Result<OsString, ShimArgsError> {
     if !odd.is_empty() {
         return Err(ShimArgsError::BadHex);
     }
-    let nibble = |c: u8| char::from(c).to_digit(16).map(|d| d as u8).ok_or(ShimArgsError::BadHex);
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        _ => Err(ShimArgsError::BadHex),
+    };
     let out = pairs
         .iter()
         .map(|[hi, lo]| Ok(nibble(*hi)? << 4 | nibble(*lo)?))
@@ -186,7 +211,14 @@ fn decimal_u32(a: &OsStr) -> Result<u32, ShimArgsError> {
 
 fn parse_identity(a: &OsStr) -> Result<Option<ShimIdentity>, ShimArgsError> {
     if a.as_bytes() == b"-" {
-        return Ok(None);
+        return if IDENTITY_PRESENT {
+            Err(ShimArgsError::BadIdentity)
+        } else {
+            Ok(None)
+        };
+    }
+    if !IDENTITY_PRESENT {
+        return Err(ShimArgsError::BadIdentity);
     }
     let mut halves = a.as_bytes().split(|&b| b == b':');
     let (Some(unique_id), Some(id_version), None) = (halves.next(), halves.next(), halves.next()) else {

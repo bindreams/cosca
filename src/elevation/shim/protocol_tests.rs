@@ -10,11 +10,19 @@ fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
 }
 
+/// The identity this platform's argv carries: present exactly on macOS.
+fn platform_identity() -> Option<ShimIdentity> {
+    cfg!(target_os = "macos").then_some(ShimIdentity {
+        unique_id: u64::MAX,
+        id_version: u32::MAX,
+    })
+}
+
 fn args(program: &[u8], rest: &[&[u8]]) -> ShimArgs {
     ShimArgs {
         dir: PathBuf::from("/tmp/cosca-x1"),
         cosca_pid: 4242,
-        cosca_identity: None,
+        cosca_identity: platform_identity(),
         cosca_euid: 1000,
         search_path: None,
         program: os(program),
@@ -34,10 +42,6 @@ fn parsed(a: &ShimArgs, hex: bool) -> ShimArgs {
 fn argv_round_trips_non_utf8_and_leading_dash_args() {
     let a = ShimArgs {
         dir: PathBuf::from(os(b"/tmp/d\xffir")),
-        cosca_identity: Some(ShimIdentity {
-            unique_id: u64::MAX,
-            id_version: u32::MAX,
-        }),
         ..args(
             b"/bin/p\xfe",
             &[
@@ -59,12 +63,17 @@ fn argv_round_trips_non_utf8_and_leading_dash_args() {
 fn plain_argv_has_the_documented_layout() {
     let a = args(b"prog", &[b"-a"]);
     let argv: Vec<_> = a.to_argv(OsStr::new(EXE), false);
+    let identity = if cfg!(target_os = "macos") {
+        "18446744073709551615:4294967295"
+    } else {
+        "-"
+    };
     let want: Vec<OsString> = [
         EXE,
         "--cosca-elevation-shim=1",
         "/tmp/cosca-x1",
         "4242",
-        "-",
+        identity,
         "1000",
         "-",
         "--",
@@ -75,19 +84,37 @@ fn plain_argv_has_the_documented_layout() {
     .map(OsString::from)
     .collect();
     assert_eq!(argv, want);
-    let with_id = ShimArgs {
-        cosca_identity: Some(ShimIdentity {
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_requires_an_identity() {
+    let mut argv = args(b"p", &[]).to_argv(OsStr::new(EXE), false);
+    argv[4] = OsString::from("-");
+    assert_eq!(ShimArgs::parse(&argv), Err(ShimArgsError::BadIdentity));
+    argv[4] = OsString::from("77:3");
+    assert_eq!(
+        ShimArgs::parse(&argv).unwrap().unwrap().cosca_identity,
+        Some(ShimIdentity {
             unique_id: 77,
-            id_version: 3,
-        }),
-        ..a
-    };
-    assert_eq!(with_id.to_argv(OsStr::new(EXE), false)[4], "77:3");
+            id_version: 3
+        })
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn linux_forbids_an_identity() {
+    let mut argv = args(b"p", &[]).to_argv(OsStr::new(EXE), false);
+    argv[4] = OsString::from("77:3");
+    assert_eq!(ShimArgs::parse(&argv), Err(ShimArgsError::BadIdentity));
+    argv[4] = OsString::from("-");
+    assert_eq!(ShimArgs::parse(&argv).unwrap().unwrap().cosca_identity, None);
 }
 
 #[skuld::test]
 fn hex_form_round_trips_every_byte() {
-    let every: Vec<u8> = (0..=255u8).collect();
+    let every: Vec<u8> = (1..=255u8).collect();
     let a = args(&every, &[&every, b"--"]);
     let argv = a.to_argv(OsStr::new(EXE), true);
     assert_eq!(argv[1], "--cosca-elevation-shim=1x");
@@ -105,6 +132,36 @@ fn hex_form_round_trips_every_byte() {
         "a program argument `--` is hex, not the separator"
     );
     assert_eq!(parsed(&a, true), a);
+}
+
+#[skuld::test]
+fn the_hex_decoder_accepts_lowercase_only() {
+    let mut argv = args(b"p", &[]).to_argv(OsStr::new(EXE), true);
+    assert_eq!(argv[8], "70");
+    argv[8] = OsString::from("7A");
+    assert_eq!(ShimArgs::parse(&argv), Err(ShimArgsError::BadHex), "uppercase");
+    argv[8] = OsString::from("7a");
+    assert_eq!(ShimArgs::parse(&argv).unwrap().unwrap().program, "z");
+}
+
+#[skuld::test]
+fn a_nul_is_rejected_in_both_forms() {
+    let mut hex = args(b"p", &[b"a"]).to_argv(OsStr::new(EXE), true);
+    for i in [2, 8, 9] {
+        let saved = std::mem::replace(&mut hex[i], OsString::from("610061"));
+        assert_eq!(ShimArgs::parse(&hex), Err(ShimArgsError::EmbeddedNul), "hex argv[{i}]");
+        hex[i] = saved;
+    }
+    let mut plain = args(b"p", &[b"a"]).to_argv(OsStr::new(EXE), false);
+    for i in [2, 8, 9] {
+        let saved = std::mem::replace(&mut plain[i], os(b"a\0b"));
+        assert_eq!(
+            ShimArgs::parse(&plain),
+            Err(ShimArgsError::EmbeddedNul),
+            "plain argv[{i}]"
+        );
+        plain[i] = saved;
+    }
 }
 
 #[skuld::test]

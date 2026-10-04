@@ -36,7 +36,6 @@ pub(crate) mod plan;
 #[path = "elevation/posix.rs"]
 pub(crate) mod posix;
 pub(crate) mod sanitize;
-// Plan F: no caller until the shim and the acceptor land (F3 and later).
 #[cfg_attr(
     not(windows),
     allow(
@@ -45,6 +44,7 @@ pub(crate) mod sanitize;
     )
 )]
 pub(crate) mod shell_file;
+// Plan F: no caller until the shim and the acceptor land (F3 and later).
 #[cfg(unix)]
 #[allow(
     dead_code,
