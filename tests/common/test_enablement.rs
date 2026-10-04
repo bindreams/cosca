@@ -1,17 +1,11 @@
-//! Group enablement for integration tests: the lib's `check_group` (`src/test_groups.rs`), included
-//! by `#[path]` because an integration test cannot name a `#[cfg(test)]` item of the library.
-//!
-//! A group whose environment support varies by host declares `COSCA_TEST_<GROUP>`, on by default:
-//! only the literal `0` disables it. A group that changes system state also needs
-//! `COSCA_TEST_<GROUP>_CONSENT=1`. An enabled group without consent fails; it never skips.
-//! See `docs/principles.md`, principles 9 and 10.
+//! Group enablement for integration tests. The lib's `check_group` is included by `#[path]` because
+//! an integration test cannot name a `#[cfg(test)]` item of the library. See `docs/principles.md`,
+//! principles 9 and 10.
 
 #[path = "../../src/test_groups.rs"]
 pub mod test_groups;
 
-/// Whether the tests of `group` run on this host. Returns `false` only when the caller set
-/// `COSCA_TEST_<GROUP>=0`; the test then returns early, as an opted-out test does. Otherwise it
-/// asserts consent and returns `true`.
+/// `false` when `COSCA_TEST_<GROUP>=0`; the caller then returns early. Otherwise `true`.
 ///
 /// # Panics
 ///
