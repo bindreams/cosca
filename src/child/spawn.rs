@@ -1932,6 +1932,11 @@ pub(crate) use batch_gate::reject_batch_path;
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
 
+// Linux only for now: the `pre_exec` fd-channel primitive `pidfd_handshake` builds on.
+#[cfg(target_os = "linux")]
+#[path = "spawn/fd_channel.rs"]
+pub(crate) mod fd_channel;
+
 // Linux: holds a forked child before `exec` until the parent has its pidfd.
 #[cfg(target_os = "linux")]
 #[path = "spawn/pidfd_handshake.rs"]

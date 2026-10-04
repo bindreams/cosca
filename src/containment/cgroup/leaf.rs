@@ -1481,7 +1481,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
     let procs_path = leaf_path.join("cgroup.procs");
     let procs_fd = dir
         .open("cgroup.procs", rustix::fs::OFlags::WRONLY)
-        .and_then(|file| Ok(rustix::io::fcntl_dupfd_cloexec(&file, 3)?));
+        .and_then(crate::above_stdio::above_stdio);
     let procs_fd = match procs_fd {
         Ok(fd) => fd,
         Err(source) => {

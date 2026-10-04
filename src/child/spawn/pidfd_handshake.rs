@@ -54,9 +54,9 @@
 //! - The helper shuts the parent's end when it is done, and when it unwinds. A child still waiting
 //!   for its verdict reads EOF, which is abort: the helper never has to send one.
 //!
-//! A descriptor created while one of fds 0 to 2 is closed lands on it, and is moved above
-//! ([`above_stdio`]). A concurrent `dup2` onto a closed stdio slot during a spawn is outside this
-//! module's contract.
+//! Descriptors this module creates are moved above stdio by
+//! [`above_stdio`](crate::above_stdio::above_stdio), which states what that does and does not
+//! guarantee.
 //!
 //! [`ReportChannel`]: crate::containment::cgroup::channel::ReportChannel
 //!
@@ -66,14 +66,13 @@
 //! naming that cause, before it forks.
 
 use std::io;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
+use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
 use super::SpawnLockGuard;
 use crate::error::Error;
 
@@ -85,17 +84,6 @@ const REPORT_ERRNO: i32 = 2;
 /// A report is two native-endian `i32`s: its tag, then its value.
 const REPORT_LEN: usize = 8;
 
-/// What the hook reads in the child: fd numbers only, published by [`Pending::open`] before the
-/// fork, and withdrawn by [`Handshake::run`] after it.
-struct Shared {
-    child_end: AtomicI32,
-    parent_end: AtomicI32,
-    /// Whether the fd numbers name this spawn's channel. Cleared when the spawn is over: a command
-    /// spawned again after that would otherwise read whatever now owns the numbers; the hook
-    /// fails it instead.
-    live: AtomicBool,
-}
-
 /// The hook is registered; the channel is not yet made. See [`register`].
 pub(crate) struct Pending {
     shared: Arc<Shared>,
@@ -105,6 +93,7 @@ pub(crate) struct Pending {
 pub(crate) struct Handshake {
     parent_end: OwnedFd,
     child_end: OwnedFd,
+    done: OwnedFd,
     shared: Arc<Shared>,
 }
 
@@ -166,31 +155,24 @@ enum Outcome {
 /// The channel is made later, under `spawn_lock`, by [`Pending::open`]; a hook whose channel was
 /// never opened fails the spawn it belongs to rather than read fd numbers that mean nothing.
 pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
-    let shared = Arc::new(Shared {
-        child_end: AtomicI32::new(-1),
-        parent_end: AtomicI32::new(-1),
-        live: AtomicBool::new(false),
-    });
     #[cfg(test)]
     let fault = fault::child_fault();
     // The child opens its own pidfd, where a thread-local seam cannot reach: take it here.
     #[cfg(test)]
     let scripted = crate::wait::backend::take_scripted_pidfd_open();
-    let hook = Arc::clone(&shared);
-    // SAFETY: the hook runs between fork and exec and is async-signal-safe: it reads atomics and
-    // makes only direct syscalls (libc or rustix, see `open_self`) on integers and fd numbers. It
-    // allocates nothing and takes no lock, and `io::Error::from_raw_os_error` does not allocate.
-    unsafe {
-        cmd.pre_exec(move || {
+    // SAFETY: the hook reads atomics and makes only direct syscalls (libc or rustix, see
+    // `open_self`) on integers and fd numbers; `io::Error::from_raw_os_error` does not allocate.
+    let shared = unsafe {
+        register_hook(cmd, move |shared| {
             hold_child(
-                &hook,
+                shared,
                 #[cfg(test)]
                 fault,
                 #[cfg(test)]
                 scripted,
             )
-        });
-    }
+        })
+    };
     Pending { shared }
 }
 
@@ -202,39 +184,22 @@ impl Pending {
         let (parent_end, child_end) =
             rustix::net::socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)
                 .map_err(|e| Error::Io(crate::error::io_context("socketpair", e.into())))?;
-        let parent_end = above_stdio(parent_end)?;
-        let child_end = above_stdio(child_end)?;
-        self.shared.child_end.store(child_end.as_raw_fd(), Ordering::Relaxed);
-        self.shared.parent_end.store(parent_end.as_raw_fd(), Ordering::Relaxed);
-        self.shared.live.store(true, Ordering::Release);
+        // Written, not closed, when the helper is done: a forked copy cannot hold it off. Made
+        // before the ends are published, so no failure here can leave stale numbers live.
+        let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
+        #[cfg(test)]
+        if let Some(errno) = fault::take_done_fd_failure() {
+            return Err(Error::Io(crate::error::io_context("eventfd", errno.into())));
+        }
+        let done = above_stdio(done)?;
+        let (child_end, parent_end) = publish_ends(&self.shared, child_end, parent_end)?;
         Ok(Handshake {
             parent_end,
             child_end,
+            done,
             shared: self.shared,
         })
-    }
-}
-
-/// `fd`, moved to 3 or above: with 0, 1 or 2 closed, the lowest free number is one, and the
-/// application may `dup2` its stdio back over it.
-///
-/// This narrows that hazard, it does not close it: no syscall that makes a descriptor takes a
-/// minimum number, so each one (`socketpair`, `eventfd`, the watch's `pidfd_open`, the
-/// `SCM_RIGHTS` install) creates it at the lowest free number first, and the move follows. A
-/// `dup2` by another thread onto a closed stdio slot in that gap is outside this function's
-/// contract, as it is outside every other spawn's.
-fn above_stdio(fd: OwnedFd) -> Result<OwnedFd, Error> {
-    above_stdio_keeping(fd).map_err(|(e, _)| e)
-}
-
-/// [`above_stdio`], handing `fd` back if it could not be moved.
-fn above_stdio_keeping(fd: OwnedFd) -> Result<OwnedFd, (Error, OwnedFd)> {
-    if fd.as_raw_fd() >= 3 {
-        return Ok(fd);
-    }
-    match rustix::io::fcntl_dupfd_cloexec(&fd, 3) {
-        Ok(moved) => Ok(moved),
-        Err(e) => Err((Error::Io(crate::error::io_context("fcntl", e.into())), fd)),
     }
 }
 
@@ -313,6 +278,7 @@ impl Handshake {
         let Handshake {
             parent_end,
             child_end,
+            done,
             shared,
         } = self;
         #[cfg(test)]
@@ -321,10 +287,6 @@ impl Handshake {
         let helper_seams = seams.clone();
         #[cfg(test)]
         let mut ends = fault::EndProbes::start(&child_end);
-        // Written, not closed, when the helper is done: a forked copy cannot hold it off.
-        let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-            .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
-        let done = above_stdio(done)?;
         let done = &done;
         // Borrowed by the helper, so this thread can still force EOF on it.
         let parent_end = &parent_end;
@@ -357,7 +319,7 @@ impl Handshake {
             let helper = match helper {
                 Ok(helper) => helper,
                 Err(e) => {
-                    shared.live.store(false, Ordering::Release);
+                    shared.withdraw();
                     return Err(helper_start_error(e));
                 }
             };
@@ -373,7 +335,7 @@ impl Handshake {
             #[cfg(test)]
             fault::fork_holder_if_armed();
             let spawned = spawn();
-            shared.live.store(false, Ordering::Release);
+            shared.withdraw();
             #[cfg(test)]
             fault::spawn_returned(spawned.as_ref().ok().and_then(Spawned::pid));
             // This thread's copy goes first: the child, or a hook that failed, closing its own copy
@@ -874,11 +836,8 @@ fn hold_child(
     #[cfg(test)] fault: fault::ChildFault,
     #[cfg(test)] scripted: Option<Errno>,
 ) -> io::Result<()> {
-    if !shared.live.load(Ordering::Acquire) {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
-    }
-    let child_end: RawFd = shared.child_end.load(Ordering::Relaxed);
-    let parent_end: RawFd = shared.parent_end.load(Ordering::Relaxed);
+    let child_end: RawFd = shared.child_end();
+    let parent_end: RawFd = shared.parent_end();
     // The parent's end, inherited: it has nothing to do here.
     // SAFETY: a plain `close` of a number this hook was given.
     unsafe { libc::close(parent_end) };

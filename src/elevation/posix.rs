@@ -238,7 +238,6 @@ fn pinned_exec_path(pinned: &File) -> PathBuf {
 /// through a symlink, and only a regular file. Moved to 3 or above when it
 /// lands lower, so no child's stdio setup can replace it before the exec.
 fn pin(real: &Path) -> std::io::Result<File> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(target_os = "linux")]
     let path_only = libc::O_PATH;
@@ -255,10 +254,7 @@ fn pin(real: &Path) -> std::io::Result<File> {
             "not a regular file",
         ));
     }
-    if file.as_raw_fd() >= 3 {
-        return Ok(file);
-    }
-    Ok(File::from(rustix::io::fcntl_dupfd_cloexec(&file, 3)?))
+    Ok(File::from(crate::above_stdio::above_stdio(file.into())?))
 }
 
 /// Run `probe` with an empty environment and read its stdout as [`super::pkexec::parse`] does.
