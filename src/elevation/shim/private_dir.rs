@@ -154,18 +154,25 @@ impl PrivateDir {
                 }
             }
             // `NOFOLLOW`: whatever now holds the name, we record the directory itself.
-            let create_err = |e| PrivateDirError::Create {
-                path: path.clone(),
-                source: io_err(e),
-            };
-            let dir = openat(
+            let opened = openat(
                 &parent,
                 &name,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(create_err)?;
-            let id = id_of(&fstat(&dir).map_err(create_err)?);
+            .and_then(|dir| fstat(&dir));
+            let id = match opened {
+                Ok(st) => id_of(&st),
+                Err(e) => {
+                    if let Err(rm) = unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
+                        log::warn!("cannot remove the private directory {}: {rm}", path.display());
+                    }
+                    return Err(PrivateDirError::Create {
+                        path,
+                        source: io_err(e),
+                    });
+                }
+            };
             return Ok(Self { parent, name, id, path });
         }
     }
