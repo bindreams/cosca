@@ -351,11 +351,15 @@ async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
 /// reads stdin to EOF can exit. The streams live in the backend, not in tokio's `Child`, so the
 /// backend does it. Observed after one poll, which has run the close and not the wait.
 ///
+/// The test holds a second write end of `cat`'s stdin so the close cannot end it: if `cat` exited
+/// early, the single poll could reap it, and `reap_now` requires a never-awaited child.
+///
 /// Mutant: `wait` leaves stdin open.
 #[cfg(unix)]
 #[skuld::test]
 async fn wait_closes_the_untaken_stdin_first() {
     use std::future::Future;
+    use std::os::fd::AsFd;
     let child = crate::test_spawn::spawn_tokio(
         ::tokio::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
@@ -364,6 +368,13 @@ async fn wait_closes_the_untaken_stdin_first() {
     )
     .expect("spawn");
     let pid = child.id().expect("tokio owns an un-reaped child");
+    let held_writer = child
+        .stdin
+        .as_ref()
+        .expect("piped stdin")
+        .as_fd()
+        .try_clone_to_owned()
+        .expect("duplicate the stdin write end");
     let mut proc = proc_source(child);
     {
         let mut waiting = Box::pin(proc.wait());
@@ -377,7 +388,9 @@ async fn wait_closes_the_untaken_stdin_first() {
         panic!("a tokio backend");
     };
     let closed = stdin.is_none();
+    assert!(!proc.is_reaped(), "the one poll finished the wait");
     proc.reap_now(pid); // the test's own `cat`: end it whatever happened
+    drop(held_writer);
     assert!(closed, "wait must close stdin before it waits");
 }
 
