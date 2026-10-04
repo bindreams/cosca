@@ -1376,16 +1376,17 @@ impl Unadopted for HeldStdChild {
 }
 
 /// A failed spawn's `error`, for a child that is an elevation front (see
-/// [`crate::elevation::front`]): the teardown sent it nothing, so the elevated program may be
-/// running, and the error says so as [`ElevationErrorKind::Untracked`](crate::error::ElevationErrorKind::Untracked).
-/// Any other child's error is `error` itself.
+/// [`crate::elevation::front`]): the teardown sent it nothing and left it unreaped, so the elevated
+/// program may be running, and the error says so as
+/// [`ElevationErrorKind::Untracked`](crate::error::ElevationErrorKind::Untracked). Any other
+/// child's error is `error` itself.
 pub(crate) fn front_left_running(error: Error, front: Option<crate::elevation::front::Front>, pid: u32) -> Error {
     match front {
         None => error,
         Some(front) => Error::Elevation {
             kind: crate::error::ElevationErrorKind::Untracked,
             detail: format!(
-                "{error}; {}; it was sent nothing and left running, so the elevated program may be running",
+                "{error}; {}; it was sent nothing, so the elevated program may be running; it is left unreaped",
                 crate::elevation::front::describe(front, pid)
             ),
         },
@@ -1393,8 +1394,9 @@ pub(crate) fn front_left_running(error: Error, front: Option<crate::elevation::f
 }
 
 /// [`teardown_unadopted`], unless `child` is an elevation front: a kill of that would orphan the
-/// elevated program. A front is sent nothing, and reaped once it exits: now if it has, otherwise in
-/// the background.
+/// elevated program. A front is sent nothing. One that has exited is reaped now; a live one is left
+/// unreaped, with nothing that waits for it (a waiter would live as long as the program), and
+/// stays a zombie once it exits.
 #[cfg(not(target_os = "macos"))]
 fn teardown_unadopted_unless_front(mut child: impl Unadopted, front: Option<crate::elevation::front::Front>) {
     if front.is_none() {
@@ -1402,24 +1404,22 @@ fn teardown_unadopted_unless_front(mut child: impl Unadopted, front: Option<crat
     }
     match child.try_wait() {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            log::warn!(
-                "spawn teardown left elevation front {} running, unsignalled; it is reaped in the background once it \
-                 exits",
-                named(child.pid())
-            );
-            reap_in_background(child);
-        }
+        Ok(None) => log::warn!(
+            "spawn teardown left elevation front {} running, unsignalled and unreaped: a kill would orphan the \
+             elevated program",
+            named(child.pid())
+        ),
         // Reaped by someone else, or unreadable: nothing is signalled or waited on.
         Err(e) => log::debug!(
             "spawn teardown: elevation front {} cannot be waited on ({e})",
             named(child.pid())
         ),
     }
+    // Dropping the handle closes it; it neither signals nor reaps the child.
 }
 
-/// [`teardown_through_pidfd`] for an elevation front: sent nothing, and reaped through `pidfd` once
-/// it exits (see [`teardown_unadopted_unless_front`]).
+/// [`teardown_through_pidfd`] for an elevation front: sent nothing, reaped now only if it has
+/// exited (see [`teardown_unadopted_unless_front`]).
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 pub(crate) fn leave_front_through_pidfd(
     pid: Option<u32>,
@@ -1512,7 +1512,7 @@ fn reap_in_background(mut child: impl Unadopted) {
     let reaper_pid = pid.clone();
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
         let pid = reaper_pid;
-        let reaped = child.wait();
+        let reaped = child.wait().map(drop);
         if let Err(e) = &reaped {
             log::warn!("background reap of {pid} failed: {e}");
         }
@@ -1597,7 +1597,7 @@ pub(crate) mod fault {
         static FORCE_REAP_FAIL: Cell<Option<&'static str>> = const { Cell::new(None) };
         static FORCE_KILL_FAIL: Cell<Option<(&'static str, std::io::ErrorKind, bool)>> = const { Cell::new(None) };
         static FORCE_KILL_ERROR_AFTER_EXIT: Cell<Option<(&'static str, std::io::ErrorKind)>> = const { Cell::new(None) };
-        static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<std::process::ExitStatus>>>> = const { Cell::new(None) };
+        static BACKGROUND_REAP_NOTIFY: Cell<Option<std::sync::mpsc::Sender<std::io::Result<()>>>> = const { Cell::new(None) };
         static CAPTURED: Cell<Option<crate::identity::Resolved<ProcessId>>> = const { Cell::new(None) };
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
@@ -1745,14 +1745,11 @@ pub(crate) mod fault {
     }
     /// Have the next background reap started on this thread report its outcome on `notify`.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn set_background_reap_notifier(
-        notify: std::sync::mpsc::Sender<std::io::Result<std::process::ExitStatus>>,
-    ) {
+    pub(crate) fn set_background_reap_notifier(notify: std::sync::mpsc::Sender<std::io::Result<()>>) {
         BACKGROUND_REAP_NOTIFY.with(|f| f.set(Some(notify)));
     }
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn take_background_reap_notifier(
-    ) -> Option<std::sync::mpsc::Sender<std::io::Result<std::process::ExitStatus>>> {
+    pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<std::io::Result<()>>> {
         BACKGROUND_REAP_NOTIFY.with(|f| f.take())
     }
     #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
