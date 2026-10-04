@@ -361,3 +361,31 @@ fn macos_sync_spawn_consults_the_report_before_attaching() {
         "the report decides before the attach does: {err:?}"
     );
 }
+
+// The attach =====
+
+/// The fd marker's root is the identity the spawn verified: the attach reads nothing by pid, so a
+/// foreign reap and reuse of the pid cannot make the marker's root a stranger.
+///
+/// Mutant: the attach reads the marker's root with `ProcessId::of(pid)`.
+#[skuld::test]
+fn macos_fdmarker_attach_reads_nothing_by_pid() {
+    let (mut cmd, _writer) = sync_blocker();
+    cmd.contain();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_marker_root(),
+        Some(child.id()),
+        "the marker's root is the verified identity"
+    );
+}

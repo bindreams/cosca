@@ -959,6 +959,12 @@ impl Marker {
         self.pgid.is_some()
     }
 
+    /// The root the ppid walk starts from. Tests only.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> ProcessId {
+        self.root.expect("the root was read")
+    }
+
     /// Whether the root's identity was read at attach, so the ppid walk has something to start from.
     pub(crate) fn has_root(&self) -> bool {
         self.root.is_some()

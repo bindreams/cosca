@@ -511,6 +511,53 @@ fn cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio(#[fixt
     assert_eq!(written, b"", "nothing reached the child's stdio");
 }
 
+/// A spawn whose identity check fails ends the leaf's placement exchange before it kills the child:
+/// the leaf then answers only for the tree, as it does after an attach failure, and the kill never
+/// races the exchange's reads.
+///
+/// Mutant: the identity-failure arm settles the verdict after the kill, or not at all.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::cgroup::fault as cgroup_fault;
+    use crate::send_log::Capture;
+    use crate::signal::Sig;
+
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain();
+    let capture = Rc::new(Capture::start());
+    let sends_at_settle = Rc::new(Cell::new(None));
+    let _hook = cgroup_fault::set_on_take_placement({
+        let (capture, sends_at_settle) = (Rc::clone(&capture), Rc::clone(&sends_at_settle));
+        move || sends_at_settle.set(Some(capture.entries().len()))
+    });
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    err.expect("a vanished identity must fail the spawn");
+
+    let Some(crate::identity::Resolved::Found(child)) = fault::take_captured() else {
+        panic!("the seam must capture the child's identity");
+    };
+    assert_eq!(
+        sends_at_settle.get(),
+        Some(0),
+        "the verdict must be settled, and before anything is sent to the child"
+    );
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|&(pid, sig, _)| pid == child.pid() && sig == Sig::Kill),
+        "the child must be killed after the verdict: {:?}",
+        capture.entries()
+    );
+    teardown.assert_killed();
+}
+
 // ===== A refused spawn leaves our handle inheritance alone =====
 
 /// A refused spawn must not have mutated this process first. `clear_std_handle_inheritance` is a

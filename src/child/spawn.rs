@@ -411,6 +411,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Ok(unique) => unique,
         Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
     };
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeAttach, child.id());
     let attachment = match attach_or_fault_typed(
         child.id(),
         #[cfg(windows)]
@@ -1536,7 +1538,6 @@ pub(crate) mod fault {
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        #[cfg(feature = "tokio")]
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
@@ -1716,8 +1717,7 @@ pub(crate) mod fault {
         /// Right before the spawn reads the child's identity (the tokio spawn's macOS unique id is
         /// read earlier, before the backend exists).
         BeforeIdentity,
-        /// Right before the async spawn attaches the containment, after `BeforeIdentity`.
-        #[cfg(feature = "tokio")]
+        /// Right before the spawn attaches the containment.
         BeforeAttach,
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
@@ -1727,7 +1727,6 @@ pub(crate) mod fault {
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
         match point {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
-            #[cfg(feature = "tokio")]
             SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
         }

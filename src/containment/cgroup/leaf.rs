@@ -326,6 +326,8 @@ impl CgroupLeaf {
     /// The outer `Err` is a spawn that must fail: membership could not be decided, so the child
     /// was killed (see [`CgroupLeaf::decide_unwaitable`]).
     pub(crate) fn take_placement(&mut self, pid: u32) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+        #[cfg(test)]
+        fault::run_on_take_placement();
         let mut channel = self.report.take().expect(RELEASED);
         self.procs_fd = None;
         let report = match channel.wait(pid) {
