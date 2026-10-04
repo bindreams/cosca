@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::process::Stdio as StdStdio;
 
-#[cfg(not(target_os = "linux"))]
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
 use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
@@ -320,12 +319,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             Ok(c) => c,
             Err(e) => {
                 let e = crate::child::spawn::unique_report::failed_spawn_error(e, &unique);
-                // A child whose own read was refused was collected by std, and its program never
-                // ran: nothing is left to warn about.
-                let abandoned = if matches!(unique, crate::child::spawn::unique_report::Report::ChildRefused(_)) {
-                    crate::containment::AbandonedChild::Ended
-                } else {
-                    prepared.abandon_before_verdict()
+                // The hook did not write an id, so the program never ran. A refusal fails the spawn
+                // after std's own collection, so nothing is left; a missing report leaves it open
+                // who collected the child.
+                use crate::child::spawn::unique_report::Report;
+                use crate::containment::AbandonedChild;
+                let abandoned = match unique {
+                    Report::ChildRefused(_) => AbandonedChild::Ended,
+                    Report::Missing => AbandonedChild::MaybeUnreaped,
+                    _ => prepared.abandon_before_verdict(),
                 };
                 warn_for_abandoned_child(abandoned, &e);
                 return Err(e);
@@ -442,8 +444,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         Ok(unique) => (Some(unique), None),
         Err(not_adopted) => (None, Some(not_adopted)),
     };
-    // Built first so failure arms tear the child down through its handle, not its pid. A refused id
-    // read leaves it id-less; the spawn fails below.
+    // Built first so failure arms tear the child down through its handle, not its pid. On macOS a
+    // child with no adopted id is id-less, and the spawn fails below.
     #[cfg(target_os = "linux")]
     let proc = {
         // Before `child` moves into the backend: a panic here would drop tokio's `Child` by value.

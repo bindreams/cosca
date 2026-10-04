@@ -141,12 +141,12 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
 async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut cmd, writer) = tokio_blocker();
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Adopt, UniqRead::Refused(libc::EPERM));
+    let reads = uniq_fault::record();
     let mut child = cmd.spawn().expect("the child's own report needs no by-pid read");
     assert_eq!(
-        uniq_fault::unconsumed(ReadPurpose::Adopt),
-        1,
-        "nothing may have read the unique id by pid"
+        reads.purposes(),
+        [ReadPurpose::Running],
+        "the only by-pid read is the identity check's re-read, none to adopt the id"
     );
     drop(writer);
     child.wait().await.expect("wait");
@@ -211,4 +211,26 @@ async fn macos_tokio_spawn_adopts_the_live_childs_own_unique_id() {
     assert_eq!(*identity, Some(info.unique_id));
     drop(writer);
     child.wait().await.expect("wait");
+}
+
+/// As the sync twin, and the abandoned-child warning must not claim a child is left running: a
+/// missing report on a failed spawn proves the program never ran.
+///
+/// Mutant: the failed spawn's warning treats a missing report like a child that may be running.
+#[skuld::test]
+async fn macos_tokio_spawn_failing_before_the_report_keeps_stds_error_and_does_not_warn_running() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, _writer) = tokio_blocker();
+    let _forced = unique_report::seams::force_hook_failure_before_report(libc::ENOENT);
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("the hook fails the spawn");
+    assert!(
+        matches!(&err, Error::Io(e) if e.raw_os_error() == Some(libc::ENOENT)),
+        "std's error stays: {err:?}"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "left running"),
+        "the program never ran, so nothing is left running"
+    );
 }
