@@ -154,7 +154,7 @@ impl PrivateDir {
                 Ok(st) => {
                     debug_assert_eq!(FileType::from_raw_mode(st.st_mode), FileType::Directory);
                     debug_assert_eq!(st.st_uid, euid);
-                    debug_assert_eq!(u32::from(st.st_mode) & 0o7777, 0o700);
+                    debug_assert_eq!(Mode::from_raw_mode(st.st_mode), Mode::RWXU);
                     id_of(&st)
                 }
                 Err(e) => {

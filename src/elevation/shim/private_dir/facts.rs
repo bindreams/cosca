@@ -10,10 +10,15 @@ const GROUP_OTHER_WRITE: u32 = 0o022;
 
 /// XNU's `MNT_IGNORE_OWNERSHIP`: the volume reports every file as owned by the caller.
 #[cfg(target_os = "macos")]
-const IGNORE_OWNERSHIP: u32 = libc::MNT_IGNORE_OWNERSHIP as u32;
+fn mount_ignores_ownership(mount_flags: u32) -> bool {
+    mount_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0
+}
+
 /// No other platform has the flag.
 #[cfg(not(target_os = "macos"))]
-const IGNORE_OWNERSHIP: u32 = 0;
+fn mount_ignores_ownership(_: u32) -> bool {
+    false
+}
 
 /// XNU's `UNKNOWNUID` (`nobody`'s old uid). Under it, XNU reports every file as owned by the caller.
 #[cfg(target_os = "macos")]
@@ -41,7 +46,7 @@ impl DirFacts {
         Self {
             uid: st.st_uid,
             mode: st.st_mode.into(),
-            ignores_ownership: mount_flags & IGNORE_OWNERSHIP != 0,
+            ignores_ownership: mount_ignores_ownership(mount_flags),
             acl_grants_others,
         }
     }
