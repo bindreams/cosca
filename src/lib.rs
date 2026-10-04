@@ -53,14 +53,6 @@
 // tests and test binaries.
 #![warn(clippy::let_underscore_must_use)]
 
-#[cfg(test)]
-#[allow(
-    unused_imports,
-    reason = "a stray #[test] must register with skuld, not silently never run"
-)]
-#[macro_use]
-extern crate skuld;
-
 pub mod containment;
 pub mod elevation;
 pub mod error;

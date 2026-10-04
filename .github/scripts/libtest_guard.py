@@ -8,9 +8,7 @@
 A `harness = false` target never runs libtest's `#[test]` or `#[tokio::test]` (the attribute is
 stripped), so such a test would silently never run. Two checks:
 
-1. Manifest (exit 2). Every `test = true` target must be `harness = false` in Cargo.toml, or be
-   listed in the unflipped file as `<kind>:<name>` (`lib:cosca`, `test:spawn_io`, `bin:tool`).
-   Every unflipped entry must still name such a target.
+1. Manifest (exit 2). Every `test = true` target must be `harness = false` in Cargo.toml.
 2. Attribute (exit 1). Every other target of every kind (`test = false` ones included: a `#[test]`
    there never runs either) is compiled with `--test` under clippy::disallowed_macros, configured
    by .github/libtest-guard/clippy.toml. A plain `cargo clippy` does not see these: the attribute
@@ -61,15 +59,9 @@ class Run:
     bad_lines: list[str] = field(default_factory=list)
 
 
-def read_unflipped(path: Path) -> set[str]:
-    lines = (line.split("#", 1)[0].strip() for line in path.read_text().splitlines())
-    return {line for line in lines if line}
-
-
-def plan(packages: list[dict], unflipped: set[str]) -> tuple[list[Target], list[str]]:
+def plan(packages: list[dict]) -> tuple[list[Target], list[str]]:
     """The targets to compile, and the manifest errors."""
     errors: list[str] = []
-    default_harness_tests: set[str] = set()
     targets: list[Target] = []
     for package in packages:
         manifest = tomllib.loads(Path(package["manifest_path"]).read_text())
@@ -88,21 +80,13 @@ def plan(packages: list[dict], unflipped: set[str]) -> tuple[list[Target], list[
                 continue
             # cargo metadata does not carry `harness`; it defaults to true, as cargo's does.
             harness = table[0].get("harness", True) if table else True
-            key = f"{kind}:{t['name']}"
             if t["test"] and harness:
-                default_harness_tests.add(key)
-                if key not in unflipped:
-                    errors.append(
-                        f"target {t['name']} ({kind}) uses the default libtest harness: set `harness = false` "
-                        f"and run it under skuld, or list `{key}` in .github/libtest-guard/unflipped.txt"
-                    )
+                errors.append(
+                    f"target {t['name']} ({kind}) uses the default libtest harness: set `harness = false` "
+                    "and run it under skuld"
+                )
                 continue
             targets.append(Target(package["manifest_path"], flag, harness))
-    for entry in sorted(unflipped - default_harness_tests):
-        errors.append(
-            f"stale UNFLIPPED entry: {entry} (no such test target with the default harness; "
-            "delete it from the unflipped file)"
-        )
     return targets, errors
 
 
@@ -174,7 +158,6 @@ def main() -> int:
     p.add_argument("--both-profiles", action="store_true", help="check debug, then release")
     p.add_argument("--features", help="the features to enable; with --feature-powerset, the ones it is over")
     p.add_argument("--manifest-path")
-    p.add_argument("--unflipped", type=Path, default=CONF_DIR / "unflipped.txt")
     p.add_argument("--findings-json", type=Path, help="write the unique {file, line} of every finding here")
     args = p.parse_args()
 
@@ -182,7 +165,7 @@ def main() -> int:
     if args.manifest_path:
         meta_cmd += ["--manifest-path", args.manifest_path]
     packages = json.loads(subprocess.run(meta_cmd, check=True, stdout=subprocess.PIPE).stdout)["packages"]
-    targets, errors = plan(packages, read_unflipped(args.unflipped))
+    targets, errors = plan(packages)
     if errors:
         for e in errors:
             print(f"::error::{e}", file=sys.stderr)
