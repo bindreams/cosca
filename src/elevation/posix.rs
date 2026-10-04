@@ -4,6 +4,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
@@ -136,6 +137,13 @@ pub(crate) fn build_argv(
 /// program: the front's options, then the shim, whose own `--` precedes the program. The program is
 /// never a front argument. `shim_exe` is absolute, so `pkexec`, which has no `--` shield, never
 /// meets a leading dash.
+///
+/// The shim's arguments are plain, except under `pkexec` when any of `dir`, `search_path`, `program`
+/// or `args` holds a byte outside printable ASCII (0x20..=0x7e): then they are hex, so the command
+/// line is ASCII apart from `shim_exe`. polkit 123 and later cuts the command line at a byte count
+/// for its dialog, which splits a multi-byte character and leaves invalid UTF-8 (derived from
+/// polkit's source, not measured), and a non-UTF-8 argument breaks `command_line` itself. Plain for
+/// ASCII keeps the dialog readable. `sudo` and `doas` are always plain.
 // No caller until the sync spawn consults `ShimChoice`.
 #[allow(dead_code, reason = "the shim is built bottom-up; its callers land later")]
 pub(crate) fn build_shim_argv(
@@ -146,7 +154,13 @@ pub(crate) fn build_shim_argv(
     shim: &ShimArgs,
     env: &[(OsString, OsString)],
 ) -> Result<Vec<OsString>, Error> {
-    let argv = shim.to_argv(shim_exe, false);
+    let printable = |a: &OsStr| a.as_bytes().iter().all(|b| (0x20..=0x7e).contains(b));
+    let hex = backend == Backend::Pkexec
+        && !(printable(shim.dir.as_os_str())
+            && shim.search_path.as_deref().is_none_or(printable)
+            && printable(&shim.program)
+            && shim.args.iter().all(|a| printable(a)));
+    let argv = shim.to_argv(shim_exe, hex);
     build_argv(backend, backend_path, auth, &argv[0], &argv[1..], env)
 }
 

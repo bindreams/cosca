@@ -56,3 +56,64 @@ fn sudo_doas_pkexec_argv_wrap_the_program_after_the_shim_separator() {
         );
     }
 }
+
+const PKEXEC_PREFIX: usize = 3;
+
+/// The shim's argv as the front was given it, parsed back.
+fn parsed_tail(argv: &[OsString]) -> ShimArgs {
+    ShimArgs::parse(&argv[PKEXEC_PREFIX..]).unwrap().unwrap()
+}
+
+fn is_hex_form(argv: &[OsString]) -> bool {
+    argv[PKEXEC_PREFIX + 1] == "--cosca-elevation-shim=1x"
+}
+
+#[skuld::test]
+fn pkexec_uses_hex_when_an_argument_is_not_ascii() {
+    let multibyte = "日本語".repeat(5);
+    let mut cases = vec![
+        shim_args(b"/usr/bin/id", &[multibyte.as_bytes()]),
+        shim_args(multibyte.as_bytes(), &[]),
+        shim_args(b"/usr/bin/id", &[b"\xff\xfe"]),
+        shim_args(b"/usr/bin/id", &[b"tab\there"]),
+        shim_args(b"/usr/bin/id", &[b"\x7f"]),
+    ];
+    let mut dir = shim_args(b"/usr/bin/id", &[]);
+    dir.dir = PathBuf::from("/tmp/ü");
+    cases.push(dir);
+    let mut search = shim_args(b"id", &[]);
+    search.search_path = Some(OsString::from_vec(b"/bin:\xff".to_vec()));
+    cases.push(search);
+    for shim in cases {
+        let argv = wrapped(Backend::Pkexec, &Auth::NonInteractive, &shim);
+        assert!(is_hex_form(&argv), "{shim:?}");
+        assert!(
+            argv[PKEXEC_PREFIX + 2..]
+                .iter()
+                .all(|a| a.as_encoded_bytes().is_ascii()),
+            "{shim:?}: ASCII apart from the executable"
+        );
+        assert_eq!(parsed_tail(&argv), shim);
+    }
+}
+
+#[skuld::test]
+fn pkexec_stays_plain_for_ascii() {
+    let mut with_search = shim_args(b"id", &[b"a b", b"'\"$`\\"]);
+    with_search.search_path = Some(OsString::from("/usr/bin:/bin"));
+    for shim in [shim_args(b"/usr/bin/id", &[b"-u", b"--", b"x y"]), with_search] {
+        let argv = wrapped(Backend::Pkexec, &Auth::NonInteractive, &shim);
+        assert!(!is_hex_form(&argv), "{shim:?}");
+        assert_eq!(argv[PKEXEC_PREFIX..], shim.to_argv(OsStr::new(EXE), false)[..]);
+        assert_eq!(parsed_tail(&argv), shim);
+    }
+}
+
+#[skuld::test]
+fn sudo_and_doas_stay_plain_for_non_ascii() {
+    let shim = shim_args("日本語".as_bytes(), &[b"\xff"]);
+    for (backend, prefix) in [(Backend::Sudo, 3), (Backend::Doas, 3)] {
+        let argv = wrapped(backend, &Auth::NonInteractive, &shim);
+        assert_eq!(argv[prefix..], shim.to_argv(OsStr::new(EXE), false)[..], "{backend:?}");
+    }
+}
