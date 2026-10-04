@@ -365,8 +365,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
         // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
         // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
+        // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
         #[cfg(target_os = "linux")]
-        let handshake = handshake.open(&_guard)?;
+        let handshake = handshake
+            .open(&_guard)?
+            .leaving_front(cmd.elevation_front().filter(|_| prepared.cgroup_leaf.is_none()));
 
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
@@ -397,7 +400,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-                let held = handshake.run(|| tcmd.spawn());
+                let held = handshake.run(|| {
+                    let spawned = tcmd.spawn();
+                    #[cfg(test)]
+                    let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
+                    spawned
+                });
                 held.map(|held| {
                     held_pidfd = Some(held.pidfd);
                     held.child
@@ -480,6 +488,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // attachment's root a stranger under an identity that passed.
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    #[cfg(target_os = "linux")]
+    let in_cgroup = prepared.cgroup_leaf.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let in_cgroup = false;
+    #[cfg(unix)]
+    let front = cmd.elevation_front().filter(|_| !in_cgroup);
+    #[cfg(not(unix))]
+    let _ = in_cgroup;
     let attach = crate::child::spawn::attach_or_fault(
         pid,
         #[cfg(windows)]
@@ -492,11 +509,9 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // attach never leaks a live/suspended process.
         Err(e) => {
             #[cfg(unix)]
-            if let Some(front) = cmd.elevation_front() {
-                // The failed attach has dropped the containment: a cgroup leaf's drop kills and
-                // drains it, so a front in it has exited by now.
+            if let Some(front) = front {
                 let fate = proc.leave_front(pid, front);
-                return Err(fate.note(e, Some(front), pid));
+                return Err(fate.note(e, Some(front), Some(pid)));
             }
             proc.reap_now(pid);
             return Err(e);
@@ -518,18 +533,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path above: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
         other => {
-            // An elevation front is sent nothing (see `ProcSource::leave_front`). Its containment
-            // goes first: a cgroup leaf's drop kills and drains it, so the teardown finds a contained
-            // front exited, and says what became of it.
+            // An elevation front is sent nothing (see `ProcSource::leave_front`).
             #[cfg(unix)]
-            if let Some(front) = cmd.elevation_front() {
-                drop(attachment);
+            if let Some(front) = front {
                 #[cfg(target_os = "macos")]
                 if matches!(other, Resolved::Unknown) {
                     proc.forget_foreign();
                 }
                 let fate = proc.leave_front(pid, front);
-                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), pid));
+                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
             }
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.

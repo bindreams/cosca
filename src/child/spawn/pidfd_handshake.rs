@@ -95,6 +95,9 @@ pub(crate) struct Handshake {
     child_end: OwnedFd,
     done: OwnedFd,
     shared: Arc<Shared>,
+    /// The elevation front the spawn launches, if it does: a spawn that fails after its fork sends
+    /// it nothing (see [`Handshake::leaving_front`]).
+    front: Option<crate::elevation::front::Front>,
 }
 
 /// A spawned child, and the pidfd it sent while it was held before `exec`.
@@ -199,6 +202,7 @@ impl Pending {
             child_end,
             done,
             shared: self.shared,
+            front: None,
         })
     }
 }
@@ -255,6 +259,17 @@ impl Drop for ShutOnDrop<'_> {
 }
 
 impl Handshake {
+    /// Names the elevation front this spawn launches. A spawn that fails after its fork then sends
+    /// the child nothing, a kill of which would orphan its elevated program (see
+    /// [`crate::elevation::front`]), and its error says what became of it. Only a spawn whose failed
+    /// `spawn()` leaves the child unreaped (tokio's) names one: std reaps the child of a spawn it
+    /// fails.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn leaving_front(mut self, front: Option<crate::elevation::front::Front>) -> Handshake {
+        self.front = front;
+        self
+    }
+
     /// Runs `spawn` (the fork) with the helper thread alive beside it, then answers the pidfd.
     ///
     /// - A failed `pidfd_open` in the child is the error, whatever `spawn` answered: the child
@@ -280,6 +295,7 @@ impl Handshake {
             child_end,
             done,
             shared,
+            front,
         } = self;
         #[cfg(test)]
         let seams = fault::take_helper_seams();
@@ -381,7 +397,7 @@ impl Handshake {
                 (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
                 (outcome, _) => outcome,
             };
-            conclude(spawned, outcome)
+            conclude(spawned, outcome, front)
         })
     }
 }
@@ -742,8 +758,20 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
-/// Combines the fork's answer with the helper's.
-fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held<T>, Error> {
+/// Combines the fork's answer with the helper's. A child left unreaped by a failed `spawn()` is
+/// torn down through its pidfd, unless it is the elevation `front`, which is sent nothing.
+fn conclude<T: Spawned>(
+    spawned: io::Result<T>,
+    outcome: Outcome,
+    front: Option<crate::elevation::front::Front>,
+) -> Result<Held<T>, Error> {
+    let teardown = |pidfd: OwnedFd, error: Error| match front {
+        Some(front) => super::leave_front_through_pidfd(None, pidfd, front).note(error, Some(front), None),
+        None => {
+            super::teardown_through_pidfd(None, pidfd);
+            error
+        }
+    };
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
@@ -772,17 +800,12 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held
         }
         // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
         // fail one after std's succeeded, and drops that child neither killed nor reaped.
-        (Err(e), Outcome::Opened(pidfd) | Outcome::Gone(pidfd)) => {
-            super::teardown_through_pidfd(None, pidfd);
-            Err(Error::Io(e))
-        }
+        (Err(e), Outcome::Opened(pidfd) | Outcome::Gone(pidfd)) => Err(teardown(pidfd, Error::Io(e))),
         // The helper's error explains the abort std reports.
-        (Err(_), Outcome::Failed(e, pidfd)) => {
-            if let Some(pidfd) = pidfd {
-                super::teardown_through_pidfd(None, pidfd);
-            }
-            Err(e)
-        }
+        (Err(_), Outcome::Failed(e, pidfd)) => Err(match pidfd {
+            Some(pidfd) => teardown(pidfd, e),
+            None => e,
+        }),
         (Ok(child), Outcome::Unwatched(cause)) => {
             let named = super::named(child.pid());
             child.abandon_unreported("it sent no pidfd, and its exit could not be watched");

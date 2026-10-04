@@ -96,8 +96,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// would name the tree by that number (a process group, a ppid walk), and the note says so.
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
-/// kill is the typed `Unkillable`, and the note says so. A front in a cgroup is ended by the tree's
-/// cgroup kill alone, read after it: the front's gate is decided once, before it.
+/// kill is the typed `Unkillable`, and the note says so.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -115,7 +114,6 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
             .hard_kill_marking_unless_reaped(view, &child.tree_killed)
             .map(|s| skipped = s)
     });
-    let tree_killed = matches!(tree, Some(Ok(())));
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     if let Some(action) = skipped {
         tree_note.push_str(&format!(
@@ -124,14 +122,6 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         ));
     }
     let root = match gate {
-        // Not asked again after the kill: a killed front can read as neither exited nor in its
-        // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if tree_killed => {
-            child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
-        }
-        crate::elevation::front::Gate::CgroupOnly => Err(Error::Containment {
-            detail: "its cgroup kill failed, and a kill of the front itself would orphan the elevated program".into(),
-        }),
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
         crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited => child.kill_sent(),
     };
@@ -432,6 +422,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Ok(unique) => unique,
         Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
     };
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    #[cfg(target_os = "linux")]
+    let in_cgroup = prepared.cgroup_leaf.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let in_cgroup = false;
+    let front = cmd.elevation_front().filter(|_| !in_cgroup);
     let attachment = match attach_or_fault_typed(
         child.id(),
         #[cfg(windows)]
@@ -455,11 +451,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 leave_unverified_child(child, e.identity.unwrap_or(crate::containment::RootIdentity::Unknown));
                 FrontFate::LeftUnreaped
             };
-            // A failed attach has dropped the containment already: a cgroup leaf's drop kills and
-            // drains it, so a front in it has exited by now.
             #[cfg(not(target_os = "macos"))]
-            let fate = teardown_unadopted_or_front(child, cmd.elevation_front());
-            return Err(fate.note(e.error, cmd.elevation_front(), pid));
+            let fate = teardown_unadopted_or_front(child, front);
+            return Err(fate.note(e.error, front, Some(pid)));
         }
     };
     // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
@@ -482,11 +476,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
-            // A front's containment goes first: a cgroup leaf's drop kills and drains it, so the
-            // teardown below finds a contained front exited, and says what became of it.
-            if cmd.elevation_front().is_some() {
-                drop(attachment);
-            }
             #[cfg(target_os = "macos")]
             let fate = {
                 let gone = matches!(other, crate::identity::Resolved::Gone);
@@ -505,11 +494,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 }
             };
             #[cfg(not(target_os = "macos"))]
-            let fate = teardown_unadopted_or_front(child, cmd.elevation_front());
+            let fate = teardown_unadopted_or_front(child, front);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
-            return Err(fate.note(spawn_identity_error(other), cmd.elevation_front(), pid));
+            return Err(fate.note(spawn_identity_error(other), front, Some(pid)));
         }
     };
     // The pidfd is already held, so adopting cannot fail.
@@ -1415,7 +1404,7 @@ impl Unadopted for HeldStdChild {
 pub(crate) enum FrontFate {
     /// Not a front: torn down as any child.
     NotAFront,
-    /// It had exited (a cgroup leaf's kill ends a contained one), and was reaped.
+    /// It had exited by the teardown, and was reaped.
     Reaped,
     /// It was running, and is left unreaped: nothing waits for it, since a waiter would live as long
     /// as the program. It stays a zombie once it exits.
@@ -1425,9 +1414,9 @@ pub(crate) enum FrontFate {
 }
 
 impl FrontFate {
-    /// A failed spawn's `error`, with what became of the front `pid` noted, its variant and kind kept
-    /// (see [`Error::with_note`]). Not a front's: `error` itself.
-    pub(crate) fn note(self, error: Error, front: Option<crate::elevation::front::Front>, pid: u32) -> Error {
+    /// A failed spawn's `error`, with what became of the front `pid` (unknown: `None`) noted, its
+    /// variant and kind kept (see [`Error::with_note`]). Not a front's: `error` itself.
+    pub(crate) fn note(self, error: Error, front: Option<crate::elevation::front::Front>, pid: Option<u32>) -> Error {
         let Some(front) = front else {
             return error;
         };
@@ -1437,10 +1426,7 @@ impl FrontFate {
                 debug_assert!(false, "a front's teardown reports its fate");
                 return error;
             }
-            FrontFate::Reaped => {
-                "it was sent no signal of its own, and had exited by the teardown (a cgroup's kill ends a contained \
-                 one), which reaped it"
-            }
+            FrontFate::Reaped => "it was sent nothing, and had exited by the teardown, which reaped it",
             FrontFate::LeftUnreaped => {
                 "it was sent nothing, so the elevated program may be running; it is left unreaped"
             }
@@ -1485,7 +1471,7 @@ fn teardown_unadopted_or_front(mut child: impl Unadopted, front: Option<crate::e
 
 /// [`teardown_through_pidfd`] for an elevation front: sent nothing, reaped now only if it has
 /// exited (see [`teardown_unadopted_or_front`]).
-#[cfg(all(target_os = "linux", feature = "tokio"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn leave_front_through_pidfd(
     pid: Option<u32>,
     pidfd: std::os::fd::OwnedFd,
@@ -1677,6 +1663,8 @@ pub(crate) mod fault {
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FAIL_TOKIO_SPAWN: Cell<bool> = const { Cell::new(false) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -1709,6 +1697,39 @@ pub(crate) mod fault {
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn take_forgotten_leaf() -> Option<std::path::PathBuf> {
         FORGOTTEN_LEAF.with(|f| f.take())
+    }
+
+    /// While the guard lives, tokio's own `spawn()` on this thread fails after its fork, dropping the
+    /// child neither killed nor reaped, as a failed reaper registration (`epoll_ctl`'s `ENOSPC` or
+    /// `ENOMEM`) does. The child's pid is kept for [`take_forgotten_pid`].
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn fail_tokio_spawns_after_fork() -> FailTokioSpawns {
+        FAIL_TOKIO_SPAWN.with(|f| f.set(true));
+        FailTokioSpawns(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[must_use = "spawns succeed again as soon as the guard is dropped"]
+    pub(crate) struct FailTokioSpawns(());
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    impl Drop for FailTokioSpawns {
+        fn drop(&mut self) {
+            FAIL_TOKIO_SPAWN.with(|f| f.set(false));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn fail_tokio_spawn_after_fork(
+        spawned: std::io::Result<::tokio::process::Child>,
+    ) -> std::io::Result<::tokio::process::Child> {
+        if !FAIL_TOKIO_SPAWN.with(Cell::get) {
+            return spawned;
+        }
+        let child = spawned?;
+        FORGOTTEN_PID.with(|f| f.set(child.id()));
+        std::mem::forget(child);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
     }
 
     #[cfg(all(target_os = "linux", feature = "tokio"))]

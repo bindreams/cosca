@@ -222,50 +222,14 @@ impl Attached {
         format!("{self:?}")
     }
 
-    /// Whether this mechanism's kill reaches `pid` whatever its credentials: only a cgroup's
-    /// `cgroup.kill` does, and only while `pid` is in it. A signal to a group or to walked members is
-    /// subject to the kernel's permission check, so it is `false` for every other mechanism.
-    /// `pid` must be this process's unreaped child, so its number is not reused.
+    /// Whether this is a Linux cgroup leaf.
     #[cfg(unix)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    pub(crate) fn kill_reaches_across_credentials(&self, pid: u32) -> std::io::Result<bool> {
+    pub(crate) fn is_cgroup(&self) -> bool {
         #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.holds_member(pid);
+        if matches!(self, Attached::Cgroup(_)) {
+            return true;
         }
-        Ok(false)
-    }
-
-    /// Whether a cgroup's `cgroup.procs` lists `pid`. `false` for every other mechanism.
-    #[cfg(unix)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    pub(crate) fn cgroup_lists(&self, pid: u32) -> std::io::Result<bool> {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.lists(pid);
-        }
-        Ok(false)
-    }
-
-    /// Whether `pid`'s `/proc/<pid>/cgroup` names a cgroup's leaf or a cgroup under it. `false` for
-    /// every other mechanism.
-    #[cfg(unix)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(unused_variables, reason = "only a Linux cgroup reads it")
-    )]
-    pub(crate) fn cgroup_names(&self, pid: u32) -> std::io::Result<bool> {
-        #[cfg(target_os = "linux")]
-        if let Attached::Cgroup(leaf) = self {
-            return leaf.names(pid);
-        }
-        Ok(false)
+        false
     }
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).

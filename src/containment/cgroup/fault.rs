@@ -33,8 +33,6 @@ thread_local! {
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
-    static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -50,35 +48,6 @@ thread_local! {
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
-
-/// While the guard lives, every `cgroup.kill` write on this thread fails with `EIO`, and kills
-/// nothing: a failed kill whose members may all still run.
-pub(crate) fn fail_kill_writes() -> FailKillWrites {
-    FAIL_KILL_WRITES.with(|f| f.set(true));
-    FailKillWrites(())
-}
-
-#[must_use = "the writes succeed again as soon as the guard is dropped"]
-pub(crate) struct FailKillWrites(());
-
-impl Drop for FailKillWrites {
-    fn drop(&mut self) {
-        FAIL_KILL_WRITES.with(|f| f.set(false));
-    }
-}
-
-pub(crate) fn kill_writes_fail() -> bool {
-    FAIL_KILL_WRITES.with(Cell::get)
-}
-
-/// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.
-pub(crate) fn set_before_kill_write(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&BEFORE_KILL_WRITE, hook)
-}
-
-pub(crate) fn run_before_kill_write() {
-    crate::oneshot_hook::fire(&BEFORE_KILL_WRITE);
-}
 
 /// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with
 /// `EMFILE`, as at `RLIMIT_NOFILE`. Take semantics.

@@ -421,34 +421,6 @@ impl CgroupLeaf {
         Err(self.fail_closed(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
     }
 
-    /// Whether `pid` is in this leaf or a cgroup under it, for a kill through it. The leaf's own
-    /// `cgroup.procs` is read first: it lists a member whatever its credentials, where a root
-    /// member's `/proc` entry may be hidden (`hidepid`). A pid not listed there is looked up through
-    /// `/proc`, for a member that moved into a cgroup under the leaf.
-    pub(crate) fn holds_member(&self, pid: u32) -> io::Result<bool> {
-        #[cfg(test)]
-        if fault::take_force_membership_unreadable() {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        if self.lists(pid)? {
-            return Ok(true);
-        }
-        self.holds(pid)
-    }
-
-    /// Whether the leaf's own `cgroup.procs` lists `pid`. A task leaves the list on its way out,
-    /// before it is a zombie.
-    pub(crate) fn lists(&self, pid: u32) -> io::Result<bool> {
-        let listed = self.dir.read("cgroup.procs")?;
-        Ok(listed.lines().any(|line| line.trim().parse() == Ok(pid)))
-    }
-
-    /// Whether `pid`'s `/proc/<pid>/cgroup` names this leaf or a cgroup under it. A killed task
-    /// keeps naming its cgroup until it is freed.
-    pub(crate) fn names(&self, pid: u32) -> io::Result<bool> {
-        self.holds(pid)
-    }
-
     /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
     /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
     ///
@@ -654,17 +626,7 @@ impl CgroupLeaf {
     /// see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        #[cfg(test)]
-        fault::run_before_kill_write();
-        #[cfg(test)]
-        let written = if fault::kill_writes_fail() {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
-        } else {
-            self.dir.write("cgroup.kill", KILL_PAYLOAD)
-        };
-        #[cfg(not(test))]
-        let written = self.dir.write("cgroup.kill", KILL_PAYLOAD);
-        match written {
+        match self.dir.write("cgroup.kill", KILL_PAYLOAD) {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());

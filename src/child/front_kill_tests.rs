@@ -13,6 +13,8 @@ use crate::child::fault::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
@@ -318,5 +320,17 @@ fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     for (_, pid) in &failures {
         let status = reap(*pid).expect("the front must be left unreaped");
         assert!(status.success(), "the teardown signalled the front: {status:?}");
+    }
+}
+
+/// A front contained in a cgroup is not gated: a spawn that fails after its fork tears it down as
+/// any child, killed and reaped, and its error carries no note. Needs a delegated cgroup: the cgroup
+/// lane. Mutant: the spawn's teardown leaves a contained front alone.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
+    for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| cmd.spawn().map(drop)) {
+        assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
+        assert_eq!(reap(pid), None, "the teardown reaps it");
     }
 }

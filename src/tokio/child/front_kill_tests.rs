@@ -8,6 +8,8 @@ use std::time::Duration;
 use crate::child::front_kill_tests::{assert_refused_by, assert_unkillable_front, report};
 use crate::containment::unix::fault::record_kill_group;
 use crate::elevation::{Backend, ElevatedVia};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
@@ -191,5 +193,59 @@ async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     for (_, pid) in &failures {
         let status = reap(*pid).expect("the front must be left unreaped");
         assert!(status.success(), "the teardown signalled the front: {status:?}");
+    }
+}
+
+/// A tokio spawn that fails after its fork, as when its reaper registration is refused
+/// (`epoll_ctl`'s `ENOSPC`), sends an elevation front nothing, leaves it unreaped, and says so on
+/// the error, its variant kept. The `cat`'s stdin is a pipe this test owns: tokio's `Child`, whose
+/// streams the failure leaks, holds none of it. Mutant: the handshake's teardown kills the front.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_spawn_failing_after_its_fork_leaves_an_elevation_front_running_and_says_so() {
+    use std::os::fd::OwnedFd;
+
+    use crate::child::front_kill_tests::reap;
+    use crate::child::spawn::fault;
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let mut cmd = crate::command::Command::new();
+    cmd.args(["cat"]);
+    cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
+        .expect("stdin");
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+        Backend::Sudo,
+    ))));
+    let err = {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        crate::tokio::spawn::spawn(&mut cmd)
+            .map(drop)
+            .expect_err("the forced failure fails the spawn")
+    };
+    let pid = fault::take_forgotten_pid().expect("the seam forked a child");
+    let crate::error::Error::Io(io) = &err else {
+        panic!("the spawn's error keeps its variant: {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), None, "noted, with the original as its source: {io}");
+    let text = err.to_string();
+    assert!(text.contains("the spawned child is what sudo left"), "{text}");
+    assert!(
+        text.contains("the elevated program may be running; it is left unreaped"),
+        "{text}"
+    );
+    drop(writer);
+    let status = reap(pid).expect("the front must be left unreaped");
+    assert!(status.success(), "the teardown signalled the front: {status:?}");
+}
+
+/// Async twin of the sync `cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_kill_tests::{failed_front_spawns, reap};
+    for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop)
+    }) {
+        assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
+        assert_eq!(reap(pid), None, "the teardown reaps it");
     }
 }
