@@ -473,6 +473,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         if not_adopted.died_before_exec {
             // Only a corpse is left, and tokio's `Child` must not reap it by pid.
             proc.forget_because("died before exec");
+        } else if let Some(front) = cmd.elevation_front() {
+            // An elevation front is sent nothing and handed to no reaper, and the error says so.
+            let fate = proc.leave_front(pid, front);
+            return Err(fate.note(not_adopted.error, Some(front), Some(pid)));
         } else {
             // With no id the backend neither signals nor waits by pid: the child is forgotten, with
             // a warning naming it, and left running.
