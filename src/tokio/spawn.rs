@@ -659,8 +659,8 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
              never reached the point where it names itself and nothing holds its pid"
         }
         AbandonedChild::MaybeUnreachable => {
-            "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
-             without the child's pid"
+            "unless its spawn collected it (an `exec` failure), the child was left running and nothing \
+             can reach it: only a cgroup v2 leaf is killed without the child's pid"
         }
     };
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");

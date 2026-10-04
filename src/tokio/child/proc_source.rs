@@ -527,7 +527,7 @@ impl ProcSource {
     /// - **Linux:** a peek through the pidfd. Exact, with no start token to collide.
     /// - **macOS:** a peek that checks the pid's unique id, including that a running child's id can
     ///   be read ([`exit_only::peek_verified`](crate::wait::exit_only)). A child with no unique id
-    ///   was already reaped, or its read was refused: unknown.
+    ///   (a spawn whose report could not be read, torn down before it is returned): unknown.
     ///
     /// A child tokio already reaped is `Ours`: nothing is left to drop wrongly.
     #[cfg(unix)]
@@ -611,8 +611,8 @@ impl ProcSource {
     ///   unique id), which never reaps. A child a tracer holds is waited for until the tracer
     ///   hands it back. Anything that cannot be shown to be ours is [`Waited::Foreign`]: a
     ///   foreign reap, a pid with another unique id, a launchd-held zombie, a refused read, a
-    ///   failed peek or kqueue (warned), and a child with no unique id (already reaped when the id
-    ///   was read, or the read was refused), which is not waited on at all. A reap and reuse
+    ///   failed peek or kqueue (warned), and a child with no unique id (a spawn whose report could not
+    ///   be read, torn down before it is returned), which is not waited on at all. A reap and reuse
     ///   between the verified exit and tokio's reap is an accepted gap.
     /// - **Windows:** waits on tokio's process handle, which pins the child.
     ///

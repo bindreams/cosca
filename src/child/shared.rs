@@ -26,8 +26,8 @@
 //!   `kevent` timeout's own cap), and after every wake `crate::wait::now() >= deadline` decides
 //!   expiry, never the primitive's own "timed out".
 //!
-//! `pidfd: None` (Linux), and an identity read that said `ESRCH` at adoption (macOS), mean the child
-//! was already reaped elsewhere when it was adopted: every wait answers `ECHILD`, and `kill` is
+//! `pidfd: None` (Linux), and an identity read that said `ESRCH` at adoption (macOS, test-only
+//! `SharedChild::adopt`), mean the child was already reaped elsewhere when it was adopted: every wait answers `ECHILD`, and `kill` is
 //! success.
 
 use std::fmt;

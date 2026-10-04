@@ -247,10 +247,11 @@ pub(crate) fn arm_launchd_hold(
 
 // The child's own unique-id read =====
 
-/// The spawn takes the child's own report: a forced by-pid refusal stays unconsumed.
+/// The spawn takes the child's own report and reads the unique id by pid only for the running
+/// check.
 ///
-/// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), so the forced refusal is
-/// consumed and the spawn fails.
+/// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), which the recorded read
+/// purposes show.
 #[skuld::test]
 fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_pid() {
     let (mut cmd, writer) = sync_blocker();
