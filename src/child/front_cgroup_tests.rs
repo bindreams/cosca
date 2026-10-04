@@ -13,7 +13,7 @@ use std::os::unix::process::ExitStatusExt as _;
 
 use crate::child::fault::record_root_teardowns;
 use crate::child::front_kill_tests::{
-    assert_ends_unsignalled, assert_reaped_unsignalled, assert_unkillable_front, cat, spawn_as,
+    assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
 };
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
@@ -21,6 +21,9 @@ use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
+
+/// A forced kill of a child: `kill` or `kill_tree`.
+type Kill = fn(&crate::Child) -> Result<(), crate::error::Error>;
 
 /// `cmd`, contained in a cgroup.
 fn in_cgroup(mut cmd: Command) -> Command {
@@ -298,4 +301,85 @@ fn cgroup_kill_of_an_exited_front_that_refuses_signals_is_ok(#[fixture(cgroup)] 
             .expect("an exited front is killed like any exited child");
     }
     assert!(child.wait().expect("wait").success());
+}
+
+/// A front that a session manager moves out of its leaf between the gate and the `cgroup.kill`
+/// write was not killed: the kill answers `Unkillable`, read after the write, and the front is sent
+/// nothing. Mutant: whether the kill reached the front is not read after the write (`Ok`).
+#[skuld::test]
+fn cgroup_a_front_moved_out_during_its_kill_is_unkillable(#[fixture(cgroup)] _group: &Group) {
+    let kills: [Kill; 2] = [crate::Child::kill, crate::Child::kill_tree];
+    for kill in kills {
+        let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+        let pid = child.id().pid();
+        let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
+        assert_refused_by(kill(&child), "left the cgroup before its kill");
+        assert_ends_unsignalled(&child, stdin);
+    }
+}
+
+/// The drop of such a front leaves it running and unreaped, and never waits for it. The front's
+/// stdin is closed only by a wait's hook, so a drop that waits ends it and reaps it, which the test
+/// sees, rather than hanging. Mutant: the drop waits for a front its kill did not reach.
+#[skuld::test]
+fn cgroup_drop_of_a_front_moved_out_during_its_kill_leaves_it_unreaped(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.id().pid();
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
+    let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait({
+        let stdin = std::rc::Rc::clone(&stdin);
+        move || drop(stdin.take())
+    });
+    let mark = crate::log_capture::mark();
+    drop(child);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "is left running and unreaped");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    drop(stdin.take().expect("the drop must not wait for the front"));
+    assert_reaped_unsignalled(pid);
+}
+
+/// `kill_tree` asks the gate once: after the cgroup kill a killed front can read as neither exited
+/// nor in its cgroup. Mutant: the backstop asks again.
+#[skuld::test]
+fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
+    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let gates = crate::elevation::front::seams::count_kill_gates();
+    child.kill_tree().expect("the cgroup kill reaches the front");
+    assert_eq!(gates.count(), 1);
+}
+
+/// A failed password write's teardown asks the gate once, for the same reason. The handle opts out
+/// of the drop, whose own teardown would ask again. Mutant: the root's kill asks again.
+#[skuld::test]
+fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
+    let mut cmd = in_cgroup(cat());
+    cmd.kill_on_drop(false);
+    let (child, _stdin) = spawn_as(cmd, SUDO);
+    let gates = crate::elevation::front::seams::count_kill_gates();
+    let err = crate::child::spawn::finish_elevated(
+        child,
+        Err(crate::error::Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("a failed write fails the spawn");
+    assert!(err.to_string().contains("the elevated child was terminated"), "{err}");
+    assert_eq!(gates.count(), 1);
+}
+
+/// A failed spawn's teardown drops a contained front's leaf first, whose kill and drain end it, then
+/// reaps it and says so, on the error it would have returned anyway. Mutants: the leaf drops after
+/// the teardown, which then says the front may be running and leaves its zombie unreaped; the
+/// error's variant is replaced.
+#[skuld::test]
+fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_kill_tests::{assert_noted, failed_front_spawns, reap};
+    let failures = failed_front_spawns(Some(ContainMode::Strongest), |cmd| cmd.spawn().map(drop));
+    assert_noted(&failures, "had exited by the teardown");
+    for (_, pid) in &failures {
+        assert_eq!(reap(*pid), None, "the teardown reaps a front its cgroup's kill ended");
+    }
 }

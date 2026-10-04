@@ -267,8 +267,10 @@ pub enum ElevatedVia {
     ///   sends nothing and returns
     ///   [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
     ///   while osascript runs, and the drop-kill that [`crate::Command::kill_on_drop`]
-    ///   performs, which is **on by default**, leaves osascript running and unreaped,
-    ///   with a `warn`. [`crate::Child::terminate`] and
+    ///   performs, which is **on by default**, leaves osascript running, with a `warn`.
+    ///   The sync [`crate::Child`]'s drop leaves it unreaped; the async
+    ///   `cosca::tokio::Child`'s hands it to tokio's own reaper, as it does any root
+    ///   still running. [`crate::Child::terminate`] and
     ///   [`crate::Child::graceful_shutdown`] are refused the same way: a `SIGTERM`
     ///   would end osascript, not the program, and once the front-end is gone the
     ///   program's completion and its exit status are unobservable.

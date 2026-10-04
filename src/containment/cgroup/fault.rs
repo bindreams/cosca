@@ -34,6 +34,7 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
+    static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -68,6 +69,15 @@ impl Drop for FailKillWrites {
 
 pub(crate) fn kill_writes_fail() -> bool {
     FAIL_KILL_WRITES.with(Cell::get)
+}
+
+/// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.
+pub(crate) fn set_before_kill_write(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_KILL_WRITE, hook)
+}
+
+pub(crate) fn run_before_kill_write() {
+    crate::oneshot_hook::fire(&BEFORE_KILL_WRITE);
 }
 
 /// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with

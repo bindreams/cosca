@@ -523,7 +523,6 @@ impl Child {
             return Err(fault::forced_kill_failure());
         }
         #[cfg(unix)]
-        #[cfg(unix)]
         let gate = self.kill_gate();
         #[cfg(unix)]
         let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
@@ -532,9 +531,11 @@ impl Child {
         #[cfg(unix)]
         match gate {
             crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited => {}
-            // The cgroup kill reached the tracked process; a signal after it could only be refused.
+            // A signal after the cgroup kill could only be refused; whether the kill reached the
+            // tracked process is read after it.
             crate::elevation::front::Gate::CgroupOnly => {
                 self.os.attached.hard_kill_marking(&self.tree_killed)?;
+                cgroup_kill_reached(self.elevation.as_ref(), &self.os, self.id.pid())?;
                 return Ok(Sent::Delivered);
             }
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
@@ -610,17 +611,31 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        // A live front outside a cgroup is not signalled, by its group or otherwise. In a cgroup the
-        // backstop below is `kill()`, which gates itself: it signals no front, live or exited.
+        // Decided once: the gate is not asked again after the kill, when a killed front may read as
+        // neither exited nor in its cgroup. `None` for a child the backstop may signal; for a front
+        // it must not, `Some(true)` when the front is in the cgroup, `Some(false)` when it exited.
         #[cfg(unix)]
-        if let crate::elevation::front::Gate::Closed(unkillable) = self.kill_gate() {
-            return Err(unkillable);
-        }
+        let front = match self.kill_gate() {
+            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
+            crate::elevation::front::Gate::Open => None,
+            crate::elevation::front::Gate::Exited => Some(false),
+            crate::elevation::front::Gate::CgroupOnly => Some(true),
+        };
         let group_result = self.os.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
         if self.os.attached.hard_kill_refused_to_walk(&group_result) {
             return group_result;
+        }
+        // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
+        // reached it is read after it. One whose kill failed may still have its program running:
+        // left alone. An exited front needs no backstop.
+        #[cfg(unix)]
+        if let Some(in_cgroup) = front {
+            return match group_result {
+                Ok(()) if in_cgroup => cgroup_kill_reached(self.elevation.as_ref(), &self.os, self.id.pid()),
+                other => other,
+            };
         }
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
@@ -983,7 +998,9 @@ impl Drop for Child {
                 gate => signal_on_drop(
                     self.id,
                     view,
-                    matches!(gate, crate::elevation::front::Gate::CgroupOnly),
+                    matches!(gate, crate::elevation::front::Gate::CgroupOnly)
+                        .then_some(self.elevation.as_ref())
+                        .flatten(),
                     &mut os,
                 ),
             }
@@ -1022,12 +1039,35 @@ fn kill_gate(
     )
 }
 
-/// The signals of a kill-on-drop drop: the tree, then the root. `cgroup_only`: the root is an
-/// elevation front in the cgroup, whose kill is the only signal it gets.
+/// Whether a cgroup kill just written reached the tracked process, a front (see
+/// [`crate::elevation::front::cgroup_kill_reached`]).
+#[cfg(unix)]
+fn cgroup_kill_reached(
+    elevation: Option<&crate::elevation::ElevationReport>,
+    os: &OsResources,
+    pid: u32,
+) -> Result<(), Error> {
+    crate::elevation::front::cgroup_kill_reached(
+        elevation.map(|r| &r.via),
+        pid,
+        || os.attached.cgroup_lists(pid),
+        || {
+            os.proc
+                .as_ref()
+                .map_or(Ok(false), ProcSource::is_running)
+                .map(|running| !running)
+        },
+        || os.attached.cgroup_names(pid),
+    )
+}
+
+/// The signals of a kill-on-drop drop: the tree, then the root. `cgroup_front`: the root is an
+/// elevation front in the cgroup, launched as this report says, whose kill is the only signal it
+/// gets.
 fn signal_on_drop(
     id: ProcessId,
     #[cfg(unix)] view: crate::containment::DropView,
-    #[cfg(unix)] cgroup_only: bool,
+    #[cfg(unix)] cgroup_front: Option<&crate::elevation::ElevationReport>,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
 ) {
@@ -1068,14 +1108,14 @@ fn signal_on_drop(
     if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
         return;
     }
-    // The cgroup kill ended the front, and tokio reaps it. One whose kill failed may still have its
-    // program running, and a kill of the front would orphan it.
+    // The cgroup kill ended the front, and tokio reaps it. One the kill did not end may still have
+    // its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
-    if cgroup_only {
-        if tree.is_err() {
+    if let Some(report) = cgroup_front {
+        if let Err(e) = tree.and_then(|()| cgroup_kill_reached(Some(report), os, pid)) {
             log::warn!(
-                "Child::drop: elevation front pid {pid} is left running: its cgroup kill failed, so the elevated \
-                 program may still run, and a kill of the front would orphan it"
+                "Child::drop: elevation front pid {pid} is left running: its cgroup kill did not end it ({e}), and a \
+                 kill of the front would orphan the elevated program"
             );
         }
         return;

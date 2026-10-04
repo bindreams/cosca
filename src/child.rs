@@ -265,9 +265,11 @@ impl Child {
             Gate::Open => {}
             // An exit is permanent, so a refused signal to an exited front changes nothing.
             Gate::Exited => return Ok(self.proc.kill_sent().unwrap_or(crate::signal::Sent::Delivered)),
-            // The cgroup kill reached the tracked process; a signal after it could only be refused.
+            // A signal after the cgroup kill could only be refused; whether the kill reached the
+            // tracked process is read after it.
             Gate::CgroupOnly => {
                 self.attached.hard_kill_marking(&self.tree_killed)?;
+                self.cgroup_kill_reached()?;
                 return Ok(crate::signal::Sent::Delivered);
             }
             Gate::Closed(unkillable) => return Err(unkillable),
@@ -288,6 +290,20 @@ impl Child {
             pid,
             || self.proc.is_running(),
             || self.attached.kill_reaches_across_credentials(pid),
+        )
+    }
+
+    /// Whether a cgroup kill just written reached this child's tracked process, a front (see
+    /// [`crate::elevation::front::cgroup_kill_reached`]).
+    #[cfg(unix)]
+    fn cgroup_kill_reached(&self) -> Result<(), Error> {
+        let pid = self.id.pid();
+        crate::elevation::front::cgroup_kill_reached(
+            self.elevation.as_ref().map(|r| &r.via),
+            pid,
+            || self.attached.cgroup_lists(pid),
+            || self.proc.is_running().map(|running| !running),
+            || self.attached.cgroup_names(pid),
         )
     }
 
@@ -393,13 +409,15 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
+        // Decided once: the gate is not asked again after the kill, when a killed front may read as
+        // neither exited nor in its cgroup. `None` for a child the backstop may signal; for a front
+        // it must not, `Some(true)` when the front is in the cgroup, `Some(false)` when it exited.
         #[cfg(unix)]
-        // `true` for a front the backstop must not signal: one in the cgroup, or one that exited.
-        #[cfg(unix)]
-        let no_backstop = match self.kill_gate() {
+        let front = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
-            crate::elevation::front::Gate::Open => false,
-            crate::elevation::front::Gate::Exited | crate::elevation::front::Gate::CgroupOnly => true,
+            crate::elevation::front::Gate::Open => None,
+            crate::elevation::front::Gate::Exited => Some(false),
+            crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
@@ -407,12 +425,15 @@ impl Child {
         if self.attached.hard_kill_refused_to_walk(&group_result) {
             return group_result;
         }
-        // A front in the cgroup: its kill reached the tracked process, and a signal after it could
-        // only be refused. One whose kill failed may still have its program running: left alone.
-        // An exited front needs no backstop.
+        // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
+        // reached it is read after it. One whose kill failed may still have its program running:
+        // left alone. An exited front needs no backstop.
         #[cfg(unix)]
-        if no_backstop {
-            return group_result;
+        if let Some(in_cgroup) = front {
+            return match group_result {
+                Ok(()) if in_cgroup => self.cgroup_kill_reached(),
+                other => other,
+            };
         }
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
@@ -781,15 +802,15 @@ impl Drop for Child {
         }
         #[cfg(unix)]
         if cgroup_only {
-            if tree.is_ok() {
+            match tree.and_then(|()| self.cgroup_kill_reached()) {
                 // The cgroup kill ended it: reap it, sending nothing.
-                self.proc.reap_after_tree_kill();
-            } else {
-                log::warn!(
-                    "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill failed, so the \
-                     elevated program may still run, and a kill of the front would orphan it",
+                Ok(()) => self.proc.reap_after_tree_kill(),
+                // Never waited for: it may run as long as its program.
+                Err(e) => log::warn!(
+                    "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill did not end it \
+                     ({e}), and a kill of the front would orphan the elevated program",
                     self.id.pid()
-                );
+                ),
             }
             return;
         }

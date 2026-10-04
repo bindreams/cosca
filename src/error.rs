@@ -248,6 +248,76 @@ impl std::error::Error for IoContext {
     }
 }
 
+impl Error {
+    /// This error with `note` appended to what it says, its variant and kind kept: a caller that
+    /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
+    pub(crate) fn with_note(self, note: &str) -> Error {
+        let append = |detail: String| format!("{detail}; {note}");
+        match self {
+            Error::Io(source) => Error::Io(std::io::Error::new(
+                source.kind(),
+                IoNote {
+                    note: note.to_owned(),
+                    source,
+                },
+            )),
+            Error::Unsupported { op, platform, detail } => Error::Unsupported {
+                op,
+                platform,
+                detail: append(detail),
+            },
+            Error::Containment { detail } => Error::Containment { detail: append(detail) },
+            Error::NoConsole { detail } => Error::NoConsole { detail: append(detail) },
+            Error::Elevation { kind, detail } => Error::Elevation {
+                kind,
+                detail: append(detail),
+            },
+            Error::Unassessable { detail, source } => Error::Unassessable {
+                detail: append(detail),
+                source,
+            },
+            Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
+                pid,
+                detail: append(detail),
+                source,
+            },
+            Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord {
+                kind,
+                detail: append(detail),
+                source,
+            },
+            Error::Quote(e) => {
+                debug_assert!(
+                    false,
+                    "a note is added only to a spawn's error, never a quoting one: {e}"
+                );
+                Error::Quote(e)
+            }
+        }
+    }
+}
+
+/// An I/O error with a note after its message; the error itself is the source.
+#[derive(Debug)]
+struct IoNote {
+    note: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for IoNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; {}", self.source, self.note)
+    }
+}
+
+impl std::error::Error for IoNote {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Test-only: assert a user-facing `detail` carries no run of two or more spaces.
 ///
 /// A hard-wrapped string literal that loses its `\` line-continuation bakes the source

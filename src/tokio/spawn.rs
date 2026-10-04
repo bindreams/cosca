@@ -493,8 +493,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         Err(e) => {
             #[cfg(unix)]
             if let Some(front) = cmd.elevation_front() {
-                proc.leave_front(pid, front);
-                return Err(crate::child::spawn::front_left_running(e, Some(front), pid));
+                // The failed attach has dropped the containment: a cgroup leaf's drop kills and
+                // drains it, so a front in it has exited by now.
+                let fate = proc.leave_front(pid, front);
+                return Err(fate.note(e, Some(front), pid));
             }
             proc.reap_now(pid);
             return Err(e);
@@ -516,19 +518,18 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path above: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
         other => {
-            // An elevation front is sent nothing (see `ProcSource::leave_front`).
+            // An elevation front is sent nothing (see `ProcSource::leave_front`). Its containment
+            // goes first: a cgroup leaf's drop kills and drains it, so the teardown finds a contained
+            // front exited, and says what became of it.
             #[cfg(unix)]
             if let Some(front) = cmd.elevation_front() {
+                drop(attachment);
                 #[cfg(target_os = "macos")]
                 if matches!(other, Resolved::Unknown) {
                     proc.forget_foreign();
                 }
-                proc.leave_front(pid, front);
-                return Err(crate::child::spawn::front_left_running(
-                    crate::child::spawn::spawn_identity_error(other),
-                    Some(front),
-                    pid,
-                ));
+                let fate = proc.leave_front(pid, front);
+                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), pid));
             }
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.

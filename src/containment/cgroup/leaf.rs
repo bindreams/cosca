@@ -430,10 +430,22 @@ impl CgroupLeaf {
         if fault::take_force_membership_unreadable() {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
-        let listed = self.dir.read("cgroup.procs")?;
-        if listed.lines().any(|line| line.trim().parse() == Ok(pid)) {
+        if self.lists(pid)? {
             return Ok(true);
         }
+        self.holds(pid)
+    }
+
+    /// Whether the leaf's own `cgroup.procs` lists `pid`. A task leaves the list on its way out,
+    /// before it is a zombie.
+    pub(crate) fn lists(&self, pid: u32) -> io::Result<bool> {
+        let listed = self.dir.read("cgroup.procs")?;
+        Ok(listed.lines().any(|line| line.trim().parse() == Ok(pid)))
+    }
+
+    /// Whether `pid`'s `/proc/<pid>/cgroup` names this leaf or a cgroup under it. A killed task
+    /// keeps naming its cgroup until it is freed.
+    pub(crate) fn names(&self, pid: u32) -> io::Result<bool> {
         self.holds(pid)
     }
 
@@ -642,6 +654,8 @@ impl CgroupLeaf {
     /// see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
+        #[cfg(test)]
+        fault::run_before_kill_write();
         #[cfg(test)]
         let written = if fault::kill_writes_fail() {
             Err(std::io::Error::from_raw_os_error(libc::EIO))

@@ -236,72 +236,87 @@ fn terminate_of_a_live_sudo_front_is_sent() {
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGTERM));
 }
 
-/// A spawn of `cmd`, marked as an elevation-derived `sudo` front, that fails after its fork: once in
-/// its attach, once in its identity check. Returns each failure, and how its child ended. The child
-/// is a `cat` whose stdin the failed spawn closes; it must be left unreaped, so this reaps it here,
-/// and a child the teardown reaped or handed to a reaper fails the `waitpid`.
+/// Spawns of a `cat` marked as an elevation-derived `sudo` front, in `contain` mode if any, that fail
+/// after their fork: once in the attach, once in the identity check. Returns each failure with the
+/// child's pid. The failed spawn closes the `cat`'s stdin, so a front left alone exits 0.
 #[cfg(target_os = "linux")]
 pub(crate) fn failed_front_spawns(
+    contain: Option<ContainMode>,
     spawn: impl Fn(&mut Command) -> Result<(), Error>,
-) -> Vec<(Error, std::process::ExitStatus)> {
+) -> [(Error, u32); 2] {
     use crate::child::spawn::fault;
     let arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
-    arms.into_iter()
-        .map(|force_arm| {
-            let mut cmd = cat();
-            cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-            cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-                Backend::Sudo,
-            ))));
-            force_arm(true);
-            let err = spawn(&mut cmd);
-            force_arm(false);
-            let err = err.expect_err("the forced arm fails the spawn");
-            let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child")
-            else {
-                panic!("the seam must capture a resolved identity");
-            };
-            let pid = id.pid();
-            let mut raw = 0;
-            // SAFETY: `raw` is a valid out-parameter; `pid` is this process's own child, which the
-            // failed spawn left unreaped.
-            let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut raw, 0) };
-            assert_eq!(
-                reaped,
-                pid as libc::pid_t,
-                "the front must be left unreaped: {} ({err})",
-                std::io::Error::last_os_error()
-            );
-            (err, std::os::unix::process::ExitStatusExt::from_raw(raw))
-        })
-        .collect()
+    arms.map(|force_arm| {
+        let mut cmd = cat();
+        cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+        if let Some(mode) = contain {
+            cmd.contain_with(mode);
+        }
+        cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
+            Backend::Sudo,
+        ))));
+        force_arm(true);
+        let err = spawn(&mut cmd);
+        force_arm(false);
+        let err = err.expect_err("the forced arm fails the spawn");
+        let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
+            panic!("the seam must capture a resolved identity");
+        };
+        (err, id.pid())
+    })
 }
 
-/// `err` is the spawn failure of a front left running, and `status` shows nothing signalled it.
+/// Reaps `pid`, this process's own child, and answers how it ended: `None` if something reaped it
+/// already.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap(pid: u32) -> Option<std::process::ExitStatus> {
+    let mut raw = 0;
+    // SAFETY: `raw` is a valid out-parameter; `pid` is this process's own child.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut raw, 0) };
+    if reaped == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+        return None;
+    }
+    assert_eq!(
+        reaped,
+        pid as libc::pid_t,
+        "waitpid: {}",
+        std::io::Error::last_os_error()
+    );
+    Some(std::os::unix::process::ExitStatusExt::from_raw(raw))
+}
+
+/// The two failures keep their variants (an attach's `Containment`, an identity check's `Io`) and
+/// carry the front's fate in their text, `fate`.
 #[cfg(target_os = "linux")]
 #[track_caller]
-pub(crate) fn assert_front_left_running(err: &Error, status: std::process::ExitStatus) {
-    match err {
-        Error::Elevation {
-            kind: ElevationErrorKind::Untracked,
-            detail,
-        } => {
-            assert!(detail.contains("what sudo left"), "{detail}");
-            assert!(detail.contains("the elevated program may be running"), "{detail}");
-            assert!(detail.contains("left unreaped"), "{detail}");
-        }
-        other => panic!("expected Untracked, got {other:?}"),
+pub(crate) fn assert_noted(failures: &[(Error, u32); 2], fate: &str) {
+    let [(attach, attach_pid), (identity, identity_pid)] = failures;
+    assert!(
+        matches!(attach, Error::Containment { .. }),
+        "the attach failure keeps its variant: {attach:?}"
+    );
+    assert!(
+        matches!(identity, Error::Io(_)),
+        "the identity failure keeps its variant: {identity:?}"
+    );
+    for (err, pid) in [(attach, attach_pid), (identity, identity_pid)] {
+        let text = err.to_string();
+        assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+        assert!(text.contains(fate), "{text}");
     }
-    assert!(status.success(), "the teardown signalled the front: {status:?}");
 }
 
 /// A spawn that fails after its fork sends an elevation front nothing (a kill would orphan the
-/// program), leaves it unreaped, and says so. Mutants: the teardown kills the front; it hands the
-/// front to a reaper; the error does not say so.
+/// program), leaves it unreaped, and says so on the error it would have returned anyway. Mutants:
+/// the teardown kills the front; it hands the front to a reaper; the error's variant is replaced;
+/// the error does not say so.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
-    for (err, status) in failed_front_spawns(|cmd| cmd.spawn().map(drop)) {
-        assert_front_left_running(&err, status);
+    let failures = failed_front_spawns(None, |cmd| cmd.spawn().map(drop));
+    assert_noted(&failures, "the elevated program may be running; it is left unreaped");
+    for (_, pid) in &failures {
+        let status = reap(*pid).expect("the front must be left unreaped");
+        assert!(status.success(), "the teardown signalled the front: {status:?}");
     }
 }

@@ -162,3 +162,72 @@ fn a_sigterm_to_a_live_osascript_is_closed() {
         Gate::Open
     ));
 }
+
+/// What `cgroup_kill_reached` asked, in order (`l`isted, `e`xited, `u`nder the leaf), and its answer.
+fn reached_asking(
+    listed: io::Result<bool>,
+    exited: io::Result<bool>,
+    under_leaf: io::Result<bool>,
+) -> (Result<(), Error>, String) {
+    let asked = Cell::new(String::new());
+    let note = |c: char| {
+        let mut s = asked.take();
+        s.push(c);
+        asked.set(s);
+    };
+    let r = super::cgroup_kill_reached(
+        Some(&ElevatedVia::Wrapped(Backend::Sudo)),
+        PID,
+        || {
+            note('l');
+            listed
+        },
+        || {
+            note('e');
+            exited
+        },
+        || {
+            note('u');
+            under_leaf
+        },
+    );
+    (r, asked.take())
+}
+
+/// A front still listed, exited, or named under the leaf after the write was there for the kill.
+/// Mutant: any of the three is ignored.
+#[skuld::test]
+fn a_front_in_its_leaf_after_the_kill_was_reached() {
+    let (r, asked) = reached_asking(Ok(true), Ok(false), Ok(false));
+    assert!(r.is_ok() && asked == "l", "{r:?} {asked}");
+    let (r, asked) = reached_asking(Ok(false), Ok(true), Ok(false));
+    assert!(r.is_ok() && asked == "le", "{r:?} {asked}");
+    let (r, asked) = reached_asking(Ok(false), Ok(false), Ok(true));
+    assert!(r.is_ok() && asked == "leu", "{r:?} {asked}");
+}
+
+/// A front none of the three places in the leaf left it before the kill: refused, and named.
+/// Mutant: a front outside its leaf after the kill is reported killed.
+#[skuld::test]
+fn a_front_outside_its_leaf_after_the_kill_was_not_reached() {
+    let (r, _) = reached_asking(Ok(false), Ok(false), Ok(false));
+    let detail = refusal_detail(Gate::Closed(r.expect_err("not reached")));
+    assert!(detail.contains("left the cgroup before its kill"), "{detail}");
+}
+
+/// A front whose place cannot be read is not shown reached: refused, with every reason. Mutant: an
+/// unreadable place reads as reached.
+#[skuld::test]
+fn a_front_whose_place_after_the_kill_cannot_be_read_is_refused() {
+    let (r, _) = reached_asking(
+        Err(io::Error::other("procs refused")),
+        Ok(false),
+        Err(io::Error::other("hidepid")),
+    );
+    let detail = refusal_detail(Gate::Closed(r.expect_err("not shown reached")));
+    assert!(detail.contains("nothing shows the cgroup kill reached it"), "{detail}");
+    assert!(
+        detail.contains("procs refused") && detail.contains("hidepid"),
+        "{detail}"
+    );
+}

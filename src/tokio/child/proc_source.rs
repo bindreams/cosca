@@ -789,21 +789,29 @@ impl ProcSource {
     /// exited. Otherwise it is left unreaped, and stays a zombie once it exits. **Invariant:** no
     /// `wait()` future for this child is in flight.
     #[cfg(unix)]
-    pub(crate) fn leave_front(mut self, pid: u32, front: crate::elevation::front::Front) {
+    pub(crate) fn leave_front(
+        mut self,
+        pid: u32,
+        front: crate::elevation::front::Front,
+    ) -> crate::child::spawn::FrontFate {
         self.forget_if_foreign();
         #[cfg(target_os = "linux")]
         {
             let ProcSource::Tokio { pidfd, .. } = &mut self else {
-                return;
+                return crate::child::spawn::FrontFate::Unaccounted;
             };
             let pidfd = pidfd.take();
             self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
-            crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front);
+            crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (pid, front);
+            if matches!(self, ProcSource::Foreign { .. }) {
+                return crate::child::spawn::FrontFate::Unaccounted;
+            }
             self.forget_because("is an elevation front, sent nothing, and left unreaped");
+            crate::child::spawn::FrontFate::LeftUnreaped
         }
     }
 

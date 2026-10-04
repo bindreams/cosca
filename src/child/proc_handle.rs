@@ -106,6 +106,8 @@ impl ProcHandle {
     pub(crate) fn reap_after_tree_kill(&self) {
         match self {
             ProcHandle::Std(s) => {
+                #[cfg(test)]
+                crate::child::spawn::fault::run_between_kill_and_wait();
                 if let Err(e) = s.wait() {
                     log_teardown_wait_failure(s.id(), &e);
                 }

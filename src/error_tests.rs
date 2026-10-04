@@ -182,3 +182,29 @@ fn io_context_keeps_the_os_error_as_its_source() {
         .expect("the OS error is the source");
     assert_eq!(source.raw_os_error(), Some(code));
 }
+
+/// A note keeps the variant, and an I/O error keeps its kind and its OS code as the source.
+/// Mutants: a noted error is rewrapped into another variant; the I/O kind or source is lost.
+#[cfg(unix)]
+#[skuld::test]
+fn with_note_keeps_the_variant_and_appends() {
+    let unassessable = Error::Unassessable {
+        detail: "refused".into(),
+        source: None,
+    }
+    .with_note("left running");
+    assert!(matches!(&unassessable, Error::Unassessable { detail, .. } if detail == "refused; left running"));
+    let containment = Error::Containment {
+        detail: "attach".into(),
+    }
+    .with_note("left running");
+    assert!(matches!(&containment, Error::Containment { detail } if detail == "attach; left running"));
+    let Error::Io(io) = Error::Io(std::io::Error::from_raw_os_error(libc::EACCES)).with_note("left running") else {
+        panic!("an Io error stays Io");
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(io.to_string().ends_with("; left running"), "{io}");
+    let source = std::error::Error::source(io.get_ref().expect("a custom payload")).expect("the original");
+    let original = source.downcast_ref::<std::io::Error>().expect("an io::Error");
+    assert_eq!(original.raw_os_error(), Some(libc::EACCES));
+}

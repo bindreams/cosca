@@ -239,6 +239,35 @@ impl Attached {
         Ok(false)
     }
 
+    /// Whether a cgroup's `cgroup.procs` lists `pid`. `false` for every other mechanism.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    pub(crate) fn cgroup_lists(&self, pid: u32) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.lists(pid);
+        }
+        Ok(false)
+    }
+
+    /// Whether `pid`'s `/proc/<pid>/cgroup` names a cgroup's leaf or a cgroup under it. `false` for
+    /// every other mechanism.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    pub(crate) fn cgroup_names(&self, pid: u32) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.names(pid);
+        }
+        Ok(false)
+    }
+
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         self.hard_kill_report().0

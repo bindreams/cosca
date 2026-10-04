@@ -181,12 +181,15 @@ async fn terminate_of_a_live_sudo_front_is_sent() {
 }
 
 /// Async twin of the sync `a_failed_spawn_leaves_an_elevation_front_running_and_says_so`.
-/// Mutants: the teardown kills the front; the error does not say so.
+/// Mutants: the teardown kills the front; the error's variant is replaced; it does not say so.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
-    use crate::child::front_kill_tests::{assert_front_left_running, failed_front_spawns};
-    for (err, status) in failed_front_spawns(|cmd| crate::tokio::spawn::spawn(cmd).map(drop)) {
-        assert_front_left_running(&err, status);
+    use crate::child::front_kill_tests::{assert_noted, failed_front_spawns, reap};
+    let failures = failed_front_spawns(None, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_noted(&failures, "the elevated program may be running; it is left unreaped");
+    for (_, pid) in &failures {
+        let status = reap(*pid).expect("the front must be left unreaped");
+        assert!(status.success(), "the teardown signalled the front: {status:?}");
     }
 }

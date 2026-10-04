@@ -7,9 +7,15 @@
 //! signal is refused. Which of the two cosca holds is not known at spawn.
 //!
 //! So a forced kill never signals a live front. It goes through a cgroup whose `cgroup.kill`
-//! reaches the tracked process whatever its credentials, and nothing is signalled after it, since
-//! that kill is complete. Without one, nothing is sent and the answer is `Unkillable`. Either way
-//! `wait()` returns only once the program is gone.
+//! reaches the tracked process whatever its credentials, and nothing is signalled after it. Whether
+//! the kill reached the tracked process is read after the write ([`cgroup_kill_reached`]): a front
+//! that left the cgroup in between was not killed. Without a cgroup, nothing is sent and the answer
+//! is `Unkillable`.
+//!
+//! Left alone, a wrapper front exits only after its program, so `wait()` returns once the program
+//! is gone. A cgroup kill is asynchronous, though: `wait()` then returns once the front is reaped,
+//! and a program stuck in uninterruptible sleep can outlive it. Only `wait_tree()` observes the
+//! program's own end.
 //!
 //! A `SIGTERM` is gated only for osascript. sudo and doas relay it to the program; osascript would
 //! end, leaving the program running, so `terminate()` on it is refused like a kill.
@@ -27,8 +33,10 @@ use crate::error::{ElevationErrorKind, Error};
 pub(crate) enum Gate {
     /// Not a front: signal it like any child.
     Open,
-    /// A front that has exited: nothing is left to orphan. A kill answers `Ok`, as for any exited
-    /// child, even where the signal to it would be refused (a root zombie keeps its credentials).
+    /// A front that has exited. A kill answers `Ok`, as for any exited child, even where the
+    /// signal to it would be refused (a root zombie keeps its credentials). `Ok` then means only
+    /// that the front has exited: a front something else killed (the OOM killer, or this user) may
+    /// have left its program running.
     Exited,
     /// A live front in a cgroup: kill the cgroup, and signal nothing after it.
     CgroupOnly,
@@ -77,6 +85,8 @@ pub(crate) fn kill_gate(
     running: impl FnOnce() -> io::Result<bool>,
     in_cgroup: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
+    #[cfg(test)]
+    seams::note_kill_gate();
     let Some(front) = front(via) else {
         return Gate::Open;
     };
@@ -94,6 +104,58 @@ pub(crate) fn kill_gate(
             Gate::Closed(refused(front, pid, Signal::Kill, Some(why)))
         }
     }
+}
+
+/// Whether a cgroup kill, just written, reached the tracked process `pid` of the front `via`
+/// launched. The kill and a move out of the cgroup are serialised by the kernel (both writes take
+/// `cgroup_mutex`), so what holds after the write says which came first:
+///
+/// - `listed`: `pid` is in the leaf's `cgroup.procs`, so it was there for the kill.
+/// - `exited`: it has exited, so nothing of it is left to kill.
+/// - `under_leaf`: its `/proc/<pid>/cgroup` names the leaf or a cgroup under it. A killed task
+///   keeps naming its cgroup until it is freed, after it has left `cgroup.procs` on its way out.
+///
+/// A front none of these places in the leaf left it before the kill, as pam_systemd moves sudo into
+/// a session scope: it was not killed, and the answer is `Unkillable`, so nothing waits for it. So
+/// is one whose place cannot be read (a `hidepid` `/proc` hides a root program): nothing shows the
+/// kill reached it. A front killed and then moved before it exited reads as moved too (measured on
+/// Linux 7.0): that answer is a refusal of a kill that did land, never an `Ok` for one that did not.
+pub(crate) fn cgroup_kill_reached(
+    via: Option<&ElevatedVia>,
+    pid: u32,
+    listed: impl FnOnce() -> io::Result<bool>,
+    exited: impl FnOnce() -> io::Result<bool>,
+    under_leaf: impl FnOnce() -> io::Result<bool>,
+) -> Result<(), Error> {
+    let Some(front) = front(via) else {
+        debug_assert!(false, "only a front's cgroup kill is checked");
+        return Ok(());
+    };
+    let mut unread = Vec::new();
+    match listed() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => unread.push(format!("its cgroup's member list could not be read: {e}")),
+    }
+    match exited() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => unread.push(format!("whether it had exited could not be read: {e}")),
+    }
+    let why = match under_leaf() {
+        Ok(true) => return Ok(()),
+        Ok(false) => "it had left the cgroup before its kill, which did not reach it".to_owned(),
+        Err(e) => {
+            unread.push(format!("its cgroup could not be read: {e}"));
+            "nothing shows the cgroup kill reached it".to_owned()
+        }
+    };
+    let why = if unread.is_empty() {
+        why
+    } else {
+        format!("{why} ({})", unread.join("; "))
+    };
+    Err(refused(front, pid, Signal::Kill, Some(why)))
 }
 
 /// The gate for a `SIGTERM` to the child `pid` that `via` launched: closed only for a live front
@@ -153,6 +215,50 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
     Error::Elevation {
         kind: ElevationErrorKind::Unkillable,
         detail,
+    }
+}
+
+/// Test seam counting kill-gate evaluations on this thread, so a test can show a kill path decides
+/// once and does not re-ask the gate after its cgroup kill. Thread-local, with an RAII reset.
+#[cfg(test)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux cgroup lane's tests count gates")
+)]
+pub(crate) mod seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static GATES: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// From now on kill-gate evaluations on THIS thread are counted.
+    pub(crate) fn count_kill_gates() -> GateCounter {
+        GATES.with(|g| g.set(Some(0)));
+        GateCounter(())
+    }
+
+    #[must_use = "counting stops as soon as the counter is dropped"]
+    pub(crate) struct GateCounter(());
+
+    impl GateCounter {
+        pub(crate) fn count(&self) -> u32 {
+            GATES.with(|g| g.get().expect("the counter is live"))
+        }
+    }
+
+    impl Drop for GateCounter {
+        fn drop(&mut self) {
+            GATES.with(|g| g.set(None));
+        }
+    }
+
+    pub(super) fn note_kill_gate() {
+        GATES.with(|g| {
+            if let Some(n) = g.get() {
+                g.set(Some(n + 1));
+            }
+        });
     }
 }
 
