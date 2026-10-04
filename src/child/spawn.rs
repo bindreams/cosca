@@ -504,21 +504,33 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(mut child: std::process::Child, unique: u64) {
-    // MUTANTS: A: Delivered does not reap; B: Gone waits; C: kill by child.kill(), old try_wait.
+fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
     use crate::signal::{via_verified_pid, Sent, Sig};
+    use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::exit_only::{try_reap, Reap, Target};
+
     let pid = child.id();
-    let _ = (unique, via_verified_pid as fn(u32, Option<u64>, Sig) -> std::io::Result<Sent>);
-    let _ = child.kill();
-    match crate::wait::backend::await_reapable(pid, Some(unique), None) {
-        Ok(_) => {}
-        Err(_) => {}
+    let target = Target::pid(pid, Some(unique));
+    let reap = || match try_reap(&target) {
+        Ok(Reap::Reaped(_)) => {}
+        Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+        Err(e) => log::warn!("spawn teardown failed to reap pid {pid}: {e}"),
+    };
+    match via_verified_pid(pid, Some(unique), Sig::Kill) {
+        Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
+            Ok(Waited::Reapable) => {}
+            Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+            Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
+            Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
+        },
+        Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
+        Err(kill) => {
+            log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
+            reap();
+        }
     }
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => log::warn!("spawn teardown: pid {pid} is still running"),
-        Err(e) => log::warn!("spawn teardown failed to reap pid {e}"),
-    }
+    drop(child);
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
