@@ -173,7 +173,7 @@ A test that can't establish its precondition fails with a message that names the
 how to opt out explicitly. A test that mutates process-wide state (fds 0–2, rlimits, credentials,
 signal dispositions) runs in its own re-exec'd process (`alone()` in
 [`test_support.rs`](../src/containment/cgroup/test_support.rs), `run_fixture_with_cwd()` in
-[`src/test_child.rs`](../src/test_child.rs)), under either test runner, and asserts that it does
+[`src/test_child.rs`](../src/test_child.rs)), and asserts that it does
 through the process-per-test gate ([#201], [#210]), which checks the re-exec's argv shape, not just
 an environment variable. `RestoreFd2` is brought under it by [#201] and tracked in [#223].
 
@@ -184,16 +184,15 @@ A test group whose environment support varies by host (root, cgroups, and the li
 declares its own `COSCA_TEST_<GROUP>` variable, on by default: any value but the literal `0` runs
 the group. Only an explicit `COSCA_TEST_<GROUP>=0` disables it, reported as `ignored` with a
 reason: the shape a `requires` predicate gives in [skuld](https://github.com/bindreams/skuld), the
-test harness cosca runs on ([#151]). Without that explicit `0` the test runs for real and
+test harness every target runs on. Without that explicit `0` the test runs for real and
 fails on whatever an environment without support produces: a failed support check never turns into
 a skip.
 
 A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
 delegated cgroup with `unshare` permitted.
 
-Today's gates take two shapes, neither matching this: some assert an opt-in variable
-(`COSCA_TEST_ELEVATION*`), and some return early instead.
-[#234] tracks the migration, names the groups, and is the authoritative inventory of what's left.
+The one exception is the presence gates in `tests/elevation.rs` (`COSCA_TEST_ELEVATION`, `_GUI`,
+`_RUN0`): they assert an opt-in variable, so `0` would enable them. #552 converts them.
 
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
@@ -216,7 +215,7 @@ host support doesn't vary: `=0` says this host can't support or run the group. C
 separate gate, `COSCA_TEST_<GROUP>_CONSENT`: disabling a group with `=0` is itself an explicit
 decision, so consent is only asked of an enabled group, and nothing else stands in for it. Only an
 explicit `COSCA_TEST_<GROUP>_CONSENT=1` gives consent; any other value, unset included, fails the
-test rather than running it. The check may be a skuld fixture, but either way a missing consent is
+test rather than running it. The check is a skuld fixture, and a missing consent is
 a hard failure (a panic or an assertion), never a return. For example, a CI step that cannot run
 the group sets `COSCA_TEST_ROOT=0`; a sandboxed lane sets `COSCA_TEST_ROOT=1` and
 `COSCA_TEST_ROOT_CONSENT=1`. `COSCA_TEST_NAMESPACES` (tests that unshare mount and pid
@@ -244,7 +243,7 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`, and which `windows-probes.yaml` selects by label.
 CI turns each off workflow-wide and opts in only in the step or job that runs it. Some
-system-affecting groups have no `COSCA_TEST_<GROUP>` at all; see [#234].
+system-affecting tests are not yet groups: the elevation exception above.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle
@@ -323,13 +322,11 @@ stacked fix PR that resolves it.
 [tokio orphan.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/orphan.rs#L118-L124
 [tokio runtime/process.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/runtime/process.rs#L30-L39
 [tokio unix/mod.rs]: https://github.com/tokio-rs/tokio/blob/tokio-1.53.1/tokio/src/process/unix/mod.rs#L124
-[#151]: https://github.com/bindreams/cosca/issues/151
 [#174]: https://github.com/bindreams/cosca/issues/174
 [#201]: https://github.com/bindreams/cosca/pull/201
 [#207]: https://github.com/bindreams/cosca/pull/207
 [#210]: https://github.com/bindreams/cosca/pull/210
 [#223]: https://github.com/bindreams/cosca/issues/223
-[#234]: https://github.com/bindreams/cosca/issues/234
 [#240]: https://github.com/bindreams/cosca/pull/240
 [#242]: https://github.com/bindreams/cosca/issues/242
 [#341]: https://github.com/bindreams/cosca/issues/341

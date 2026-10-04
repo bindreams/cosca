@@ -40,9 +40,8 @@ feature powerset.
 
 ### Doc tests
 
-nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`, which still
-uses rustdoc. cosca has none today. Claude Code agents in this repo deny plain `cargo test`
-(`.claude/settings.json`), so an agent can't run that step locally either.
+nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`. cosca has none today. Claude Code agents in this repo deny plain
+`cargo test` (`.claude/settings.json`), so an agent can't run that step locally either.
 
 ### Test groups
 
@@ -51,10 +50,8 @@ the way [principles 9 and 10](docs/principles.md#9-tests-fail-loudly-and-never-s
 describe: `COSCA_TEST_<GROUP>=0` turns the group off (its tests report as ignored), and a
 system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To keep a group off
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
-table of `~/.cargo/config.toml`, except `COSCA_TEST_ELEVATION*` (`tests/elevation.rs`): those
-gates are still opt-in presence checks, so setting them to `0` there would enable the tests. See
-[principle 9](docs/principles.md#9-tests-fail-loudly-and-never-silently-skip) and
-[principle 10](docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
+table of `~/.cargo/config.toml`, except the presence gates in `tests/elevation.rs`
+(`COSCA_TEST_ELEVATION`, `_GUI`, `_RUN0`): `0` would enable them.
 
 ### Tests that need root
 
