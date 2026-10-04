@@ -139,9 +139,8 @@ pub(crate) struct SharedChild {
     /// reaped elsewhere at adoption.
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
-    /// The child's unique id, the one identity every by-pid check on macOS uses. The spawn passes
-    /// the id the child reported before `exec` (`adopt_verified`), so it is `Some`; `None` is only
-    /// what the test-only by-pid `adopt` read when the pid had no process.
+    /// The child's unique id, the one identity every by-pid check on macOS uses. `None`: no id is
+    /// held, so the pid is acted on never.
     #[cfg(target_os = "macos")]
     identity: Option<u64>,
     /// A duplicate of the std `Child`'s process handle, usable unlocked.
@@ -278,6 +277,12 @@ impl SharedChild {
     #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lock().state, State::E(_))
+    }
+
+    /// The unique id this handle checks its by-pid actions against. Tests only.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn adopted_unique(&self) -> Option<u64> {
+        self.identity
     }
 
     /// The child's process id.

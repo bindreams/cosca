@@ -223,7 +223,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     }
     #[cfg(target_os = "linux")]
     let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register)?;
-    // macOS: the child reports its own unique id before `exec`; see `unique_report`.
     #[cfg(target_os = "macos")]
     let (mut std_cmd, report) = build_std_command_with(cmd, unique_report::register)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -306,7 +305,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
-        // Registered first (above), so `fd_map`'s `dup2` below cannot move the pipe from under it.
         let report = report.open(&_guard)?;
 
         // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
@@ -329,9 +327,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard`, taken at the top of this block"
         )]
-        let (c, unique) = report
-            .run(|| std_cmd.spawn().map_err(Error::Io))
-            .map_err(|(e, refused)| refused.map_or(e, unique_report::refused_error))?;
+        let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io));
+        let c = spawned.map_err(|e| unique_report::failed_spawn_error(e, &unique))?;
         drop(std_cmd);
         (prepared, c, unique)
     };
@@ -438,16 +435,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
-    // macOS has no handle: the unique id the child reported is what the identity is checked
-    // against, and the one the shared child is adopted with. The child read it itself before
-    // `exec`, so it is the id of the process this spawn forked, whatever became of the pid since.
+    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
+    // checked against and the shared child is adopted with.
     #[cfg(target_os = "macos")]
-    let unique = match unique {
+    let unique = match unique_report::adopted_id(unique, child.id()) {
         Ok(unique) => unique,
-        Err(errno) => {
-            let error = crate::signal::identity_unreadable(child.id(), errno);
-            return Err(teardown_after_failed_adoption(child, error));
-        }
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
     };
     #[cfg(target_os = "linux")]
     let through = child.through.target();
@@ -497,6 +490,23 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         kill_on_drop,
         attachment,
     ))
+}
+
+/// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
+/// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
+/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it.
+#[cfg(target_os = "macos")]
+fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::NotAdopted) -> Error {
+    if not_adopted.died_before_exec {
+        log::warn!(
+            "child {} died before exec; nothing is signalled or waited on by pid, so its status is not collected",
+            child.id()
+        );
+        drop(child);
+        not_adopted.error
+    } else {
+        teardown_after_failed_adoption(child, not_adopted.error)
+    }
 }
 
 /// macOS: abandon `child` without signalling or waiting on it by pid, since nothing shows its pid
@@ -1934,7 +1944,7 @@ pub(crate) use batch_gate::reject_batch_path;
 pub(crate) mod fd_map;
 
 // The skeleton of a `pre_exec` hook that talks to its parent over a descriptor.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "spawn/fd_channel.rs"]
 pub(crate) mod fd_channel;
 
