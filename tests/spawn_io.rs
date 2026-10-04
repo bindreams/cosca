@@ -5,7 +5,7 @@ use cosca::{Command, Fd, Stdio};
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(target_os = "linux")]
-use test_groups::{cgroup, Group};
+use common::test_groups::{cgroup, Group};
 
 fn testbin() -> &'static str {
     env!("CARGO_BIN_EXE_cosca_testbin")
@@ -2027,8 +2027,6 @@ fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
     assert_eq!(soft(), before, "drop must restore it");
 }
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

@@ -72,6 +72,7 @@ mod verdict;
 #[path = "windows_path_resolution/winapi.rs"]
 mod winapi;
 
+#[cfg(windows)]
 use common::test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;

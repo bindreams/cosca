@@ -4,7 +4,7 @@
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(all(feature = "tokio", target_os = "linux"))]
-use test_groups::{cgroup, Group};
+use common::test_groups::{cgroup, Group};
 
 #[cfg(feature = "tokio")]
 #[skuld::test]
@@ -1404,8 +1404,6 @@ async fn death_watch_spawn_tree_async_panics_when_the_root_dies_before_reporting
     );
 }
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 

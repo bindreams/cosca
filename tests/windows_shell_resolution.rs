@@ -124,6 +124,7 @@ mod precedence;
 #[path = "windows_shell_resolution/trailing_dot.rs"]
 mod trailing_dot;
 
+#[cfg(windows)]
 use common::test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
