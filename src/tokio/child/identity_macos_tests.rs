@@ -7,7 +7,7 @@ use super::{drop_fault, fault as backend_fault};
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::identity_macos_tests::{
     arm_launchd_hold, assert_program_did_not_run, end_unsignalled_and_reap, has_not_exited, other_unique_id,
-    reap_by_pid, vanished,
+    ran_marker, reap_by_pid, vanished, RAN_ARGV,
 };
 use crate::child::spawn::unique_report;
 use crate::error::Error;
@@ -159,7 +159,10 @@ async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_nothing_by_p
 async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_program_does_not_run() {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut cmd, _writer) = tokio_blocker();
+    let (stdout, reader) = ran_marker();
+    let mut cmd = crate::tokio::Command::new();
+    cmd.args(RAN_ARGV);
+    cmd.stdout(stdout).expect("set stdout");
     let _forced = unique_report::seams::force_child_read_errno(libc::EPERM);
     let mark = crate::log_capture::mark();
     let err = cmd.spawn().expect_err("a refused own read fails the spawn");
@@ -167,10 +170,10 @@ async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_progr
         matches!(err, Error::Unassessable { .. }),
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
-    assert_program_did_not_run();
+    assert_program_did_not_run(cmd, reader);
     // Who collected the child is open: std may have returned `Ok` for a child killed after its refusal.
     assert!(
-        crate::log_capture::contains_since(mark, "was left unreaped"),
+        crate::log_capture::contains_since(mark, "if its spawn did not collect it"),
         "a refusal under tokio may leave an unreaped child, and the spawn must say so"
     );
 }

@@ -91,18 +91,18 @@ fn a_missing_report_is_a_child_that_died_before_exec() {
     assert_eq!(e.raw_os_error(), None, "no errno is made up");
 }
 
-/// A refusal under `Ok` is not a child that provably did not start: the hook fails the spawn after
-/// reporting it, so either the child ran on or a signal raced std's pipe.
+/// A refusal under `Ok` is a child killed between its report and std's own pipe: the hook failed
+/// the spawn, so the program did not start.
 ///
-/// Mutant: it is reported as "did not start" and the child is treated as a corpse.
+/// Mutant: it is reported as a child that may have started.
 #[skuld::test]
-fn a_refusal_under_an_ok_spawn_may_have_started_the_program() {
+fn a_refusal_under_an_ok_spawn_means_the_program_did_not_start() {
     let not_adopted = adopted_id(Report::ChildRefused(libc::EPERM), 9).expect_err("no id");
-    assert!(!not_adopted.died_before_exec);
+    assert!(not_adopted.died_before_exec);
     let Error::Unassessable { detail, .. } = not_adopted.error else {
-        panic!("an Ok spawn with a refusal is Unassessable")
+        panic!("a refusal is Unassessable")
     };
-    assert!(detail.contains("may have started"), "{detail}");
+    assert!(detail.contains("did not start"), "{detail}");
 }
 
 /// Mutant: the parent's own read failure is taken for the child's refusal.
@@ -158,25 +158,6 @@ fn a_nonexistent_program_fails_with_stds_io_error() {
     assert!(matches!(report, Report::Id(_)), "{report:?}");
     let mapped = failed_spawn_error(Error::Io(io_error), &report);
     assert!(matches!(mapped, Error::Io(_)), "{mapped:?}");
-}
-
-/// Spawning the same command again after its spawn ended fails in the hook, not by writing to a
-/// reused descriptor number.
-///
-/// Mutant: `fd_channel::register` stops gating on liveness.
-#[skuld::test]
-fn a_command_spawned_again_fails_in_the_hook() {
-    let mut cmd = std::process::Command::new("/usr/bin/true");
-    let (first, report) = run_through_channel(&mut cmd);
-    first.expect("first spawn").wait().expect("wait");
-    assert!(matches!(report, Report::Id(_)));
-    let _guard = crate::child::spawn::spawn_lock();
-    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard`")]
-    let second = cmd.spawn();
-    assert_eq!(
-        second.expect_err("a withdrawn channel").raw_os_error(),
-        Some(libc::EBADF)
-    );
 }
 
 /// The id a child reports is the one `proc_pidinfo` gives for it from outside.

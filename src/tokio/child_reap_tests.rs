@@ -649,10 +649,11 @@ async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_
     crate::tokio::test_runtime::assert_current_thread();
 
     let _forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
+    use crate::child::spawn::identity_macos_tests::{ran_marker, RAN_ARGV};
+    let (stdout, reader) = ran_marker();
     let mut cmd = crate::tokio::Command::new();
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(crate::test_child::leaked_writer_stdin()).expect("set stdin");
-    cmd.stdout(crate::stdio::Stdio::null()).expect("stdout null");
+    cmd.args(RAN_ARGV);
+    cmd.stdout(stdout).expect("set stdout");
 
     let err = cmd.spawn().err();
 
@@ -660,7 +661,7 @@ async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_
         crate::error::Error::Unassessable { detail, .. } => assert!(detail.contains("did not start"), "{detail}"),
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    crate::child::spawn::identity_macos_tests::assert_program_did_not_run();
+    crate::child::spawn::identity_macos_tests::assert_program_did_not_run(cmd, reader);
 }
 
 /// A wait whose peek or kqueue fails cannot show the child is ours, so it is `Foreign`, and tokio

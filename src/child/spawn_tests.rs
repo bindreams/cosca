@@ -993,7 +993,11 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
-    let mut cmd = blocker();
+    use crate::child::spawn::identity_macos_tests::{ran_marker, RAN_ARGV};
+    let (stdout, reader) = ran_marker();
+    let mut cmd = Command::new();
+    cmd.args(RAN_ARGV);
+    cmd.stdout(stdout).expect("set stdout");
     let forced = crate::child::spawn::unique_report::seams::force_child_read_errno(libc::EPERM);
     let err = cmd.spawn().err();
     drop(forced);
@@ -1005,7 +1009,7 @@ fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    crate::child::spawn::identity_macos_tests::assert_program_did_not_run();
+    crate::child::spawn::identity_macos_tests::assert_program_did_not_run(cmd, reader);
 }
 
 /// macOS: the child a failed spawn left behind. Dropping it kills and reaps it, so a failing
