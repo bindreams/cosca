@@ -553,7 +553,7 @@ impl Child {
     }
 
     /// Test-only: the root a `TreeWalk` attachment walks from.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
         match &self.attached {
             crate::containment::Attached::TreeWalk(root) => Some(*root),
