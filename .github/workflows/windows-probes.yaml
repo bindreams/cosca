@@ -204,7 +204,7 @@ jobs:
   # an ephemeral VM destroyed after the job — the only kind of host they may run on.
   executing:
     name: Executing probes (${{ matrix.runner }})
-    if: github.event_name == 'workflow_dispatch' && inputs.run_executing_probes
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_executing_probes)
     strategy:
       fail-fast: false
       matrix:
