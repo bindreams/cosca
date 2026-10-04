@@ -238,7 +238,7 @@ jobs:
       # for `windows_elevation_routes` ever ran.
       #
       # The three probes that hand `ShellExecuteExW` an EXISTING extensionless target are excluded
-      # here (`SKULD_LABELS`) and run below instead, each in its own nextest invocation, consecutively, after
+      # here (the `!isolated_*` terms in `SKULD_LABELS`) and run below instead, each in its own nextest invocation, consecutively, after
       # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
       # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
       # candidate explanation for the intermittent hang; the module doc has what was measured about

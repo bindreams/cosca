@@ -331,8 +331,8 @@ impl Eq for EnvKeyIgnoreCase {}
 /// caller happens to have set — including any secrets a CI runner exports — into a child running
 /// as, or purporting to measure, someone else. Only what a freshly logged-on account needs to run
 /// anything at all (`SystemRoot`, `PATH`, `TEMP`/`TMP`, `COMSPEC`, `PATHEXT`), plus any
-/// `COSCA_PROBE_*` variable this file itself uses to talk to its children, plus
-/// whatever the caller passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that
+/// `COSCA_PROBE_*` variable this file uses to talk to its children, plus whatever the caller
+/// passes in `extra`. `COSCA_PROBE_MARKERS` is carved out of that
 /// `COSCA_PROBE_*` pass-through: it names a directory this process's OWN account can write to, and a child spawned
 /// here under a different account (the whole point of several of these routes) cannot create or
 /// overwrite files there. A child that inherited it would panic trying to mark itself passed,

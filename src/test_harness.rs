@@ -40,14 +40,14 @@ pub const SHELL_PROBES: skuld::Label;
 #[skuld::label]
 pub const ELEVATION_ROUTES: skuld::Label;
 
-/// Selects the one `SHELL_PROBES` probe that runs alone: a trailing dot on an existing extensionless file.
+/// Isolated `SHELL_PROBES` probe: a trailing dot on an existing extensionless file.
 #[skuld::label]
 pub const ISOLATED_TRAILING_DOT: skuld::Label;
 
-/// Selects the one `SHELL_PROBES` probe that runs alone: `PATHEXT` against an existing extensionless file.
+/// Isolated `SHELL_PROBES` probe: `PATHEXT` against an existing extensionless file.
 #[skuld::label]
 pub const ISOLATED_PATHEXT_PRECEDENCE: skuld::Label;
 
-/// Selects the one `SHELL_PROBES` probe that runs alone: whether an existing extensionless file ever launches.
+/// Isolated `SHELL_PROBES` probe: whether an existing extensionless file ever launches.
 #[skuld::label]
 pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
