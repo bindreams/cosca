@@ -655,8 +655,8 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
     let consequence = match child {
         AbandonedChild::Ended => return,
         AbandonedChild::MaybeUnreaped => {
-            "the child exits before `exec` but was left unreaped: it never reached the point where it \
-             names itself, so nothing holds its pid"
+            "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
+             never reached the point where it names itself and nothing holds its pid"
         }
         AbandonedChild::MaybeUnreachable => {
             "the child was left running and nothing can reach it: only a cgroup v2 leaf is killed \
