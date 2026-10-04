@@ -414,20 +414,20 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         through: PidfdChild::new(Some(child.id()), pidfd),
         child,
     };
-    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
-    // checked against and the shared child is adopted with. The report decides first: a child that
-    // died before `exec` is that, whatever an attach would find of its pid.
-    #[cfg(target_os = "macos")]
-    let unique = match unique_report::adopted_id(unique, child.id()) {
-        Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
-    };
     // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
     #[cfg(target_os = "linux")]
     let in_cgroup = prepared.cgroup_leaf.is_some();
     #[cfg(not(target_os = "linux"))]
     let in_cgroup = false;
     let front = cmd.elevation_front().filter(|_| !in_cgroup);
+    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
+    // checked against and the shared child is adopted with. The report decides first: a child that
+    // died before `exec` is that, whatever an attach would find of its pid.
+    #[cfg(target_os = "macos")]
+    let unique = match unique_report::adopted_id(unique, child.id()) {
+        Ok(unique) => unique,
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front)),
+    };
     let attachment = match attach_or_fault_typed(
         child.id(),
         #[cfg(windows)]
@@ -517,9 +517,14 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
 /// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it.
+/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it, and the error
+/// notes that a `front` is left unreaped.
 #[cfg(target_os = "macos")]
-fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::NotAdopted) -> Error {
+fn abandon_unadopted(
+    child: std::process::Child,
+    not_adopted: unique_report::NotAdopted,
+    front: Option<crate::elevation::front::Front>,
+) -> Error {
     if not_adopted.died_before_exec {
         log::warn!(
             "child {} died before exec; nothing is signalled or waited on by pid, so its status is not collected",
@@ -528,7 +533,9 @@ fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::Not
         drop(child);
         not_adopted.error
     } else {
-        teardown_after_failed_adoption(child, not_adopted.error)
+        let pid = child.id();
+        let error = teardown_after_failed_adoption(child, not_adopted.error);
+        FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid))
     }
 }
 
