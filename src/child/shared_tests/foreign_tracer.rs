@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use super::fixtures::Blocker;
-use crate::test_support::require_group;
+use crate::test_groups::{tracer_group, Group};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 use crate::wait::exit_only::Target;
 
@@ -192,14 +192,16 @@ enum Wait {
 /// A zombie held by a foreign tracer is running to `try_wait`; `wait` blocks, unlocked, in
 /// `waitid` (no polling, no `WNOHANG`) until the tracer reaps it, then returns the kill.
 #[skuld::test]
-fn a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait() {
+fn a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait(#[fixture(tracer_group)] _group: &Group) {
     hand_back(REAP, Wait::Unbounded, false);
 }
 
 /// As [`a_zombie_held_by_a_foreign_tracer_is_handed_back_to_a_blocked_wait`], but the tracer lets
 /// go by exiting without reaping, as a debugger that quits does.
 #[skuld::test]
-fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait() {
+fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait(
+    #[fixture(tracer_group)] _group: &Group,
+) {
     hand_back(EXIT, Wait::Unbounded, false);
 }
 
@@ -208,7 +210,7 @@ fn a_zombie_held_by_a_foreign_tracer_that_exits_is_handed_back_to_a_blocked_wait
 ///
 /// Mutant: a peek that finds no record reads as an exit (the holder goes on to reap).
 #[skuld::test]
-fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit() {
+fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit(#[fixture(tracer_group)] _group: &Group) {
     hand_back(REAP, Wait::Unbounded, true);
 }
 
@@ -218,14 +220,11 @@ fn a_tracee_stopped_by_a_foreign_tracer_is_not_an_exit() {
 ///
 /// Mutants: a deadline holder that re-polls, or reads the missing record as the child gone.
 #[skuld::test]
-fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back() {
+fn a_deadline_wait_on_a_zombie_held_by_a_foreign_tracer_is_handed_back(#[fixture(tracer_group)] _group: &Group) {
     hand_back(REAP, Wait::Deadline, false);
 }
 
 fn hand_back(go_byte: u8, wait: Wait, stop_first: bool) {
-    if !require_group("TRACER") {
-        return;
-    }
     let b = Blocker::spawn_with(|cmd| {
         // SAFETY: `set_ptracer` is a raw `prctl` syscall, async-signal-safe, and touches only the
         // forked child.

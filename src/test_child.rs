@@ -1002,8 +1002,9 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
 ///
 /// - `assert_fn_item($name)` forces the compiler to resolve `$name` as a fn in scope — a typo
 ///   or a stale name after a rename is a compile error here, not a filter that silently matches
-///   zero tests at runtime. It accepts any signature, since an `async fn` fixture is not a `fn()` (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
-///   this macro exists to rule out).
+///   zero tests at runtime. It accepts any return type, since an `async fn` fixture is not a `fn()` (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
+///   this macro exists to rule out). A test that takes a group fixture uses
+///   `fixture_path!(name, Group)`.
 /// - `module_path!()` derives the module portion at compile time, so it can never fall out of
 ///   sync with a file move or a module rename; libtest's `--exact` filter never includes the
 ///   crate-name component `module_path!()` always carries as its own first segment, hence the
@@ -1013,12 +1014,20 @@ macro_rules! fixture_path {
         crate::test_child::assert_fn_item($name);
         crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
     }};
+    ($name:ident, $group:ty) => {{
+        crate::test_child::assert_fn_item_taking::<$group, _>($name);
+        crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
+    }};
 }
 pub(crate) use fixture_path;
 
-/// Compiles only for a fn item or closure of any signature, `async fn` included: a misspelled name or
+/// Compiles only for a fn item or closure that takes no arguments, of any return type, `async fn` included: a misspelled name or
 /// a non-fn item is a compile error at the [`fixture_path!`] call site.
 pub(crate) fn assert_fn_item<R>(_: impl Fn() -> R) {}
+
+/// [`assert_fn_item`] for a fn that takes one fixture, by reference.
+#[cfg(target_os = "macos")]
+pub(crate) fn assert_fn_item_taking<A: ?Sized, R>(_: impl Fn(&A) -> R) {}
 
 /// Strips the crate-name segment `module_path!()` always carries as its own first component
 /// (e.g. `"cosca::resolve::resolve_tests"`), since libtest's `--exact` filter never includes it

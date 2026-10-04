@@ -11,7 +11,7 @@ use super::fixtures::Blocker;
 #[cfg(target_os = "linux")]
 use crate::child::shared::State;
 #[cfg(target_os = "linux")]
-use crate::test_support::require_group;
+use crate::test_groups::{tracer_group, Group};
 
 /// `try_wait` on a child stopped under this process's `PTRACE_SEIZE` returns `None`, leaves the
 /// state `N`, and leaves the stop for the tracer: the test's own `waitpid` then still gets it.
@@ -21,12 +21,9 @@ use crate::test_support::require_group;
 /// `None`; a `try_wait` that caches a state. Each fails by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn try_wait_leaves_a_ptrace_stop_for_the_tracer() {
+fn try_wait_leaves_a_ptrace_stop_for_the_tracer(#[fixture(tracer_group)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    if !require_group("TRACER") {
-        return;
-    }
     let b = Blocker::spawn();
     let pid = b.shared.id() as libc::pid_t;
     // `ptrace` is variadic, and glibc reads `addr` and `data` as pointers.
@@ -101,6 +98,7 @@ mod macos {
     use crate::child::shared::State;
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
     use crate::test_child::{run_fixture_output_within, step, watchdog};
+    use crate::test_groups::{tracer_group, Group};
     use crate::test_support::tracer::{attach_settled, debugger_signed_copy, settled_stop, AttachError};
     use crate::wait::exit_only::Reaped;
 
@@ -180,13 +178,13 @@ mod macos {
     ///
     /// Mutant: a `waitpid(WNOHANG)` reap returns the stop as a status and writes `E`.
     #[skuld::test]
-    fn try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped() {
-        if !crate::test_support::require_group("TRACER") {
-            return;
-        }
+    fn try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped(
+        #[fixture(tracer_group)] _group: &Group,
+    ) {
         if !crate::test_child::is_marked_fixture_reexec(MARKER) {
             return run_signed(crate::test_child::fixture_path!(
-                try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped
+                try_wait_on_a_child_this_process_traces_returns_none_while_it_is_stopped,
+                Group
             ));
         }
         let _dog = watchdog("try_wait on a stopped tracee", BOUND);
@@ -206,13 +204,11 @@ mod macos {
     ///
     /// Mutant: one consuming reap leaves the zombie, which the final peek still finds.
     #[skuld::test]
-    fn a_child_this_process_traces_is_reaped_fully() {
-        if !crate::test_support::require_group("TRACER") {
-            return;
-        }
+    fn a_child_this_process_traces_is_reaped_fully(#[fixture(tracer_group)] _group: &Group) {
         if !crate::test_child::is_marked_fixture_reexec(MARKER) {
             return run_signed(crate::test_child::fixture_path!(
-                a_child_this_process_traces_is_reaped_fully
+                a_child_this_process_traces_is_reaped_fully,
+                Group
             ));
         }
         let _dog = watchdog("reaped fully", BOUND);
@@ -241,13 +237,11 @@ mod macos {
     ///
     /// Mutant: a second reap that panics on a refused identity read.
     #[skuld::test]
-    fn a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n() {
-        if !crate::test_support::require_group("TRACER") {
-            return;
-        }
+    fn a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n(#[fixture(tracer_group)] _group: &Group) {
         if !crate::test_child::is_marked_fixture_reexec(MARKER) {
             return run_signed(crate::test_child::fixture_path!(
-                a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n
+                a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n,
+                Group
             ));
         }
         crate::log_capture::install();

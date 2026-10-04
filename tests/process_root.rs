@@ -5,6 +5,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[cfg(unix)]
+use common::test_groups::{uid_switch, Group};
+
 /// Set on the re-exec'd reader to `<parent pid>:<target pid>`; `main` then runs
 /// [`foreign_kill_helper_main`] instead of skuld. See [`helper_role`].
 #[cfg(unix)]
@@ -34,16 +37,13 @@ fn helper_role(inherited: Option<&str>, parent_pid: u32) -> Result<Option<u32>, 
 /// pid cannot be recycled before the reader reports.
 #[cfg(unix)]
 #[skuld::test]
-fn foreign_kill_surfaces_permission_denied() {
+fn foreign_kill_surfaces_permission_denied(#[fixture(uid_switch)] _group: &Group) {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
     use common::KillOnDrop;
 
-    if !common::require_group("UID_SWITCH") {
-        return;
-    }
     common::assert_root_capable();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind control listener");
@@ -157,6 +157,129 @@ fn foreign_kill_helper_main(pid: u32) -> i32 {
             eprintln!("foreign_kill_helper: kill() returned an unexpected result: {other:?}");
             11
         }
+    }
+}
+
+#[cfg(unix)]
+mod uid_switch_group {
+    //! Every case stops before the test body, so these are safe on any host.
+
+    use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
+
+    const UID_SWITCH_TEST: &str = "foreign_kill_surfaces_permission_denied";
+
+    fn run_uid_switch_test(
+        extra: &[&str],
+        group: Option<&str>,
+        consent: Option<&str>,
+        labels: Option<&str>,
+    ) -> (SuiteOutcome, bool, String) {
+        let mut cmd = command(std::env::current_exe().expect("current_exe"));
+        cmd.args(["--test-threads=1", "--exact", UID_SWITCH_TEST, NOCAPTURE]);
+        cmd.args(extra);
+        with_json_events(&mut cmd);
+        for (var, value) in [
+            ("COSCA_TEST_UID_SWITCH", group),
+            ("COSCA_TEST_UID_SWITCH_CONSENT", consent),
+            ("SKULD_LABELS", labels),
+        ] {
+            match value {
+                Some(value) => cmd.env(var, value),
+                None => cmd.env_remove(var),
+            };
+        }
+        let out = crate::common::output_locked(&mut cmd).expect("re-exec this test binary");
+        let outcome = suite_outcome(&out.stdout).expect("the child reports its suite");
+        (
+            outcome,
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    /// The `failed` event of [`UID_SWITCH_TEST`]: its message tells a setup refusal from a body failure.
+    fn failure_message(stdout: &str) -> String {
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|e| e["type"] == "test" && e["event"] == "failed" && e["name"] == UID_SWITCH_TEST)
+            .unwrap_or_else(|| panic!("no `failed` event for the test: {stdout}"))["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn assert_consent_refused(group: Option<&str>, consent: Option<&str>) {
+        let (outcome, success, stdout) = run_uid_switch_test(&[], group, consent, None);
+        assert_eq!((outcome.failed, outcome.passed, outcome.ignored), (1, 0, 0), "{stdout}");
+        assert!(!success, "{stdout}");
+        // The fixture's own setup text. The consent variable's name alone would not do: the body's
+        // `assert_root_capable` panic names it too, so an unprivileged run would pass without the check.
+        assert!(
+            failure_message(&stdout).contains("setup failed: the group runs as real root"),
+            "{stdout}"
+        );
+    }
+
+    /// Mutant: the group's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn uid_switch_group_zero_reports_ignored() {
+        let (outcome, success, stdout) = run_uid_switch_test(&[], Some("0"), None, None);
+        assert_eq!(
+            outcome,
+            SuiteOutcome {
+                test_count: 1,
+                passed: 0,
+                failed: 0,
+                ignored: 1
+            },
+            "{stdout}"
+        );
+        assert!(success, "{stdout}");
+    }
+
+    /// Mutant: the group's setup does not check consent (the body then switches uids as root).
+    #[skuld::test]
+    fn uid_switch_unset_consent_fails() {
+        assert_consent_refused(None, None);
+    }
+
+    /// Mutant: a set group variable counts as consent.
+    #[skuld::test]
+    fn uid_switch_group_on_without_consent_fails() {
+        assert_consent_refused(Some("1"), None);
+    }
+
+    /// Mutant: any non-empty consent counts.
+    #[skuld::test]
+    fn uid_switch_consent_other_than_1_fails() {
+        assert_consent_refused(None, Some("yes"));
+    }
+
+    /// Mutant: the setup grants a group that is off, so `--ignored` runs the body.
+    #[skuld::test]
+    fn uid_switch_group_zero_never_runs_the_body_under_run_ignored() {
+        let (outcome, success, stdout) = run_uid_switch_test(&["--ignored"], Some("0"), None, None);
+        assert_eq!(
+            (outcome.test_count, outcome.passed, outcome.failed, outcome.ignored),
+            (1, 0, 1, 0),
+            "{stdout}"
+        );
+        assert!(!success, "{stdout}");
+        // Only the fixture's refusal carries this message; a body that ran cannot.
+        assert!(
+            failure_message(&stdout).contains("setup failed: COSCA_TEST_UID_SWITCH=0"),
+            "{stdout}"
+        );
+    }
+
+    /// Mutant: the fixture carries no `UID_SWITCH` label, so `SKULD_LABELS=uid_switch` selects none of the group.
+    #[skuld::test]
+    fn the_uid_switch_label_selects_its_test() {
+        let (outcome, _, stdout) = run_uid_switch_test(&[], Some("0"), None, Some("uid_switch"));
+        assert_eq!(outcome.test_count, 1, "{stdout}");
+        let (outcome, _, stdout) = run_uid_switch_test(&[], Some("0"), None, Some("!uid_switch"));
+        assert_eq!(outcome.test_count, 0, "{stdout}");
     }
 }
 

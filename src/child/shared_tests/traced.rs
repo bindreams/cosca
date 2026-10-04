@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use crate::identity::{uniq_info, ReadPurpose, UniqRead};
+use crate::test_groups::{tracer_group, Group};
 use crate::test_support::tracer::{self, Mode, Report};
 use crate::wait::backend::{await_reapable, test_hooks, Waited};
 use crate::wait::exit_only::{self, Reap, Target};
@@ -14,10 +15,7 @@ use crate::wait::exit_only::{self, Reap, Target};
 /// Mutant: a by-pid `ECHILD` taken for a foreign reap without checking the pid still names the
 /// child.
 #[skuld::test]
-fn a_child_held_by_a_tracer_is_running_until_the_hand_back() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let pid = tracee.id().pid();
@@ -44,13 +42,10 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back() {
 }
 
 /// A tracee held by a tracer, its handle, and the stdin that ends it.
-fn held() -> Option<(crate::Child, std::io::PipeWriter)> {
-    if !crate::test_support::require_group("TRACER") {
-        return None;
-    }
+fn held() -> (crate::Child, std::io::PipeWriter) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    Some((tracee, stdin))
+    (tracee, stdin)
 }
 
 /// Runs `tracee.wait()` on a thread and returns once that thread is about to block in its first
@@ -76,8 +71,8 @@ fn wait_blocked<'s, G>(
 ///
 /// Mutant: a by-pid `ECHILD` taken for a foreign reap: the wait returns `ECHILD`.
 #[skuld::test]
-fn a_wait_blocked_across_the_exit_and_the_hand_back_returns_the_status() {
-    let Some((tracee, stdin)) = held() else { return };
+fn a_wait_blocked_across_the_exit_and_the_hand_back_returns_the_status(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, stdin) = held();
     let mut helper = tracer::start(Mode::Auto).attach_shared(&tracee);
     assert_eq!(helper.recv(), Report::Attached);
     std::thread::scope(|s| {
@@ -94,8 +89,8 @@ fn a_wait_blocked_across_the_exit_and_the_hand_back_returns_the_status() {
 ///
 /// Mutant: `kill` refused for a pid the start read cannot see, or a wait that gives up on `ECHILD`.
 #[skuld::test]
-fn kill_ends_a_held_child_and_the_wait_returns_the_kill() {
-    let Some((tracee, _stdin)) = held() else { return };
+fn kill_ends_a_held_child_and_the_wait_returns_the_kill(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, _stdin) = held();
     let mut helper = tracer::start(Mode::Auto).attach_shared(&tracee);
     assert_eq!(helper.recv(), Report::Attached);
     assert_eq!(tracee.try_wait().expect("try_wait"), None, "a held child is running");
@@ -115,8 +110,8 @@ fn kill_ends_a_held_child_and_the_wait_returns_the_kill() {
 /// Mutant: an `ECHILD` for a resolvable pid taken for a reap once nothing traces it (a held
 /// zombie is no longer flagged as traced): the wait and `try_wait` answer `ECHILD`.
 #[skuld::test]
-fn a_zombie_a_tracer_holds_is_running_until_the_hand_back() {
-    let Some((tracee, stdin)) = held() else { return };
+fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, stdin) = held();
     let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
     assert_eq!(helper.recv(), Report::Attached);
     std::thread::scope(|s| {
