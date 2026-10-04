@@ -295,7 +295,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // (a spawn racing this one via a path outside cosca's own spawn functions) that no local
     // code can close.
     #[cfg(target_os = "macos")]
-    let (prepared, child, unique) = {
+    let (mut prepared, child, unique) = {
         let _guard = spawn_lock();
         let prepared = crate::containment::prepare(
             &mut std_cmd,
@@ -335,7 +335,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
     // Everything from the channel's creation to the helper's join is under `spawn_lock`.
     #[cfg(target_os = "linux")]
-    let (prepared, child, pidfd) = {
+    let (mut prepared, child, pidfd) = {
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
@@ -365,7 +365,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         (prepared, held.child, held.pidfd)
     };
     #[cfg(windows)]
-    let (prepared, child) = {
+    let (mut prepared, child) = {
         let prepared = crate::containment::prepare(
             &mut std_cmd,
             &cmd.contain_request(),
@@ -411,36 +411,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Ok(unique) => unique,
         Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
     };
-    let attachment = match attach_or_fault_typed(
-        child.id(),
-        #[cfg(windows)]
-        proc_handle,
-        prepared,
-    ) {
-        Ok(v) => v,
-        // Off macOS: kill + reap so a failed attach never leaks the child (std `Child::drop` neither
-        // kills nor reaps).
-        // macOS: attach fails only when the tree-walk root's identity is unreadable; see
-        // `leave_unverified_child`.
-        Err(e) => {
-            log::debug!("attach failed (root identity verdict: {:?}): {}", e.identity, e.error);
-            #[cfg(target_os = "macos")]
-            {
-                debug_assert!(
-                    e.identity.is_some(),
-                    "a macOS attach fails only on the root's identity read"
-                );
-                leave_unverified_child(child, e.identity.unwrap_or(crate::containment::RootIdentity::Unknown));
-            }
-            #[cfg(not(target_os = "macos"))]
-            teardown_unadopted(child);
-            return Err(e.error);
-        }
-    };
     // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
     // against the handle held since the spawn: a pid alone does not say whom it names once
-    // something else has reaped the child. `SharedChild::adopt` reaps nothing, so this is also the
-    // identity it takes.
+    // something else has reaped the child. The attach takes this identity and reads nothing by
+    // pid, so a reap and reuse after the check cannot make the containment name a stranger.
+    // `SharedChild::adopt` reaps nothing, so this is also the identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
     #[cfg(target_os = "linux")]
@@ -456,6 +431,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
+            // The leaf's placement exchange ends before the kill, as an attach would end it, so
+            // the leaf answers only for the tree and the kill never races its reads.
+            prepared.settle_verdict(child.id());
             #[cfg(target_os = "macos")]
             leave_unverified_child(
                 child,
@@ -471,6 +449,30 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure.
             return Err(spawn_identity_error(other));
+        }
+    };
+    #[cfg(test)]
+    fault::run_at(fault::SpawnPoint::BeforeAttach, child.id());
+    let attachment = match attach_or_fault(
+        id,
+        #[cfg(windows)]
+        proc_handle,
+        prepared,
+    ) {
+        Ok(v) => v,
+        // Off macOS: kill + reap so a failed attach never leaks the child (std `Child::drop` neither
+        // kills nor reaps).
+        Err(e) => {
+            log::debug!("attach failed: {e}");
+            // macOS: the attach reads nothing, so it cannot fail; see `teardown_after_attach_failure`.
+            #[cfg(target_os = "macos")]
+            {
+                debug_assert!(false, "a macOS attach cannot fail: {e}");
+                teardown_after_attach_failure(child, unique);
+            }
+            #[cfg(not(target_os = "macos"))]
+            teardown_unadopted(child);
+            return Err(e);
         }
     };
     // The pidfd is already held, so adopting cannot fail.
@@ -491,6 +493,72 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         kill_on_drop,
         attachment,
     ))
+}
+
+/// macOS: the attach failed, which it cannot. The child is killed through its verified unique id
+/// and reaped only after that id shows the zombie is ours.
+/// - A kill that was delivered: wait for the exit, then reap once.
+/// - A child already gone: nothing to do.
+/// - A kill that failed: one verified, non-blocking reap, and the child is left.
+///
+/// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
+/// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
+/// consuming `waitid`. A child that cannot be shown ours (a refused id read, or a zombie launchd
+/// holds) is left with a `warn`.
+///
+/// Dropping the `std` `Child` closes our pipe ends only.
+#[cfg(target_os = "macos")]
+fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
+    use crate::signal::{via_verified_pid, Sent, Sig};
+    use crate::wait::backend::{await_reapable, Waited};
+
+    let pid = child.id();
+    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+    match via_verified_pid(pid, Some(unique), Sig::Kill) {
+        Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
+            Ok(Waited::Reapable) => reap_verified(pid, &target),
+            Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+            Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
+            Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
+        },
+        Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
+        Err(kill) => {
+            log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
+            reap_verified(pid, &target);
+        }
+    }
+    drop(child);
+}
+
+/// [`teardown_after_attach_failure`]'s reap: consume `target`'s exit record only when a verified
+/// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
+/// shown ours or reaped is a `warn`.
+#[cfg(target_os = "macos")]
+fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
+    use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
+
+    let unverifiable = |why: &dyn std::fmt::Display| {
+        log::warn!("spawn teardown: pid {pid} cannot be shown to be ours or reaped ({why})");
+    };
+    let orphaned = "launchd holds it, because its tracer died";
+    match peek_verified(target) {
+        Err(e) => return unverifiable(&e),
+        Ok(Peek::Foreign(Foreign::Orphaned)) => return unverifiable(&orphaned),
+        Ok(Peek::Foreign(_)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+        Ok(Peek::Running) => return log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Peek::Exit(_)) => {}
+    }
+    match try_reap(target) {
+        Ok(Reap::Reaped(Reaped::Status(_))) => {}
+        Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
+            log::warn!("spawn teardown: pid {pid}: a consuming waitid returned si_code {si_code}, not an exit record");
+            debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
+        }
+        Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Reap::Foreign(Foreign::Orphaned)) => unverifiable(&orphaned),
+        Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+        Err(e) => log::warn!("spawn teardown failed to reap pid {pid}: {e}"),
+    }
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
@@ -1070,7 +1138,7 @@ fn inherit_end(slot: Fd) -> Result<ChildEnd, Error> {
 
 /// The error for a spawn whose child could not be identified. `Gone` is an absence;
 /// `Unknown` is an OS refusal about a child that may be running fine - never report the
-/// second as the first. Mirrors `containment::dispatch::resolve_root_id`.
+/// second as the first.
 pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>) -> Error {
     match outcome {
         // An unavailable Linux `/proc` view is named; any other refusal is the OS's.
@@ -1141,8 +1209,9 @@ pub(crate) fn resolve_identity(
     }
 }
 
-/// [`resolve_identity`]'s read, by pid alone: for a caller with no handle to check it against. A
-/// test-only fault seam (`fault`) can force the vanished or unreadable branch.
+/// The unchecked half of [`resolve_identity`]: the read by pid alone, which nothing has yet shown
+/// to name our child. Only `resolve_identity` and tests call it. A test-only fault seam (`fault`)
+/// can force the vanished or unreadable branch.
 pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<ProcessId> {
     #[cfg(test)]
     {
@@ -1161,54 +1230,35 @@ pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<
     ProcessId::of(pid)
 }
 
-/// `containment::attach`, with a test-only seam to force its failure.
-#[cfg(any(windows, feature = "tokio"))]
+/// `containment::attach` for the child whose identity `id` the spawn verified, with a test-only
+/// seam to force its failure.
 pub(crate) fn attach_or_fault(
-    pid: u32,
+    id: ProcessId,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: crate::containment::Prepared,
 ) -> Result<crate::containment::Attachment, Error> {
-    attach_or_fault_typed(
-        pid,
-        #[cfg(windows)]
-        proc_handle,
-        prepared,
-    )
-    .map_err(Error::from)
-}
-
-/// [`attach_or_fault`], keeping the verdict of the root's identity read when that is what failed.
-pub(crate) fn attach_or_fault_typed(
-    pid: u32,
-    #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
-    prepared: crate::containment::Prepared,
-) -> Result<crate::containment::Attachment, crate::containment::AttachError> {
     #[cfg(test)]
     if fault::force_attach_failure() {
         // Capture identity for the test to check what became of the child, then simulate an attach
         // failure so `spawn` takes the attach-error arm. The caller still holds the child, so the
         // verdict is taken before `prepared` drops, as a real attach takes it.
-        fault::capture(ProcessId::of(pid));
+        fault::capture(crate::identity::Resolved::Found(id));
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        prepared.settle_verdict(id.pid());
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
-        return Err(crate::containment::AttachError {
-            error: Error::Containment {
-                detail: "forced attach failure (test seam)".into(),
-            },
-            // A real macOS attach fails only on the root's identity read.
-            identity: cfg!(target_os = "macos").then_some(crate::containment::RootIdentity::Unknown),
+        return Err(Error::Containment {
+            detail: "forced attach failure (test seam)".into(),
         });
     }
     #[cfg(all(test, target_os = "linux"))]
     if let Some(attachment) = fault::take_attachment_override() {
         let mut prepared = prepared;
-        prepared.settle_verdict(pid);
+        prepared.settle_verdict(id.pid());
         return Ok(attachment);
     }
     crate::containment::attach(
-        pid,
+        id,
         #[cfg(windows)]
         proc_handle,
         prepared,
@@ -1536,7 +1586,6 @@ pub(crate) mod fault {
         static BETWEEN_KILL_AND_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         static BEFORE_IDENTITY: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        #[cfg(feature = "tokio")]
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
@@ -1716,8 +1765,7 @@ pub(crate) mod fault {
         /// Right before the spawn reads the child's identity (the tokio spawn's macOS unique id is
         /// read earlier, before the backend exists).
         BeforeIdentity,
-        /// Right before the async spawn attaches the containment, after `BeforeIdentity`.
-        #[cfg(feature = "tokio")]
+        /// Right before the spawn attaches the containment.
         BeforeAttach,
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
@@ -1727,7 +1775,6 @@ pub(crate) mod fault {
     fn hook_at(point: SpawnPoint) -> &'static std::thread::LocalKey<crate::oneshot_hook::OneShotHook> {
         match point {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
-            #[cfg(feature = "tokio")]
             SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
         }

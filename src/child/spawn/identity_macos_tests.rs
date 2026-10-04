@@ -361,3 +361,204 @@ fn macos_sync_spawn_consults_the_report_before_attaching() {
         "the report decides before the attach does: {err:?}"
     );
 }
+
+// The attach =====
+
+/// The fd marker's root is the identity the spawn verified: the attach reads nothing by pid, so a
+/// foreign reap and reuse of the pid cannot make the marker's root a stranger.
+///
+/// Mutant: the attach reads the marker's root with `ProcessId::of(pid)`.
+#[skuld::test]
+fn macos_fdmarker_attach_reads_nothing_by_pid() {
+    let (mut cmd, _writer) = sync_blocker();
+    cmd.contain();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_marker_root(),
+        Some(child.id()),
+        "the marker's root is the verified identity"
+    );
+}
+
+// The attach-failure teardown =====
+
+/// A `std` blocker, its stdin writer, and its unique id.
+fn std_blocker_with_unique() -> (std::process::Child, std::process::ChildStdin, u64) {
+    let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
+    cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
+        .stdin(std::process::Stdio::piped());
+    let guard = crate::child::spawn::spawn_lock();
+    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
+    let mut child = cmd.spawn().expect("spawn the blocker");
+    drop(guard);
+    let stdin = child.stdin.take().expect("piped stdin");
+    let Ok(Some(unique)) = crate::signal::read_identity(child.id()) else {
+        panic!("the blocker's unique id must be readable")
+    };
+    (child, stdin, unique)
+}
+
+/// Whether `pid` is still an exit record this process can reap (`ECHILD` once something took it).
+fn is_reaped(pid: u32) -> bool {
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own child; `WNOHANG` never blocks.
+    let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+}
+
+/// A delivered kill is waited for through the unique id and reaped once, silently.
+///
+/// Mutant: the teardown does not reap (the child is left a zombie), or warns.
+#[skuld::test]
+fn macos_attach_failure_teardown_kills_and_reaps_a_verified_child() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    super::teardown_after_attach_failure(child, unique);
+    let levels = crate::log_capture::levels_since(mark, &format!("pid {pid}"));
+    assert!(
+        !levels.contains(&log::Level::Warn),
+        "a clean teardown does not warn: {levels:?}"
+    );
+    assert!(is_reaped(pid), "the killed child must have been reaped");
+}
+
+/// A child someone else already reaped is gone: nothing is waited on, and only `debug` speaks.
+///
+/// Mutant: the `Gone` arm waits on the child, which fails and warns.
+#[skuld::test]
+fn macos_attach_failure_teardown_of_a_reaped_child_only_logs_at_debug() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    // SAFETY: `pid` is this test's own child.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    reap_by_pid(pid);
+    let mark = crate::log_capture::mark();
+    super::teardown_after_attach_failure(child, unique);
+    let levels = crate::log_capture::levels_since(mark, &format!("pid {pid}"));
+    assert!(
+        !levels.is_empty() && levels.iter().all(|&l| l == log::Level::Debug),
+        "a reaped child is a `debug`, never a `warn`: {levels:?}"
+    );
+}
+
+/// The teardown's own log records for `pid`, oldest first.
+fn teardown_records(mark: usize) -> Vec<(log::Level, String)> {
+    crate::log_capture::records_since_on_current_thread(mark, "spawn teardown")
+}
+
+/// A refused kill, with the child left running and an `EPERM` for every id read the teardown makes
+/// of it: arms the kill's refusal and returns the guard.
+fn refuse_the_kill() -> uniq_fault::Forced {
+    uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM))
+}
+
+/// A refused kill warns and sends nothing, then reaps through the verified id. The id read for the
+/// peek shows another process holding the pid (forced, while the child really runs): a verified
+/// foreign reap, so `debug`, and nothing taken. The child is left running.
+///
+/// Mutants: the teardown kills with `child.kill()`; the reap is `child.try_wait()`; the target
+/// carries no id (`Target::pid(pid, None)`), so the peek answers `Running` and warns.
+#[skuld::test]
+fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_by_id() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let other = other_unique_id(pid);
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let _other = uniq_fault::force_uniq_read_once(ReadPurpose::Running, other);
+    super::teardown_after_attach_failure(child, unique);
+    let records = teardown_records(mark);
+    let levels: Vec<_> = records.iter().map(|r| r.0).collect();
+    assert_eq!(levels, vec![log::Level::Warn, log::Level::Debug], "{records:?}");
+    assert!(records[1].1.contains("reaped by someone else"), "{records:?}");
+    end_unsignalled_and_reap(pid);
+}
+
+/// A zombie launchd holds (its tracer died) is not shown ours or reaped: a `warn` saying so, not a
+/// `debug` claim of a foreign reap.
+///
+/// Mutant: `Foreign::Orphaned` is logged as a reaped-by-someone-else `debug`.
+#[skuld::test]
+fn macos_attach_failure_teardown_of_an_orphaned_child_warns_it_cannot_be_shown_ours() {
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    super::teardown_after_attach_failure(child, unique);
+    let records = teardown_records(mark);
+    let levels: Vec<_> = records.iter().map(|r| r.0).collect();
+    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
+    assert!(records[1].1.contains("cannot be shown to be ours"), "{records:?}");
+    end_unsignalled_and_reap(pid);
+}
+
+/// An id read the OS refuses (a MACF denial) is the same: not shown ours, so a `warn`.
+///
+/// Mutant: the reap is unverified, so a refusal reads as `Running` or as a reap by another party.
+#[skuld::test]
+fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown_ours() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let mark = crate::log_capture::mark();
+    let _refused = refuse_the_kill();
+    let _denied = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    super::teardown_after_attach_failure(child, unique);
+    let records = teardown_records(mark);
+    let levels: Vec<_> = records.iter().map(|r| r.0).collect();
+    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
+    assert!(records[1].1.contains("cannot be shown to be ours"), "{records:?}");
+    end_unsignalled_and_reap(pid);
+}
+
+/// A delivered kill, then a foreign reap and a reuse of the pid between the wait and the reap: the
+/// verified reap sees another unique id and takes nothing. The test then reaps the zombie itself,
+/// proving it was left.
+///
+/// Mutant: the `Reapable` arm reaps with `child.wait()`, by the number.
+#[skuld::test]
+fn macos_attach_failure_teardown_does_not_reap_a_pid_reused_after_the_wait() {
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let other = other_unique_id(pid);
+    let mark = crate::log_capture::mark();
+    // The wait's peek matches; the reap's peek finds another id.
+    let _first = uniq_fault::force_uniq_read_once(
+        ReadPurpose::Peek,
+        UniqRead::Found(crate::identity::UniqInfo { unique_id: unique }),
+    );
+    let _second = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, other);
+    super::teardown_after_attach_failure(child, unique);
+    let records = teardown_records(mark);
+    assert!(
+        records.iter().all(|(level, _)| *level == log::Level::Debug),
+        "{records:?}"
+    );
+    assert!(
+        records.iter().any(|(_, text)| text.contains("reaped by someone else")),
+        "{records:?}"
+    );
+    assert!(
+        !is_reaped(pid),
+        "the zombie must have been left: its exit record is still ours to take"
+    );
+}

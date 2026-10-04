@@ -375,6 +375,51 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio(#[fixture(cgroup)]
     teardown.assert_killed();
 }
 
+/// As the sync twin: a spawn whose identity check fails ends the leaf's placement exchange before
+/// it kills the child.
+///
+/// Mutant: the identity-failure arm settles the verdict after the kill, or not at all.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn cgroup_tokio_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::send_log::Capture;
+    use crate::signal::Sig;
+
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain();
+    let capture = Rc::new(Capture::start());
+    let sends_at_settle = Rc::new(Cell::new(None));
+    let _hook = crate::containment::cgroup::fault::set_on_take_placement({
+        let (capture, sends_at_settle) = (Rc::clone(&capture), Rc::clone(&sends_at_settle));
+        move || sends_at_settle.set(Some(capture.entries().len()))
+    });
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    err.expect("a vanished identity must fail the spawn");
+
+    let Some(crate::identity::Resolved::Found(child)) = fault::take_captured() else {
+        panic!("the seam must capture the child's identity");
+    };
+    assert_eq!(
+        sends_at_settle.get(),
+        Some(0),
+        "the verdict must be settled, and before anything is sent to the child"
+    );
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|&(pid, sig, _)| pid == child.pid() && sig == Sig::Kill),
+        "the child must be killed after the verdict: {:?}",
+        capture.entries()
+    );
+    teardown.assert_killed();
+}
+
 /// On the identity-failure path, a child tokio could not kill (`EPERM`) goes to tokio's orphan
 /// queue, which reaps it once it exits. The leaf, having taken its verdict first, answers only for
 /// the tree — its kill through the leaf — and never reaps that child as an abandoned spawn's,
