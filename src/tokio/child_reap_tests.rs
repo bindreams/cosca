@@ -351,13 +351,10 @@ async fn dropping_a_backend_implicitly_forgets_a_child_reaped_elsewhere() {
 /// reads stdin to EOF can exit. The streams live in the backend, not in tokio's `Child`, so the
 /// backend does it. Observed after one poll, which has run the close and not the wait.
 ///
-/// The test holds a second write end of `cat`'s stdin, so the close cannot end it. A `cat` that
-/// exited before the wait armed would let that one poll finish the wait (macOS: the arm finds no
-/// process, and tokio's `wait` reaps), and `reap_now`, whose child is never awaited, would then
-/// meet a reaped one.
+/// The test holds a second write end of `cat`'s stdin so the close cannot end it: if `cat` exited
+/// early, the single poll could reap it, and `reap_now` requires a never-awaited child.
 ///
-/// Mutants: `wait` leaves stdin open; the test holds no second write end and the child has
-/// exited before the poll.
+/// Mutant: `wait` leaves stdin open.
 #[cfg(unix)]
 #[skuld::test]
 async fn wait_closes_the_untaken_stdin_first() {
@@ -391,10 +388,7 @@ async fn wait_closes_the_untaken_stdin_first() {
         panic!("a tokio backend");
     };
     let closed = stdin.is_none();
-    assert!(
-        !proc.is_reaped(),
-        "the one poll finished the wait, so reap_now would meet an awaited child"
-    );
+    assert!(!proc.is_reaped(), "the one poll finished the wait");
     proc.reap_now(pid); // the test's own `cat`: end it whatever happened
     drop(held_writer);
     assert!(closed, "wait must close stdin before it waits");
