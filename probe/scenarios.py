@@ -311,14 +311,16 @@ def s_nosigpipe_getsockopt():
 
 # --- authentication, owner watch -----------------------------------------------------------------
 def s_wrong_identity():
-    """Item 2: argv carries an identity the listener does not have: refused 122, nothing starts."""
-    c = setup(SUDO, mode="42", extra={"ident": 12345})
+    """Item 2: argv carries an identity the listener does not have: refused 122 before hello, so cosca never
+    answers -> exactly NotStarted(shim_connected=false). The shim is held after connect until cosca has
+    accepted it, so the acceptor's view does not depend on how fast the shim exits."""
+    d = workdir(); g = Gate(d, "before_id")
+    c = setup(SUDO, d=d, mode="42", extra={"ident": "12345" if not MACOS else "12345:1"}, seams_extra={"SHIM_GATE_BEFORE_ID": g.path})
+    ev_until(c.ev, "accepted")
+    g.open()
     log = c.shimlog.eof(); w = outcome(c.wait); c.link.release(False)
-    # The shim refuses after connecting and writes nothing to an unverified listener, so cosca may already
-    # have answered A (then: ShimLost, "may still be running") or seen the peer gone (NotStarted). Both honest.
     result("listener identity mismatch refused", "refused 122" in " ".join(refusal(log)) and never_ran(c) and w[0] == "not-started" and w[2] is False,
            f"{refusal(log)} {w}")
-
 
 def s_owner_rebind():
     """Item 2: cosca dies leaving its socket; a same-uid process on cosca's reused pid rebinds the path and
