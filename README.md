@@ -32,9 +32,11 @@ startup instead of selecting nothing (or, negated, everything). Labels are decla
 only skuld binaries honour it: libtest binaries ignore it and would run whole.
 
 Libtest's `#[test]` never runs in a `harness = false` target, so
-[`.github/scripts/libtest_guard.py`](.github/scripts/libtest_guard.py) (a prek hook, and a CI
-step per target and feature powerset) fails on any such test and on any `test = true` target left
-on the default harness.
+[`.github/scripts/libtest_guard.py`](.github/scripts/libtest_guard.py) fails on any such test and
+on any `test = true` target left on the default harness. It compiles each target with `cfg(test)`
+on, so code hiding a test from it (`#[cfg_attr(not(test), test)]`) escapes. It runs as a prek hook
+and as one CI step per lane (target triple), covering every cargo target, both profiles and the
+feature powerset.
 
 ### Doc tests
 
@@ -49,7 +51,10 @@ the way [principles 9 and 10](docs/principles.md#9-tests-fail-loudly-and-never-s
 describe: `COSCA_TEST_<GROUP>=0` turns the group off (its tests report as ignored), and a
 system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To keep a group off
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
-table of `~/.cargo/config.toml`.
+table of `~/.cargo/config.toml`, except `COSCA_TEST_ELEVATION*` (`tests/elevation.rs`): those
+gates are still opt-in presence checks, so setting them to `0` there would enable the tests. See
+[principle 9](docs/principles.md#9-tests-fail-loudly-and-never-silently-skip) and
+[principle 10](docs/principles.md#10-system-affecting-tests-run-in-a-sandbox).
 
 ### Tests that need root
 
