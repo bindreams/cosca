@@ -333,13 +333,6 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         graceful: crate::containment::windows::mechanism_from_flags(flags),
     };
     let raw_handle = proc.as_raw_handle();
-    let attachment = match attach_or_fault(pid, raw_handle, prepared) {
-        Ok(v) => v,
-        Err(e) => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(e);
-        }
-    };
     let id = match resolve_identity(
         pid,
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
@@ -348,6 +341,13 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         other => {
             sync_raw::raw_spawn_teardown(proc, pid);
             return Err(crate::child::spawn::spawn_identity_error(other));
+        }
+    };
+    let attachment = match attach_or_fault(id, raw_handle, prepared) {
+        Ok(v) => v,
+        Err(e) => {
+            sync_raw::raw_spawn_teardown(proc, pid);
+            return Err(e);
         }
     };
 

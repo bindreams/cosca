@@ -329,13 +329,13 @@ pub(crate) mod treewalk;
 pub(crate) mod dispatch;
 #[cfg(unix)]
 pub(crate) use dispatch::DropView;
+#[cfg(target_os = "macos")]
+pub(crate) use dispatch::RootIdentity;
 #[allow(
     unused_imports,
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
-pub(crate) use dispatch::{
-    attach, prepare, AbandonedChild, AttachError, Attached, Attachment, Prepared, RootIdentity, TreeKilled,
-};
+pub(crate) use dispatch::{attach, prepare, AbandonedChild, Attached, Attachment, Prepared, TreeKilled};
 
 #[cfg(target_os = "macos")]
 #[path = "containment/marker_eof.rs"]
