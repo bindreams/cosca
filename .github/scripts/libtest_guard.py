@@ -9,7 +9,7 @@ A `harness = false` target never runs libtest's `#[test]` or `#[tokio::test]` (t
 stripped), so such a test would silently never run. Two checks:
 
 1. Manifest (exit 2). Every `test = true` target must be `harness = false` in Cargo.toml, or be
-   listed in the unflipped file as `<kind>:<name>` (`lib:cosca`, `test:spawn_io`, `bin:tool`).
+   named in the optional `--unflipped` file as `<kind>:<name>` (`lib:cosca`, `test:spawn_io`, `bin:tool`).
    Every unflipped entry must still name such a target.
 2. Attribute (exit 1). Every other target of every kind (`test = false` ones included: a `#[test]`
    there never runs either) is compiled with `--test` under clippy::disallowed_macros, configured
@@ -94,7 +94,7 @@ def plan(packages: list[dict], unflipped: set[str]) -> tuple[list[Target], list[
                 if key not in unflipped:
                     errors.append(
                         f"target {t['name']} ({kind}) uses the default libtest harness: set `harness = false` "
-                        f"and run it under skuld, or list `{key}` in .github/libtest-guard/unflipped.txt"
+                        "and run it under skuld"
                     )
                 continue
             targets.append(Target(package["manifest_path"], flag, harness))
@@ -174,7 +174,7 @@ def main() -> int:
     p.add_argument("--both-profiles", action="store_true", help="check debug, then release")
     p.add_argument("--features", help="the features to enable; with --feature-powerset, the ones it is over")
     p.add_argument("--manifest-path")
-    p.add_argument("--unflipped", type=Path, default=CONF_DIR / "unflipped.txt")
+    p.add_argument("--unflipped", type=Path, help="targets still on libtest, one `<kind>:<name>` per line")
     p.add_argument("--findings-json", type=Path, help="write the unique {file, line} of every finding here")
     args = p.parse_args()
 
@@ -182,7 +182,7 @@ def main() -> int:
     if args.manifest_path:
         meta_cmd += ["--manifest-path", args.manifest_path]
     packages = json.loads(subprocess.run(meta_cmd, check=True, stdout=subprocess.PIPE).stdout)["packages"]
-    targets, errors = plan(packages, read_unflipped(args.unflipped))
+    targets, errors = plan(packages, read_unflipped(args.unflipped) if args.unflipped else set())
     if errors:
         for e in errors:
             print(f"::error::{e}", file=sys.stderr)
