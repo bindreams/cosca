@@ -1621,7 +1621,6 @@ pub(crate) mod fault {
     pub(crate) fn force_identity_vanished() -> bool {
         FORCE_VANISH.with(|f| f.get())
     }
-    #[cfg(any(not(target_os = "macos"), feature = "tokio"))]
     pub(crate) fn set_force_attach_failure(on: bool) {
         FORCE_ATTACH_FAIL.with(|f| f.set(on));
     }
