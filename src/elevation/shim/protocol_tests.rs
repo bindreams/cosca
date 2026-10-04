@@ -147,14 +147,14 @@ fn the_hex_decoder_accepts_lowercase_only() {
 #[skuld::test]
 fn a_nul_is_rejected_in_both_forms() {
     let mut hex = args(b"p", &[b"a"]).to_argv(OsStr::new(EXE), true);
-    for i in [2, 8, 9] {
-        let saved = std::mem::replace(&mut hex[i], OsString::from("610061"));
+    for (i, nul) in [(2, "610061"), (6, "50610062"), (8, "610061"), (9, "610061")] {
+        let saved = std::mem::replace(&mut hex[i], OsString::from(nul));
         assert_eq!(ShimArgs::parse(&hex), Err(ShimArgsError::EmbeddedNul), "hex argv[{i}]");
         hex[i] = saved;
     }
     let mut plain = args(b"p", &[b"a"]).to_argv(OsStr::new(EXE), false);
-    for i in [2, 8, 9] {
-        let saved = std::mem::replace(&mut plain[i], os(b"a\0b"));
+    for (i, nul) in [(2, &b"a\0b"[..]), (6, b"Pa\0b"), (8, b"a\0b"), (9, b"a\0b")] {
+        let saved = std::mem::replace(&mut plain[i], os(nul));
         assert_eq!(
             ShimArgs::parse(&plain),
             Err(ShimArgsError::EmbeddedNul),
@@ -345,4 +345,82 @@ fn f_kinds_round_trip_and_unknown_kind_or_zero_value_is_garbled() {
     for kind in 0..=5 {
         assert_eq!(f(0, kind), Err(FrameError::Garbled), "zero value, kind {kind}");
     }
+}
+
+#[skuld::test]
+fn leading_zeros_are_rejected() {
+    for hex in [false, true] {
+        let enc = |t: &str| {
+            if hex {
+                super::to_hex(OsStr::new(t))
+            } else {
+                OsString::from(t)
+            }
+        };
+        for (i, bad) in [
+            (3, "04242"),
+            (3, "00"),
+            (5, "01000"),
+            (4, "077:03"),
+            (4, "077:3"),
+            (4, "77:03"),
+            (4, "0:00"),
+        ] {
+            let mut v = args(b"p", &[]).to_argv(OsStr::new(EXE), hex);
+            v[i] = enc(bad);
+            let want = if i == 4 {
+                ShimArgsError::BadIdentity
+            } else {
+                ShimArgsError::BadNumber
+            };
+            assert_eq!(ShimArgs::parse(&v), Err(want), "hex = {hex}, argv[{i}] = {bad:?}");
+        }
+        // A lone zero is the one encoding of zero.
+        let mut v = args(b"p", &[]).to_argv(OsStr::new(EXE), hex);
+        v[3] = enc("0");
+        assert_eq!(ShimArgs::parse(&v).unwrap().unwrap().cosca_pid, 0);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[skuld::test]
+#[should_panic(expected = "identity is present exactly on macOS")]
+fn to_argv_asserts_the_platform_identity() {
+    let a = ShimArgs {
+        cosca_identity: None,
+        ..args(b"p", &[])
+    };
+    a.to_argv(OsStr::new(EXE), false);
+}
+
+#[cfg(all(debug_assertions, not(target_os = "macos")))]
+#[skuld::test]
+#[should_panic(expected = "identity is present exactly on macOS")]
+fn to_argv_asserts_the_platform_identity() {
+    let a = ShimArgs {
+        cosca_identity: Some(ShimIdentity {
+            unique_id: 1,
+            id_version: 1,
+        }),
+        ..args(b"p", &[])
+    };
+    a.to_argv(OsStr::new(EXE), false);
+}
+
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "execve cannot carry a NUL")]
+fn to_argv_asserts_no_nul_in_the_program() {
+    args(b"p\0q", &[]).to_argv(OsStr::new(EXE), false);
+}
+
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "execve cannot carry a NUL")]
+fn to_argv_asserts_no_nul_in_the_search_path() {
+    let a = ShimArgs {
+        search_path: Some(os(b"/a\0b")),
+        ..args(b"p", &[])
+    };
+    a.to_argv(OsStr::new(EXE), false);
 }

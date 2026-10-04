@@ -197,9 +197,9 @@ fn from_hex(a: &OsStr) -> Result<OsString, ShimArgsError> {
     Ok(OsString::from_vec(out))
 }
 
-/// Decimal digits only: no sign, no whitespace.
+/// Decimal digits only: no sign, no whitespace, no leading zero, so a number has one encoding.
 fn decimal<T: std::str::FromStr>(a: &[u8]) -> Option<T> {
-    if a.is_empty() || !a.iter().all(u8::is_ascii_digit) {
+    if a.is_empty() || !a.iter().all(u8::is_ascii_digit) || (a.len() > 1 && a[0] == b'0') {
         return None;
     }
     std::str::from_utf8(a).ok()?.parse().ok()
