@@ -238,7 +238,7 @@ mod log_capture {
 pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
 
 pub mod test_enablement;
-pub use test_enablement::require_group;
+pub use test_enablement::{require_group, test_groups};
 
 /// Is `pid` attached to OUR console? `None` when the probe found no console at all, so a
 /// broken or console-less probe can never satisfy an "absent" assertion — the two are

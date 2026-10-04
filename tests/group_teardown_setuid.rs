@@ -46,7 +46,7 @@ use std::net::{TcpListener, TcpStream};
 #[path = "common/mod.rs"]
 mod common;
 #[cfg(target_os = "linux")]
-use test_groups::{setuid, Group};
+use common::test_groups::{setuid, Group};
 
 #[cfg(target_os = "linux")]
 fn testbin() -> &'static str {
@@ -503,8 +503,6 @@ mod setuid_group {
     }
 }
 
-#[path = "../src/test_groups.rs"]
-mod test_groups;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
