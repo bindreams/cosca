@@ -1,0 +1,25 @@
+name: tmp-probe
+on: pull_request
+permissions: {}
+jobs:
+  macos-protocol:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          sw_vers; sudo -V | head -1; python3 --version
+          cc -Wall -o probe/shim5 probe/shim5.c
+      - name: scenarios
+        timeout-minutes: 20
+        run: |
+          python3 probe/scenarios.py wiring no_front_real_link impostor_peer symlink_swap not_empty tmpdir d2_symlink fork_owner frames refusal_codes \
+            connect_after_accept connect_before_accept refuse_wins connect_wins second_root_peer \
+            kill_after_shim_death kill_after_clean_exit nosigpipe_getsockopt wrong_identity owner_fork_copy leaked_listener \
+            wait_started_front_exit wait_started_live front_death_prestart front_death_live shim_death_backlog exit_races_kill fail_fork accept_emfile \
+            detach_refuses detach_live osascript argv_sudo argv_osascript
+      - name: mutants
+        if: always()
+        timeout-minutes: 15
+        run: bash probe/mut.sh
