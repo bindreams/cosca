@@ -504,7 +504,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
+fn teardown_after_attach_failure(mut child: std::process::Child, unique: u64) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
     use crate::wait::exit_only::{try_reap, Reap, Target};
@@ -519,15 +519,22 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
     };
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap(),
+            Ok(Waited::Reapable) => {}
             Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
             Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
             Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
         },
-        Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
+        Ok(Sent::Gone) => {
+            if let Err(e) = child.wait() {
+                log::warn!("spawn teardown failed to reap pid {pid}: {e}");
+            }
+        }
         Err(kill) => {
             log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
-            reap();
+            let _ = child.kill();
+            if let Ok(None) = child.try_wait() {
+                log::warn!("spawn teardown: pid {pid} is still running");
+            }
         }
     }
     drop(child);
