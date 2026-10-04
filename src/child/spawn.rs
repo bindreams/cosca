@@ -519,7 +519,6 @@ fn teardown_after_attach_failure(mut child: std::process::Child, unique: u64) {
         Ok(None) => log::warn!("spawn teardown: pid {pid} is still running"),
         Err(e) => log::warn!("spawn teardown failed to reap pid {e}"),
     }
-    let _ = child.wait();
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
