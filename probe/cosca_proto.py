@@ -421,9 +421,12 @@ class ElevatedChild:
         """Block until Live, or until the front exits first (then NotStarted). Events only."""
         if MACOS:
             kq = select.kqueue()
-            kq.control([select.kevent(self.p.pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD, select.KQ_NOTE_EXIT)], 0)
             kq.control([select.kevent(self.link.note_r, select.KQ_FILTER_READ, select.KQ_EV_ADD)], 0)
-            watch = lambda: kq.control(None, 2)
+            try:  # ESRCH: the front is already past exit (a zombie) -- the await_reapable peek's rule (D18)
+                kq.control([select.kevent(self.p.pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD, select.KQ_NOTE_EXIT)], 0)
+                watch = lambda: kq.control(None, 2)
+            except ProcessLookupError:
+                watch = lambda: None
         else:
             pfd = os.pidfd_open(self.p.pid)
             p = select.poll(); p.register(pfd, select.POLLIN); p.register(self.link.note_r, select.POLLIN)

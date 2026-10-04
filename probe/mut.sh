@@ -22,5 +22,8 @@ mutate f-on-lost shim6.c "    if (open_) frame(s, 'L', ws);" "    if (open_) fra
 mutate exec-fail-as-status shim6.c "    if (en == (ssize_t)sizeof ee) {" "    if (0) {" exec_failure
 mutate owner-recheck-after-a-missing shim6.c '      for (int i = 0; i < k; i++) if (out[i].filter == EVFILT_PROC) return refuse(E_OWNER_GONE, "cosca exited before the start"); }' '      (void)k; }' code_123_after_a
 mutate getppid-check-missing shim6.c "        if (getppid() != me) {" "        if (0) {" code_119
+mutate front-esrch-unhandled cosca_proto.py "            except ProcessLookupError:
+                watch = lambda: None" "            except OverflowError:
+                watch = lambda: None" wait_started_late_shim
 git checkout -q -- shim6.c cosca_proto.py
 exit $rc
