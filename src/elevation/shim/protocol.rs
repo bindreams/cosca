@@ -17,7 +17,7 @@ const SEPARATOR: &str = "--";
 /// Index of [`SEPARATOR`]: `[exe, flag, dir, pid, identity, euid, search, "--", program, args…]`.
 const SEPARATOR_AT: usize = 7;
 /// The identity field is `uniq:ver` on macOS and `-` on Linux; the other form is an error there.
-const IDENTITY_PRESENT: bool = cfg!(target_os = "macos");
+pub(crate) const IDENTITY_PRESENT: bool = cfg!(target_os = "macos");
 
 /// Raw `i32` newtypes: rustix's `Errno` and `Signal` are unavailable on macOS with this crate's features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

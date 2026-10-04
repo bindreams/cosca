@@ -1,32 +1,19 @@
 //! The AppleScript that elevates the shim instead of the program.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::Path;
 
 use super::super::build_shim_script;
-use crate::elevation::shim::protocol::{ShimArgs, ShimIdentity};
+use crate::elevation::shim::fixtures::shim_args;
+use crate::elevation::shim::protocol::ShimArgs;
+use crate::error::{ElevationErrorKind, Error, QuoteErrorKind};
 
 const PREFIX: &str = "do shell script \"";
 const SUFFIX: &str = "\" with administrator privileges without altering line endings";
 
 fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
-}
-
-fn shim_args(program: &[u8], rest: &[&[u8]]) -> ShimArgs {
-    ShimArgs {
-        dir: PathBuf::from("/tmp/cosca-x1"),
-        cosca_pid: 4242,
-        cosca_identity: cfg!(target_os = "macos").then_some(ShimIdentity {
-            unique_id: 7,
-            id_version: 9,
-        }),
-        cosca_euid: 1000,
-        search_path: None,
-        program: os(program),
-        args: rest.iter().map(|a| os(a)).collect(),
-    }
 }
 
 /// The shell command inside the script: the literal body with AppleScript's escapes undone, written
@@ -51,6 +38,10 @@ fn shell_command(script: &str) -> Vec<u8> {
     out
 }
 
+fn split(command: &[u8]) -> Vec<Vec<u8>> {
+    crate::quote::posix::split(command).unwrap()
+}
+
 #[skuld::test]
 fn osascript_script_is_ascii_and_uses_the_hex_form() {
     // A program and arguments that no AppleScript literal can carry as bytes: non-UTF-8, and CJK.
@@ -59,11 +50,10 @@ fn osascript_script_is_ascii_and_uses_the_hex_form() {
         .expect("hex keeps a non-UTF-8 program out of the script's bytes");
     assert!(script.is_ascii(), "{script}");
     assert!(script.contains("--cosca-elevation-shim=1x"), "{script}");
-    let words = cosca_split(&shell_command(&script));
+    let words = split(&shell_command(&script));
     assert_eq!(words[0], b"exec");
     assert_eq!(words[1], b"/opt/host/app");
     assert_eq!(words[2], b"--cosca-elevation-shim=1x");
-    // Every word after the flag except the separator is lowercase hex.
     for w in &words[3..] {
         assert!(
             *w == b"--" || w.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
@@ -71,10 +61,6 @@ fn osascript_script_is_ascii_and_uses_the_hex_form() {
             String::from_utf8_lossy(w)
         );
     }
-}
-
-fn cosca_split(command: &[u8]) -> Vec<Vec<u8>> {
-    crate::quote::posix::split(command).unwrap()
 }
 
 #[skuld::test]
@@ -86,13 +72,63 @@ fn adversarial_arguments_survive_quoting() {
     let shim = shim_args(b"/bin/echo", &[b"'; id #", b"\"$(id)\"", b"\n", b"--", b"-n"]);
     let script = build_shim_script(OsStr::new(exe), &shim, Some(Path::new(cwd)), None).unwrap();
 
-    let words = cosca_split(&shell_command(&script));
-    // `cd -P -- <cwd> && exec <exe> <shim args…>`: the shell reads exactly these words back.
+    let words = split(&shell_command(&script));
+    // `cd -P -- <cwd> && exec <exe> <shim args…>`
     let want_cd: [&[u8]; 5] = [b"cd", b"-P", b"--", cwd.as_bytes(), b"&&"];
     assert_eq!(words[..5], want_cd);
     assert_eq!(words[5], b"exec");
     let tail: Vec<OsString> = words[6..].iter().map(|w| os(w)).collect();
     assert_eq!(tail, shim.to_argv(OsStr::new(exe), true));
-    let parsed = ShimArgs::parse(&tail).unwrap().unwrap();
-    assert_eq!(parsed, shim);
+    assert_eq!(ShimArgs::parse(&tail).unwrap().unwrap(), shim);
+}
+
+#[skuld::test]
+fn a_script_over_arg_max_is_command_too_long() {
+    let shim = shim_args(b"id", &[]);
+    let err = build_shim_script(OsStr::new("/opt/host/app"), &shim, None, Some(10)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Elevation {
+                kind: ElevationErrorKind::CommandTooLong,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[skuld::test]
+fn a_shim_exe_or_cwd_with_no_text_form_is_a_typed_error() {
+    let shim = shim_args(b"id", &[]);
+    let cwd = Path::new(OsStr::from_bytes(b"/tmp/\xff"));
+    for (exe, cwd) in [(os(b"/opt/\xffapp"), None), (os(b"/opt/app"), Some(cwd))] {
+        let err = build_shim_script(&exe, &shim, cwd, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::Quote(q) if q.kind == QuoteErrorKind::NonUtf8),
+            "{err:?}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+mod asserts {
+    use super::*;
+
+    #[skuld::test]
+    #[should_panic(expected = "shim_exe must be POSIX-absolute")]
+    fn a_relative_shim_exe_is_a_contract_violation() {
+        let _result = build_shim_script(OsStr::new("app"), &shim_args(b"id", &[]), None, None);
+    }
+
+    #[skuld::test]
+    #[should_panic(expected = "the structural gate must reject a non-absolute cwd")]
+    fn a_relative_cwd_is_a_contract_violation() {
+        let _result = build_shim_script(
+            OsStr::new("/opt/app"),
+            &shim_args(b"id", &[]),
+            Some(Path::new("rel")),
+            None,
+        );
+    }
 }
