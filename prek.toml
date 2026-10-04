@@ -39,7 +39,8 @@ name = "libtest guard"
 # CI's Test job runs it per target over the feature powerset in both profiles (and skips this hook).
 entry = "uv run --script .github/scripts/libtest_guard.py"
 language = "system"
-types = ["rust"]
+# The guard's inputs: sources, manifests, its config and itself.
+files = '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.github/libtest-guard/|^\.github/scripts/libtest_guard\.py$'
 pass_filenames = false
 
 # External hooks =======================================================================================================

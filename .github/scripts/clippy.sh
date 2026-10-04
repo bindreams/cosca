@@ -4,8 +4,6 @@
 # CI's clippy-powerset composite action (extra `--target`/`--feature-powerset`
 # for cross-target, cross-feature coverage the host-only prek hook can't give).
 #
-# The libtest guard (libtest_guard.py) is a hook of its own (prek.toml) and a step of the CI Test job.
-#
 # Usage: clippy.sh [--target TRIPLE] [--feature-powerset] [--release]
 set -euo pipefail
 

@@ -41,7 +41,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured: 192 s to 242 s in three runs since the libtest guard left it. 25 min is 6x the slowest, a failure bound for a hang.
+    # Measured: 192 s to 242 s in three runs. 25 min is 6x the slowest, a failure bound for a hang.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -573,7 +573,7 @@ jobs:
       # seen when the guard compiles for that architecture. Both profiles, over the feature powerset.
       #
       # Placed after every test step, just before the JUnit upload: a guard failure must not skip the
-      # Linux-only steps above, which have no `!cancelled()` (the Clippy steps' rationale). Its debug
+      # Linux-only steps above, which have no `!cancelled()`. Its debug
       # library units are the ones `Build tests` built, and its type-checked test targets the ones
       # Clippy checked, so cargo reuses them. `!cancelled()`: reported even after an earlier failure.
       - name: Libtest guard
@@ -583,11 +583,12 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: uv run --script .github/scripts/libtest_guard.py --feature-powerset --both-profiles --target "$TARGET"
 
-      # Runs the guard on .github/fixtures/libtest-guard, natively and for `matrix.other`, behind a
-      # private sccache on a cold and then a warm cache.
+      # Runs the guard on .github/fixtures/libtest-guard, natively and for `matrix.other`.
       - name: Test the libtest guard
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          LIBTEST_GUARD_OTHER_TARGET: ${{ matrix.other }}
         run: uv run --script .github/scripts/libtest_guard_tests.py
 
       - name: Upload JUnit
