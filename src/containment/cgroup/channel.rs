@@ -124,8 +124,8 @@ impl ReportChannel {
         // closed — that gap is the host's, not cosca's to fill.
         let (read, write) = socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)?;
         Ok(ReportChannel {
-            read: rustix::io::fcntl_dupfd_cloexec(&read, 3)?,
-            write: Some(rustix::io::fcntl_dupfd_cloexec(&write, 3)?),
+            read: crate::above_stdio::above_stdio(read)?,
+            write: Some(crate::above_stdio::above_stdio(write)?),
             received: Received::default(),
         })
     }

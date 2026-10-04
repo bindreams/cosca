@@ -1202,3 +1202,21 @@ fn fixture_thread_reuse_init() {
     );
     assert!(!program_ran(cmd, reader));
 }
+
+/// An `open` that fails before the channel is published leaves it dead: spawning the command anyway
+/// fails in the gate, not in a hook that reads numbers that now belong to something else.
+///
+/// Mutant: `open` publishes the ends before it makes its done fd.
+#[skuld::test]
+fn a_failed_open_leaves_no_numbers_live() {
+    let mut cmd = std::process::Command::new("true");
+    let pending = super::register(&mut cmd);
+    let guard = crate::child::spawn::spawn_lock();
+    let armed = fault::fail_done_fd(Errno::MFILE);
+    let opened = pending.open(&guard);
+    drop(armed);
+    assert!(opened.is_err(), "the forced failure fails the open");
+    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
+    let spawned = cmd.spawn();
+    assert_eq!(spawned.expect_err("never published").raw_os_error(), Some(libc::EBADF));
+}

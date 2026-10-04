@@ -49,6 +49,42 @@ pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
     crate::stdio::Stdio::from_file(file)
 }
 
+/// This process's stdio, closed with copies kept at 10 or above, put back when dropped. For a
+/// re-exec'd fixture that needs the lowest free numbers to be stdio slots: drop every descriptor
+/// created meanwhile first, or the restoring `dup2` replaces it.
+#[cfg(unix)]
+pub(crate) struct ClosedStdio {
+    saved: [std::os::fd::OwnedFd; 3],
+}
+
+/// Closes fds 0 to 2; see [`ClosedStdio`].
+#[cfg(unix)]
+pub(crate) fn close_stdio_keeping_a_copy() -> ClosedStdio {
+    use std::os::fd::BorrowedFd;
+    let copy = |fd: i32| {
+        // SAFETY: fds 0 to 2 are open in a running test process.
+        let stdio = unsafe { BorrowedFd::borrow_raw(fd) };
+        rustix::io::fcntl_dupfd_cloexec(stdio, 10).expect("copy a stdio descriptor")
+    };
+    let saved = [copy(0), copy(1), copy(2)];
+    for fd in 0..3 {
+        // SAFETY: closes a descriptor the copies above preserve.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+    ClosedStdio { saved }
+}
+
+#[cfg(unix)]
+impl Drop for ClosedStdio {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        for (fd, saved) in self.saved.iter().enumerate() {
+            // SAFETY: `dup2` of a copy this guard owns onto a stdio slot.
+            unsafe { libc::dup2(saved.as_raw_fd(), fd as i32) };
+        }
+    }
+}
+
 /// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.

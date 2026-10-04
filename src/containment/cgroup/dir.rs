@@ -188,16 +188,7 @@ fn open_dir(at: impl AsFd, path: impl rustix::path::Arg) -> io::Result<OwnedFd> 
     )?)
 }
 
-/// `fd`, moved to 3 or above, close-on-exec. A descriptor the leaf holds for the child's lifetime
-/// must not share its number with a closed stdio slot: std `dup2`s the child's stdio into those
-/// slots, and an inherited slot left pointing at the leaf would hand the child a cgroup
-/// directory, or a watch, for its stdin.
-pub(crate) fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
-    if fd.as_raw_fd() >= 3 {
-        return Ok(fd);
-    }
-    Ok(rustix::io::fcntl_dupfd_cloexec(&fd, 3)?)
-}
+pub(crate) use crate::above_stdio::above_stdio;
 
 /// Open `name` in `dir` as a directory, refusing to cross a mount or follow a symlink on the way.
 fn open_child_on_this_mount(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> rustix::io::Result<OwnedFd> {

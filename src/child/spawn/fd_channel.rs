@@ -3,9 +3,8 @@
 //!
 //! A hook is registered on the command first and the channel is made later, under `spawn_lock`, so
 //! the descriptor numbers are published to the hook between the two. The hook reads only atomics.
-//! The channel is live from [`Shared::publish`] to [`Shared::withdraw`]: [`register`] fails a hook
-//! run outside that window with `EBADF` before the hook itself runs, so a command spawned again
-//! later never uses whatever now owns the numbers.
+//! The channel is live from [`Shared::publish`] to [`Shared::withdraw`], so a command spawned
+//! again later never uses whatever now owns the numbers.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -15,7 +14,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 
-/// What a hook reads in the child: fd numbers only.
+/// What a hook reads in the child: fd numbers only. Every accessor is async-signal-safe.
 pub(crate) struct Shared {
     child_end: AtomicI32,
     parent_end: AtomicI32,
@@ -23,37 +22,36 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// The child's end of the channel. Async-signal-safe.
+    /// The child's end of the channel.
     pub(crate) fn child_end(&self) -> RawFd {
         self.child_end.load(Ordering::Relaxed)
     }
 
-    /// The parent's end, as inherited by the child; `-1` for a channel with none. Async-signal-safe.
+    /// The parent's end, as inherited by the child.
     pub(crate) fn parent_end(&self) -> RawFd {
         self.parent_end.load(Ordering::Relaxed)
     }
 
-    /// Whether the numbers name this spawn's channel. Async-signal-safe.
     fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }
 
-    /// Publishes the channel's fd numbers to the hook, before the fork.
+    /// Publishes the fd numbers before the fork; the `Release` store of `live` makes the `Relaxed`
+    /// stores visible to the hook.
     pub(crate) fn publish(&self, child_end: RawFd, parent_end: RawFd) {
         self.child_end.store(child_end, Ordering::Relaxed);
         self.parent_end.store(parent_end, Ordering::Relaxed);
         self.live.store(true, Ordering::Release);
     }
 
-    /// Withdraws the numbers, after the fork.
+    /// Ends the window after the fork.
     pub(crate) fn withdraw(&self) {
         self.live.store(false, Ordering::Release);
     }
 }
 
-/// Registers `hook` as a `pre_exec` hook on `cmd`, with the channel not yet made: [`Shared::publish`]
-/// it later, under `spawn_lock`. While the channel is not live the spawn fails with `EBADF` and
-/// `hook` does not run.
+/// Registers `hook` as a `pre_exec` hook on `cmd`. Until [`Shared::publish`], and after
+/// [`Shared::withdraw`], the spawn fails with `EBADF` and `hook` does not run.
 ///
 /// # Safety
 ///
@@ -82,8 +80,8 @@ pub(crate) unsafe fn register(
     shared
 }
 
-/// Moves a channel's two ends to 3 or above and publishes their numbers to the hook. Returns
-/// `(child_end, parent_end)`.
+/// Moves both ends to 3 or above (see [`above_stdio`]) and publishes their numbers; returns them in
+/// `(child_end, parent_end)` order.
 pub(crate) fn publish_ends(
     shared: &Shared,
     child_end: OwnedFd,
@@ -95,26 +93,14 @@ pub(crate) fn publish_ends(
     Ok((child_end, parent_end))
 }
 
-/// `fd`, moved to 3 or above: with 0, 1 or 2 closed, the lowest free number is one, and the
-/// application may `dup2` its stdio back over it.
-///
-/// This narrows that hazard, it does not close it: no syscall that makes a descriptor takes a
-/// minimum number, so each one creates it at the lowest free number first, and the move follows. A
-/// `dup2` by another thread onto a closed stdio slot in that gap is outside this function's
-/// contract, as it is outside every other spawn's.
+/// [`crate::above_stdio::above_stdio`], with the error in this crate's terms.
 pub(crate) fn above_stdio(fd: OwnedFd) -> Result<OwnedFd, Error> {
     above_stdio_keeping(fd).map_err(|(e, _)| e)
 }
 
 /// [`above_stdio`], handing `fd` back if it could not be moved.
 pub(crate) fn above_stdio_keeping(fd: OwnedFd) -> Result<OwnedFd, (Error, OwnedFd)> {
-    if fd.as_raw_fd() >= 3 {
-        return Ok(fd);
-    }
-    match rustix::io::fcntl_dupfd_cloexec(&fd, 3) {
-        Ok(moved) => Ok(moved),
-        Err(e) => Err((Error::Io(crate::error::io_context("fcntl", e.into())), fd)),
-    }
+    crate::above_stdio::above_stdio_keeping(fd).map_err(|(e, fd)| (Error::Io(crate::error::io_context("fcntl", e)), fd))
 }
 
 #[cfg(test)]

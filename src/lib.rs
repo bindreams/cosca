@@ -119,6 +119,9 @@ pub use command::Command;
 
 mod wait;
 
+#[cfg(unix)]
+mod above_stdio;
+
 #[cfg(feature = "tokio")]
 mod bounded;
 #[cfg(all(test, unix))]

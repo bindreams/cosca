@@ -54,9 +54,9 @@
 //! - The helper shuts the parent's end when it is done, and when it unwinds. A child still waiting
 //!   for its verdict reads EOF, which is abort: the helper never has to send one.
 //!
-//! A descriptor created while one of fds 0 to 2 is closed lands on it, and is moved above
-//! ([`above_stdio`](super::fd_channel::above_stdio)). A concurrent `dup2` onto a closed stdio slot during a spawn is outside this
-//! module's contract.
+//! Descriptors this module creates are moved above stdio by
+//! [`above_stdio`](crate::above_stdio::above_stdio), which states what that does and does not
+//! guarantee.
 //!
 //! [`ReportChannel`]: crate::containment::cgroup::channel::ReportChannel
 //!
@@ -93,6 +93,7 @@ pub(crate) struct Pending {
 pub(crate) struct Handshake {
     parent_end: OwnedFd,
     child_end: OwnedFd,
+    done: OwnedFd,
     shared: Arc<Shared>,
 }
 
@@ -159,9 +160,8 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     // The child opens its own pidfd, where a thread-local seam cannot reach: take it here.
     #[cfg(test)]
     let scripted = crate::wait::backend::take_scripted_pidfd_open();
-    // SAFETY: the hook is async-signal-safe: it reads atomics and makes only direct syscalls (libc
-    // or rustix, see `open_self`) on integers and fd numbers. It allocates nothing, takes no lock
-    // and never panics, and `io::Error::from_raw_os_error` does not allocate.
+    // SAFETY: the hook reads atomics and makes only direct syscalls (libc or rustix, see
+    // `open_self`) on integers and fd numbers; `io::Error::from_raw_os_error` does not allocate.
     let shared = unsafe {
         register_hook(cmd, move |shared| {
             hold_child(
@@ -184,10 +184,20 @@ impl Pending {
         let (parent_end, child_end) =
             rustix::net::socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)
                 .map_err(|e| Error::Io(crate::error::io_context("socketpair", e.into())))?;
+        // Written, not closed, when the helper is done: a forked copy cannot hold it off. Made
+        // before the ends are published, so no failure here can leave stale numbers live.
+        let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
+        #[cfg(test)]
+        if let Some(errno) = fault::take_done_fd_failure() {
+            return Err(Error::Io(crate::error::io_context("eventfd", errno.into())));
+        }
+        let done = above_stdio(done)?;
         let (child_end, parent_end) = publish_ends(&self.shared, child_end, parent_end)?;
         Ok(Handshake {
             parent_end,
             child_end,
+            done,
             shared: self.shared,
         })
     }
@@ -268,6 +278,7 @@ impl Handshake {
         let Handshake {
             parent_end,
             child_end,
+            done,
             shared,
         } = self;
         #[cfg(test)]
@@ -276,10 +287,6 @@ impl Handshake {
         let helper_seams = seams.clone();
         #[cfg(test)]
         let mut ends = fault::EndProbes::start(&child_end);
-        // Written, not closed, when the helper is done: a forked copy cannot hold it off.
-        let done = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-            .map_err(|e| Error::Io(crate::error::io_context("eventfd", e.into())))?;
-        let done = above_stdio(done)?;
         let done = &done;
         // Borrowed by the helper, so this thread can still force EOF on it.
         let parent_end = &parent_end;

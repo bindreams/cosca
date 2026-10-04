@@ -64,6 +64,7 @@ fn kill_self() -> io::Result<()> {
 type VerdictHook = Box<dyn FnOnce(Option<u32>)>;
 
 thread_local! {
+    static DONE_FD_FAILURE: Cell<Option<Errno>> = const { Cell::new(None) };
     static CHILD_FAULT: Cell<ChildFault> = const { Cell::new(ChildFault::None) };
     static SPAWNS: Cell<usize> = const { Cell::new(0) };
     static LEAKED: Cell<Option<Option<u32>>> = const { Cell::new(None) };
@@ -163,6 +164,26 @@ pub(crate) enum WatchFault {
     Peek(Errno),
     /// The child is taken to be running, and its poll fails with this.
     Poll(Errno),
+}
+
+/// Disarms the done-fd failure on drop.
+#[must_use = "dropping this disarms the failure at once"]
+pub(crate) struct ArmedDoneFdFailure(());
+
+/// Make the NEXT [`Pending::open`](super::Pending::open) on this thread fail making its done fd.
+pub(crate) fn fail_done_fd(errno: Errno) -> ArmedDoneFdFailure {
+    DONE_FD_FAILURE.with(|f| f.set(Some(errno)));
+    ArmedDoneFdFailure(())
+}
+
+impl Drop for ArmedDoneFdFailure {
+    fn drop(&mut self) {
+        DONE_FD_FAILURE.with(|f| f.set(None));
+    }
+}
+
+pub(super) fn take_done_fd_failure() -> Option<Errno> {
+    DONE_FD_FAILURE.with(Cell::take)
 }
 
 /// Disarms the watch fault on drop.
