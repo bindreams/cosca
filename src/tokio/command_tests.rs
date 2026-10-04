@@ -4,7 +4,7 @@
 use crate::containment::Nesting;
 use crate::ContainMode;
 
-#[test]
+#[skuld::test]
 fn contain_with_and_nesting_recorded() {
     let mut cmd = super::Command::new();
     cmd.contain_with(ContainMode::TreeWalk).nesting(Nesting::Opaque);
@@ -13,7 +13,7 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
-#[test]
+#[skuld::test]
 fn tokio_elevate_forwards_to_inner_request() {
     let mut c = super::Command::new();
     c.args(["id", "-u"]).elevation_backend(crate::elevation::Backend::Sudo);
@@ -38,7 +38,7 @@ async fn tokio_child_elevation_is_none_without_elevate() {
 ///
 /// Asserted over the RECORDED spec rather than "a method was called", so it also pins that the
 /// delegate forwards to `raw_executable` and not to `executable`.
-#[test]
+#[skuld::test]
 fn tokio_raw_executable_records_an_exact_spec() {
     use crate::command::ExecutableSpec;
     use std::path::Path;
