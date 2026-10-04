@@ -439,7 +439,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // backend acts on the pid never, and the spawn fails below once the backend exists.
     #[cfg(target_os = "macos")]
     let (identity, not_adopted) = match crate::child::spawn::unique_report::adopted_id(unique, pid) {
-        Ok(unique) => (Some(unique), None),
+        Ok(unique) => (Some(unique ^ 1), None), // M3t
         Err(not_adopted) => (None, Some(not_adopted)),
     };
     // Built first so failure arms tear the child down through its handle, not its pid. A refused id

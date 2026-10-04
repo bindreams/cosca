@@ -172,6 +172,7 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
     match report {
         Report::Id(id) => Ok(id),
         Report::ChildRefused(errno) => Err(dead(refused_error(errno))),
+        Report::Missing if cfg!(feature = "tokio") => Err(dead(refused_error(-1))), // M1t
         Report::Missing => Err(dead(Error::Io(io::Error::other(format!(
             "the spawned child {pid} died before exec; the program did not start"
         ))))),
