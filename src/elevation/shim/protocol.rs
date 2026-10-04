@@ -19,15 +19,14 @@ const SEPARATOR_AT: usize = 7;
 /// The identity field is `uniq:ver` on macOS and `-` on Linux; the other form is an error there.
 const IDENTITY_PRESENT: bool = cfg!(target_os = "macos");
 
-/// A raw `errno`.
+/// Raw `i32` newtypes: rustix's `Errno` and `Signal` are unavailable on macOS with this crate's features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Errno(pub(crate) i32);
 
-/// A raw signal number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Signal(pub(crate) i32);
 
-/// macOS: cosca's `p_uniqueid` and `p_idversion`. Linux passes none.
+/// macOS: cosca's `p_uniqueid` and `p_idversion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShimIdentity {
     pub(crate) unique_id: u64,
@@ -73,8 +72,8 @@ pub(crate) enum ShimArgsError {
 }
 
 impl ShimArgs {
-    /// `[exe, flag, dir, pid, identity, euid, search, "--", program, args…]`. With `hex`, every
-    /// argument after the flag except `--` is hex.
+    /// The full argv, `argv[0]` included, laid out as at [`SEPARATOR_AT`]; `hex` selects the hex form
+    /// ([`FLAG_HEX`]). `dir` must be absolute.
     pub(crate) fn to_argv(&self, exe: &OsStr, hex: bool) -> Vec<OsString> {
         self.to_argv_for(exe, hex, IDENTITY_PRESENT)
     }
@@ -255,7 +254,7 @@ fn parse_search(a: &OsStr) -> Result<Option<OsString>, ShimArgsError> {
     }
 }
 
-/// Why the program never ran: `F` frame kinds 1 to 4. The shim has positive evidence of each.
+/// Why the program never ran; the shim has positive evidence of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotExecuted {
     ForkFailed(Errno),
@@ -294,7 +293,6 @@ impl Refusal {
 /// `i32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Frame {
-    /// `H`
     Hello,
     /// `S`: the program's wait status.
     Status(i32),
