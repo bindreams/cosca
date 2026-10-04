@@ -134,12 +134,12 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
     end_unsignalled_and_reap(pid.get());
 }
 
-/// As the sync twin: the unique id is the child's own report, and the by-pid read is only the
-/// running check.
+/// As the sync twin: the unique id is the child's own report, and its only by-pid unique-id read
+/// is the running peek's.
 ///
 /// Mutant: the spawn reads the unique id by pid.
 #[skuld::test]
-async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_by_pid_only_to_check_running() {
+async fn macos_tokio_spawn_takes_the_childs_own_unique_id_and_reads_its_unique_id_by_pid_only_in_the_running_peek() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut cmd, writer) = tokio_blocker();
     let reads = uniq_fault::record();

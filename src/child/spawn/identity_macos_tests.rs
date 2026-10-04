@@ -253,7 +253,7 @@ pub(crate) fn arm_launchd_hold(
 /// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), which the recorded read
 /// purposes show.
 #[skuld::test]
-fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_by_pid_only_to_check_running() {
+fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_its_unique_id_by_pid_only_in_the_running_peek() {
     let (mut cmd, writer) = sync_blocker();
     let reads = uniq_fault::record();
     let child = cmd.spawn().expect("the child's own report needs no by-pid read");
