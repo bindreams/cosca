@@ -1,6 +1,6 @@
 //! Support for the `UID_SWITCH` group (`COSCA_TEST_UID_SWITCH`, principles 9 and 10): tests that run
-//! as real root and switch to other real uids. Gating is the group's fixture (`test_groups::uid_switch`);
-//! this module adds what it cannot check, that the process really can do the switching.
+//! as real root and switch to other real uids. This module checks what the group fixture cannot: that
+//! the process really can do the switching.
 
 /// The target's uid/gid: unprivileged, distinct from root and `READER_UID`. No `/etc/passwd` entry
 /// is needed.

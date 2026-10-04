@@ -17,7 +17,6 @@ use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
 use crate::identity::kinfo::P_WEXIT;
 use crate::test_groups::{tracer_group, Group};
 
-/// The tracee and its stdin.
 fn tracee() -> (crate::Child, std::io::PipeWriter) {
     tracee_with(Tracee::Plain)
 }

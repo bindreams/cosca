@@ -1,7 +1,6 @@
 //! `foreign_kill_surfaces_permission_denied`: a foreign, unprivileged caller's `kill` on a foreign,
 //! unprivileged target surfaces `EPERM` as `Err`, never `Ok`. It is the `UID_SWITCH` group
 //! (`COSCA_TEST_UID_SWITCH`, principles 9 and 10): it runs as root and switches to real uids.
-//! The group's fixture is the gate (`src/test_groups.rs`).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -163,7 +162,7 @@ fn foreign_kill_helper_main(pid: u32) -> i32 {
 
 #[cfg(unix)]
 mod uid_switch_group {
-    //! Re-execs this binary on the `UID_SWITCH` test; every case stops before its body, so it is safe on any host.
+    //! Every case stops before the test body, so these are safe on any host.
 
     use crate::common::test_reexec::{command, suite_outcome, with_json_events, SuiteOutcome, NOCAPTURE};
 

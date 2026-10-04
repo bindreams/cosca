@@ -1003,8 +1003,8 @@ pub(crate) fn expected_cwd(marker_env: &str) -> Option<std::path::PathBuf> {
 /// - `assert_fn_item($name)` forces the compiler to resolve `$name` as a fn in scope — a typo
 ///   or a stale name after a rename is a compile error here, not a filter that silently matches
 ///   zero tests at runtime. It accepts any return type, since an `async fn` fixture is not a `fn()` (see [`run_fixture_with_cwd`]'s doc for why that is exactly the bug
-///   this macro exists to rule out). A fixture taking arguments is rejected; a test that takes a
-///   group fixture uses the `fixture_path!(name, Group)` form.
+///   this macro exists to rule out). A test that takes a group fixture uses
+///   `fixture_path!(name, Group)`.
 /// - `module_path!()` derives the module portion at compile time, so it can never fall out of
 ///   sync with a file move or a module rename; libtest's `--exact` filter never includes the
 ///   crate-name component `module_path!()` always carries as its own first segment, hence the
@@ -1014,7 +1014,6 @@ macro_rules! fixture_path {
         crate::test_child::assert_fn_item($name);
         crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
     }};
-    // A test that takes one group fixture: `fixture_path!(name, Group)`.
     ($name:ident, $group:ty) => {{
         crate::test_child::assert_fn_item_taking::<$group, _>($name);
         crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))

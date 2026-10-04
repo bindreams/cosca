@@ -36,7 +36,8 @@ Two test groups run only as root (principles 9 and 10 in `docs/principles.md`):
   `tests/process_root.rs`. It runs as real root, spawns children under two other real uids and
   re-execs itself as one of them.
 
-For each group, `=0` turns it off: the tests of `ROOT` and `UID_SWITCH` report as ignored. Otherwise `COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
+For each group, `=0` turns it off: its tests report as ignored. Otherwise
+`COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
 (unprivileged) run sets both switches to `0`. CI does this workflow-wide; the root lanes in
 `.github/workflows/ci.yaml` turn `ROOT` on, and turn `UID_SWITCH` on only in the lanes that are real
 root (Linux root, `DAC_READ_SEARCH`, foreign `TMPDIR`, and macOS).

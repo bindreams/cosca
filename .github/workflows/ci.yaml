@@ -267,8 +267,9 @@ jobs:
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
       # The `TRACER` group attaches a tracer to the tests' own children, as a debugger would; a CI
-      # runner is the sandbox, so this step consents. Windows has no tracer tests. `tokio` carries
-      # the group's one async test; `-E binary(...)`: libtest binaries ignore `SKULD_LABELS`.
+      # runner is the sandbox, so this step consents. Windows has no tracer tests.
+      # `-E 'binary(cosca)'` keeps libtest binaries out: they ignore `SKULD_LABELS`. `tokio` is for
+      # the group's one async test.
       - name: Run the tracer tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 8
