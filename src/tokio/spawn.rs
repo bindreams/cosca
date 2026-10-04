@@ -326,7 +326,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
                 let abandoned = match unique {
-                    Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
+                    Report::ChildRefused(_) => AbandonedChild::Ended, // MUTANT
+                    Report::Missing => AbandonedChild::MaybeUnreaped,
                     _ => prepared.abandon_before_verdict(),
                 };
                 warn_for_abandoned_child(abandoned, &e);
