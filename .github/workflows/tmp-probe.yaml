@@ -1,0 +1,45 @@
+name: tmp-probe
+on: pull_request
+permissions: {}
+jobs:
+  linux-kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: kernel and pidfs on the hosted Linux runner
+        run: |
+          uname -r
+          python3 - <<'PY'
+          import ctypes, os, struct
+          fd = os.pidfd_open(os.getpid()); buf = ctypes.create_string_buffer(128)
+          ctypes.CDLL(None).fstatfs(fd, buf)
+          t = struct.unpack_from("l", buf.raw, 0)[0]
+          print("pidfd fs magic 0x%x -> %s" % (t, "pidfs" if t == 0x50494446 else "NOT pidfs"))
+          PY
+  macos-protocol:
+    runs-on: macos-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          sw_vers; sudo -V | head -1; python3 --version
+          cc -Wall -o probe/shim7 probe/shim7.c
+      - name: scenarios
+        timeout-minutes: 25
+        run: |
+          python3 probe/scenarios.py wiring no_front_real_link impostor_peer symlink_swap not_empty tmpdir tmpdir_ancestor d2_symlink fork_owner frames refusal_codes \
+            connect_after_accept connect_before_accept refuse_wins connect_wins second_root_peer \
+            kill_after_shim_death kill_after_clean_exit nosigpipe_getsockopt wrong_identity wrong_identity_parts wrong_euid owner_fork_copy leaked_listener \
+            wait_started_front_exit wait_started_live wait_started_late_shim front_death_prestart front_death_live shim_death_backlog exit_races_kill \
+            fail_fork fail_pidfd fail_loop exec_failure accept_emfile accept_fail_live code_119 code_123_before_answer code_123_after_a \
+            preexec_sigkill preexec_sigint status_stolen threads_refused \
+            detach_refuses detach_live osascript argv_sudo argv_osascript
+      - name: macOS residual (leaked listener answering A)
+        if: always()
+        timeout-minutes: 5
+        run: python3 probe/scenarios.py leaked_listener_answers_macos
+      - name: mutants
+        if: always()
+        timeout-minutes: 20
+        run: bash probe/mut.sh
