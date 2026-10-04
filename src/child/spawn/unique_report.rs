@@ -21,7 +21,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
-use super::fd_channel::{self, above_stdio, Shared};
+use super::fd_channel::{self, publish_ends, Shared};
 use super::SpawnLockGuard;
 use crate::error::Error;
 
@@ -65,13 +65,18 @@ pub(crate) fn register(cmd: &mut std::process::Command) -> Pending {
     // Thread-locals are not visible in the forked child, so capture the seam before the fork.
     #[cfg(test)]
     let seam = seams::armed();
-    let shared = fd_channel::register(cmd, move |shared| {
-        report(
-            shared,
-            #[cfg(test)]
-            seam,
-        )
-    });
+    // SAFETY: the hook is async-signal-safe: it reads atomics and makes only direct syscalls
+    // (`proc_pidinfo`, `write`, and in tests `kill`) on stack buffers. It allocates nothing, takes
+    // no lock and never panics.
+    let shared = unsafe {
+        fd_channel::register(cmd, move |shared| {
+            report(
+                shared,
+                #[cfg(test)]
+                seam,
+            )
+        })
+    };
     Pending { shared }
 }
 
@@ -80,10 +85,8 @@ impl Pending {
     /// cosca fork can inherit the ends before they are close-on-exec.
     pub(crate) fn open(self, _lock: &SpawnLockGuard) -> Result<Channel, Error> {
         let (read_end, write_end) = std::io::pipe().map_err(|e| Error::Io(crate::error::io_context("pipe", e)))?;
-        let read_end = above_stdio(OwnedFd::from(read_end))?;
-        let write_end = above_stdio(OwnedFd::from(write_end))?;
+        let (write_end, read_end) = publish_ends(&self.shared, OwnedFd::from(write_end), OwnedFd::from(read_end))?;
         set_nonblocking(&read_end)?;
-        self.shared.publish(write_end.as_raw_fd(), -1);
         Ok(Channel {
             read_end,
             write_end,
