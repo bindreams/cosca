@@ -756,3 +756,100 @@ async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back()
     let status = proc.wait().await.expect("the handed-back zombie is ours to reap");
     assert!(status.success(), "{status:?}");
 }
+
+// THROWAWAY (tmp/555-reaped-flake) =====
+
+/// `wait` closes the untaken stdin before it waits, as tokio's own `wait` does, so a child that
+/// reads stdin to EOF can exit. The streams live in the backend, not in tokio's `Child`, so the
+/// backend does it. Observed after one poll, which has run the close and not the wait.
+///
+/// Mutant: `wait` leaves stdin open.
+#[cfg(unix)]
+#[skuld::test]
+async fn tmp_original_wait_closes_the_untaken_stdin_first() {
+    use std::future::Future;
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let mut proc = proc_source(child);
+    {
+        let mut waiting = Box::pin(proc.wait());
+        std::future::poll_fn(|cx| {
+            drop(waiting.as_mut().poll(cx));
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    let ProcSource::Tokio { stdin, .. } = &proc else {
+        panic!("a tokio backend");
+    };
+    let closed = stdin.is_none();
+    proc.reap_now(pid); // the test's own `cat`: end it whatever happened
+    assert!(closed, "wait must close stdin before it waits");
+}
+
+/// THROWAWAY: a tokio child with piped stdin, built into a backend, that has exited (an unreaped
+/// zombie) by the time this returns.
+#[cfg(unix)]
+fn tmp_exited_backend_with_piped_stdin() -> (ProcSource, u32) {
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::from(crate::test_reexec::command(
+            std::env::current_exe().expect("current_exe"),
+        ))
+        .args(["--exact", "__cosca_no_such_test__"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = proc_source(child);
+    wait_exited_unreaped(pid);
+    (proc, pid)
+}
+
+/// THROWAWAY RED: main's test shape with CI's interleaving forced: the child exits before the
+/// wait arms. Expected on macOS: reap_now's "already-reaped child" debug_assert.
+#[cfg(unix)]
+#[skuld::test]
+async fn tmp_red_main_shape_with_the_child_exited_before_the_poll() {
+    use std::future::Future;
+    let (mut proc, pid) = tmp_exited_backend_with_piped_stdin();
+    {
+        let mut waiting = Box::pin(proc.wait());
+        std::future::poll_fn(|cx| {
+            drop(waiting.as_mut().poll(cx));
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    eprintln!("tmp: after one poll, is_reaped = {}", proc.is_reaped());
+    proc.reap_now(pid);
+}
+
+/// THROWAWAY RED: the fixed test's shape under its named mutant (no held write end, and the child
+/// has exited before the poll). Expected on macOS: the test's own precondition assertion.
+#[cfg(unix)]
+#[skuld::test]
+async fn tmp_red_fixed_shape_under_its_mutant() {
+    use std::future::Future;
+    let (mut proc, pid) = tmp_exited_backend_with_piped_stdin();
+    {
+        let mut waiting = Box::pin(proc.wait());
+        std::future::poll_fn(|cx| {
+            drop(waiting.as_mut().poll(cx));
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    assert!(
+        !proc.is_reaped(),
+        "the one poll finished the wait, so reap_now would meet an awaited child"
+    );
+    proc.reap_now(pid);
+}
