@@ -44,6 +44,13 @@ pub(crate) mod sanitize;
     )
 )]
 pub(crate) mod shell_file;
+// No caller until the shim and the acceptor land.
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "the shim is built bottom-up; the wire protocol lands before its users"
+)]
+pub(crate) mod shim;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
 pub(crate) mod windows;
