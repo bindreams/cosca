@@ -36,6 +36,7 @@ pub(crate) mod plan;
 #[path = "elevation/posix.rs"]
 pub(crate) mod posix;
 pub(crate) mod sanitize;
+// Plan F: no caller until the shim and the acceptor land (F3 and later).
 #[cfg_attr(
     not(windows),
     allow(
@@ -44,6 +45,12 @@ pub(crate) mod sanitize;
     )
 )]
 pub(crate) mod shell_file;
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "plan F builds the shim bottom-up; the wire protocol lands before its users"
+)]
+pub(crate) mod shim;
 #[cfg(windows)]
 #[path = "elevation/windows.rs"]
 pub(crate) mod windows;
