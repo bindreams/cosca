@@ -244,7 +244,7 @@ fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
         let n = unsafe { libc::write(shared.child_end(), buf.as_ptr().cast(), REPORT_LEN) };
         if n == REPORT_LEN as isize {
             return match tag {
-                REPORT_ERRNO => Err(io::Error::from_raw_os_error(value as i32)),
+                REPORT_ERRNO => Ok(()), // MUTANT
                 _ => Ok(()),
             };
         }
