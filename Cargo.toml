@@ -120,12 +120,12 @@ libc = "0.2.189"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs"] }
 # Typed `fcntl` wrappers: the raw call is variadic, and the right argument width differs per libc.
 rustix = { version = "1", features = ["fs"] }
+# The random part of a cgroup leaf's name and of the elevation shim's private directory's.
+getrandom = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
 event-listener = "5"
-# The random part of a cgroup leaf's name.
-getrandom = "0.4"
 # cgroup syscalls; typed `ioctl`, `prctl`, `pidfd_open`.
 rustix = { version = "1", features = ["process", "event", "net", "thread"] }
 
