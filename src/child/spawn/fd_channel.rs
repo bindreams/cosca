@@ -30,6 +30,7 @@ impl Shared {
     }
 
     /// The parent's end, as inherited by the child; `-1` for a channel with none. Async-signal-safe.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn parent_end(&self) -> RawFd {
         self.parent_end.load(Ordering::Relaxed)
     }

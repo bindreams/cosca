@@ -52,10 +52,8 @@ pub(crate) enum ProcSource {
         /// the pid.
         #[cfg(target_os = "linux")]
         pidfd: PinnedPidfd,
-        /// The child's unique id, which the child reported itself before `exec` (see
-        /// `child::spawn::unique_report`): the only identity a by-pid signal on macOS is checked
-        /// against. `None`: the child's own read was refused, so nothing shows the pid names this
-        /// child, and it is acted on never.
+        /// The child's unique id (see `child::spawn::unique_report`): the only identity a by-pid
+        /// signal on macOS is checked against. `None`: no id is held, so the pid is acted on never.
         #[cfg(target_os = "macos")]
         identity: Option<u64>,
     },
@@ -678,7 +676,7 @@ impl ProcSource {
     /// [`forget_foreign`](ProcSource::forget_foreign) for any reason: `why` completes "child N ...",
     /// so the warning says what actually happened.
     #[cfg(unix)]
-    fn forget_because(&mut self, why: &str) {
+    pub(crate) fn forget_because(&mut self, why: &str) {
         let ProcSource::Tokio {
             child,
             stdin,

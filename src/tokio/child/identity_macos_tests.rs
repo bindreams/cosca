@@ -11,7 +11,7 @@ use crate::child::spawn::identity_macos_tests::{
 };
 use crate::child::spawn::unique_report;
 use crate::error::Error;
-use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+use crate::identity::{uniq_fault, uniq_info, ReadPurpose, UniqRead};
 use crate::wait::exit_only::seams::force_peek_once;
 
 fn tokio_blocker() -> (crate::tokio::Command, std::io::PipeWriter) {
@@ -166,4 +166,49 @@ async fn macos_tokio_spawn_childs_own_read_refused_is_unassessable_and_the_progr
         "a refusal is Unassessable, not a vanish: {err:?}"
     );
     assert_program_did_not_run();
+}
+
+/// As the sync twin: a child killed before it reports is a child that died before exec, and
+/// tokio's `Child` is forgotten, not reaped by pid.
+///
+/// Mutant: a missing report is read as an errno.
+#[skuld::test]
+async fn macos_tokio_spawn_of_a_child_killed_before_its_report_says_it_died_before_exec() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut cmd, _writer) = tokio_blocker();
+    let _forced = unique_report::seams::force_child_killed_before_report();
+    let backend_drops = backend_fault::count_backend_drops();
+    let mark = crate::log_capture::mark();
+    let err = cmd.spawn().expect_err("a child that never reported cannot be adopted");
+    let Error::Io(e) = &err else {
+        panic!("a child that died before exec is an io error, not a refusal: {err:?}")
+    };
+    assert!(e.to_string().contains("died before exec"), "{e}");
+    assert_eq!(backend_drops.get(), 0, "tokio's Child must not be dropped");
+    assert!(
+        !crate::log_capture::contains_since(mark, "left running"),
+        "a dead child is not left running"
+    );
+}
+
+/// As the sync twin: the adopted id is the live child's own.
+///
+/// Mutant: the spawn adopts another process's id.
+#[skuld::test]
+async fn macos_tokio_spawn_adopts_the_live_childs_own_unique_id() {
+    use crate::tokio::child::ProcSource;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, writer) = tokio_blocker();
+    let mut child = cmd.spawn().expect("spawn");
+    let UniqRead::Found(info) = uniq_info(child.id().pid(), ReadPurpose::Kill) else {
+        panic!("the live child has a unique id")
+    };
+    let ProcSource::Tokio { identity, .. } = child.proc_mut() else {
+        panic!("a fresh child is a tokio backend")
+    };
+    assert_eq!(*identity, Some(info.unique_id));
+    drop(writer);
+    child.wait().await.expect("wait");
 }

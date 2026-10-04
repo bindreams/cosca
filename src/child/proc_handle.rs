@@ -28,6 +28,13 @@ impl ProcHandle {
         ProcHandle::Std(shared)
     }
 
+    /// The unique id the handle checks its by-pid actions against. Tests only.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn adopted_unique(&self) -> Option<u64> {
+        let ProcHandle::Std(shared) = self;
+        shared.adopted_unique()
+    }
+
     /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
