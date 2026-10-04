@@ -86,7 +86,6 @@ impl Pending {
     pub(crate) fn open(self, _lock: &SpawnLockGuard) -> Result<Channel, Error> {
         let (read_end, write_end) = std::io::pipe().map_err(|e| Error::Io(crate::error::io_context("pipe", e)))?;
         let (write_end, read_end) = publish_ends(&self.shared, OwnedFd::from(write_end), OwnedFd::from(read_end))?;
-        set_nonblocking(&read_end)?;
         Ok(Channel {
             read_end,
             write_end,
@@ -173,7 +172,10 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
         died_before_exec: false,
     };
     match report {
-        Report::Id(id) => Ok(id),
+        Report::Id(id) => {
+            let _ = crate::identity::uniq_info(pid, crate::identity::ReadPurpose::Kill); // MUTANT C
+            Ok(id)
+        }
         // The hook fails its spawn after reporting a refusal, so `spawn` returning `Ok` means the
         // child either ran on (a contract break) or was killed between the report and std's own
         // pipe. Nothing says which, so the program may have started.
@@ -253,7 +255,7 @@ fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
         let n = unsafe { libc::write(shared.child_end(), buf.as_ptr().cast(), REPORT_LEN) };
         if n == REPORT_LEN as isize {
             return match tag {
-                REPORT_ERRNO => Err(io::Error::from_raw_os_error(value as i32)),
+                REPORT_ERRNO => Ok(()), // MUTANT A
                 _ => Ok(()),
             };
         }
