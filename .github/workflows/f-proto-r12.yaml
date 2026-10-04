@@ -1,0 +1,46 @@
+# THROWAWAY (plan F revision 12 prototype, macOS). Never merged; the PR is closed and the branch deleted.
+name: f-proto-r12
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos-protocol:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: build
+        run: |
+          sw_vers; sudo -V | head -1; python3 --version; sysctl kern.maxproc kern.maxprocperuid
+          cc -Wall -o probe/shim12 probe/shim12.c probe/hostobjc.m -framework Foundation
+          cc -Wall -o probe/pidwrap probe/pidwrap.c
+          cc -Wall -o probe/decide_test probe/decide_test.c
+      - name: scenarios
+        timeout-minutes: 10
+        run: |
+          bash probe/run.sh python3 probe/scenarios.py wiring no_front_real_link impostor_peer symlink_swap not_empty tmpdir tmpdir_ancestor d2_symlink fork_owner frames u_frame refusal_codes \
+            connect_after_accept connect_before_accept refuse_wins connect_wins second_root_peer \
+            kill_after_shim_death kill_after_clean_exit nosigpipe_getsockopt wrong_identity wrong_identity_parts wrong_euid owner_fork_copy leaked_listener \
+            wait_started_front_exit wait_started_live wait_started_late_shim front_death_prestart front_death_live shim_death_backlog exit_races_kill \
+            fail_fork fail_pipe fail_loop exec_failure accept_emfile accept_fail_live code_119 code_123_before_answer code_123_after_a \
+            preexec_sigkill preexec_sigint status_stolen threads_refused \
+            t_before_exec exec_failure_stolen garbled_then_kill host_executable_macos \
+            fault_before_exec unknown_control_byte \
+            detach_refuses detach_live osascript argv_sudo argv_osascript \
+            threads_allowed objc_initialize_in_progress status_lost_before_identity
+      - name: decide
+        if: always()
+        run: bash probe/run.sh probe/decide_test
+      - name: leaked listener (the [6/7] residual, measured)
+        if: always()
+        timeout-minutes: 5
+        run: bash probe/run.sh python3 probe/scenarios.py leaked_listener_answers_macos
+      - name: reaper race with a pid wrap
+        if: always()
+        timeout-minutes: 15
+        run: bash probe/run.sh python3 probe/scenarios.py macos_reaper_race
+      - name: mutants
+        if: always()
+        timeout-minutes: 20
+        run: bash probe/run.sh bash probe/mut.sh
