@@ -319,14 +319,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             Ok(c) => c,
             Err(e) => {
                 let e = crate::child::spawn::unique_report::failed_spawn_error(e, &unique);
-                // The hook did not write an id, so the program never ran. A refusal fails the spawn
-                // after std's own collection, so nothing is left; a missing report leaves it open
-                // who collected the child.
+                // Without an id the program never ran, but who collected the child is open: a signal
+                // after the refusal makes std return `Ok`, and tokio's own setup can then drop the
+                // child unreaped. With an id the program may be running (exec failed, or tokio's
+                // setup failed after it).
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
                 let abandoned = match unique {
-                    Report::ChildRefused(_) => AbandonedChild::Ended,
-                    Report::Missing => AbandonedChild::MaybeUnreaped,
+                    Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
                     _ => prepared.abandon_before_verdict(),
                 };
                 warn_for_abandoned_child(abandoned, &e);

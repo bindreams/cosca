@@ -636,9 +636,8 @@ impl ProcSource {
                 if !still_ours(child) {
                     return Waited::Exited;
                 }
-                // No unique id: the child was already reaped when it was read, or the read was
-                // refused. Either way nothing shows the pid still names this child, so it is never
-                // waited on.
+                // No unique id is held, so nothing shows the pid names this child: it is never waited
+                // on.
                 let Some(identity) = identity else {
                     return Waited::Foreign;
                 };

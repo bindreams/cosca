@@ -229,10 +229,6 @@ pub(crate) fn refused_error(errno: i32) -> Error {
 
 /// The hook: the child reads its own unique id and writes the report. Async-signal-safe.
 fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
-    if !shared.is_live() {
-        // The command is being spawned again after its spawn ended: the number is not ours.
-        return Err(io::Error::from_raw_os_error(libc::ENOTCONN));
-    }
     #[cfg(test)]
     if let Some(errno) = seam.fail_before_report() {
         return Err(io::Error::from_raw_os_error(errno));

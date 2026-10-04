@@ -163,7 +163,7 @@ fn a_nonexistent_program_fails_with_stds_io_error() {
 /// Spawning the same command again after its spawn ended fails in the hook, not by writing to a
 /// reused descriptor number.
 ///
-/// Mutant: the hook ignores `is_live`.
+/// Mutant: `fd_channel::register` stops gating on liveness.
 #[skuld::test]
 fn a_command_spawned_again_fails_in_the_hook() {
     let mut cmd = std::process::Command::new("/usr/bin/true");
@@ -175,7 +175,7 @@ fn a_command_spawned_again_fails_in_the_hook() {
     let second = cmd.spawn();
     assert_eq!(
         second.expect_err("a withdrawn channel").raw_os_error(),
-        Some(libc::ENOTCONN)
+        Some(libc::EBADF)
     );
 }
 
