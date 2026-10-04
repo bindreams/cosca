@@ -227,8 +227,13 @@ copy of `cosca_testbin`, named by `COSCA_TEST_SETUID_HELPER`): CI provisions the
 Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, and opts in there.
 `SKULD_LABELS=setuid` selects its tests, and `setuid_root` the one the Linux root-run step also
 runs. So does
-`COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids): CI turns
-it off workflow-wide and opts in only in the root lanes that can `setuid` to those uids. So does
+`COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids), a
+`test_group!` row joined with `#[fixture(uid_switch)] _group: &Group`: CI turns it off
+workflow-wide and opts in only in the root lanes that can `setuid` to those uids, which select it
+with `SKULD_LABELS=root`. So does `COSCA_TEST_TRACER` (the tests that attach a tracer to their own
+children, as a debugger does), joined with `#[fixture(tracer_group)] _group: &Group`: CI turns it
+off workflow-wide, and the two tracer steps of the `test` job (debug and release) opt in, selected
+by `SKULD_LABELS=tracer`. So does
 `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
 with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
 in. So does

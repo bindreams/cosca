@@ -1013,12 +1013,21 @@ macro_rules! fixture_path {
         crate::test_child::assert_fn_item($name);
         crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
     }};
+    // A test that takes one group fixture: `fixture_path!(name, Group)`.
+    ($name:ident, $group:ty) => {{
+        crate::test_child::assert_fn_item_taking::<$group, _>($name);
+        crate::test_child::strip_crate_prefix(concat!(module_path!(), "::", stringify!($name)))
+    }};
 }
 pub(crate) use fixture_path;
 
 /// Compiles only for a fn item or closure of any signature, `async fn` included: a misspelled name or
 /// a non-fn item is a compile error at the [`fixture_path!`] call site.
 pub(crate) fn assert_fn_item<R>(_: impl Fn() -> R) {}
+
+/// [`assert_fn_item`] for a fn that takes one fixture, by reference.
+#[cfg(target_os = "macos")]
+pub(crate) fn assert_fn_item_taking<A: ?Sized, R>(_: impl Fn(&A) -> R) {}
 
 /// Strips the crate-name segment `module_path!()` always carries as its own first component
 /// (e.g. `"cosca::resolve::resolve_tests"`), since libtest's `--exact` filter never includes it

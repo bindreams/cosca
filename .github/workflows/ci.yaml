@@ -20,12 +20,14 @@ env:
   # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml and the devvm provision scripts carry the same nextest version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.146"
   # The root lanes' binaries, narrowed by `SKULD_LABELS=root`. Name only skuld binaries: a libtest
-  # binary ignores `SKULD_LABELS` and would run whole. `process_root` is gated by `COSCA_TEST_UID_SWITCH`.
+  # binary ignores `SKULD_LABELS` and would run whole. `process_root`'s test is the `UID_SWITCH` group.
   PRIVILEGE_TESTS: "binary(cosca) | binary(process_root)"
   # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
   COSCA_TEST_UID_SWITCH: "0"
   # System-affecting groups are off workflow-wide; the root lane opts back in.
   COSCA_TEST_NAMESPACES: "0"
+  # The tracer tests run in the two tracer steps of the test job below.
+  COSCA_TEST_TRACER: "0"
   # The setuid group runs only where a step provisions a setuid-root helper and opts back in.
   COSCA_TEST_SETUID: "0"
   # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
@@ -196,12 +198,6 @@ jobs:
     # self-test included. 50 min is 1.5x the slowest. All lanes share this bound.
     timeout-minutes: 50
 
-    # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
-    # sandbox, so every step consents. Windows has no tracer tests.
-    env:
-      COSCA_TEST_TRACER: "1"
-      COSCA_TEST_TRACER_CONSENT: "1"
-
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -269,6 +265,18 @@ jobs:
       - name: Run tests (tokio feature)
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
+
+      # The `TRACER` group attaches a tracer to the tests' own children, as a debugger would; a CI
+      # runner is the sandbox, so this step consents. Windows has no tracer tests. `tokio` carries
+      # the group's one async test; `-E binary(...)`: libtest binaries ignore `SKULD_LABELS`.
+      - name: Run the tracer tests (Unix)
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 8
+        env:
+          COSCA_TEST_TRACER: "1"
+          COSCA_TEST_TRACER_CONSENT: "1"
+          SKULD_LABELS: tracer
+        run: ${{ matrix.nextest }} tracer cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
 
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
@@ -384,6 +392,16 @@ jobs:
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 8
         run: ${{ matrix.nextest }} release-tokio cargo nextest run --locked --release --lib --features tokio --target ${{ matrix.target }}
+
+      # The tracer tests with `debug_assertions` off too.
+      - name: Run the tracer tests (release — debug_assertions off)
+        if: matrix.os == 'darwin' || matrix.os == 'linux'
+        timeout-minutes: 8
+        env:
+          COSCA_TEST_TRACER: "1"
+          COSCA_TEST_TRACER_CONSENT: "1"
+          SKULD_LABELS: tracer
+        run: ${{ matrix.nextest }} tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
 
 
       # `#[cfg(windows)]` code (including feature-gated code, e.g. tokio's raw

@@ -56,3 +56,11 @@ pub const ISOLATED_EXISTING_EXTENSIONLESS: skuld::Label;
 /// filter selected (most use fake leaves and also run in the main lanes).
 #[skuld::label]
 pub const CGROUP: skuld::Label;
+
+/// Selects the `TRACER` group's tests: those that attach a tracer to a child, as a debugger would.
+#[skuld::label]
+pub const TRACER: skuld::Label;
+
+/// Selects the `UID_SWITCH` group's test: it runs as real root and switches to other real uids.
+#[skuld::label]
+pub const UID_SWITCH: skuld::Label;

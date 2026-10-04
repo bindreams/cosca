@@ -1,4 +1,6 @@
 use super::{ProcSource, Waited};
+#[cfg(target_os = "macos")]
+use crate::test_groups::{tracer_group, Group};
 
 /// `child` as a backend, as the spawn builds it: Linux holds a pidfd the test opens itself (a raw
 /// tokio child has none), macOS the child's unique id.
@@ -725,11 +727,10 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_foreign() {
 /// Mutant: a by-pid `ECHILD` is taken for a foreign reap.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back() {
+async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back(
+    #[fixture(tracer_group)] _group: &Group,
+) {
     use crate::test_support::tracer::{self, Mode, Report, Tracee};
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
     let (child, stdin) = tracer::spawn_tracee_tokio(Tracee::Plain).await;
     let pid = child.id().expect("tokio owns an un-reaped child");
     let unique = crate::signal::read_identity(pid).expect("readable");

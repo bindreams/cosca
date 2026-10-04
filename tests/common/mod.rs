@@ -237,8 +237,11 @@ mod log_capture {
 }
 pub use log_capture::{contains_since, install as install_log_capture, levels_since, mark as log_mark};
 
-pub mod test_enablement;
-pub use test_enablement::{require_group, test_groups};
+/// The lib's group declarations, included once for every root that uses `common` (an integration
+/// test cannot name a `#[cfg(test)]` item of the library). See `docs/principles.md`, principles 9
+/// and 10.
+#[path = "../../src/test_groups.rs"]
+pub mod test_groups;
 
 /// Is `pid` attached to OUR console? `None` when the probe found no console at all, so a
 /// broken or console-less probe can never satisfy an "absent" assertion — the two are

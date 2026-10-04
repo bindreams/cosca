@@ -15,30 +15,28 @@ use std::os::unix::process::ExitStatusExt as _;
 use super::sys::{proc_state, ProcState};
 use super::{sys, Cause, Mode, Report, Tracee, TracerHelper, Until};
 use crate::identity::kinfo::P_WEXIT;
+use crate::test_groups::{tracer_group, Group};
 
-/// The tracee and its stdin, or `None` with the `TRACER` group turned off.
-fn tracee() -> Option<(crate::Child, std::io::PipeWriter)> {
+/// The tracee and its stdin.
+fn tracee() -> (crate::Child, std::io::PipeWriter) {
     tracee_with(Tracee::Plain)
 }
 
 /// [`tracee`] of `kind` (see [`super::spawn_tracee`]).
-fn tracee_with(kind: Tracee) -> Option<(crate::Child, std::io::PipeWriter)> {
+fn tracee_with(kind: Tracee) -> (crate::Child, std::io::PipeWriter) {
     tracee_receiving(kind, &[])
 }
 
 /// [`tracee`] of `kind`, which the test sends each of `signals` while it is traced: asserts that
 /// it receives them as the helper's contract needs ([`assert_receives`]).
-fn tracee_receiving(kind: Tracee, signals: &[i32]) -> Option<(crate::Child, std::io::PipeWriter)> {
-    if !crate::test_support::require_group("TRACER") {
-        return None;
-    }
+fn tracee_receiving(kind: Tracee, signals: &[i32]) -> (crate::Child, std::io::PipeWriter) {
     let (mut child, ready) = super::spawn_tracee(kind);
     for &signal in signals {
         let caught = kind == Tracee::CatchSigterm && signal == libc::SIGTERM;
         assert_receives(child.id().pid(), &ready, signal, caught);
     }
     let stdin = child.stdin().expect("the tracee's stdin is piped");
-    Some((child, stdin))
+    (child, stdin)
 }
 
 /// `signal`'s bit in a signal mask.
@@ -322,8 +320,8 @@ fn panic_of(f: impl FnOnce()) -> String {
 /// tracee only for a peeked `SIGSTOP`, so `attached` shows it. After the detach the tracee is
 /// this test's child again, a `SIGSTOP` job-stops it, and `SIGKILL` ends it.
 #[skuld::test]
-fn feasibility_facts() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn feasibility_facts(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
@@ -373,10 +371,7 @@ fn check_receives(kind: Tracee, signal: i32, caught: bool) -> Result<(), String>
 /// orphaned-group check reads a field that is 0 here; `Tracee::OwnGroup` stays in its parent's
 /// group.
 #[skuld::test]
-fn the_tracees_meet_the_preconditions() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn the_tracees_meet_the_preconditions(#[fixture(tracer_group)] _group: &Group) {
     for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGCONT] {
         assert_eq!(
             check_receives(Tracee::OwnGroup, signal, false),
@@ -390,10 +385,7 @@ fn the_tracees_meet_the_preconditions() {
 
 /// Mutant: the signal mask is not checked.
 #[skuld::test]
-fn a_blocked_signal_fails_the_precondition() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_blocked_signal_fails_the_precondition(#[fixture(tracer_group)] _group: &Group) {
     let message = check_receives(Tracee::BlockSigtstp, libc::SIGTSTP, false).expect_err("no failure");
     assert!(message.contains("blocks signal 18"), "{message}");
 }
@@ -402,10 +394,7 @@ fn a_blocked_signal_fails_the_precondition() {
 /// tracee exits on EOF. Mutant: `BlockSigtstp` blocks it on the reading thread only, and the
 /// main thread takes the stop.
 #[skuld::test]
-fn a_blocked_tracee_blocks_the_signal_on_every_thread() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_blocked_tracee_blocks_the_signal_on_every_thread(#[fixture(tracer_group)] _group: &Group) {
     let (mut tracee, ready) = super::spawn_tracee(Tracee::BlockSigtstp);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let pid = tracee.id().pid();
@@ -425,40 +414,28 @@ fn a_blocked_tracee_blocks_the_signal_on_every_thread() {
 
 /// Mutant: `tracee_receiving` does not assert the preconditions.
 #[skuld::test]
-fn a_tracee_a_test_sends_a_job_control_stop_must_lead_its_own_group() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_tracee_a_test_sends_a_job_control_stop_must_lead_its_own_group(#[fixture(tracer_group)] _group: &Group) {
     let message = panic_of(|| drop(tracee_receiving(Tracee::Plain, &[libc::SIGTSTP])));
     assert!(message.contains("does not lead its own process group"), "{message}");
 }
 
 /// Mutant: `SIG_IGN` is not checked.
 #[skuld::test]
-fn an_ignored_signal_fails_the_precondition() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn an_ignored_signal_fails_the_precondition(#[fixture(tracer_group)] _group: &Group) {
     let message = check_receives(Tracee::IgnoreSigtstp, libc::SIGTSTP, false).expect_err("no failure");
     assert!(message.contains("ignores signal 18"), "{message}");
 }
 
 /// Mutant: the handler is not checked.
 #[skuld::test]
-fn a_missing_handler_fails_the_precondition() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_missing_handler_fails_the_precondition(#[fixture(tracer_group)] _group: &Group) {
     let message = check_receives(Tracee::Plain, libc::SIGTERM, true).expect_err("no failure");
     assert!(message.contains("catches signal 15"), "{message}");
 }
 
 /// Mutant: the own-group check is skipped.
 #[skuld::test]
-fn a_shared_group_fails_the_precondition_for_a_job_control_stop() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn a_shared_group_fails_the_precondition_for_a_job_control_stop(#[fixture(tracer_group)] _group: &Group) {
     let message = check_receives(Tracee::Plain, libc::SIGTSTP, false).expect_err("no failure");
     assert!(message.contains("does not lead its own process group"), "{message}");
 }
@@ -466,10 +443,7 @@ fn a_shared_group_fails_the_precondition_for_a_job_control_stop() {
 /// A session leader leads its own group too, so only the orphaned-group check fails. Mutant: that
 /// check is skipped.
 #[skuld::test]
-fn an_orphaned_group_fails_the_precondition_for_a_job_control_stop() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn an_orphaned_group_fails_the_precondition_for_a_job_control_stop(#[fixture(tracer_group)] _group: &Group) {
     let message = check_receives(Tracee::OwnSession, libc::SIGTSTP, false).expect_err("no failure");
     assert!(message.contains("process group is orphaned"), "{message}");
 }
@@ -477,10 +451,7 @@ fn an_orphaned_group_fails_the_precondition_for_a_job_control_stop() {
 /// XNU discards only the job-control stops in an orphaned group. Mutant: the orphaned-group check
 /// applies to every signal.
 #[skuld::test]
-fn an_orphaned_group_does_not_matter_for_other_signals() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn an_orphaned_group_does_not_matter_for_other_signals(#[fixture(tracer_group)] _group: &Group) {
     assert_eq!(check_receives(Tracee::OwnSession, libc::SIGTERM, false), Ok(()));
 }
 
@@ -489,8 +460,8 @@ fn an_orphaned_group_does_not_matter_for_other_signals() {
 /// A client's helper: no `state` reports, and `recv` skips `blocking` ones. Mutant: `start`
 /// enables the traces.
 #[skuld::test]
-fn a_client_helper_reports_only_the_protocol() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_client_helper_reports_only_the_protocol(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start(Mode::Auto).attach(&mut tracee);
     assert_eq!(th.recv(), Report::Attached);
@@ -503,8 +474,8 @@ fn a_client_helper_reports_only_the_protocol() {
 
 /// Mutant: `attach` sends a reaped child's pid.
 #[skuld::test]
-fn attach_refuses_a_reaped_tracee() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn attach_refuses_a_reaped_tracee(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     drop(stdin);
     let status = tracee.wait().expect("wait for the tracee");
     assert!(status.success(), "expected the tracee's own clean exit, got {status:?}");
@@ -515,8 +486,8 @@ fn attach_refuses_a_reaped_tracee() {
 
 /// Mutant: the teardown drains a helper that waits for the tracee's exit.
 #[skuld::test]
-fn dropping_a_helper_that_awaits_the_tracees_exit_kills_it_and_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn dropping_a_helper_that_awaits_the_tracees_exit_kills_it_and_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = at_s4(&mut tracee, "S4:ESRCH");
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
     // A mutant that drains instead then ends, rather than hanging.
@@ -532,9 +503,6 @@ fn dropping_a_helper_that_awaits_the_tracees_exit_kills_it_and_fails() {
 
 /// Sends `line`, closes the signal pipe, and expects the malformed-line exit.
 fn malformed(line: &[u8]) {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
     let mut pending = super::start_forced(Mode::Auto, "");
     std::io::Write::write_all(pending.session.signal_tx(), line).expect("write the line");
     drop(pending.session.signal_tx.take());
@@ -550,50 +518,47 @@ fn malformed(line: &[u8]) {
 
 /// Mutant: a malformed line exits as EOF does.
 #[skuld::test]
-fn s_minus_1_a_stray_line_is_malformed() {
+fn s_minus_1_a_stray_line_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"not a pid\n");
 }
 
 #[skuld::test]
-fn s_minus_1_a_non_numeric_pid_is_malformed() {
+fn s_minus_1_a_non_numeric_pid_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid abc\n");
 }
 
 #[skuld::test]
-fn s_minus_1_an_empty_pid_is_malformed() {
+fn s_minus_1_an_empty_pid_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid \n");
 }
 
 /// `kill(0, …)` would signal the helper's own process group. Mutant: a pid of 0 is accepted.
 #[skuld::test]
-fn s_minus_1_pid_0_is_malformed() {
+fn s_minus_1_pid_0_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid 0\n");
 }
 
 /// Mutant: a negative pid, a process group to `kill(2)`, is accepted.
 #[skuld::test]
-fn s_minus_1_a_negative_pid_is_malformed() {
+fn s_minus_1_a_negative_pid_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid -1\n");
 }
 
 #[skuld::test]
-fn s_minus_1_non_utf8_is_malformed() {
+fn s_minus_1_non_utf8_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid \xff\n");
 }
 
 /// A pid no process has, so a mutant that takes it fails at S0. Mutant: S-1 takes a line cut
 /// short by EOF.
 #[skuld::test]
-fn s_minus_1_eof_inside_the_line_is_malformed() {
+fn s_minus_1_eof_inside_the_line_is_malformed(#[fixture(tracer_group)] _group: &Group) {
     malformed(b"pid 99999998");
 }
 
 /// Mutant: S-1 treats EOF as a pid.
 #[skuld::test]
-fn s_minus_1_eof_exits_without_a_report() {
-    if !crate::test_support::require_group("TRACER") {
-        return;
-    }
+fn s_minus_1_eof_exits_without_a_report(#[fixture(tracer_group)] _group: &Group) {
     let mut pending = super::start_forced(Mode::Auto, "");
     drop(pending.session.signal_tx.take());
     assert_eq!(pending.session.next_report(), None);
@@ -604,8 +569,8 @@ fn s_minus_1_eof_exits_without_a_report() {
 
 /// Mutant: S0 ignores a receipt error.
 #[skuld::test]
-fn s0_a_receipt_error_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s0_a_receipt_error_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S0:ESRCH").attach(&mut tracee);
     expect(&mut th, &["S0", &err(libc::ESRCH, "S0"), DONE]);
     drop(th);
@@ -615,8 +580,8 @@ fn s0_a_receipt_error_fails() {
 
 /// Mutant: S1 treats an attach error as success.
 #[skuld::test]
-fn s1_an_attach_error_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s1_an_attach_error_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S1:EPERM").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", &err(libc::EPERM, "S1"), DONE]);
     drop(th);
@@ -628,8 +593,8 @@ fn s1_an_attach_error_fails() {
 
 /// Mutant: S1h's signal byte goes straight to S3.
 #[skuld::test]
-fn s1h_a_signal_byte_goes_to_release() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s1h_a_signal_byte_goes_to_release(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
@@ -646,8 +611,8 @@ fn s1h_a_signal_byte_goes_to_release() {
 /// `SIGKILL`.
 /// Mutant: `assert_sigkilled` takes the stop record of an exiting tracee for a stop.
 #[skuld::test]
-fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
-    let Some((tracee, _stdin)) = tracee() else { return };
+fn a_stop_record_of_an_exiting_tracee_is_its_kill(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, _stdin) = tracee();
     let pid = tracee.id().pid();
     send(pid, libc::SIGKILL);
     sys::peek(pid, libc::WEXITED).expect("waitid the killed tracee");
@@ -658,8 +623,8 @@ fn a_stop_record_of_an_exiting_tracee_is_its_kill() {
 /// Mutant: `stopped_by` takes a tracee that is only stopped for one that ends, so
 /// `assert_sigkilled` would wait on it forever.
 #[skuld::test]
-fn a_stopped_tracee_reads_as_stopped() {
-    let Some((tracee, _stdin)) = tracee() else { return };
+fn a_stopped_tracee_reads_as_stopped(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, _stdin) = tracee();
     let pid = tracee.id().pid();
     send(pid, libc::SIGSTOP);
     let info = await_change(pid);
@@ -720,8 +685,8 @@ fn stopped_by_asserts_a_zombie_has_begun_to_exit() {
 
 /// Mutant: `assert_sigkilled` reads the tracee while a helper is unreaped.
 #[skuld::test]
-fn assert_sigkilled_needs_the_helpers_reaped() {
-    let Some((tracee, stdin)) = tracee() else { return };
+fn assert_sigkilled_needs_the_helpers_reaped(#[fixture(tracer_group)] _group: &Group) {
+    let (tracee, stdin) = tracee();
     let pending = super::start(Mode::Auto);
     // Closed, so without the check the tracee's clean exit fails the test, not a hang.
     drop(stdin);
@@ -732,8 +697,8 @@ fn assert_sigkilled_needs_the_helpers_reaped() {
 
 /// Mutant: S1h's EOF goes to S2.
 #[skuld::test]
-fn s1h_eof_exits_and_xnu_kills_the_tracee() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s1h_eof_exits_and_xnu_kills_the_tracee(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
     drop(th.session.signal_tx.take());
@@ -747,8 +712,8 @@ fn s1h_eof_exits_and_xnu_kills_the_tracee() {
 /// The injected `NOTE_EXIT` arrives while the tracee is really held, so S5's result is injected
 /// too, and XNU kills the tracee when the helper exits. Mutant: S1h's `NOTE_EXIT` goes to S2.
 #[skuld::test]
-fn s1h_note_exit_goes_to_reap() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s1h_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S1h:NOTE_EXIT,S5:ok").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h", "S5", "reaped", DONE]);
     drop(th);
@@ -758,7 +723,7 @@ fn s1h_note_exit_goes_to_reap() {
 
 /// Runs S1h's peeks under `force`, the last of which fails the run.
 fn s1h_peeks_until_the_error(force: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h", &err(libc::EINVAL, "S1h"), DONE]);
     drop(th);
@@ -768,26 +733,26 @@ fn s1h_peeks_until_the_error(force: &str) {
 
 /// Mutant: S1h retries a failed peek.
 #[skuld::test]
-fn s1h_a_failed_stop_peek_fails() {
+fn s1h_a_failed_stop_peek_fails(#[fixture(tracer_group)] _group: &Group) {
     s1h_peeks_until_the_error("S1:hold,S1hstop:EINVAL");
 }
 
 /// Mutant: S1h holds a tracee that is not stopped.
 #[skuld::test]
-fn s1h_a_tracee_not_stopped_yet_backs_off() {
+fn s1h_a_tracee_not_stopped_yet_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s1h_peeks_until_the_error("S1:hold,S1hstop:none,S1hstop:EINVAL");
 }
 
 /// Mutant: S1h holds a stop that has not settled.
 #[skuld::test]
-fn s1h_a_settling_stop_backs_off() {
+fn s1h_a_settling_stop_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s1h_peeks_until_the_error("S1:hold,S1hstop:settling,S1hstop:EINVAL");
 }
 
 /// Mutant: a lone `SIGCHLD` counts as a signal byte in S1h.
 #[skuld::test]
-fn s1h_a_lone_sigchld_reads_as_the_timeout() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s1h_a_lone_sigchld_reads_as_the_timeout(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S1h:SIGCHLD").attach(&mut tracee);
     expect(&mut th, &HELD);
     drop(th.session.signal_tx.take());
@@ -846,10 +811,8 @@ fn await_settled(pid: u32) {
 /// Mutant: no exemption for an uninterruptible thread without a kernel stack, so S2 backs off
 /// instead of releasing the tracee.
 #[skuld::test]
-fn a_stop_with_a_never_started_thread_settles() {
-    let Some((mut tracee, stdin)) = tracee_with(Tracee::UnstartedThread) else {
-        return;
-    };
+fn a_stop_with_a_never_started_thread_settles(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_with(Tracee::UnstartedThread);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S1h"]);
@@ -885,8 +848,8 @@ fn from_held<'a>(tracee: &'a mut crate::Child, force: &str) -> TracerHelper<'a> 
 
 /// Mutant: S2 treats `EBUSY` as a failure.
 #[skuld::test]
-fn s2_ebusy_backs_off_then_retries() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s2_ebusy_backs_off_then_retries(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = from_held(&mut tracee, "S1:hold,S2:EBUSY");
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
@@ -899,18 +862,18 @@ fn s2_ebusy_backs_off_then_retries() {
 
 /// Mutants: S2 releases a tracee its peek finds not stopped; S2 fails on it.
 #[skuld::test]
-fn s2_a_tracee_not_stopped_yet_backs_off() {
+fn s2_a_tracee_not_stopped_yet_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s2_backs_off_before_the_release("S1:hold,S2stop:none");
 }
 
 /// Mutant: S2 releases a stop that has not settled.
 #[skuld::test]
-fn s2_a_settling_stop_backs_off() {
+fn s2_a_settling_stop_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s2_backs_off_before_the_release("S1:hold,S2stop:settling");
 }
 
 fn s2_backs_off_before_the_release(force: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = from_held(&mut tracee, force);
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
@@ -926,10 +889,8 @@ fn s2_backs_off_before_the_release(force: &str) {
 /// signal's properties (`issignal`): it discards a default-action one, so this tracee catches
 /// `SIGTERM`. Mutants: S2 releases any stop without its signal; S2 passes on signal 0.
 #[skuld::test]
-fn s2_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::CatchSigterm, &[libc::SIGTERM]) else {
-        return;
-    };
+fn s2_passes_a_stopping_signal_through(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::CatchSigterm, &[libc::SIGTERM]);
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM");
     expect(&mut th, &["S2", "S2s"]);
     // A tracee released without the signal then exits on its own instead.
@@ -948,10 +909,8 @@ fn s2_passes_a_stopping_signal_through() {
 /// attach's one that a real stop signal would have beaten. Mutants: S2 passes a stop signal on;
 /// the kept signal is not re-sent.
 #[skuld::test]
-fn s2_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
-        return;
-    };
+fn s2_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S1:hold,S2stop:SIGTSTP").attach(&mut tracee);
     expect(&mut th, &HELD);
@@ -970,7 +929,7 @@ fn s2_keeps_a_stop_signal_until_after_the_detach() {
 }
 
 fn s2_fails(force: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S2", &err(libc::EINVAL, "S2"), DONE]);
     drop(th);
@@ -980,24 +939,24 @@ fn s2_fails(force: &str) {
 
 /// Mutant: S2 treats a failed stop peek as "not stopped yet".
 #[skuld::test]
-fn s2_a_failed_stop_peek_fails() {
+fn s2_a_failed_stop_peek_fails(#[fixture(tracer_group)] _group: &Group) {
     s2_fails("S2stop:EINVAL");
 }
 
 /// Mutant: S2 ignores a failed pass-through.
 #[skuld::test]
-fn s2_a_failed_pass_through_fails() {
+fn s2_a_failed_pass_through_fails(#[fixture(tracer_group)] _group: &Group) {
     s2_fails("S2stop:SIGTERM,S2cont:EINVAL");
 }
 
 /// Mutant: S2 treats `EINVAL` as `EBUSY`.
 #[skuld::test]
-fn s2_another_errno_fails() {
+fn s2_another_errno_fails(#[fixture(tracer_group)] _group: &Group) {
     s2_fails("S2:EINVAL");
 }
 
 fn s2b_event_fails(event: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let force = format!("S2:EBUSY,S2b:{event}");
     let mut th = super::start_forced(Mode::Auto, &force).attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S2", "S2b", &err(event, "S2b"), DONE]);
@@ -1008,26 +967,26 @@ fn s2b_event_fails(event: &str) {
 
 /// Mutant: S2b retries on `NOTE_EXIT`.
 #[skuld::test]
-fn s2b_note_exit_fails() {
+fn s2b_note_exit_fails(#[fixture(tracer_group)] _group: &Group) {
     s2b_event_fails("NOTE_EXIT");
 }
 
 /// Mutant: S2b retries on a signal byte.
 #[skuld::test]
-fn s2b_a_signal_byte_fails() {
+fn s2b_a_signal_byte_fails(#[fixture(tracer_group)] _group: &Group) {
     s2b_event_fails("SIGNAL");
 }
 
 /// Mutant: S2b retries on EOF.
 #[skuld::test]
-fn s2b_eof_fails() {
+fn s2b_eof_fails(#[fixture(tracer_group)] _group: &Group) {
     s2b_event_fails("EOF");
 }
 
 /// Mutant: a lone `SIGCHLD` counts as an event in S2b.
 #[skuld::test]
-fn s2b_a_lone_sigchld_reads_as_the_timeout() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s2b_a_lone_sigchld_reads_as_the_timeout(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = from_held(&mut tracee, "S1:hold,S2:EBUSY,S2b:SIGCHLD");
     expect(&mut th, &["S2", "S2b", "attached", "S3", "blocking S3 eof"]);
@@ -1044,8 +1003,8 @@ fn s2b_a_lone_sigchld_reads_as_the_timeout() {
 /// reap, which hands the zombie back with its real status. Mutants: S3 `auto` takes
 /// `NOTE_EXIT` to S4; S5 reports `reaped` without reaping.
 #[skuld::test]
-fn s3_auto_note_exit_goes_to_reap() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_auto_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1058,8 +1017,8 @@ fn s3_auto_note_exit_goes_to_reap() {
 
 /// Mutant: S3 `auto` checks the signal byte before `NOTE_EXIT`.
 #[skuld::test]
-fn s3_auto_note_exit_wins_over_a_signal_byte_in_the_same_batch() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_auto_note_exit_wins_over_a_signal_byte_in_the_same_batch(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S3:NOTE_EXIT+SIGNAL").attach(&mut tracee);
     expect(
@@ -1076,8 +1035,8 @@ fn s3_auto_note_exit_wins_over_a_signal_byte_in_the_same_batch() {
 /// Also S4's real `SIGSTOP` and `PT_DETACH`. Mutants: S3 `auto` takes a signal byte to S5; S4
 /// reports `detached` without detaching.
 #[skuld::test]
-fn s3_auto_a_signal_byte_goes_to_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_auto_a_signal_byte_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1090,8 +1049,8 @@ fn s3_auto_a_signal_byte_goes_to_detach() {
 
 /// Mutant: S3 treats EOF as `NOTE_EXIT`.
 #[skuld::test]
-fn s3_auto_eof_goes_to_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_auto_eof_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1104,8 +1063,8 @@ fn s3_auto_eof_goes_to_detach() {
 
 /// Mutant: S5 fails on `EINTR`.
 #[skuld::test]
-fn s5_eintr_retries() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s5_eintr_retries(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S5:EINTR").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1118,8 +1077,8 @@ fn s5_eintr_retries() {
 
 /// Mutant: S5 retries any error.
 #[skuld::test]
-fn s5_another_errno_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s5_another_errno_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S5:ECHILD").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1133,8 +1092,8 @@ fn s5_another_errno_fails() {
 /// `NOTE_EXIT` is injected while the tracee runs, then this test stops it, and S5's `wait4`
 /// returns the traced stop. Mutant: S5 takes any record for a reap.
 #[skuld::test]
-fn s5_a_stop_is_not_a_reap() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s5_a_stop_is_not_a_reap(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S3:NOTE_EXIT").attach(&mut tracee);
     expect(
@@ -1155,8 +1114,8 @@ const EXITED: [&str; 4] = ["blocking S3 exit", "exited", "S3x", "blocking S3x eo
 
 /// Mutant: S3 `hold` reaps at once.
 #[skuld::test]
-fn s3_hold_note_exit_reports_exited_then_a_signal_byte_reaps() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_hold_note_exit_reports_exited_then_a_signal_byte_reaps(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1172,8 +1131,8 @@ fn s3_hold_note_exit_reports_exited_then_a_signal_byte_reaps() {
 
 /// Mutant: S3x ignores EOF.
 #[skuld::test]
-fn s3x_eof_reaps() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3x_eof_reaps(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1188,7 +1147,7 @@ fn s3x_eof_reaps() {
 
 /// S3x's event arrives as an injected batch.
 fn s3x_injected_release(event: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, &format!("S3x:{event}")).attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1202,20 +1161,20 @@ fn s3x_injected_release(event: &str) {
 
 /// Mutant: S3x takes only a real signal byte.
 #[skuld::test]
-fn s3x_an_injected_signal_byte_reaps() {
+fn s3x_an_injected_signal_byte_reaps(#[fixture(tracer_group)] _group: &Group) {
     s3x_injected_release("SIGNAL");
 }
 
 /// Mutant: S3x takes only a real EOF.
 #[skuld::test]
-fn s3x_an_injected_eof_reaps() {
+fn s3x_an_injected_eof_reaps(#[fixture(tracer_group)] _group: &Group) {
     s3x_injected_release("EOF");
 }
 
 /// Mutant: S3x takes an injected `NOTE_EXIT` for a release.
 #[skuld::test]
-fn s3x_note_exit_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3x_note_exit_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "S3x:NOTE_EXIT").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1232,8 +1191,8 @@ fn s3x_note_exit_fails() {
 /// The second injection fails S3x, which the test sees only if the first left it waiting.
 /// Mutant: a lone `SIGCHLD` releases S3x.
 #[skuld::test]
-fn s3x_a_lone_sigchld_is_ignored() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3x_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "S3x:SIGCHLD,S3x:NOTE_EXIT").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1251,8 +1210,8 @@ fn s3x_a_lone_sigchld_is_ignored() {
 /// `WEXITED` wait returns the stop record (measured on CI), which is not an exit. Mutant: S3
 /// `hold` reports `exited` without checking the record.
 #[skuld::test]
-fn s3_hold_a_zombie_wait_that_finds_no_exit_fails() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_hold_a_zombie_wait_that_finds_no_exit_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "S3:NOTE_EXIT").attach(&mut tracee);
     expect(
@@ -1268,8 +1227,8 @@ fn s3_hold_a_zombie_wait_that_finds_no_exit_fails() {
 
 /// Mutant: S3 `hold` takes a signal byte to S3x.
 #[skuld::test]
-fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1282,8 +1241,8 @@ fn s3_hold_a_signal_byte_without_note_exit_goes_to_detach() {
 
 /// Mutant: S3 `hold` waits on after EOF.
 #[skuld::test]
-fn s3_hold_eof_without_note_exit_goes_to_detach() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_hold_eof_without_note_exit_goes_to_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1296,7 +1255,7 @@ fn s3_hold_eof_without_note_exit_goes_to_detach() {
 
 /// The injected batch is taken on S3's entry; S3 then waits for the real zombie.
 fn s3_hold_batch_passes_s3x(event: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let force = format!("S3:NOTE_EXIT+{event}");
     let mut th = super::start_forced(Mode::Hold, &force).attach(&mut tracee);
@@ -1313,13 +1272,13 @@ fn s3_hold_batch_passes_s3x(event: &str) {
 
 /// Mutant: the batch's signal byte is dropped.
 #[skuld::test]
-fn s3_hold_note_exit_and_a_signal_byte_in_one_batch_pass_s3x_to_reap() {
+fn s3_hold_note_exit_and_a_signal_byte_in_one_batch_pass_s3x_to_reap(#[fixture(tracer_group)] _group: &Group) {
     s3_hold_batch_passes_s3x("SIGNAL");
 }
 
 /// Mutant: the batch's EOF is dropped.
 #[skuld::test]
-fn s3_hold_note_exit_and_eof_in_one_batch_pass_s3x_to_reap() {
+fn s3_hold_note_exit_and_eof_in_one_batch_pass_s3x_to_reap(#[fixture(tracer_group)] _group: &Group) {
     s3_hold_batch_passes_s3x("EOF");
 }
 
@@ -1335,8 +1294,8 @@ fn at_s4<'a>(tracee: &'a mut crate::Child, force: &str) -> TracerHelper<'a> {
 
 /// Mutant: S4 treats `EBUSY` as a failure.
 #[skuld::test]
-fn s4_ebusy_backs_off_then_retries() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s4_ebusy_backs_off_then_retries(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, "S4:EBUSY,S4sigstop:1");
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
@@ -1347,20 +1306,20 @@ fn s4_ebusy_backs_off_then_retries() {
 
 /// Mutants: S4 detaches a tracee its peek finds not stopped; S4 fails on it.
 #[skuld::test]
-fn s4_a_tracee_not_stopped_yet_backs_off() {
+fn s4_a_tracee_not_stopped_yet_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s4_backs_off_before_the_detach("none");
 }
 
 /// Mutant: S4 detaches a stop that has not settled.
 #[skuld::test]
-fn s4_a_settling_stop_backs_off() {
+fn s4_a_settling_stop_backs_off(#[fixture(tracer_group)] _group: &Group) {
     s4_backs_off_before_the_detach("settling");
 }
 
 /// The tracee stays in the attach's settled stop (`S2:ok` skips the release), so the only
 /// backoff is the injected answer's.
 fn s4_backs_off_before_the_detach(stop: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let force = format!("S1:hold,S2:ok,S3:SIGNAL,S4sigstop:0,S4stop:{stop}");
     let mut th = from_held(&mut tracee, &force);
     expect(&mut th, &["S2", "attached", "S3", "S4", "S4b", "detached", DONE]);
@@ -1371,8 +1330,8 @@ fn s4_backs_off_before_the_detach(stop: &str) {
 /// Mutant: S4b ignores `NOTE_EXIT` (with no `SIGSTOP` sent, S4 finds the tracee running and
 /// backs off again).
 #[skuld::test]
-fn s4b_note_exit_goes_to_reap() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s4b_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, "S4:EBUSY,S4b:NOTE_EXIT");
     expect(&mut th, &["S4", "S4b", "S5", "blocking S5 exit"]);
@@ -1384,7 +1343,7 @@ fn s4b_note_exit_goes_to_reap() {
 }
 
 fn s4b_ignores(event: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, &format!("S4:EBUSY,S4sigstop:1,S4b:{event}"));
     expect(&mut th, &["S4", "S4b", "S4b*", "detached", DONE]);
@@ -1395,25 +1354,25 @@ fn s4b_ignores(event: &str) {
 
 /// Mutant: S4b fails on a signal byte.
 #[skuld::test]
-fn s4b_a_signal_byte_is_ignored() {
+fn s4b_a_signal_byte_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     s4b_ignores("SIGNAL");
 }
 
 /// Mutant: S4b fails on EOF.
 #[skuld::test]
-fn s4b_eof_is_ignored() {
+fn s4b_eof_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     s4b_ignores("EOF");
 }
 
 /// Mutant: S4b fails on a lone `SIGCHLD`.
 #[skuld::test]
-fn s4b_a_lone_sigchld_is_ignored() {
+fn s4b_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     s4b_ignores("SIGCHLD");
 }
 
 /// Reaches S6 with S4's injections, then lets the tracee really exit: S6's `NOTE_EXIT` row.
 fn s4_goes_to_s6(force: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, force);
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
@@ -1426,27 +1385,27 @@ fn s4_goes_to_s6(force: &str) {
 
 /// Mutant: S4 treats `ESRCH` as a failure.
 #[skuld::test]
-fn s4_esrch_goes_to_exiting() {
+fn s4_esrch_goes_to_exiting(#[fixture(tracer_group)] _group: &Group) {
     s4_goes_to_s6("S4:ESRCH");
 }
 
 /// Mutant: S4 ignores its `SIGSTOP`'s result.
 #[skuld::test]
-fn s4_a_sigstop_esrch_goes_to_exiting() {
+fn s4_a_sigstop_esrch_goes_to_exiting(#[fixture(tracer_group)] _group: &Group) {
     s4_goes_to_s6("S4sigstop:ESRCH,S4:EINVAL");
 }
 
 /// Mutant: S4 fails when the pass-through meets an exiting tracee.
 #[skuld::test]
-fn s4_a_pass_through_on_an_exiting_tracee_goes_to_exiting() {
+fn s4_a_pass_through_on_an_exiting_tracee_goes_to_exiting(#[fixture(tracer_group)] _group: &Group) {
     s4_goes_to_s6("S4sigstop:0,S4stop:SIGTERM,S4cont:ESRCH");
 }
 
 /// The "else S5" branch, reached only with `seed:NOTE_EXIT`. Mutant: S4's `ESRCH` ignores a
 /// seen `NOTE_EXIT`.
 #[skuld::test]
-fn s4_esrch_after_note_exit_goes_to_reap() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s4_esrch_after_note_exit_goes_to_reap(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, "seed:NOTE_EXIT,S4:ESRCH");
     expect(&mut th, &["S4", "S5", "blocking S5 exit"]);
@@ -1458,7 +1417,7 @@ fn s4_esrch_after_note_exit_goes_to_reap() {
 }
 
 fn s4_fails(force: &str, errno: i32) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let mut th = at_s4(&mut tracee, force);
     expect(&mut th, &["S4", &err(errno, "S4"), DONE]);
     drop(th);
@@ -1468,36 +1427,36 @@ fn s4_fails(force: &str, errno: i32) {
 
 /// Mutant: S4 takes `EPERM` for an exiting tracee.
 #[skuld::test]
-fn s4_eperm_fails() {
+fn s4_eperm_fails(#[fixture(tracer_group)] _group: &Group) {
     s4_fails("S4:EPERM", libc::EPERM);
 }
 
 /// Mutant: S4 treats `EINVAL` as `EBUSY`.
 #[skuld::test]
-fn s4_another_errno_fails() {
+fn s4_another_errno_fails(#[fixture(tracer_group)] _group: &Group) {
     s4_fails("S4:EINVAL", libc::EINVAL);
 }
 
 /// Mutant: S4 ignores a failed `SIGSTOP`.
 #[skuld::test]
-fn s4_a_sigstop_error_fails() {
+fn s4_a_sigstop_error_fails(#[fixture(tracer_group)] _group: &Group) {
     s4_fails("S4sigstop:EPERM,S4:EINVAL", libc::EPERM);
 }
 
 /// Mutant: S4 treats a failed stop peek as "not stopped yet".
 #[skuld::test]
-fn s4_a_failed_stop_peek_fails() {
+fn s4_a_failed_stop_peek_fails(#[fixture(tracer_group)] _group: &Group) {
     s4_fails("S4stop:EINVAL", libc::EINVAL);
 }
 
 /// Mutant: S4 ignores a failed pass-through.
 #[skuld::test]
-fn s4_a_failed_pass_through_fails() {
+fn s4_a_failed_pass_through_fails(#[fixture(tracer_group)] _group: &Group) {
     s4_fails("S4sigstop:0,S4stop:SIGTERM,S4cont:EINVAL", libc::EINVAL);
 }
 
 fn s6_ignores(eof: bool) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = at_s4(&mut tracee, "S4:ESRCH");
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
@@ -1516,20 +1475,20 @@ fn s6_ignores(eof: bool) {
 
 /// Mutant: S6 takes a signal byte to S5.
 #[skuld::test]
-fn s6_a_signal_byte_is_ignored() {
+fn s6_a_signal_byte_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     s6_ignores(false);
 }
 
 /// Mutant: S6 exits on EOF.
 #[skuld::test]
-fn s6_eof_is_ignored() {
+fn s6_eof_is_ignored(#[fixture(tracer_group)] _group: &Group) {
     s6_ignores(true);
 }
 
 /// Mutant: S6 re-enters on a lone `SIGCHLD`.
 #[skuld::test]
-fn s6_a_lone_sigchld_is_ignored() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s6_a_lone_sigchld_is_ignored(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = at_s4(&mut tracee, "S4:ESRCH,S6:SIGCHLD");
     expect(&mut th, &["S4", "S6", "blocking S6 exit"]);
     drop(stdin);
@@ -1567,10 +1526,8 @@ fn released_with_pending<'a>(tracee: &'a mut crate::Child, force: &str, signal: 
 
 /// Mutant: S3 passes on signal 0.
 #[skuld::test]
-fn s3_passes_a_stopping_signal_through() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]) else {
-        return;
-    };
+fn s3_passes_a_stopping_signal_through(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]);
     let pid = tracee.id().pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold", libc::SIGTERM);
     expect(&mut th, &["blocking S3 eof", "S3s", "blocking S3 eof"]);
@@ -1584,10 +1541,8 @@ fn s3_passes_a_stopping_signal_through() {
 
 /// Mutants: S3 passes a stop signal on; the kept signal is not re-sent after the detach.
 #[skuld::test]
-fn s3_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
-        return;
-    };
+fn s3_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1603,10 +1558,8 @@ fn s3_keeps_a_stop_signal_until_after_the_detach() {
 
 /// Mutant: a later stop signal replaces the kept one.
 #[skuld::test]
-fn s3_keeps_only_the_first_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGTTIN]) else {
-        return;
-    };
+fn s3_keeps_only_the_first_stop_signal(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGTTIN]);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1624,10 +1577,8 @@ fn s3_keeps_only_the_first_stop_signal() {
 
 /// Mutant: a `SIGCONT` passed on leaves the kept stop signal.
 #[skuld::test]
-fn s3_a_sigcont_drops_a_kept_stop_signal() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGCONT]) else {
-        return;
-    };
+fn s3_a_sigcont_drops_a_kept_stop_signal(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP, libc::SIGCONT]);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1653,10 +1604,8 @@ fn s3_a_sigcont_drops_a_kept_stop_signal() {
 
 /// Mutants: S4 passes a stop signal on; S4 detaches from any stop.
 #[skuld::test]
-fn s4_keeps_a_stop_signal_until_after_the_detach() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
-        return;
-    };
+fn s4_keeps_a_stop_signal_until_after_the_detach(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
     let pid = tracee.id().pid();
     // S3's injected byte takes it to S4 before the SIGTSTP stop is handled there, and S4 sends no
     // SIGSTOP until the test does, after S4k: SIGSTOP (17) would otherwise beat SIGTSTP (18).
@@ -1672,10 +1621,8 @@ fn s4_keeps_a_stop_signal_until_after_the_detach() {
 
 /// Mutant: S4 ignores a failed re-send.
 #[skuld::test]
-fn s4_a_failed_resend_fails() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]) else {
-        return;
-    };
+fn s4_a_failed_resend_fails(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::OwnGroup, &[libc::SIGTSTP]);
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S4r:EPERM").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1689,8 +1636,8 @@ fn s4_a_failed_resend_fails() {
 
 /// Mutant: S3 takes a `SIGCHLD` with no stop for a signal byte.
 #[skuld::test]
-fn s3_a_sigchld_without_a_stop_changes_nothing() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_a_sigchld_without_a_stop_changes_nothing(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S3:SIGCHLD").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1703,8 +1650,8 @@ fn s3_a_sigchld_without_a_stop_changes_nothing() {
 
 /// Mutant: S3 fails when the pass-through meets an exiting tracee.
 #[skuld::test]
-fn s3_a_pass_through_on_an_exiting_tracee_waits_for_note_exit() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn s3_a_pass_through_on_an_exiting_tracee_waits_for_note_exit(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S3:SIGCHLD,S3stop:SIGTERM,S3cont:ESRCH").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1716,7 +1663,7 @@ fn s3_a_pass_through_on_an_exiting_tracee_waits_for_note_exit() {
 }
 
 fn s3_fails(force: &str) {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, force).attach(&mut tracee);
     expect(
         &mut th,
@@ -1738,30 +1685,28 @@ fn s3_fails(force: &str) {
 
 /// Mutant: S3 ignores a failed stop peek.
 #[skuld::test]
-fn s3_a_failed_stop_peek_fails() {
+fn s3_a_failed_stop_peek_fails(#[fixture(tracer_group)] _group: &Group) {
     s3_fails("S3:SIGCHLD,S3stop:EINVAL");
 }
 
 /// The re-peek after the backoff meets the injected error. Mutant: S3 waits for another
 /// `SIGCHLD` after a settling stop.
 #[skuld::test]
-fn s3_a_settling_stop_peeks_again() {
+fn s3_a_settling_stop_peeks_again(#[fixture(tracer_group)] _group: &Group) {
     s3_fails("S3:SIGCHLD,S3stop:settling,S3stop:EINVAL");
 }
 
 /// Mutant: S3 ignores a failed pass-through.
 #[skuld::test]
-fn s3_a_failed_pass_through_fails() {
+fn s3_a_failed_pass_through_fails(#[fixture(tracer_group)] _group: &Group) {
     s3_fails("S3:SIGCHLD,S3stop:SIGTERM,S3cont:EINVAL");
 }
 
 /// The injected byte takes S3 to S4 before the `SIGTERM` stop is handled there. Mutant: S4
 /// detaches from whatever stop holds the tracee.
 #[skuld::test]
-fn s4_passes_a_stopping_signal_through_before_detaching() {
-    let Some((mut tracee, stdin)) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]) else {
-        return;
-    };
+fn s4_passes_a_stopping_signal_through_before_detaching(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee_receiving(Tracee::Plain, &[libc::SIGTERM]);
     let pid = tracee.id().pid();
     let mut th = released_with_pending(&mut tracee, "S1:hold,S3:SIGNAL", libc::SIGTERM);
     expect(
@@ -1780,8 +1725,8 @@ fn s4_passes_a_stopping_signal_through_before_detaching() {
 /// earlier), so the next write, S2's `state` line, fails and the helper exits while still
 /// tracing: XNU kills the tracee. Mutant: a failed report write is ignored.
 #[skuld::test]
-fn a_failed_report_write_exits() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_report_write_exits(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = super::start_forced(Mode::Auto, "S1:hold").attach(&mut tracee);
     expect(&mut th, &HELD);
     th.session.reports = None;
@@ -1796,8 +1741,8 @@ fn a_failed_report_write_exits() {
 /// `gone:attached`: the helper goes to done still tracing. Mutant: `report_then` ignores a
 /// failed write.
 #[skuld::test]
-fn a_failed_attached_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_attached_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = from_held(&mut tracee, "S1:hold,gone:attached");
     expect(&mut th, &["S2", DONE]);
     drop(th);
@@ -1807,8 +1752,8 @@ fn a_failed_attached_write_ends_the_run() {
 
 /// Mutant: the pass-through's trace ignores a failed write.
 #[skuld::test]
-fn a_failed_pass_through_trace_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_pass_through_trace_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = from_held(&mut tracee, "S1:hold,S2stop:SIGTERM,S2cont:ok,gone:state S2s");
     expect(&mut th, &["S2", DONE]);
     drop(th);
@@ -1818,8 +1763,8 @@ fn a_failed_pass_through_trace_write_ends_the_run() {
 
 /// Mutant: S3's pass-through ignores a failed trace write.
 #[skuld::test]
-fn a_failed_s3_pass_through_trace_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_s3_pass_through_trace_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th =
         super::start_forced(Mode::Auto, "S3:SIGCHLD,S3stop:SIGTERM,S3cont:ok,gone:state S3s").attach(&mut tracee);
     expect(&mut th, &["S0", "S1", "S2", "S2b*", "attached", "S3", DONE]);
@@ -1830,8 +1775,8 @@ fn a_failed_s3_pass_through_trace_write_ends_the_run() {
 
 /// Mutant: a failed `exited` write is ignored.
 #[skuld::test]
-fn a_failed_exited_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_exited_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Hold, "gone:exited").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1844,8 +1789,8 @@ fn a_failed_exited_write_ends_the_run() {
 
 /// Mutant: a failed `blocking` write is ignored.
 #[skuld::test]
-fn a_failed_blocking_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_blocking_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "gone:blocking S5 exit").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1858,8 +1803,8 @@ fn a_failed_blocking_write_ends_the_run() {
 
 /// Mutant: a failed `reaped` write is ignored.
 #[skuld::test]
-fn a_failed_reaped_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_reaped_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "gone:reaped").attach(&mut tracee);
     expect(&mut th, &TO_S3);
@@ -1872,8 +1817,8 @@ fn a_failed_reaped_write_ends_the_run() {
 
 /// Mutant: a failed `detached` write is ignored.
 #[skuld::test]
-fn a_failed_detached_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_detached_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let mut th = at_s4(&mut tracee, "gone:detached");
     expect(&mut th, &["S4", "S4b*", DONE]);
     drop(th);
@@ -1882,8 +1827,8 @@ fn a_failed_detached_write_ends_the_run() {
 
 /// `fail` ends the run whether or not its report is written.
 #[skuld::test]
-fn a_failed_error_write_ends_the_run() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn a_failed_error_write_ends_the_run(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let force = format!("S0:ESRCH,gone:{}", err(libc::ESRCH, "S0"));
     let mut th = super::start_forced(Mode::Auto, &force).attach(&mut tracee);
     expect(&mut th, &["S0", DONE]);
@@ -1894,8 +1839,8 @@ fn a_failed_error_write_ends_the_run() {
 
 /// After a terminal report the helper holds until EOF. Mutant: a signal byte ends it.
 #[skuld::test]
-fn done_ignores_a_signal_byte_and_holds() {
-    let Some((mut tracee, stdin)) = tracee() else { return };
+fn done_ignores_a_signal_byte_and_holds(#[fixture(tracer_group)] _group: &Group) {
+    let (mut tracee, stdin) = tracee();
     let pid = tracee.id().pid();
     let mut th = super::start_forced(Mode::Auto, "S5:ECHILD").attach(&mut tracee);
     expect(&mut th, &TO_S3);

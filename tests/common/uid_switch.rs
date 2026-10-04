@@ -1,5 +1,5 @@
 //! Support for the `UID_SWITCH` group (`COSCA_TEST_UID_SWITCH`, principles 9 and 10): tests that run
-//! as real root and switch to other real uids. Gating is `common::require_group("UID_SWITCH")`;
+//! as real root and switch to other real uids. Gating is the group's fixture (`test_groups::uid_switch`);
 //! this module adds what it cannot check, that the process really can do the switching.
 
 /// The target's uid/gid: unprivileged, distinct from root and `READER_UID`. No `/etc/passwd` entry
@@ -10,8 +10,8 @@ pub const READER_UID: u32 = 65533;
 
 /// Asserts this process can do what a `UID_SWITCH` test needs: real root, and on Linux the ability
 /// to `setgroups`/`setgid`/`setuid` to both `TARGET_UID` and `READER_UID` in this user namespace.
-/// Call it from the test body once `require_group` has returned `true`: a group that is on and
-/// consented to but cannot run is a failure, not a skip.
+/// Call it from the test body: a group that is on and consented to but cannot run is a failure,
+/// not a skip.
 pub fn assert_root_capable() {
     // SAFETY: geteuid() takes no arguments and has no preconditions.
     assert_eq!(

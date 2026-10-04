@@ -64,6 +64,12 @@ inherits = "ci"
 [profile.ci-release-tokio]
 inherits = "ci"
 
+[profile.ci-tracer]
+inherits = "ci"
+
+[profile.ci-tracer-release]
+inherits = "ci"
+
 [profile.ci-cgroup]
 inherits = "ci"
 

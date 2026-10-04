@@ -1,8 +1,9 @@
-//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test, one real `ROOT` test and one real `CGROUP` test under chosen environments. None of the bodies runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
+//! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test, one real `ROOT` test, one real `CGROUP` test and one real `TRACER` test under chosen environments. None of the bodies runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
 use crate::test_groups::{check_group, require_consent, require_enabled, Group};
 use crate::test_harness::{
     CGROUP, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
+    TRACER, UID_SWITCH,
 };
 
 fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -122,6 +123,8 @@ fn every_group_fixture_carries_exactly_its_label() {
         ("shell_probes", SHELL_PROBES),
         ("elevation_routes", ELEVATION_ROUTES),
         ("cgroup", CGROUP),
+        ("tracer_group", TRACER),
+        ("uid_switch", UID_SWITCH),
     ] {
         assert_eq!(skuld::fixture::collect_fixture_labels(&[fixture]), [label], "{fixture}");
     }
@@ -142,6 +145,9 @@ mod reexec {
     /// It makes cgroup leaves, so only a granted group may run it.
     const CGROUP_TEST: &str =
         "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
+
+    /// A real `TRACER` test: it attaches a tracer with `ptrace`, so only a granted group may run it.
+    const TRACER_TEST: &str = "child::shared::shared_tests::tracer::try_wait_leaves_a_ptrace_stop_for_the_tracer";
 
     struct Case {
         test: &'static str,
@@ -164,6 +170,12 @@ mod reexec {
         test: CGROUP_TEST,
         var: "COSCA_TEST_CGROUP",
         label: "cgroup",
+    };
+
+    const TRACER: Case = Case {
+        test: TRACER_TEST,
+        var: "COSCA_TEST_TRACER",
+        label: "tracer",
     };
 
     /// Re-execs this binary on exactly the case's test with the group's variables set as given (`None` removes them).
@@ -362,5 +374,41 @@ mod reexec {
     #[skuld::test]
     fn the_cgroup_label_selects_its_tests() {
         assert_label_selects(&CGROUP);
+    }
+
+    /// Mutant: the `TRACER` row's `requires` never fails, so `=0` runs the test.
+    #[skuld::test]
+    fn tracer_group_zero_reports_ignored() {
+        assert_group_zero_reports_ignored(&TRACER);
+    }
+
+    /// Mutant: an enabled `TRACER` group needs no consent. `=1` is not consent.
+    #[skuld::test]
+    fn tracer_group_one_without_consent_fails() {
+        assert_consent_refused_with(&TRACER, Some("1"), None);
+    }
+
+    /// Mutant: the `TRACER` setup does not check consent.
+    #[skuld::test]
+    fn tracer_unset_consent_fails() {
+        assert_consent_refused(&TRACER, None);
+    }
+
+    /// Mutant: any non-empty consent counts for `TRACER`.
+    #[skuld::test]
+    fn tracer_consent_other_than_1_fails() {
+        assert_consent_refused(&TRACER, Some("yes"));
+    }
+
+    /// Mutant: the `TRACER` setup grants a group that is off.
+    #[skuld::test]
+    fn tracer_group_zero_never_runs_the_body_under_run_ignored() {
+        assert_zero_never_runs_the_body_under_run_ignored(&TRACER);
+    }
+
+    /// Mutant: the `TRACER` fixture carries no label, so `SKULD_LABELS=tracer` selects none of its tests.
+    #[skuld::test]
+    fn the_tracer_label_selects_its_tests() {
+        assert_label_selects(&TRACER);
     }
 }
