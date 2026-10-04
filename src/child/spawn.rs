@@ -511,7 +511,7 @@ fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::Not
 
 /// macOS: abandon `child` without signalling or waiting on it by pid, since nothing shows its pid
 /// still names it. `RootIdentity::Gone` means someone else reaped it, so it is forgotten; otherwise
-/// it is left running and unreaped. Dropping the `std` `Child` closes our pipe ends only. Either way
+/// it is left unreaped. Dropping the `std` `Child` closes our pipe ends only. Either way
 /// a warning names the pid, and the spawn still fails: the caller must not assume the program did
 /// not start.
 #[cfg(target_os = "macos")]
@@ -523,8 +523,8 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
         );
     } else {
         log::warn!(
-            "child {} cannot be shown to be ours (its identity could not be read); leaving it running and \
-             unreaped, with nothing signalled or waited on by pid",
+            "child {} cannot be shown to be ours (its identity could not be read); leaving it unreaped, with \
+             nothing signalled or waited on by pid, and it may still be running",
             child.id()
         );
     }

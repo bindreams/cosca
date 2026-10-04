@@ -74,9 +74,8 @@ pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
     }
 }
 
-/// The adoption error for a child whose identity read was refused with `errno`: the child is not
-/// adopted. The sync spawn leaves it running, and the async spawn forgets it, with a warning;
-/// neither signals or waits on it by pid. Tests only: a spawn takes the child's own report.
+/// The error for adopting a child whose by-pid identity read was refused with `errno`. Tests
+/// only: a spawn takes the child's own report.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
     crate::error::Error::Unassessable {
