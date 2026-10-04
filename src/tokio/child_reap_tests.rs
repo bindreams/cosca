@@ -640,7 +640,7 @@ async fn macos_forget_if_foreign_with_no_unique_id_forgets() {
 }
 
 /// A unique-id read the child itself is refused fails the spawn with `Unassessable` and stops the
-/// child before `exec`: the program did not run, so there is nothing to forget or reap.
+/// child before `exec`: the program did not run.
 ///
 /// Mutants: the hook execs anyway (a child is left); the failure maps to `Gone`.
 #[cfg(target_os = "macos")]
