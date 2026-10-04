@@ -41,7 +41,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Measured: 192 s to 242 s in three runs. 25 min is 6x the slowest, a failure bound for a hang.
+    # Measured: 164 s to 242 s in four runs. 25 min is 6x the slowest, a failure bound for a hang.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -191,9 +191,8 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # The slowest lanes are darwin/amd64 (1902 s at most) and windows/amd64 (1888 s), each with the
-    # libtest guard (313-877 s) and its self-test (55-248 s). The guard adds ~6 s per flipped
-    # integration-test target. 50 min is 1.6x the slowest. All lanes share this bound.
+    # The slowest lane is windows/amd64: 1848 s, guard and self-test included. 50 min is 1.6x that.
+    # All lanes share this bound.
     timeout-minutes: 50
 
     # The TRACER test group attaches a tracer to the tests' own children; a CI runner is the
