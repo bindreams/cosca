@@ -159,9 +159,12 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
 }
 
 /// `reap_now`'s refused-kill arm must not hand tokio's drop a child that is not shown ours: it
-/// forgets it instead. A forced attach failure, a refused kill and forced evidence, for a child
-/// that exited before the identity read. `evidence` arms the evidence inside the hook, where the
-/// handshake's own peeks are done.
+/// forgets it instead. A forced failure, a refused kill and forced evidence, for a child that
+/// exited after the identity check. `evidence` arms the evidence inside the hook, where the
+/// handshake's and the identity check's own peeks are done.
+///
+/// The forced failure is the attach's, except on macOS, where the attach cannot fail and the
+/// identity check's (which finds the child gone before it peeks) reaches the same `reap_now`.
 fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -170,19 +173,24 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 
     let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
-    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+    let (point, force): (fault::SpawnPoint, fn(bool)) = if cfg!(target_os = "macos") {
+        (fault::SpawnPoint::BeforeIdentity, fault::set_force_identity_vanished)
+    } else {
+        (fault::SpawnPoint::BeforeAttach, fault::set_force_attach_failure)
+    };
+    let _hook = fault::set_at(point, {
         let slot = Rc::clone(&slot);
         let armed = Rc::clone(&armed);
         move || {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
-            // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
-            // would consume it.
+            // Armed here, not before `spawn()`: the handshake's own watch peek and the identity
+            // check's run first and would consume it.
             *armed.borrow_mut() = Some(evidence());
             *slot.borrow_mut() = Some(witness);
         }
     });
-    fault::set_force_attach_failure(true);
+    force(true);
     fault::set_force_kill_failure_leaving_child_alive_as("reap_now refused", std::io::ErrorKind::PermissionDenied);
     let backend_drops = super::fault::count_backend_drops();
     crate::log_capture::install();
@@ -193,9 +201,9 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 
     let err = cmd.spawn().err();
 
-    fault::set_force_attach_failure(false);
+    force(false);
     drop(armed);
-    assert!(err.is_some(), "the forced attach failure fails the spawn");
+    assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
         crate::log_capture::contains_since(mark, "reap_now refused); it is not waited on"),
         "a forgotten child was handed nowhere, and the warning must say so"

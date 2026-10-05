@@ -576,3 +576,52 @@ fn target_pins_the_process_cwd_for_every_program() {
     assert_eq!(reads.get(), 1);
     assert_eq!(got.cwd, PathBuf::from(EXACT_CWD));
 }
+
+// The post-spawn identity read and attach =====
+
+/// A raw-backend blocker: `findstr` reads its stdin until EOF, and `executable()` routes it to the
+/// raw backend.
+fn raw_blocker() -> Command {
+    let mut c = Command::new();
+    c.executable("findstr")
+        .args(["findstr", "/c:needle"])
+        .stdin(crate::stdio::Stdio::pipe())
+        .expect("stdin pipe");
+    c
+}
+
+/// A raw spawn reads and checks the child's identity before it attaches the containment: with the
+/// attach and the identity read both forced to fail, the identity's error is the one answered.
+///
+/// Mutant: the raw spawn attaches first, so the attach's `Containment` is answered.
+#[skuld::test]
+fn a_raw_spawn_reads_the_identity_before_it_attaches() {
+    use crate::child::spawn::fault;
+    let mut c = raw_blocker();
+    fault::set_force_identity_vanished(true);
+    fault::set_force_attach_failure(true);
+    let result = c.spawn();
+    fault::set_force_attach_failure(false);
+    fault::set_force_identity_vanished(false);
+    let err = result.expect_err("a forced failure fails the spawn");
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("reaped by another party")),
+        "the identity check comes first: {err:?}"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}
+
+/// A raw spawn whose attach fails kills and reaps its child, and answers the attach's error.
+///
+/// Mutant: the raw teardown is skipped, leaving the child running.
+#[skuld::test]
+fn a_raw_spawn_whose_attach_fails_tears_its_child_down() {
+    use crate::child::spawn::fault;
+    let mut c = raw_blocker();
+    fault::set_force_attach_failure(true);
+    let result = c.spawn();
+    fault::set_force_attach_failure(false);
+    let err = result.expect_err("the forced attach failure fails the spawn");
+    assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}

@@ -59,6 +59,10 @@ pub(crate) mod front_kill_tests;
 #[path = "child/front_cgroup_tests.rs"]
 pub(crate) mod front_cgroup_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/front_failed_closed_tests.rs"]
+pub(crate) mod front_failed_closed_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -635,6 +639,24 @@ impl Child {
         match &mut self.attached {
             crate::containment::Attached::FdMarker(m) => m.force_pgid_for_test(pgid),
             other => panic!("test_force_fdmarker_pgid called on a non-FdMarker child: {other:?}"),
+        }
+    }
+
+    /// The root a `TreeWalk` attachment walks from.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
+        match &self.attached {
+            crate::containment::Attached::TreeWalk(root) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// The root an fd marker's ppid-walk channel starts from.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            _ => None,
         }
     }
 }

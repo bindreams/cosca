@@ -9,6 +9,8 @@ thread_local! {
     static AFTER_FINAL_READ: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static FORCE_FAIL_CLOSED: Cell<bool> = const { Cell::new(false) };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
@@ -638,4 +640,24 @@ pub(crate) fn set_force_kill_on_drop_kill_failure(on: bool) {
 }
 pub(crate) fn take_force_kill_on_drop_kill_failure() -> bool {
     FORCE_KILL_ON_DROP_KILL_FAILURE.with(|f| f.replace(false))
+}
+
+/// Run `hook` when the next leaf on this thread starts to settle its placement verdict
+/// (`CgroupLeaf::take_placement`); the guard clears it on drop.
+pub(crate) fn set_on_take_placement(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&ON_TAKE_PLACEMENT, hook)
+}
+pub(crate) fn run_on_take_placement() {
+    crate::oneshot_hook::fire(&ON_TAKE_PLACEMENT);
+}
+
+/// Make the NEXT placement verdict taken on this thread fail closed, through the real
+/// `fail_closed`: the child and its group are killed, and through its leaf if it entered. A spawn
+/// cannot reach that on its own, since its child's report is already received by the time the
+/// verdict is taken. Take semantics.
+pub(crate) fn set_force_fail_closed(on: bool) {
+    FORCE_FAIL_CLOSED.with(|f| f.set(on));
+}
+pub(crate) fn take_force_fail_closed() -> bool {
+    FORCE_FAIL_CLOSED.with(|f| f.replace(false))
 }

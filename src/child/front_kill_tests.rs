@@ -601,13 +601,56 @@ fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// macOS: a failed attach whose read of the front's identity found it gone, reaped by someone else,
-/// says it could not be waited on, not that it is left unreaped.
+/// While it lives, this thread's spawns fail their attach (a test seam: a macOS attach reads
+/// nothing, so it cannot fail on its own).
+#[cfg(target_os = "macos")]
+pub(crate) fn fail_the_attach() -> AttachFails {
+    crate::child::spawn::fault::set_force_attach_failure(true);
+    AttachFails
+}
+
+/// Fails attaches until dropped (see [`fail_the_attach`]).
+#[cfg(target_os = "macos")]
+#[must_use = "attaches succeed again as soon as the guard is dropped"]
+pub(crate) struct AttachFails;
+
+#[cfg(target_os = "macos")]
+impl Drop for AttachFails {
+    fn drop(&mut self) {
+        crate::child::spawn::fault::set_force_attach_failure(false);
+    }
+}
+
+/// `err` is a failed attach that left the front `pid` running and unreaped, and the log says the
+/// attach failed, not that its identity could not be read: it was verified.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub(crate) fn assert_attach_failure_left_the_front(err: &Error, pid: u32, mark: usize) {
+    assert!(matches!(err, Error::Containment { .. }), "the variant is kept: {err:?}");
+    let text = err.to_string();
+    assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+    assert!(text.contains("it is left unreaped"), "{text}");
+    assert!(
+        crate::log_capture::contains_since(mark, "attach failed"),
+        "the warning says the attach failed"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, "could not be read"),
+        "the identity was read, so the log must not say it was not"
+    );
+}
+
+/// macOS: a front whose attach fails (which only a seam makes it do) is sent nothing and left
+/// running and unreaped, not killed like another child; the error keeps its variant and says so.
+///
+/// Mutant: the arm kills and reaps it as any child.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_a_failed_attach_that_found_the_front_gone_does_not_claim_it_unreaped() {
-    let (err, _pid) = fail_a_front_spawn(|_| {}, attach_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
-    assert_noted_unaccounted(&err);
+fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (err, pid) = fail_a_front_spawn(|_| {}, fail_the_attach, |cmd| cmd.spawn().map(drop));
+    assert_attach_failure_left_the_front(&err, pid, mark);
 }
 
 /// macOS: an identity check that found the front gone, reaped by someone else, says it could not be
@@ -634,27 +677,6 @@ pub(crate) struct IdentityFindsGone;
 #[cfg(target_os = "macos")]
 impl Drop for IdentityFindsGone {
     fn drop(&mut self) {
-        crate::child::spawn::fault::set_force_identity_vanished(false);
-    }
-}
-
-/// While it lives, this thread's spawns fail their attach, which finds the root gone.
-#[cfg(target_os = "macos")]
-pub(crate) fn attach_finds_the_front_gone() -> AttachFindsGone {
-    crate::child::spawn::fault::set_force_attach_failure(true);
-    crate::child::spawn::fault::set_force_identity_vanished(true);
-    AttachFindsGone
-}
-
-/// Fails attaches until dropped (see [`attach_finds_the_front_gone`]).
-#[cfg(target_os = "macos")]
-#[must_use = "attaches succeed again as soon as the guard is dropped"]
-pub(crate) struct AttachFindsGone;
-
-#[cfg(target_os = "macos")]
-impl Drop for AttachFindsGone {
-    fn drop(&mut self) {
-        crate::child::spawn::fault::set_force_attach_failure(false);
         crate::child::spawn::fault::set_force_identity_vanished(false);
     }
 }
@@ -696,23 +718,6 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
     let (err, pid) = fail_a_front_spawn(|_| {}, refuse_the_identity, |cmd| cmd.spawn().map(drop));
     assert_unadopted_front_noted(&err, pid);
-}
-
-/// macOS: a tree-walk spawn whose attach cannot read the front's identity (refused) leaves it
-/// unverified: sent nothing, and unreaped, and the error says so. The attach reads the root's
-/// identity only without the fd marker, which this spawn suppresses.
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted() {
-    let (err, pid) = fail_a_front_spawn(walk_the_tree, refuse_the_identity, |cmd| cmd.spawn().map(drop));
-    assert_unadopted_front_noted(&err, pid);
-}
-
-/// Contains `cmd` by a tree walk without the fd marker, so its attach reads the root's identity.
-#[cfg(target_os = "macos")]
-pub(crate) fn walk_the_tree(cmd: &mut Command) {
-    cmd.contain_with(ContainMode::TreeWalk);
-    cmd.suppress_fd_marker();
 }
 
 /// While it lives, this thread's reads of a spawned child's own unique-id report fail.

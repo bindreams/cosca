@@ -99,9 +99,8 @@ mod waits {
                 read_handle: handle,
                 fd: 3,
             },
+            crate::containment::fdmarker::fdmarker_tests::inert_root(),
             None,
-            None,
-            false,
         );
         let _section = Section::enter();
         _ = marker.wait_drained(Some(Some(std::time::Instant::now())));

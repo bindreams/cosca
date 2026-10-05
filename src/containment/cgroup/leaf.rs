@@ -178,6 +178,8 @@ pub(crate) struct CgroupLeaf {
     pub(super) report: Option<ReportChannel>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     pub(super) entered: bool,
+    /// How a verdict that failed closed left the child, once it has.
+    closed: Option<crate::containment::ClosedFate>,
     /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
@@ -251,8 +253,12 @@ pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
 
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
+    /// How a verdict that failed closed left the child; `None` until one has.
+    pub(crate) fn closed_fate(&self) -> Option<crate::containment::ClosedFate> {
+        self.closed
+    }
+
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
-    #[cfg(test)]
     pub(crate) fn holds_verdict_to_take(&self) -> bool {
         self.report.is_some()
     }
@@ -326,8 +332,15 @@ impl CgroupLeaf {
     /// The outer `Err` is a spawn that must fail: membership could not be decided, so the child
     /// was killed (see [`CgroupLeaf::decide_unwaitable`]).
     pub(crate) fn take_placement(&mut self, pid: u32) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+        #[cfg(test)]
+        fault::run_on_take_placement();
         let mut channel = self.report.take().expect(RELEASED);
         self.procs_fd = None;
+        #[cfg(test)]
+        if fault::take_force_fail_closed() {
+            crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
+            return Err(self.fail_closed(pid, channel, "forced by a test seam"));
+        }
         let report = match channel.wait(pid) {
             Ok(report) => report,
             Err(source) => return self.decide_unwaitable(pid, channel, source),
@@ -561,6 +574,10 @@ impl CgroupLeaf {
                     self.block_until_drained()
                         .map_err(|e| format!("cgroup.kill succeeded, but its drain could not be watched ({e})"))
                 })
+        });
+        self.closed = Some(crate::containment::ClosedFate {
+            entered: self.entered,
+            killed: matches!(signalled, Signalled::Killed),
         });
         let fate = match (signalled, through_leaf) {
             (Signalled::Killed, None) => {
@@ -863,6 +880,7 @@ impl CgroupLeaf {
             procs_fd: None,
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
+            closed: None,
             cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
@@ -1526,6 +1544,7 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,
+        closed: None,
         cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
