@@ -251,6 +251,13 @@ filter = 'binary(spawn_io) & test(=linux_cgroup_v2_keeps_the_worker_of_a_root_th
 slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 
 [[profile.default.overrides]]
+# A failure bound, not a sync: a copy of a `ShimLink` that tore the owner's link down would hang in a
+# join of a thread that does not exist in the forked child. The test watches for that through the
+# owner's events and kills the child itself; this only stops a regression it did not anticipate.
+filter = 'test(/::fork_copy_drop_leaves_the_owner_intact$/)'
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+
+[[profile.default.overrides]]
 # A hang backstop, not a synchronization primitive: fixtures in the `cosca` lib tests block on
 # stdin until a real kill, so a regression that skips the kill hangs instead of passing. Tests
 # detect that themselves; this bound only stops a hang from stalling the job. It covers the whole

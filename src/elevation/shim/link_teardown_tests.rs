@@ -77,7 +77,10 @@ fn fork_copy_drop_leaves_the_owner_intact() {
         events,
         tmp: _tmp,
     } = rig;
-    // SAFETY: the child only drops the copy and `_exit`s; nothing unwinds out of it.
+    // SAFETY: the child only drops its copy of the link and `_exit`s. Its normal path takes only
+    // malloc's lock, which glibc and libmalloc reset across `fork`, and no other thread holds a lock
+    // the child takes: the copy's `Drop` locks nothing, and the acceptor thread, which does not exist
+    // in the child, is the only other user of the link's mutex. Nothing unwinds out of the child.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
@@ -85,26 +88,38 @@ fn fork_copy_drop_leaves_the_owner_intact() {
         // SAFETY: `_exit` is async-signal-safe and never returns.
         unsafe { libc::_exit(if dropped.is_ok() { 0 } else { 101 }) };
     }
+    // The waiter only observes the exit (`WNOWAIT` leaves the zombie), so the child stays unreaped
+    // and its pid stays ours until this thread reaps it.
     let waiter = {
         let probe = probe.clone();
         std::thread::spawn(move || {
-            let mut status = 0;
+            // SAFETY: an all-zero `siginfo_t` is valid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             // SAFETY: `pid` is this test's own unreaped child.
-            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            let waited =
+                unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            assert_eq!(waited, 0, "waitid");
             probe.inject(LinkEvent::ChildExited);
-            status
         })
+    };
+    let reap = || {
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own child, reaped here and only here.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        status
     };
     // A copy that tore the owner's link down would stop the owner's acceptor first (and hang in its
     // join, in a thread that does not exist there).
     let first = next_acceptor_event(&events);
     if first != LinkEvent::ChildExited {
-        // SAFETY: as above.
+        // SAFETY: the child is unreaped, so its pid is still ours.
         unsafe { libc::kill(pid, libc::SIGKILL) };
         waiter.join().unwrap();
+        reap();
         panic!("the copy's drop disturbed the owner: {first:?}");
     }
-    let status = waiter.join().unwrap();
+    waiter.join().unwrap();
+    let status = reap();
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         "child status {status:#x}"
@@ -118,4 +133,34 @@ fn fork_copy_drop_leaves_the_owner_intact() {
     assert_eq!(link.observe().unwrap().start, StartState::Live);
     assert_eq!(link.kill().unwrap(), KillOutcome::Delivered);
     // `link` drops here, in its owner: the acceptor is joined.
+}
+
+/// With no descriptor to spare, the owner check, every control call and `Drop` neither panic nor
+/// leak the acceptor: none of them opens a descriptor. A panic in `Drop` during an unwind aborts.
+#[skuld::test]
+fn control_and_drop_with_a_full_fd_table_do_not_panic() {
+    let fixture = crate::test_child::fixture_path!(fixture_full_fd_table);
+    crate::test_child::run_fixture_command(fixture, crate::test_child::fixture_command(fixture));
+}
+
+#[skuld::test]
+fn fixture_full_fd_table() {
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    let dir = rig.link.dir().to_owned();
+    let Rig { link, tmp: _tmp, .. } = rig;
+    let _restore = crate::test_child::exhaust_fds();
+    assert!(
+        std::fs::File::open("/dev/null").is_err(),
+        "the precondition: no descriptor can be opened"
+    );
+    assert_eq!(link.observe().unwrap().start, StartState::Live);
+    assert_eq!(link.try_wait().unwrap(), None);
+    assert_eq!(link.kill().unwrap(), KillOutcome::Delivered);
+    assert_eq!(shim.read_byte(), Some(b'K'));
+    drop(link);
+    assert!(!dir.exists(), "teardown still removed the directory");
 }

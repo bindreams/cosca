@@ -83,6 +83,8 @@ mod hooks {
         /// While `true`, a waiter waits after finding no outcome, before it polls.
         waiters_held: Mutex<bool>,
         held_changed: Condvar,
+        /// The waiters' own: a condvar must only ever be used with one mutex.
+        waiters_changed: Condvar,
         accept_errors: Mutex<VecDeque<Errno>>,
         stop_accept_errors: Mutex<VecDeque<Errno>>,
         poll_errors: Mutex<VecDeque<Errno>>,
@@ -107,6 +109,7 @@ mod hooks {
                 held: Mutex::new(false),
                 waiters_held: Mutex::new(false),
                 held_changed: Condvar::new(),
+                waiters_changed: Condvar::new(),
                 accept_errors: Mutex::new(VecDeque::new()),
                 stop_accept_errors: Mutex::new(VecDeque::new()),
                 poll_errors: Mutex::new(VecDeque::new()),
@@ -137,7 +140,7 @@ mod hooks {
 
         pub(crate) fn release_waiters(&self) {
             *self.hooks().waiters_held.lock().unwrap_or_else(PoisonError::into_inner) = false;
-            self.hooks().held_changed.notify_all();
+            self.hooks().waiters_changed.notify_all();
         }
 
         /// Puts `event` in the event stream, from a thread of the test's.
@@ -205,7 +208,7 @@ mod hooks {
             let Some(h) = &self.0 else { return };
             let mut held = h.waiters_held.lock().unwrap_or_else(PoisonError::into_inner);
             while *held {
-                held = h.held_changed.wait(held).unwrap_or_else(PoisonError::into_inner);
+                held = h.waiters_changed.wait(held).unwrap_or_else(PoisonError::into_inner);
             }
         }
 

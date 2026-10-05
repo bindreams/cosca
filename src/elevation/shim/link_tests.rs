@@ -125,6 +125,10 @@ fn the_final_drain_answers_the_backlog_even_when_accept_fails_at_stop() {
     assert_eq!(held.read_byte(), Some(b'N'));
     let levels = crate::log_capture::levels_since(mark, &marker);
     assert!(
+        levels.contains(&log::Level::Warn),
+        "the failed accept at teardown is reported: {levels:?}"
+    );
+    assert!(
         !levels.contains(&log::Level::Error),
         "a teardown-time accept error is not an acceptor failure: {levels:?}"
     );
@@ -211,8 +215,8 @@ fn macos_fds_are_created_under_spawn_lock() {
     let rig = Rig::new();
     let _shim = rig.live();
     let creations = rig.probe.fd_creations();
-    // The listener, the wake pipe, and the accepted connection.
-    assert!(creations.len() >= 3, "{creations:?}");
+    // The listener, the wake pipe, the settled pipe, and the accepted connection.
+    assert!(creations.len() >= 4, "{creations:?}");
     assert!(creations.iter().all(|held| *held), "{creations:?}");
 }
 

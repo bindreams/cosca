@@ -4,7 +4,6 @@
 use std::io;
 
 use crate::elevation::shim::protocol::{decode_frame, Frame, FrameError, NotExecuted, Refusal};
-use crate::identity::ProcessId;
 
 /// Why the acceptor stopped serving (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,15 +108,16 @@ pub(crate) enum KillError {
     Io(io::Error),
 }
 
-/// A control call from a pid that did not bind the link (D21).
+/// A control call from a process that did not bind the link (D21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("a fork copy of the link cannot control it")]
 pub(crate) struct NotOwner;
 
-/// D21: only the process that bound the link controls it. A bare pid does not tell processes apart:
-/// a fork copy in another pid namespace can have the owner's pid.
-pub(super) fn owner_check(owner: ProcessId, current: ProcessId) -> Result<(), NotOwner> {
-    if owner == current {
+/// D21: only the process that bound the link controls it. `original` is the link's fork guard: a bare
+/// pid does not tell processes apart, since a fork copy in another pid namespace can have the
+/// owner's.
+pub(super) fn owner_check(original: bool) -> Result<(), NotOwner> {
+    if original {
         Ok(())
     } else {
         Err(NotOwner)

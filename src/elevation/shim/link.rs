@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 
 use rustix::io::Errno;
 
+use super::fork_guard::ForkGuard;
 use super::private_dir::{PrivateDir, PrivateDirError};
-use crate::identity::ProcessId;
 
 mod acceptor;
 mod outcome;
@@ -39,6 +39,8 @@ pub(crate) enum BindError {
     Dir(#[from] PrivateDirError),
     #[error("cannot set up the shim channel in {}: {source}", dir.display())]
     Io { dir: std::path::PathBuf, source: io::Error },
+    #[error("cannot set up the fork guard of the shim channel: {0}")]
+    ForkGuard(io::Error),
 }
 
 pub(crate) struct ShimLink {
@@ -46,8 +48,9 @@ pub(crate) struct ShimLink {
     wake: Arc<Wake>,
     acceptor: Option<JoinHandle<()>>,
     dir: Option<PrivateDir>,
-    /// The pid that bound the link (D21).
-    owner: ProcessId,
+    /// Tells the process that bound the link from a fork copy of it (D21); no I/O, so `Drop` and
+    /// every control call can use it.
+    owner: ForkGuard,
 }
 
 impl ShimLink {
@@ -61,6 +64,7 @@ impl ShimLink {
     }
 
     pub(crate) fn bind_probed(tmp: &Path, peer_euid: u32, probe: Probe) -> Result<Self, BindError> {
+        let owner = ForkGuard::new().map_err(BindError::ForkGuard)?;
         let dir = PrivateDir::create_in(tmp)?;
         let io_err = |source| BindError::Io {
             dir: dir.path().to_owned(),
@@ -107,7 +111,7 @@ impl ShimLink {
             wake,
             acceptor: Some(thread),
             dir: Some(dir),
-            owner: ProcessId::current(),
+            owner,
         })
     }
 
@@ -117,7 +121,7 @@ impl ShimLink {
     }
 
     fn check_owner(&self) -> Result<(), NotOwner> {
-        let checked = outcome::owner_check(self.owner, ProcessId::current());
+        let checked = outcome::owner_check(self.owner.is_original());
         debug_assert!(checked.is_ok(), "a fork copy of a ShimLink was used to control it");
         checked
     }
@@ -152,18 +156,18 @@ impl ShimLink {
         Ok(self.shared.observe())
     }
 
-    /// `Drop`'s body, for `who` as the current process. Only the process that bound the link tears
-    /// it down. The stop byte, the path and the directory are the owner's (D21), and a fork copy has
-    /// no acceptor thread to join.
+    /// `Drop`'s body, where `original` says whether this is the process that bound the link. Only
+    /// that process tears it down. The stop byte, the path and the directory are the owner's (D21),
+    /// and a fork copy has no acceptor thread to join.
     ///
-    /// A copy drops what it owns, but not what the acceptor thread holds: the listener, the
-    /// connection and the wake pipe are kept alive by `Arc`s that the thread, which does not exist
-    /// in the copy, never drops. They stay open in the copy until it execs or exits. A shim that
-    /// reached the copy's connection copy would see the same as an idle one (the owner's accepted
-    /// idle-root-shim residual); closing them by hand would need raw closes of descriptors the
-    /// owner still uses.
-    fn release(&mut self, who: ProcessId) {
-        if outcome::owner_check(self.owner, who).is_err() {
+    /// A copy drops what it owns, but not what the acceptor thread holds. The connection, the wake
+    /// pipe and the settled pipe are kept alive by `Arc`s of the thread, and the listener by the
+    /// thread's closure; the thread does not exist in the copy, so none of them is ever dropped.
+    /// They stay open in the copy until it execs or exits. That falls under the owner's accepted
+    /// idle-root-shim residual; closing them by hand would need raw closes of descriptors the owner
+    /// still uses.
+    fn release(&mut self, original: bool) {
+        if outcome::owner_check(original).is_err() {
             std::mem::forget(self.acceptor.take());
             return;
         }
@@ -219,7 +223,7 @@ impl ShimLink {
 
 impl Drop for ShimLink {
     fn drop(&mut self) {
-        self.release(ProcessId::current());
+        self.release(self.owner.is_original());
     }
 }
 
