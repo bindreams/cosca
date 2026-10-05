@@ -88,6 +88,8 @@ impl ProcessId {
 
     /// [`of`](Self::of), and why it was [`Resolved::Unknown`] when the read itself knows.
     pub(crate) fn of_explained(pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+        #[cfg(all(test, target_os = "macos"))]
+        seams::note_by_pid_read();
         let (read, cause) = start_token_explained(pid);
         (read.map(|start| ProcessId { pid, start }), cause)
     }
@@ -246,6 +248,25 @@ pub(crate) fn unknown_identity_error(_subject: &str) -> Option<crate::error::Err
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::fault;
+
+/// macOS test seams.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) mod seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BY_PID_READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_by_pid_read() {
+        BY_PID_READS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// How many by-pid identity reads ([`ProcessId::of`](super::ProcessId::of)) this thread has made.
+    pub(crate) fn by_pid_reads() -> usize {
+        BY_PID_READS.with(Cell::get)
+    }
+}
 
 /// The [`proc_view`] and fdinfo forcing seams.
 #[cfg(all(target_os = "linux", test))]

@@ -494,6 +494,24 @@ impl Child {
         crate::containment::windows::job_contains_pid(&self.os.attached, pid)
     }
 
+    /// The root a `TreeWalk` attachment walks from.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
+        match &self.os.attached {
+            crate::containment::Attached::TreeWalk(root) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// The root an fd marker's ppid-walk channel starts from.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
+        match &self.os.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            _ => None,
+        }
+    }
+
     /// Block until the child exits, returning its status. For a bounded wait, fix a deadline
     /// instant once (`let deadline = tokio::time::Instant::now() + d;`) and use
     /// `tokio::time::timeout_at(deadline, child.wait())`, not a duration re-derived later.
@@ -889,6 +907,10 @@ mod front_kill_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "child/front_cgroup_tests.rs"]
 mod front_cgroup_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/front_failed_closed_tests.rs"]
+mod front_failed_closed_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]

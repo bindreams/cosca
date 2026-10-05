@@ -681,6 +681,33 @@ async fn macos_wait_and_reap_on_a_failed_peek_is_foreign() {
     reap_behind_the_owner(pid);
 }
 
+/// A zombie launchd holds (its tracer died) is not shown ours or reaped: `Foreign`, with a `warn`
+/// saying so.
+///
+/// Mutant: `Awaited::Orphaned` is folded into `Gone` without a log.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_wait_and_reap_of_a_zombie_launchd_holds_warns_it_cannot_be_shown_ours() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::{Foreign, Peek};
+    crate::log_capture::install();
+    let (mut proc, pid) = exited_unreaped_with(Some);
+    let mark = crate::log_capture::mark();
+    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+
+    let records = crate::log_capture::records_since_on_current_thread(mark, &format!("child {pid}"));
+    assert!(
+        records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Warn && text.contains("cannot be shown to be ours or reaped")),
+        "{records:?}"
+    );
+    proc.forget_foreign();
+    reap_behind_the_owner(pid);
+}
+
 /// A child a tracer holds (as a debugger does) answers `ECHILD` to `waitid` and is still running.
 /// `wait_and_reap` waits for the tracer's hand-back and answers `Exited`, so the zombie stays
 /// reapable; it must not forget the child as "reaped by someone else", which would leave the zombie

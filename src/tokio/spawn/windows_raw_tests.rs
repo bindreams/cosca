@@ -122,3 +122,52 @@ async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheri
         "the refusal ran after the mutation it was supposed to precede"
     );
 }
+
+/// A raw-backend blocker: `findstr` reads its stdin until EOF, and `executable()` routes it to the
+/// raw backend.
+#[cfg(windows)]
+fn raw_blocker() -> Command {
+    let mut c = Command::new();
+    c.executable("findstr")
+        .args(["findstr", "/c:needle"])
+        .stdin(Stdio::pipe())
+        .unwrap();
+    c
+}
+
+/// The async twin of `a_raw_spawn_reads_the_identity_before_it_attaches`.
+#[cfg(windows)]
+#[skuld::test]
+async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
+    crate::tokio::test_runtime::assert_current_thread();
+    use crate::child::spawn::fault;
+    use crate::error::Error;
+    let mut c = raw_blocker();
+    fault::set_force_identity_vanished(true);
+    fault::set_force_attach_failure(true);
+    let result = c.spawn();
+    fault::set_force_attach_failure(false);
+    fault::set_force_identity_vanished(false);
+    let err = result.expect_err("a forced failure fails the spawn");
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string().contains("reaped by another party")),
+        "the identity check comes first: {err:?}"
+    );
+    fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}
+
+/// The async twin of `a_raw_spawn_whose_attach_fails_tears_its_child_down`.
+#[cfg(windows)]
+#[skuld::test]
+async fn an_async_raw_spawn_whose_attach_fails_tears_its_child_down() {
+    crate::tokio::test_runtime::assert_current_thread();
+    use crate::child::spawn::fault;
+    use crate::error::Error;
+    let mut c = raw_blocker();
+    fault::set_force_attach_failure(true);
+    let result = c.spawn();
+    fault::set_force_attach_failure(false);
+    let err = result.expect_err("the forced attach failure fails the spawn");
+    assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}

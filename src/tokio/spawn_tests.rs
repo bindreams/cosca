@@ -55,6 +55,8 @@ async fn identity_failure_reaps_the_spawned_child() {
     teardown.assert_killed();
 }
 
+// macOS: the attach cannot fail; see `macos_tokio_a_failed_attach_kills_and_reaps_a_child_that_is_not_a_front`.
+#[cfg(not(target_os = "macos"))]
 #[skuld::test]
 async fn attach_failure_reaps_the_spawned_child() {
     fault::set_force_attach_failure(true);
@@ -146,10 +148,17 @@ fn a_failed_teardown_kill_in_the_async_spawn_asserts_all_but_eperm() {
                 let mut cmd = crate::tokio::Command::new();
                 cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
                 cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
-                fault::set_force_attach_failure(true);
+                // The attach, except on macOS, where it cannot fail: the identity check's failure
+                // reaches the same teardown.
+                let force: fn(bool) = if cfg!(target_os = "macos") {
+                    fault::set_force_identity_vanished
+                } else {
+                    fault::set_force_attach_failure
+                };
+                force(true);
                 fault::set_force_kill_failure_leaving_child_alive_as("cosca-async-kill-fail-5d2c", kind);
                 let err = cmd.spawn().err();
-                fault::set_force_attach_failure(false);
+                force(false);
                 err
             })
         }));
@@ -372,6 +381,51 @@ async fn cgroup_an_identity_failure_leaves_the_child_to_tokio(#[fixture(cgroup)]
         "the leaf must not reap a child tokio owns"
     );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
+    teardown.assert_killed();
+}
+
+/// As the sync twin: a spawn whose identity check fails ends the leaf's placement exchange before
+/// it kills the child.
+///
+/// Mutant: the identity-failure arm settles the verdict after the kill, or not at all.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn cgroup_tokio_identity_failure_settles_the_leaf_verdict_before_the_kill(#[fixture(cgroup)] _group: &Group) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::send_log::Capture;
+    use crate::signal::Sig;
+
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.contain();
+    let capture = Rc::new(Capture::start());
+    let sends_at_settle = Rc::new(Cell::new(None));
+    let _hook = crate::containment::cgroup::fault::set_on_take_placement({
+        let (capture, sends_at_settle) = (Rc::clone(&capture), Rc::clone(&sends_at_settle));
+        move || sends_at_settle.set(Some(capture.entries().len()))
+    });
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    err.expect("a vanished identity must fail the spawn");
+
+    let Some(crate::identity::Resolved::Found(child)) = fault::take_captured() else {
+        panic!("the seam must capture the child's identity");
+    };
+    assert_eq!(
+        sends_at_settle.get(),
+        Some(0),
+        "the verdict must be settled, and before anything is sent to the child"
+    );
+    assert!(
+        capture
+            .entries()
+            .iter()
+            .any(|&(pid, sig, _)| pid == child.pid() && sig == Sig::Kill),
+        "the child must be killed after the verdict: {:?}",
+        capture.entries()
+    );
     teardown.assert_killed();
 }
 

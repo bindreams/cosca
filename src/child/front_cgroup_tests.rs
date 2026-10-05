@@ -2,9 +2,9 @@
 //! ordinary `cat` reported as launched by `sudo`.
 //!
 //! A front its cgroup leaf holds is not gated: its kills, drop and graceful escalation signal it,
-//! and a spawn that fails after its fork tears it down, as for any child. Held means what the
-//! attach made of it: a front whose leaf did not take it is in a process group, and gated as any
-//! uncontained front.
+//! and a spawn that fails after its fork tears it down, as for any child. Held means what the leaf's
+//! placement verdict made of it: a front whose leaf did not take it is in a process group, and gated
+//! as any uncontained front.
 
 use std::io::{PipeWriter, Read as _};
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -158,4 +158,17 @@ fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fix
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
     assert_left_unsignalled(&err, pid, stdin);
+}
+
+/// A `cat` in a cgroup, reported as launched by `sudo` when `front`, whose stdin is a pipe the
+/// caller owns.
+pub(crate) fn contained_cat(front: bool) -> (Command, PipeWriter) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let mut cmd = in_cgroup(cat());
+    cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
+        .expect("stdin");
+    if front {
+        cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+    }
+    (cmd, writer)
 }

@@ -215,19 +215,6 @@ async fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exit
     );
 }
 
-/// Async twin of the sync `macos_a_failed_attach_that_found_the_front_gone_does_not_claim_it_unreaped`.
-#[cfg(target_os = "macos")]
-#[skuld::test]
-async fn macos_a_failed_attach_that_found_the_front_gone_does_not_claim_it_unreaped() {
-    use crate::child::front_kill_tests::{assert_noted_unaccounted, attach_finds_the_front_gone, fail_a_front_spawn};
-    let (err, _pid) = fail_a_front_spawn(
-        |_| {},
-        attach_finds_the_front_gone,
-        |cmd| crate::tokio::spawn::spawn(cmd).map(drop),
-    );
-    assert_noted_unaccounted(&err);
-}
-
 #[skuld::test]
 async fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() {
     let mut cmd = cat();
@@ -478,17 +465,15 @@ async fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
     assert_unadopted_front_noted(&err, pid);
 }
 
-/// Async twin of the sync `macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted`.
+/// Async twin of the sync `macos_a_front_whose_attach_fails_is_left_unreaped_and_noted`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted() {
-    use crate::child::front_kill_tests::{
-        assert_unadopted_front_noted, fail_a_front_spawn, refuse_the_identity, walk_the_tree,
-    };
-    let (err, pid) = fail_a_front_spawn(walk_the_tree, refuse_the_identity, |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop)
-    });
-    assert_unadopted_front_noted(&err, pid);
+async fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
+    use crate::child::front_kill_tests::{assert_attach_failure_left_the_front, fail_a_front_spawn, fail_the_attach};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (err, pid) = fail_a_front_spawn(|_| {}, fail_the_attach, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_attach_failure_left_the_front(&err, pid, mark);
 }
 
 /// Async twin of the sync `macos_an_identity_check_that_found_the_front_gone_does_not_claim_it_unreaped`.

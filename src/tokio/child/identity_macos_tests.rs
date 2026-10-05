@@ -249,3 +249,83 @@ async fn macos_tokio_spawn_failing_before_the_report_keeps_stds_error_and_does_n
         "the program never ran, so nothing is left running"
     );
 }
+
+/// As the sync twin: the fd marker's root is the verified identity, and the attach reads nothing
+/// by pid.
+///
+/// Mutant: the attach reads the marker's root with `ProcessId::of(pid)`.
+#[skuld::test]
+async fn macos_tokio_fdmarker_attach_reads_nothing_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, _writer) = tokio_blocker();
+    cmd.contain();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_marker_root(),
+        Some(child.id()),
+        "the marker's root is the verified identity"
+    );
+}
+
+/// As the sync twin: a non-front child whose attach fails is killed and reaped through its verified
+/// id, and tokio's `Child` is forgotten, so nothing else reaps it.
+///
+/// Mutant: the arm leaves the child unreaped.
+#[skuld::test]
+async fn macos_tokio_a_failed_attach_kills_and_reaps_a_child_that_is_not_a_front() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, _writer) = tokio_blocker();
+    fault::set_force_attach_failure(true);
+    let err = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+    fault::set_force_attach_failure(false);
+    assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity")
+    };
+    assert!(
+        crate::child::spawn::identity_macos_tests::is_reaped(id.pid()),
+        "the killed child must have been reaped"
+    );
+}
+
+/// As the sync twin: a tree-walk root without the fd marker is the verified identity, and the attach
+/// reads nothing by pid.
+///
+/// Mutant: the attach reads the root with `ProcessId::of(pid)`.
+#[skuld::test]
+async fn macos_tokio_treewalk_attach_reads_nothing_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
+    // The sync command, which the async spawn takes: only it can suppress the fd marker.
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = crate::Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    cmd.suppress_fd_marker();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = crate::tokio::spawn::spawn(&mut cmd).expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_treewalk_root(),
+        Some(child.id()),
+        "the walk's root is the verified identity"
+    );
+}

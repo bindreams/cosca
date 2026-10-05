@@ -600,6 +600,29 @@ fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
     assert_eq!(waited, Waited::Gone);
 }
 
+/// A wait whose peek finds the zombie held by launchd (its tracer died) gives up on it with a
+/// `warn` that it cannot be shown ours or reaped, not silently as for a reap.
+///
+/// Mutant: `Waited::Orphaned` is folded into `Gone` without a log.
+#[skuld::test]
+fn a_wait_on_a_zombie_launchd_holds_warns_it_cannot_be_shown_ours() {
+    crate::log_capture::install();
+    let mut b = Blocker::spawn();
+    b.end_child_and_confirm_exit();
+    let pid = b.shared.id();
+    let mark = crate::log_capture::mark();
+    let _orphaned = exit_seams::force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+    _ = b.shared.wait();
+    let records = crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid}"));
+    assert!(
+        records
+            .iter()
+            .any(|(level, text)| *level == log::Level::Warn && text.contains("cannot be shown to be ours or reaped")),
+        "{records:?}"
+    );
+    crate::child::spawn::identity_macos_tests::reap_by_pid(pid);
+}
+
 // S11m: the reap finds no exit record after `Reapable` =====
 
 /// A reap whose own peek finds no exit record right after the wait saw one is still our child (a

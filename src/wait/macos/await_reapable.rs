@@ -8,10 +8,11 @@
 //!   tracer's hand-back re-sends `NOTE_EXIT` and returns before `proc_knote(child, NOTE_REAP)`,
 //!   `kern_exit.c:2721-2773` against `:2787`), and every caller reaps only after this returns,
 //!   so a `NOTE_REAP` during the wait means something else reaped the child. It never peeks
-//!   again by a pid that may since name another child. An `ECHILD` from a peek is `Gone` in four
+//!   again by a pid that may since name another child. An `ECHILD` from a peek is `Gone` in three
 //!   cases, all decided in `exit_only::macos::peek`: the unique id says the pid names another
 //!   process, `arg = 1` says it is reaped (`ESRCH`: a process resolves from `P_REF_DEAD` until
-//!   its reap), launchd holds it (a zombie whose tracer died), or the read was refused. While the
+//!   its reap), or the read was refused. If launchd holds it (a zombie whose tracer died), the
+//!   verdict is [`Waited::Orphaned`], which is not a reap. While the
 //!   pid names the child and a live process other than launchd holds it, a tracer holds the
 //!   child, and the wait goes on.
 //! - Once `NOTE_EXIT` has come, or the registration's receipt says `ESRCH` (the child is past
@@ -50,6 +51,9 @@ pub(crate) enum Waited {
     DeadlinePassed,
     /// Something else reaped the child.
     Gone,
+    /// The pid names the child, but launchd holds its zombie because its tracer died: not this
+    /// process's to reap.
+    Orphaned,
 }
 
 /// Slots in one `kevent` batch.
@@ -117,7 +121,8 @@ fn settle(peeked: Peek) -> Option<Waited> {
     match peeked {
         Peek::Exit(_) => Some(Waited::Reapable),
         Peek::Running => None,
-        Peek::Foreign(Foreign::Gone | Foreign::Other | Foreign::Orphaned) => Some(Waited::Gone),
+        Peek::Foreign(Foreign::Gone | Foreign::Other) => Some(Waited::Gone),
+        Peek::Foreign(Foreign::Orphaned) => Some(Waited::Orphaned),
     }
 }
 
