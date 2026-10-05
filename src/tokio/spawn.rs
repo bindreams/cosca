@@ -516,6 +516,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         Err(e) => {
             #[cfg(unix)]
             if let Some(front) = front {
+                // macOS: the attach failed on the root's identity read, which leaves the front
+                // unverified, as the sync spawn leaves it.
+                #[cfg(target_os = "macos")]
+                let fate = leave_unverified_front(
+                    &mut proc,
+                    e.identity.unwrap_or(crate::containment::RootIdentity::Unknown),
+                );
+                #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
                 return Err(fate.note(e.error, Some(front), Some(pid)));
             }
