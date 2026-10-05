@@ -911,6 +911,11 @@ fn attach_tree(
 ) -> Result<(Containment, Attached), AttachError> {
     #[cfg(unix)]
     let pid = id.pid();
+    #[cfg(unix)]
+    let id = match crate::identity::ProcessId::of(pid) {
+        crate::identity::Resolved::Found(x) => x,
+        _ => id,
+    };
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
