@@ -38,31 +38,40 @@ pub(crate) enum Gate {
     Closed(Error),
 }
 
-/// A front, and what a signal to it does.
+/// A front, and what a signal to it does. A tag, so a `Child` holding one stays small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Front {
-    pub(crate) name: &'static str,
+pub(crate) enum Front {
+    Sudo,
+    Doas,
+    Osascript,
+}
+
+impl Front {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Front::Sudo => "sudo",
+            Front::Doas => "doas",
+            Front::Osascript => "osascript",
+        }
+    }
+
     /// The tracked process may be the program itself (direct exec), not the wrapper.
-    may_be_the_program: bool,
+    fn may_be_the_program(self) -> bool {
+        !matches!(self, Front::Osascript)
+    }
+
     /// A `SIGTERM` to the front reaches the program.
-    relays_term: bool,
+    fn relays_term(self) -> bool {
+        !matches!(self, Front::Osascript)
+    }
 }
 
 /// The front `via` leaves this process tracking, if it does.
 pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
-    let wrapper = |name| Front {
-        name,
-        may_be_the_program: true,
-        relays_term: true,
-    };
     match via? {
-        ElevatedVia::Wrapped(Backend::Sudo) => Some(wrapper("sudo")),
-        ElevatedVia::Wrapped(Backend::Doas) => Some(wrapper("doas")),
-        ElevatedVia::MacosOsascript => Some(Front {
-            name: "osascript",
-            may_be_the_program: false,
-            relays_term: false,
-        }),
+        ElevatedVia::Wrapped(Backend::Sudo) => Some(Front::Sudo),
+        ElevatedVia::Wrapped(Backend::Doas) => Some(Front::Doas),
+        ElevatedVia::MacosOsascript => Some(Front::Osascript),
         // pkexec execs the program, and a report never names `Auto`. run0 is not gated.
         ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
     }
@@ -98,7 +107,7 @@ pub(crate) fn kill_gate(
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
 /// for a live front that does not relay it. `running` is asked only about such a front.
 pub(crate) fn terminate_gate(front: Option<Front>, pid: u32, running: impl FnOnce() -> io::Result<bool>) -> Gate {
-    let Some(front) = front.filter(|f| !f.relays_term) else {
+    let Some(front) = front.filter(|f| !f.relays_term()) else {
         return Gate::Open;
     };
     match running() {
@@ -118,18 +127,18 @@ pub(crate) fn describe(front: Front, pid: impl Into<Option<u32>>) -> String {
     let subject = pid
         .into()
         .map_or_else(|| "the spawned child".to_owned(), |pid| format!("pid {pid}"));
-    if front.may_be_the_program {
+    if front.may_be_the_program() {
         format!(
             "{subject} is what {name} left this process tracking: {name} itself, which runs as this user and \
              outlives the elevated program it launched, so a kill would orphan the program, or, with direct exec, \
              the root program itself, whose kill is refused",
-            name = front.name
+            name = front.name()
         )
     } else {
         format!(
             "{subject} is {name}, which runs as this user and outlives the elevated program it launched, so a signal \
              would end {name} and orphan the program",
-            name = front.name
+            name = front.name()
         )
     }
 }

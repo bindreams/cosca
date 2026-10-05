@@ -44,7 +44,7 @@ fn front_named(backend: Backend, host: &Host) -> Option<&'static str> {
         .derived
         .expect("a derived command")
         .elevation_front()
-        .map(|front| front.name)
+        .map(|front| front.name())
 }
 
 /// sudo and doas leave this process tracking a front; pkexec and run0 do not.
