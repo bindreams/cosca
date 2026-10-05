@@ -975,3 +975,7 @@ mod rewrite_tests {
 #[cfg(unix)]
 #[path = "posix_tests/cwd.rs"]
 mod cwd;
+
+#[cfg(unix)]
+#[path = "posix_tests/front.rs"]
+mod front;

@@ -22,6 +22,15 @@ use zeroize::Zeroize;
     )
 )]
 pub(crate) mod macos;
+// Only the unix kill paths consult the gate.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the unix kill paths consult the front gate; it is tested everywhere"
+    )
+)]
+pub(crate) mod front;
 // Pure, and a `Host` field everywhere; only the unix rewrite reads it.
 #[cfg_attr(
     not(unix),
@@ -253,14 +262,9 @@ pub enum ElevatedVia {
     /// - **Left alone, osascript outlives the program**: it blocks until the program
     ///   exits, so [`crate::Child::wait`] returning means the elevated work is
     ///   finished.
-    /// - **Killed or dropped early, it does not.** [`crate::Child::kill`] — and the
-    ///   drop-kill that [`crate::Command::kill_on_drop`] performs, which is **on by
-    ///   default** — reaches only osascript. The root program keeps running, nothing
-    ///   unprivileged can stop it, and once the front-end is gone its completion and
-    ///   its exit status are unobservable. If you need the program's outcome, do not
-    ///   kill the child and do not drop it before [`crate::Child::wait`] returns. (An
-    ///   explicit `.kill_on_drop(true)` cannot currently be told apart from the
-    ///   builder default, so this is documented rather than refused.)
+    /// - **It cannot be killed or sent `SIGTERM`** while it runs: it is a front (see
+    ///   [`crate::Child::kill`]), and once it is gone the program's completion and
+    ///   exit status are unobservable.
     /// - `wait` reports **osascript's** exit status. It is zero if and only if the
     ///   elevated program exited zero; a non-zero code is osascript's, not the
     ///   program's — and on that path the program's stdout is discarded rather than

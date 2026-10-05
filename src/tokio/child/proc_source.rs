@@ -585,6 +585,24 @@ impl ProcSource {
         }
     }
 
+    /// Whether the child is still running, read without reaping it: `false` once it is reaped, by
+    /// tokio or by someone else, or has exited. On macOS a child with no unique id cannot be read.
+    #[cfg(unix)]
+    pub(crate) fn is_running(&self) -> std::io::Result<bool> {
+        if self.is_reaped() {
+            return Ok(false);
+        }
+        let Some(target) = self.target() else {
+            return Err(std::io::Error::other(
+                "the child's unique id is unknown, so nothing shows its pid still names it",
+            ));
+        };
+        Ok(matches!(
+            crate::wait::exit_only::peek(&target)?,
+            crate::wait::exit_only::Peek::Running
+        ))
+    }
+
     /// `true` once the backend has collected the child's status, so no reap remains.
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
@@ -763,6 +781,34 @@ impl ProcSource {
         #[cfg(windows)]
         self.wait_and_reap(pid);
         self.release();
+    }
+
+    /// [`reap_now`](ProcSource::reap_now) for an elevation front (see [`crate::elevation::front`]):
+    /// it is sent nothing, and tokio's `Child` is forgotten, never handed to a reaper. The sync
+    /// spawn's front teardown reaps it through its pidfd if it has already exited. **Invariant:** no
+    /// `wait()` future for this child is in flight.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn leave_front(
+        mut self,
+        pid: u32,
+        front: crate::elevation::front::Front,
+    ) -> crate::child::spawn::FrontFate {
+        self.forget_if_foreign();
+        let ProcSource::Tokio { pidfd, .. } = &mut self else {
+            // Only something that broke the reaping precondition (see `Command::contain`) leaves a
+            // spawn's backend foreign this early.
+            log::warn!(
+                "elevation front pid {pid}: its backend is foreign (reaped elsewhere), so it cannot be waited on"
+            );
+            debug_assert!(
+                false,
+                "elevation front pid {pid}: a spawn's backend is foreign before its teardown"
+            );
+            return crate::child::spawn::FrontFate::Unaccounted;
+        };
+        let pidfd = pidfd.take();
+        self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
+        crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front)
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the

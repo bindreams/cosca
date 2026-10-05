@@ -72,7 +72,14 @@ impl Child {
     /// mechanism that addresses no pid keeps its own answer: an uncontained Windows child is
     /// `Unsupported` before and after the reap alike, because nothing was ever going to be sent
     /// to a pid in the first place.
+    ///
+    /// **A macOS graphically-elevated child** is refused, as for the sync
+    /// [`Child::terminate`](crate::Child::terminate).
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
+            return Err(unkillable);
+        }
         let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
         if mechanism.addresses_a_bare_pid() && !self.proc().pins_pid() {

@@ -52,6 +52,10 @@ impl Child {
     /// **Every error means nothing was sent and nothing was killed.** On Linux that includes a
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
+    /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
+    /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`
+    /// would end osascript, not the program.
+    ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
     /// delivered in that window ends it during loader init rather than through its own handler.
@@ -61,6 +65,10 @@ impl Child {
     /// before it has run at all should use [`kill`](Child::kill), which is honest about being
     /// forced.
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
+            return Err(unkillable);
+        }
         crate::graceful::signal(self.graceful, self.id)
     }
 
@@ -97,6 +105,10 @@ impl Child {
     /// A watch failure never skips the kill and reap; it surfaces only after they run, and a
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
+    ///
+    /// An elevated child behind a front outside a cgroup (see [`kill`](Child::kill)) that outlives
+    /// the grace is not killed: it is left running, and this answers
+    /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
 
@@ -110,7 +122,25 @@ impl Child {
                 id = self.id.pid()
             );
         }
-        self.proc.kill().map_err(Error::Io)?; // escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's both-fail disposition)
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeEscalation);
+        // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
+        // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
+        // refused kill stays the raw `Io`.
+        #[cfg(unix)]
+        match self.kill_gate() {
+            crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
+            // An exit is permanent, so a refused signal to an exited front changes nothing.
+            crate::elevation::front::Gate::Exited => match self.proc.kill() {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                }
+                other => other.map_err(Error::Io)?,
+            },
+            crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
+        }
+        #[cfg(not(unix))]
+        self.proc.kill().map_err(Error::Io)?;
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         let status = self.wait()?;
@@ -390,6 +420,8 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
+    #[cfg(unix)]
+    pub(crate) use crate::graceful_hooks::at;
     pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR`: a test that arms this seam expecting the sweep

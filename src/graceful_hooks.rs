@@ -10,18 +10,28 @@ pub(crate) enum HookPoint {
     AfterTerminate,
     /// After the kill or sweep returned `Ok` (or was skipped), before the root is reaped.
     BeforeReap,
+    /// `graceful_shutdown`: after the grace ran out, before the escalation.
+    BeforeEscalation,
 }
 
 thread_local! {
     static AFTER_TERMINATE: OneShotHook = const { OneShotHook::new() };
     static BEFORE_REAP: OneShotHook = const { OneShotHook::new() };
+    static BEFORE_ESCALATION: OneShotHook = const { OneShotHook::new() };
 }
 
 fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
     match point {
         HookPoint::AfterTerminate => &AFTER_TERMINATE,
         HookPoint::BeforeReap => &BEFORE_REAP,
+        HookPoint::BeforeEscalation => &BEFORE_ESCALATION,
     }
+}
+
+/// Run `hook` when the shutdown reaches `point`.
+#[cfg(unix)]
+pub(crate) fn at(point: HookPoint, hook: impl FnOnce() + 'static) -> Armed {
+    arm(slot(point), hook)
 }
 
 /// Drop `held` (a stdin a fixture blocks on) when the shutdown reaches `point`.

@@ -93,6 +93,14 @@ impl ProcHandle {
         }
     }
 
+    /// Whether the process is still running, read without reaping it.
+    #[cfg(unix)]
+    pub(crate) fn is_running(&self) -> io::Result<bool> {
+        match self {
+            ProcHandle::Std(s) => s.is_running(),
+        }
+    }
+
     /// The OS process id.
     pub(crate) fn id(&self) -> u32 {
         match self {

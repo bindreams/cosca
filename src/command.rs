@@ -27,6 +27,9 @@ pub struct Command {
     contain: ContainRequest,
     elevation: crate::elevation::ElevationRequest,
     fd_marker_suppressed: bool,
+    /// The front this command's spawn leaves the caller tracking, for an elevation-derived spawn
+    /// (see [`crate::elevation::front`]): its teardown after a failed spawn must not signal it.
+    elevation_front: Option<crate::elevation::front::Front>,
     flags: FlagsRequest,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
     /// `/proc/self/fd/N`.
@@ -116,6 +119,7 @@ impl Default for Command {
             contain: ContainRequest::default(),
             elevation: crate::elevation::ElevationRequest::default(),
             fd_marker_suppressed: false,
+            elevation_front: None,
             held: Vec::new(),
             flags: FlagsRequest::default(),
         }
@@ -589,6 +593,9 @@ impl Command {
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
+    /// So is an elevated child behind a front outside a cgroup (see
+    /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
+    /// `warn` naming it.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
@@ -889,6 +896,21 @@ impl Command {
 
     pub(crate) fn fd_marker_suppressed(&self) -> bool {
         self.fd_marker_suppressed
+    }
+
+    /// Name the front this command's spawn leaves the caller tracking (see
+    /// [`crate::elevation::front`]). Set by the unix elevation rewrite on its derived command.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "set only by the unix elevation rewrite; dead off unix")
+    )]
+    pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
+        self.elevation_front = front;
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the unix spawn teardowns"))]
+    pub(crate) fn elevation_front(&self) -> Option<crate::elevation::front::Front> {
+        self.elevation_front
     }
 
     // ---- crate-internal accessors for the spawn engine -------------

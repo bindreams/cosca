@@ -1098,7 +1098,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let said = std::rc::Rc::new(RefCell::new(None));
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed).err();
+    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, None).err();
     assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("the report was cut short"));
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(
@@ -1106,7 +1106,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         "{why}"
     );
 
-    super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport).err();
+    super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport, None).err();
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
@@ -1219,4 +1219,104 @@ fn a_failed_open_leaves_no_numbers_live() {
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
     let spawned = cmd.spawn();
     assert_eq!(spawned.expect_err("never published").raw_os_error(), Some(libc::EBADF));
+}
+
+/// A child of a failed spawn, for `conclude`'s arms that never reach it.
+struct NoChild;
+
+impl super::Spawned for NoChild {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    fn reap_unexecuted(self, _: OwnedFd) {
+        panic!("no child was handed back");
+    }
+    fn abandon_unreported(self, _: &str) {
+        panic!("no child was handed back");
+    }
+}
+
+/// The front `sudo` leaves.
+fn sudo_front() -> Option<crate::elevation::front::Front> {
+    crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
+        crate::elevation::Backend::Sudo,
+    )))
+}
+
+/// A `cat` whose stdin this test holds, and a pidfd naming it.
+fn cat_with_pidfd() -> (std::process::Child, OwnedFd) {
+    let cat = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
+        .expect("spawn cat");
+    let pid = rustix::process::Pid::from_raw(cat.id() as i32).expect("a positive pid");
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).expect("pidfd_open");
+    (cat, pidfd)
+}
+
+/// A front tokio dropped after it ran the program is sent nothing and left, and the error says so.
+#[skuld::test]
+fn a_dropped_front_is_left_and_noted() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails");
+    let text = err.to_string();
+    assert!(text.contains("the spawned child is what sudo left"), "{text}");
+    assert!(text.contains("it is left unreaped"), "{text}");
+    drop(cat.stdin.take());
+    assert!(cat.wait().expect("wait").success(), "the front was signalled");
+}
+
+/// A front std already collected never ran the program: it is torn down, with no note.
+#[skuld::test]
+fn a_collected_front_is_no_front() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    drop(cat.stdin.take());
+    cat.wait().expect("collect the child");
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("exec failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails");
+    assert!(!err.to_string().contains("what sudo left"), "{err}");
+}
+
+/// A child that died before it was told to go never ran the program: it is reaped, with no note.
+#[skuld::test]
+fn a_front_gone_before_its_go_is_no_front() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let pid = cat.id();
+    cat.kill().expect("kill the child");
+    crate::test_child::wait_until_zombie(pid);
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("killed on its way")),
+        Outcome::Gone(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails");
+    assert!(!err.to_string().contains("what sudo left"), "{err}");
+    assert_eq!(crate::child::front_kill_tests::reap(pid), None, "the teardown reaps it");
+}
+
+/// A dropped front whose pidfd cannot be peeked is taken to be there still: sent nothing, and left.
+#[skuld::test]
+fn an_unpeekable_dropped_front_is_left_and_noted() {
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let _unpeekable = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        sudo_front(),
+    )
+    .err()
+    .expect("the spawn fails");
+    assert!(err.to_string().contains("the spawned child is what sudo left"), "{err}");
+    drop(cat.stdin.take());
+    assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }

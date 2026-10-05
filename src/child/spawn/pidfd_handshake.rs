@@ -95,6 +95,9 @@ pub(crate) struct Handshake {
     child_end: OwnedFd,
     done: OwnedFd,
     shared: Arc<Shared>,
+    /// The elevation front the spawn launches, if it does: a spawn that fails after its fork sends
+    /// it nothing (see [`Handshake::leaving_front`]).
+    front: Option<crate::elevation::front::Front>,
 }
 
 /// A spawned child, and the pidfd it sent while it was held before `exec`.
@@ -199,6 +202,7 @@ impl Pending {
             child_end,
             done,
             shared: self.shared,
+            front: None,
         })
     }
 }
@@ -255,6 +259,17 @@ impl Drop for ShutOnDrop<'_> {
 }
 
 impl Handshake {
+    /// Names the elevation front this spawn launches. A spawn that fails after its fork then sends
+    /// the child nothing, a kill of which would orphan its elevated program (see
+    /// [`crate::elevation::front`]), and its error says what became of it. Only a spawn whose failed
+    /// `spawn()` leaves the child unreaped (tokio's) names one: std reaps the child of a spawn it
+    /// fails.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn leaving_front(mut self, front: Option<crate::elevation::front::Front>) -> Handshake {
+        self.front = front;
+        self
+    }
+
     /// Runs `spawn` (the fork) with the helper thread alive beside it, then answers the pidfd.
     ///
     /// - A failed `pidfd_open` in the child is the error, whatever `spawn` answered: the child
@@ -280,6 +295,7 @@ impl Handshake {
             child_end,
             done,
             shared,
+            front,
         } = self;
         #[cfg(test)]
         let seams = fault::take_helper_seams();
@@ -381,7 +397,7 @@ impl Handshake {
                 (Outcome::NoReport, Some(cause)) => Outcome::Unwatched(cause),
                 (outcome, _) => outcome,
             };
-            conclude(spawned, outcome)
+            conclude(spawned, outcome, front)
         })
     }
 }
@@ -742,8 +758,38 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
     outcome
 }
 
-/// Combines the fork's answer with the helper's.
-fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held<T>, Error> {
+/// Combines the fork's answer with the helper's. A child that sent its pidfd and then failed its
+/// `spawn()` is torn down through that pidfd. The exception is the elevation `front` still there:
+/// tokio dropped it after it ran the program, so it is sent nothing. A child std already
+/// collected never ran the program (its exec failed): it is not a front.
+fn conclude<T: Spawned>(
+    spawned: io::Result<T>,
+    outcome: Outcome,
+    front: Option<crate::elevation::front::Front>,
+) -> Result<Held<T>, Error> {
+    let opened_teardown = |pidfd: OwnedFd, error: Error| {
+        use crate::wait::exit_only::{peek, Peek, Target};
+        use std::os::fd::AsFd as _;
+        // A child std collected never ran the program. A peek that fails tells nothing, so the
+        // child is taken for a front still there, which is sent nothing.
+        let collected = match peek(&Target::PidFd(pidfd.as_fd())) {
+            Ok(Peek::Foreign(_)) => true,
+            Ok(_) => false,
+            Err(e) => {
+                log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
+                false
+            }
+        };
+        match front {
+            Some(front) if !collected => {
+                super::leave_front_through_pidfd(None, pidfd, front).note(error, Some(front), None)
+            }
+            _ => {
+                super::teardown_through_pidfd(None, pidfd);
+                error
+            }
+        }
+    };
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
@@ -772,7 +818,9 @@ fn conclude<T: Spawned>(spawned: io::Result<T>, outcome: Outcome) -> Result<Held
         }
         // The spawn failed after the fork. std collects the child of a spawn it fails; tokio can
         // fail one after std's succeeded, and drops that child neither killed nor reaped.
-        (Err(e), Outcome::Opened(pidfd) | Outcome::Gone(pidfd)) => {
+        (Err(e), Outcome::Opened(pidfd)) => Err(opened_teardown(pidfd, Error::Io(e))),
+        // Not told to go, so it never ran the program.
+        (Err(e), Outcome::Gone(pidfd)) => {
             super::teardown_through_pidfd(None, pidfd);
             Err(Error::Io(e))
         }

@@ -219,6 +219,12 @@ impl Command {
         super::spawn::spawn(&mut self.inner)
     }
 
+    /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
+        self.inner.set_elevation_front(front);
+    }
+
     /// Run to completion with inherited stdio, returning the exit status.
     /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
     pub async fn status(&mut self) -> Result<std::process::ExitStatus, Error> {

@@ -222,6 +222,16 @@ impl Attached {
         format!("{self:?}")
     }
 
+    /// Whether this is a Linux cgroup leaf.
+    #[cfg(unix)]
+    pub(crate) fn is_cgroup(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Attached::Cgroup(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Hard-kill the contained tree (best-effort; already-gone is success).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         self.hard_kill_report().0

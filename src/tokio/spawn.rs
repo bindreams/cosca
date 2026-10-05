@@ -365,8 +365,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
         // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
         // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
+        // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
         #[cfg(target_os = "linux")]
-        let handshake = handshake.open(&_guard)?;
+        let handshake = handshake
+            .open(&_guard)?
+            .leaving_front(cmd.elevation_front().filter(|_| prepared.cgroup_leaf.is_none()));
 
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
@@ -397,7 +400,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(target_os = "linux")]
             let spawned = {
                 #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-                let held = handshake.run(|| tcmd.spawn());
+                let held = handshake.run(|| {
+                    let spawned = tcmd.spawn();
+                    #[cfg(test)]
+                    let spawned = crate::child::spawn::fault::fail_tokio_spawn_after_fork(spawned);
+                    spawned
+                });
                 held.map(|held| {
                     held_pidfd = Some(held.pidfd);
                     held.child
@@ -465,6 +473,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         if not_adopted.died_before_exec {
             // Only a corpse is left, and tokio's `Child` must not reap it by pid.
             proc.forget_because("died before exec");
+        } else if let Some(front) = cmd.elevation_front() {
+            // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
+            // spawn leaves it, and the error says so.
+            proc.forget_because("is an elevation front, sent nothing, and left unreaped");
+            let fate = crate::child::spawn::FrontFate::LeftUnreaped;
+            return Err(fate.note(not_adopted.error, Some(front), Some(pid)));
         } else {
             // With no id the backend neither signals nor waits by pid: the child is forgotten, with
             // a warning naming it, and left running.
@@ -480,7 +494,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     // attachment's root a stranger under an identity that passed.
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
-    let attach = crate::child::spawn::attach_or_fault(
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    #[cfg(target_os = "linux")]
+    let in_cgroup = prepared.cgroup_leaf.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let in_cgroup = false;
+    #[cfg(unix)]
+    let front = cmd.elevation_front().filter(|_| !in_cgroup);
+    #[cfg(not(unix))]
+    let _ = in_cgroup;
+    let attach = crate::child::spawn::attach_or_fault_typed(
         pid,
         #[cfg(windows)]
         proc_handle,
@@ -491,10 +514,27 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
         // attach never leaks a live/suspended process.
         Err(e) => {
+            #[cfg(unix)]
+            if let Some(front) = front {
+                // macOS: the attach failed on the root's identity read, which leaves the front
+                // unverified, as the sync spawn leaves it.
+                #[cfg(target_os = "macos")]
+                let fate = leave_unverified_front(
+                    &mut proc,
+                    e.identity.unwrap_or(crate::containment::RootIdentity::Unknown),
+                );
+                #[cfg(not(target_os = "macos"))]
+                let fate = proc.leave_front(pid, front);
+                return Err(fate.note(e.error, Some(front), Some(pid)));
+            }
             proc.reap_now(pid);
-            return Err(e);
+            return Err(e.error);
         }
     };
+    // From here what the attach made decides: a leaf that did not take the child left it in its
+    // process group, uncontained.
+    #[cfg(unix)]
+    let front = cmd.elevation_front().filter(|_| !attachment.attached.is_cgroup());
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`.
@@ -511,6 +551,24 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Mirror the attach-failure path above: tear the child down so a vanished-identity error
         // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
         other => {
+            // An elevation front is sent nothing (see `ProcSource::leave_front`).
+            #[cfg(unix)]
+            if let Some(front) = front {
+                // macOS: a front whose identity was refused or found gone is left unverified, as the
+                // sync spawn leaves it.
+                #[cfg(target_os = "macos")]
+                let fate = leave_unverified_front(
+                    &mut proc,
+                    if matches!(other, Resolved::Gone) {
+                        crate::containment::RootIdentity::Gone
+                    } else {
+                        crate::containment::RootIdentity::Unknown
+                    },
+                );
+                #[cfg(not(target_os = "macos"))]
+                let fate = proc.leave_front(pid, front);
+                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
+            }
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
@@ -546,7 +604,25 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
+    child.set_front(cmd.elevation_front());
     Ok(child)
+}
+
+/// macOS: a front whose identity read found it reaped elsewhere (`Gone`) or could not be read
+/// (`Unknown`) is left unverified, as the sync spawn's `leave_unverified_child` leaves any child:
+/// sent nothing, and tokio's `Child` forgotten, since its drop reaps by pid.
+#[cfg(target_os = "macos")]
+fn leave_unverified_front(
+    proc: &mut ProcSource,
+    identity: crate::containment::RootIdentity,
+) -> crate::child::spawn::FrontFate {
+    proc.forget_because(match identity {
+        crate::containment::RootIdentity::Gone => "was reaped by someone else",
+        crate::containment::RootIdentity::Unknown => {
+            "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
+        }
+    });
+    crate::child::spawn::FrontFate::of_unverified(identity)
 }
 
 /// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
@@ -557,7 +633,12 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         return Ok(child);
     };
     let mut skipped = None;
-    let tree = child.containment().can_teardown().then(|| {
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
+    let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
+    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         skipped = child.kill_tree_members_unless_reaped()?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
@@ -574,13 +655,24 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
              process, and the kill would {action}"
         ));
     }
-    let root_note = match child.kill_sent() {
+    let root = match gate {
+        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+        gate => child.kill_sent_gated(gate),
+    };
+    let root_note = match root {
         Ok(Sent::Delivered) => {
             child.wait_and_reap_blocking();
-            "the elevated child was terminated".to_string()
+            if exited_front {
+                "the elevated child had already exited, and was reaped".to_string()
+            } else {
+                "the elevated child was terminated".to_string()
+            }
         }
         // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
         // which may name another process by now.
+        Ok(Sent::Gone) if exited_front => {
+            "the elevated child had already exited, and was reaped by someone else".to_string()
+        }
         Ok(Sent::Gone) => {
             "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
         }

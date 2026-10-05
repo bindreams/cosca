@@ -50,6 +50,10 @@ pub(crate) fn via_pidfd(pidfd: Option<std::os::fd::BorrowedFd<'_>>, pid: u32, si
     };
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Pidfd);
+    #[cfg(test)]
+    if let Some(errno) = seams::kills_refused() {
+        return Err(io_context("pidfd_send_signal", io::Error::from_raw_os_error(errno)));
+    }
     match rustix::process::pidfd_send_signal(pidfd, sig.as_rustix()) {
         Ok(()) => Ok(Sent::Delivered),
         Err(rustix::io::Errno::SRCH) => {
@@ -119,6 +123,10 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     };
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
+    #[cfg(test)]
+    if let Some(errno) = seams::kills_refused() {
+        return Err(io_context("kill", io::Error::from_raw_os_error(errno)));
+    }
     // SAFETY: `target` is a positive pid, so the signal goes to one process.
     if unsafe { libc::kill(target, sig.as_libc()) } == 0 {
         return Ok(Sent::Delivered);
@@ -129,6 +137,42 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
         return Ok(Sent::Gone);
     }
     Err(io_context("kill", e))
+}
+
+/// Test seam: while the guard lives, every kill sent on this thread is refused with `EPERM` and
+/// not sent, as the kernel refuses a signal to another user's process. Thread-local, with an RAII
+/// reset. The refusal is real: an unprivileged kill of a root-owned zombie fails with `EPERM`
+/// (measured in a container), and #552's ELEVATION lanes run the real case.
+#[cfg(all(test, unix))]
+pub(crate) mod seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSED: Cell<Option<i32>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn refuse_kills() -> RefusedKills {
+        fail_kills_with(libc::EPERM)
+    }
+
+    /// [`refuse_kills`], failing each kill with `errno` instead.
+    pub(crate) fn fail_kills_with(errno: i32) -> RefusedKills {
+        REFUSED.with(|r| r.set(Some(errno)));
+        RefusedKills(())
+    }
+
+    #[must_use = "kills are sent again as soon as the guard is dropped"]
+    pub(crate) struct RefusedKills(());
+
+    impl Drop for RefusedKills {
+        fn drop(&mut self) {
+            REFUSED.with(|r| r.set(None));
+        }
+    }
+
+    pub(super) fn kills_refused() -> Option<i32> {
+        REFUSED.with(Cell::get)
+    }
 }
 
 #[cfg(all(test, unix))]

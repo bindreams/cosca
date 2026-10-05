@@ -50,9 +50,11 @@ pub enum ElevationErrorKind {
     /// Interactive auth requested but there is no controlling terminal to prompt on.
     #[error("no controlling terminal for interactive elevation")]
     NoTty,
-    /// An unprivileged parent could not signal its elevated child (EPERM on POSIX,
-    /// ACCESS_DENIED on Windows). Whether the child is still running is in `detail`.
-    #[error("could not terminate an elevated child: permission denied")]
+    /// An unprivileged parent could not signal or stop its elevated child: the OS refused the
+    /// signal (EPERM on POSIX, ACCESS_DENIED on Windows), or the tracked process is a front (see
+    /// [`Child::kill`](crate::Child::kill)), so nothing was sent. `detail` says which, and whether
+    /// the child is still running.
+    #[error("could not signal or stop an elevated child")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to
     /// manage it. Whether it was terminated is reported in the error `detail`.
@@ -240,6 +242,76 @@ impl std::fmt::Display for IoContext {
 }
 
 impl std::error::Error for IoContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl Error {
+    /// This error with `note` appended to what it says, its variant and kind kept: a caller that
+    /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
+    /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "only the unix spawn teardowns add a note"))]
+    pub(crate) fn with_note(self, note: &str) -> Error {
+        let append = |detail: String| format!("{detail}; {note}");
+        match self {
+            Error::Io(source) => Error::Io(std::io::Error::new(
+                source.kind(),
+                IoNote {
+                    note: note.to_owned(),
+                    source,
+                },
+            )),
+            Error::Unsupported { op, platform, detail } => Error::Unsupported {
+                op,
+                platform,
+                detail: append(detail),
+            },
+            Error::Containment { detail } => Error::Containment { detail: append(detail) },
+            Error::NoConsole { detail } => Error::NoConsole { detail: append(detail) },
+            Error::Elevation { kind, detail } => Error::Elevation {
+                kind,
+                detail: append(detail),
+            },
+            Error::Unassessable { detail, source } => Error::Unassessable {
+                detail: append(detail),
+                source,
+            },
+            Error::NotThreadGroupLeader { pid, detail, source } => Error::NotThreadGroupLeader {
+                pid,
+                detail: append(detail),
+                source,
+            },
+            Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord {
+                kind,
+                detail: append(detail),
+                source,
+            },
+            Error::Quote(e) => {
+                debug_assert!(
+                    false,
+                    "a note is added only to a spawn's error, never a quoting one: {e}"
+                );
+                Error::Quote(e)
+            }
+        }
+    }
+}
+
+/// An I/O error with a note after its message; the error itself is the source.
+#[derive(Debug)]
+struct IoNote {
+    note: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for IoNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; {}", self.source, self.note)
+    }
+}
+
+impl std::error::Error for IoNote {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }

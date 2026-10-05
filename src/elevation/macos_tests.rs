@@ -425,7 +425,7 @@ fn kill_on_drop_reaches_the_derived_command() {
 #[skuld::test]
 fn kill_on_drop_warns_that_it_cannot_reach_the_payload() {
     // The builder default sets the flag, so this is the DEFAULT path: dropping the
-    // child SIGKILLs osascript while the root payload keeps running, unobservable.
+    // child early leaves osascript and the root payload running, unobservable.
     // That must never be silent, so the spawn says so.
     //
     // The capture buffer is process-global and every sibling test that calls

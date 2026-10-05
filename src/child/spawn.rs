@@ -94,6 +94,10 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 ///
 /// A reaped root's number may name another process by now, so the tree kill is skipped when it
 /// would name the tree by that number (a process group, a ppid walk), and the note says so.
+///
+/// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
+/// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
+/// and the note says it had exited. The front's gate is read once, for both kills.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -101,7 +105,11 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     };
     let view = crate::containment::DropView::read(child.id, child.proc.is_reaped(), &child.tree_killed);
     let mut skipped = None;
-    let tree = child.containment().can_teardown().then(|| {
+    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
+    // below then says why.
+    let gate = child.kill_gate();
+    let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
+    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
             .hard_kill_marking_unless_reaped(view, &child.tree_killed)
@@ -114,7 +122,15 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
              process, and the kill would {action}"
         ));
     }
-    let root_note = match child.kill_sent() {
+    let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
+    let root = match gate {
+        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+        gate => child.kill_sent_gated(gate),
+    };
+    let root_note = match root {
+        Ok(crate::signal::Sent::Gone) if exited_front => {
+            "the elevated child had already exited, and was reaped by someone else".to_string()
+        }
         Ok(crate::signal::Sent::Gone) => {
             "the elevated child could not be terminated (it was already reaped)".to_string()
         }
@@ -125,7 +141,15 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
                 Ok(_status) => {
                     #[cfg(test)]
                     fault::record_teardown_reap(child.id().pid(), _status);
-                    "the elevated child was terminated".to_string()
+                    if exited_front {
+                        "the elevated child had already exited, and was reaped".to_string()
+                    } else {
+                        "the elevated child was terminated".to_string()
+                    }
+                }
+                Err(e) if exited_front => {
+                    log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
+                    format!("the elevated child had already exited, but could not be reaped ({e})")
                 }
                 Err(e) => {
                     log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
@@ -403,13 +427,19 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         through: PidfdChild::new(Some(child.id()), pidfd),
         child,
     };
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    #[cfg(target_os = "linux")]
+    let in_cgroup = prepared.cgroup_leaf.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let in_cgroup = false;
+    let front = cmd.elevation_front().filter(|_| !in_cgroup);
     // macOS has no handle: the unique id the child reported before `exec` is what the identity is
     // checked against and the shared child is adopted with. The report decides first: a child that
     // died before `exec` is that, whatever an attach would find of its pid.
     #[cfg(target_os = "macos")]
     let unique = match unique_report::adopted_id(unique, child.id()) {
         Ok(unique) => unique,
-        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted)),
+        Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front)),
     };
     let attachment = match attach_or_fault_typed(
         child.id(),
@@ -424,17 +454,20 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         // `leave_unverified_child`.
         Err(e) => {
             log::debug!("attach failed (root identity verdict: {:?}): {}", e.identity, e.error);
+            let pid = child.id();
             #[cfg(target_os = "macos")]
-            {
+            let fate = {
                 debug_assert!(
                     e.identity.is_some(),
                     "a macOS attach fails only on the root's identity read"
                 );
-                leave_unverified_child(child, e.identity.unwrap_or(crate::containment::RootIdentity::Unknown));
-            }
+                let identity = e.identity.unwrap_or(crate::containment::RootIdentity::Unknown);
+                leave_unverified_child(child, identity);
+                FrontFate::of_unverified(identity)
+            };
             #[cfg(not(target_os = "macos"))]
-            teardown_unadopted(child);
-            return Err(e.error);
+            let fate = teardown_unadopted_or_front(child, front);
+            return Err(fate.note(e.error, front, Some(pid)));
         }
     };
     // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
@@ -443,6 +476,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
+    // From here what the attach made decides: a leaf that did not take the child left it in its
+    // process group, uncontained.
+    #[cfg(unix)]
+    let front = cmd.elevation_front().filter(|_| !attachment.attached.is_cgroup());
+    #[cfg(not(unix))]
+    let front = None;
     #[cfg(target_os = "linux")]
     let through = child.through.target();
     #[cfg(target_os = "macos")]
@@ -452,25 +491,27 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         use std::os::windows::io::AsHandle;
         crate::wait::exit_only::Target::Handle(child.as_handle())
     };
-    let id = match resolve_identity(child.id(), &through) {
+    let pid = child.id();
+    let id = match resolve_identity(pid, &through) {
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
             #[cfg(target_os = "macos")]
-            leave_unverified_child(
-                child,
-                if matches!(other, crate::identity::Resolved::Gone) {
+            let fate = {
+                let identity = if matches!(other, crate::identity::Resolved::Gone) {
                     crate::containment::RootIdentity::Gone
                 } else {
                     crate::containment::RootIdentity::Unknown
-                },
-            );
+                };
+                leave_unverified_child(child, identity);
+                FrontFate::of_unverified(identity)
+            };
             #[cfg(not(target_os = "macos"))]
-            teardown_unadopted(child);
+            let fate = teardown_unadopted_or_front(child, front);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
-            // treat a live, merely-unreadable child as a startup failure.
-            return Err(spawn_identity_error(other));
+            // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
+            return Err(fate.note(spawn_identity_error(other), front, Some(pid)));
         }
     };
     // The pidfd is already held, so adopting cannot fail.
@@ -484,20 +525,21 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Err((error, child)) => return Err(teardown_after_failed_adoption(child, error)),
     };
 
-    Ok(Child::from_parts(
-        ProcHandle::std(shared),
-        id,
-        parent_ends,
-        kill_on_drop,
-        attachment,
-    ))
+    let mut child = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
+    child.set_front(cmd.elevation_front());
+    Ok(child)
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
 /// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it.
+/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it, and the error
+/// notes that a `front` is left unreaped.
 #[cfg(target_os = "macos")]
-fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::NotAdopted) -> Error {
+fn abandon_unadopted(
+    child: std::process::Child,
+    not_adopted: unique_report::NotAdopted,
+    front: Option<crate::elevation::front::Front>,
+) -> Error {
     if not_adopted.died_before_exec {
         log::warn!(
             "child {} died before exec; nothing is signalled or waited on by pid, so its status is not collected",
@@ -506,7 +548,9 @@ fn abandon_unadopted(child: std::process::Child, not_adopted: unique_report::Not
         drop(child);
         not_adopted.error
     } else {
-        teardown_after_failed_adoption(child, not_adopted.error)
+        let pid = child.id();
+        let error = teardown_after_failed_adoption(child, not_adopted.error);
+        FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid))
     }
 }
 
@@ -1162,7 +1206,7 @@ pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<
 }
 
 /// `containment::attach`, with a test-only seam to force its failure.
-#[cfg(any(windows, feature = "tokio"))]
+#[cfg(windows)]
 pub(crate) fn attach_or_fault(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
@@ -1197,8 +1241,13 @@ pub(crate) fn attach_or_fault_typed(
             error: Error::Containment {
                 detail: "forced attach failure (test seam)".into(),
             },
-            // A real macOS attach fails only on the root's identity read.
-            identity: cfg!(target_os = "macos").then_some(crate::containment::RootIdentity::Unknown),
+            // A real macOS attach fails only on the root's identity read: refused, or (with the
+            // vanish seam also set) found gone.
+            identity: cfg!(target_os = "macos").then_some(if fault::force_identity_vanished() {
+                crate::containment::RootIdentity::Gone
+            } else {
+                crate::containment::RootIdentity::Unknown
+            }),
         });
     }
     #[cfg(all(test, target_os = "linux"))]
@@ -1361,6 +1410,107 @@ impl Unadopted for HeldStdChild {
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.through.wait()
     }
+}
+
+/// What a failed spawn's teardown did with its child, when that child is an elevation front (see
+/// [`crate::elevation::front`]), which it never signals: a kill of it would orphan the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    target_os = "macos",
+    allow(
+        dead_code,
+        reason = "macOS leaves an unverified child without tearing it down, so it is never reaped here"
+    )
+)]
+pub(crate) enum FrontFate {
+    /// Not a front: torn down as any child.
+    NotAFront,
+    /// It had exited by the teardown, and was reaped.
+    Reaped,
+    /// It was running, and is left unreaped (it stays a zombie once it exits).
+    LeftUnreaped,
+    /// It could not be waited on: reaped by someone else, or unreadable.
+    Unaccounted,
+}
+
+impl FrontFate {
+    /// The fate of a child left unverified (macOS: `leave_unverified_child`): one reaped by someone
+    /// else is unaccounted for, and any other is left unreaped.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS leaves a child unverified")
+    )]
+    pub(crate) fn of_unverified(identity: crate::containment::RootIdentity) -> FrontFate {
+        match identity {
+            crate::containment::RootIdentity::Gone => FrontFate::Unaccounted,
+            crate::containment::RootIdentity::Unknown => FrontFate::LeftUnreaped,
+        }
+    }
+
+    /// A failed spawn's `error`, with what became of the front `pid` (unknown: `None`) noted, its
+    /// variant and kind kept (see [`Error::with_note`]). Not a front's: `error` itself.
+    pub(crate) fn note(self, error: Error, front: Option<crate::elevation::front::Front>, pid: Option<u32>) -> Error {
+        let Some(front) = front else {
+            return error;
+        };
+        let what = crate::elevation::front::describe(front, pid);
+        let fate = match self {
+            FrontFate::NotAFront => {
+                debug_assert!(false, "a front's teardown reports its fate");
+                return error;
+            }
+            FrontFate::Reaped => "it was sent nothing, and had exited by the teardown, which reaped it",
+            FrontFate::LeftUnreaped => {
+                "it was sent nothing, so the elevated program may be running; it is left unreaped"
+            }
+            FrontFate::Unaccounted => {
+                "it was sent nothing and could not be waited on, so the elevated program may be running"
+            }
+        };
+        error.with_note(&format!("{what}; {fate}"))
+    }
+}
+
+/// [`teardown_unadopted`], unless `child` is an elevation front: a kill of that would orphan the
+/// elevated program. A front is sent nothing. One that has exited is reaped now; a live one is left
+/// unreaped, with nothing that waits for it, and stays a zombie once it exits.
+#[cfg(not(target_os = "macos"))]
+fn teardown_unadopted_or_front(mut child: impl Unadopted, front: Option<crate::elevation::front::Front>) -> FrontFate {
+    if front.is_none() {
+        teardown_unadopted(child);
+        return FrontFate::NotAFront;
+    }
+    // Dropping the handle afterwards closes it; it neither signals nor reaps the child.
+    match child.try_wait() {
+        Ok(Some(_)) => FrontFate::Reaped,
+        Ok(None) => {
+            log::warn!(
+                "spawn teardown left elevation front {} running, unsignalled and unreaped: a kill would orphan the \
+                 elevated program",
+                named(child.pid())
+            );
+            FrontFate::LeftUnreaped
+        }
+        // Reaped by someone else, or unreadable: nothing is signalled or waited on.
+        Err(e) => {
+            log::debug!(
+                "spawn teardown: elevation front {} cannot be waited on ({e})",
+                named(child.pid())
+            );
+            FrontFate::Unaccounted
+        }
+    }
+}
+
+/// [`teardown_through_pidfd`] for an elevation front: sent nothing, reaped now only if it has
+/// exited (see [`teardown_unadopted_or_front`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn leave_front_through_pidfd(
+    pid: Option<u32>,
+    pidfd: std::os::fd::OwnedFd,
+    front: crate::elevation::front::Front,
+) -> FrontFate {
+    teardown_unadopted_or_front(PidfdChild::new(pid, pidfd), Some(front))
 }
 
 /// Kill and reap, through `pidfd`, the child of a spawn that failed after its fork, unless it is
@@ -1546,6 +1696,8 @@ pub(crate) mod fault {
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
+        static FAIL_TOKIO_SPAWN: Cell<bool> = const { Cell::new(false) };
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -1578,6 +1730,39 @@ pub(crate) mod fault {
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     pub(crate) fn take_forgotten_leaf() -> Option<std::path::PathBuf> {
         FORGOTTEN_LEAF.with(|f| f.take())
+    }
+
+    /// While the guard lives, tokio's own `spawn()` on this thread fails after its fork, dropping the
+    /// child neither killed nor reaped, as a failed reaper registration (`epoll_ctl`'s `ENOSPC` or
+    /// `ENOMEM`) does. The child's pid is kept for [`take_forgotten_pid`].
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn fail_tokio_spawns_after_fork() -> FailTokioSpawns {
+        FAIL_TOKIO_SPAWN.with(|f| f.set(true));
+        FailTokioSpawns(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[must_use = "spawns succeed again as soon as the guard is dropped"]
+    pub(crate) struct FailTokioSpawns(());
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    impl Drop for FailTokioSpawns {
+        fn drop(&mut self) {
+            FAIL_TOKIO_SPAWN.with(|f| f.set(false));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn fail_tokio_spawn_after_fork(
+        spawned: std::io::Result<::tokio::process::Child>,
+    ) -> std::io::Result<::tokio::process::Child> {
+        if !FAIL_TOKIO_SPAWN.with(Cell::get) {
+            return spawned;
+        }
+        let child = spawned?;
+        FORGOTTEN_PID.with(|f| f.set(child.id()));
+        std::mem::forget(child);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
     }
 
     #[cfg(all(target_os = "linux", feature = "tokio"))]

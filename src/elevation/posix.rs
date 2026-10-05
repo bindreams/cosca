@@ -817,7 +817,8 @@ pub(crate) fn rewrite_with_host_and_cwd(
         Transition::ElevateWindows { .. } => unreachable!("planner never yields ElevateWindows on a unix host"),
         Transition::ElevateMacosGui { osascript, arg_max } => {
             let launch = super::macos::program_and_args(cmd, process_cwd)?;
-            let (derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
+            let (mut derived, report) = super::macos::build_rewrite(cmd, launch, &osascript, arg_max)?;
+            derived.set_elevation_front(super::front::front(Some(&report.via)));
             Ok(PosixRewrite {
                 derived: Some(derived),
                 report: Some(report),
@@ -948,10 +949,12 @@ pub(crate) fn rewrite_with_host_and_cwd(
             } else {
                 ElevatedStdio::Passthrough
             };
+            let via = ElevatedVia::Wrapped(backend);
+            derived.set_elevation_front(super::front::front(Some(&via)));
             Ok(PosixRewrite {
                 derived: Some(derived),
                 report: Some(ElevationReport {
-                    via: ElevatedVia::Wrapped(backend),
+                    via,
                     stripped_env: stripped,
                     stdio,
                 }),
