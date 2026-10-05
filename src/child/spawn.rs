@@ -128,6 +128,9 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         gate => child.kill_sent_gated(gate),
     };
     let root_note = match root {
+        Ok(crate::signal::Sent::Gone) if exited_front => {
+            "the elevated child had already exited, and was reaped by someone else".to_string()
+        }
         Ok(crate::signal::Sent::Gone) => {
             "the elevated child could not be terminated (it was already reaped)".to_string()
         }
@@ -143,6 +146,10 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
                     } else {
                         "the elevated child was terminated".to_string()
                     }
+                }
+                Err(e) if exited_front => {
+                    log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
+                    format!("the elevated child had already exited, but could not be reaped ({e})")
                 }
                 Err(e) => {
                     log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
@@ -420,9 +427,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         through: PidfdChild::new(Some(child.id()), pidfd),
         child,
     };
-    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`). An attach
-    // with a leaf fails only on an undecidable verdict, which kills the child before `exec`: it never
-    // ran the program, so it is no front.
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
     #[cfg(target_os = "linux")]
     let in_cgroup = prepared.cgroup_leaf.is_some();
     #[cfg(not(target_os = "linux"))]
@@ -1205,7 +1210,7 @@ pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<
 }
 
 /// `containment::attach`, with a test-only seam to force its failure.
-#[cfg(any(windows, feature = "tokio"))]
+#[cfg(windows)]
 pub(crate) fn attach_or_fault(
     pid: u32,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,

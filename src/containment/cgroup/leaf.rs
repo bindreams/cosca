@@ -886,7 +886,7 @@ impl Drop for CgroupLeaf {
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            self.abandon_before_verdict(false);
+            self.abandon_before_verdict();
         }
         if self.abandoned {
             return;
@@ -994,9 +994,6 @@ pub(crate) enum Abandoned {
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
     /// signal, and its leaf does not hold it.
     OutOfReach,
-    /// The child is an elevation front its leaf does not hold, which was sent nothing (see
-    /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
-    Front(crate::child::spawn::FrontFate),
 }
 
 /// What became of the child itself when its spawn was abandoned.
@@ -1027,11 +1024,7 @@ impl CgroupLeaf {
     /// a child it forked and then failed to set up, neither killed nor reaped. A spawn path that
     /// still holds its child takes the verdict first, and one whose child `std` reaped leaves
     /// nothing to reap here.
-    ///
-    /// A child that is an elevation `front` (see [`crate::elevation::front`]) the leaf does not hold
-    /// is uncontained: it is sent nothing, since a kill of it would orphan its elevated program (see
-    /// [`end_unentered_front`]). One the leaf holds is answered as any child.
-    pub(crate) fn abandon_before_verdict(&mut self, front: bool) -> Abandoned {
+    pub(crate) fn abandon_before_verdict(&mut self) -> Abandoned {
         let Some(channel) = self.report.take() else {
             return Abandoned::Ended;
         };
@@ -1039,10 +1032,6 @@ impl CgroupLeaf {
         self.abandoned = true;
         let received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
-        if front && !self.entered {
-            self.remove_holding_nothing();
-            return end_unentered_front(&received);
-        }
         // The child first, by its pidfd and as its group, whatever the leaf's own kill does: it
         // may have left the leaf, or never entered it.
         let fate = end_child(&received);
@@ -1176,7 +1165,9 @@ impl CgroupLeaf {
 /// exits, however that comes.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
-    use rustix::process::{pidfd_send_signal, waitid, WaitIdOptions};
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use rustix::process::{pidfd_send_signal, waitid, WaitId, WaitIdOptions};
 
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("end_child");
@@ -1192,8 +1183,36 @@ fn end_child(received: &Received) -> ChildFate {
         log::warn!("cgroup v2: an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled");
         return ChildFate::Unkillable;
     };
-    let id = || wait_id(received, pid);
-    if !still_unreaped(received, pid) {
+    // The reap names the child by its pidfd, or — with its `/proc` directory proving the number is
+    // still its own, and it unreaped — by its pid.
+    let id = || match &received.pidfd {
+        Some(pidfd) => WaitId::PidFd(pidfd.as_fd()),
+        None => WaitId::Pid(pid),
+    };
+    // Still unreaped? A process `std` reaped is gone: its pidfd waits on nothing, its `/proc`
+    // directory opens nothing.
+    let unreaped = match &received.pidfd {
+        Some(_) => loop {
+            match waitid(
+                id(),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::CHILD) => break false,
+                _ => break true,
+            }
+        },
+        None => {
+            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
+            let stat = unsafe { libc::openat(handle.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if stat >= 0 {
+                // Safety: the descriptor just opened, closed once.
+                unsafe { libc::close(stat) };
+            }
+            stat >= 0
+        }
+    };
+    if !unreaped {
         return ChildFate::Gone;
     }
     #[cfg(test)]
@@ -1254,94 +1273,6 @@ fn end_child(received: &Received) -> ChildFate {
         }
     }
     ChildFate::Killed
-}
-
-/// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`
-/// directory proving the number is still its own, and it unreaped — its pid.
-#[cfg(target_os = "linux")]
-fn wait_id(received: &Received, pid: rustix::process::Pid) -> rustix::process::WaitId<'_> {
-    use std::os::fd::AsFd;
-    match &received.pidfd {
-        Some(pidfd) => rustix::process::WaitId::PidFd(pidfd.as_fd()),
-        None => rustix::process::WaitId::Pid(pid),
-    }
-}
-
-/// Whether the child `received` names, `pid`, is still unreaped. A process `std` reaped is gone:
-/// its pidfd waits on nothing, its `/proc` directory opens nothing. A child that sent no handle on
-/// itself is not.
-#[cfg(target_os = "linux")]
-fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
-    use rustix::process::{waitid, WaitIdOptions};
-    match (&received.pidfd, &received.proc_dir) {
-        (Some(_), _) => loop {
-            match waitid(
-                wait_id(received, pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            ) {
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::CHILD) => break false,
-                _ => break true,
-            }
-        },
-        (None, Some(proc_dir)) => {
-            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
-            let stat =
-                unsafe { libc::openat(proc_dir.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if stat >= 0 {
-                // Safety: the descriptor just opened, closed once.
-                unsafe { libc::close(stat) };
-            }
-            stat >= 0
-        }
-        (None, None) => false,
-    }
-}
-
-/// Answer for an abandoned spawn's elevation front its leaf does not hold: it is sent nothing. One
-/// that has exited is reaped; any other is left running and unreaped, with nothing that waits for
-/// it.
-///
-/// A child that never named itself, or that `std` collected, never ran the elevated program, so it
-/// is no front: it is answered as any child.
-#[cfg(target_os = "linux")]
-fn end_unentered_front(received: &Received) -> Abandoned {
-    use crate::child::spawn::FrontFate;
-    use rustix::process::{waitid, WaitIdOptions};
-
-    let Some((raw, pid)) = received
-        .pid
-        .and_then(|raw| Some((raw, rustix::process::Pid::from_raw(i32::try_from(raw).ok()?)?)))
-    else {
-        return Abandoned::MaybeUnreaped;
-    };
-    if received.pidfd.is_none() && received.proc_dir.is_none() {
-        log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) sent no handle on itself; it is left");
-        return Abandoned::Front(FrontFate::Unaccounted);
-    }
-    if !still_unreaped(received, pid) {
-        return Abandoned::Ended;
-    }
-    let exited = loop {
-        match waitid(wait_id(received, pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
-            Err(rustix::io::Errno::INTR) => continue,
-            other => break other,
-        }
-    };
-    match exited {
-        Ok(Some(_)) => Abandoned::Front(FrontFate::Reaped),
-        Ok(None) => {
-            log::warn!(
-                "cgroup v2: an abandoned spawn's elevation front (pid {raw}) is outside its leaf; it is left \
-                 running, unsignalled and unreaped: a kill would orphan the elevated program"
-            );
-            Abandoned::Front(FrontFate::LeftUnreaped)
-        }
-        Err(e) => {
-            log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be waited on ({e})");
-            Abandoned::Front(FrontFate::Unaccounted)
-        }
-    }
 }
 
 /// What names a child to its reaper: its own pidfd, or its pid once its `/proc` directory proved

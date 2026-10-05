@@ -289,7 +289,11 @@ async fn a_front_whose_exec_fails_is_not_noted() {
 #[skuld::test]
 async fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
     use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_spawn, fail_the_report_read};
-    let (err, pid) = fail_a_front_spawn(fail_the_report_read, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let (err, pid) = fail_a_front_spawn(
+        |_| {},
+        fail_the_report_read,
+        |cmd| crate::tokio::spawn::spawn(cmd).map(drop),
+    );
     assert_unadopted_front_noted(&err, pid);
 }
 
@@ -299,6 +303,25 @@ async fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 #[skuld::test]
 async fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
     use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_spawn, refuse_the_identity};
-    let (err, pid) = fail_a_front_spawn(refuse_the_identity, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let (err, pid) = fail_a_front_spawn(
+        |_| {},
+        refuse_the_identity,
+        |cmd| crate::tokio::spawn::spawn(cmd).map(drop),
+    );
+    assert_unadopted_front_noted(&err, pid);
+}
+
+/// Async twin of the sync `macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted`.
+/// Mutant: the attach failure's front is taken for one reaped elsewhere, which "could not be waited
+/// on".
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted() {
+    use crate::child::front_kill_tests::{
+        assert_unadopted_front_noted, fail_a_front_spawn, refuse_the_identity, walk_the_tree,
+    };
+    let (err, pid) = fail_a_front_spawn(walk_the_tree, refuse_the_identity, |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop)
+    });
     assert_unadopted_front_noted(&err, pid);
 }

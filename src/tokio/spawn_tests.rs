@@ -244,8 +244,8 @@ fn the_unreachable_child_warning_is_every_time() {
 
     for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
         let mark = crate::log_capture::mark();
-        _ = super::abandoned_error(child, error(), None);
-        _ = super::abandoned_error(child, error(), None);
+        super::warn_for_abandoned_child(child, &error());
+        super::warn_for_abandoned_child(child, &error());
 
         assert_eq!(
             crate::log_capture::levels_since(mark, marker),
@@ -265,7 +265,7 @@ fn ended_abandoned_child_logs_nothing() {
     let marker = "cosca-abandoned-ended-probe-3a17";
 
     let mark = crate::log_capture::mark();
-    _ = super::abandoned_error(AbandonedChild::Ended, error, None);
+    super::warn_for_abandoned_child(AbandonedChild::Ended, &error);
 
     assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
 }

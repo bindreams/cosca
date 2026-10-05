@@ -93,33 +93,3 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
     assert_left_unsignalled(&err, pid, stdin);
 }
-
-/// A front whose leaf did not take it, dropped by tokio after its fork, is sent nothing, by the
-/// handshake or the leaf, and left unreaped, and the error says so. The failure comes from the
-/// `fail_tokio_spawns_after_fork` seam. Mutant: the handshake reads "contained" from the leaf the
-/// spawn prepared, not from its verdict, and tears the front down.
-#[skuld::test]
-async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixture(cgroup)] _group: &Group) {
-    use crate::child::front_kill_tests::assert_reaped_unsignalled;
-    use crate::child::spawn::fault;
-    let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let err = {
-        let _failing = fault::fail_tokio_spawns_after_fork();
-        crate::tokio::spawn::spawn(&mut cmd)
-            .map(drop)
-            .expect_err("the forced failure fails the spawn")
-    };
-    let pid = fault::take_forgotten_pid().expect("the seam forked a child");
-    let crate::error::Error::Io(io) = &err else {
-        panic!("the spawn's error keeps its variant: {err:?}");
-    };
-    assert_eq!(io.raw_os_error(), None, "noted, with the original as its source: {io}");
-    let text = err.to_string();
-    assert!(text.contains("the spawned child is what sudo left"), "{text}");
-    assert!(
-        text.contains("the elevated program may be running; it is left unreaped"),
-        "{text}"
-    );
-    drop(stdin);
-    assert_reaped_unsignalled(pid);
-}

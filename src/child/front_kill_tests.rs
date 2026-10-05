@@ -234,6 +234,36 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     assert!(!detail.contains("terminated"), "{detail}");
 }
 
+/// A failed password write to a front that had exited, whose reap then fails (as when someone else
+/// reaps the zombie first), says the front had exited, not that it was killed. The reap failure is
+/// forced; it still reaps first. Mutant: the failed reap of an exited front says it was killed.
+#[skuld::test]
+fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exited() {
+    let mut cmd = cat();
+    cmd.kill_on_drop(false);
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let _refused = crate::signal::seams::refuse_kills();
+    crate::child::spawn::fault::set_force_reap_failure("forced reap failure");
+    let err = crate::child::spawn::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("a failed write fails the spawn");
+    let Error::Elevation { detail, .. } = &err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    assert!(
+        detail.contains("the elevated child had already exited, but could not be reaped"),
+        "{detail}"
+    );
+    assert!(!detail.contains("killed"), "{detail}");
+}
+
 /// A `SIGTERM` would end osascript and orphan the program, so `terminate()` on a live osascript
 /// front sends nothing. Mutant: osascript's `SIGTERM` is sent (the `cat` dies of it).
 #[skuld::test]
@@ -417,7 +447,7 @@ fn an_unverified_childs_fate_follows_its_identity() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
-    let (err, pid) = fail_a_front_spawn(fail_the_report_read, |cmd| cmd.spawn().map(drop));
+    let (err, pid) = fail_a_front_spawn(|_| {}, fail_the_report_read, |cmd| cmd.spawn().map(drop));
     assert_unadopted_front_noted(&err, pid);
 }
 
@@ -427,8 +457,26 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
-    let (err, pid) = fail_a_front_spawn(refuse_the_identity, |cmd| cmd.spawn().map(drop));
+    let (err, pid) = fail_a_front_spawn(|_| {}, refuse_the_identity, |cmd| cmd.spawn().map(drop));
     assert_unadopted_front_noted(&err, pid);
+}
+
+/// macOS: a tree-walk spawn whose attach cannot read the front's identity (refused) leaves it
+/// unverified: sent nothing, and unreaped, and the error says so. The attach reads the root's
+/// identity only without the fd marker, which this spawn suppresses. Mutant (tokio): the attach
+/// failure's front is taken for one reaped elsewhere, which "could not be waited on".
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted() {
+    let (err, pid) = fail_a_front_spawn(walk_the_tree, refuse_the_identity, |cmd| cmd.spawn().map(drop));
+    assert_unadopted_front_noted(&err, pid);
+}
+
+/// Contains `cmd` by a tree walk without the fd marker, so its attach reads the root's identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn walk_the_tree(cmd: &mut Command) {
+    cmd.contain_with(ContainMode::TreeWalk);
+    cmd.suppress_fd_marker();
 }
 
 /// While it lives, this thread's reads of a spawned child's own unique-id report fail.
@@ -456,11 +504,12 @@ impl Drop for RefusedIdentity {
     }
 }
 
-/// Spawns, through `spawn` and with `force` armed, a `cat` front whose stdin is a pipe this function
+/// Spawns, through `spawn` and with `force` armed, a `cat` front, `configure`d, whose stdin is a pipe this function
 /// owns, and returns the spawn's error with the front's pid once the front has been shown to end
 /// unsignalled, after its stdin closed.
 #[cfg(target_os = "macos")]
 pub(crate) fn fail_a_front_spawn<G>(
+    configure: impl FnOnce(&mut Command),
     force: impl FnOnce() -> G,
     spawn: impl FnOnce(&mut Command) -> Result<(), Error>,
 ) -> (Error, u32) {
@@ -474,6 +523,7 @@ pub(crate) fn fail_a_front_spawn<G>(
     cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
         Backend::Sudo,
     ))));
+    configure(&mut cmd);
     let err = {
         let _forced = force();
         spawn(&mut cmd).expect_err("the forced failure fails the spawn")
