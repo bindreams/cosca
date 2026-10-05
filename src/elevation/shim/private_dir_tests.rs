@@ -1,5 +1,5 @@
 use super::super::fork_guard::Origin;
-use super::{check_facts, DirFacts, PrivateDir, PrivateDirError, Removal};
+use super::{check_facts, DirFacts, NotOriginal, PrivateDir, PrivateDirError, Removal};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -144,7 +144,7 @@ fn an_acl_with_only_denials_reads_and_our_own_entries_is_accepted() {
     ] {
         let (_root, dir) = acl_dir(ace);
         let made = PrivateDir::create_in(&dir).unwrap_or_else(|e| panic!("{ace:?}: {e}"));
-        assert_eq!(made.remove(), Removal::Removed);
+        assert_eq!(made.remove(Origin::Original).unwrap(), Removal::Removed);
     }
     let me = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(euid()))
         .unwrap()
@@ -152,7 +152,7 @@ fn an_acl_with_only_denials_reads_and_our_own_entries_is_accepted() {
         .name;
     let (_root, dir) = acl_dir(&format!("user:{me} allow add_file"));
     let made = PrivateDir::create_in(&dir).unwrap();
-    assert_eq!(made.remove(), Removal::Removed);
+    assert_eq!(made.remove(Origin::Original).unwrap(), Removal::Removed);
 }
 
 #[skuld::test]
@@ -193,8 +193,8 @@ fn accepts_the_real_system_tmpdir() {
     let other = PrivateDir::create_in(&tmp).unwrap();
     assert_ne!(dir.path(), other.path(), "the name is random");
     let (gone, also_gone) = (dir.path().to_owned(), other.path().to_owned());
-    assert_eq!(dir.remove(), Removal::Removed);
-    assert_eq!(other.remove(), Removal::Removed);
+    assert_eq!(dir.remove(Origin::Original).unwrap(), Removal::Removed);
+    assert_eq!(other.remove(Origin::Original).unwrap(), Removal::Removed);
     assert!(!gone.exists() && !also_gone.exists());
 }
 
@@ -207,7 +207,7 @@ fn cleanup_leaves_a_directory_swapped_in_under_our_name() {
     fs::rename(&path, root.path().join("moved")).unwrap();
     fs::create_dir(&path).unwrap();
     let mark = crate::log_capture::mark();
-    assert_eq!(dir.remove(), Removal::NotOurs);
+    assert_eq!(dir.remove(Origin::Original).unwrap(), Removal::NotOurs);
     assert!(path.is_dir(), "the stranger's directory under our name must stay");
     let path_text = path.display().to_string();
     assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
@@ -221,7 +221,7 @@ fn leftover_file_reports_not_empty_and_warns() {
     let path = dir.path().to_owned();
     fs::write(path.join("leftover"), b"x").unwrap();
     let mark = crate::log_capture::mark();
-    assert_eq!(dir.remove(), Removal::NotEmpty);
+    assert_eq!(dir.remove(Origin::Original).unwrap(), Removal::NotEmpty);
     assert!(path.join("leftover").exists(), "nothing inside is deleted");
     let path_text = path.display().to_string();
     assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
@@ -235,7 +235,7 @@ fn already_removed_directory_is_gone_and_not_a_warning() {
     let path = dir.path().to_owned();
     fs::remove_dir(&path).unwrap();
     let mark = crate::log_capture::mark();
-    assert_eq!(dir.remove(), Removal::Gone);
+    assert_eq!(dir.remove(Origin::Original).unwrap(), Removal::Gone);
     let path_text = path.display().to_string();
     assert!(!crate::log_capture::levels_since(mark, &path_text)
         .iter()
@@ -359,6 +359,30 @@ fn dropping_with_a_full_fd_table_does_not_panic() {
     assert!(!path.exists(), "the drop still removed the directory");
 }
 
+/// `remove` refuses, as an error in release builds too, for any origin but the creator's.
+#[skuld::test]
+fn remove_refuses_a_copy_and_an_unknown_origin() {
+    for origin in [Origin::Copy, Origin::Unknown] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = PrivateDir::create_unguarded(root.path()).unwrap();
+        let path = dir.path().to_owned();
+        assert_eq!(dir.remove(origin), Err(NotOriginal(origin)));
+        assert!(path.is_dir(), "{origin:?} must not remove the directory");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        fs::remove_dir(&path).unwrap();
+    }
+}
+
+/// An unguarded directory is removed by its owner only: dropping it does nothing.
+#[skuld::test]
+fn dropping_an_unguarded_directory_leaves_it() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = PrivateDir::create_unguarded(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    drop(dir);
+    assert!(path.is_dir());
+}
+
 /// A process whose origin cannot be told leaves the directory: from a copy, removing it would take
 /// the original's.
 #[skuld::test]
@@ -388,7 +412,7 @@ fn open_fails_after_removing(
 #[skuld::test]
 fn a_failure_after_mkdirat_removes_the_directory() {
     let root = tempfile::tempdir().unwrap();
-    let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails) else {
+    let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails, true) else {
         panic!("a failing open must be a Create error");
     };
     assert!(!path.exists(), "the half-made directory must not be left");
@@ -400,7 +424,8 @@ fn a_failed_cleanup_after_a_failure_warns() {
     crate::log_capture::install();
     let root = tempfile::tempdir().unwrap();
     let mark = crate::log_capture::mark();
-    let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails_after_removing)
+    let Err(PrivateDirError::Create { path, .. }) =
+        PrivateDir::create_with(root.path(), open_fails_after_removing, true)
     else {
         panic!("a failing open must be a Create error");
     };

@@ -1,4 +1,4 @@
-//! The private directory that holds the shim's socket (D14): a directory made `0700` (whatever the
+//! The private directory that holds the shim's socket: a directory made `0700` (whatever the
 //! umask says) with a random name in a temp directory no other user can tamper with, removed
 //! through file descriptors.
 
@@ -33,6 +33,11 @@ pub(crate) enum PrivateDirError {
     ForkGuard(io::Error),
 }
 
+/// [`PrivateDir::remove`] was asked by a process that is not the one that created the directory.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the private directory can only be removed by the process that created it, not by {0:?}")]
+pub(crate) struct NotOriginal(pub(crate) Origin);
+
 /// What removing a [`PrivateDir`] found. Every outcome except `Removed` is logged: `Gone` at
 /// `debug`, the rest at `warn`, naming the path.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,17 +55,17 @@ pub(crate) enum Removal {
 
 /// A private directory, identified by `(dev, ino)` and removed only if the name still holds it.
 ///
-/// [`remove`](Self::remove) is the explicit teardown. `Drop` is the same removal, with the same
-/// logging, so no path leaks the directory silently. Only the process that created the directory
-/// (told by its fork guard) removes it: a fork copy's `Drop` closes its own descriptors and nothing
-/// else.
+/// Only the process that created the directory removes it; a fork copy closes its own descriptors
+/// and nothing else. [`create_in`](Self::create_in) gives the directory its own fork guard, and
+/// its `Drop` removes it. [`create_unguarded`](Self::create_unguarded) is for an owner that already
+/// has one: it must call [`remove`](Self::remove) with its own [`Origin`], and `Drop` does nothing.
 pub(crate) struct PrivateDir {
     parent: OwnedFd,
     name: OsString,
     id: (u64, u64),
     path: PathBuf,
-    /// Tells the creating process from a fork copy of it (no I/O: `Drop` uses it).
-    creator: ForkGuard,
+    /// Tells the creating process from a fork copy of it, for a directory that is dropped on its own.
+    creator: Option<ForkGuard>,
     removed: bool,
 }
 
@@ -112,12 +117,18 @@ impl PrivateDir {
     /// In `tmp`, which must be absolute, and whose real path and every ancestor of it must pass
     /// [`check_facts`]; otherwise nothing is created.
     pub(crate) fn create_in(tmp: &Path) -> Result<Self, PrivateDirError> {
-        Self::create_with(tmp, open_and_harden)
+        Self::create_with(tmp, open_and_harden, true)
+    }
+
+    /// [`create_in`](Self::create_in) for an owner that tells its own [`Origin`]: no fork guard of
+    /// the directory's own, and nothing happens on `Drop`.
+    pub(crate) fn create_unguarded(tmp: &Path) -> Result<Self, PrivateDirError> {
+        Self::create_with(tmp, open_and_harden, false)
     }
 
     /// [`create_in`](Self::create_in), where `open` opens the directory just made, in `parent`
     /// under `name`, and returns its `stat`. A failure removes the directory.
-    fn create_with(tmp: &Path, open: OpenMade) -> Result<Self, PrivateDirError> {
+    fn create_with(tmp: &Path, open: OpenMade, guarded: bool) -> Result<Self, PrivateDirError> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let tmp_err = |source| PrivateDirError::Tmpdir {
@@ -148,7 +159,11 @@ impl PrivateDir {
         if !check_facts(&facts, euid) {
             return Err(unsafe_err(real));
         }
-        let creator = ForkGuard::new().map_err(PrivateDirError::ForkGuard)?;
+        let creator = if guarded {
+            Some(ForkGuard::new().map_err(PrivateDirError::ForkGuard)?)
+        } else {
+            None
+        };
         loop {
             let mut random = [0u8; 8];
             getrandom::fill(&mut random).map_err(|e| PrivateDirError::Create {
@@ -202,31 +217,32 @@ impl PrivateDir {
 
     /// Removes the directory if the name still holds the one we made, by `(dev, ino)`, with
     /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Logs as [`Removal`]
-    /// says. Only the process that created the directory may call it.
-    pub(crate) fn remove(mut self) -> Removal {
-        debug_assert_eq!(
-            self.creator.origin(),
-            Origin::Original,
-            "removed by a process that did not make it"
-        );
+    /// says. Refused, in release builds too, for any `origin` but [`Origin::Original`]: removing it
+    /// from a fork copy would take the original's.
+    pub(crate) fn remove(mut self, origin: Origin) -> Result<Removal, NotOriginal> {
+        if origin != Origin::Original {
+            return Err(NotOriginal(origin));
+        }
         self.removed = true;
-        self.remove_by_fd()
+        Ok(self.remove_by_fd())
     }
 
-    /// `Drop`'s body, for a process of this `origin`: nothing unless it is the process that created
-    /// the directory (told by its fork guard, not a bare pid), and the directory is not removed yet.
-    /// An origin that cannot be told leaves the directory: removing it from a copy would take the
-    /// original's.
+    /// `Drop`'s body, for a process of this `origin`: nothing once removed, and nothing unless it is
+    /// the process that created the directory. An origin that cannot be told leaves the directory,
+    /// and says so without the `log` facade, which a fork copy must not touch.
     fn release(&mut self, origin: Origin) {
-        if origin == Origin::Unknown {
-            log::warn!(
-                "cannot tell who made the private directory {}; left in place",
-                self.path.display()
-            );
+        if self.removed {
+            return;
         }
-        if origin == Origin::Original && !self.removed {
-            self.removed = true;
-            self.remove_by_fd();
+        match origin {
+            Origin::Original => {
+                self.removed = true;
+                self.remove_by_fd();
+            }
+            Origin::Copy => {}
+            Origin::Unknown => super::fork_guard::warn_unlogged(
+                b"cosca: cannot tell which process made a shim directory; left in place\n",
+            ),
         }
     }
 
@@ -260,7 +276,9 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        self.release(self.creator.origin());
+        if let Some(creator) = &self.creator {
+            self.release(creator.origin());
+        }
     }
 }
 

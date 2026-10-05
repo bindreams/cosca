@@ -9,7 +9,8 @@
 //! - **macOS:** the process's audit token (`task_info(mach_task_self(), TASK_AUDIT_TOKEN)`: pid and
 //!   pidversion), read at creation and again at each check. Unlike `proc_pidinfo`, it works under a
 //!   Seatbelt sandbox entered after creation. The read is a call that could in principle fail, so
-//!   [`Origin::Unknown`] exists: a contract violation, logged, and never taken for either answer.
+//!   [`Origin::Unknown`] exists: a contract violation, reported on stderr, and never taken for either
+//!   answer.
 //! - **Other platforms:** no exact mechanism, so [`ForkGuard::new`] is `Unsupported`.
 
 use std::io;
@@ -24,6 +25,13 @@ pub(crate) enum Origin {
     /// The platform could not say (macOS only, and a contract violation). Whoever asks must do only
     /// what is safe in both cases: nothing shared with the original, and nothing that waits on it.
     Unknown,
+}
+
+/// Writes `message` to stderr with a bare `write(2)`: for a process that may be a fork copy, where the
+/// `log` facade and the allocator are not safe to use. A failed write is ignored.
+pub(crate) fn warn_unlogged(message: &[u8]) {
+    // SAFETY: `write` to fd 2 from a valid buffer.
+    unsafe { libc::write(2, message.as_ptr().cast(), message.len()) };
 }
 
 /// Created by the original; [`origin`](Self::origin) is [`Origin::Copy`] in a fork copy of it.
@@ -53,7 +61,8 @@ impl ForkGuard {
         match self.guard.origin() {
             Ok(origin) => origin,
             Err(why) => {
-                log::warn!("cannot tell whether this process is the one that made a fork guard: {why}");
+                // Possibly a fork copy, which must not take the `log` facade's locks.
+                warn_unlogged(b"cosca: cannot tell whether this process made a fork guard\n");
                 debug_assert!(false, "the fork guard's identity read failed: {why}");
                 Origin::Unknown
             }

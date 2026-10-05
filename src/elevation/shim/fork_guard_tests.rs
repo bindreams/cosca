@@ -8,7 +8,7 @@ fn the_creator_is_the_original() {
 }
 
 /// A real fork copy reads `false`. Mutants: Linux, the page is not marked `MADV_WIPEONFORK` (the copy
-/// reads the marker); macOS, `is_original` is always true.
+/// reads the marker); macOS, `origin` is always `Original`.
 #[skuld::test]
 fn a_fork_copy_is_not_the_original() {
     let guard = ForkGuard::new().unwrap();
