@@ -89,8 +89,25 @@ fn kill_on_a_full_socket_is_unkillable_not_gone() {
 }
 
 #[skuld::test]
-fn owner_check_refuses_another_pid() {
+fn owner_check_refuses_another_process() {
     use super::super::outcome::{owner_check, NotOwner};
-    assert_eq!(owner_check(7, 7), Ok(()));
-    assert_eq!(owner_check(7, 8), Err(NotOwner));
+    use crate::identity::ProcessId;
+    let me = ProcessId::current();
+    assert_eq!(owner_check(me, me), Ok(()));
+    assert_eq!(
+        owner_check(
+            me,
+            ProcessId::from_parts(me.pid().wrapping_add(1), me.start_token_raw())
+        ),
+        Err(NotOwner)
+    );
+    // In another pid namespace a fork copy can have the owner's pid (1, for an init); only the start
+    // identity tells it apart.
+    assert_eq!(
+        owner_check(
+            me,
+            ProcessId::from_parts(me.pid(), me.start_token_raw().wrapping_add(1))
+        ),
+        Err(NotOwner)
+    );
 }

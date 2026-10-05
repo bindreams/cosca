@@ -71,21 +71,32 @@ impl Acceptor<'_> {
             }
 
             // The listener before the wake pipe: a shim queued before the stop is answered.
-            if incoming || stop {
-                self.accept_all()?;
-            }
+            let accepted = if incoming || stop {
+                self.accept_all(stop)
+            } else {
+                Ok(())
+            };
             if stop {
+                // The drain answers the peers already held whatever `accept` said. At teardown the
+                // state is settled, so there is nothing to fail closed: the error is only reported.
                 self.drain();
+                if let Err(failure) = accepted {
+                    log::warn!(
+                        "accept on {} failed during teardown ({failure:?}); the backlog may be closed unanswered",
+                        self.shared.sock_path.display()
+                    );
+                }
                 return Ok(());
             }
+            accepted?;
             self.say_hellos(&ready);
         }
     }
 
     /// Takes every connection queued, root ones into `pending`.
-    fn accept_all(&mut self) -> Result<(), AcceptorFailure> {
+    fn accept_all(&mut self, stopping: bool) -> Result<(), AcceptorFailure> {
         loop {
-            let accepted = match self.shared.probe.accept_error() {
+            let accepted = match self.shared.probe.accept_error(stopping) {
                 Some(errno) => Err(io::Error::from(errno)),
                 None => sys::accept(&self.shared.probe, self.listener),
             };

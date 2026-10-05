@@ -58,15 +58,18 @@ pub(super) fn bind_listener(probe: &Probe, path: &Path) -> io::Result<UnixListen
     let listener = create_fds(probe, || {
         let listener = UnixListener::bind(path)?;
         set_nosigpipe(listener.as_fd())?;
+        probe.listener_made(listener.as_fd());
         Ok::<_, io::Error>(listener)
     })?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
 
-/// Accepts one connection, still blocking and without `SO_NOSIGPIPE`; the caller prepares it
-/// ([`prepare_conn`]), because a peer that already left makes that fail. `Ok(None)` when none is
-/// queued.
+/// Accepts one connection; the caller prepares it ([`prepare_conn`]), because a peer that already
+/// left makes that fail. `Ok(None)` when none is queued.
+///
+/// On macOS the accepted socket inherits `O_NONBLOCK` and `SO_NOSIGPIPE` from the listener; on Linux
+/// it inherits neither. `prepare_conn` therefore sets both, and owes nothing to the listener.
 pub(super) fn accept(probe: &Probe, listener: &UnixListener) -> io::Result<Option<UnixStream>> {
     match create_fds(probe, || listener.accept()) {
         Ok((conn, _)) => Ok(Some(conn)),
@@ -81,8 +84,9 @@ pub(super) fn prepare_conn(conn: &UnixStream) -> io::Result<()> {
     set_nosigpipe(conn.as_fd())
 }
 
-/// The wake pipe: the acceptor polls its read end, teardown writes the stop byte to its write end.
-pub(super) fn wake_pipe(probe: &Probe) -> io::Result<(PipeReader, PipeWriter)> {
+/// A pipe: the wake pipe (the acceptor polls its read end, teardown writes the stop byte to its
+/// write end) and the settled pipe (written once, when the outcome is set).
+pub(super) fn pipe(probe: &Probe) -> io::Result<(PipeReader, PipeWriter)> {
     create_fds(probe, std::io::pipe)
 }
 
@@ -150,7 +154,25 @@ pub(super) fn poll_ready(fds: &mut [PollFd<'_>]) -> Result<(), Errno> {
     }
 }
 
-/// Blocks until `conn` is readable, hung up or in error.
-pub(super) fn wait_readable(conn: BorrowedFd<'_>) -> Result<(), Errno> {
-    poll_ready(&mut [PollFd::new(&conn, PollFlags::IN)])
+/// Blocks until `conn` is readable (or hung up, or in error) or `settled` is. `on_armed` gets the
+/// number of descriptors about to be polled. Returns on `EINTR` too: the caller re-checks the
+/// outcome after every wake.
+pub(super) fn wait_for_frame_or_outcome(
+    conn: BorrowedFd<'_>,
+    settled: &PipeReader,
+    on_armed: impl FnOnce(usize),
+) -> Result<(), Errno> {
+    let mut fds = [PollFd::new(&conn, PollFlags::IN), PollFd::new(settled, PollFlags::IN)];
+    on_armed(fds.len());
+    match poll(&mut fds, None) {
+        Ok(_) | Err(Errno::INTR) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `fd` is readable now, without blocking.
+pub(super) fn is_readable(fd: &PipeReader) -> bool {
+    let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut fds = [PollFd::new(fd, PollFlags::IN)];
+    matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
 }

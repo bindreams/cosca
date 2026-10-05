@@ -2,6 +2,7 @@
 //!
 //! No thread holds the lock across a blocking call: every socket call made under it is nonblocking.
 
+use std::io::{PipeReader, PipeWriter};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -54,6 +55,9 @@ pub(super) struct Shared {
     /// The shim's connection, set once, by the `Pending` to `Live` transition. Closed only in
     /// teardown (D7): a reader never closes it.
     pub(super) conn: OnceLock<UnixStream>,
+    /// Written once, when the outcome is set, so a waiter that found nothing to read and then lost
+    /// the frame to another reader still wakes: it polls this next to `conn`.
+    settled: (PipeReader, PipeWriter),
     pub(super) sock_path: PathBuf,
     /// The euid a shim must have: root, in production.
     pub(super) peer_euid: u32,
@@ -61,7 +65,7 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    pub(super) fn new(sock_path: PathBuf, peer_euid: u32, probe: Probe) -> Self {
+    pub(super) fn new(sock_path: PathBuf, peer_euid: u32, probe: Probe, settled: (PipeReader, PipeWriter)) -> Self {
         Shared {
             inner: Mutex::new(Inner {
                 start: StartState::Pending,
@@ -73,6 +77,7 @@ impl Shared {
                 unlinked: false,
             }),
             conn: OnceLock::new(),
+            settled,
             sock_path,
             peer_euid,
             probe,
@@ -188,6 +193,14 @@ impl Shared {
             }
         }
         inner.outcome = Some(outcome);
+        // Under the lock, so a waiter that sees no outcome and then polls sees this byte at the
+        // latest: the outcome is set before the byte, and the byte stays.
+        if let Err(e) = rustix::io::write(&self.settled.1, &[1]) {
+            log::warn!(
+                "cannot signal the outcome of the shim at {}: {e}",
+                self.sock_path.display()
+            );
+        }
     }
 
     /// Reads what the connection has into the frame buffer, without blocking, until the frame
@@ -199,7 +212,7 @@ impl Shared {
             let (settled, more) = match sys::read_some(conn.as_fd(), &mut inner.frame[len..]) {
                 Read::Bytes(n) => {
                     inner.frame_len += n;
-                    self.probe.event(|| LinkEvent::Read(n));
+                    self.probe.event(|| LinkEvent::Read(n, std::thread::current().id()));
                     (classify(&inner.frame[..inner.frame_len], false), true)
                 }
                 Read::Eof => (classify(&inner.frame[..len], true), false),
@@ -247,8 +260,17 @@ impl Shared {
                 return outcome;
             }
             let conn = self.conn.get().expect("Live has a connection");
-            self.probe.event(|| LinkEvent::Parked);
-            if let Err(e) = sys::wait_readable(conn.as_fd()) {
+            self.probe.event(|| LinkEvent::Parked(std::thread::current().id()));
+            self.probe.waiter_gate();
+            // Another reader may settle the outcome from here on and leave `conn` empty, with the
+            // shim's end still open: only the settled signal then wakes this waiter.
+            let armed = |fds| {
+                self.probe.event(|| LinkEvent::Polling {
+                    fds,
+                    settled_readable: sys::is_readable(&self.settled.0),
+                });
+            };
+            if let Err(e) = sys::wait_for_frame_or_outcome(conn.as_fd(), &self.settled.0, armed) {
                 // Cannot wait on the shim any more: the honest answer is that it is lost.
                 log::warn!("waiting for the shim at {}: {e}", self.sock_path.display());
                 let mut inner = self.lock();

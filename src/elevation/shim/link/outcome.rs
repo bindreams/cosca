@@ -4,6 +4,7 @@
 use std::io;
 
 use crate::elevation::shim::protocol::{decode_frame, Frame, FrameError, NotExecuted, Refusal};
+use crate::identity::ProcessId;
 
 /// Why the acceptor stopped serving (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,9 +18,11 @@ pub(crate) enum AcceptorFailure {
 /// Why the program never ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotStartedCause {
-    /// cosca withheld the answer: the front ended, or `kill` or teardown refused the start first.
+    /// cosca withheld the answer: the front ended, or `kill` or teardown refused the start, and the
+    /// acceptor did not fail.
     Withheld,
-    /// The acceptor failed before it answered a shim.
+    /// The acceptor failed while the start was not `Live`. It wins over [`Withheld`](Self::Withheld),
+    /// even when `kill` had refused the start first (D4).
     AcceptorFailed(AcceptorFailure),
     /// An `F` frame: the shim has positive evidence the program never ran.
     NotExecuted(NotExecuted),
@@ -57,7 +60,9 @@ impl LinkOutcome {
     }
 }
 
-/// The outcome the bytes read so far settle, if any. `bytes` is at most one frame; `eof` says no more
+/// The outcome the bytes read so far settle, if any. A short or garbled frame is a real outcome (a
+/// shim of another version, a crash mid-write), so it is `ShimLost` and never a `debug_assert`
+/// (principle 7). `bytes` is at most one frame; `eof` says no more
 /// will come.
 pub(super) fn classify(bytes: &[u8], eof: bool) -> Option<LinkOutcome> {
     match decode_frame(bytes) {
@@ -109,8 +114,9 @@ pub(crate) enum KillError {
 #[error("a fork copy of the link cannot control it")]
 pub(crate) struct NotOwner;
 
-/// D21: only the pid that bound the link controls it.
-pub(super) fn owner_check(owner: u32, current: u32) -> Result<(), NotOwner> {
+/// D21: only the process that bound the link controls it. A bare pid does not tell processes apart:
+/// a fork copy in another pid namespace can have the owner's pid.
+pub(super) fn owner_check(owner: ProcessId, current: ProcessId) -> Result<(), NotOwner> {
     if owner == current {
         Ok(())
     } else {

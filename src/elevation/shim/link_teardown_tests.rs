@@ -1,6 +1,6 @@
 //! Teardown (D14) and the pid that owns the link (D21).
 
-use super::super::fake_shim::Rig;
+use super::super::fake_shim::{next_acceptor_event, FakeShim, Rig};
 use super::super::probe::LinkEvent;
 use super::super::{KillOutcome, LinkOutcome, StartState};
 use crate::elevation::shim::protocol::{Command, Frame};
@@ -65,32 +65,57 @@ fn teardown_removes_the_directory_and_closes_the_connection() {
     assert_eq!(shim.read_byte(), None, "the connection is closed");
 }
 
+/// A fork copy's real `Drop` leaves the owner's link as it was.
 #[skuld::test]
 fn fork_copy_drop_leaves_the_owner_intact() {
     let rig = Rig::new();
     let socket = rig.link.dir().join(super::super::SOCKET_NAME);
     assert!(socket.exists());
     let Rig {
-        mut link,
+        link,
         probe,
         events,
         tmp: _tmp,
     } = rig;
-    // As a fork copy would drop it: some other pid.
-    link.release(std::process::id() + 1);
-    assert!(socket.exists(), "a fork copy does not unlink the path");
-    assert!(link.dir().exists(), "a fork copy does not remove the directory");
-    let mut shim = super::super::fake_shim::FakeShim::connect(link.dir()).unwrap();
-    shim.hello();
-    loop {
-        match events.recv().unwrap() {
-            LinkEvent::Answered(Command::Allow) => break,
-            LinkEvent::AcceptorExited | LinkEvent::Dropped(_) => panic!("the owner's acceptor stopped"),
-            _ => {}
-        }
+    // SAFETY: the child only drops the copy and `_exit`s; nothing unwinds out of it.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(link)));
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(if dropped.is_ok() { 0 } else { 101 }) };
     }
+    let waiter = {
+        let probe = probe.clone();
+        std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: `pid` is this test's own unreaped child.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            probe.inject(LinkEvent::ChildExited);
+            status
+        })
+    };
+    // A copy that tore the owner's link down would stop the owner's acceptor first (and hang in its
+    // join, in a thread that does not exist there).
+    let first = next_acceptor_event(&events);
+    if first != LinkEvent::ChildExited {
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        waiter.join().unwrap();
+        panic!("the copy's drop disturbed the owner: {first:?}");
+    }
+    let status = waiter.join().unwrap();
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "child status {status:#x}"
+    );
+    assert!(socket.exists(), "a fork copy does not unlink the path");
+    let mut shim = FakeShim::connect(link.dir()).unwrap();
+    shim.hello();
+    assert_eq!(next_acceptor_event(&events), LinkEvent::Accepted);
+    assert_eq!(next_acceptor_event(&events), LinkEvent::Answered(Command::Allow));
     assert_eq!(shim.read_byte(), Some(b'A'));
     assert_eq!(link.observe().unwrap().start, StartState::Live);
     assert_eq!(link.kill().unwrap(), KillOutcome::Delivered);
-    let _ = probe;
+    // `link` drops here, in its owner: the acceptor is joined.
 }

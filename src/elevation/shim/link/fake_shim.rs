@@ -48,7 +48,7 @@ impl FakeShim {
 pub(crate) fn next_acceptor_event(rx: &Receiver<LinkEvent>) -> LinkEvent {
     loop {
         match rx.recv().expect("the link's probe outlives its events") {
-            LinkEvent::Parked | LinkEvent::Read(_) => continue,
+            LinkEvent::Parked(_) | LinkEvent::Read(..) => continue,
             event => return event,
         }
     }

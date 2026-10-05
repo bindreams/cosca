@@ -98,15 +98,36 @@ fn accept_failure_while_live_keeps_control() {
 
 #[skuld::test]
 fn acceptor_panic_fails_closed() {
-    let rig = Rig::new();
+    let mut rig = Rig::new();
     rig.probe.panic_acceptor();
     let _wakes_the_acceptor = rig.connect();
-    rig.expect_event(LinkEvent::AcceptorExited);
+    // Joined directly: a thread that dies without the guard still ends, so this cannot hang.
+    let thread = rig.link.acceptor.take().expect("the acceptor thread");
+    assert!(thread.join().is_err(), "the acceptor panicked");
     let seen = rig.link.observe().unwrap();
     assert_eq!(seen.start, StartState::Refused);
     assert_eq!(seen.acceptor_failure, Some(AcceptorFailure::Panicked));
     assert!(!socket_exists(&rig));
     assert_eq!(rig.link.kill().unwrap(), KillOutcome::RefusedStart);
+}
+
+#[skuld::test]
+fn the_final_drain_answers_the_backlog_even_when_accept_fails_at_stop() {
+    let rig = Rig::new();
+    let marker = rig.log_marker();
+    // Held, silent: the drain answers it N hello or not.
+    let mut held = rig.connect();
+    rig.expect_event(LinkEvent::Accepted);
+    rig.probe.fail_accept_at_stop(Errno::MFILE);
+    let mark = crate::log_capture::mark();
+    let super::fake_shim::Rig { link, .. } = rig;
+    drop(link);
+    assert_eq!(held.read_byte(), Some(b'N'));
+    let levels = crate::log_capture::levels_since(mark, &marker);
+    assert!(
+        !levels.contains(&log::Level::Error),
+        "a teardown-time accept error is not an acceptor failure: {levels:?}"
+    );
 }
 
 #[skuld::test]

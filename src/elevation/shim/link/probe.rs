@@ -25,13 +25,18 @@ pub(crate) enum LinkEvent {
     /// An answer was written (`A` or `N`) and the state updated.
     Answered(Command),
     /// A waiter is about to block for the frame.
-    Parked,
+    Parked(std::thread::ThreadId),
     /// Bytes of the frame were read.
-    Read(usize),
+    Read(usize, std::thread::ThreadId),
     /// The final drain began; whether the socket path still existed then.
     DrainStarted { path_exists: bool },
     /// The acceptor thread ended.
     AcceptorExited,
+    /// A waiter is about to poll `fds` descriptors; whether the outcome's settled signal is already
+    /// raised.
+    Polling { fds: usize, settled_readable: bool },
+    /// Injected by a test thread that waited for a child process.
+    ChildExited,
 }
 
 #[cfg(not(test))]
@@ -45,10 +50,12 @@ impl Probe {
     }
     pub(super) fn event(&self, _: impl FnOnce() -> LinkEvent) {}
     pub(super) fn acceptor_gate(&self) {}
+    pub(super) fn waiter_gate(&self) {}
+    pub(super) fn listener_made(&self, _: std::os::fd::BorrowedFd<'_>) {}
     pub(super) fn poll_error(&self) -> Option<rustix::io::Errno> {
         None
     }
-    pub(super) fn accept_error(&self) -> Option<rustix::io::Errno> {
+    pub(super) fn accept_error(&self, _stopping: bool) -> Option<rustix::io::Errno> {
         None
     }
     pub(super) fn fd_created(&self, _spawn_lock_held: bool) {}
@@ -73,8 +80,11 @@ mod hooks {
         events: Sender<LinkEvent>,
         /// While `true`, the acceptor waits after each wake, before it serves anything.
         held: Mutex<bool>,
+        /// While `true`, a waiter waits after finding no outcome, before it polls.
+        waiters_held: Mutex<bool>,
         held_changed: Condvar,
         accept_errors: Mutex<VecDeque<Errno>>,
+        stop_accept_errors: Mutex<VecDeque<Errno>>,
         poll_errors: Mutex<VecDeque<Errno>>,
         panic_at_gate: AtomicBool,
         fds: Mutex<Vec<bool>>,
@@ -95,8 +105,10 @@ mod hooks {
             let hooks = Hooks {
                 events,
                 held: Mutex::new(false),
+                waiters_held: Mutex::new(false),
                 held_changed: Condvar::new(),
                 accept_errors: Mutex::new(VecDeque::new()),
+                stop_accept_errors: Mutex::new(VecDeque::new()),
                 poll_errors: Mutex::new(VecDeque::new()),
                 panic_at_gate: AtomicBool::new(false),
                 fds: Mutex::new(Vec::new()),
@@ -118,10 +130,34 @@ mod hooks {
             self.hooks().held_changed.notify_all();
         }
 
+        /// Holds each waiter after it found no outcome, before it polls.
+        pub(crate) fn hold_waiters(&self) {
+            *self.hooks().waiters_held.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        }
+
+        pub(crate) fn release_waiters(&self) {
+            *self.hooks().waiters_held.lock().unwrap_or_else(PoisonError::into_inner) = false;
+            self.hooks().held_changed.notify_all();
+        }
+
+        /// Puts `event` in the event stream, from a thread of the test's.
+        pub(crate) fn inject(&self, event: LinkEvent) {
+            self.event(|| event);
+        }
+
         /// The acceptor's next `accept` fails with `errno`.
         pub(crate) fn fail_next_accept(&self, errno: Errno) {
             self.hooks()
                 .accept_errors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back(errno);
+        }
+
+        /// The acceptor's `accept` fails with `errno` in the wake that stops it, and in no other.
+        pub(crate) fn fail_accept_at_stop(&self, errno: Errno) {
+            self.hooks()
+                .stop_accept_errors
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(errno);
@@ -165,17 +201,40 @@ mod hooks {
             }
         }
 
+        pub(in crate::elevation::shim::link) fn waiter_gate(&self) {
+            let Some(h) = &self.0 else { return };
+            let mut held = h.waiters_held.lock().unwrap_or_else(PoisonError::into_inner);
+            while *held {
+                held = h.held_changed.wait(held).unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+
+        /// macOS: a test clears `SO_NOSIGPIPE` on the listener, so that a connection's option can
+        /// only have come from `prepare_conn`.
+        #[cfg_attr(
+            not(target_os = "macos"),
+            allow(unused_variables, reason = "only macOS has the option")
+        )]
+        pub(in crate::elevation::shim::link) fn listener_made(&self, listener: std::os::fd::BorrowedFd<'_>) {
+            #[cfg(target_os = "macos")]
+            if self.0.is_some() {
+                rustix::net::sockopt::set_socket_nosigpipe(listener, false).expect("the listener's option clears");
+            }
+        }
+
         pub(in crate::elevation::shim::link) fn poll_error(&self) -> Option<Errno> {
             let h = self.0.as_ref()?;
             h.poll_errors.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
         }
 
-        pub(in crate::elevation::shim::link) fn accept_error(&self) -> Option<Errno> {
+        pub(in crate::elevation::shim::link) fn accept_error(&self, stopping: bool) -> Option<Errno> {
             let h = self.0.as_ref()?;
-            h.accept_errors
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop_front()
+            let queue = if stopping {
+                &h.stop_accept_errors
+            } else {
+                &h.accept_errors
+            };
+            queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
         }
 
         pub(in crate::elevation::shim::link) fn fd_created(&self, spawn_lock_held: bool) {
@@ -191,6 +250,7 @@ mod hooks {
         pub(in crate::elevation::shim::link) fn release(&self) {
             if self.0.is_some() {
                 self.release_acceptor();
+                self.release_waiters();
             }
         }
     }

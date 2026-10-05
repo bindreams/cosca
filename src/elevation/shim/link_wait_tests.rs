@@ -155,20 +155,18 @@ fn two_threads_waiting_concurrently_get_the_same_outcome() {
         let b = scope.spawn(|| rig.link.wait().unwrap());
         // Both are about to block for the frame before a byte of it exists.
         for _ in 0..2 {
-            loop {
-                if rig.events.recv().unwrap() == LinkEvent::Parked {
-                    break;
-                }
-            }
+            while !matches!(rig.events.recv().unwrap(), LinkEvent::Parked(_)) {}
         }
         let frame = Frame::Status(0x2a00).encode();
         shim.send(&frame[..3]);
         // One of them has read the first part before the rest exists.
-        loop {
-            if rig.events.recv().unwrap() == LinkEvent::Read(3) {
-                break;
+        let reader = loop {
+            if let LinkEvent::Read(3, thread) = rig.events.recv().unwrap() {
+                break thread;
             }
-        }
+        };
+        // That waiter ends its read call and parks again, so the rest is read by a later call.
+        while rig.events.recv().unwrap() != LinkEvent::Parked(reader) {}
         shim.send(&frame[3..]);
         shim.close();
         (a.join().unwrap(), b.join().unwrap())
@@ -203,4 +201,44 @@ fn a_frame_sent_before_the_shim_closed_with_k_unread_is_still_read() {
     shim.send_frame(Frame::Status(0x0900));
     shim.close();
     assert_eq!(rig.link.wait().unwrap(), LinkOutcome::Exited(0x0900));
+}
+
+#[skuld::test]
+fn waiters_whose_frame_went_to_another_reader_wake_on_the_outcome() {
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    rig.probe.hold_waiters();
+    let (polls, first, second) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| rig.link.wait().unwrap());
+        let b = scope.spawn(|| rig.link.wait().unwrap());
+        // Both found no outcome and are held before they poll.
+        for _ in 0..2 {
+            while !matches!(rig.events.recv().unwrap(), LinkEvent::Parked(_)) {}
+        }
+        // The shim keeps its end open after the frame; a reader in the waiters' position takes it.
+        shim.send_frame(Frame::Status(0x2a00));
+        assert_eq!(rig.link.try_wait().unwrap(), Some(LinkOutcome::Exited(0x2a00)));
+        rig.probe.release_waiters();
+        let mut polls = Vec::new();
+        while polls.len() < 2 {
+            if let event @ LinkEvent::Polling { .. } = rig.events.recv().unwrap() {
+                polls.push(event);
+            }
+        }
+        // Closing the shim ends a waiter that nothing else would wake, so a failure below is an
+        // assertion and not a hang.
+        shim.close();
+        (polls, a.join().unwrap(), b.join().unwrap())
+    });
+    let expected = LinkEvent::Polling {
+        fds: 2,
+        settled_readable: true,
+    };
+    assert_eq!(
+        polls,
+        [expected, expected],
+        "each waiter polls the settled signal, already raised"
+    );
+    assert_eq!(first, LinkOutcome::Exited(0x2a00));
+    assert_eq!(second, LinkOutcome::Exited(0x2a00));
 }
