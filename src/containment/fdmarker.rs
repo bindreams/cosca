@@ -812,14 +812,9 @@ pub(crate) struct Marker {
     /// `read`'s OWN handle, captured at `install()` time — see `PreparedMarker::read_handle`'s
     /// doc comment. What `sweep`'s entry contract re-checks against `read` at signal time.
     read_handle: u64,
-    /// The root's identity, for the ppid-walk channel. `None` when it could not be read at
-    /// attach — the marker channel still runs.
-    root: Option<ProcessId>,
-    /// `true` only when `root` is `None` BECAUSE the OS refused to answer (`Resolved::Unknown`)
-    /// — never for a root that had already exited (`Resolved::Gone`, a routine outcome; see
-    /// `dispatch.rs`). `sweep_pass` folds this into `incomplete` on every pass for the marker's
-    /// whole life, since a denial (unlike a dead root) is a real, standing teardown gap.
-    root_denied: bool,
+    /// The root's identity, for the ppid-walk channel: the one the spawn verified against the
+    /// child's handle, never a read by pid at attach.
+    root: ProcessId,
     /// The root's process group, when the requested mode created one. `None` for TreeWalk.
     pgid: Option<i32>,
     /// The descriptor number the marker occupies in the child, copied from
@@ -913,22 +908,12 @@ fn combine_group_errors(first: Error, latest: Error) -> Error {
 }
 
 impl Marker {
-    pub(crate) fn new(
-        prepared: PreparedMarker,
-        root: Option<ProcessId>,
-        pgid: Option<i32>,
-        root_denied: bool,
-    ) -> Marker {
-        debug_assert!(
-            !(root_denied && root.is_some()),
-            "root_denied must only be set when root is None"
-        );
+    pub(crate) fn new(prepared: PreparedMarker, root: ProcessId, pgid: Option<i32>) -> Marker {
         Marker {
             read: prepared.read,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
             root,
-            root_denied,
             pgid,
             own_fd: prepared.fd,
         }
@@ -959,9 +944,10 @@ impl Marker {
         self.pgid.is_some()
     }
 
-    /// Whether the root's identity was read at attach, so the ppid walk has something to start from.
-    pub(crate) fn has_root(&self) -> bool {
-        self.root.is_some()
+    /// The root the ppid walk starts from. Tests only.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> ProcessId {
+        self.root
     }
 
     /// The group `killpg` targets, if this mode created one.
@@ -1290,16 +1276,6 @@ impl Marker {
             }
         }
 
-        // A root that could not be resolved BECAUSE the OS refused (not because it had already
-        // exited — see `Marker::root_denied`'s doc) is a standing gap for this marker's whole
-        // life: fold it in every pass, the same as a blind pass or an unqueryable holder.
-        //
-        // Not when the root's number is off limits (`by_root_number` false): the gap is in the
-        // channel that names the root, which this pass then does not run.
-        if by_root_number && self.root_denied {
-            *incomplete = true;
-        }
-
         // Channel 1+2: the root (needs no snapshot — already a resolved `ProcessId`) plus its
         // ppid-walk descendants NOT already signalled this sweep (need THIS pass's snapshot;
         // skipped when blind, since there is nothing to walk). `descendants` applies the
@@ -1307,7 +1283,8 @@ impl Marker {
         //
         // Skipped when `by_root_number` is false: the root's pid names no one reliably any more.
         let mut new_walk: Vec<ProcessId> = Vec::new();
-        if let Some(root) = self.root.filter(|_| by_root_number) {
+        if by_root_number {
+            let root = self.root;
             #[cfg(test)]
             crate::containment::treewalk::fault::note_walk(root.pid());
             if seen.insert(root) {
@@ -1432,7 +1409,7 @@ impl Marker {
             // `kill_tree` handle backstop to be the sole killer regardless of which mechanism a
             // given platform actually attaches for a request.
             #[cfg(test)]
-            if Some(id) == self.root && fault::take_force_root_kill_noop() {
+            if id == self.root && fault::take_force_root_kill_noop() {
                 continue;
             }
             // `KillOutcome::NotAttempted` means the OS refused to query or signal an identity
@@ -1551,4 +1528,4 @@ impl Marker {
 
 #[cfg(test)]
 #[path = "fdmarker_tests.rs"]
-mod fdmarker_tests;
+pub(crate) mod fdmarker_tests;

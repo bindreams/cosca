@@ -959,6 +959,13 @@ fn wait_reapable(pid: u32, identity: u64) -> Waited {
             Waited::Exited
         }
         Ok(Awaited::Gone) => Waited::Foreign,
+        Ok(Awaited::Orphaned) => {
+            log::warn!(
+                "wait_and_reap: child {pid} cannot be shown to be ours or reaped (launchd holds it, because its \
+                 tracer died)"
+            );
+            Waited::Foreign
+        }
         // Unbounded, so the deadline cannot pass: a contract breach.
         Ok(Awaited::DeadlinePassed) => {
             log::warn!("wait_and_reap: the unbounded wait on child {pid} reported a passed deadline");

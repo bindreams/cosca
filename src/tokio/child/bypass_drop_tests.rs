@@ -160,8 +160,8 @@ async fn tokio_bypass_drop_after_a_refused_kill_and_a_foreign_reap_reaps_nothing
 
 /// `reap_now`'s refused-kill arm must not hand tokio's drop a child that is not shown ours: it
 /// forgets it instead. A forced attach failure, a refused kill and forced evidence, for a child
-/// that exited before the identity read. `evidence` arms the evidence inside the hook, where the
-/// handshake's own peeks are done.
+/// that exited after the identity check. `evidence` arms the evidence inside the hook, where the
+/// handshake's and the identity check's own peeks are done.
 fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -170,14 +170,14 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
 
     let slot: Rc<RefCell<Option<Witness>>> = Rc::default();
     let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
-    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+    let _hook = fault::set_at(fault::SpawnPoint::BeforeAttach, {
         let slot = Rc::clone(&slot);
         let armed = Rc::clone(&armed);
         move || {
             let witness = Witness::new(fault::spawn_pid());
             witness.wait_exited();
-            // Armed here, not before `spawn()`: the handshake's own watch peek runs first and
-            // would consume it.
+            // Armed here, not before `spawn()`: the handshake's own watch peek and the identity
+            // check's run first and would consume it.
             *armed.borrow_mut() = Some(evidence());
             *slot.borrow_mut() = Some(witness);
         }

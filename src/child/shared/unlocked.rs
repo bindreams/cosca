@@ -175,6 +175,14 @@ impl SharedChild {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,
             Waited::Gone => Unlocked::Gone,
+            // Not ours to reap, and not shown reaped: the wait gives up on it, saying so.
+            Waited::Orphaned => {
+                log::warn!(
+                    "pid {}: cannot be shown to be ours or reaped (launchd holds it, because its tracer died)",
+                    self.id.pid()
+                );
+                Unlocked::Gone
+            }
         })
     }
 

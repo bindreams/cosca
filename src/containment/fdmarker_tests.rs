@@ -39,6 +39,12 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use super::{holders, holds_marker, holds_marker_query, pipe_handle_of, MarkerQuery, PipeFdInfo, PROC_PIDFDPIPEINFO};
 
+/// A root no process holds and no process can be a child of (past `PID_MAX`), so the ppid-walk
+/// channel finds nothing and a test sees only the channels it is about.
+pub(crate) fn inert_root() -> crate::identity::ProcessId {
+    crate::identity::ProcessId::from_parts_for_test(0x7FFF_FFF0, 1)
+}
+
 fn all_pids() -> Vec<crate::identity::RawPid> {
     crate::containment::enumerate::snapshot().0
 }
@@ -683,8 +689,8 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let ppid = parents.iter().find(|(p, _)| *p == orphan).map(|(_, pp)| *pp);
     assert_eq!(ppid, Some(1), "precondition: the orphan must be reparented to launchd");
 
-    // No root identity: sh is reaped, so ONLY the marker channel can reach the orphan.
-    let marker = super::Marker::new(prepared, None, None, false);
+    // The root is inert: sh is reaped, so ONLY the marker channel can reach the orphan.
+    let marker = super::Marker::new(prepared, inert_root(), None);
     marker.hard_kill().expect("hard_kill");
 
     // If `hard_kill()` missed the orphan, the live `cat` echoes this byte and then exits on the
@@ -745,7 +751,7 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
         "precondition: the escapee no longer holds the marker"
     );
 
-    let marker = super::Marker::new(prepared, None, None, false);
+    let marker = super::Marker::new(prepared, inert_root(), None);
     marker.hard_kill().expect("hard_kill");
 
     // Alive, proven positively: a line in, the same line back — the sweep must not have
@@ -762,32 +768,6 @@ fn hard_kill_never_reaches_a_pid_that_closed_the_marker_before_the_sweep() {
 
     drop(stdin);
     _ = child.wait();
-}
-
-/// A root whose identity could not be read because the OS refused (`root_denied` — set only
-/// for `Resolved::Unknown`, never for a root that had simply already exited; see
-/// `dispatch.rs`) is a standing gap for the marker's whole life: `hard_kill` must report
-/// `incomplete` even on a pass that converges immediately with nothing else to signal — proving
-/// the flag actually reaches `finish_sweep`, not merely that `Marker::new` accepts it.
-#[skuld::test]
-fn hard_kill_reports_incomplete_for_a_denied_root_even_with_nothing_else_to_signal() {
-    let (read, write) = std::io::pipe().expect("pipe");
-    let handle = super::pipe_handle_of(write.as_fd()).expect("handle");
-    let read_handle = super::pipe_handle_of(read.as_fd()).expect("read handle");
-    let prepared = super::PreparedMarker {
-        read: std::os::fd::OwnedFd::from(read),
-        handle,
-        read_handle,
-        fd: write.as_fd().as_raw_fd(),
-    };
-    drop(write); // nobody holds the write end: nothing for the sweep to find or signal
-
-    let marker = super::Marker::new(prepared, None, None, true);
-    let err = marker.hard_kill().expect_err("a denied root must report incomplete");
-    assert!(
-        matches!(err, crate::error::Error::Unassessable { source: None, .. }),
-        "unexpected error shape: {err:?}"
-    );
 }
 
 /// `pid_is_live_group_member` — the group-signal re-fire gate's anchor — confirms a real,
@@ -894,7 +874,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     await_member_ready(&mut p_child); // P's own group exists before T and Q ask to join it.
     let pgid = p_child.id() as i32;
 
-    let pass1_marker = super::Marker::new(scratch, None, Some(pgid), false);
+    let pass1_marker = super::Marker::new(scratch, inert_root(), Some(pgid));
     let mut seen: std::collections::HashSet<crate::identity::ProcessId> = std::collections::HashSet::new();
     let mut group_result: Result<(), crate::error::Error> = Ok(());
     let mut incomplete = false;
@@ -939,7 +919,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     await_member_ready(&mut q_child);
 
     let handle = prepared.handle;
-    let marker = super::Marker::new(prepared, None, Some(pgid), false);
+    let marker = super::Marker::new(prepared, inert_root(), Some(pgid));
     let mark = crate::log_capture::mark();
 
     // A stand-in for the sibling record this assertion must ignore, emitted inside the window
@@ -1016,7 +996,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::install(&mut cmd, &[]).expect("install");
-    let marker = super::Marker::new(prepared, None, None, false);
+    let marker = super::Marker::new(prepared, inert_root(), None);
 
     let id = match crate::identity::ProcessId::of(1) {
         crate::identity::Resolved::Found(id) => id,
@@ -1040,14 +1020,17 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 /// but real identity like pid 1 cannot be used as `root` here, because `treewalk::descendants`
 /// would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
 /// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
-/// `root: None, pgid: None` keeps every channel this test does not need inert, so the blind
+/// `inert_root()` and `pgid: None` keep every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
 #[skuld::test]
 fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     let _serialize = test_spawn_lock();
     let mut cmd = std::process::Command::new("/usr/bin/true");
     let prepared = super::install(&mut cmd, &[]).expect("install");
-    let marker = super::Marker::new(prepared, None, None, false);
+    // The write end closes with the command: the root's pass below makes progress, so a second,
+    // seeing pass follows, and it must not find this process holding its own marker.
+    drop(cmd);
+    let marker = super::Marker::new(prepared, inert_root(), None);
 
     crate::containment::enumerate::force_blind_snapshot_for_next_call(true);
     let result = marker.hard_kill();
@@ -1092,37 +1075,18 @@ fn teardown_mechanism_failure_includes_listing_failure_unassessable() {
 // Holders-only sweeps (a reaped root) =====
 
 /// A marker nothing was spawned under, its write end closed with the command.
-fn marker_without_holders(
-    root: Option<crate::identity::ProcessId>,
-    pgid: Option<i32>,
-    root_denied: bool,
-) -> super::Marker {
+fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -> super::Marker {
     let mut cmd = std::process::Command::new("true");
     let prepared = super::install(&mut cmd, &[]).expect("install a scratch marker");
     drop(cmd);
-    super::Marker::new(prepared, root, pgid, root_denied)
+    super::Marker::new(prepared, root, pgid)
 }
 
-/// `root_denied` is a gap in the channel that names the root, which a holders-only sweep does not
-/// run. Mutant: the fold is not gated on `by_root_number`.
+/// The drop's skip names what the marker would have done by the root's number: the walk always,
+/// and the group only when the mode made one. Mutant: the rule drops the walk, or names a group
+/// the marker does not have.
 #[skuld::test]
-fn a_holders_only_sweep_does_not_report_a_denied_root_as_a_gap() {
-    let _serialize = test_spawn_lock();
-    let marker = marker_without_holders(None, None, true);
-    assert!(
-        marker.hard_kill().is_err(),
-        "control: a full sweep reports the denied root as a gap"
-    );
-    marker
-        .hard_kill_holders_only()
-        .expect("no holders, and the root's channel is not run");
-}
-
-/// The drop's skip names only what the marker would have done by the root's number. A marker with
-/// neither a group nor a root (it exited before attach, in `TreeWalk` mode) would have done
-/// nothing, so it warns of nothing. Mutant: the rule ignores the root.
-#[skuld::test]
-fn a_marker_with_neither_a_group_nor_a_root_is_not_named_by_the_roots_number() {
+fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     let _serialize = test_spawn_lock();
     crate::log_capture::install();
     let view = crate::containment::DropView {
@@ -1137,20 +1101,18 @@ fn a_marker_with_neither_a_group_nor_a_root_is_not_named_by_the_roots_number() {
         crate::log_capture::records_since_on_current_thread(mark, "Child::drop: the root is already reaped")
     };
 
-    assert_eq!(text(marker_without_holders(None, None, false)), []);
-
     let root = crate::identity::ProcessId::from_parts_for_test(4242, 1);
-    let rooted = text(marker_without_holders(Some(root), None, false));
+    let rooted = text(marker_without_holders(root, None));
     assert_eq!(rooted.len(), 1, "{rooted:?}");
     assert!(
         rooted[0].1.contains("root pid 4242") && !rooted[0].1.contains("pgid"),
         "{rooted:?}"
     );
 
-    let grouped = text(marker_without_holders(None, Some(4242), false));
+    let grouped = text(marker_without_holders(root, Some(4243)));
     assert_eq!(grouped.len(), 1, "{grouped:?}");
     assert!(
-        grouped[0].1.contains("pgid 4242") && !grouped[0].1.contains("root pid"),
+        grouped[0].1.contains("pgid 4243") && grouped[0].1.contains("root pid 4242"),
         "{grouped:?}"
     );
 }
