@@ -9,8 +9,14 @@ use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, Refusal, Signa
 #[skuld::test]
 fn front_exit_while_pending_is_not_started() {
     let rig = Rig::new();
+    // A pending start has no connection to read; a `wait` that tries panics, and that is the failure.
+    let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.link.wait().unwrap()));
+    assert!(
+        waited.is_ok(),
+        "wait on a pending start must refuse it, not read a connection"
+    );
     assert_eq!(
-        rig.link.wait().unwrap(),
+        waited.unwrap(),
         LinkOutcome::NotStarted(NotStarted {
             shim_connected: false,
             cause: NotStartedCause::Withheld,
