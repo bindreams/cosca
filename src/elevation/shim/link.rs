@@ -48,6 +48,15 @@ pub(crate) enum BindError {
         tmpdir: std::path::PathBuf,
         source: io::Error,
     },
+    #[error(
+        "TMPDIR ({}) is too long: the shim's socket path would be {length} bytes, and this system allows {limit}",
+        tmpdir.display()
+    )]
+    TmpdirTooLong {
+        tmpdir: std::path::PathBuf,
+        length: usize,
+        limit: usize,
+    },
 }
 
 pub(crate) struct ShimLink {
@@ -72,6 +81,17 @@ impl ShimLink {
 
     pub(crate) fn bind_probed(tmp: &Path, peer_euid: u32, probe: Probe) -> Result<Self, BindError> {
         let owner = ForkGuard::new().map_err(BindError::ForkGuard)?;
+        // Before anything is created: a socket path that cannot fit `sun_path` is refused. A temp
+        // directory that cannot be resolved is reported by the private directory instead.
+        if let Ok(real) = std::fs::canonicalize(tmp) {
+            if let Err((length, limit)) = sys::full_path_fits(&real, SOCKET_NAME) {
+                return Err(BindError::TmpdirTooLong {
+                    tmpdir: tmp.to_owned(),
+                    length,
+                    limit,
+                });
+            }
+        }
         let dir = PrivateDir::create_unguarded(tmp)?;
         let sock_path = dir.path().join(SOCKET_NAME);
         // Any failure from here on removes what was made: the socket file, if it was bound, goes

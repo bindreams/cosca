@@ -80,6 +80,26 @@ pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> io::Re
     Ok(via_proc.join(name))
 }
 
+/// Whether the socket's full path fits `sun_path`: `Err(limit)` if it does not, `limit` being the
+/// longest path (the field holds a terminating NUL). The path is `<real tmp>/<directory name>/<name>`.
+/// Only macOS binds by full path; Linux binds relative to the directory's descriptor.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn full_path_fits(real_tmp: &Path, name: &str) -> Result<(), (usize, usize)> {
+    // SAFETY: an all-zero `sockaddr_un` is valid.
+    let limit = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len() - 1;
+    let length = real_tmp.as_os_str().len() + 1 + crate::elevation::shim::private_dir::NAME_LEN + 1 + name.len();
+    if length > limit {
+        Err((length, limit))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn full_path_fits(_: &Path, _: &str) -> Result<(), (usize, usize)> {
+    Ok(())
+}
+
 /// macOS has no `bindat`, so the socket is bound at its full path.
 #[cfg(not(target_os = "linux"))]
 pub(super) fn socket_path(_: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {

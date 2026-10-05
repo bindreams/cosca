@@ -325,3 +325,25 @@ fn an_unusable_proc_is_refused_naming_tmpdir() {
         "nothing is left behind"
     );
 }
+
+/// macOS binds by full path, so a `TMPDIR` that would overflow `sun_path` is refused before the
+/// directory is made, naming `TMPDIR` and the limit. Mutant: no length check.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_tmpdir_too_long_for_sun_path_is_refused_before_anything_is_made() {
+    use super::super::link::BindError;
+    crate::log_capture::install();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut nested = tmp.path().to_owned();
+    while nested.as_os_str().len() < 90 {
+        nested.push("n".repeat(20));
+    }
+    std::fs::create_dir_all(&nested).unwrap();
+    let (probe, _events) = super::probe::Probe::new();
+    let Err(error @ BindError::TmpdirTooLong { .. }) = super::ShimLink::bind_probed(&nested, my_euid(), probe) else {
+        panic!("a TMPDIR that cannot hold the socket path must be refused up front");
+    };
+    let text = error.to_string();
+    assert!(text.contains("TMPDIR") && text.contains("103"), "{text}");
+    assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0, "nothing is made");
+}
