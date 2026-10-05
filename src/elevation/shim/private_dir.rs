@@ -16,6 +16,10 @@ mod facts;
 
 use facts::{check_dir, DirFacts, Unfit};
 
+/// The length of the directory's name, `cosca-` and 16 hex digits: a caller can tell how long a path
+/// into the directory will be before it creates one.
+pub(crate) const NAME_LEN: usize = 22;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PrivateDirError {
     #[error("the temp directory {} is not an absolute path", .0.display())]
@@ -186,6 +190,7 @@ impl PrivateDir {
                 source: io::Error::other(e),
             })?;
             let name = OsString::from(format!("cosca-{:016x}", u64::from_ne_bytes(random)));
+            debug_assert_eq!(name.len(), NAME_LEN);
             let path = real.join(&name);
             match mkdirat(&parent, &name, Mode::RWXU) {
                 Ok(()) => {}
