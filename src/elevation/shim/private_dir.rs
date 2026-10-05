@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{fchmod, fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
@@ -14,7 +14,7 @@ use super::fork_guard::{ForkGuard, Origin};
 
 mod facts;
 
-use facts::{check_dir, DirFacts, Unfit};
+use facts::{check_dir, check_facts, DirFacts, FsOverride, Unfit};
 
 /// The length of the directory's name, `cosca-` and 16 hex digits: a caller can tell how long a path
 /// into the directory will be before it creates one.
@@ -32,7 +32,7 @@ pub(crate) enum PrivateDirError {
     )]
     Unsafe { tmpdir: PathBuf, offender: PathBuf },
     #[error(
-        "the temp directory {} is on {filesystem}, which the private directory refuses ({} is on it); set TMPDIR to a local directory",
+        "the temp directory {} (resolved to {}) is on {filesystem}, which the private directory refuses; set TMPDIR to a local directory",
         tmpdir.display(), offender.display()
     )]
     Filesystem {
@@ -109,12 +109,13 @@ fn io_err(e: Errno) -> io::Error {
     e.into()
 }
 
-/// `path` and every ancestor, leaf first, with the first one that fails [`check_dir`].
-fn unsafe_ancestor(real: &Path, euid: u32) -> io::Result<Option<(PathBuf, Unfit)>> {
+/// `path` and every ancestor, leaf first, with the first one that fails [`check_facts`]. Only the
+/// temp directory itself is checked for its filesystem: a local one under a network root is fine.
+fn unsafe_ancestor(real: &Path, euid: u32) -> io::Result<Option<PathBuf>> {
     for path in real.ancestors() {
         let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)?;
-        if let Err(unfit) = check_dir(&DirFacts::read(path, &st, euid)?, euid) {
-            return Ok(Some((path.to_owned(), unfit)));
+        if !check_facts(&DirFacts::read(path, &st, euid)?, euid) {
+            return Ok(Some(path.to_owned()));
         }
     }
     Ok(None)
@@ -126,8 +127,21 @@ impl PrivateDir {
         Self::create_in(&std::env::temp_dir())
     }
 
-    /// In `tmp`, which must be absolute, and whose real path and every ancestor of it must pass
-    /// [`check_dir`]; otherwise nothing is created.
+    /// The real path of `tmp`, which must be absolute. A caller that needs to look at the path
+    /// before anything is created resolves once and passes it to
+    /// [`create_unguarded_resolved`](Self::create_unguarded_resolved).
+    pub(crate) fn resolve(tmp: &Path) -> Result<PathBuf, PrivateDirError> {
+        if !tmp.is_absolute() {
+            return Err(PrivateDirError::TmpdirNotAbsolute(tmp.to_owned()));
+        }
+        std::fs::canonicalize(tmp).map_err(|source| PrivateDirError::Tmpdir {
+            path: tmp.to_owned(),
+            source,
+        })
+    }
+
+    /// In `tmp`, which must be absolute. Every ancestor of its real path must pass [`check_facts`],
+    /// and `tmp` itself [`check_dir`]; otherwise nothing is created.
     pub(crate) fn create_in(tmp: &Path) -> Result<Self, PrivateDirError> {
         Self::create_with(tmp, open_and_harden, true)
     }
@@ -138,32 +152,37 @@ impl PrivateDir {
         Self::create_with(tmp, open_and_harden, false)
     }
 
-    /// [`create_in`](Self::create_in) with the opening of the new directory replaced by `open`. A
-    /// failure removes the directory.
+    /// [`create_unguarded`](Self::create_unguarded) for a `real` path from [`resolve`](Self::resolve).
+    pub(crate) fn create_unguarded_resolved(tmp: &Path, real: PathBuf) -> Result<Self, PrivateDirError> {
+        Self::create_resolved(tmp, real, open_and_harden, false, None)
+    }
+
     fn create_with(tmp: &Path, open: OpenMade, guarded: bool) -> Result<Self, PrivateDirError> {
+        let real = Self::resolve(tmp)?;
+        Self::create_resolved(tmp, real, open, guarded, None)
+    }
+
+    /// [`create_in`](Self::create_in) with the opening of the new directory replaced by `open`, and
+    /// `over` standing in for the temp directory's `statfs`. A failure removes the directory.
+    fn create_resolved(
+        tmp: &Path,
+        real: PathBuf,
+        open: OpenMade,
+        guarded: bool,
+        over: Option<FsOverride>,
+    ) -> Result<Self, PrivateDirError> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let tmp_err = |source| PrivateDirError::Tmpdir {
             path: tmp.to_owned(),
             source,
         };
-        if !tmp.is_absolute() {
-            return Err(PrivateDirError::TmpdirNotAbsolute(tmp.to_owned()));
-        }
-        let real = std::fs::canonicalize(tmp).map_err(tmp_err)?;
-        let unfit_err = |offender, unfit| match unfit {
-            Unfit::Writable => PrivateDirError::Unsafe {
-                tmpdir: tmp.to_owned(),
-                offender,
-            },
-            Unfit::Filesystem(filesystem) => PrivateDirError::Filesystem {
-                tmpdir: tmp.to_owned(),
-                offender,
-                filesystem,
-            },
+        let unsafe_err = |offender| PrivateDirError::Unsafe {
+            tmpdir: tmp.to_owned(),
+            offender,
         };
-        if let Some((offender, unfit)) = unsafe_ancestor(&real, euid).map_err(tmp_err)? {
-            return Err(unfit_err(offender, unfit));
+        if let Some(offender) = unsafe_ancestor(&real, euid).map_err(tmp_err)? {
+            return Err(unsafe_err(offender));
         }
         let parent = openat(
             CWD,
@@ -174,9 +193,17 @@ impl PrivateDir {
         .map_err(|e| tmp_err(io_err(e)))?;
         // The path walk above may have raced a rename; the descriptor we hold is checked again.
         let st = fstat(&parent).map_err(|e| tmp_err(io_err(e)))?;
-        let facts = DirFacts::read(&real, &st, euid).map_err(tmp_err)?;
-        if let Err(unfit) = check_dir(&facts, euid) {
-            return Err(unfit_err(real, unfit));
+        let facts = DirFacts::read_fd(parent.as_fd(), &real, &st, euid, over).map_err(tmp_err)?;
+        match check_dir(&facts, euid) {
+            Ok(()) => {}
+            Err(Unfit::Writable) => return Err(unsafe_err(real)),
+            Err(Unfit::Filesystem(filesystem)) => {
+                return Err(PrivateDirError::Filesystem {
+                    tmpdir: tmp.to_owned(),
+                    offender: real,
+                    filesystem,
+                })
+            }
         }
         let creator = if guarded {
             Some(ForkGuard::new().map_err(PrivateDirError::ForkGuard)?)
@@ -236,10 +263,10 @@ impl PrivateDir {
         &self.path
     }
 
-    /// The directory itself. A socket in it is bound and connected relative to this descriptor, so
-    /// that a long `TMPDIR` cannot overflow `sun_path`.
+    /// The directory itself. On Linux a socket in it is bound and connected relative to this
+    /// descriptor, so that a long `TMPDIR` cannot overflow `sun_path`; macOS has no `bindat`, and
+    /// binds by full path.
     pub(crate) fn dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd;
         self.dir.as_fd()
     }
 

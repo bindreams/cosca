@@ -3,6 +3,8 @@
 use std::io;
 use std::path::Path;
 
+use std::os::fd::BorrowedFd;
+
 use rustix::fs::Stat;
 
 const STICKY: u32 = 0o1000;
@@ -35,13 +37,36 @@ pub(crate) struct DirFacts {
     pub(crate) acl_grants_others: bool,
     /// The filesystem's type (`f_type`) where the platform reports one (Linux); 0 elsewhere.
     pub(crate) fs_type: u64,
+    /// The volume is not local (macOS: its mount flags lack `MNT_LOCAL`, as a network share's do).
+    pub(crate) not_local: bool,
 }
 
-/// Filesystems whose permissions and ownership are enforced by something other than this kernel's
-/// own view of local users: another host (NFS, SMB/CIFS, Ceph, AFS, Coda, NCP, Lustre), a hypervisor
-/// (9p), or a user-space daemon (FUSE). Neither the `0700` mode nor the rename protection the path
-/// check relies on holds there (root squashing, uid mapping, server-side policy), and Unix sockets
-/// are not reliable on them. Local filesystems, overlayfs and eCryptfs included, are not listed.
+/// What a test makes the directory's `statfs` say: the mount flags and the filesystem type.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FsOverride {
+    pub(crate) mount_flags: u32,
+    pub(crate) fs_type: u64,
+}
+
+/// XNU's `MNT_LOCAL`: the volume is on a local device.
+#[cfg(target_os = "macos")]
+fn mount_not_local(mount_flags: u32) -> bool {
+    mount_flags & libc::MNT_LOCAL as u32 == 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_not_local(_: u32) -> bool {
+    false
+}
+
+/// Filesystems whose permissions and ownership are decided by something other than this kernel's own
+/// view of local users: another host (NFS, SMB/CIFS, Ceph, AFS, kAFS, Coda, NCP, Lustre, GPFS,
+/// BeeGFS, PanFS), a hypervisor or its guest tools (9p, vboxsf, prl_fs, vmhgfs), or a user-space
+/// daemon (FUSE). Neither the `0700` mode nor the rename protection the path check relies on holds
+/// there (root squashing, uid mapping, server-side policy), and Unix sockets are not reliable on
+/// them. The list follows coreutils' `stat.c` (`human_fstype`, which marks the same types remote or
+/// shared) for the types that fit that rule. Local filesystems, overlayfs and eCryptfs are not
+/// listed.
 const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x6969, "NFS"),
     (0x6573_5546, "FUSE"),
@@ -54,6 +79,13 @@ const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x564C, "NCP"),
     (0x0BD0_0BD0, "Lustre"),
     (0x0102_1997, "9p"),
+    (0x6B41_4653, "kAFS"),
+    (0x786F_4256, "vboxsf"),
+    (0x7C7C_6673, "prl_fs"),
+    (0xBACB_ACBC, "vmhgfs"),
+    (0x4750_4653, "GPFS"),
+    (0x1983_0326, "BeeGFS"),
+    (0xAAD7_AAEA, "PanFS"),
 ];
 
 /// The name of the network or user-space filesystem `fs_type` is, if it is one the private directory
@@ -80,6 +112,9 @@ pub(crate) fn check_dir(facts: &DirFacts, euid: u32) -> Result<(), Unfit> {
     if let Some(name) = refused_filesystem(facts.fs_type) {
         return Err(Unfit::Filesystem(name));
     }
+    if facts.not_local {
+        return Err(Unfit::Filesystem("a volume that is not local"));
+    }
     if check_facts(facts, euid) {
         Ok(())
     } else {
@@ -101,15 +136,40 @@ impl DirFacts {
             mode: st.st_mode.into(),
             ignores_ownership: mount_ignores_ownership(mount_flags),
             acl_grants_others,
+            not_local: mount_not_local(mount_flags),
         }
     }
 
-    /// The facts of the directory at `path`, whose `stat` is `st`.
+    /// The facts of the directory at `path`, whose `stat` is `st`, for an ancestor of the temp
+    /// directory: only who owns it and who can change it matter, so no filesystem type is read.
     pub(crate) fn read(path: &Path, st: &Stat, euid: u32) -> io::Result<Self> {
-        Ok(Self::from_parts(
+        let mut facts = Self::from_parts(
             st,
             platform::mount_flags(path)?,
-            platform::fs_type(path)?,
+            0,
+            platform::acl_grants_others(path, euid)?,
+        );
+        facts.not_local = false;
+        Ok(facts)
+    }
+
+    /// The facts of the temp directory itself, open as `fd` at `path`, whose `stat` is `st`: its
+    /// filesystem is read from the descriptor (or from `over`, in a test).
+    pub(crate) fn read_fd(
+        fd: BorrowedFd<'_>,
+        path: &Path,
+        st: &Stat,
+        euid: u32,
+        over: Option<FsOverride>,
+    ) -> io::Result<Self> {
+        let (mount_flags, fs_type) = match over {
+            Some(o) => (o.mount_flags, o.fs_type),
+            None => platform::fstatfs(fd)?,
+        };
+        Ok(Self::from_parts(
+            st,
+            mount_flags,
+            fs_type,
             platform::acl_grants_others(path, euid)?,
         ))
     }
@@ -148,8 +208,15 @@ mod platform {
         .union(Perm::WRITESECURITY)
         .union(Perm::CHOWN);
 
-    pub(super) fn fs_type(_: &Path) -> io::Result<u64> {
-        Ok(0)
+    /// `(f_flags, 0)` of the volume `fd` is on.
+    pub(super) fn fstatfs(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(u32, u64)> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: an all-zero `statfs` is a valid out-parameter, and `fd` is open.
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut buf) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((buf.f_flags, 0))
     }
 
     pub(super) fn mount_flags(path: &Path) -> io::Result<u32> {
@@ -199,15 +266,15 @@ mod platform {
         Ok(0)
     }
 
-    /// The `f_type` of the filesystem holding `path`.
+    /// `(0, f_type)` of the filesystem `fd` is on.
     #[cfg(target_os = "linux")]
-    pub(super) fn fs_type(path: &Path) -> io::Result<u64> {
-        Ok(rustix::fs::statfs(path)?.f_type as u64)
+    pub(super) fn fstatfs(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(u32, u64)> {
+        Ok((0, rustix::fs::fstatfs(fd)?.f_type as u64))
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn fs_type(_: &Path) -> io::Result<u64> {
-        Ok(0)
+    pub(super) fn fstatfs(_: std::os::fd::BorrowedFd<'_>) -> io::Result<(u32, u64)> {
+        Ok((0, 0))
     }
 
     pub(super) fn acl_grants_others(_: &Path, _: u32) -> io::Result<bool> {

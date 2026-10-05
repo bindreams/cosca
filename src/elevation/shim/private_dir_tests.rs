@@ -1,5 +1,5 @@
 use super::super::fork_guard::Origin;
-use super::facts::{check_dir, check_facts, refused_filesystem, Unfit};
+use super::facts::{check_dir, check_facts, refused_filesystem, FsOverride, Unfit};
 use super::{DirFacts, NotOriginal, PrivateDir, PrivateDirError, Removal};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -45,6 +45,7 @@ fn path_check_accepts_sticky_root_and_own_0700_and_refuses_the_rest() {
                     ignores_ownership: false,
                     acl_grants_others: false,
                     fs_type: 0,
+                    not_local: false,
                 },
                 me
             ),
@@ -62,6 +63,7 @@ fn path_check_refuses_an_acl_grant_and_an_ownerless_volume() {
         ignores_ownership,
         acl_grants_others,
         fs_type: 0,
+        not_local: false,
     };
     assert!(check_facts(&facts(false, false), 1000));
     assert!(!check_facts(&facts(false, true), 1000));
@@ -97,6 +99,7 @@ fn euid_99_is_refused_on_macos() {
         ignores_ownership: false,
         acl_grants_others: false,
         fs_type: 0,
+        not_local: false,
     };
     assert!(!check_facts(&facts, 99));
 }
@@ -450,6 +453,7 @@ fn network_and_fuse_filesystems_are_refused() {
         ignores_ownership: false,
         acl_grants_others: false,
         fs_type,
+        not_local: false,
     };
     let refused = [
         (0x6969, "NFS"),
@@ -459,10 +463,17 @@ fn network_and_fuse_filesystems_are_refused() {
         (0xFF53_4D42, "CIFS"),
         (0x00C3_6400, "Ceph"),
         (0x5346_414F, "AFS"),
+        (0x6B41_4653, "kAFS"),
         (0x7375_7245, "Coda"),
         (0x564C, "NCP"),
         (0x0BD0_0BD0, "Lustre"),
         (0x0102_1997, "9p"),
+        (0x786F_4256, "vboxsf"),
+        (0x7C7C_6673, "prl_fs"),
+        (0xBACB_ACBC, "vmhgfs"),
+        (0x4750_4653, "GPFS"),
+        (0x1983_0326, "BeeGFS"),
+        (0xAAD7_AAEA, "PanFS"),
     ];
     for (magic, name) in refused {
         assert_eq!(refused_filesystem(magic), Some(name));
@@ -484,16 +495,92 @@ fn network_and_fuse_filesystems_are_refused() {
     }
 }
 
-/// The refusal names TMPDIR's filesystem and what to do, and the real read reports a type.
+/// The real `fstatfs` of a directory reports a type, and the system temp directory's is not one
+/// that is refused.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn the_real_filesystem_type_of_the_system_tmpdir_is_read_and_accepted() {
     let tmp = std::env::temp_dir();
     let real = std::fs::canonicalize(&tmp).unwrap();
-    let st = rustix::fs::stat(&real).unwrap();
-    let facts = DirFacts::read(&real, &st, euid()).unwrap();
-    assert_ne!(facts.fs_type, 0, "statfs reports a type");
+    let dir = std::fs::File::open(&real).unwrap();
+    let st = rustix::fs::fstat(&dir).unwrap();
+    let facts = DirFacts::read_fd(std::os::fd::AsFd::as_fd(&dir), &real, &st, euid(), None).unwrap();
+    assert_ne!(facts.fs_type, 0, "fstatfs reports a type");
     assert_eq!(refused_filesystem(facts.fs_type), None);
+}
+
+/// Mount flags of a local volume.
+#[cfg(target_os = "macos")]
+fn local_mount_flags() -> u32 {
+    libc::MNT_LOCAL as u32
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_mount_flags() -> u32 {
+    0
+}
+
+/// The temp directory's own filesystem decides, through `create_in`'s path: an NFS one is refused
+/// naming the filesystem and `TMPDIR`; a tmpfs one is accepted, whatever its ancestors are on (they
+/// are never asked). Mutant: `check_facts` where `check_dir` is.
+#[skuld::test]
+fn the_temp_directorys_own_filesystem_decides() {
+    let over = |fs_type| {
+        Some(FsOverride {
+            mount_flags: local_mount_flags(),
+            fs_type,
+        })
+    };
+    let root = tempfile::tempdir().unwrap();
+    let real = PrivateDir::resolve(root.path()).unwrap();
+    let Err(error @ PrivateDirError::Filesystem { .. }) =
+        PrivateDir::create_resolved(root.path(), real.clone(), super::open_and_harden, true, over(0x6969))
+    else {
+        panic!("an NFS temp directory must be refused");
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains("NFS") && text.contains("TMPDIR") && text.contains(&real.display().to_string()),
+        "{text}"
+    );
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0, "nothing is made");
+    let dir = PrivateDir::create_resolved(root.path(), real, super::open_and_harden, true, over(0x0102_1994)).unwrap();
+    drop(dir);
+}
+
+/// A volume that is not local (macOS: no `MNT_LOCAL`) is refused like a network filesystem.
+#[skuld::test]
+fn a_volume_that_is_not_local_is_refused() {
+    let facts = DirFacts {
+        uid: 1000,
+        mode: 0o700,
+        ignores_ownership: false,
+        acl_grants_others: false,
+        fs_type: 0,
+        not_local: true,
+    };
+    assert_eq!(
+        check_dir(&facts, 1000),
+        Err(Unfit::Filesystem("a volume that is not local"))
+    );
+}
+
+/// On macOS the mount flags decide: a volume without `MNT_LOCAL` is refused through `create_in`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_a_temp_directory_without_mnt_local_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let real = PrivateDir::resolve(root.path()).unwrap();
+    let over = Some(FsOverride {
+        mount_flags: 0,
+        fs_type: 0,
+    });
+    let Err(PrivateDirError::Filesystem { filesystem, .. }) =
+        PrivateDir::create_resolved(root.path(), real, super::open_and_harden, true, over)
+    else {
+        panic!("a volume without MNT_LOCAL must be refused");
+    };
+    assert_eq!(filesystem, "a volume that is not local");
 }
 
 #[skuld::test]
