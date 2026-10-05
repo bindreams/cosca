@@ -14,7 +14,7 @@ use super::fork_guard::{ForkGuard, Origin};
 
 mod facts;
 
-use facts::{check_facts, DirFacts};
+use facts::{check_dir, DirFacts, Unfit};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PrivateDirError {
@@ -27,6 +27,15 @@ pub(crate) enum PrivateDirError {
         tmpdir.display(), offender.display()
     )]
     Unsafe { tmpdir: PathBuf, offender: PathBuf },
+    #[error(
+        "the temp directory {} is on {filesystem}, which the private directory refuses ({} is on it); set TMPDIR to a local directory",
+        tmpdir.display(), offender.display()
+    )]
+    Filesystem {
+        tmpdir: PathBuf,
+        offender: PathBuf,
+        filesystem: &'static str,
+    },
     #[error("cannot create the private directory {}: {source}", path.display())]
     Create { path: PathBuf, source: io::Error },
     #[error("cannot set up the fork guard of the private directory: {0}")]
@@ -60,15 +69,17 @@ pub(crate) struct PrivateDir {
     name: OsString,
     id: (u64, u64),
     path: PathBuf,
+    /// The directory itself, for binding and connecting relative to it.
+    dir: OwnedFd,
     /// Tells the creating process from a fork copy of it, for a directory that is dropped on its own.
     creator: Option<ForkGuard>,
     removed: bool,
 }
 
-/// Opens the directory `name` in `parent`, makes it `0700` and returns its `stat`.
-type OpenMade = fn(&OwnedFd, &OsStr) -> rustix::io::Result<Stat>;
+/// Opens the directory `name` in `parent`, makes it `0700` and returns it with its `stat`.
+type OpenMade = fn(&OwnedFd, &OsStr) -> rustix::io::Result<(OwnedFd, Stat)>;
 
-fn open_and_harden(parent: &OwnedFd, name: &OsStr) -> rustix::io::Result<Stat> {
+fn open_and_harden(parent: &OwnedFd, name: &OsStr) -> rustix::io::Result<(OwnedFd, Stat)> {
     // `NOFOLLOW`: whatever now holds the name, we record the directory itself.
     let dir = openat(
         parent,
@@ -78,7 +89,8 @@ fn open_and_harden(parent: &OwnedFd, name: &OsStr) -> rustix::io::Result<Stat> {
     )?;
     // `mkdirat`'s mode is masked by the umask; the descriptor's is not.
     fchmod(&dir, Mode::RWXU)?;
-    fstat(&dir)
+    let st = fstat(&dir)?;
+    Ok((dir, st))
 }
 
 #[allow(
@@ -93,12 +105,12 @@ fn io_err(e: Errno) -> io::Error {
     e.into()
 }
 
-/// `path` and every ancestor, leaf first, with the first one that fails [`check_facts`].
-fn unsafe_ancestor(real: &Path, euid: u32) -> io::Result<Option<PathBuf>> {
+/// `path` and every ancestor, leaf first, with the first one that fails [`check_dir`].
+fn unsafe_ancestor(real: &Path, euid: u32) -> io::Result<Option<(PathBuf, Unfit)>> {
     for path in real.ancestors() {
         let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io_err)?;
-        if !check_facts(&DirFacts::read(path, &st, euid)?, euid) {
-            return Ok(Some(path.to_owned()));
+        if let Err(unfit) = check_dir(&DirFacts::read(path, &st, euid)?, euid) {
+            return Ok(Some((path.to_owned(), unfit)));
         }
     }
     Ok(None)
@@ -111,7 +123,7 @@ impl PrivateDir {
     }
 
     /// In `tmp`, which must be absolute, and whose real path and every ancestor of it must pass
-    /// [`check_facts`]; otherwise nothing is created.
+    /// [`check_dir`]; otherwise nothing is created.
     pub(crate) fn create_in(tmp: &Path) -> Result<Self, PrivateDirError> {
         Self::create_with(tmp, open_and_harden, true)
     }
@@ -135,12 +147,19 @@ impl PrivateDir {
             return Err(PrivateDirError::TmpdirNotAbsolute(tmp.to_owned()));
         }
         let real = std::fs::canonicalize(tmp).map_err(tmp_err)?;
-        let unsafe_err = |offender| PrivateDirError::Unsafe {
-            tmpdir: tmp.to_owned(),
-            offender,
+        let unfit_err = |offender, unfit| match unfit {
+            Unfit::Writable => PrivateDirError::Unsafe {
+                tmpdir: tmp.to_owned(),
+                offender,
+            },
+            Unfit::Filesystem(filesystem) => PrivateDirError::Filesystem {
+                tmpdir: tmp.to_owned(),
+                offender,
+                filesystem,
+            },
         };
-        if let Some(offender) = unsafe_ancestor(&real, euid).map_err(tmp_err)? {
-            return Err(unsafe_err(offender));
+        if let Some((offender, unfit)) = unsafe_ancestor(&real, euid).map_err(tmp_err)? {
+            return Err(unfit_err(offender, unfit));
         }
         let parent = openat(
             CWD,
@@ -152,8 +171,8 @@ impl PrivateDir {
         // The path walk above may have raced a rename; the descriptor we hold is checked again.
         let st = fstat(&parent).map_err(|e| tmp_err(io_err(e)))?;
         let facts = DirFacts::read(&real, &st, euid).map_err(tmp_err)?;
-        if !check_facts(&facts, euid) {
-            return Err(unsafe_err(real));
+        if let Err(unfit) = check_dir(&facts, euid) {
+            return Err(unfit_err(real, unfit));
         }
         let creator = if guarded {
             Some(ForkGuard::new().map_err(PrivateDirError::ForkGuard)?)
@@ -179,12 +198,12 @@ impl PrivateDir {
                 }
             }
             let made = open(&parent, &name);
-            let id = match made {
-                Ok(st) => {
+            let (dir, id) = match made {
+                Ok((dir, st)) => {
                     debug_assert_eq!(FileType::from_raw_mode(st.st_mode), FileType::Directory);
                     debug_assert_eq!(st.st_uid, euid);
                     debug_assert_eq!(Mode::from_raw_mode(st.st_mode), Mode::RWXU);
-                    id_of(&st)
+                    (dir, id_of(&st))
                 }
                 Err(e) => {
                     if let Err(rm) = unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
@@ -201,6 +220,7 @@ impl PrivateDir {
                 name,
                 id,
                 path,
+                dir,
                 creator,
                 removed: false,
             });
@@ -209,6 +229,13 @@ impl PrivateDir {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory itself. A socket in it is bound and connected relative to this descriptor, so
+    /// that a long `TMPDIR` cannot overflow `sun_path`.
+    pub(crate) fn dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.dir.as_fd()
     }
 
     /// Removes the directory if the name still holds the one we made, by `(dev, ino)`, with

@@ -1,5 +1,6 @@
 use super::super::fork_guard::Origin;
-use super::{check_facts, DirFacts, NotOriginal, PrivateDir, PrivateDirError, Removal};
+use super::facts::{check_dir, check_facts, refused_filesystem, Unfit};
+use super::{DirFacts, NotOriginal, PrivateDir, PrivateDirError, Removal};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -42,7 +43,8 @@ fn path_check_accepts_sticky_root_and_own_0700_and_refuses_the_rest() {
                     uid,
                     mode,
                     ignores_ownership: false,
-                    acl_grants_others: false
+                    acl_grants_others: false,
+                    fs_type: 0,
                 },
                 me
             ),
@@ -59,6 +61,7 @@ fn path_check_refuses_an_acl_grant_and_an_ownerless_volume() {
         mode: 0o700,
         ignores_ownership,
         acl_grants_others,
+        fs_type: 0,
     };
     assert!(check_facts(&facts(false, false), 1000));
     assert!(!check_facts(&facts(false, true), 1000));
@@ -79,9 +82,9 @@ fn an_ignore_ownership_volume_is_refused() {
     st.st_uid = euid();
     st.st_mode = 0o40700;
     let flags = libc::MNT_IGNORE_OWNERSHIP as u32;
-    assert!(check_facts(&DirFacts::from_parts(&st, 0, false), euid()));
-    assert!(!check_facts(&DirFacts::from_parts(&st, flags, false), euid()));
-    assert!(!check_facts(&DirFacts::from_parts(&st, flags | 1, false), euid()));
+    assert!(check_facts(&DirFacts::from_parts(&st, 0, 0, false), euid()));
+    assert!(!check_facts(&DirFacts::from_parts(&st, flags, 0, false), euid()));
+    assert!(!check_facts(&DirFacts::from_parts(&st, flags | 1, 0, false), euid()));
 }
 
 /// Under uid 99 XNU reports every file as the caller's, whatever the volume.
@@ -93,6 +96,7 @@ fn euid_99_is_refused_on_macos() {
         mode: 0o700,
         ignores_ownership: false,
         acl_grants_others: false,
+        fs_type: 0,
     };
     assert!(!check_facts(&facts, 99));
 }
@@ -396,7 +400,10 @@ fn an_unknown_origin_leaves_the_directory() {
     assert!(!path.exists(), "the creator's drop still removes it");
 }
 
-fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {
+fn open_fails(
+    _: &std::os::fd::OwnedFd,
+    _: &std::ffi::OsStr,
+) -> rustix::io::Result<(std::os::fd::OwnedFd, rustix::fs::Stat)> {
     Err(rustix::io::Errno::IO)
 }
 
@@ -404,7 +411,7 @@ fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Resu
 fn open_fails_after_removing(
     parent: &std::os::fd::OwnedFd,
     name: &std::ffi::OsStr,
-) -> rustix::io::Result<rustix::fs::Stat> {
+) -> rustix::io::Result<(std::os::fd::OwnedFd, rustix::fs::Stat)> {
     rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR)?;
     Err(rustix::io::Errno::IO)
 }
@@ -431,4 +438,72 @@ fn a_failed_cleanup_after_a_failure_warns() {
     };
     let path_text = path.display().to_string();
     assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
+}
+
+/// Network and user-space filesystems are refused, and local ones are not. Mutant: the type is
+/// ignored.
+#[skuld::test]
+fn network_and_fuse_filesystems_are_refused() {
+    let facts = |fs_type| DirFacts {
+        uid: 1000,
+        mode: 0o700,
+        ignores_ownership: false,
+        acl_grants_others: false,
+        fs_type,
+    };
+    let refused = [
+        (0x6969, "NFS"),
+        (0x6573_5546, "FUSE"),
+        (0x517B, "SMB"),
+        (0xFE53_4D42, "SMB2"),
+        (0xFF53_4D42, "CIFS"),
+        (0x00C3_6400, "Ceph"),
+        (0x5346_414F, "AFS"),
+        (0x7375_7245, "Coda"),
+        (0x564C, "NCP"),
+        (0x0BD0_0BD0, "Lustre"),
+        (0x0102_1997, "9p"),
+    ];
+    for (magic, name) in refused {
+        assert_eq!(refused_filesystem(magic), Some(name));
+        assert_eq!(check_dir(&facts(magic), 1000), Err(Unfit::Filesystem(name)));
+        // A sign-extended `f_type`, as some architectures report it.
+        assert_eq!(refused_filesystem(magic | 0xFFFF_FFFF_0000_0000), Some(name));
+    }
+    // ext4, tmpfs, btrfs, xfs, overlayfs, zfs, and "unknown".
+    for local in [
+        0xEF53,
+        0x0102_1994,
+        0x9123_683E,
+        0x5846_5342,
+        0x794C_7630,
+        0x2FC1_2FC1,
+        0,
+    ] {
+        assert_eq!(check_dir(&facts(local), 1000), Ok(()), "{local:#x}");
+    }
+}
+
+/// The refusal names TMPDIR's filesystem and what to do, and the real read reports a type.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_real_filesystem_type_of_the_system_tmpdir_is_read_and_accepted() {
+    let tmp = std::env::temp_dir();
+    let real = std::fs::canonicalize(&tmp).unwrap();
+    let st = rustix::fs::stat(&real).unwrap();
+    let facts = DirFacts::read(&real, &st, euid()).unwrap();
+    assert_ne!(facts.fs_type, 0, "statfs reports a type");
+    assert_eq!(refused_filesystem(facts.fs_type), None);
+}
+
+#[skuld::test]
+fn the_directory_fd_names_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = PrivateDir::create_in(root.path()).unwrap();
+    let by_fd = rustix::fs::fstat(dir.dir_fd()).unwrap();
+    let by_path = fs::metadata(dir.path()).unwrap();
+    assert_eq!(
+        (by_fd.st_dev as u64, by_fd.st_ino as u64),
+        (by_path.dev(), by_path.ino())
+    );
 }

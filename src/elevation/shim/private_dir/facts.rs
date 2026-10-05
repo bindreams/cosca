@@ -33,6 +33,58 @@ pub(crate) struct DirFacts {
     /// An ACL entry lets someone other than the euid and root add, remove or rename entries, or
     /// grant themselves the right to. macOS only.
     pub(crate) acl_grants_others: bool,
+    /// The filesystem's type (`f_type`) where the platform reports one (Linux); 0 elsewhere.
+    pub(crate) fs_type: u64,
+}
+
+/// Filesystems whose permissions and ownership are enforced by something other than this kernel's
+/// own view of local users: another host (NFS, SMB/CIFS, Ceph, AFS, Coda, NCP, Lustre), a hypervisor
+/// (9p), or a user-space daemon (FUSE). Neither the `0700` mode nor the rename protection the path
+/// check relies on holds there (root squashing, uid mapping, server-side policy), and Unix sockets
+/// are not reliable on them. Local filesystems, overlayfs and eCryptfs included, are not listed.
+const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
+    (0x6969, "NFS"),
+    (0x6573_5546, "FUSE"),
+    (0x517B, "SMB"),
+    (0xFE53_4D42, "SMB2"),
+    (0xFF53_4D42, "CIFS"),
+    (0x00C3_6400, "Ceph"),
+    (0x5346_414F, "AFS"),
+    (0x7375_7245, "Coda"),
+    (0x564C, "NCP"),
+    (0x0BD0_0BD0, "Lustre"),
+    (0x0102_1997, "9p"),
+];
+
+/// The name of the network or user-space filesystem `fs_type` is, if it is one the private directory
+/// refuses.
+pub(crate) fn refused_filesystem(fs_type: u64) -> Option<&'static str> {
+    // `f_type` is a signed word on some architectures; the magics are 32-bit.
+    let magic = fs_type & 0xFFFF_FFFF;
+    REFUSED_FILESYSTEMS
+        .iter()
+        .find(|(m, _)| *m == magic)
+        .map(|(_, name)| *name)
+}
+
+/// Why a directory is unfit to hold the private directory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unfit {
+    /// Another user could rename entries in it, or it cannot vouch for ownership.
+    Writable,
+    Filesystem(&'static str),
+}
+
+/// [`check_facts`], and the filesystem refusal first.
+pub(crate) fn check_dir(facts: &DirFacts, euid: u32) -> Result<(), Unfit> {
+    if let Some(name) = refused_filesystem(facts.fs_type) {
+        return Err(Unfit::Filesystem(name));
+    }
+    if check_facts(facts, euid) {
+        Ok(())
+    } else {
+        Err(Unfit::Writable)
+    }
 }
 
 impl DirFacts {
@@ -42,8 +94,9 @@ impl DirFacts {
         clippy::useless_conversion,
         reason = "`st_mode` is `u16` on macOS and `u32` on Linux"
     )]
-    pub(crate) fn from_parts(st: &Stat, mount_flags: u32, acl_grants_others: bool) -> Self {
+    pub(crate) fn from_parts(st: &Stat, mount_flags: u32, fs_type: u64, acl_grants_others: bool) -> Self {
         Self {
+            fs_type,
             uid: st.st_uid,
             mode: st.st_mode.into(),
             ignores_ownership: mount_ignores_ownership(mount_flags),
@@ -56,6 +109,7 @@ impl DirFacts {
         Ok(Self::from_parts(
             st,
             platform::mount_flags(path)?,
+            platform::fs_type(path)?,
             platform::acl_grants_others(path, euid)?,
         ))
     }
@@ -93,6 +147,10 @@ mod platform {
         .union(Perm::DELETE_CHILD)
         .union(Perm::WRITESECURITY)
         .union(Perm::CHOWN);
+
+    pub(super) fn fs_type(_: &Path) -> io::Result<u64> {
+        Ok(0)
+    }
 
     pub(super) fn mount_flags(path: &Path) -> io::Result<u32> {
         let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -138,6 +196,17 @@ mod platform {
     use std::path::Path;
 
     pub(super) fn mount_flags(_: &Path) -> io::Result<u32> {
+        Ok(0)
+    }
+
+    /// The `f_type` of the filesystem holding `path`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn fs_type(path: &Path) -> io::Result<u64> {
+        Ok(rustix::fs::statfs(path)?.f_type as u64)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn fs_type(_: &Path) -> io::Result<u64> {
         Ok(0)
     }
 
