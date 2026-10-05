@@ -485,17 +485,22 @@ pub(crate) fn fail_the_report_read() -> crate::child::spawn::unique_report::seam
     crate::child::spawn::unique_report::seams::fail_parent_read(libc::EIO)
 }
 
-/// While it lives, this thread's identity checks of a spawned child are refused (`Unknown`).
+/// While it lives, this thread's reads of a spawned child's identity are refused: the spawn's own
+/// check (`Unknown`), and the next peek that reads its unique id.
 #[cfg(target_os = "macos")]
 pub(crate) fn refuse_the_identity() -> RefusedIdentity {
     crate::child::spawn::fault::set_force_identity_unknown(true);
-    RefusedIdentity
+    RefusedIdentity(crate::wait::exit_only::seams::force_peek_once(Err(
+        std::io::Error::from_raw_os_error(libc::EPERM),
+    )))
 }
 
-/// Refuses identity checks until dropped (see [`refuse_the_identity`]).
+/// Refuses identity reads until dropped (see [`refuse_the_identity`]).
 #[cfg(target_os = "macos")]
-#[must_use = "identity checks succeed again as soon as the guard is dropped"]
-pub(crate) struct RefusedIdentity;
+#[must_use = "identity reads succeed again as soon as the guard is dropped"]
+pub(crate) struct RefusedIdentity(
+    #[allow(dead_code, reason = "held for its drop")] crate::wait::exit_only::seams::Forced,
+);
 
 #[cfg(target_os = "macos")]
 impl Drop for RefusedIdentity {
