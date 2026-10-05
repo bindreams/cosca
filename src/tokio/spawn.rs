@@ -554,23 +554,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             // An elevation front is sent nothing (see `ProcSource::leave_front`).
             #[cfg(unix)]
             if let Some(front) = front {
-                // macOS: a front whose identity was refused is left unverified, as the sync spawn
-                // leaves it: sent nothing, and unreaped.
+                // macOS: a front whose identity was refused or found gone is left unverified, as the
+                // sync spawn leaves it.
                 #[cfg(target_os = "macos")]
-                if matches!(other, Resolved::Unknown) {
-                    let fate = leave_unverified_front(&mut proc, crate::containment::RootIdentity::Unknown);
-                    return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
-                }
-                #[cfg(target_os = "macos")]
-                let fate = {
-                    proc.forget_if_foreign();
-                    if proc.is_reaped() {
-                        crate::child::spawn::FrontFate::Unaccounted
+                let fate = leave_unverified_front(
+                    &mut proc,
+                    if matches!(other, Resolved::Gone) {
+                        crate::containment::RootIdentity::Gone
                     } else {
-                        proc.forget_because("is an elevation front, sent nothing, and left unreaped");
-                        crate::child::spawn::FrontFate::LeftUnreaped
-                    }
-                };
+                        crate::containment::RootIdentity::Unknown
+                    },
+                );
                 #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
                 return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
