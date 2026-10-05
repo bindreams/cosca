@@ -1,12 +1,12 @@
-//! What a [`ShimLink`](super::ShimLink) reports: the one outcome of the shim's run (D7), and the
-//! results of `kill` (D5).
+//! What a [`ShimLink`](super::ShimLink) reports: the one outcome of the shim's run, and the
+//! results of `kill`.
 
 use std::io;
 
 use crate::elevation::shim::fork_guard::Origin;
 use crate::elevation::shim::protocol::{decode_frame, Frame, FrameError, NotExecuted, Refusal};
 
-/// Why the acceptor stopped serving (D4).
+/// Why the acceptor stopped serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptorFailure {
     /// `accept` or `poll` failed with this errno.
@@ -22,7 +22,7 @@ pub(crate) enum NotStartedCause {
     /// acceptor did not fail.
     Withheld,
     /// The acceptor failed while the start was not `Live`. It wins over [`Withheld`](Self::Withheld),
-    /// even when `kill` had refused the start first (D4).
+    /// even when `kill` had refused the start first.
     AcceptorFailed(AcceptorFailure),
     /// An `F` frame: the shim has positive evidence the program never ran.
     NotExecuted(NotExecuted),
@@ -37,7 +37,7 @@ pub(crate) struct NotStarted {
     pub(crate) cause: NotStartedCause,
 }
 
-/// The link's one outcome. Set once, under the link's lock, and cached (D7).
+/// The link's one outcome. Set once, under the link's lock, and cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkOutcome {
     /// `S`: the program's exact wait status.
@@ -60,10 +60,9 @@ impl LinkOutcome {
     }
 }
 
-/// The outcome the bytes read so far settle, if any. A short or garbled frame is a real outcome (a
-/// shim of another version, a crash mid-write), so it is `ShimLost` and never a `debug_assert`
-/// (principle 7). `bytes` is at most one frame; `eof` says no more
-/// will come.
+/// The outcome the bytes read so far settle, if any. `bytes` is at most one frame; `eof` says no
+/// more will come. A short or garbled frame is a real outcome (a shim of another version, a crash
+/// mid-write), so it is `ShimLost`, never an assertion.
 pub(super) fn classify(bytes: &[u8], eof: bool) -> Option<LinkOutcome> {
     match decode_frame(bytes) {
         // `H` is the one frame cosca consumed before it answered.
@@ -87,12 +86,29 @@ pub(super) fn classify(bytes: &[u8], eof: bool) -> Option<LinkOutcome> {
 /// What a successful [`kill`](super::ShimLink::kill) means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
-    /// `K` reached the shim's socket. That is all it says (D5).
+    /// `K` reached the shim's socket. That is all it says.
     Delivered,
     /// The program has ended or never ran; nothing was sent.
     AlreadyEnded,
     /// There is no shim to signal: the start is refused, and the caller must SIGKILL the front.
     RefusedStart,
+}
+
+/// Why [`ShimLink::wait`](super::ShimLink::wait) did not return an outcome.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WaitError {
+    #[error("a fork copy of the link cannot control it")]
+    NotOwner,
+    /// Waiting for the shim failed here, say for lack of memory. The outcome is not settled: the
+    /// shim may be fine, and a later call can still read its frame.
+    #[error("waiting for the shim: {0}")]
+    Poll(io::Error),
+}
+
+impl From<NotOwner> for WaitError {
+    fn from(NotOwner: NotOwner) -> Self {
+        WaitError::NotOwner
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,14 +125,14 @@ pub(crate) enum KillError {
     Io(io::Error),
 }
 
-/// A control call from a process that did not bind the link (D21).
+/// A control call from a process that did not bind the link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("a fork copy of the link cannot control it")]
 pub(crate) struct NotOwner;
 
-/// D21: only the process that bound the link controls it. `origin` is the link's fork guard's
-/// answer: a bare pid does not tell processes apart, since a fork copy in another pid namespace can
-/// have the owner's. A process that cannot be told is refused too.
+/// Only the process that bound the link controls it. `origin` is its fork guard's answer; a bare pid
+/// does not tell processes apart, since a fork copy in another pid namespace can have the owner's. A
+/// process that cannot be told is refused too.
 pub(super) fn owner_check(origin: Origin) -> Result<(), NotOwner> {
     if origin == Origin::Original {
         Ok(())

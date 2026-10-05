@@ -1,4 +1,4 @@
-//! Test seams of the link (T4, T5). Outside tests, [`Probe`] is a unit struct whose methods do
+//! Test seams of the link. Outside tests, [`Probe`] is a unit struct whose methods do
 //! nothing, so no seam exists in a shipped build.
 
 use crate::elevation::shim::protocol::Command;
@@ -53,6 +53,15 @@ impl Probe {
     pub(super) fn event(&self, _: impl FnOnce() -> LinkEvent) {}
     pub(super) fn acceptor_gate(&self) {}
     pub(super) fn waiter_gate(&self) {}
+    pub(super) fn wait_poll_error(&self) -> Option<rustix::io::Errno> {
+        None
+    }
+    pub(super) fn send_error(&self) -> Option<rustix::io::Errno> {
+        None
+    }
+    pub(super) fn credentials_error(&self) -> Option<std::io::Error> {
+        None
+    }
     pub(super) fn listener_made(&self, _: std::os::fd::BorrowedFd<'_>) {}
     pub(super) fn poll_error(&self) -> Option<rustix::io::Errno> {
         None
@@ -90,6 +99,10 @@ mod hooks {
         accept_errors: Mutex<VecDeque<Errno>>,
         stop_accept_errors: Mutex<VecDeque<Errno>>,
         poll_errors: Mutex<VecDeque<Errno>>,
+        wait_poll_errors: Mutex<VecDeque<Errno>>,
+        send_errors: Mutex<VecDeque<Errno>>,
+        credential_failures: Mutex<usize>,
+        listener_cloexec: Mutex<Option<bool>>,
         panic_at_gate: AtomicBool,
         fds: Mutex<Vec<bool>>,
     }
@@ -115,6 +128,10 @@ mod hooks {
                 accept_errors: Mutex::new(VecDeque::new()),
                 stop_accept_errors: Mutex::new(VecDeque::new()),
                 poll_errors: Mutex::new(VecDeque::new()),
+                wait_poll_errors: Mutex::new(VecDeque::new()),
+                send_errors: Mutex::new(VecDeque::new()),
+                credential_failures: Mutex::new(0),
+                listener_cloexec: Mutex::new(None),
                 panic_at_gate: AtomicBool::new(false),
                 fds: Mutex::new(Vec::new()),
             };
@@ -157,6 +174,42 @@ mod hooks {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(errno);
+        }
+
+        /// The next waiter's poll fails with `errno`.
+        pub(crate) fn fail_next_wait_poll(&self, errno: Errno) {
+            self.hooks()
+                .wait_poll_errors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back(errno);
+        }
+
+        /// The next `K` send fails with `errno`.
+        pub(crate) fn fail_next_send(&self, errno: Errno) {
+            self.hooks()
+                .send_errors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back(errno);
+        }
+
+        /// The acceptor cannot prepare or read the credentials of the next accepted connection.
+        pub(crate) fn fail_next_credentials(&self) {
+            *self
+                .hooks()
+                .credential_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) += 1;
+        }
+
+        /// Whether the listener was made `CLOEXEC`.
+        pub(crate) fn listener_cloexec(&self) -> Option<bool> {
+            *self
+                .hooks()
+                .listener_cloexec
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
         }
 
         /// The acceptor's `accept` fails with `errno` in the wake that stops it, and in no other.
@@ -221,10 +274,36 @@ mod hooks {
             allow(unused_variables, reason = "only macOS has the option")
         )]
         pub(in crate::elevation::shim::link) fn listener_made(&self, listener: std::os::fd::BorrowedFd<'_>) {
+            if let Some(h) = &self.0 {
+                let cloexec = rustix::io::fcntl_getfd(listener).map(|f| f.contains(rustix::io::FdFlags::CLOEXEC));
+                *h.listener_cloexec.lock().unwrap_or_else(PoisonError::into_inner) = cloexec.ok();
+            }
             #[cfg(target_os = "macos")]
             if self.0.is_some() {
                 rustix::net::sockopt::set_socket_nosigpipe(listener, false).expect("the listener's option clears");
             }
+        }
+
+        pub(in crate::elevation::shim::link) fn wait_poll_error(&self) -> Option<Errno> {
+            let h = self.0.as_ref()?;
+            h.wait_poll_errors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+        }
+
+        pub(in crate::elevation::shim::link) fn send_error(&self) -> Option<Errno> {
+            let h = self.0.as_ref()?;
+            h.send_errors.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+        }
+
+        pub(in crate::elevation::shim::link) fn credentials_error(&self) -> Option<std::io::Error> {
+            let h = self.0.as_ref()?;
+            let mut failures = h.credential_failures.lock().unwrap_or_else(PoisonError::into_inner);
+            (*failures > 0).then(|| {
+                *failures -= 1;
+                std::io::Error::from(Errno::IO)
+            })
         }
 
         pub(in crate::elevation::shim::link) fn poll_error(&self) -> Option<Errno> {

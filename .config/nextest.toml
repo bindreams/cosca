@@ -254,7 +254,7 @@ slow-timeout = { period = "30s", terminate-after = 2, grace-period = "1s" }
 # A failure bound, not a sync: a copy of a `ShimLink` that tore the owner's link down would hang in a
 # join of a thread that does not exist in the forked child. The test watches for that through the
 # owner's events and kills the child itself; this only stops a regression it did not anticipate.
-filter = 'test(/::fork_copy_drop_leaves_the_owner_intact$/)'
+filter = 'test(/::(fork_copy_drop_leaves_the_owner_intact|unknown_origin_in_a_fork_copy_leaves_the_owner_intact|control_calls_from_a_fork_copy_are_refused)$/)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
 [[profile.default.overrides]]

@@ -1,9 +1,9 @@
-//! The one outcome (D7): `wait`, `try_wait`, `observe` and the frames they decode.
+//! The one outcome: `wait`, `try_wait`, `observe` and the frames they decode.
 
 use super::super::fake_shim::Rig;
 use super::super::outcome::classify;
 use super::super::probe::LinkEvent;
-use super::super::{KillError, KillOutcome, LinkOutcome, NotStarted, NotStartedCause, StartState};
+use super::super::{KillError, KillOutcome, LinkOutcome, NotStarted, NotStartedCause, StartState, WaitError};
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, Refusal, Signal};
 
 #[skuld::test]
@@ -27,7 +27,7 @@ fn front_exit_while_pending_is_not_started() {
     assert_eq!(rig.link.kill().unwrap(), KillOutcome::RefusedStart);
 }
 
-/// The wire bytes of a frame, as a shim would write them.
+/// A live shim writes `bytes` and closes, then the link waits for its outcome.
 fn wait_after(bytes: &[u8]) -> LinkOutcome {
     let rig = Rig::new();
     let mut shim = rig.live();
@@ -247,4 +247,20 @@ fn waiters_whose_frame_went_to_another_reader_wake_on_the_outcome() {
     );
     assert_eq!(first, LinkOutcome::Exited(0x2a00));
     assert_eq!(second, LinkOutcome::Exited(0x2a00));
+}
+
+/// A failure to wait here is not the shim's loss: it is reported, nothing is settled, and the frame
+/// is still read by the next call.
+#[skuld::test]
+fn a_local_poll_error_in_wait_settles_nothing() {
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    rig.probe.fail_next_wait_poll(rustix::io::Errno::NOMEM);
+    match rig.link.wait() {
+        Err(WaitError::Poll(e)) => assert_eq!(e.raw_os_error(), Some(libc::ENOMEM)),
+        other => panic!("expected a poll error, got {other:?}"),
+    }
+    assert_eq!(rig.link.observe().unwrap().outcome, None);
+    shim.send_frame(Frame::Status(0x2a00));
+    assert_eq!(rig.link.wait().unwrap(), LinkOutcome::Exited(0x2a00));
 }

@@ -1,4 +1,4 @@
-//! The state both the acceptor thread and the caller's threads act on, behind one lock (D4, D7).
+//! The state both the acceptor thread and the caller's threads act on, behind one lock.
 //!
 //! No thread holds the lock across a blocking call: every socket call made under it is nonblocking.
 
@@ -16,7 +16,7 @@ use super::probe::{DropReason, LinkEvent, Probe};
 use super::sys::{self, Read};
 use crate::elevation::shim::protocol::Command;
 
-/// Whether a shim has been told to start the program (D4). Only ever moves right.
+/// Whether a shim has been told to start the program. Only ever moves right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartState {
     /// Nobody has been answered.
@@ -33,7 +33,7 @@ const FRAME_LEN: usize = 5;
 pub(super) struct Inner {
     start: StartState,
     /// Root peers that said hello.
-    hellos: u32,
+    hello_seen: bool,
     /// The frame read so far.
     frame: [u8; FRAME_LEN],
     frame_len: usize,
@@ -54,11 +54,11 @@ pub(crate) struct Observed {
 pub(super) struct Shared {
     inner: Mutex<Inner>,
     /// The shim's connection, set once, by the `Pending` to `Live` transition. Closed only in
-    /// teardown (D7): a reader never closes it.
+    /// teardown: a reader never closes it.
     pub(super) conn: OnceLock<UnixStream>,
     /// Written once, when the outcome is set, so a waiter that found nothing to read and then lost
     /// the frame to another reader still wakes: it polls this next to `conn`.
-    settled: (PipeReader, PipeWriter),
+    pub(super) settled: (PipeReader, PipeWriter),
     pub(super) sock_path: PathBuf,
     /// The euid a shim must have: root, in production.
     pub(super) peer_euid: u32,
@@ -74,7 +74,7 @@ impl Shared {
         Shared {
             inner: Mutex::new(Inner {
                 start: StartState::Pending,
-                hellos: 0,
+                hello_seen: false,
                 frame: [0; FRAME_LEN],
                 frame_len: 0,
                 outcome: None,
@@ -131,7 +131,7 @@ impl Shared {
         true
     }
 
-    /// `Pending` to `Refused`, removing the path in the same critical section (D4).
+    /// `Pending` to `Refused`, removing the path in the same critical section.
     pub(super) fn refuse_pending(&self, inner: &mut Inner) {
         if inner.start == StartState::Pending {
             inner.start = StartState::Refused;
@@ -139,7 +139,7 @@ impl Shared {
         }
     }
 
-    /// The acceptor cannot go on (D4): the start is refused, unless a shim already has the answer `A`.
+    /// The acceptor cannot go on: the start is refused, unless a shim already has the answer `A`.
     pub(super) fn fail_closed(&self, failure: AcceptorFailure) {
         let mut inner = self.lock();
         match inner.start {
@@ -161,11 +161,10 @@ impl Shared {
         }
     }
 
-    /// A root peer said hello (D4): answers it under the lock.
+    /// A root peer said hello: answers it under the lock.
     pub(super) fn answer_hello(&self, conn: UnixStream) {
         let mut inner = self.lock();
-        inner.hellos += 1;
-        let further = inner.hellos > 1;
+        let further = std::mem::replace(&mut inner.hello_seen, true);
         let path = self.sock_path.display();
         if inner.start == StartState::Pending {
             match sys::send_byte(conn.as_fd(), Command::Allow.encode()) {
@@ -221,11 +220,15 @@ impl Shared {
         inner.outcome = Some(outcome);
         // Under the lock, so a waiter that sees no outcome and then polls sees this byte at the
         // latest: the outcome is set before the byte, and the byte stays.
-        if let Err(e) = rustix::io::write(&self.settled.1, &[1]) {
-            log::warn!(
-                "cannot signal the outcome of the shim at {}: {e}",
-                self.sock_path.display()
-            );
+        // The write end is nonblocking; a full pipe is already readable.
+        if let Err(e) = sys::write_byte(self.settled.1.as_fd()) {
+            if e != Errno::AGAIN {
+                debug_assert!(false, "writing the settled byte failed: {e}");
+                log::warn!(
+                    "cannot signal the outcome of the shim at {}: {e}",
+                    self.sock_path.display()
+                );
+            }
         }
     }
 
@@ -257,7 +260,7 @@ impl Shared {
     }
 
     /// The outcome once the front is gone and its status is known, if it is settled: `Pending`
-    /// becomes `Refused` (D7). `None` means `Live` and no complete frame yet.
+    /// becomes `Refused`. `None` means `Live` and no complete frame yet.
     pub(super) fn settle(&self) -> Option<LinkOutcome> {
         let mut inner = self.lock();
         if inner.outcome.is_none() {
@@ -266,7 +269,7 @@ impl Shared {
                 let cause = inner
                     .failure
                     .map_or(NotStartedCause::Withheld, NotStartedCause::AcceptorFailed);
-                let shim_connected = inner.hellos > 0;
+                let shim_connected = inner.hello_seen;
                 self.set_outcome(
                     &mut inner,
                     LinkOutcome::NotStarted(NotStarted { shim_connected, cause }),
@@ -278,12 +281,12 @@ impl Shared {
         inner.outcome
     }
 
-    /// Blocks until the outcome is settled (D7). Waiters block on readiness outside the lock, then
-    /// read under it.
-    pub(super) fn wait(&self) -> LinkOutcome {
+    /// Blocks until the outcome is settled. Waiters block on readiness outside the lock, then read
+    /// under it. A failure to wait is returned and settles nothing: the shim may be fine.
+    pub(super) fn wait(&self) -> Result<LinkOutcome, Errno> {
         loop {
             if let Some(outcome) = self.settle() {
-                return outcome;
+                return Ok(outcome);
             }
             let conn = self.conn.get().expect("Live has a connection");
             self.probe.event(|| LinkEvent::Parked(std::thread::current().id()));
@@ -296,19 +299,18 @@ impl Shared {
                     settled_readable: sys::is_readable(&self.settled.0),
                 });
             };
-            if let Err(e) = sys::wait_for_frame_or_outcome(conn.as_fd(), &self.settled.0, armed) {
-                // Cannot wait on the shim any more: the honest answer is that it is lost.
+            let waited = match self.probe.wait_poll_error() {
+                Some(injected) => Err(injected),
+                None => sys::wait_for_frame_or_outcome(conn.as_fd(), &self.settled.0, armed),
+            };
+            if let Err(e) = waited {
                 log::warn!("waiting for the shim at {}: {e}", self.sock_path.display());
-                let mut inner = self.lock();
-                if inner.outcome.is_none() {
-                    self.set_outcome(&mut inner, LinkOutcome::ShimLost);
-                }
-                return inner.outcome.expect("just set");
+                return Err(e);
             }
         }
     }
 
-    /// The state and outcome, after one nonblocking read when `Live`; moves nothing (D7a).
+    /// The state and outcome, after one nonblocking read when `Live`; moves nothing.
     pub(super) fn observe(&self) -> Observed {
         let mut inner = self.lock();
         if inner.start == StartState::Live && inner.outcome.is_none() {
@@ -321,7 +323,7 @@ impl Shared {
         }
     }
 
-    // `kill` (D5) -----
+    // `kill` -----
 
     pub(super) fn kill(&self) -> Result<KillOutcome, KillError> {
         let mut inner = self.lock();
@@ -335,7 +337,11 @@ impl Shared {
             None => {}
         }
         let conn = self.conn.get().expect("Live has a connection");
-        match sys::send_byte(conn.as_fd(), Command::Kill.encode()) {
+        let sent = match self.probe.send_error() {
+            Some(injected) => Err(injected),
+            None => sys::send_byte(conn.as_fd(), Command::Kill.encode()),
+        };
+        match sent {
             Ok(()) => Ok(KillOutcome::Delivered),
             Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN) => {
                 // The shim is gone. Whether the program is depends on what it said first.
@@ -348,7 +354,7 @@ impl Shared {
             Err(Errno::AGAIN | Errno::NOBUFS) => Err(KillError::Unkillable),
             Err(e) => {
                 log::warn!("sending K to the shim at {}: {e}", self.sock_path.display());
-                Err(KillError::ShimLost)
+                Err(KillError::Io(e.into()))
             }
         }
     }

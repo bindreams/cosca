@@ -1,8 +1,8 @@
 //! The link's system calls: its sockets and descriptors.
 //!
 //! Every descriptor is created `CLOEXEC`. Linux does it atomically. macOS cannot, so there the
-//! creation runs under `spawn_lock` (D23): a cosca spawn never inherits one. A spawn outside cosca
-//! still can, which D23 accepts.
+//! creation runs under `spawn_lock`: a cosca spawn never inherits one. A spawn outside cosca still
+//! can, which is accepted.
 
 use std::io::{self, PipeReader, PipeWriter};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -15,13 +15,13 @@ use rustix::net::SendFlags;
 
 use super::probe::Probe;
 
-/// Runs `create`, which makes descriptors, under `spawn_lock` on macOS (D23).
-fn create_fds<T>(probe: &Probe, create: impl FnOnce() -> T) -> T {
+/// Runs `create`, which makes descriptors, under `spawn_lock` on macOS.
+fn create_fds<T>(probe: &Probe, create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     #[cfg(target_os = "macos")]
     let _guard = crate::child::spawn::spawn_lock();
-    let made = create();
+    let made = create()?;
     probe.fd_created(spawn_lock_is_held());
-    made
+    Ok(made)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -34,7 +34,7 @@ fn spawn_lock_is_held() -> bool {
     false
 }
 
-/// `SO_NOSIGPIPE` on macOS (D20), where std already sets it on every socket it makes; asserted here
+/// `SO_NOSIGPIPE` on macOS, where std already sets it on every socket it makes; asserted here
 /// all the same. Linux uses `MSG_NOSIGNAL` per send.
 #[cfg(target_os = "macos")]
 pub(super) fn set_nosigpipe(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -71,8 +71,8 @@ pub(super) fn bind_listener(probe: &Probe, path: &Path) -> io::Result<UnixListen
 /// On macOS the accepted socket inherits `O_NONBLOCK` and `SO_NOSIGPIPE` from the listener; on Linux
 /// it inherits neither. `prepare_conn` therefore sets both, and owes nothing to the listener.
 pub(super) fn accept(probe: &Probe, listener: &UnixListener) -> io::Result<Option<UnixStream>> {
-    match create_fds(probe, || listener.accept()) {
-        Ok((conn, _)) => Ok(Some(conn)),
+    match create_fds(probe, || listener.accept().map(|(conn, _)| conn)) {
+        Ok(conn) => Ok(Some(conn)),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
     }
@@ -84,10 +84,28 @@ pub(super) fn prepare_conn(conn: &UnixStream) -> io::Result<()> {
     set_nosigpipe(conn.as_fd())
 }
 
-/// A pipe: the wake pipe (the acceptor polls its read end, teardown writes the stop byte to its
-/// write end) and the settled pipe (written once, when the outcome is set).
+/// A pipe with a nonblocking write end: the wake pipe (the acceptor polls its read end, teardown
+/// writes the stop byte to its write end) and the settled pipe (written once, when the outcome is
+/// set). A write to a full pipe then fails with `EAGAIN` instead of blocking, and the pipe is
+/// readable, which is all either byte is for.
 pub(super) fn pipe(probe: &Probe) -> io::Result<(PipeReader, PipeWriter)> {
-    create_fds(probe, std::io::pipe)
+    create_fds(probe, || {
+        let (reader, writer) = std::io::pipe()?;
+        let flags = rustix::fs::fcntl_getfl(&writer)?;
+        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK)?;
+        Ok((reader, writer))
+    })
+}
+
+/// Writes one byte to a nonblocking pipe.
+pub(super) fn write_byte(fd: BorrowedFd<'_>) -> Result<(), Errno> {
+    loop {
+        match rustix::io::write(fd, &[1]) {
+            Ok(_) => return Ok(()),
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The effective uid of the process that connected `conn`.

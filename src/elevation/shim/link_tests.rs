@@ -1,4 +1,4 @@
-//! The acceptor and the start state (D4), against a fake shim.
+//! The acceptor and the start state, against a fake shim.
 
 use rustix::io::Errno;
 
@@ -216,7 +216,7 @@ fn macos_fds_are_created_under_spawn_lock() {
     let _shim = rig.live();
     let creations = rig.probe.fd_creations();
     // The listener, the wake pipe, the settled pipe, and the accepted connection.
-    assert!(creations.len() >= 4, "{creations:?}");
+    assert_eq!(creations.len(), 4, "{creations:?}");
     assert!(creations.iter().all(|held| *held), "{creations:?}");
 }
 
@@ -257,4 +257,35 @@ fn a_failed_answer_refuses_the_start() {
     rig.expect_event(LinkEvent::Dropped(DropReason::AnswerFailed));
     assert_eq!(rig.link.observe().unwrap().start, StartState::Refused);
     assert!(!socket_exists(&rig));
+}
+
+/// A peer whose credentials cannot be prepared or read is closed unanswered, and the acceptor
+/// serves the next one.
+#[skuld::test]
+fn unreadable_credentials_drop_the_peer_and_the_next_is_served() {
+    let rig = Rig::new();
+    rig.probe.fail_next_credentials();
+    let mut unreadable = rig.connect();
+    rig.expect_event(LinkEvent::Dropped(DropReason::Unreadable));
+    assert_eq!(unreadable.read_byte(), None);
+    let _next = rig.live();
+}
+
+/// A failure of the acceptor's `poll` while `Pending` refuses the start and says why.
+#[skuld::test]
+fn a_poll_failure_while_pending_refuses_the_start() {
+    let rig = Rig::new();
+    rig.probe.fail_next_poll(Errno::NOMEM);
+    let _wakes = rig.connect();
+    rig.expect_event(LinkEvent::AcceptorExited);
+    let seen = rig.link.observe().unwrap();
+    assert_eq!(seen.start, StartState::Refused);
+    assert_eq!(seen.acceptor_failure, Some(AcceptorFailure::Errno(libc::ENOMEM)));
+    assert_eq!(
+        rig.link.wait().unwrap(),
+        LinkOutcome::NotStarted(NotStarted {
+            shim_connected: false,
+            cause: NotStartedCause::AcceptorFailed(AcceptorFailure::Errno(libc::ENOMEM)),
+        })
+    );
 }

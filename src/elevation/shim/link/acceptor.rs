@@ -1,4 +1,4 @@
-//! The acceptor thread (D4): answers each root shim that says hello, under the state lock, without
+//! The acceptor thread: answers each root shim that says hello, under the state lock, without
 //! any call from the owner. The link owns it and joins it in `Drop`.
 
 use std::io::{self, PipeReader, PipeWriter};
@@ -62,20 +62,21 @@ impl Acceptor<'_> {
             fds.extend(self.pending.iter().map(|c| PollFd::new(c, PollFlags::IN)));
             sys::poll_ready(&mut fds).map_err(|e| AcceptorFailure::Errno(e.raw_os_error()))?;
             let woken = !fds[0].revents().is_empty();
-            // A byte nobody here asked for came from a fork copy of the link: consume it.
-            let stop = woken && self.shared.is_stopping();
-            if woken && !stop {
-                let mut byte = [0u8];
-                if let Err(e) = rustix::io::read(&wake.reader, &mut byte) {
-                    log::debug!("consuming a stray wake byte: {e}");
-                }
-            }
             let incoming = !fds[1].revents().is_empty();
             let ready: Vec<bool> = fds[2..].iter().map(|f| !f.revents().is_empty()).collect();
             drop(fds);
             self.shared.probe.acceptor_gate();
             if let Some(errno) = self.shared.probe.poll_error() {
                 return Err(AcceptorFailure::Errno(errno.raw_os_error()));
+            }
+            // A byte nobody here asked for came from a fork copy of the link: consume it. Decided
+            // after the gate, so a test that holds the acceptor can fill the pipe meanwhile.
+            let stop = woken && self.shared.is_stopping();
+            if woken && !stop {
+                let mut byte = [0u8];
+                if let Err(e) = rustix::io::read(&wake.reader, &mut byte) {
+                    log::debug!("consuming a stray wake byte: {e}");
+                }
             }
 
             // The listener before the wake pipe: a shim queued before the stop is answered.
@@ -122,7 +123,10 @@ impl Acceptor<'_> {
     /// Keeps `conn` if its peer is root; closes it unanswered otherwise.
     fn admit(&mut self, conn: UnixStream) {
         let path = self.shared.sock_path.display();
-        let peer = sys::prepare_conn(&conn).and_then(|()| sys::peer_euid(conn.as_fd()));
+        let peer = match self.shared.probe.credentials_error() {
+            Some(injected) => Err(injected),
+            None => sys::prepare_conn(&conn).and_then(|()| sys::peer_euid(conn.as_fd())),
+        };
         match peer {
             Err(e) => {
                 log::debug!("cannot read the credentials of a peer at {path}: {e}");
@@ -175,7 +179,7 @@ impl Acceptor<'_> {
         self.pending = kept;
     }
 
-    /// The final drain (D14): every peer still held is answered `N`, hello or not.
+    /// The final drain: every peer still held is answered `N`, hello or not.
     fn drain(&mut self) {
         self.shared.probe.event(|| LinkEvent::DrainStarted {
             path_exists: self.shared.sock_path.exists(),

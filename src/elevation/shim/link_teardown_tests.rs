@@ -1,8 +1,8 @@
-//! Teardown (D14) and the process that owns the link (D21).
+//! Teardown and the process that owns the link.
 
 use super::super::fake_shim::{next_acceptor_event, FakeShim, Rig};
 use super::super::probe::LinkEvent;
-use super::super::{KillOutcome, LinkOutcome, StartState};
+use super::super::{KillError, KillOutcome, LinkOutcome, NotOwner, StartState, WaitError};
 use crate::elevation::shim::protocol::{Command, Frame};
 
 #[skuld::test]
@@ -79,11 +79,11 @@ fn owner_survives_a_fork_copy(in_copy: fn(super::super::ShimLink)) {
         events,
         tmp: _tmp,
     } = rig;
-    // SAFETY: the child only runs `in_copy` on its copy of the link and `_exit`s. Its normal path
-    // takes only malloc's lock, which glibc and libmalloc reset across `fork`, and no other thread
-    // holds a lock the child takes: the copy's `Drop` locks nothing (the unknown-origin path only
-    // tries the state lock), and the acceptor thread, which does not exist in the child, is the only
-    // other user of the link's mutex. Nothing unwinds out of the child.
+    // SAFETY: the child only runs `in_copy` on its copy of the link and `_exit`s; nothing unwinds out
+    // of it. The locks it can take are malloc's, which glibc and libmalloc reset across `fork`; the
+    // link's state mutex, only through `try_lock`, which never blocks; and the probe channel's, which
+    // `send` takes only when a receiver is blocked in `recv`, and no thread is at the fork. The
+    // acceptor thread does not exist in the child.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
@@ -218,4 +218,83 @@ fn control_and_drop_with_a_full_fd_table_do_not_panic() {
         cfg!(target_os = "linux"),
         "the accept at teardown: {levels:?}"
     );
+}
+
+/// A fork copy calling a control method gets an error, not a panic or an effect.
+#[skuld::test]
+fn control_calls_from_a_fork_copy_are_refused() {
+    owner_survives_a_fork_copy(|link| {
+        assert!(matches!(link.kill(), Err(KillError::NotOwner)));
+        assert!(matches!(link.wait(), Err(WaitError::NotOwner)));
+        assert!(matches!(link.try_wait(), Err(NotOwner)));
+        assert!(matches!(link.observe(), Err(NotOwner)));
+    });
+}
+
+fn at_capacity(writer: &std::io::PipeWriter) {
+    use std::os::fd::AsFd;
+    while super::super::sys::write_byte(writer.as_fd()).is_ok() {}
+}
+
+fn is_nonblocking(fd: impl std::os::fd::AsFd) -> bool {
+    rustix::fs::fcntl_getfl(fd)
+        .unwrap()
+        .contains(rustix::fs::OFlags::NONBLOCK)
+}
+
+/// Both pipes' write ends are nonblocking, so a full pipe cannot block teardown or the outcome. The
+/// acceptor is held while the wake pipe fills, so it cannot drain it.
+#[skuld::test]
+fn teardown_completes_with_the_wake_pipe_full() {
+    let rig = Rig::new();
+    assert!(is_nonblocking(&rig.link.wake.writer), "the wake pipe's write end");
+    assert!(
+        is_nonblocking(&rig.link.shared.settled.1),
+        "the settled pipe's write end"
+    );
+    rig.probe.hold_acceptor();
+    let _wakes = rig.connect();
+    at_capacity(&rig.link.wake.writer);
+    let Rig { link, tmp: _tmp, .. } = rig;
+    drop(link);
+}
+
+#[skuld::test]
+fn the_outcome_settles_with_the_settled_pipe_full() {
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    assert!(
+        is_nonblocking(&rig.link.shared.settled.1),
+        "the settled pipe's write end"
+    );
+    at_capacity(&rig.link.shared.settled.1);
+    shim.send_frame(Frame::Status(0x2a00));
+    assert_eq!(rig.link.wait().unwrap(), LinkOutcome::Exited(0x2a00));
+}
+
+/// Every descriptor the link makes is `CLOEXEC`: the listener, both pipes, and an accepted
+/// connection.
+#[skuld::test]
+fn every_descriptor_is_close_on_exec() {
+    use std::os::fd::AsFd;
+    let cloexec = |fd: std::os::fd::BorrowedFd<'_>| {
+        rustix::io::fcntl_getfd(fd)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC)
+    };
+    let rig = Rig::new();
+    let _shim = rig.live();
+    assert_eq!(rig.probe.listener_cloexec(), Some(true), "the listener");
+    assert!(cloexec(rig.link.wake.reader.as_fd()), "the wake pipe's read end");
+    assert!(cloexec(rig.link.wake.writer.as_fd()), "the wake pipe's write end");
+    assert!(
+        cloexec(rig.link.shared.settled.0.as_fd()),
+        "the settled pipe's read end"
+    );
+    assert!(
+        cloexec(rig.link.shared.settled.1.as_fd()),
+        "the settled pipe's write end"
+    );
+    let conn = rig.link.shared.conn.get().expect("Live has a connection");
+    assert!(cloexec(conn.as_fd()), "the accepted connection");
 }

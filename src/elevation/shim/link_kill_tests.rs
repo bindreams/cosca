@@ -1,4 +1,4 @@
-//! `kill` on the channel side (D5, D20).
+//! `kill` on the channel side.
 
 use super::super::fake_shim::Rig;
 use super::super::{KillError, KillOutcome, LinkOutcome};
@@ -95,4 +95,17 @@ fn owner_check_refuses_a_fork_copy() {
     assert_eq!(owner_check(Origin::Original), Ok(()));
     assert_eq!(owner_check(Origin::Copy), Err(NotOwner));
     assert_eq!(owner_check(Origin::Unknown), Err(NotOwner));
+}
+
+/// An errno `kill` has no meaning for is an I/O error, not a lost shim, and settles nothing.
+#[skuld::test]
+fn an_unexpected_send_errno_is_an_io_error() {
+    let rig = Rig::new();
+    let _shim = rig.live();
+    rig.probe.fail_next_send(rustix::io::Errno::IO);
+    match rig.link.kill() {
+        Err(KillError::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+        other => panic!("expected an I/O error, got {other:?}"),
+    }
+    assert_eq!(rig.link.observe().unwrap().outcome, None);
 }
