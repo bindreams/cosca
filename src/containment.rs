@@ -334,7 +334,7 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{
-    attach, prepare, AbandonedChild, AttachError, Attached, Attachment, Prepared, RootIdentity, TreeKilled,
+    attach, prepare, AbandonedChild, Attached, Attachment, Prepared, RootIdentity, Settled, TreeKilled,
 };
 
 #[cfg(target_os = "macos")]

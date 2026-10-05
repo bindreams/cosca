@@ -338,7 +338,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         (prepared, c, unique)
     };
     #[cfg(not(target_os = "macos"))]
-    let (prepared, child) = {
+    let (mut prepared, child) = {
         let mut prepared = crate::containment::prepare(
             tcmd.as_std_mut(),
             &cmd.contain_request(),
@@ -488,56 +488,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     }
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
-    // Attached before the identity is read and checked, as the sync spawn does: the attach reads
-    // the tree-walk root by pid, so a reap before the check makes that read name a stranger, and
-    // the check then fails the spawn `Gone`. Attached after, a reap in between would leave the
-    // attachment's root a stranger under an identity that passed.
-    #[cfg(test)]
-    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
-    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
-    #[cfg(target_os = "linux")]
-    let in_cgroup = prepared.cgroup_leaf.is_some();
-    #[cfg(not(target_os = "linux"))]
-    let in_cgroup = false;
-    #[cfg(unix)]
-    let front = cmd.elevation_front().filter(|_| !in_cgroup);
-    #[cfg(not(unix))]
-    let _ = in_cgroup;
-    let attach = crate::child::spawn::attach_or_fault_typed(
-        pid,
-        #[cfg(windows)]
-        proc_handle,
-        prepared,
-    );
-    let attachment = match attach {
-        Ok(v) => v,
-        // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
-        // attach never leaks a live/suspended process.
-        Err(e) => {
-            #[cfg(unix)]
-            if let Some(front) = front {
-                // macOS: the attach failed on the root's identity read, which leaves the front
-                // unverified, as the sync spawn leaves it.
-                #[cfg(target_os = "macos")]
-                let fate = leave_unverified_front(
-                    &mut proc,
-                    e.identity.unwrap_or(crate::containment::RootIdentity::Unknown),
-                );
-                #[cfg(not(target_os = "macos"))]
-                let fate = proc.leave_front(pid, front);
-                return Err(fate.note(e.error, Some(front), Some(pid)));
-            }
-            proc.reap_now(pid);
-            return Err(e.error);
-        }
-    };
-    // From here what the attach made decides: a leaf that did not take the child left it in its
-    // process group, uncontained.
-    #[cfg(unix)]
-    let front = cmd.elevation_front().filter(|_| !attachment.attached.is_cgroup());
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
-    // it, and a panic unwinds through `ProcSource`'s `Drop`.
+    // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
+    // and does not re-read the root's. (A Linux leaf's placement verdict still addresses the child
+    // by pid: A1c3 hands it the pidfd.)
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
@@ -548,9 +503,32 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     };
     let id = match resolved {
         Resolved::Found(id) => id,
-        // Mirror the attach-failure path above: tear the child down so a vanished-identity error
-        // never leaks a live (Windows: still CREATE_SUSPENDED) process. `attachment` drops after.
+        // Tear the child down so a vanished-identity error never leaks a live (Windows: still
+        // CREATE_SUSPENDED) process.
         other => {
+            // The leaf's placement exchange ends before the kill, as an attach would end it. A leaf
+            // that took the child contains it, so it is no front; one that did not left it in its
+            // process group, uncontained.
+            // A verdict that failed closed has killed the child: it is no front left alone, and
+            // the leaf's account of it is kept.
+            let (front, failed_closed): (Option<crate::elevation::front::Front>, Option<Error>) =
+                match prepared.settle_verdict(pid) {
+                    crate::containment::Settled::InLeaf => (None, None),
+                    #[cfg(unix)]
+                    crate::containment::Settled::NotPlaced => (cmd.elevation_front(), None),
+                    #[cfg(not(unix))]
+                    crate::containment::Settled::NotPlaced => (None, None),
+                    crate::containment::Settled::FailedClosed(e) => (None, Some(e)),
+                };
+            #[cfg(not(unix))]
+            let _ = front;
+            let identity_error = |other| {
+                let error = crate::child::spawn::spawn_identity_error(other);
+                match &failed_closed {
+                    Some(closed) => error.with_note(&format!("its cgroup leaf's placement failed closed: {closed}")),
+                    None => error,
+                }
+            };
             // An elevation front is sent nothing (see `ProcSource::leave_front`).
             #[cfg(unix)]
             if let Some(front) = front {
@@ -567,14 +545,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 );
                 #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
-                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
+                return Err(fate.note(identity_error(other), Some(front), Some(pid)));
             }
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
             if matches!(other, Resolved::Unknown) {
                 proc.teardown_through_pidfd(pid);
-                return Err(crate::child::spawn::spawn_identity_error(other));
+                return Err(identity_error(other));
             }
             // macOS: nothing pins the pid, so a child the handle still cannot show ours is
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
@@ -583,7 +561,46 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 proc.forget_foreign();
             }
             proc.reap_now(pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            return Err(identity_error(other));
+        }
+    };
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    #[cfg(target_os = "linux")]
+    let in_cgroup = prepared.cgroup_leaf.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let in_cgroup = false;
+    #[cfg(unix)]
+    let front_before_attach = cmd.elevation_front().filter(|_| !in_cgroup);
+    #[cfg(not(unix))]
+    let _ = in_cgroup;
+    let attach = crate::child::spawn::attach_or_fault(
+        id,
+        #[cfg(windows)]
+        proc_handle,
+        prepared,
+    );
+    let attachment = match attach {
+        Ok(v) => v,
+        // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed
+        // attach never leaks a live/suspended process.
+        Err(e) => {
+            #[cfg(unix)]
+            if let Some(front) = front_before_attach {
+                // macOS: the attach cannot fail; a front is sent nothing and left unreaped, as the
+                // sync spawn leaves it.
+                #[cfg(target_os = "macos")]
+                let fate = {
+                    proc.forget_because("is an elevation front whose attach failed, sent nothing, and left unreaped");
+                    crate::child::spawn::FrontFate::LeftUnreaped
+                };
+                #[cfg(not(target_os = "macos"))]
+                let fate = proc.leave_front(pid, front);
+                return Err(fate.note(e, Some(front), Some(pid)));
+            }
+            proc.reap_now(pid);
+            return Err(e);
         }
     };
 

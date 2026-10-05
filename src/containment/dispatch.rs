@@ -25,6 +25,23 @@ pub(crate) struct Prepared {
     pub graceful: crate::graceful::GracefulMechanism,
 }
 
+/// What [`Prepared::settle_verdict`] found of the child's placement in its cgroup leaf.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only a Linux cgroup leaf is settled")
+)]
+#[derive(Debug)]
+pub(crate) enum Settled {
+    /// The child is in its leaf, which contains it.
+    InLeaf,
+    /// No leaf holds the child: there is none, the child did not enter it, or the verdict was
+    /// already taken.
+    NotPlaced,
+    /// Membership could not be decided, so the verdict failed closed: the child, and its tree
+    /// through the leaf if it entered, have already been killed. The error says so.
+    FailedClosed(Error),
+}
+
 impl Prepared {
     /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
     /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
@@ -38,16 +55,20 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child
     /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
-    /// never for the child the caller will reap. A no-op without a leaf, or once taken.
-    #[cfg(any(test, all(feature = "tokio", target_os = "macos")))]
-    pub(crate) fn settle_verdict(&mut self, pid: u32) {
+    /// never for the child the caller will reap. [`Settled::NotPlaced`] without a leaf, or once
+    /// the verdict is taken.
+    pub(crate) fn settle_verdict(&mut self, pid: u32) -> Settled {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            // The spawn fails either way; an undecidable verdict has already killed the child.
-            _ = leaf.take_placement(pid);
+            return match leaf.take_placement(pid) {
+                Ok(Ok(())) => Settled::InLeaf,
+                Ok(Err(_)) => Settled::NotPlaced,
+                Err(e) => Settled::FailedClosed(e),
+            };
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
+        Settled::NotPlaced
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
@@ -381,17 +402,12 @@ impl Attached {
             Attached::ProcessGroup(pgid) => Some(format!("kill its process group (pgid {pgid})")),
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => {
-                // A group only if the mode made one, and a walk only if the root's identity was
-                // read at attach: a root that had already exited has none.
-                let actions: Vec<String> = [
-                    m.pgid().map(|pgid| format!("kill its process group (pgid {pgid})")),
-                    m.has_root()
-                        .then(|| format!("walk the process table from the root's pid (root pid {root_pid})")),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                (!actions.is_empty()).then(|| actions.join(" or "))
+                // A group only if the mode made one; the walk always runs.
+                let walk = format!("walk the process table from the root's pid (root pid {root_pid})");
+                Some(match m.pgid() {
+                    Some(pgid) => format!("kill its process group (pgid {pgid}) or {walk}"),
+                    None => walk,
+                })
             }
             Attached::TreeWalk(_) => Some(format!(
                 "walk the process table from the root's pid (root pid {root_pid})"
@@ -534,60 +550,17 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
     marker_present
 }
 
-/// What the root's own identity read said when [`attach`] failed on it.
+/// What the spawn's identity read said of a child it cannot verify (macOS leaves such a child alone).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS leaves a child unverified")
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootIdentity {
     /// The root was already reaped (someone else reaped it, and its pid may be reused).
     Gone,
     /// The read was refused or could not be trusted.
     Unknown,
-}
-
-/// Why [`attach`] failed. `identity` is the verdict of the root's own identity read when that is
-/// what failed (the tree-walk root's), and `None` for every other failure.
-#[derive(Debug)]
-pub(crate) struct AttachError {
-    pub(crate) error: Error,
-    pub(crate) identity: Option<RootIdentity>,
-}
-
-impl From<Error> for AttachError {
-    fn from(error: Error) -> Self {
-        AttachError { error, identity: None }
-    }
-}
-
-impl From<AttachError> for Error {
-    fn from(e: AttachError) -> Self {
-        e.error
-    }
-}
-
-/// Resolve the spawned root's identity by pid alone, with no handle to check the read against.
-/// On Unix a foreign reap and reuse before the read makes it name a stranger. The spawn's own
-/// identity read, taken after this attach and checked through the child's handle, then fails the
-/// spawn `Gone`. On Windows the held process handle pins the pid.
-#[cfg(any(unix, windows))]
-fn resolve_root_id(pid: u32) -> Result<crate::identity::ProcessId, AttachError> {
-    // Via `resolve_identity_unchecked` so the test seam applies here too.
-    match crate::child::spawn::resolve_identity_unchecked(pid) {
-        crate::identity::Resolved::Found(id) => Ok(id),
-        crate::identity::Resolved::Gone => Err(AttachError {
-            error: Error::Containment {
-                detail: "tree-walk root vanished before its identity could be read".into(),
-            },
-            identity: Some(RootIdentity::Gone),
-        }),
-        crate::identity::Resolved::Unknown => Err(AttachError {
-            error: crate::identity::unknown_identity_error(&format!("tree-walk root pid {pid}")).unwrap_or_else(|| {
-                Error::Unassessable {
-                    detail: format!("tree-walk root pid {pid} identity could not be read"),
-                    source: None,
-                }
-            }),
-            identity: Some(RootIdentity::Unknown),
-        }),
-    }
 }
 
 /// Which Unix setup action to apply to a root `Command` for a given mode.
@@ -879,13 +852,13 @@ pub(crate) fn prepare(
 /// cleanly to `Attached::Cgroup` without requiring interior mutability — hence the
 /// cooperative-signal mechanism is read off it first.
 pub(crate) fn attach(
-    pid: u32,
+    id: crate::identity::ProcessId,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<Attachment, AttachError> {
+) -> Result<Attachment, Error> {
     let graceful = prepared.graceful_mechanism();
     let (containment, attached) = attach_tree(
-        pid,
+        id,
         #[cfg(windows)]
         proc_handle,
         prepared,
@@ -899,20 +872,21 @@ pub(crate) fn attach(
 
 /// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.
 fn attach_tree(
-    pid: u32,
+    id: crate::identity::ProcessId,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<(Containment, Attached), AttachError> {
+) -> Result<(Containment, Attached), Error> {
+    #[cfg(unix)]
+    let pid = id.pid();
     // Linux: session, or cgroup v2 / process group.
     #[cfg(target_os = "linux")]
     {
         if prepared.mode.is_some() {
             if prepared.is_root {
                 // TreeWalk root: no kernel container / process group; teardown is
-                // by identity. Resolve the root identity (consistent with the
-                // post-attach identity read in spawn.rs).
+                // by identity: the one the spawn verified against the child's handle.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
                 }
 
                 let raw_pid = pid;
@@ -974,32 +948,6 @@ fn attach_tree(
                 // survives setsid/reparenting/exec that the mode-specific mechanism does not.
                 #[cfg(target_os = "macos")]
                 if let Some(marker) = prepared.marker {
-                    // `Gone` is routine, not an anomaly: a fast-exiting child that something else
-                    // in the process reaps (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` reaper)
-                    // can be gone before this read (#61) — `debug!`, no `incomplete`. The marker and group channels below don't need
-                    // `root`, so a reparented-away live descendant stays reachable through them.
-                    // `Unknown` means the OS refused to answer — a real gap — so it is `warn!`
-                    // and carries `root_denied` into `Marker`, the only way `sweep_pass` can
-                    // tell "denied" apart from an ordinary `Gone` on every later pass.
-                    let (root, root_denied) = match crate::identity::ProcessId::of(pid) {
-                        crate::identity::Resolved::Found(id) => (Some(id), false),
-                        crate::identity::Resolved::Gone => {
-                            log::debug!(
-                                "fd marker: the root exited before its identity could be read; \
-                                 the sweep runs without its ppid-walk channel (the marker and \
-                                 group channels do not need it)"
-                            );
-                            (None, false)
-                        }
-                        crate::identity::Resolved::Unknown => {
-                            log::warn!(
-                                "fd marker: the root's identity could not be read (access \
-                                 denied); the sweep runs without its ppid-walk channel, and \
-                                 every pass reports this marker as incomplete"
-                            );
-                            (None, true)
-                        }
-                    };
                     let pgid = match prepared.mode {
                         Some(ContainMode::TreeWalk) => None,
                         _ => {
@@ -1012,17 +960,12 @@ fn attach_tree(
                     };
                     return Ok((
                         Containment::FdMarker,
-                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(
-                            marker,
-                            root,
-                            pgid,
-                            root_denied,
-                        )),
+                        Attached::FdMarker(crate::containment::fdmarker::Marker::new(marker, id, pgid)),
                     ));
                 }
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
                 }
                 let raw_pid = pid;
                 debug_assert!(
@@ -1063,7 +1006,7 @@ fn attach_tree(
             // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
             // identity teardown, with CTRL_BREAK to the group as cooperative term.
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
+                return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
             }
             match crate::containment::windows::attach_job(proc_handle) {
                 Ok(Some(job)) => return Ok((Containment::JobObject, Attached::JobObject(job))),
@@ -1072,9 +1015,9 @@ fn attach_tree(
                     // mechanism rather than silently yielding no containment. The
                     // root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags),
                     // so `terminate`'s CTRL_BREAK still reaches the group.
-                    return Ok((Containment::TreeWalk, Attached::TreeWalk(resolve_root_id(pid)?)));
+                    return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
                 }
-                Err(e) => return Err(Error::Containment { detail: e.to_string() }.into()),
+                Err(e) => return Err(Error::Containment { detail: e.to_string() }),
             }
         } else if prepared.mode.is_some() {
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no

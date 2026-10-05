@@ -249,3 +249,54 @@ async fn macos_tokio_spawn_failing_before_the_report_keeps_stds_error_and_does_n
         "the program never ran, so nothing is left running"
     );
 }
+
+/// As the sync twin: the fd marker's root is the verified identity, and the attach reads nothing
+/// by pid.
+///
+/// Mutant: the attach reads the marker's root with `ProcessId::of(pid)`.
+#[skuld::test]
+async fn macos_tokio_fdmarker_attach_reads_nothing_by_pid() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, _writer) = tokio_blocker();
+    cmd.contain();
+    let reads_before_attach = Rc::new(Cell::new(None));
+    let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
+        let reads = Rc::clone(&reads_before_attach);
+        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+    });
+    let child = cmd.spawn().expect("spawn");
+    assert_eq!(
+        Some(crate::identity::seams::by_pid_reads()),
+        reads_before_attach.get(),
+        "nothing from the attach on may read an identity by pid"
+    );
+    assert_eq!(
+        child.test_marker_root(),
+        Some(child.id()),
+        "the marker's root is the verified identity"
+    );
+}
+
+/// As the sync twin: a non-front child whose attach fails is killed, and what the teardown reaped
+/// is recorded.
+///
+/// Mutant: the arm leaves the child unreaped.
+#[skuld::test]
+async fn macos_tokio_a_failed_attach_kills_and_reaps_a_child_that_is_not_a_front() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut cmd, _writer) = tokio_blocker();
+    let reaps = fault::record_teardown_reaps();
+    fault::set_force_attach_failure(true);
+    let err = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+    fault::set_force_attach_failure(false);
+    assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity")
+    };
+    let reaped = reaps.recorded();
+    assert_eq!(reaped.len(), 1, "{reaped:?}");
+    assert_eq!(reaped[0].0, id.pid());
+    assert_eq!(reaped[0].1.signal(), Some(libc::SIGKILL));
+}

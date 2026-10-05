@@ -174,7 +174,9 @@ impl SharedChild {
         Ok(match await_reapable(self.id.pid(), self.identity, deadline)? {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,
-            Waited::Gone => Unlocked::Gone,
+            // An orphaned zombie is not ours to reap and cannot be told from a reap: as before,
+            // the wait gives up on it.
+            Waited::Gone | Waited::Orphaned => Unlocked::Gone,
         })
     }
 

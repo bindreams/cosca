@@ -252,7 +252,6 @@ pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
-    #[cfg(test)]
     pub(crate) fn holds_verdict_to_take(&self) -> bool {
         self.report.is_some()
     }
@@ -326,8 +325,14 @@ impl CgroupLeaf {
     /// The outer `Err` is a spawn that must fail: membership could not be decided, so the child
     /// was killed (see [`CgroupLeaf::decide_unwaitable`]).
     pub(crate) fn take_placement(&mut self, pid: u32) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+        #[cfg(test)]
+        fault::run_on_take_placement();
         let mut channel = self.report.take().expect(RELEASED);
         self.procs_fd = None;
+        #[cfg(test)]
+        if fault::take_force_fail_closed() {
+            return Err(self.fail_closed(pid, channel, "forced by a test seam"));
+        }
         let report = match channel.wait(pid) {
             Ok(report) => report,
             Err(source) => return self.decide_unwaitable(pid, channel, source),

@@ -2,9 +2,10 @@
 //! ordinary `cat` reported as launched by `sudo`.
 //!
 //! A front its cgroup leaf holds is not gated: its kills, drop and graceful escalation signal it,
-//! and a spawn that fails after its fork tears it down, as for any child. Held means what the
-//! attach made of it: a front whose leaf did not take it is in a process group, and gated as any
-//! uncontained front.
+//! and a spawn that fails after its fork tears it down, as for any child. Held means what the leaf's
+//! placement verdict made of it (the attach's, or on a failed identity check the one settled
+//! then): a front whose leaf did not take it is in a process group, and gated as any uncontained
+//! front.
 
 use std::io::{PipeWriter, Read as _};
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -158,4 +159,76 @@ fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fix
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
     assert_left_unsignalled(&err, pid, stdin);
+}
+
+/// A `cat` in a cgroup, reported as launched by `sudo` when `front`, whose stdin is a pipe the
+/// caller owns.
+pub(crate) fn contained_cat(front: bool) -> (Command, PipeWriter) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let mut cmd = in_cgroup(cat());
+    cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
+        .expect("stdin");
+    if front {
+        cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
+    }
+    (cmd, writer)
+}
+
+/// Spawns `cmd` through `spawn` with its identity check refused (`Unknown`) and its leaf's
+/// placement verdict failing closed (see `cgroup::fault::set_force_fail_closed`). Returns the error
+/// with the child's pid.
+pub(crate) fn fail_closed_and_refuse_the_identity(
+    cmd: &mut Command,
+    spawn: impl FnOnce(&mut Command) -> Result<(), crate::error::Error>,
+) -> (crate::error::Error, u32) {
+    use crate::child::spawn::fault;
+    use crate::containment::cgroup::fault as cgroup_fault;
+    fault::set_force_identity_unknown(true);
+    cgroup_fault::set_force_fail_closed(true);
+    let result = spawn(cmd);
+    fault::set_force_identity_unknown(false);
+    assert!(
+        !cgroup_fault::take_force_fail_closed(),
+        "the verdict must have been taken, and failed closed"
+    );
+    let err = result.expect_err("the forced identity failure fails the spawn");
+    let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
+        panic!("the seam must capture a resolved identity");
+    };
+    (err, id.pid())
+}
+
+/// A failed-closed verdict killed the child and says so; the error keeps the identity check's
+/// variant, and a front is not taken for one that was "sent nothing".
+#[track_caller]
+pub(crate) fn assert_failed_closed(err: &crate::error::Error, pid: u32) {
+    let text = err.to_string();
+    assert!(
+        matches!(err, crate::error::Error::Unassessable { .. }),
+        "the identity check's variant is kept: {err:?}"
+    );
+    assert!(
+        text.contains(&format!("cannot tell whether child {pid} entered its cgroup leaf")),
+        "the leaf's own account must be kept: {text}"
+    );
+    assert!(text.contains("its leaf was killed through"), "{text}");
+    assert!(
+        !text.contains("what sudo left"),
+        "a killed child is no front left alone: {text}"
+    );
+    assert_eq!(reap(pid), None, "the teardown reaps it");
+}
+
+/// An identity check that fails while the leaf's verdict fails closed: the leaf has already killed
+/// the child (a placed one, through its leaf), so a front is no front, and the leaf's account is not
+/// lost.
+///
+/// Mutant: the verdict is two-state, so a failed-closed one reads as "not placed".
+#[skuld::test]
+fn cgroup_a_failed_closed_verdict_is_kept_when_the_identity_check_fails(#[fixture(cgroup)] _group: &Group) {
+    for front in [true, false] {
+        let (mut cmd, _stdin) = contained_cat(front);
+        let (err, pid) = fail_closed_and_refuse_the_identity(&mut cmd, |cmd| cmd.spawn().map(drop));
+        assert_failed_closed(&err, pid);
+    }
 }

@@ -637,6 +637,24 @@ impl Child {
             other => panic!("test_force_fdmarker_pgid called on a non-FdMarker child: {other:?}"),
         }
     }
+
+    /// Test-only: the root a `TreeWalk` attachment walks from.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_treewalk_root(&self) -> Option<ProcessId> {
+        match &self.attached {
+            crate::containment::Attached::TreeWalk(root) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// Test-only: the root an fd marker's ppid-walk channel starts from.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_marker_root(&self) -> Option<ProcessId> {
+        match &self.attached {
+            crate::containment::Attached::FdMarker(m) => Some(m.root()),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the root has been reaped, from its inputs: this handle's own reap, or the root's number

@@ -6,7 +6,10 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
 use super::front_kill_tests::{cat, spawn_as};
-use crate::child::front_cgroup_tests::{assert_left_unsignalled, fail_the_identity_check, front_its_leaf_did_not_take};
+use crate::child::front_cgroup_tests::{
+    assert_failed_closed, assert_left_unsignalled, contained_cat, fail_closed_and_refuse_the_identity,
+    fail_the_identity_check, front_its_leaf_did_not_take,
+};
 use crate::elevation::{Backend, ElevatedVia};
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
@@ -88,4 +91,14 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
     assert_left_unsignalled(&err, pid, stdin);
+}
+
+/// Async twin of the sync `cgroup_a_failed_closed_verdict_is_kept_when_the_identity_check_fails`.
+#[skuld::test]
+async fn cgroup_a_failed_closed_verdict_is_kept_when_the_identity_check_fails(#[fixture(cgroup)] _group: &Group) {
+    for front in [true, false] {
+        let (mut cmd, _stdin) = contained_cat(front);
+        let (err, pid) = fail_closed_and_refuse_the_identity(&mut cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+        assert_failed_closed(&err, pid);
+    }
 }
