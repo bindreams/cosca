@@ -327,6 +327,8 @@ pub(crate) mod treewalk;
 
 #[path = "containment/dispatch.rs"]
 pub(crate) mod dispatch;
+#[cfg(target_os = "linux")]
+pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]
 pub(crate) use dispatch::DropView;
 #[allow(
@@ -334,8 +336,7 @@ pub(crate) use dispatch::DropView;
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
 pub(crate) use dispatch::{
-    attach, prepare, AbandonedChild, AttachError, Attached, Attachment, ClosedFate, Prepared, RootIdentity, Settled,
-    TreeKilled,
+    attach, prepare, AbandonedChild, Attached, Attachment, Prepared, RootIdentity, Settled, TreeKilled,
 };
 
 #[cfg(target_os = "macos")]

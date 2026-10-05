@@ -149,30 +149,3 @@ fn proc_stat_state_malformed_is_none() {
     assert_eq!(parse_proc_stat_state("42 (noparen"), None);
     assert_eq!(parse_proc_stat_state("42 (comm)"), None);
 }
-
-/// A child is in a leaf when its cgroup is the leaf's own path or nested under it — not when some
-/// other cgroup merely shares the leaf's name or a prefix of it.
-#[skuld::test]
-fn a_cgroup_path_is_inside_a_leaf_only_at_or_under_its_own_path() {
-    let leaf = "/slice/cosca-7-0";
-    for (path, inside) in [
-        ("/slice/cosca-7-0", true),
-        ("/slice/cosca-7-0/nested", true),
-        ("/slice/cosca-7-0/nested/deeper", true),
-        ("/other/cosca-7-0", false),
-        ("/slice/cosca-7-0-sibling", false),
-        ("/slice/cosca-7-01", false),
-        ("/slice", false),
-        ("/", false),
-    ] {
-        assert_eq!(
-            crate::containment::cgroup::is_at_or_under(path, leaf),
-            inside,
-            "{path} in {leaf}"
-        );
-    }
-    assert!(
-        crate::containment::cgroup::is_at_or_under("/cosca-7-0/x", "/cosca-7-0"),
-        "a leaf under the root cgroup"
-    );
-}

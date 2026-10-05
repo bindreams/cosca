@@ -20,8 +20,18 @@ use super::namespaces as ns;
 /// `crate::test_groups::namespaces`.
 macro_rules! in_fresh_pid_ns {
     ($test:ident, $driver:ident, $init:ident, $body:path) => {
+        $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [#[fixture(namespaces)] _group: &crate::test_groups::Group]);
+    };
+    // For a body that also needs a delegated cgroup: the entry test holds the `cgroup` group too.
+    ($test:ident, $driver:ident, $init:ident, $body:path, cgroup) => {
+        $crate::test_child::pid_reuse::in_fresh_pid_ns!(@define $test, $driver, $init, $body, [
+            #[fixture(namespaces)] _group: &crate::test_groups::Group,
+            #[fixture(cgroup)] _cgroup: &crate::test_groups::Group
+        ]);
+    };
+    (@define $test:ident, $driver:ident, $init:ident, $body:path, [$($params:tt)*]) => {
         #[skuld::test]
-        fn $test(#[fixture(namespaces)] _group: &crate::test_groups::Group) {
+        fn $test($($params)*) {
             crate::test_child::namespaces::run(crate::test_child::fixture_path!($driver));
         }
 

@@ -170,8 +170,9 @@ pub(crate) enum NotPlaced {
         /// The leaf's placement report — the outcome of the last self-placement write made
         /// through it, which for a production leaf is `pid`'s own.
         report: NotEntered,
-        /// The child's `/proc/<pid>` state letter, read BEFORE `procs`: `Z` means it had
-        /// exited before the file was read.
+        /// The child's state letter, found BEFORE `procs` is read: `Z` means its pidfd showed it
+        /// exited (reaped or not), and any other letter is its `/proc/<pid>` state while it had
+        /// not.
         child_state: Option<char>,
     },
     /// `cgroup.procs` could not be read.
@@ -181,13 +182,6 @@ pub(crate) enum NotPlaced {
         source: io::Error,
         /// As in [`NotPlaced::Absent`]: the leaf's report, not `pid`'s in general.
         report: NotEntered,
-    },
-    /// The child's exit could not be watched, so its report could not be waited for, and the
-    /// leaf was removed before the child entered it: it never can.
-    Unwaitable {
-        pid: u32,
-        /// `pidfd_open`'s error.
-        source: io::Error,
     },
 }
 
@@ -229,11 +223,6 @@ impl fmt::Display for NotPlaced {
                 f,
                 "child {pid} is not in the leaf cgroup: {report}; {} could not be read: {source}",
                 path.display()
-            ),
-            NotPlaced::Unwaitable { pid, source } => write!(
-                f,
-                "child {pid}'s placement report cannot be waited for: pidfd_open failed: {source}; \
-                 the leaf cgroup was removed before the child entered it"
             ),
         }
     }

@@ -73,12 +73,59 @@ pub(crate) fn read_populated(file: &mut File, buf: &mut String) -> Result<bool, 
     })
 }
 
-/// The kernel's current state letter for `pid`, or `None` when it is unknown; the cause is
-/// logged at debug (see [`StateUnknown`]). A not-yet-reaped child reads as `Z`, which is what
-/// separates "the placement write failed" from "the child exited before membership was checked".
+/// Whether the process `pidfd` names has exited, reaped or not: the pidfd turns readable at exit
+/// and stays so.
 #[cfg(target_os = "linux")]
-fn proc_state(pid: u32) -> Option<char> {
-    match read_proc_state(pid) {
+fn pidfd_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+    let now = Timespec { tv_sec: 0, tv_nsec: 0 };
+    loop {
+        match poll(&mut fds, Some(&now)) {
+            Ok(_) if fds[0].revents().contains(PollFlags::NVAL) => {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            Ok(_) => return Ok(fds[0].revents().contains(PollFlags::IN)),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The state letter of `child`, or `None` when it is unknown; the cause is logged at debug (see
+/// [`StateUnknown`]). Only the pidfd says `Z`: the child exited, which separates "the placement
+/// write failed" from "the child exited before membership was checked".
+///
+/// The pidfd is checked before and after the `/proc` read: a child unexited at the second check held
+/// `pid` throughout, so the read is its own; otherwise the state is `Z`.
+///
+/// A `/proc` state of `Z` or `X` with the pidfd unexited is a thread-group leader that exited while
+/// other threads run: the group has not exited, so that is no state of the child.
+#[cfg(target_os = "linux")]
+fn proc_state(child: crate::containment::ChildHandle<'_>) -> Option<char> {
+    let crate::containment::ChildHandle { pid, pidfd } = child;
+    let exited = |when: &str| match pidfd_exited(pidfd) {
+        Ok(exited) => Some(exited),
+        Err(e) => {
+            log::debug!("cgroup leaf: whether pid {pid} had exited {when} its state was read is unknown: {e}");
+            None
+        }
+    };
+    if exited("before")? {
+        return Some('Z');
+    }
+    #[cfg(test)]
+    fault::run_before_state_read();
+    let state = read_proc_state(pid);
+    if exited("after")? {
+        return Some('Z');
+    }
+    match state {
+        Ok('Z' | 'X' | 'x') => {
+            log::debug!("cgroup leaf: pid {pid}'s leader exited, group lives");
+            None
+        }
         Ok(state) => Some(state),
         Err(why) => {
             log::debug!("cgroup leaf: pid {pid}'s state is unknown: {why}");
@@ -178,11 +225,6 @@ pub(crate) struct CgroupLeaf {
     pub(super) report: Option<ReportChannel>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     pub(super) entered: bool,
-    /// How a verdict that failed closed left the child, once it has.
-    closed: Option<crate::containment::ClosedFate>,
-    /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
-    /// created outside the cgroup filesystem.
-    cgroup_path: Option<String>,
     /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
     /// abandoned before its verdict, or an async `Drop` released it
     /// ([`release_without_waiting`](Self::release_without_waiting)).
@@ -200,33 +242,6 @@ pub(crate) struct CgroupLeaf {
     /// silently folding a genuine failure into the same `debug` note used for a tree the caller
     /// never asked to kill at all.
     kill_attempt_failed: AtomicBool,
-}
-
-/// [`CgroupLeaf::holds`]'s error for a `/proc` view that could not be established: `message` names
-/// the view, and `source` is the OS error behind it, kept whole.
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct ViewRefused {
-    message: String,
-    source: Option<io::Error>,
-}
-
-#[cfg(target_os = "linux")]
-impl fmt::Display for ViewRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)?;
-        match &self.source {
-            Some(source) => write!(f, ": {source}"),
-            None => Ok(()),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl std::error::Error for ViewRefused {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
-    }
 }
 
 /// Why a spawn-side resource of a [`CgroupLeaf`] is missing.
@@ -253,11 +268,6 @@ pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
 
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// How a verdict that failed closed left the child; `None` until one has.
-    pub(crate) fn closed_fate(&self) -> Option<crate::containment::ClosedFate> {
-        self.closed
-    }
-
     /// Whether the placement verdict is still to be taken: the exchange has not ended.
     pub(crate) fn holds_verdict_to_take(&self) -> bool {
         self.report.is_some()
@@ -316,302 +326,48 @@ impl CgroupLeaf {
         self.report.as_ref().expect(RELEASED).slot()
     }
 
-    /// Whether `pid` entered this leaf: `Ok` when its own write into it succeeded.
+    /// Whether `child` entered this leaf: `Ok` when its own write into it succeeded.
     ///
     /// Used once, post-spawn (parent side). Blocks until the report is final — `spawn` returning
-    /// does not make it so (see [`ReportChannel`]) — or, when it cannot wait, decides without it
-    /// (see [`CgroupLeaf::decide_unwaitable`]). The child's report is the verdict: `cgroup.procs`
-    /// lists only live tasks, so a placed child that has already exited reads back absent from
-    /// it. Only a child that reported no successful write has `cgroup.procs` and its `/proc`
-    /// state read, to diagnose why — see [`NotPlaced`].
+    /// does not make it so (see [`ReportChannel`], which also says why the wait goes through the
+    /// child's pidfd). The child's report is the verdict: `cgroup.procs` lists only live tasks, so
+    /// a placed child that has already exited reads back absent from it. Only a child that reported
+    /// no successful write has `cgroup.procs` and its state read, to diagnose why — see
+    /// [`NotPlaced`].
     ///
     /// Taking the verdict closes the `cgroup.procs` fd and the report channel: nothing
     /// needs either after the child's `exec`, and otherwise every live contained child would
     /// hold three fds in the supervisor.
-    ///
-    /// The outer `Err` is a spawn that must fail: membership could not be decided, so the child
-    /// was killed (see [`CgroupLeaf::decide_unwaitable`]).
-    pub(crate) fn take_placement(&mut self, pid: u32) -> Result<Result<(), NotPlaced>, crate::error::Error> {
+    pub(crate) fn take_placement(&mut self, child: crate::containment::ChildHandle<'_>) -> Result<(), NotPlaced> {
         #[cfg(test)]
         fault::run_on_take_placement();
         let mut channel = self.report.take().expect(RELEASED);
         self.procs_fd = None;
-        #[cfg(test)]
-        if fault::take_force_fail_closed() {
-            crate::child::spawn::fault::capture(crate::identity::ProcessId::of(pid));
-            return Err(self.fail_closed(pid, channel, "forced by a test seam"));
-        }
-        let report = match channel.wait(pid) {
-            Ok(report) => report,
-            Err(source) => return self.decide_unwaitable(pid, channel, source),
-        };
+        let report = channel.wait(child.pidfd);
         channel.proceed();
         self.entered = report == PlacementReport::Placed;
         let report = match report {
-            PlacementReport::Placed => return Ok(Ok(())),
+            PlacementReport::Placed => return Ok(()),
             PlacementReport::NotReported => NotEntered::NotReported,
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
         };
         let path = self.leaf_path.join("cgroup.procs");
-        let child_state = proc_state(pid);
-        Ok(Err(match self.dir.read("cgroup.procs") {
+        let child_state = proc_state(child);
+        Err(match self.dir.read("cgroup.procs") {
             Ok(procs) => NotPlaced::Absent {
-                pid,
+                pid: child.pid,
                 path,
                 procs,
                 report,
                 child_state,
             },
             Err(source) => NotPlaced::Unreadable {
-                pid,
+                pid: child.pid,
                 path,
                 source,
                 report,
             },
-        }))
-    }
-
-    /// Decide membership for a child whose report has not arrived and cannot be waited for:
-    /// `pidfd_open` failed with `source`, and waiting on the channel's EOF could block forever
-    /// (see [`ReportChannel`]).
-    ///
-    /// The leaf is removed. `rmdir` succeeds only on a leaf with no live member, and a removed
-    /// leaf admits none: the child's later `cgroup.procs` write fails with `ENODEV`. So:
-    /// - removed, no `Placed` sent: the child is not in the leaf and never will be — degrade;
-    /// - removed, `Placed` sent: the child entered, and every member has since exited;
-    /// - `EBUSY` with the child's own `/proc/<pid>/cgroup` inside the leaf: it entered;
-    /// - anything else: the child may still enter a leaf cosca can neither wait on nor close.
-    ///   It is killed and the spawn fails (see [`CgroupLeaf::fail_closed`]).
-    ///
-    /// Every outcome but the last is a decision, so the child is sent *proceed*: one whose report
-    /// then fails to send carries on to `exec` under the verdict.
-    pub(super) fn decide_unwaitable(
-        &mut self,
-        pid: u32,
-        mut channel: ReportChannel,
-        source: io::Error,
-    ) -> Result<Result<(), NotPlaced>, crate::error::Error> {
-        let remove = || self.rmdir_leaf();
-        // Test-only fault seam: a leaf that is busy with another process.
-        #[cfg(test)]
-        let removed = match fault::take_force_leaf_busy() {
-            true => Err(io::Error::from_raw_os_error(libc::EBUSY)),
-            false => remove(),
-        };
-        #[cfg(not(test))]
-        let removed = remove();
-        let why = match removed {
-            Ok(()) => None,
-            Err(e) if removed_after_drain(&e) => None,
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => match self.holds(pid) {
-                Ok(true) => {
-                    log::debug!(
-                        "cgroup v2: pidfd_open failed ({source}), but child {pid} is already in its leaf {}",
-                        self.leaf_path.display()
-                    );
-                    self.entered = true;
-                    channel.proceed();
-                    return Ok(Ok(()));
-                }
-                Ok(false) => Some(format!("its leaf is occupied ({e}) but not by the child")),
-                // Unknown membership is not absence: deciding "not the child" on it would leave a
-                // child that may be in the leaf unkilled. Undecided fails closed.
-                Err(read) => Some(format!(
-                    "its leaf is occupied ({e}) and the child's membership could not be read ({read})"
-                )),
-            },
-            Err(e) => Some(format!("its leaf could not be removed ({e})")),
-        };
-        let Some(why) = why else {
-            self.entered = channel.read_final() == PlacementReport::Placed;
-            channel.proceed();
-            return Ok(if self.entered {
-                Ok(())
-            } else {
-                Err(NotPlaced::Unwaitable { pid, source })
-            });
-        };
-        Err(self.fail_closed(pid, channel, &format!("pidfd_open failed ({source}) and {why}")))
-    }
-
-    /// Whether `pid`'s own cgroup is this leaf or nested under it, or why that could not be read.
-    /// A leaf with no known unified-hierarchy path (a test leaf) holds nothing.
-    ///
-    /// Reads through the `/proc` dirfd that [`ProcView::Same`] carries. A `Diverged` or
-    /// `Unassessable` view is an `Err` (`/proc/{pid}` may name another process), which
-    /// [`decide_unwaitable`](Self::decide_unwaitable) treats as unreadable membership.
-    fn holds(&self, pid: u32) -> io::Result<bool> {
-        if self.cgroup_path.is_none() {
-            return Ok(false);
-        }
-        #[cfg(test)]
-        if fault::take_force_membership_unreadable() {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        let proc_dir = match crate::identity::proc_view() {
-            crate::identity::ProcView::Same(dir) => dir,
-            crate::identity::ProcView::Diverged => {
-                return Err(io::Error::other(format!(
-                    "this process's /proc is an outer pid namespace's, so pid {pid}'s cgroup membership cannot be read"
-                )));
-            }
-            crate::identity::ProcView::Unassessable(why) => {
-                let kind = why.source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
-                return Err(io::Error::new(
-                    kind,
-                    ViewRefused {
-                        message: format!(
-                            "the /proc view could not be established, so pid {pid}'s cgroup membership cannot be read: \
-                             {}",
-                            why.reason
-                        ),
-                        source: why.source,
-                    },
-                ));
-            }
-        };
-        self.holds_via(&proc_dir, pid)
-    }
-
-    /// [`holds`](Self::holds), reading `{pid}/cgroup` through `proc_dir` alone.
-    fn holds_via(&self, proc_dir: &crate::identity::ProcDir, pid: u32) -> io::Result<bool> {
-        let Some(leaf) = &self.cgroup_path else {
-            return Ok(false);
-        };
-        let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
-        let path = parse_v2_relative_path(&text)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
-        Ok(is_at_or_under(path, leaf))
-    }
-
-    /// Fail a spawn whose membership cannot be decided: kill the child as a group and shut the
-    /// channel, which end its chance to enter the leaf and make its report final, then apply the
-    /// module's report contract — kill through the leaf only on `Placed`.
-    ///
-    /// The group, not only the pid: between the last look at the report and the kill, the child
-    /// can report, exec and fork, and its descendants start in its process group, outside the
-    /// leaf. The pid too: a child killed before its own `setpgid` leads no group yet.
-    ///
-    /// There is no pidfd here — its failure is why the verdict is undecidable — so the child is
-    /// signalled by number. That is sound while `pid` is this process's own unreaped child (see
-    /// [`Command::contain`](crate::Command::contain)): the kernel does not reuse a pid, nor so a
-    /// process-group id, while any task holds it, and the unreaped child does. A child something
-    /// else already reaped is detected and never signalled; one reaped between that check and the
-    /// kill — only possible when the precondition is broken — is not.
-    pub(super) fn fail_closed(&mut self, pid: u32, channel: ReportChannel, why: &str) -> crate::error::Error {
-        use nix::sys::wait::{waitid, Id, WaitPidFlag};
-
-        #[cfg(feature = "tokio")]
-        crate::bounded::assert_may_block("fail_closed");
-
-        let child = Pid::from_raw(i32::try_from(pid).expect("a spawned child's pid is a positive i32"));
-        // Whether `pid` is still this process's child, live or exited, without reaping it.
-        let ours = loop {
-            match waitid(
-                Id::Pid(child),
-                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
-            ) {
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(nix::errno::Errno::ECHILD) => break false,
-                _ => break true,
-            }
-        };
-        debug_assert!(
-            ours,
-            "{child} is not an unreaped child of this process: something else reaped it"
-        );
-        // How the child itself was signalled.
-        enum Signalled {
-            Killed,
-            // cosca changes no credentials before the placement hook, so a child it may not
-            // signal has exec'd a program that runs as someone else, and its report, sent before
-            // `exec`, is final. Waiting for it would last that program's whole life.
-            Denied(nix::errno::Errno),
-            NotOurs,
-        }
-        let signalled = if ours {
-            #[cfg(test)]
-            let denied = fault::take_force_signal_denied();
-            #[cfg(not(test))]
-            let denied = false;
-            let killed = if denied {
-                Err(nix::errno::Errno::EPERM)
-            } else {
-                kill(child, Signal::SIGKILL)
-            };
-            // The child leads its group; the unreaped child holds the group's id.
-            if !denied {
-                _ = nix::sys::signal::killpg(child, Signal::SIGKILL);
-            }
-            match killed {
-                Ok(()) => {
-                    #[cfg(test)]
-                    fault::run_before_exit_wait();
-                    // Its exit, not its reaping: the spawn's error path reaps it.
-                    while let Err(nix::errno::Errno::EINTR) =
-                        waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
-                    {}
-                    Signalled::Killed
-                }
-                // ESRCH cannot happen to an unreaped child, so this is EPERM.
-                Err(e) => Signalled::Denied(e),
-            }
-        } else {
-            Signalled::NotOurs
-        };
-        // Shut, then read: a send after the read fails with no *proceed* queued, and its child exits
-        // without `exec` — so the report read is final, whether or not the kill landed.
-        self.entered = channel.shut().placement() == PlacementReport::Placed;
-        // Test-only fault seam: a child's send landing after the read.
-        #[cfg(test)]
-        fault::run_after_final_read(pid);
-        // Only a placed child's tree is in the leaf; `cgroup.kill` needs no credential to kill it.
-        let through_leaf = self.entered.then(|| {
-            self.hard_kill()
-                .map_err(|e| format!("cgroup.kill failed ({e})"))
-                .and_then(|()| {
-                    // Every member was just sent SIGKILL, so the leaf drains; `Drop` then removes it.
-                    self.block_until_drained()
-                        .map_err(|e| format!("cgroup.kill succeeded, but its drain could not be watched ({e})"))
-                })
-        });
-        self.closed = Some(crate::containment::ClosedFate {
-            entered: self.entered,
-            killed: matches!(signalled, Signalled::Killed),
-        });
-        let fate = match (signalled, through_leaf) {
-            (Signalled::Killed, None) => {
-                "the child and its process group were killed, and it had not entered its leaf".to_string()
-            }
-            (Signalled::Killed, Some(Ok(()))) => {
-                "the child and its process group were killed, and its leaf was killed through".to_string()
-            }
-            (Signalled::Killed, Some(Err(leaf))) => {
-                format!("the child and its process group were killed; through its leaf, {leaf}")
-            }
-            (Signalled::Denied(e), Some(Ok(()))) => {
-                format!("the child could not be signalled ({e}), but was killed through its leaf")
-            }
-            (Signalled::Denied(e), Some(Err(leaf))) => {
-                format!("the child could not be signalled ({e}); through its leaf, {leaf}")
-            }
-            (Signalled::Denied(e), None) => format!(
-                "the child could not be signalled ({e}): it exec'd a program this process may not kill, and \
-                 is left running outside its leaf"
-            ),
-            (Signalled::NotOurs, leaf) => format!(
-                "the child was already reaped by something else in this process, so it was not signalled, \
-                 and {}",
-                match leaf {
-                    None => "it had not entered its leaf".to_string(),
-                    Some(Ok(())) => "its leaf was killed through".to_string(),
-                    Some(Err(leaf)) => format!("through its leaf, {leaf}"),
-                }
-            ),
-        };
-        crate::error::Error::Containment {
-            detail: format!("cannot tell whether child {pid} entered its cgroup leaf: {why}; {fate}"),
-        }
+        })
     }
 
     fn rmdir_leaf(&self) -> io::Result<()> {
@@ -880,8 +636,6 @@ impl CgroupLeaf {
             procs_fd: None,
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
-            closed: None,
-            cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
             killed: AtomicBool::new(false),
@@ -1384,10 +1138,7 @@ pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
         }
     })?;
 
-    let mut leaf = create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))?;
-    let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
-    leaf.cgroup_path = Some(format!("{}/{name}", rel_path.trim_end_matches('/')));
-    Ok(leaf)
+    create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))
 }
 
 /// A new leaf's name: `cosca-<pid>-<seq>-<random>`. The pid and sequence number name the spawn for
@@ -1544,8 +1295,6 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,
-        closed: None,
-        cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
         killed: AtomicBool::new(false),
@@ -1671,9 +1420,5 @@ mod leaf_tests;
 mod leaf_state_tests;
 
 #[cfg(all(test, target_os = "linux"))]
-#[path = "leaf_namespace_tests.rs"]
-mod leaf_namespace_tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "leaf_holds_tests.rs"]
-mod leaf_holds_tests;
+#[path = "placement_reuse_tests.rs"]
+mod placement_reuse_tests;

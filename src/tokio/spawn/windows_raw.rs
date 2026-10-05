@@ -347,7 +347,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         Ok(v) => v,
         Err(e) => {
             sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(e.error);
+            return Err(e);
         }
     };
 

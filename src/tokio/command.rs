@@ -100,9 +100,8 @@ impl Command {
         self.inner.kill_on_drop(yes);
         self
     }
-    /// Contain the child's tree with the strongest available mechanism. The same Linux
-    /// precondition applies as for [`Command::contain`](crate::Command::contain): nothing else
-    /// in the process may reap the child.
+    /// Contain the child's tree with the strongest available mechanism. See
+    /// [`Command::contain`](crate::Command::contain) for the Linux precondition.
     ///
     /// tokio itself can fail a spawn after forking the child, and then drops it neither killed nor
     /// reaped, without reporting its pid. Only a child contained in a cgroup leaf

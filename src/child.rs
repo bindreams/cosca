@@ -59,10 +59,6 @@ pub(crate) mod front_kill_tests;
 #[path = "child/front_cgroup_tests.rs"]
 pub(crate) mod front_cgroup_tests;
 
-#[cfg(all(test, target_os = "linux"))]
-#[path = "child/front_failed_closed_tests.rs"]
-pub(crate) mod front_failed_closed_tests;
-
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {

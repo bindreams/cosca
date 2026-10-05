@@ -159,16 +159,3 @@ fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fix
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
     assert_left_unsignalled(&err, pid, stdin);
 }
-
-/// A `cat` in a cgroup, reported as launched by `sudo` when `front`, whose stdin is a pipe the
-/// caller owns.
-pub(crate) fn contained_cat(front: bool) -> (Command, PipeWriter) {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = in_cgroup(cat());
-    cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
-        .expect("stdin");
-    if front {
-        cmd.set_elevation_front(crate::elevation::front::front(Some(&SUDO)));
-    }
-    (cmd, writer)
-}

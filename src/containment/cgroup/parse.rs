@@ -1,20 +1,6 @@
 //! Pure parsers of cgroup and `/proc` text — no OS deps — compiled on all platforms so their
 //! unit tests run on any host.
 
-/// Whether the cgroup at `path` is `leaf` itself or nested under it. Both are unified-hierarchy
-/// paths as `/proc/<pid>/cgroup` prints them.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(
-        dead_code,
-        reason = "cgroup::leaf is this function's only caller and is linux-gated; kept host-agnostic"
-    )
-)]
-pub(crate) fn is_at_or_under(path: &str, leaf: &str) -> bool {
-    path.strip_prefix(leaf)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
 /// Parse the `0::` (cgroup v2 unified hierarchy) line from the contents of
 /// `/proc/self/cgroup`. Returns the relative path (e.g. `/user.slice/…`) on
 /// success, or `None` when no such line is present (v1-only or empty).

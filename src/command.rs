@@ -620,11 +620,9 @@ impl Command {
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
     ///
     /// # Linux: the child must stay this process's to reap
-    /// Until `spawn` returns, cosca tells by the child's pid whether it entered its cgroup, and may
-    /// have to kill it. So nothing else in the process may reap it first: do not set `SIGCHLD` to
-    /// `SIG_IGN`, and do not run a reaper that calls `waitpid(-1, …)` or `wait()`. Either can free
-    /// the pid for reuse by an unrelated process. Debug builds assert this; release builds
-    /// degrade, or fail the spawn, without signalling the pid when they see it.
+    /// Until `spawn` returns, nothing else in the process may reap the child: do not set `SIGCHLD`
+    /// to `SIG_IGN` or run a reaper that calls `waitpid(-1, …)`/`wait()`, since that frees the pid
+    /// for reuse by an unrelated process.
     pub fn contain(&mut self) -> &mut Command {
         self.contain_with(ContainMode::Strongest)
     }

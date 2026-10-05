@@ -1,4 +1,6 @@
-use crate::containment::cgroup::test_support::{alone, block_on, childs_copy, fork_running, reap};
+use std::os::fd::AsFd;
+
+use crate::containment::cgroup::test_support::{alone, block_on, childs_copy, fork_running, pidfd_of, reap};
 use crate::containment::cgroup::PlacementReport;
 
 /// The child's self-placement errno crosses `fork` into the parent. Deterministic and
@@ -28,7 +30,7 @@ fn placement_report_crosses_fork_with_the_childs_errno() {
         });
     }
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
-    let report = channel.wait(child.id()).expect("open a pidfd");
+    let report = channel.wait(pidfd_of(child.id()).as_fd());
     let status = child.wait().expect("wait");
     assert!(status.success(), "the failed placement must not abort the spawn");
     assert_eq!(
@@ -63,7 +65,7 @@ fn placement_report_records_a_successful_write() {
         });
     }
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
-    assert_eq!(channel.wait(child.id()).expect("open a pidfd"), PlacementReport::Placed);
+    assert_eq!(channel.wait(pidfd_of(child.id()).as_fd()), PlacementReport::Placed);
     child.wait().expect("wait");
     // SAFETY: the parent's own copy of the descriptor, closed exactly once.
     unsafe { libc::close(fd) };
@@ -91,10 +93,11 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
         _ = unsafe { slot.send_report(crate::containment::cgroup::REPORT_PLACED) };
     });
     let pid = guard.pid();
+    let pidfd = pidfd_of(pid);
     let (polling_tx, polling_rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
         crate::containment::cgroup::fault::set_wait_polling_notifier(polling_tx);
-        channel.wait(pid).expect("open a pidfd")
+        channel.wait(pidfd.as_fd())
     });
     polling_rx.recv().expect("the wait reaches its poll with nothing sent");
     gate_write.write_all(b"x").expect("release the child");
@@ -121,7 +124,7 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
     let child = fork_running(|| {});
 
     assert_eq!(
-        channel.wait(child.pid()).expect("open a pidfd"),
+        channel.wait(pidfd_of(child.pid()).as_fd()),
         PlacementReport::NotReported
     );
     reap(child.defuse());

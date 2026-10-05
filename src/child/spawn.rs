@@ -445,7 +445,6 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // against the handle held since the spawn: a pid alone does not say whom it names once
     // something else has reaped the child. The attach takes this identity and does not re-read
     // the root's, so a reap and reuse after the check cannot make the containment name a stranger.
-    // (A Linux leaf's placement verdict still addresses the child by pid.)
     // `SharedChild::adopt` reaps nothing, so this is also the identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
@@ -459,15 +458,27 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         crate::wait::exit_only::Target::Handle(child.as_handle())
     };
     let pid = child.id();
+    #[cfg(target_os = "linux")]
+    let handle = crate::containment::ChildHandle {
+        pid,
+        pidfd: std::os::fd::AsFd::as_fd(&child.through.pidfd),
+    };
     let id = match resolve_identity(pid, &through) {
         crate::identity::Resolved::Found(id) => id,
         // Different diagnosis per arm: an OS refusal is not a vanish.
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
             #[cfg(unix)]
-            let settlement = Settlement::settle(&mut prepared, pid, cmd.elevation_front());
+            let left_front = front_after_verdict(
+                &mut prepared,
+                #[cfg(target_os = "linux")]
+                handle,
+                #[cfg(not(target_os = "linux"))]
+                pid,
+                cmd.elevation_front(),
+            );
             #[cfg(not(unix))]
-            let settlement = Settlement::settle(&mut prepared, pid, None);
+            let left_front = front_after_verdict(&mut prepared, pid, None);
             #[cfg(target_os = "macos")]
             let fate = {
                 let identity = if matches!(other, crate::identity::Resolved::Gone) {
@@ -479,35 +490,32 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 FrontFate::of_unverified(identity)
             };
             #[cfg(not(target_os = "macos"))]
-            let fate = teardown_unadopted_or_front(child, settlement.front);
+            let fate = teardown_unadopted_or_front(child, left_front);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
-            return Err(settlement.finish(spawn_identity_error(other), fate, pid));
+            return Err(fate.note(spawn_identity_error(other), left_front, Some(pid)));
         }
     };
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeAttach, child.id());
     let attachment = match attach_or_fault(
         id,
+        #[cfg(target_os = "linux")]
+        handle,
         #[cfg(windows)]
         proc_handle,
         prepared,
     ) {
         Ok(v) => v,
-        Err(failed) => {
-            log::debug!("attach failed: {}", failed.error);
-            #[cfg(unix)]
-            let cmd_front = cmd.elevation_front();
-            #[cfg(not(unix))]
-            let cmd_front = None;
-            let (error, settlement) = Settlement::of_failed_attach(failed, front, cmd_front);
+        Err(error) => {
+            log::debug!("attach failed: {error}");
             // macOS: a front is left running and unreaped, sent nothing; any other child is killed
             // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
             let fate = {
                 assert_attach_cannot_fail(&error);
-                if settlement.front.is_some() {
+                if front.is_some() {
                     leave_front_after_attach_failure(child)
                 } else {
                     teardown_after_attach_failure(child, unique);
@@ -517,8 +525,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // Off macOS: kill + reap so a failed attach never leaks the child (std `Child::drop`
             // neither kills nor reaps), unless it is a front.
             #[cfg(not(target_os = "macos"))]
-            let fate = teardown_unadopted_or_front(child, settlement.front);
-            return Err(settlement.finish(error, fate, pid));
+            let fate = teardown_unadopted_or_front(child, front);
+            return Err(fate.note(error, front, Some(pid)));
         }
     };
     // The pidfd is already held, so adopting cannot fail.
@@ -1316,9 +1324,10 @@ pub(crate) fn resolve_identity_unchecked(pid: u32) -> crate::identity::Resolved<
 /// seam to force its failure.
 pub(crate) fn attach_or_fault(
     id: ProcessId,
+    #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: crate::containment::Prepared,
-) -> Result<crate::containment::Attachment, crate::containment::AttachError> {
+) -> Result<crate::containment::Attachment, Error> {
     #[cfg(test)]
     if fault::force_attach_failure() {
         // Capture identity for the test to check what became of the child, then simulate an attach
@@ -1326,22 +1335,33 @@ pub(crate) fn attach_or_fault(
         // verdict is taken before `prepared` drops, as a real attach takes it.
         fault::capture(crate::identity::Resolved::Found(id));
         let mut prepared = prepared;
-        prepared.settle_verdict(id.pid());
+        prepared.settle_verdict(
+            #[cfg(target_os = "linux")]
+            child,
+            #[cfg(not(target_os = "linux"))]
+            id.pid(),
+        );
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {
             detail: "forced attach failure (test seam)".into(),
-        }
-        .into());
+        });
     }
     #[cfg(all(test, target_os = "linux"))]
     if let Some(attachment) = fault::take_attachment_override() {
         let mut prepared = prepared;
-        prepared.settle_verdict(id.pid());
+        prepared.settle_verdict(
+            #[cfg(target_os = "linux")]
+            child,
+            #[cfg(not(target_os = "linux"))]
+            id.pid(),
+        );
         return Ok(attachment);
     }
     crate::containment::attach(
         id,
+        #[cfg(target_os = "linux")]
+        child,
         #[cfg(windows)]
         proc_handle,
         prepared,
@@ -1515,8 +1535,6 @@ pub(crate) enum FrontFate {
     LeftUnreaped,
     /// It could not be waited on: reaped by someone else, or unreadable.
     Unaccounted,
-    /// Its cgroup leaf did not hold it, and killed it outside the leaf.
-    KilledOutsideLeaf,
 }
 
 impl FrontFate {
@@ -1552,91 +1570,38 @@ impl FrontFate {
             FrontFate::Unaccounted => {
                 "it was sent nothing and could not be waited on, so the elevated program may be running"
             }
-            FrontFate::KilledOutsideLeaf => "it was killed outside its leaf, so the elevated program may be running",
         };
         error.with_note(&format!("{what}; {fate}"))
     }
 }
 
-/// What a failure arm after the fork takes from its cgroup leaf's placement verdict, settled before
-/// the child is torn down: whether the child is an elevation front left alone, and what the leaf
-/// has already done to it.
-pub(crate) struct Settlement {
-    /// The front the teardown must leave alone: not one the leaf holds, or killed through its leaf.
-    pub(crate) front: Option<crate::elevation::front::Front>,
-    /// The leaf's account of a verdict that failed closed, to append to the failure's own error.
-    note: Option<Error>,
-    closed: Option<crate::containment::ClosedFate>,
-}
-
-impl Settlement {
-    /// Settle `prepared`'s verdict before any kill, so the kill never races its reads. `front` is
-    /// the spawn's elevation front, if it has one.
-    pub(crate) fn settle(
-        prepared: &mut crate::containment::Prepared,
-        pid: u32,
-        front: Option<crate::elevation::front::Front>,
-    ) -> Settlement {
-        use crate::containment::Settled;
-        match prepared.settle_verdict(pid) {
-            Settled::InLeaf => Settlement {
-                front: None,
-                note: None,
-                closed: None,
-            },
-            Settled::NotPlaced => Settlement {
-                front,
-                note: None,
-                closed: None,
-            },
-            Settled::FailedClosed { error, fate } => Settlement {
-                front: front.filter(|_| !fate.entered),
-                note: Some(error),
-                closed: Some(fate),
-            },
-        }
-    }
-
-    /// What a failed attach left: the error to answer, and the settlement. `early_front` is the front
-    /// chosen before the attach, for a failure that says nothing of the verdict.
-    pub(crate) fn of_failed_attach(
-        failed: crate::containment::AttachError,
-        early_front: Option<crate::elevation::front::Front>,
-        front: Option<crate::elevation::front::Front>,
-    ) -> (Error, Settlement) {
-        let settlement = match failed.closed {
-            Some(fate) => Settlement {
-                front: front.filter(|_| !fate.entered),
-                note: None,
-                closed: Some(fate),
-            },
-            None => Settlement {
-                front: early_front,
-                note: None,
-                closed: None,
-            },
-        };
-        (failed.error, settlement)
-    }
-
-    /// `error` with the leaf's account and, for a front, its fate once its teardown did `teardown`.
-    pub(crate) fn finish(self, error: Error, teardown: FrontFate, pid: u32) -> Error {
-        let error = match &self.note {
-            Some(closed) => error.with_note(&format!("its cgroup leaf's placement failed closed: {closed}")),
-            None => error,
-        };
-        let killed_outside_leaf = matches!(self.closed, Some(fate) if fate.killed && !fate.entered);
-        let fate = match teardown {
-            FrontFate::Reaped if killed_outside_leaf => FrontFate::KilledOutsideLeaf,
-            other => other,
-        };
-        fate.note(error, self.front, Some(pid))
+/// The elevation front a failure arm after the fork must leave alone, once the cgroup leaf has
+/// taken its placement verdict, before the child is torn down so that the teardown never races the
+/// verdict's reads: none when the leaf holds the child (it is torn down as any child, see
+/// `crate::elevation::front`), else `front`. An uncontained front is never signalled: the arm
+/// returns its error with the front's fate noted (see [`FrontFate::note`]).
+pub(crate) fn front_after_verdict(
+    prepared: &mut crate::containment::Prepared,
+    #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
+    #[cfg(not(target_os = "linux"))] pid: u32,
+    front: Option<crate::elevation::front::Front>,
+) -> Option<crate::elevation::front::Front> {
+    use crate::containment::Settled;
+    match prepared.settle_verdict(
+        #[cfg(target_os = "linux")]
+        child,
+        #[cfg(not(target_os = "linux"))]
+        pid,
+    ) {
+        Settled::InLeaf => None,
+        Settled::NotPlaced => front,
     }
 }
 
-/// [`teardown_unadopted`], unless `child` is an elevation front: a kill of that would orphan the
-/// elevated program. A front is sent nothing. One that has exited is reaped now; a live one is left
-/// unreaped, with nothing that waits for it, and stays a zombie once it exits.
+/// [`teardown_unadopted`], unless `child` is an uncontained elevation front, which is never
+/// signalled: a kill of it would orphan the elevated program. One that has exited is reaped now; a
+/// live one is left unreaped, with nothing that waits for it, and stays a zombie once it exits. The
+/// caller returns its error with the front's fate noted ([`FrontFate::note`]).
 #[cfg(not(target_os = "macos"))]
 fn teardown_unadopted_or_front(mut child: impl Unadopted, front: Option<crate::elevation::front::Front>) -> FrontFate {
     if front.is_none() {
@@ -2306,6 +2271,10 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/placement_reuse_tests.rs"]
+mod placement_reuse_tests;
 
 #[cfg(test)]
 #[path = "spawn/spawn_lock_tests.rs"]

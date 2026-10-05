@@ -206,22 +206,6 @@ fn a_repeated_degrade_reason_warns_every_time() {
     );
 }
 
-/// `NotPlaced::Unwaitable` — a `pidfd_open` failure — is a degrade reason like any other, logged
-/// at `warn`. The pid is the marker: `Unwaitable`'s `Display` carries no path to embed one in.
-#[skuld::test]
-fn an_unwaitable_verdict_logs_at_warn() {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    log_degrade(&NotPlaced::Unwaitable {
-        pid: 918273645,
-        source: std::io::Error::from_raw_os_error(libc::EMFILE),
-    });
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "918273645's placement report"),
-        vec![log::Level::Warn],
-    );
-}
-
 // /proc/self/cgroup summary -----
 // `/proc/self/cgroup` is a whole-system dump of every hierarchy the caller is in, read to look
 // up one `0::` line. When there is no such line, none of its paths is one cosca touched, and

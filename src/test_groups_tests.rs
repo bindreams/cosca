@@ -144,7 +144,7 @@ mod reexec {
     /// A real `CGROUP` test, outside `containment::cgroup`, so only its fixture labels it `cgroup`.
     /// It makes cgroup leaves, so only a granted group may run it.
     const CGROUP_TEST: &str =
-        "child::spawn::spawn_tests::cgroup_a_sync_spawn_failed_closed_writes_nothing_into_the_childs_stdio";
+        "child::spawn::spawn_tests::cgroup_sync_identity_failure_settles_the_leaf_verdict_before_the_kill";
 
     /// A real `TRACER` test: it attaches a tracer with `ptrace`, so only a granted group may run it.
     const TRACER_TEST: &str = "child::shared::shared_tests::tracer::try_wait_leaves_a_ptrace_stop_for_the_tracer";

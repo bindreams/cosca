@@ -25,32 +25,14 @@ pub(crate) struct Prepared {
     pub graceful: crate::graceful::GracefulMechanism,
 }
 
-/// How a placement verdict that failed closed left the child.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only a Linux cgroup leaf is settled")
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ClosedFate {
-    /// The child entered its leaf, so the leaf's kill reached it.
-    pub(crate) entered: bool,
-    /// The child itself was killed. Not when it exec'd a program this process may not signal, or
-    /// something else had already reaped it.
-    pub(crate) killed: bool,
-}
-
-/// Why [`attach`] failed. `closed` is how a cgroup verdict that failed closed left the child, when
-/// that is what failed.
-#[derive(Debug)]
-pub(crate) struct AttachError {
-    pub(crate) error: Error,
-    pub(crate) closed: Option<ClosedFate>,
-}
-
-impl From<Error> for AttachError {
-    fn from(error: Error) -> Self {
-        AttachError { error, closed: None }
-    }
+/// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd the handshake
+/// gave it from before `exec`. The pidfd names the child whoever reaps it and whoever takes its
+/// number, so everything about the child's exit asks it, and the pid only labels.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChildHandle<'a> {
+    pub(crate) pid: u32,
+    pub(crate) pidfd: std::os::fd::BorrowedFd<'a>,
 }
 
 /// What [`Prepared::settle_verdict`] found of the child's placement in its cgroup leaf.
@@ -65,9 +47,6 @@ pub(crate) enum Settled {
     /// No leaf holds the child: there is none, the child did not enter it, or the verdict was
     /// already taken.
     NotPlaced,
-    /// Membership could not be decided, so the verdict failed closed: the child, and its tree
-    /// through the leaf if it entered, have already been killed. The error says so.
-    FailedClosed { error: Error, fate: ClosedFate },
 }
 
 impl Prepared {
@@ -81,22 +60,20 @@ impl Prepared {
         return crate::graceful::GracefulMechanism::Process;
     }
 
-    /// End the placement exchange of a spawn that failed while the caller still holds its child
-    /// (`pid`): take the verdict, as `attach` would, so the leaf answers only for the tree and
+    /// End the placement exchange of a spawn that failed while the caller still holds its child:
+    /// take the verdict, as `attach` would, so the leaf answers only for the tree and
     /// never for the child the caller will reap. [`Settled::NotPlaced`] without a leaf, or once
     /// the verdict is taken.
-    pub(crate) fn settle_verdict(&mut self, pid: u32) -> Settled {
+    pub(crate) fn settle_verdict(
+        &mut self,
+        #[cfg(target_os = "linux")] child: ChildHandle<'_>,
+        #[cfg(not(target_os = "linux"))] pid: u32,
+    ) -> Settled {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            return match leaf.take_placement(pid) {
-                Ok(Ok(())) => Settled::InLeaf,
-                Ok(Err(_)) => Settled::NotPlaced,
-                Err(error) => Settled::FailedClosed {
-                    error,
-                    fate: leaf
-                        .closed_fate()
-                        .expect("a verdict that failed closed records its fate"),
-                },
+            return match leaf.take_placement(child) {
+                Ok(()) => Settled::InLeaf,
+                Err(_) => Settled::NotPlaced,
             };
         }
         #[cfg(not(target_os = "linux"))]
@@ -886,12 +863,15 @@ pub(crate) fn prepare(
 /// cooperative-signal mechanism is read off it first.
 pub(crate) fn attach(
     id: crate::identity::ProcessId,
+    #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<Attachment, AttachError> {
+) -> Result<Attachment, Error> {
     let graceful = prepared.graceful_mechanism();
     let (containment, attached) = attach_tree(
         id,
+        #[cfg(target_os = "linux")]
+        child,
         #[cfg(windows)]
         proc_handle,
         prepared,
@@ -906,9 +886,10 @@ pub(crate) fn attach(
 /// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.
 fn attach_tree(
     id: crate::identity::ProcessId,
+    #[cfg(target_os = "linux")] child: ChildHandle<'_>,
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
-) -> Result<(Containment, Attached), AttachError> {
+) -> Result<(Containment, Attached), Error> {
     #[cfg(unix)]
     let pid = id.pid();
     // Linux: session, or cgroup v2 / process group.
@@ -943,12 +924,7 @@ fn attach_tree(
                     // because it lists only live tasks and a placed child may already have
                     // exited. Taking the verdict waits for that report — `spawn` returning does
                     // not mean the child has made it — then releases the leaf's fd and pipe.
-                    // An undecidable verdict fails the spawn: the child is already killed.
-                    let placement = leaf.take_placement(raw_pid).map_err(|error| AttachError {
-                        error,
-                        closed: leaf.closed_fate(),
-                    })?;
-                    match placement {
+                    match leaf.take_placement(child) {
                         Ok(()) => return Ok((Containment::CgroupV2, Attached::Cgroup(leaf))),
                         // Nothing of the child's is in the leaf: its final report is not Placed. The
                         // process group set pre-spawn is the real container; the leaf is
@@ -1054,7 +1030,7 @@ fn attach_tree(
                     // so `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok((Containment::TreeWalk, Attached::TreeWalk(id)));
                 }
-                Err(e) => return Err(Error::Containment { detail: e.to_string() }.into()),
+                Err(e) => return Err(Error::Containment { detail: e.to_string() }),
             }
         } else if prepared.mode.is_some() {
             // Nested member: it inherits the ancestor's job (or the root's tree-walk; no
