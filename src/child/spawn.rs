@@ -522,7 +522,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 debug_assert!(fault::force_attach_failure(), "a macOS attach cannot fail: {e}");
                 #[cfg(not(test))]
                 debug_assert!(false, "a macOS attach cannot fail: {e}");
-                if front.is_some() {
+                if front.is_none() {
                     leave_front_after_attach_failure(child)
                 } else {
                     teardown_after_attach_failure(child, unique);
