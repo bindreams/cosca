@@ -191,9 +191,6 @@ a skip.
 A group names an environment, not a mechanism. `CGROUP` means the unconfined cgroup lane: a
 delegated cgroup with `unshare` permitted.
 
-The one exception is the presence gates in `tests/elevation.rs` (`COSCA_TEST_ELEVATION`, `_GUI`,
-`_RUN0`): they assert an opt-in variable, so `0` would enable them. #552 converts them.
-
 **Why:** a skipped test reports the same pass as a working one, a gate that defaults to skip hides a
 whole group nobody decided to disable, and a process-wide mutation corrupts whichever tests share
 the process.
@@ -237,13 +234,14 @@ by `SKULD_LABELS=tracer`. So does
 with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
 in. So does
 `COSCA_TEST_DRIVE_MAPPING` (`windows_process_cwd`'s drive mapping), a `test_group!` row joined with
-`#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So do the other
+`#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So does
+`COSCA_TEST_ELEVATION` (tests that run commands with real administrator or root privileges), a `test_group!` row
+joined with `#[fixture(elevation)] _group: &Group`, selected by `SKULD_LABELS=elevation`. So do the other
 Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries and surveys),
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`, and which `windows-probes.yaml` selects by label.
-CI turns each off workflow-wide and opts in only in the step or job that runs it. Some
-system-affecting tests are not yet groups: the elevation exception above.
+CI turns each off workflow-wide and opts in only in the step or job that runs it.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's
 correctness, has to be what protects it. A group signal can reach an unrelated process ([principle

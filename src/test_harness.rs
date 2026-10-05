@@ -64,3 +64,7 @@ pub const TRACER: skuld::Label;
 /// Selects the `UID_SWITCH` group's test: it runs as real root and switches to other real uids.
 #[skuld::label]
 pub const UID_SWITCH: skuld::Label;
+
+/// Selects the tests that gain real administrator or root privileges (the `ELEVATION` group).
+#[skuld::label]
+pub const ELEVATION: skuld::Label;

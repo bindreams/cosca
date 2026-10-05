@@ -5,8 +5,8 @@ nextest-version = { required = "0.9.146" }
 [[profile.default.overrides]]
 #
 # `payload_race` and `block_on_socket` (the elevation tests' payload helper and testbin's payload) and
-# `*_unkillable_and_drop_does_not_hang` (a `Drop` that waited on a live child blocks) cover the
-# same shape of regression. The helper's own tests fail on a broken helper without waiting; this
+# `*_unkillable_and_drop_does_not_hang` (a `Drop` that waited on a live child blocks) cover the same shape of
+# regression. The helper's own tests fail on a broken helper without waiting; this
 # bound only stops a regression they did not anticipate from stalling the job.
 filter = 'test(/(^|::)death_watch_/) | test(/unkillable_and_drop_does_not_hang/) | binary(payload_race) | binary(block_on_socket)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
@@ -30,6 +30,14 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 filter = 'binary(tokio_control) & test(=async_graceful_tree_cancel_does_not_escalate_on_windows)'
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 
+# The Windows elevation kill tests spawn through UAC and then wait for the payload's socket to end, with their own 20 s
+# failure bound (`assert_kill_matches_payload`), so that a false kill is a diagnostic panic. This bound counts from
+# the test's start, spawn included, and is the backstop for a hang the in-test bound does not cover; it is longer
+# than that bound, or a false kill would show as a timeout instead.
+[[profile.default.overrides]]
+filter = 'test(/kill_of_an_elevated_child_reports_what_happened/)'
+slow-timeout = { period = "60s", terminate-after = 1, grace-period = "1s" }
+
 [profile.ci]
 fail-fast = false
 # Failure bound, not a sync: a descendant that never closes the test's stdout/stderr fails the test.
@@ -43,9 +51,9 @@ path = "junit.xml"
 
 # One profile per Unix step in ci.yaml (`.github/scripts/run-nextest.py` selects it through
 # `NEXTEST_PROFILE`), so a straggler from one step can only ever write that step's own JUnit file.
-# Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows keeps the shared `ci`
-# profile (run-nextest.ps1): after a failed or timed-out step every later step is skipped, so
-# nothing a surviving process writes can reach a published file.
+# Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows runs its steps under the
+# shared `ci` profile (run-nextest.ps1), and the elevation step under `ci-elevation`: after a failed or timed-out step
+# every later step is skipped, so nothing a surviving process writes can reach a published file.
 [profile.ci-tests]
 inherits = "ci"
 
@@ -72,6 +80,21 @@ inherits = "ci"
 
 [profile.ci-cgroup]
 inherits = "ci"
+
+[profile.ci-elevation]
+inherits = "ci"
+
+# `.github/scripts/check-junit.py` fails a lane with a skipped test, but nextest leaves ignored tests out of the
+# JUnit file unless asked.
+[profile.ci-elevation.junit]
+report-skipped = "ignored"
+
+# `gui_elevated_child_runs_as_root` waits on osascript's administrator dialog. The macOS lane approves it beforehand
+# (`unattended-gui-elevation.py`), so it finishes in seconds; where nothing approves it, it hangs. This bound only
+# fails that hang: it is the failure bound on an external event, not a sync.
+[[profile.ci-elevation.overrides]]
+filter = 'test(=gui_elevated_child_runs_as_root)'
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "1s" }
 
 [profile.ci-setuid]
 inherits = "ci"

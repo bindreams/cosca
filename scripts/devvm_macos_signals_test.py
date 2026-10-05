@@ -122,7 +122,7 @@ class CancellabilityWiringTests(SignalCase):
         self.assertIsNotNone(by_call["vms"][1], "counting the running VMs")
         self.assertIsNotNone(by_call["clone"][0], "cloning")
         self.assertIsNotNone(by_call["exec:true"][0], "the boot probe")
-        self.assertEqual([g is not None for g in by_call["exec:stage"]], [True, True], "archive copy and provisioning")
+        self.assertEqual([g is not None for g in by_call["exec:stage"]], [True, True, True], "archive copy, provisioning and the guest marker")
 
     def test_teardown_calls_take_no_gate_so_a_signal_cannot_cut_them_short(self) -> None:
         env = Env(self)
