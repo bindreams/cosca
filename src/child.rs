@@ -55,6 +55,10 @@ mod drop_reaped_tests;
 #[path = "child/front_kill_tests.rs"]
 pub(crate) mod front_kill_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/front_cgroup_tests.rs"]
+pub(crate) mod front_cgroup_tests;
+
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]
 pub(crate) enum ParentEnd {
@@ -256,8 +260,15 @@ impl Child {
     /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
+        self.kill_sent_gated(self.kill_gate())
+    }
+
+    /// [`kill_sent`](Child::kill_sent) under `gate`, this child's [`kill_gate`](Child::kill_gate)
+    /// read by the caller.
+    #[cfg(unix)]
+    pub(crate) fn kill_sent_gated(&self, gate: crate::elevation::front::Gate) -> Result<crate::signal::Sent, Error> {
         use crate::elevation::front::Gate;
-        match self.kill_gate() {
+        match gate {
             Gate::Open => {}
             // An exit is permanent, so a refused signal to an exited front changes nothing.
             Gate::Exited => return Ok(self.proc.kill_sent().unwrap_or(crate::signal::Sent::Delivered)),

@@ -96,7 +96,8 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// would name the tree by that number (a process group, a ppid walk), and the note says so.
 ///
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
-/// kill is the typed `Unkillable`, and the note says so.
+/// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
+/// and the note says it had exited. The front's gate is read once, for both kills.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -121,9 +122,10 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
              process, and the kill would {action}"
         ));
     }
+    let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let root = match gate {
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited => child.kill_sent(),
+        gate => child.kill_sent_gated(gate),
     };
     let root_note = match root {
         Ok(crate::signal::Sent::Gone) => {
@@ -136,7 +138,11 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
                 Ok(_status) => {
                     #[cfg(test)]
                     fault::record_teardown_reap(child.id().pid(), _status);
-                    "the elevated child was terminated".to_string()
+                    if exited_front {
+                        "the elevated child had already exited, and was reaped".to_string()
+                    } else {
+                        "the elevated child was terminated".to_string()
+                    }
                 }
                 Err(e) => {
                     log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
@@ -414,7 +420,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         through: PidfdChild::new(Some(child.id()), pidfd),
         child,
     };
-    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`). An attach
+    // with a leaf fails only on an undecidable verdict, which kills the child before `exec`: it never
+    // ran the program, so it is no front.
     #[cfg(target_os = "linux")]
     let in_cgroup = prepared.cgroup_leaf.is_some();
     #[cfg(not(target_os = "linux"))]
@@ -463,6 +471,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     // identity it takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, child.id());
+    // From here what the attach made decides: a leaf that did not take the child left it in its
+    // process group, uncontained.
+    #[cfg(unix)]
+    let front = cmd.elevation_front().filter(|_| !attachment.attached.is_cgroup());
+    #[cfg(not(unix))]
+    let front = None;
     #[cfg(target_os = "linux")]
     let through = child.through.target();
     #[cfg(target_os = "macos")]

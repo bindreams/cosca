@@ -1,0 +1,125 @@
+//! Async twins of `child/front_cgroup_tests.rs`: a front in a Linux cgroup, on the cgroup lane (the
+//! `cgroup` group, as root). A front its leaf holds acts as on `main`; one its leaf did not take is
+//! gated as any uncontained front.
+
+use std::os::unix::process::ExitStatusExt as _;
+use std::time::Duration;
+
+use super::front_kill_tests::{cat, spawn_as};
+use crate::child::front_cgroup_tests::{assert_left_unsignalled, fail_the_identity_check, front_its_leaf_did_not_take};
+use crate::elevation::{Backend, ElevatedVia};
+use crate::test_groups::{cgroup, Group};
+use crate::tokio::child::{drop_fault, Child};
+use crate::tokio::{ChildStdin, Command};
+use crate::{ContainMode, Containment, Stdio};
+
+const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
+
+/// A `sudo` front its cgroup leaf holds, with its stdin.
+fn spawn_contained_front(mut cmd: Command) -> (Child, ChildStdin) {
+    cmd.contain_with(ContainMode::Strongest);
+    let (child, stdin) = spawn_as(cmd, SUDO);
+    assert_eq!(child.containment(), Containment::CgroupV2);
+    (child, stdin)
+}
+
+/// Mutant: a front its leaf holds is gated, so its kill is `Unkillable`.
+#[skuld::test]
+async fn cgroup_kill_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+    let (mut child, _stdin) = spawn_contained_front(cat());
+    child.kill().expect("a contained front is killed as any child");
+    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
+}
+
+/// Mutant: a front its leaf holds is gated, so its `kill_tree` is `Unkillable`.
+#[skuld::test]
+async fn cgroup_kill_tree_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+    let (mut child, _stdin) = spawn_contained_front(cat());
+    child
+        .kill_tree()
+        .expect("a contained front's tree is killed as any child's");
+    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
+}
+
+/// The drop kills a contained front's root, as on `main`. Mutant: a front its leaf holds is gated,
+/// so the drop starts no root kill.
+#[skuld::test]
+async fn cgroup_drop_of_a_contained_front_kills_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+    crate::tokio::test_runtime::assert_current_thread();
+    let roots = drop_fault::record();
+    let (child, _stdin) = spawn_contained_front(cat());
+    drop(child);
+    assert_eq!(roots.kills(), 1, "the drop kills a contained front");
+}
+
+/// Mutant: a front its leaf holds is gated, so the escalation is `Unkillable`.
+#[skuld::test]
+async fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_on_main(#[fixture(cgroup)] _group: &Group) {
+    use tokio::io::AsyncReadExt as _;
+    let mut cmd = Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+    cmd.stdout(Stdio::pipe()).expect("stdout pipe");
+    let (mut child, _stdin) = spawn_contained_front(cmd);
+    let mut ready = [0u8; 6];
+    child
+        .stdout()
+        .expect("stdout pipe")
+        .read_exact(&mut ready)
+        .await
+        .expect("read `ready`");
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .await
+        .expect("the escalation kills a contained front");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+}
+
+/// Async twin of the sync `cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child`.
+#[skuld::test]
+async fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_kill_tests::{failed_front_spawns, reap};
+    for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop)
+    }) {
+        assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
+        assert_eq!(reap(pid), None, "the teardown reaps it");
+    }
+}
+
+/// Async twin of the sync `cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check`.
+#[skuld::test]
+async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
+    let (mut cmd, stdin) = front_its_leaf_did_not_take();
+    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_left_unsignalled(&err, pid, stdin);
+}
+
+/// A front whose leaf did not take it, dropped by tokio after its fork, is sent nothing, by the
+/// handshake or the leaf, and left unreaped, and the error says so. The failure comes from the
+/// `fail_tokio_spawns_after_fork` seam. Mutant: the handshake reads "contained" from the leaf the
+/// spawn prepared, not from its verdict, and tears the front down.
+#[skuld::test]
+async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_kill_tests::assert_reaped_unsignalled;
+    use crate::child::spawn::fault;
+    let (mut cmd, stdin) = front_its_leaf_did_not_take();
+    let err = {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        crate::tokio::spawn::spawn(&mut cmd)
+            .map(drop)
+            .expect_err("the forced failure fails the spawn")
+    };
+    let pid = fault::take_forgotten_pid().expect("the seam forked a child");
+    let crate::error::Error::Io(io) = &err else {
+        panic!("the spawn's error keeps its variant: {err:?}");
+    };
+    assert_eq!(io.raw_os_error(), None, "noted, with the original as its source: {io}");
+    let text = err.to_string();
+    assert!(text.contains("the spawned child is what sudo left"), "{text}");
+    assert!(
+        text.contains("the elevated program may be running; it is left unreaped"),
+        "{text}"
+    );
+    drop(stdin);
+    assert_reaped_unsignalled(pid);
+}

@@ -2889,7 +2889,7 @@ fn an_abandoned_intent_without_a_handle_is_never_signalled() {
     }
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
@@ -2935,7 +2935,7 @@ fn an_abandoned_child_with_no_handle_on_itself_is_out_of_reach() {
     crate::containment::cgroup::fault::set_force_child_proc_dir_failure(false);
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
@@ -2975,7 +2975,7 @@ fn an_abandoned_child_std_already_reaped_is_never_signalled() {
     reap(guard.defuse());
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::Ended
     );
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
@@ -2993,7 +2993,7 @@ fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::MaybeUnreaped
     );
     assert!(!leaf_path.exists(), "the empty leaf is removed");
@@ -3022,7 +3022,7 @@ fn a_child_reaped_between_the_check_and_the_kill_is_not_signalled_by_number() {
     crate::containment::cgroup::fault::set_between_check_and_kill(move || reap(pid));
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::Ended
     );
     assert_eq!(crate::containment::cgroup::fault::take_signalled_by_pid(), 0);
@@ -3058,7 +3058,7 @@ fn an_abandoned_child_that_refuses_the_kill_is_reaped_once_it_exits() {
     crate::containment::cgroup::fault::set_background_reap_notifier(reaped_tx);
 
     assert_eq!(
-        leaf.abandon_before_verdict(),
+        leaf.abandon_before_verdict(false),
         crate::containment::cgroup::Abandoned::OutOfReach
     );
     crate::test_child::assert_echoes(&mut stdin, &mut stdout);

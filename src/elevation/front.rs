@@ -79,6 +79,8 @@ pub(crate) fn kill_gate(
     in_cgroup: bool,
     running: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
+    #[cfg(test)]
+    seams::note_kill_gate();
     let Some(front) = front(via).filter(|_| !in_cgroup) else {
         return Gate::Open;
     };
@@ -151,6 +153,45 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
     Error::Elevation {
         kind: ElevationErrorKind::Unkillable,
         detail,
+    }
+}
+
+/// Test seams.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static GATES: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// From now on kill-gate evaluations on THIS thread are counted.
+    pub(crate) fn count_kill_gates() -> GateCounter {
+        GATES.with(|g| g.set(Some(0)));
+        GateCounter(())
+    }
+
+    #[must_use = "counting stops as soon as the counter is dropped"]
+    pub(crate) struct GateCounter(());
+
+    impl GateCounter {
+        pub(crate) fn count(&self) -> u32 {
+            GATES.with(|g| g.get().expect("the counter is live"))
+        }
+    }
+
+    impl Drop for GateCounter {
+        fn drop(&mut self) {
+            GATES.with(|g| g.set(None));
+        }
+    }
+
+    pub(super) fn note_kill_gate() {
+        GATES.with(|g| {
+            if let Some(n) = g.get() {
+                g.set(Some(n + 1));
+            }
+        });
     }
 }
 

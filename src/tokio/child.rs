@@ -517,12 +517,20 @@ impl Child {
     /// child was already gone ([`Sent::Gone`]: nothing was sent, and the caller must not wait for
     /// a termination that did not happen).
     pub(crate) fn kill_sent(&mut self) -> Result<Sent, Error> {
+        #[cfg(unix)]
+        let gate = self.kill_gate();
+        self.kill_sent_gated(
+            #[cfg(unix)]
+            gate,
+        )
+    }
+
+    /// [`kill_sent`](Child::kill_sent) under `gate`, this child's kill gate read by the caller.
+    pub(crate) fn kill_sent_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
         }
-        #[cfg(unix)]
-        let gate = self.kill_gate();
         #[cfg(unix)]
         let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
         #[cfg(not(unix))]
@@ -867,6 +875,10 @@ mod macos_kill_tests;
 #[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
 mod front_kill_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/front_cgroup_tests.rs"]
+mod front_cgroup_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]

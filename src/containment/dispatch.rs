@@ -52,7 +52,10 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
-    /// tell, so [`AbandonedChild::MaybeUnreachable`].
+    /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` its leaf
+    /// does not hold is sent nothing (see [`CgroupLeaf::abandon_before_verdict`]).
+    ///
+    /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
         not(feature = "tokio"),
         allow(
@@ -60,16 +63,19 @@ impl Prepared {
             reason = "only the tokio spawn path can lose a handle before a verdict is settled"
         )
     )]
-    pub(crate) fn abandon_before_verdict(&mut self) -> AbandonedChild {
+    pub(crate) fn abandon_before_verdict(&mut self, front: bool) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            return match leaf.abandon_before_verdict() {
+            return match leaf.abandon_before_verdict(front) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+                Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = front;
         AbandonedChild::MaybeUnreachable
     }
 }
@@ -91,6 +97,9 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It is an elevation front its leaf does not hold, which was sent nothing, and this is what
+    /// became of it.
+    Front(crate::child::spawn::FrontFate),
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the

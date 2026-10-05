@@ -13,8 +13,6 @@ use crate::child::fault::record_root_teardowns;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedStdio, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
-#[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
 use crate::{ContainMode, Containment, Stdio};
 
 pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
@@ -205,6 +203,37 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     assert_reaped_unsignalled(pid);
 }
 
+/// A failed password write whose front had already exited says so, not that it terminated the
+/// front, and asks the gate once. With direct exec the front is the root program, which refuses
+/// this process's signal even as a zombie: the `refuse_kills` seam stands in for that refusal.
+/// Mutants: the note of an exited front says it was terminated; the root's kill asks the gate
+/// again.
+#[skuld::test]
+fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
+    let mut cmd = cat();
+    // The drop, whose own teardown would ask the gate again, is opted out of.
+    cmd.kill_on_drop(false);
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let _refused = crate::signal::seams::refuse_kills();
+    let gates = crate::elevation::front::seams::count_kill_gates();
+    let err = crate::child::spawn::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("a failed write fails the spawn");
+    assert_eq!(gates.count(), 1, "{err}");
+    let Error::Elevation { detail, .. } = &err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    assert!(detail.contains("the elevated child had already exited"), "{detail}");
+    assert!(!detail.contains("terminated"), "{detail}");
+}
+
 /// A `SIGTERM` would end osascript and orphan the program, so `terminate()` on a live osascript
 /// front sends nothing. Mutant: osascript's `SIGTERM` is sent (the `cat` dies of it).
 #[skuld::test]
@@ -322,18 +351,6 @@ fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     }
 }
 
-/// A front contained in a cgroup is not gated: a spawn that fails after its fork tears it down as
-/// any child, killed and reaped, and its error carries no note. Needs a delegated cgroup: the cgroup
-/// lane. Mutant: the spawn's teardown leaves a contained front alone.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
-    for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| cmd.spawn().map(drop)) {
-        assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
-        assert_eq!(reap(pid), None, "the teardown reaps it");
-    }
-}
-
 /// A child that is not a front outside a cgroup keeps `main`'s refused escalation: the raw `Io`,
 /// not `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its kill is refused by a
 /// seam, and it ignores `SIGTERM`, so the escalation runs. Mutant: the escalation goes through
@@ -400,18 +417,56 @@ fn an_unverified_childs_fate_follows_its_identity() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
-    let (err, pid) = fail_a_front_report_read(|cmd| cmd.spawn().map(drop));
+    let (err, pid) = fail_a_front_spawn(fail_the_report_read, |cmd| cmd.spawn().map(drop));
     assert_unadopted_front_noted(&err, pid);
 }
 
-/// Spawns, through `spawn`, a `cat` front whose stdin is a pipe this function owns, with this
-/// process's read of its unique-id report failing, and returns the error with the front's pid once
-/// the front has been shown to end unsignalled, after its stdin closed.
+/// macOS: a spawn whose check of the front's identity is refused (`Unknown`) leaves it unverified:
+/// sent nothing, and unreaped. The error says so, as for a report it could not read. Mutant (tokio):
+/// the front is taken for one reaped elsewhere, which "could not be waited on".
 #[cfg(target_os = "macos")]
-pub(crate) fn fail_a_front_report_read(spawn: impl FnOnce(&mut Command) -> Result<(), Error>) -> (Error, u32) {
+#[skuld::test]
+fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
+    let (err, pid) = fail_a_front_spawn(refuse_the_identity, |cmd| cmd.spawn().map(drop));
+    assert_unadopted_front_noted(&err, pid);
+}
+
+/// While it lives, this thread's reads of a spawned child's own unique-id report fail.
+#[cfg(target_os = "macos")]
+pub(crate) fn fail_the_report_read() -> crate::child::spawn::unique_report::seams::FailedParentRead {
+    crate::child::spawn::unique_report::seams::fail_parent_read(libc::EIO)
+}
+
+/// While it lives, this thread's identity checks of a spawned child are refused (`Unknown`).
+#[cfg(target_os = "macos")]
+pub(crate) fn refuse_the_identity() -> RefusedIdentity {
+    crate::child::spawn::fault::set_force_identity_unknown(true);
+    RefusedIdentity
+}
+
+/// Refuses identity checks until dropped (see [`refuse_the_identity`]).
+#[cfg(target_os = "macos")]
+#[must_use = "identity checks succeed again as soon as the guard is dropped"]
+pub(crate) struct RefusedIdentity;
+
+#[cfg(target_os = "macos")]
+impl Drop for RefusedIdentity {
+    fn drop(&mut self) {
+        crate::child::spawn::fault::set_force_identity_unknown(false);
+    }
+}
+
+/// Spawns, through `spawn` and with `force` armed, a `cat` front whose stdin is a pipe this function
+/// owns, and returns the spawn's error with the front's pid once the front has been shown to end
+/// unsignalled, after its stdin closed.
+#[cfg(target_os = "macos")]
+pub(crate) fn fail_a_front_spawn<G>(
+    force: impl FnOnce() -> G,
+    spawn: impl FnOnce(&mut Command) -> Result<(), Error>,
+) -> (Error, u32) {
     use std::os::fd::OwnedFd;
 
-    use crate::child::spawn::{fault, unique_report};
+    use crate::child::spawn::fault;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let mut cmd = cat();
     cmd.stdin(Stdio::from_file(std::fs::File::from(OwnedFd::from(reader))))
@@ -420,8 +475,8 @@ pub(crate) fn fail_a_front_report_read(spawn: impl FnOnce(&mut Command) -> Resul
         Backend::Sudo,
     ))));
     let err = {
-        let _failing = unique_report::seams::fail_parent_read(libc::EIO);
-        spawn(&mut cmd).expect_err("the failed report read fails the spawn")
+        let _forced = force();
+        spawn(&mut cmd).expect_err("the forced failure fails the spawn")
     };
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the spawn captured the child") else {
         panic!("the spawn must capture a resolved identity");
@@ -432,8 +487,7 @@ pub(crate) fn fail_a_front_report_read(spawn: impl FnOnce(&mut Command) -> Resul
     (err, id.pid())
 }
 
-/// `err` keeps the failed read's `Unassessable` variant, and notes that the front `pid` is left
-/// unreaped.
+/// `err` keeps its `Unassessable` variant, and notes that the front `pid` is left unreaped.
 #[cfg(target_os = "macos")]
 #[track_caller]
 pub(crate) fn assert_unadopted_front_noted(err: &Error, pid: u32) {

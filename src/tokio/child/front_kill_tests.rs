@@ -8,8 +8,6 @@ use std::time::Duration;
 use crate::child::front_kill_tests::{assert_refused_by, assert_unkillable_front, report};
 use crate::containment::unix::fault::record_kill_group;
 use crate::elevation::{Backend, ElevatedVia};
-#[cfg(target_os = "linux")]
-use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
@@ -151,6 +149,33 @@ async fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
 }
 
+/// Async twin of the sync `a_failed_password_write_to_a_front_that_had_exited_says_so`.
+#[skuld::test]
+async fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
+    let mut cmd = cat();
+    // The drop, whose own teardown would ask the gate again, is opted out of.
+    cmd.kill_on_drop(false);
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let _refused = crate::signal::seams::refuse_kills();
+    let gates = crate::elevation::front::seams::count_kill_gates();
+    let err = crate::tokio::spawn::finish_elevated(
+        child,
+        Err(crate::error::Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("a failed write fails the spawn");
+    assert_eq!(gates.count(), 1, "{err}");
+    let crate::error::Error::Elevation { detail, .. } = &err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    assert!(detail.contains("the elevated child had already exited"), "{detail}");
+    assert!(!detail.contains("terminated"), "{detail}");
+}
+
 /// Mutant: osascript's `SIGTERM` is sent.
 #[skuld::test]
 async fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
@@ -237,19 +262,6 @@ async fn a_spawn_failing_after_its_fork_leaves_an_elevation_front_running_and_sa
     assert!(status.success(), "the teardown signalled the front: {status:?}");
 }
 
-/// Async twin of the sync `cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child`.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-async fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
-    use crate::child::front_kill_tests::{failed_front_spawns, reap};
-    for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop)
-    }) {
-        assert!(!err.to_string().contains("what sudo left"), "no note: {err}");
-        assert_eq!(reap(pid), None, "the teardown reaps it");
-    }
-}
-
 /// A front whose exec fails never ran the program: std collected the child, so its error carries no
 /// note that the program may be running. The exec fails on an argument longer than
 /// `MAX_ARG_STRLEN` (`E2BIG`). Mutant: a collected child is taken for a dropped front, and noted.
@@ -276,7 +288,17 @@ async fn a_front_whose_exec_fails_is_not_noted() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
-    use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_report_read};
-    let (err, pid) = fail_a_front_report_read(|cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_spawn, fail_the_report_read};
+    let (err, pid) = fail_a_front_spawn(fail_the_report_read, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_unadopted_front_noted(&err, pid);
+}
+
+/// Async twin of the sync `macos_a_front_whose_identity_is_refused_is_left_and_noted`. Mutant: the
+/// front is taken for one reaped elsewhere, which "could not be waited on".
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
+    use crate::child::front_kill_tests::{assert_unadopted_front_noted, fail_a_front_spawn, refuse_the_identity};
+    let (err, pid) = fail_a_front_spawn(refuse_the_identity, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
     assert_unadopted_front_noted(&err, pid);
 }
