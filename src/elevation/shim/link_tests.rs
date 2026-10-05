@@ -216,3 +216,20 @@ fn a_first_byte_that_is_not_hello_is_dropped() {
     assert_eq!(shim.read_byte(), None);
     assert_eq!(rig.link.observe().unwrap().start, StartState::Pending);
 }
+
+/// Linux keeps a connection's credentials after the peer is gone, so the hello is read and the answer
+/// to it fails; macOS cannot read them, and drops the peer before hello.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_answer_refuses_the_start() {
+    let rig = Rig::new();
+    rig.probe.hold_acceptor();
+    let mut shim = rig.connect();
+    shim.hello();
+    shim.close();
+    rig.probe.release_acceptor();
+    rig.expect_event(LinkEvent::Accepted);
+    rig.expect_event(LinkEvent::Dropped(DropReason::AnswerFailed));
+    assert_eq!(rig.link.observe().unwrap().start, StartState::Refused);
+    assert!(!socket_exists(&rig));
+}

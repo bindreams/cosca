@@ -192,3 +192,15 @@ fn observe_reads_but_never_moves_the_state() {
     shim.send_frame(Frame::Status(0));
     assert_eq!(rig.link.observe().unwrap().outcome, Some(LinkOutcome::Exited(0)));
 }
+
+#[skuld::test]
+fn a_frame_sent_before_the_shim_closed_with_k_unread_is_still_read() {
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    assert_eq!(rig.link.kill().unwrap(), KillOutcome::Delivered);
+    // The shim answers with its status and exits without ever reading the K: its close then resets
+    // the connection, which must not cost the frame.
+    shim.send_frame(Frame::Status(0x0900));
+    shim.close();
+    assert_eq!(rig.link.wait().unwrap(), LinkOutcome::Exited(0x0900));
+}

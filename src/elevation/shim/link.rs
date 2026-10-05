@@ -66,8 +66,21 @@ impl ShimLink {
             source,
         };
         let sock_path = dir.path().join(SOCKET_NAME);
-        let listener = sys::bind_listener(&probe, &sock_path).map_err(io_err)?;
-        // From here the socket file exists, and a failure must remove it before the directory goes.
+        // The socket file may exist even if setting the listener up failed, and must go before the
+        // directory does.
+        let remove_socket = || match std::fs::remove_file(&sock_path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                log::warn!("cannot remove the socket {}: {e}", sock_path.display());
+            }
+            _ => {}
+        };
+        let listener = match sys::bind_listener(&probe, &sock_path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                remove_socket();
+                return Err(io_err(e));
+            }
+        };
         let started = (|| {
             let (reader, writer) = sys::wake_pipe(&probe)?;
             let wake = Arc::new(Wake { reader, writer });
@@ -83,9 +96,7 @@ impl ShimLink {
         let (shared, wake, thread) = match started {
             Ok(parts) => parts,
             Err(e) => {
-                if let Err(rm) = std::fs::remove_file(&sock_path) {
-                    log::warn!("cannot remove the socket {}: {rm}", sock_path.display());
-                }
+                remove_socket();
                 return Err(io_err(e));
             }
         };
@@ -119,13 +130,15 @@ impl ShimLink {
         self.shared.kill()
     }
 
-    /// The outcome, once the caller has reaped the front (D7). Blocks until it is settled.
+    /// The outcome, once the caller has reaped the front (D7). Blocks until it is settled. A start
+    /// still pending is refused first, so the front must be gone: a late shim would be answered `N`.
     pub(crate) fn wait(&self) -> Result<LinkOutcome, NotOwner> {
         self.check_owner()?;
         Ok(self.shared.wait())
     }
 
-    /// [`wait`](Self::wait) without blocking: `None` while the frame is incomplete.
+    /// [`wait`](Self::wait) without blocking: `None` while the frame is incomplete. The same caveat
+    /// applies.
     pub(crate) fn try_wait(&self) -> Result<Option<LinkOutcome>, NotOwner> {
         self.check_owner()?;
         Ok(self.shared.settle())

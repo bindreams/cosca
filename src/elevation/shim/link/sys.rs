@@ -34,7 +34,8 @@ fn spawn_lock_is_held() -> bool {
     false
 }
 
-/// `SO_NOSIGPIPE` on macOS; Linux uses `MSG_NOSIGNAL` per send (D20).
+/// `SO_NOSIGPIPE` on macOS (D20), where std already sets it on every socket it makes; asserted here
+/// all the same. Linux uses `MSG_NOSIGNAL` per send.
 #[cfg(target_os = "macos")]
 pub(super) fn set_nosigpipe(fd: BorrowedFd<'_>) -> io::Result<()> {
     rustix::net::sockopt::set_socket_nosigpipe(fd, true)?;
