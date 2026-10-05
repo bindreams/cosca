@@ -58,9 +58,10 @@ pub(crate) struct ClosedStdio {
 }
 
 /// Lowers this process's descriptor limit to its lowest free descriptor, so that no further one can
-/// be made, until the guard drops. Process-wide: only a re-exec'd fixture calls it.
+/// be made, until the guard drops. Process-wide, so it takes the witness that this test runs in a
+/// process of its own (`test_own_process::own_process`).
 #[cfg(unix)]
-pub(crate) fn exhaust_fds() -> RestoreNofile {
+pub(crate) fn exhaust_fds(_alone: &crate::test_own_process::Completion) -> RestoreNofile {
     // SAFETY: `dup`, `close`, `getrlimit` and `setrlimit` on valid arguments.
     unsafe {
         let lowest_free = libc::dup(0);

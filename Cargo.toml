@@ -129,11 +129,10 @@ event-listener = "5"
 # cgroup syscalls; typed `ioctl`, `prctl`, `pidfd_open`; `mm`: the fork guard's wipe-on-fork page.
 rustix = { version = "1", features = ["process", "event", "net", "thread", "mm"] }
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-# Raw Mach threads for the tracer helper's thread-listing tests.
-mach2 = "0.7"
-
 [target.'cfg(target_os = "macos")'.dependencies]
+# `task_info(TASK_AUDIT_TOKEN)`: the fork guard's identity of the process; also raw Mach threads for
+# the tracer helper's thread-listing tests.
+mach2 = "0.7"
 # Reads the ACL that decides who may rename entries of a directory the shim channel lives under.
 exacl = "0.13"
 

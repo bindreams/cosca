@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{fchmod, fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
 use rustix::io::Errno;
 
-use super::fork_guard::ForkGuard;
+use super::fork_guard::{ForkGuard, Origin};
 
 mod facts;
 
@@ -51,8 +51,9 @@ pub(crate) enum Removal {
 /// A private directory, identified by `(dev, ino)` and removed only if the name still holds it.
 ///
 /// [`remove`](Self::remove) is the explicit teardown. `Drop` is the same removal, with the same
-/// logging, so no path leaks the directory silently. Only the pid that made the directory removes
-/// it: a fork copy's `Drop` closes its own descriptors and nothing else.
+/// logging, so no path leaks the directory silently. Only the process that created the directory
+/// (told by its fork guard) removes it: a fork copy's `Drop` closes its own descriptors and nothing
+/// else.
 pub(crate) struct PrivateDir {
     parent: OwnedFd,
     name: OsString,
@@ -201,18 +202,29 @@ impl PrivateDir {
 
     /// Removes the directory if the name still holds the one we made, by `(dev, ino)`, with
     /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Logs as [`Removal`]
-    /// says. Only the pid that made the directory may call it.
+    /// says. Only the process that created the directory may call it.
     pub(crate) fn remove(mut self) -> Removal {
-        debug_assert!(self.creator.is_original(), "removed by a process that did not make it");
+        debug_assert_eq!(
+            self.creator.origin(),
+            Origin::Original,
+            "removed by a process that did not make it"
+        );
         self.removed = true;
         self.remove_by_fd()
     }
 
-    /// `Drop`'s body, where `original` says whether this is the creating process (not a fork copy
-    /// of it, which a bare pid cannot tell): nothing unless it is, and the directory is not removed
-    /// yet.
-    fn release(&mut self, original: bool) {
-        if original && !self.removed {
+    /// `Drop`'s body, for a process of this `origin`: nothing unless it is the process that created
+    /// the directory (told by its fork guard, not a bare pid), and the directory is not removed yet.
+    /// An origin that cannot be told leaves the directory: removing it from a copy would take the
+    /// original's.
+    fn release(&mut self, origin: Origin) {
+        if origin == Origin::Unknown {
+            log::warn!(
+                "cannot tell who made the private directory {}; left in place",
+                self.path.display()
+            );
+        }
+        if origin == Origin::Original && !self.removed {
             self.removed = true;
             self.remove_by_fd();
         }
@@ -248,7 +260,7 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        self.release(self.creator.is_original());
+        self.release(self.creator.origin());
     }
 }
 

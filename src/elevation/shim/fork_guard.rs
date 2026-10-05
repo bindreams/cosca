@@ -1,29 +1,69 @@
-//! Exact detection of a fork copy, with no I/O after creation, so that checking it can neither fail
-//! nor panic, and a `Drop` that checks it cannot abort an unwind.
+//! Detection of a fork copy, with no descriptor, path or `/proc` read after creation, so that
+//! checking it needs no resource a full fd table or a sandbox could refuse.
 //!
 //! A bare pid cannot tell a fork copy from its original: in another pid namespace the copy can have
 //! the original's pid.
 //!
 //! - **Linux:** one page marked `MADV_WIPEONFORK` (kernel 4.14, below the 5.6 floor), with a marker
-//!   byte set at creation. A fork copy reads zero.
-//! - **macOS:** the process's unique id (`proc_pidinfo` flavour 17, which takes no descriptor), read
-//!   at creation; a copy is another process, with another id.
+//!   byte set at creation. A fork copy reads zero. The check is a memory read and cannot fail.
+//! - **macOS:** the process's audit token (`task_info(mach_task_self(), TASK_AUDIT_TOKEN)`: pid and
+//!   pidversion), read at creation and again at each check. Unlike `proc_pidinfo`, it works under a
+//!   Seatbelt sandbox entered after creation. The read is a call that could in principle fail, so
+//!   [`Origin::Unknown`] exists: a contract violation, logged, and never taken for either answer.
+//! - **Other platforms:** no exact mechanism, so [`ForkGuard::new`] is `Unsupported`.
 
 use std::io;
 
-/// Created by the original; [`is_original`](Self::is_original) is `false` in a fork copy of it.
-pub(crate) struct ForkGuard(imp::Guard);
+/// What [`ForkGuard::origin`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The process that created the guard.
+    Original,
+    /// A fork copy of it.
+    Copy,
+    /// The platform could not say (macOS only, and a contract violation). Whoever asks must do only
+    /// what is safe in both cases: nothing shared with the original, and nothing that waits on it.
+    Unknown,
+}
+
+/// Created by the original; [`origin`](Self::origin) is [`Origin::Copy`] in a fork copy of it.
+pub(crate) struct ForkGuard {
+    guard: imp::Guard,
+    /// A test makes the guard unable to say.
+    #[cfg(test)]
+    unreadable: std::sync::atomic::AtomicBool,
+}
 
 impl ForkGuard {
-    /// An error if the platform cannot give the guard its identity.
+    /// An error if the platform cannot give the guard its identity, or has no exact mechanism.
     pub(crate) fn new() -> io::Result<ForkGuard> {
-        imp::Guard::new().map(ForkGuard)
+        Ok(ForkGuard {
+            guard: imp::Guard::new()?,
+            #[cfg(test)]
+            unreadable: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
-    /// Whether this is the process that created the guard. A question the platform cannot answer
-    /// (macOS only) is `false`: whatever is guarded is then left alone, never torn down on a guess.
-    pub(crate) fn is_original(&self) -> bool {
-        self.0.is_original()
+    /// Which process this is. Never panics in a release build; see [`Origin::Unknown`].
+    pub(crate) fn origin(&self) -> Origin {
+        #[cfg(test)]
+        if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Origin::Unknown;
+        }
+        match self.guard.origin() {
+            Ok(origin) => origin,
+            Err(why) => {
+                log::warn!("cannot tell whether this process is the one that made a fork guard: {why}");
+                debug_assert!(false, "the fork guard's identity read failed: {why}");
+                Origin::Unknown
+            }
+        }
+    }
+
+    /// Makes [`origin`](Self::origin) answer [`Origin::Unknown`], as a failed read would.
+    #[cfg(test)]
+    pub(crate) fn make_unreadable(&self) {
+        self.unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -33,6 +73,8 @@ mod imp {
     use std::ptr::NonNull;
 
     use rustix::mm::{madvise, mmap_anonymous, munmap, Advice, MapFlags, ProtFlags};
+
+    use super::Origin;
 
     const MARKER: u8 = 0x5a;
     /// `mmap` rounds up to a page, which is what `madvise` covers.
@@ -69,9 +111,14 @@ mod imp {
             Ok(Guard(page))
         }
 
-        pub(super) fn is_original(&self) -> bool {
+        pub(super) fn origin(&self) -> Result<Origin, String> {
             // SAFETY: the mapping lives as long as `self`.
-            unsafe { self.0.as_ptr().read_volatile() == MARKER }
+            let marker = unsafe { self.0.as_ptr().read_volatile() };
+            Ok(if marker == MARKER {
+                Origin::Original
+            } else {
+                Origin::Copy
+            })
         }
     }
 
@@ -83,36 +130,70 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod imp {
     use std::io;
 
-    pub(super) struct Guard(u64);
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::message::audit_token_t;
+    use mach2::task::task_info;
+    use mach2::task_info::{TASK_AUDIT_TOKEN, TASK_AUDIT_TOKEN_COUNT};
+    use mach2::traps::mach_task_self;
 
-    #[cfg(target_os = "macos")]
-    fn unique_id() -> Result<u64, i32> {
-        crate::identity::own_unique_id()
-    }
+    use super::Origin;
 
-    /// Other Unixes: the pid, which a fork copy outside a pid namespace does not share.
-    #[cfg(not(target_os = "macos"))]
-    fn unique_id() -> Result<u64, i32> {
-        Ok(u64::from(std::process::id()))
+    /// `(pid, pidversion)`: `audit_token_to_pid` and `audit_token_to_pidversion`.
+    type Ids = (u32, u32);
+
+    pub(super) struct Guard(Ids);
+
+    /// This process's pid and pidversion, from its own task: no descriptor, no `proc_pidinfo`, and no
+    /// permission a sandbox could take away.
+    fn own_ids() -> Result<Ids, String> {
+        let mut token = audit_token_t::default();
+        let mut count = TASK_AUDIT_TOKEN_COUNT;
+        // SAFETY: `token` is `count` words of writable memory; `mach_task_self` has no preconditions.
+        let kr = unsafe {
+            task_info(
+                mach_task_self(),
+                TASK_AUDIT_TOKEN,
+                (&mut token as *mut audit_token_t).cast(),
+                &mut count,
+            )
+        };
+        if kr == KERN_SUCCESS && count == TASK_AUDIT_TOKEN_COUNT {
+            Ok((token.val[5], token.val[7]))
+        } else {
+            Err(format!("task_info(TASK_AUDIT_TOKEN) returned {kr} with {count} words"))
+        }
     }
 
     impl Guard {
         pub(super) fn new() -> io::Result<Guard> {
-            unique_id().map(Guard).map_err(io::Error::from_raw_os_error)
+            own_ids().map(Guard).map_err(io::Error::other)
         }
 
-        pub(super) fn is_original(&self) -> bool {
-            match unique_id() {
-                Ok(id) => id == self.0,
-                Err(errno) => {
-                    log::warn!("cannot read this process's unique id (errno {errno}); treating it as a fork copy");
-                    false
-                }
-            }
+        pub(super) fn origin(&self) -> Result<Origin, String> {
+            own_ids().map(|ids| if ids == self.0 { Origin::Original } else { Origin::Copy })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod imp {
+    use std::io;
+
+    use super::Origin;
+
+    pub(super) struct Guard;
+
+    impl Guard {
+        pub(super) fn new() -> io::Result<Guard> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub(super) fn origin(&self) -> Result<Origin, String> {
+            Ok(Origin::Unknown)
         }
     }
 }

@@ -1,3 +1,4 @@
+use super::super::fork_guard::Origin;
 use super::{check_facts, DirFacts, PrivateDir, PrivateDirError, Removal};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -300,7 +301,7 @@ fn a_fork_copys_drop_leaves_the_directory() {
     let root = tempfile::tempdir().unwrap();
     let mut dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    dir.release(false);
+    dir.release(Origin::Copy);
     assert!(
         path.is_dir(),
         "a process that did not make the directory must not remove it"
@@ -340,25 +341,35 @@ fn a_real_fork_copys_drop_leaves_the_directory() {
 /// needs a new descriptor. A panic in `Drop` during an unwind aborts the process.
 #[skuld::test]
 fn dropping_with_a_full_fd_table_does_not_panic() {
-    let fixture = crate::test_child::fixture_path!(fixture_drop_with_a_full_fd_table);
-    crate::test_child::run_fixture_command(fixture, crate::test_child::fixture_command(fixture));
-}
-
-#[skuld::test]
-fn fixture_drop_with_a_full_fd_table() {
-    if !crate::test_child::is_fixture_reexec() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(dropping_with_a_full_fd_table_does_not_panic),
+        crate::test_spawn::spawn,
+    ) else {
         return;
-    }
+    };
     let root = tempfile::tempdir().unwrap();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    let _restore = crate::test_child::exhaust_fds();
+    let _restore = crate::test_child::exhaust_fds(&done);
     assert!(
         std::fs::File::open("/dev/null").is_err(),
         "the precondition: no descriptor can be opened"
     );
     drop(dir);
     assert!(!path.exists(), "the drop still removed the directory");
+}
+
+/// A process whose origin cannot be told leaves the directory: from a copy, removing it would take
+/// the original's.
+#[skuld::test]
+fn an_unknown_origin_leaves_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let mut dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    dir.release(Origin::Unknown);
+    assert!(path.is_dir());
+    drop(dir);
+    assert!(!path.exists(), "the creator's drop still removes it");
 }
 
 fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {

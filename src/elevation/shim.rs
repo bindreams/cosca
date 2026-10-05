@@ -7,9 +7,9 @@
 mod choice;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub(crate) mod fork_guard;
 // Crate-private and not yet called: the `ShimLink` that owns it lands next.
 #[allow(dead_code, reason = "its only caller, ShimLink, lands in a later unit")]
-pub(crate) mod fork_guard;
 pub(crate) mod private_dir;
 pub(crate) mod protocol;
 
