@@ -9,9 +9,7 @@ use crate::elevation::shim::protocol::{decode_frame, Frame, FrameError, NotExecu
 /// Why the acceptor stopped serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptorFailure {
-    /// `accept` or `poll` failed with this errno.
     Errno(i32),
-    /// The acceptor thread panicked.
     Panicked,
 }
 
@@ -97,18 +95,12 @@ pub(crate) enum KillOutcome {
 /// Why [`ShimLink::wait`](super::ShimLink::wait) did not return an outcome.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WaitError {
-    #[error("a fork copy of the link cannot control it")]
-    NotOwner,
+    #[error(transparent)]
+    NotOwner(#[from] NotOwner),
     /// Waiting for the shim failed here, say for lack of memory. The outcome is not settled: the
     /// shim may be fine, and a later call can still read its frame.
     #[error("waiting for the shim: {0}")]
     Poll(io::Error),
-}
-
-impl From<NotOwner> for WaitError {
-    fn from(NotOwner: NotOwner) -> Self {
-        WaitError::NotOwner
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,8 +111,8 @@ pub(crate) enum KillError {
     /// The shim's socket is full (`EAGAIN`/`ENOBUFS`): `K` was not delivered.
     #[error("the shim's socket would block")]
     Unkillable,
-    #[error("a fork copy of the link cannot control it")]
-    NotOwner,
+    #[error(transparent)]
+    NotOwner(#[from] NotOwner),
     #[error("sending to the shim: {0}")]
     Io(io::Error),
 }
@@ -130,9 +122,8 @@ pub(crate) enum KillError {
 #[error("a fork copy of the link cannot control it")]
 pub(crate) struct NotOwner;
 
-/// Only the process that bound the link controls it. `origin` is its fork guard's answer; a bare pid
-/// does not tell processes apart, since a fork copy in another pid namespace can have the owner's. A
-/// process that cannot be told is refused too.
+/// Only the process that bound the link controls it; a process that cannot be told (`Unknown`) is
+/// refused too.
 pub(super) fn owner_check(origin: Origin) -> Result<(), NotOwner> {
     if origin == Origin::Original {
         Ok(())

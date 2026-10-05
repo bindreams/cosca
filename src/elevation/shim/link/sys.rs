@@ -1,8 +1,7 @@
 //! The link's system calls: its sockets and descriptors.
 //!
-//! Every descriptor is created `CLOEXEC`. Linux does it atomically. macOS cannot, so there the
-//! creation runs under `spawn_lock`: a cosca spawn never inherits one. A spawn outside cosca still
-//! can, which is accepted.
+//! Every descriptor is created `CLOEXEC`. macOS cannot do it atomically, so creation runs under
+//! `spawn_lock`: a cosca spawn never inherits one, though a spawn outside cosca can.
 
 use std::io::{self, PipeReader, PipeWriter};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -34,8 +33,8 @@ fn spawn_lock_is_held() -> bool {
     false
 }
 
-/// `SO_NOSIGPIPE` on macOS, where std already sets it on every socket it makes; asserted here
-/// all the same. Linux uses `MSG_NOSIGNAL` per send.
+/// macOS: sets and checks `SO_NOSIGPIPE` (std sets it already). Linux uses `MSG_NOSIGNAL` per send
+/// instead.
 #[cfg(target_os = "macos")]
 pub(super) fn set_nosigpipe(fd: BorrowedFd<'_>) -> io::Result<()> {
     rustix::net::sockopt::set_socket_nosigpipe(fd, true)?;
@@ -69,7 +68,7 @@ pub(super) fn bind_listener(probe: &Probe, path: &Path) -> io::Result<UnixListen
 /// left makes that fail. `Ok(None)` when none is queued.
 ///
 /// On macOS the accepted socket inherits `O_NONBLOCK` and `SO_NOSIGPIPE` from the listener; on Linux
-/// it inherits neither. `prepare_conn` therefore sets both, and owes nothing to the listener.
+/// it inherits neither. `prepare_conn` therefore sets both.
 pub(super) fn accept(probe: &Probe, listener: &UnixListener) -> io::Result<Option<UnixStream>> {
     match create_fds(probe, || listener.accept().map(|(conn, _)| conn)) {
         Ok(conn) => Ok(Some(conn)),
@@ -84,10 +83,9 @@ pub(super) fn prepare_conn(conn: &UnixStream) -> io::Result<()> {
     set_nosigpipe(conn.as_fd())
 }
 
-/// A pipe with a nonblocking write end: the wake pipe (the acceptor polls its read end, teardown
-/// writes the stop byte to its write end) and the settled pipe (written once, when the outcome is
-/// set). A write to a full pipe then fails with `EAGAIN` instead of blocking, and the pipe is
-/// readable, which is all either byte is for.
+/// A pipe with a nonblocking write end, for the wake pipe and the settled pipe. A write to a full
+/// pipe then fails with `EAGAIN` instead of blocking, and the pipe is readable, which is all either
+/// byte is for.
 pub(super) fn pipe(probe: &Probe) -> io::Result<(PipeReader, PipeWriter)> {
     create_fds(probe, || {
         let (reader, writer) = std::io::pipe()?;
@@ -161,7 +159,7 @@ pub(super) fn read_some(conn: BorrowedFd<'_>, buf: &mut [u8]) -> Read {
     }
 }
 
-/// Blocks until `fds` has an event, retrying `EINTR`. Returns when any of `fds` is ready.
+/// Blocks until `fds` has an event, retrying `EINTR`.
 pub(super) fn poll_ready(fds: &mut [PollFd<'_>]) -> Result<(), Errno> {
     loop {
         match poll(fds, None) {

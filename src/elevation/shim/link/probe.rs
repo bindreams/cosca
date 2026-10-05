@@ -18,25 +18,29 @@ pub(crate) enum DropReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only a test probe receives events"))]
 pub(crate) enum LinkEvent {
-    /// A root peer was accepted.
     Accepted,
-    /// A connection was closed unanswered.
     Dropped(DropReason),
     /// An answer was written (`A` or `N`) and the state updated.
     Answered(Command),
     /// A waiter is about to block for the frame.
     Parked(std::thread::ThreadId),
-    /// Bytes of the frame were read.
     Read(usize, std::thread::ThreadId),
     /// The final drain began; whether the socket path still existed then.
-    DrainStarted { path_exists: bool },
-    /// The acceptor thread ended.
+    DrainStarted {
+        path_exists: bool,
+    },
     AcceptorExited,
     /// A waiter is about to poll `fds` descriptors; whether the outcome's settled signal is already
     /// raised.
-    Polling { fds: usize, settled_readable: bool },
+    Polling {
+        fds: usize,
+        settled_readable: bool,
+    },
     /// `Drop` could not tell whether this process made the link, and did what is safe either way.
-    UnknownOriginHandled { refused: bool, stop_written: bool },
+    UnknownOriginHandled {
+        refused: bool,
+        stop_written: bool,
+    },
     /// Injected by a test thread that waited for a child process.
     ChildExited,
 }
@@ -53,6 +57,12 @@ impl Probe {
     pub(super) fn event(&self, _: impl FnOnce() -> LinkEvent) {}
     pub(super) fn acceptor_gate(&self) {}
     pub(super) fn waiter_gate(&self) {}
+    pub(super) fn stop_write_error(&self) -> Option<rustix::io::Errno> {
+        None
+    }
+    pub(super) fn settled_write_error(&self) -> Option<rustix::io::Errno> {
+        None
+    }
     pub(super) fn wait_poll_error(&self) -> Option<rustix::io::Errno> {
         None
     }
@@ -101,6 +111,8 @@ mod hooks {
         poll_errors: Mutex<VecDeque<Errno>>,
         wait_poll_errors: Mutex<VecDeque<Errno>>,
         send_errors: Mutex<VecDeque<Errno>>,
+        stop_write_error: Mutex<Option<Errno>>,
+        settled_write_error: Mutex<Option<Errno>>,
         credential_failures: Mutex<usize>,
         listener_cloexec: Mutex<Option<bool>>,
         panic_at_gate: AtomicBool,
@@ -130,6 +142,8 @@ mod hooks {
                 poll_errors: Mutex::new(VecDeque::new()),
                 wait_poll_errors: Mutex::new(VecDeque::new()),
                 send_errors: Mutex::new(VecDeque::new()),
+                stop_write_error: Mutex::new(None),
+                settled_write_error: Mutex::new(None),
                 credential_failures: Mutex::new(0),
                 listener_cloexec: Mutex::new(None),
                 panic_at_gate: AtomicBool::new(false),
@@ -183,6 +197,24 @@ mod hooks {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(errno);
+        }
+
+        /// The stop byte's next write fails with `errno`.
+        pub(crate) fn fail_next_stop_write(&self, errno: Errno) {
+            *self
+                .hooks()
+                .stop_write_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(errno);
+        }
+
+        /// The settled byte's next write fails with `errno`.
+        pub(crate) fn fail_next_settled_write(&self, errno: Errno) {
+            *self
+                .hooks()
+                .settled_write_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(errno);
         }
 
         /// The next `K` send fails with `errno`.
@@ -290,6 +322,19 @@ mod hooks {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()
+        }
+
+        pub(in crate::elevation::shim::link) fn stop_write_error(&self) -> Option<Errno> {
+            let h = self.0.as_ref()?;
+            h.stop_write_error.lock().unwrap_or_else(PoisonError::into_inner).take()
+        }
+
+        pub(in crate::elevation::shim::link) fn settled_write_error(&self) -> Option<Errno> {
+            let h = self.0.as_ref()?;
+            h.settled_write_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
         }
 
         pub(in crate::elevation::shim::link) fn send_error(&self) -> Option<Errno> {

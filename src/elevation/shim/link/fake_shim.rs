@@ -12,7 +12,6 @@ use crate::elevation::shim::protocol::Frame;
 pub(crate) struct FakeShim(UnixStream);
 
 impl FakeShim {
-    /// Connects to the link listening in `dir`.
     pub(crate) fn connect(dir: &Path) -> io::Result<FakeShim> {
         UnixStream::connect(dir.join(SOCKET_NAME)).map(FakeShim)
     }
@@ -54,7 +53,7 @@ pub(crate) fn next_acceptor_event(rx: &Receiver<LinkEvent>) -> LinkEvent {
     }
 }
 
-/// A link bound in a fresh temp directory, its probe, and the receiver of the probe's events.
+/// A link bound in a fresh temp directory, with a test probe.
 pub(crate) struct Rig {
     pub(crate) link: super::ShimLink,
     pub(crate) probe: super::probe::Probe,

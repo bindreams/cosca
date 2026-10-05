@@ -1,5 +1,5 @@
-//! The acceptor thread: answers each root shim that says hello, under the state lock, without
-//! any call from the owner. The link owns it and joins it in `Drop`.
+//! The acceptor thread: answers each shim with the expected euid that says hello, under the state
+//! lock, without any call from the owner.
 
 use std::io::{self, PipeReader, PipeWriter};
 use std::os::fd::AsFd;
@@ -32,7 +32,7 @@ impl Drop for ExitGuard<'_> {
     }
 }
 
-/// The thread body. Dropping `listener` on return closes it: a shim still queued sees EOF.
+/// The thread body. The listener closes on return, so a shim still queued sees EOF.
 pub(super) fn run(shared: Arc<Shared>, listener: UnixListener, wake: Arc<Wake>) {
     let _exit = ExitGuard(&shared);
     let mut acceptor = Acceptor {
@@ -48,7 +48,7 @@ pub(super) fn run(shared: Arc<Shared>, listener: UnixListener, wake: Arc<Wake>) 
 struct Acceptor<'a> {
     shared: &'a Shared,
     listener: &'a UnixListener,
-    /// Root peers that have not said hello.
+    /// Peers with the expected euid that have not said hello.
     pending: Vec<UnixStream>,
 }
 
@@ -69,8 +69,7 @@ impl Acceptor<'_> {
             if let Some(errno) = self.shared.probe.poll_error() {
                 return Err(AcceptorFailure::Errno(errno.raw_os_error()));
             }
-            // A byte nobody here asked for came from a fork copy of the link: consume it. Decided
-            // after the gate, so a test that holds the acceptor can fill the pipe meanwhile.
+            // Decided after the gate, so a test that holds the acceptor can fill the pipe meanwhile.
             let stop = woken && self.shared.is_stopping();
             if woken && !stop {
                 let mut byte = [0u8];
@@ -86,8 +85,8 @@ impl Acceptor<'_> {
                 Ok(())
             };
             if stop {
-                // The drain answers the peers already held whatever `accept` said. At teardown the
-                // state is settled, so there is nothing to fail closed: the error is only reported.
+                // At teardown the state is settled, so an accept failure is only reported, and the
+                // drain still runs.
                 self.drain();
                 if let Err(failure) = accepted {
                     log::warn!(
@@ -102,7 +101,7 @@ impl Acceptor<'_> {
         }
     }
 
-    /// Takes every connection queued, root ones into `pending`.
+    /// Takes every connection queued, those with the expected euid into `pending`.
     fn accept_all(&mut self, stopping: bool) -> Result<(), AcceptorFailure> {
         loop {
             let accepted = match self.shared.probe.accept_error(stopping) {
@@ -120,7 +119,7 @@ impl Acceptor<'_> {
         }
     }
 
-    /// Keeps `conn` if its peer is root; closes it unanswered otherwise.
+    /// Keeps `conn` if its peer has the expected euid; closes it unanswered otherwise.
     fn admit(&mut self, conn: UnixStream) {
         let path = self.shared.sock_path.display();
         let peer = match self.shared.probe.credentials_error() {
@@ -146,7 +145,8 @@ impl Acceptor<'_> {
         }
     }
 
-    /// Reads the hello of each pending peer that `ready` marks, in order of `pending` when polled.
+    /// Reads the hello of each pending peer that `ready` marks; `ready` is indexed like `pending` at
+    /// poll time.
     fn say_hellos(&mut self, ready: &[bool]) {
         let mut ready = ready.iter();
         let mut kept = Vec::with_capacity(self.pending.len());
@@ -179,7 +179,7 @@ impl Acceptor<'_> {
         self.pending = kept;
     }
 
-    /// The final drain: every peer still held is answered `N`, hello or not.
+    /// Answers every peer still held `N`, whether or not it said hello.
     fn drain(&mut self) {
         self.shared.probe.event(|| LinkEvent::DrainStarted {
             path_exists: self.shared.sock_path.exists(),

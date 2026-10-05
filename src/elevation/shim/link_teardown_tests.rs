@@ -38,7 +38,6 @@ fn wait_then_drop_does_not_report_shim_lost() {
     let mut shim = super::super::fake_shim::FakeShim::connect(link.dir()).unwrap();
     shim.hello();
     shim.send_frame(Frame::Status(0));
-    // Ensure the answer was read first.
     assert_eq!(shim.read_byte(), Some(b'A'));
     shim.close();
     assert_eq!(link.wait().unwrap(), LinkOutcome::Exited(0));
@@ -224,8 +223,8 @@ fn control_and_drop_with_a_full_fd_table_do_not_panic() {
 #[skuld::test]
 fn control_calls_from_a_fork_copy_are_refused() {
     owner_survives_a_fork_copy(|link| {
-        assert!(matches!(link.kill(), Err(KillError::NotOwner)));
-        assert!(matches!(link.wait(), Err(WaitError::NotOwner)));
+        assert!(matches!(link.kill(), Err(KillError::NotOwner(_))));
+        assert!(matches!(link.wait(), Err(WaitError::NotOwner(_))));
         assert!(matches!(link.try_wait(), Err(NotOwner)));
         assert!(matches!(link.observe(), Err(NotOwner)));
     });
@@ -297,4 +296,41 @@ fn every_descriptor_is_close_on_exec() {
     );
     let conn = rig.link.shared.conn.get().expect("Live has a connection");
     assert!(cloexec(conn.as_fd()), "the accepted connection");
+}
+
+/// A stop byte that cannot be written leaves the acceptor and the directory alone (joining would
+/// hang), and is a contract violation: an assertion in debug builds.
+#[skuld::test]
+fn a_failed_stop_write_leaks_instead_of_joining() {
+    let Rig {
+        link,
+        probe,
+        events,
+        tmp: _tmp,
+    } = Rig::new();
+    let dir = link.dir().to_owned();
+    let wake = link.wake.clone();
+    probe.fail_next_stop_write(rustix::io::Errno::IO);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(link)));
+    assert_eq!(dropped.is_err(), cfg!(debug_assertions), "the debug assertion");
+    assert!(dir.is_dir(), "nothing is removed");
+    // The stop flag was set, so the byte the failed write did not deliver still stops the acceptor.
+    super::super::sys::write_byte(std::os::fd::AsFd::as_fd(&wake.writer)).unwrap();
+    assert_eq!(
+        next_acceptor_event(&events),
+        LinkEvent::DrainStarted { path_exists: false }
+    );
+    assert_eq!(next_acceptor_event(&events), LinkEvent::AcceptorExited);
+}
+
+/// A settled byte that cannot be written is a contract violation too, but the outcome is set first.
+#[skuld::test]
+fn a_failed_settled_write_still_settles_the_outcome() {
+    let rig = Rig::new();
+    let mut shim = rig.live();
+    rig.probe.fail_next_settled_write(rustix::io::Errno::IO);
+    shim.send_frame(Frame::Status(0x2a00));
+    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.link.try_wait()));
+    assert_eq!(polled.is_err(), cfg!(debug_assertions), "the debug assertion");
+    assert_eq!(rig.link.observe().unwrap().outcome, Some(LinkOutcome::Exited(0x2a00)));
 }

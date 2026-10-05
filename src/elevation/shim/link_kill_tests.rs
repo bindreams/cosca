@@ -6,7 +6,7 @@ use crate::elevation::shim::protocol::Frame;
 
 /// Runs `f` with `SIGPIPE` blocked on this thread, and says whether `f` raised it. On Linux a blocked
 /// signal is never discarded, even where its disposition is `SIG_IGN` (as Rust's runtime sets it), so
-/// this sees a `send` that did not suppress the signal without changing any process-wide state.
+/// this sees a `send` that did not suppress the signal.
 fn raises_sigpipe(f: impl FnOnce()) -> bool {
     // SAFETY: plain signal-mask calls on zeroed sets, restoring the mask before returning.
     unsafe {

@@ -16,18 +16,16 @@ use super::probe::{DropReason, LinkEvent, Probe};
 use super::sys::{self, Read};
 use crate::elevation::shim::protocol::Command;
 
-/// Whether a shim has been told to start the program. Only ever moves right.
+/// Whether a shim has been told to start the program. Moves only `Pending` to `Live` or `Pending`
+/// to `Refused`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartState {
-    /// Nobody has been answered.
     Pending,
-    /// A shim was answered `A`.
     Live,
-    /// The start is refused: every shim is answered `N`.
     Refused,
 }
 
-/// A frame is a tag and four bytes.
+/// The length of a frame; see `protocol::decode_frame`.
 const FRAME_LEN: usize = 5;
 
 pub(super) struct Inner {
@@ -90,13 +88,10 @@ impl Shared {
         }
     }
 
-    /// A panic under the lock must not wedge teardown, so a poisoned lock is recovered: the data is
-    /// only ever updated in whole steps.
+    /// Recovers a poisoned lock so a panic cannot wedge teardown.
     pub(super) fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
-
-    // Transitions -----
 
     fn unlink(&self, inner: &mut Inner) {
         if std::mem::replace(&mut inner.unlinked, true) {
@@ -139,7 +134,7 @@ impl Shared {
         }
     }
 
-    /// The acceptor cannot go on: the start is refused, unless a shim already has the answer `A`.
+    /// The acceptor cannot go on: refuses the start unless a shim already has `A`.
     pub(super) fn fail_closed(&self, failure: AcceptorFailure) {
         let mut inner = self.lock();
         match inner.start {
@@ -191,15 +186,13 @@ impl Shared {
         self.deny(&conn);
     }
 
-    /// Answers `N`, best effort, and lets `conn` close.
+    /// Answers `N`; a failed send is only logged.
     pub(super) fn deny(&self, conn: &UnixStream) {
         if let Err(e) = sys::send_byte(conn.as_fd(), Command::Deny.encode()) {
             log::debug!("cannot answer N at {}: {e}", self.sock_path.display());
         }
         self.probe.event(|| LinkEvent::Answered(Command::Deny));
     }
-
-    // Reading the one outcome -----
 
     fn set_outcome(&self, inner: &mut Inner, outcome: LinkOutcome) {
         debug_assert!(inner.outcome.is_none(), "the outcome is set once");
@@ -218,10 +211,13 @@ impl Shared {
             }
         }
         inner.outcome = Some(outcome);
-        // Under the lock, so a waiter that sees no outcome and then polls sees this byte at the
-        // latest: the outcome is set before the byte, and the byte stays.
-        // The write end is nonblocking; a full pipe is already readable.
-        if let Err(e) = sys::write_byte(self.settled.1.as_fd()) {
+        // Written under the lock: a waiter that saw no outcome is guaranteed to see this byte when it
+        // polls. The write end is nonblocking, and a full pipe is already readable.
+        let written = match self.probe.settled_write_error() {
+            Some(injected) => Err(injected),
+            None => sys::write_byte(self.settled.1.as_fd()),
+        };
+        if let Err(e) = written {
             if e != Errno::AGAIN {
                 debug_assert!(false, "writing the settled byte failed: {e}");
                 log::warn!(
@@ -259,8 +255,8 @@ impl Shared {
         }
     }
 
-    /// The outcome once the front is gone and its status is known, if it is settled: `Pending`
-    /// becomes `Refused`. `None` means `Live` and no complete frame yet.
+    /// The settled outcome, if any. Refuses a pending start; `None` means `Live` with no complete
+    /// frame yet.
     pub(super) fn settle(&self) -> Option<LinkOutcome> {
         let mut inner = self.lock();
         if inner.outcome.is_none() {
@@ -291,8 +287,7 @@ impl Shared {
             let conn = self.conn.get().expect("Live has a connection");
             self.probe.event(|| LinkEvent::Parked(std::thread::current().id()));
             self.probe.waiter_gate();
-            // Another reader may settle the outcome from here on and leave `conn` empty, with the
-            // shim's end still open: only the settled signal then wakes this waiter.
+            // Poll `settled` too: another reader may take the frame and leave `conn` silent.
             let armed = |fds| {
                 self.probe.event(|| LinkEvent::Polling {
                     fds,
@@ -322,8 +317,6 @@ impl Shared {
             acceptor_failure: inner.failure,
         }
     }
-
-    // `kill` -----
 
     pub(super) fn kill(&self) -> Result<KillOutcome, KillError> {
         let mut inner = self.lock();

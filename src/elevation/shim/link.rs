@@ -70,8 +70,7 @@ impl ShimLink {
             source,
         };
         let sock_path = dir.path().join(SOCKET_NAME);
-        // The socket file may exist even if setting the listener up failed, and must go before the
-        // directory does.
+        // The bound socket file must be removed before the directory, on any failure after the bind.
         let remove_socket = || match std::fs::remove_file(&sock_path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
                 log::warn!("cannot remove the socket {}: {e}", sock_path.display());
@@ -131,20 +130,18 @@ impl ShimLink {
     /// killer can end or stop the shim between `K` and the signal. Every later observation then
     /// reports `ShimLost`, never "gone".
     pub(crate) fn kill(&self) -> Result<KillOutcome, KillError> {
-        self.check_owner().map_err(|NotOwner| KillError::NotOwner)?;
+        self.check_owner()?;
         self.shared.kill()
     }
 
-    /// The outcome, once the caller has reaped the front. Blocks until it is settled. A start still
-    /// pending is refused first, so the front must be gone: a late shim would be answered `N`. A
-    /// failure to wait leaves the outcome unset; a later call can still read the frame.
+    /// Blocks for the outcome. Call only after reaping the front: a still-pending start is refused
+    /// here, so a late shim is answered `N`. A failure to wait leaves the outcome unset.
     pub(crate) fn wait(&self) -> Result<LinkOutcome, WaitError> {
         self.check_owner()?;
         self.shared.wait().map_err(|e| WaitError::Poll(e.into()))
     }
 
-    /// [`wait`](Self::wait) without blocking: `None` while the frame is incomplete. The same caveat
-    /// applies.
+    /// Non-blocking `wait`: `None` until the frame is complete.
     pub(crate) fn try_wait(&self) -> Result<Option<LinkOutcome>, NotOwner> {
         self.check_owner()?;
         Ok(self.shared.settle())
@@ -188,7 +185,11 @@ impl ShimLink {
     /// Writes the stop byte. The write end is nonblocking and `stopping` is already set, so a full
     /// pipe (`EAGAIN`) means the acceptor will see the stop anyway.
     fn write_stop(&self) -> Result<(), Errno> {
-        match sys::write_byte(self.wake.writer.as_fd()) {
+        let written = match self.shared.probe.stop_write_error() {
+            Some(injected) => Err(injected),
+            None => sys::write_byte(self.wake.writer.as_fd()),
+        };
+        match written {
             Err(e) if e != Errno::AGAIN => Err(e),
             _ => Ok(()),
         }
@@ -211,13 +212,13 @@ impl ShimLink {
         self.shared.probe.release();
         self.shared.request_stop();
         if let Err(e) = self.write_stop() {
-            // The stop cannot be delivered, so joining would hang. Leave as an unknown origin does.
-            debug_assert!(false, "writing the stop byte failed: {e}");
+            // The stop cannot be delivered, so joining would hang: leak as an unknown origin does.
             log::error!(
                 "cannot stop the acceptor for {}: {e}; leaking its thread handle and the directory",
                 self.shared.sock_path.display()
             );
             std::mem::forget(self.acceptor.take());
+            debug_assert!(false, "writing the stop byte failed: {e}");
             return;
         }
         if let Some(thread) = self.acceptor.take() {
