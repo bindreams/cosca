@@ -12,7 +12,16 @@ use crate::elevation::shim::protocol::Frame;
 pub(crate) struct FakeShim(UnixStream);
 
 impl FakeShim {
+    /// Connects the way the real shim will: relative to the directory's descriptor on Linux, so a
+    /// long path cannot overflow `sun_path`; by full path on macOS.
     pub(crate) fn connect(dir: &Path) -> io::Result<FakeShim> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let held = std::fs::File::open(dir)?;
+            UnixStream::connect(format!("/proc/self/fd/{}/{SOCKET_NAME}", held.as_raw_fd())).map(FakeShim)
+        }
+        #[cfg(not(target_os = "linux"))]
         UnixStream::connect(dir.join(SOCKET_NAME)).map(FakeShim)
     }
 
@@ -78,6 +87,26 @@ impl Rig {
         let tmp = tempfile::tempdir().expect("a temp directory");
         let (probe, events) = super::probe::Probe::new();
         let link = super::ShimLink::bind_probed(tmp.path(), peer_euid, probe.clone()).expect("the link binds");
+        Rig {
+            link,
+            probe,
+            events,
+            tmp,
+        }
+    }
+
+    /// A link whose directory is under a temp directory nested deeper than `min_len` bytes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn deep(min_len: usize) -> Rig {
+        crate::log_capture::install();
+        let tmp = tempfile::tempdir().expect("a temp directory");
+        let mut nested = tmp.path().to_owned();
+        while nested.as_os_str().len() <= min_len {
+            nested.push("n".repeat(40));
+        }
+        std::fs::create_dir_all(&nested).expect("the nested directories");
+        let (probe, events) = super::probe::Probe::new();
+        let link = super::ShimLink::bind_probed(&nested, my_euid(), probe.clone()).expect("the link binds");
         Rig {
             link,
             probe,

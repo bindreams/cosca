@@ -57,6 +57,9 @@ impl Probe {
     pub(super) fn event(&self, _: impl FnOnce() -> LinkEvent) {}
     pub(super) fn acceptor_gate(&self) {}
     pub(super) fn waiter_gate(&self) {}
+    pub(super) fn proc_root(&self) -> std::path::PathBuf {
+        "/proc".into()
+    }
     pub(super) fn stop_write_error(&self) -> Option<rustix::io::Errno> {
         None
     }
@@ -115,6 +118,7 @@ mod hooks {
         settled_write_error: Mutex<Option<Errno>>,
         credential_failures: Mutex<usize>,
         listener_cloexec: Mutex<Option<bool>>,
+        proc_root: Mutex<Option<std::path::PathBuf>>,
         panic_at_gate: AtomicBool,
         fds: Mutex<Vec<bool>>,
     }
@@ -146,6 +150,7 @@ mod hooks {
                 settled_write_error: Mutex::new(None),
                 credential_failures: Mutex::new(0),
                 listener_cloexec: Mutex::new(None),
+                proc_root: Mutex::new(None),
                 panic_at_gate: AtomicBool::new(false),
                 fds: Mutex::new(Vec::new()),
             };
@@ -215,6 +220,11 @@ mod hooks {
                 .settled_write_error
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(errno);
+        }
+
+        /// `/proc` is looked for at `root` instead.
+        pub(crate) fn use_proc_root(&self, root: std::path::PathBuf) {
+            *self.hooks().proc_root.lock().unwrap_or_else(PoisonError::into_inner) = Some(root);
         }
 
         /// The next `K` send fails with `errno`.
@@ -335,6 +345,14 @@ mod hooks {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
+        }
+
+        pub(in crate::elevation::shim::link) fn proc_root(&self) -> std::path::PathBuf {
+            let configured = self
+                .0
+                .as_ref()
+                .and_then(|h| h.proc_root.lock().unwrap_or_else(PoisonError::into_inner).clone());
+            configured.unwrap_or_else(|| "/proc".into())
         }
 
         pub(in crate::elevation::shim::link) fn send_error(&self) -> Option<Errno> {

@@ -13,6 +13,7 @@ use rustix::io::Errno;
 use rustix::net::SendFlags;
 
 use super::probe::Probe;
+use crate::elevation::shim::private_dir::PrivateDir;
 
 /// Runs `create`, which makes descriptors, under `spawn_lock` on macOS.
 fn create_fds<T>(probe: &Probe, create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
@@ -51,6 +52,39 @@ pub(super) fn set_nosigpipe(_: BorrowedFd<'_>) -> io::Result<()> {
 const SEND_FLAGS: SendFlags = SendFlags::empty();
 #[cfg(not(target_os = "macos"))]
 const SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
+
+/// The path to bind the socket named `name` in `dir` at.
+///
+/// Linux: through `/proc/self/fd/<dir fd>`, so that `sun_path` holds a short name whatever the length
+/// of `TMPDIR`. The path is tried and compared with the descriptor before it is used; if `/proc` is
+/// not usable (not mounted, a different one mounted), that is the error, and there is no fallback to
+/// the long path.
+#[cfg(target_os = "linux")]
+pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    let via_proc = probe.proc_root().join(format!("self/fd/{}", dir.dir_fd().as_raw_fd()));
+    let opened = rustix::fs::openat(
+        rustix::fs::CWD,
+        &via_proc,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let (through_proc, own) = (rustix::fs::fstat(&opened)?, rustix::fs::fstat(dir.dir_fd())?);
+    if (through_proc.st_dev, through_proc.st_ino) != (own.st_dev, own.st_ino) {
+        return Err(io::Error::other(format!(
+            "{} is not this process's descriptor {}",
+            via_proc.display(),
+            dir.dir_fd().as_raw_fd()
+        )));
+    }
+    Ok(via_proc.join(name))
+}
+
+/// macOS has no `bindat`, so the socket is bound at its full path.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn socket_path(_: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
+    Ok(dir.path().join(name))
+}
 
 /// Binds the listener at `path`, nonblocking.
 pub(super) fn bind_listener(probe: &Probe, path: &Path) -> io::Result<UnixListener> {

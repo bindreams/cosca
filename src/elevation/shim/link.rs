@@ -40,6 +40,14 @@ pub(crate) enum BindError {
     Io { dir: std::path::PathBuf, source: io::Error },
     #[error("cannot set up the fork guard of the shim channel: {0}")]
     ForkGuard(io::Error),
+    #[error(
+        "the shim's socket is bound relative to its directory through /proc/self/fd, which is not usable here ({source}); TMPDIR ({}) cannot hold it on this system",
+        tmpdir.display()
+    )]
+    ProcUnusable {
+        tmpdir: std::path::PathBuf,
+        source: io::Error,
+    },
 }
 
 pub(crate) struct ShimLink {
@@ -65,23 +73,42 @@ impl ShimLink {
     pub(crate) fn bind_probed(tmp: &Path, peer_euid: u32, probe: Probe) -> Result<Self, BindError> {
         let owner = ForkGuard::new().map_err(BindError::ForkGuard)?;
         let dir = PrivateDir::create_unguarded(tmp)?;
-        let io_err = |source| BindError::Io {
+        let sock_path = dir.path().join(SOCKET_NAME);
+        // Any failure from here on removes what was made: the socket file, if it was bound, goes
+        // before the directory.
+        let fail = |dir: PrivateDir, error: BindError| {
+            match std::fs::remove_file(&sock_path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    log::warn!("cannot remove the socket {}: {e}", sock_path.display());
+                }
+                _ => {}
+            }
+            // `remove` logs what it finds.
+            let removed = dir.remove(Origin::Original);
+            debug_assert!(removed.is_ok(), "the original may remove its directory");
+            error
+        };
+        let io_err = |dir: &PrivateDir, source| BindError::Io {
             dir: dir.path().to_owned(),
             source,
         };
-        let sock_path = dir.path().join(SOCKET_NAME);
-        // The bound socket file must be removed before the directory, on any failure after the bind.
-        let remove_socket = || match std::fs::remove_file(&sock_path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                log::warn!("cannot remove the socket {}: {e}", sock_path.display());
+        // The socket is bound relative to the directory's descriptor where the platform allows it,
+        // so that a long `TMPDIR` cannot overflow `sun_path`.
+        let bind_path = match sys::socket_path(&probe, &dir, SOCKET_NAME) {
+            Ok(path) => path,
+            Err(source) => {
+                let error = BindError::ProcUnusable {
+                    tmpdir: tmp.to_owned(),
+                    source,
+                };
+                return Err(fail(dir, error));
             }
-            _ => {}
         };
-        let listener = match sys::bind_listener(&probe, &sock_path) {
+        let listener = match sys::bind_listener(&probe, &bind_path) {
             Ok(listener) => listener,
             Err(e) => {
-                remove_socket();
-                return Err(io_err(e));
+                let error = io_err(&dir, e);
+                return Err(fail(dir, error));
             }
         };
         let started = (|| {
@@ -100,8 +127,8 @@ impl ShimLink {
         let (shared, wake, thread) = match started {
             Ok(parts) => parts,
             Err(e) => {
-                remove_socket();
-                return Err(io_err(e));
+                let error = io_err(&dir, e);
+                return Err(fail(dir, error));
             }
         };
         Ok(ShimLink {

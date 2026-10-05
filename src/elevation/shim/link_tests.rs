@@ -289,3 +289,39 @@ fn a_poll_failure_while_pending_refuses_the_start() {
         })
     );
 }
+
+/// The socket is bound relative to the directory's descriptor, so a `TMPDIR` far longer than
+/// `sun_path` still works. Mutant: bind by full path.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_tmpdir_deeper_than_200_bytes_binds_and_accepts() {
+    let rig = Rig::deep(200);
+    assert!(rig.link.dir().as_os_str().len() > 200, "{}", rig.link.dir().display());
+    let _shim = rig.live();
+    assert_eq!(rig.link.observe().unwrap().start, StartState::Live);
+}
+
+/// Where `/proc` is not usable the bind is refused, naming `TMPDIR`, with no fallback to the long
+/// path and nothing left behind.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn an_unusable_proc_is_refused_naming_tmpdir() {
+    use super::super::link::BindError;
+    crate::log_capture::install();
+    let tmp = tempfile::tempdir().unwrap();
+    let (probe, _events) = super::probe::Probe::new();
+    probe.use_proc_root(tmp.path().join("no-proc-here"));
+    let Err(error @ BindError::ProcUnusable { .. }) = super::ShimLink::bind_probed(tmp.path(), my_euid(), probe) else {
+        panic!("an unusable /proc must refuse the bind");
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains("TMPDIR") && text.contains(&tmp.path().display().to_string()),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "nothing is left behind"
+    );
+}
