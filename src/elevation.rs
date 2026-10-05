@@ -22,7 +22,7 @@ use zeroize::Zeroize;
     )
 )]
 pub(crate) mod macos;
-// The gate is pure and tested everywhere; only the unix kill paths consult it.
+// Only the unix kill paths consult the gate.
 #[cfg_attr(
     not(unix),
     allow(
@@ -262,18 +262,9 @@ pub enum ElevatedVia {
     /// - **Left alone, osascript outlives the program**: it blocks until the program
     ///   exits, so [`crate::Child::wait`] returning means the elevated work is
     ///   finished.
-    /// - **It cannot be killed.** A kill of osascript would reach only osascript, and
-    ///   nothing unprivileged can stop the root program. So [`crate::Child::kill`]
-    ///   sends nothing and returns
-    ///   [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
-    ///   while osascript runs, and the drop-kill that [`crate::Command::kill_on_drop`]
-    ///   performs, which is **on by default**, leaves osascript running, with a `warn`.
-    ///   The sync [`crate::Child`]'s drop leaves it unreaped; the async
-    ///   `cosca::tokio::Child`'s hands it to tokio's own reaper, as it does any root
-    ///   still running. [`crate::Child::terminate`] and
-    ///   [`crate::Child::graceful_shutdown`] are refused the same way: a `SIGTERM`
-    ///   would end osascript, not the program, and once the front-end is gone the
-    ///   program's completion and its exit status are unobservable.
+    /// - **It cannot be killed or sent `SIGTERM`** while it runs: it is a front (see
+    ///   [`crate::Child::kill`]), and once it is gone the program's completion and
+    ///   exit status are unobservable.
     /// - `wait` reports **osascript's** exit status. It is zero if and only if the
     ///   elevated program exited zero; a non-zero code is osascript's, not the
     ///   program's — and on that path the program's stdout is discarded rather than

@@ -768,11 +768,18 @@ fn conclude<T: Spawned>(
     front: Option<crate::elevation::front::Front>,
 ) -> Result<Held<T>, Error> {
     let opened_teardown = |pidfd: OwnedFd, error: Error| {
+        use crate::wait::exit_only::{peek, Peek, Target};
         use std::os::fd::AsFd as _;
-        let collected = matches!(
-            crate::wait::exit_only::peek(&crate::wait::exit_only::Target::PidFd(pidfd.as_fd())),
-            Ok(crate::wait::exit_only::Peek::Foreign(_))
-        );
+        // A child std collected never ran the program. A peek that fails tells nothing, so the
+        // child is taken for a front still there, which is sent nothing.
+        let collected = match peek(&Target::PidFd(pidfd.as_fd())) {
+            Ok(Peek::Foreign(_)) => true,
+            Ok(_) => false,
+            Err(e) => {
+                log::debug!("a failed spawn's child cannot be peeked ({e}); taken to be uncollected");
+                false
+            }
+        };
         match front {
             Some(front) if !collected => {
                 super::leave_front_through_pidfd(None, pidfd, front).note(error, Some(front), None)

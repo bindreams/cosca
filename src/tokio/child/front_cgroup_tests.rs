@@ -1,5 +1,5 @@
 //! Async twins of `child/front_cgroup_tests.rs`: a front in a Linux cgroup, on the cgroup lane (the
-//! `cgroup` group, as root). A front its leaf holds acts as on `main`; one its leaf did not take is
+//! `cgroup` group, as root). A front its leaf holds acts as any child does; one its leaf did not take is
 //! gated as any uncontained front.
 
 use std::os::unix::process::ExitStatusExt as _;
@@ -23,17 +23,15 @@ fn spawn_contained_front(mut cmd: Command) -> (Child, ChildStdin) {
     (child, stdin)
 }
 
-/// Mutant: a front its leaf holds is gated, so its kill is `Unkillable`.
 #[skuld::test]
-async fn cgroup_kill_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+async fn cgroup_kill_of_a_contained_front_signals_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let (mut child, _stdin) = spawn_contained_front(cat());
     child.kill().expect("a contained front is killed as any child");
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
 }
 
-/// Mutant: a front its leaf holds is gated, so its `kill_tree` is `Unkillable`.
 #[skuld::test]
-async fn cgroup_kill_tree_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+async fn cgroup_kill_tree_of_a_contained_front_signals_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let (mut child, _stdin) = spawn_contained_front(cat());
     child
         .kill_tree()
@@ -41,10 +39,9 @@ async fn cgroup_kill_tree_of_a_contained_front_signals_it_as_on_main(#[fixture(c
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
 }
 
-/// The drop kills a contained front's root, as on `main`. Mutant: a front its leaf holds is gated,
-/// so the drop starts no root kill.
+/// The drop kills a contained front's root, as any child's is.
 #[skuld::test]
-async fn cgroup_drop_of_a_contained_front_kills_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+async fn cgroup_drop_of_a_contained_front_kills_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
     let roots = drop_fault::record();
     let (child, _stdin) = spawn_contained_front(cat());
@@ -52,9 +49,8 @@ async fn cgroup_drop_of_a_contained_front_kills_it_as_on_main(#[fixture(cgroup)]
     assert_eq!(roots.kills(), 1, "the drop kills a contained front");
 }
 
-/// Mutant: a front its leaf holds is gated, so the escalation is `Unkillable`.
 #[skuld::test]
-async fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_on_main(#[fixture(cgroup)] _group: &Group) {
+async fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_any_child(#[fixture(cgroup)] _group: &Group) {
     use tokio::io::AsyncReadExt as _;
     let mut cmd = Command::new();
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);

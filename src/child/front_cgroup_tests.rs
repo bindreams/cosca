@@ -1,8 +1,8 @@
 //! A front in a Linux cgroup: the cgroup lane (the `cgroup` group, as root). The front is an
 //! ordinary `cat` reported as launched by `sudo`.
 //!
-//! A front its cgroup leaf holds is not gated: its kills, drop and graceful escalation signal it as
-//! on `main`, and a spawn that fails after its fork tears it down as any child. Held means what the
+//! A front its cgroup leaf holds is not gated: its kills, drop and graceful escalation signal it,
+//! and a spawn that fails after its fork tears it down, as for any child. Held means what the
 //! attach made of it: a front whose leaf did not take it is in a process group, and gated as any
 //! uncontained front.
 
@@ -54,17 +54,15 @@ pub(crate) fn reaped(pidfd: &OwnedFd) -> bool {
     }
 }
 
-/// Mutant: a front its leaf holds is gated, so its kill is `Unkillable`.
 #[skuld::test]
-fn cgroup_kill_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_kill_of_a_contained_front_signals_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let (child, _stdin) = spawn_contained_front(cat());
     child.kill().expect("a contained front is killed as any child");
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
-/// Mutant: a front its leaf holds is gated, so its `kill_tree` is `Unkillable`.
 #[skuld::test]
-fn cgroup_kill_tree_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_kill_tree_of_a_contained_front_signals_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let (child, _stdin) = spawn_contained_front(cat());
     child
         .kill_tree()
@@ -72,20 +70,19 @@ fn cgroup_kill_tree_of_a_contained_front_signals_it_as_on_main(#[fixture(cgroup)
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
-/// The drop kills and reaps a contained front, as on `main`. Mutant: a front its leaf holds is
-/// gated, so the drop leaves it unreaped.
+/// The drop kills and reaps a contained front, as any child's is.
 #[skuld::test]
-fn cgroup_drop_of_a_contained_front_kills_and_reaps_it_as_on_main(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_drop_of_a_contained_front_kills_and_reaps_it_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let (child, _stdin) = spawn_contained_front(cat());
     let pidfd = pidfd_of(child.id().pid());
     drop(child);
     assert!(reaped(&pidfd), "the drop kills and reaps a contained front");
 }
 
-/// A contained front that outlives the grace is killed by the escalation, as on `main`. Its `cat`
-/// ignores `SIGTERM`. Mutant: a front its leaf holds is gated, so the escalation is `Unkillable`.
+/// A contained front that outlives the grace is killed by the escalation, as any child's is. Its
+/// `cat` ignores `SIGTERM`.
 #[skuld::test]
-fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_on_main(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_any_child(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = Command::new();
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
@@ -103,8 +100,7 @@ fn cgroup_graceful_shutdown_of_a_contained_front_escalates_as_on_main(#[fixture(
 }
 
 /// A front contained in a cgroup is not gated: a spawn that fails after its fork tears it down as
-/// any child, killed and reaped, and its error carries no note. Mutant: the spawn's teardown leaves
-/// a contained front alone.
+/// any child, killed and reaped, and its error carries no note.
 #[skuld::test]
 fn cgroup_a_failed_spawn_tears_a_contained_front_down_as_any_child(#[fixture(cgroup)] _group: &Group) {
     for (err, pid) in failed_front_spawns(Some(ContainMode::Strongest), |cmd| cmd.spawn().map(drop)) {
@@ -156,8 +152,7 @@ pub(crate) fn assert_left_unsignalled(err: &crate::error::Error, pid: u32, stdin
 }
 
 /// A front whose leaf did not take it is uncontained: a failed identity check sends it nothing, and
-/// says so. Mutant: "contained" is read from the leaf the spawn prepared, not from what the attach
-/// made, so the teardown kills the front.
+/// says so.
 #[skuld::test]
 fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();

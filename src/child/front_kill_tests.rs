@@ -23,9 +23,10 @@ pub(crate) fn report(via: ElevatedVia) -> Option<ElevationReport> {
     })
 }
 
-/// Spawns `cmd` with a piped stdin, reported as launched by `via`.
+/// Spawns `cmd` with a piped stdin, as the front `via` launches, and reported so.
 pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    cmd.set_elevation_front(crate::elevation::front::front(Some(&via)));
     let mut child = cmd.spawn().expect("spawn");
     child.set_elevation(report(via));
     let stdin = child.stdin().expect("stdin pipe");
@@ -64,7 +65,6 @@ pub(crate) fn assert_ends_unsignalled(child: &crate::Child, stdin: PipeWriter) {
     assert!(status.success(), "the front was signalled: {status:?}");
 }
 
-/// Mutant: `kill()` signals the front (it answers `Ok`, and the `cat` dies of `SIGKILL`).
 #[skuld::test]
 fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
@@ -72,19 +72,222 @@ fn kill_of_a_live_front_is_unkillable_and_sends_nothing() {
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// A front that has exited orphans nothing, so its kill answers as any child's. Mutant: the
-/// front's exit is not read, so the kill is `Unkillable`.
+/// A front that has exited orphans nothing, so its kill answers as any child's, even where the
+/// signal to its zombie is refused, as the root program's is with direct exec.
 #[skuld::test]
 fn kill_of_an_exited_front_is_ok() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id().pid());
+    let refused = crate::signal::seams::refuse_kills();
     child.kill().expect("an exited front is killed like any child");
+    drop(refused);
     assert!(child.wait().expect("wait").success());
 }
 
-/// pkexec execs the program, so the tracked process is the program: it is signalled. Mutant:
-/// pkexec counted as a front.
+/// An exited front's kill that fails other than by a refusal fails.
+#[skuld::test]
+fn kill_of_an_exited_front_returns_any_other_failure() {
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let failing = crate::signal::seams::fail_kills_with(libc::EINVAL);
+    match child.kill() {
+        Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{io}"),
+        other => panic!("expected the kill's own failure, got {other:?}"),
+    }
+    drop(failing);
+    assert!(child.wait().expect("wait").success());
+}
+
+/// An exited front's tree is killed as any child's, its refused root signal included.
+#[skuld::test]
+fn kill_tree_of_an_exited_front_is_ok() {
+    let mut cmd = cat();
+    cmd.contain_with(ContainMode::Session);
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.id().pid());
+    let refused = crate::signal::seams::refuse_kills();
+    child
+        .kill_tree()
+        .expect("an exited front's tree is killed like any child's");
+    drop(refused);
+    assert!(child.wait().expect("wait").success());
+}
+
+/// The drop of an exited front tears it down as any child's, reaping it, and warns of nothing.
+#[skuld::test]
+fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
+    crate::log_capture::install();
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let pid = child.id().pid();
+    drop(stdin);
+    crate::test_child::wait_until_zombie(pid);
+    let mark = crate::log_capture::mark();
+    drop(child);
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    assert!(warns.is_empty(), "{warns:?}");
+    assert_eq!(reap(pid), None, "the drop reaps an exited front");
+}
+
+/// A front its spawn found is what the gates read, not the elevation report: a child with a report
+/// and no front is killed as any child.
+#[skuld::test]
+fn kill_reads_the_front_its_spawn_found_not_its_report() {
+    let mut cmd = cat();
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    child.set_elevation(report(ElevatedVia::Wrapped(Backend::Sudo)));
+    let _stdin = child.stdin().expect("stdin pipe");
+    child.kill().expect("a child with no front is killed as any child");
+    assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
+}
+
+/// doas leaves this process tracking a front, as sudo does.
+#[skuld::test]
+fn kill_of_a_live_doas_front_is_unkillable_and_sends_nothing() {
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Doas));
+    assert_refused_by(child.kill(), &format!("pid {} is what doas left", child.id().pid()));
+    assert_ends_unsignalled(&child, stdin);
+}
+
+/// A live front's containments outside a cgroup that tell nothing of it: none, and a tree walk.
+pub(crate) fn uncontained_cats() -> [Command; 2] {
+    let mut walked = cat();
+    walked.contain_with(ContainMode::TreeWalk);
+    [cat(), walked]
+}
+
+/// A live front with no group, uncontained or in a walked tree, is sent nothing by `kill`.
+#[skuld::test]
+fn kill_of_a_live_front_without_a_group_sends_nothing() {
+    for cmd in uncontained_cats() {
+        let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+        assert_unkillable_front(child.kill(), child.id().pid());
+        assert_ends_unsignalled(&child, stdin);
+    }
+}
+
+/// A live front with no group, uncontained or in a walked tree, is sent nothing by the drop.
+#[skuld::test]
+fn drop_of_a_live_front_without_a_group_sends_nothing() {
+    for cmd in uncontained_cats() {
+        let teardowns = record_root_teardowns();
+        let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+        let pid = child.id().pid();
+        drop(child);
+        assert_eq!(teardowns.count(), 0, "the drop must not kill or reap a live front");
+        drop(stdin);
+        assert_reaped_unsignalled(pid);
+    }
+}
+
+/// A live front with no group, uncontained or in a walked tree, is sent nothing by a failed
+/// password write's teardown.
+#[skuld::test]
+fn a_failed_password_write_sends_a_live_front_without_a_group_nothing() {
+    for cmd in uncontained_cats() {
+        let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+        let pid = child.id().pid();
+        let detail = failed_password_write_detail(child);
+        assert!(detail.contains("could not be terminated"), "{detail}");
+        assert!(detail.contains(&format!("pid {pid} is what sudo left")), "{detail}");
+        drop(stdin);
+        assert_reaped_unsignalled(pid);
+    }
+}
+
+/// The `detail` of the error the sync `finish_elevated` returns for `child` after a failed
+/// password write.
+pub(crate) fn failed_password_write_detail(child: crate::Child) -> String {
+    let err = crate::child::spawn::finish_elevated(
+        child,
+        Err(Error::Elevation {
+            kind: ElevationErrorKind::AuthFailed,
+            detail: "forced password-write failure".into(),
+        }),
+    )
+    .expect_err("a failed write fails the spawn");
+    let Error::Elevation { detail, .. } = err else {
+        panic!("expected an Elevation error, got {err:?}");
+    };
+    detail
+}
+
+/// A front that exits on its `SIGTERM` within the grace is not escalated against: its status is
+/// returned.
+#[skuld::test]
+fn graceful_shutdown_of_a_front_that_exits_within_the_grace_returns_its_status() {
+    let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let status = child
+        .graceful_shutdown(Duration::from_secs(3600))
+        .expect("the relayed SIGTERM ends the front");
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+}
+
+/// A front that exits after its grace runs out, before its escalation, is killed as any exited
+/// child: its refused kill is `Ok`, and any other failure fails. The `cat` ignores `SIGTERM`; a hook
+/// before the escalation ends it and arms the kill's outcome.
+#[skuld::test]
+fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::child::graceful::fault::{at, HookPoint};
+    for errno in [libc::EPERM, libc::EINVAL] {
+        let mut cmd = Command::new();
+        cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+        cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+        let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+        let mut ready = [0u8; 6];
+        child
+            .stdout()
+            .expect("stdout pipe")
+            .read_exact(&mut ready)
+            .expect("read `ready`");
+        let pid = child.id().pid();
+        let failing = Rc::new(RefCell::new(None));
+        let _hook = at(HookPoint::BeforeEscalation, {
+            let failing = Rc::clone(&failing);
+            move || {
+                drop(stdin);
+                crate::test_child::wait_until_zombie(pid);
+                *failing.borrow_mut() = Some(crate::signal::seams::fail_kills_with(errno));
+            }
+        });
+        let result = child.graceful_shutdown(Duration::ZERO);
+        drop(failing.borrow_mut().take());
+        if errno == libc::EPERM {
+            assert!(result.expect("a refused kill of an exited front is Ok").success());
+        } else {
+            match result {
+                Err(Error::Io(io)) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput, "{io}"),
+                other => panic!("expected the kill's own failure, got {other:?}"),
+            }
+            assert!(child.wait().expect("wait").success());
+        }
+    }
+}
+
+/// A failed password write to a front someone else already reaped says the front had exited.
+#[skuld::test]
+fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exited() {
+    let mut cmd = cat();
+    cmd.kill_on_drop(false);
+    let (child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    let pid = child.id().pid();
+    drop(stdin);
+    crate::test_child::wait_until_zombie(pid);
+    assert!(reap(pid).is_some(), "the test reaps the front itself");
+    let detail = failed_password_write_detail(child);
+    assert!(
+        detail.contains("the elevated child had already exited, and was reaped by someone else"),
+        "{detail}"
+    );
+}
+
+/// pkexec execs the program, so the tracked process is the program: it is signalled.
 #[skuld::test]
 fn kill_of_a_pkexec_child_signals_it() {
     let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Pkexec));
@@ -93,7 +296,7 @@ fn kill_of_a_pkexec_child_signals_it() {
 }
 
 /// A process group or a walked tree is signalled subject to the target's credentials, so it does
-/// not reach the program either. Mutants: `kill_tree` runs the group kill; it signals the front.
+/// not reach the program either.
 #[skuld::test]
 fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() {
     let mut cmd = cat();
@@ -104,8 +307,7 @@ fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() 
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// The escalation is the gated kill. A `cat` that ignores `SIGTERM` outlives the grace. Mutant:
-/// the escalation signals the front directly.
+/// The escalation is the gated kill. A `cat` that ignores `SIGTERM` outlives the grace.
 #[skuld::test]
 fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
     let mut cmd = Command::new();
@@ -124,8 +326,7 @@ fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// The drop neither kills nor waits for a live front, and says so. Mutants: the drop runs the
-/// root's teardown (kill and reap); it warns of nothing.
+/// The drop neither kills nor waits for a live front, and says so.
 #[skuld::test]
 fn drop_of_a_live_front_leaves_it_running_unreaped_and_warns() {
     crate::log_capture::install();
@@ -170,9 +371,8 @@ pub(crate) fn assert_reaped_unsignalled(pid: u32) {
     );
 }
 
-/// A failed password write's teardown signals neither a live front nor its group, and says why.
-/// The `killpg` recorder stands in for the group kill. Mutants: the teardown runs the group kill;
-/// it signals the front.
+/// A failed password write's teardown signals neither a live front nor its group, and says why. The
+/// `killpg` recorder stands in for the group kill.
 #[skuld::test]
 fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
     let groups = crate::containment::unix::fault::record_kill_group();
@@ -206,8 +406,6 @@ fn a_failed_password_write_signals_neither_a_live_front_nor_its_group() {
 /// A failed password write whose front had already exited says so, not that it terminated the
 /// front, and asks the gate once. With direct exec the front is the root program, which refuses
 /// this process's signal even as a zombie: the `refuse_kills` seam stands in for that refusal.
-/// Mutants: the note of an exited front says it was terminated; the root's kill asks the gate
-/// again.
 #[skuld::test]
 fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     let mut cmd = cat();
@@ -236,7 +434,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
 
 /// A failed password write to a front that had exited, whose reap then fails (as when someone else
 /// reaps the zombie first), says the front had exited, not that it was killed. The reap failure is
-/// forced; it still reaps first. Mutant: the failed reap of an exited front says it was killed.
+/// forced; it still reaps first.
 #[skuld::test]
 fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exited() {
     let mut cmd = cat();
@@ -265,7 +463,7 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
 }
 
 /// A `SIGTERM` would end osascript and orphan the program, so `terminate()` on a live osascript
-/// front sends nothing. Mutant: osascript's `SIGTERM` is sent (the `cat` dies of it).
+/// front sends nothing.
 #[skuld::test]
 fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
@@ -275,8 +473,7 @@ fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
 }
 
 /// The graceful path starts with `terminate()`, so it is refused before any grace or kill. Then a
-/// kill is refused too, as it was before the attempt. Mutants: the graceful path signals
-/// osascript; a kill after it does.
+/// kill is refused too, as it was before the attempt.
 #[skuld::test]
 fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
@@ -289,7 +486,7 @@ fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// sudo relays `SIGTERM` to the program, so it is sent. Mutant: every front's `SIGTERM` is refused.
+/// sudo relays `SIGTERM` to the program, so it is sent.
 #[skuld::test]
 fn terminate_of_a_live_sudo_front_is_sent() {
     let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
@@ -367,9 +564,7 @@ pub(crate) fn assert_noted(failures: &[(Error, u32); 2], fate: &str) {
 }
 
 /// A spawn that fails after its fork sends an elevation front nothing (a kill would orphan the
-/// program), leaves it unreaped, and says so on the error it would have returned anyway. Mutants:
-/// the teardown kills the front; it hands the front to a reaper; the error's variant is replaced;
-/// the error does not say so.
+/// program), leaves it unreaped, and says so on the error it would have returned anyway.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
@@ -381,12 +576,11 @@ fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     }
 }
 
-/// A child that is not a front outside a cgroup keeps `main`'s refused escalation: the raw `Io`,
-/// not `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its kill is refused by a
-/// seam, and it ignores `SIGTERM`, so the escalation runs. Mutant: the escalation goes through
-/// `kill()`, whose mapping makes a wrapper child's refusal `Unkillable`.
+/// A child that is not a front outside a cgroup keeps its refused escalation the raw `Io`, not
+/// `Unkillable`. A pkexec child is one, as is any child in a cgroup. Its kill is refused by a seam,
+/// and it ignores `SIGTERM`, so the escalation runs.
 #[skuld::test]
-fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_mains_refusal() {
+fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_its_io_refusal() {
     let mut cmd = Command::new();
     cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
     cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
@@ -401,37 +595,82 @@ fn graceful_shutdown_of_a_child_that_is_not_a_front_keeps_mains_refusal() {
         let _refused = crate::signal::seams::refuse_kills();
         match child.graceful_shutdown(Duration::ZERO) {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
-            other => panic!("expected main's Io(PermissionDenied), got {other:?}"),
+            other => panic!("expected the raw Io(PermissionDenied), got {other:?}"),
         }
     }
     assert_ends_unsignalled(&child, stdin);
 }
 
 /// macOS: a failed attach whose read of the front's identity found it gone, reaped by someone else,
-/// says it could not be waited on, not that it is left unreaped. Mutant: the arm always says the
-/// front is left unreaped.
+/// says it could not be waited on, not that it is left unreaped.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_failed_attach_that_found_the_front_gone_does_not_claim_it_unreaped() {
-    use crate::child::spawn::fault;
-    let mut cmd = cat();
-    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.set_elevation_front(crate::elevation::front::front(Some(&ElevatedVia::Wrapped(
-        Backend::Sudo,
-    ))));
-    fault::set_force_attach_failure(true);
-    fault::set_force_identity_vanished(true);
-    let err = cmd.spawn().map(drop);
-    fault::set_force_attach_failure(false);
-    fault::set_force_identity_vanished(false);
-    let text = err.expect_err("the forced attach failure fails the spawn").to_string();
+    let (err, _pid) = fail_a_front_spawn(|_| {}, attach_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
+    assert_noted_unaccounted(&err);
+}
+
+/// macOS: an identity check that found the front gone, reaped by someone else, says it could not be
+/// waited on, not that it is left unreaped.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_an_identity_check_that_found_the_front_gone_does_not_claim_it_unreaped() {
+    let (err, _pid) = fail_a_front_spawn(|_| {}, identity_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
+    assert_noted_unaccounted(&err);
+}
+
+/// While it lives, this thread's identity checks find the spawned child gone.
+#[cfg(target_os = "macos")]
+pub(crate) fn identity_finds_the_front_gone() -> IdentityFindsGone {
+    crate::child::spawn::fault::set_force_identity_vanished(true);
+    IdentityFindsGone
+}
+
+/// Finds identities gone until dropped (see [`identity_finds_the_front_gone`]).
+#[cfg(target_os = "macos")]
+#[must_use = "identity checks succeed again as soon as the guard is dropped"]
+pub(crate) struct IdentityFindsGone;
+
+#[cfg(target_os = "macos")]
+impl Drop for IdentityFindsGone {
+    fn drop(&mut self) {
+        crate::child::spawn::fault::set_force_identity_vanished(false);
+    }
+}
+
+/// While it lives, this thread's spawns fail their attach, which finds the root gone.
+#[cfg(target_os = "macos")]
+pub(crate) fn attach_finds_the_front_gone() -> AttachFindsGone {
+    crate::child::spawn::fault::set_force_attach_failure(true);
+    crate::child::spawn::fault::set_force_identity_vanished(true);
+    AttachFindsGone
+}
+
+/// Fails attaches until dropped (see [`attach_finds_the_front_gone`]).
+#[cfg(target_os = "macos")]
+#[must_use = "attaches succeed again as soon as the guard is dropped"]
+pub(crate) struct AttachFindsGone;
+
+#[cfg(target_os = "macos")]
+impl Drop for AttachFindsGone {
+    fn drop(&mut self) {
+        crate::child::spawn::fault::set_force_attach_failure(false);
+        crate::child::spawn::fault::set_force_identity_vanished(false);
+    }
+}
+
+/// `err` notes a front that could not be waited on, and never says it is left unreaped.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub(crate) fn assert_noted_unaccounted(err: &Error) {
+    let text = err.to_string();
     assert!(text.contains("what sudo left"), "{text}");
     assert!(text.contains("could not be waited on"), "{text}");
     assert!(!text.contains("left unreaped"), "{text}");
 }
 
 /// A child left unverified because someone else reaped it is unaccounted for, never "left
-/// unreaped"; one whose identity was refused is left unreaped. Mutant: either maps to the other.
+/// unreaped"; one whose identity was refused is left unreaped.
 #[skuld::test]
 fn an_unverified_childs_fate_follows_its_identity() {
     use crate::child::spawn::FrontFate;
@@ -442,8 +681,7 @@ fn an_unverified_childs_fate_follows_its_identity() {
 
 /// macOS: a spawn whose own read of the front's unique-id report fails cannot adopt it, and leaves
 /// it as any unadopted child: sent nothing, and unreaped. The error, its variant kept, says so. The
-/// `cat`'s stdin is a pipe this test owns, so the front is shown unsignalled by its exit. Mutant:
-/// no note.
+/// `cat`'s stdin is a pipe this test owns, so the front is shown unsignalled by its exit.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
@@ -452,8 +690,7 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 }
 
 /// macOS: a spawn whose check of the front's identity is refused (`Unknown`) leaves it unverified:
-/// sent nothing, and unreaped. The error says so, as for a report it could not read. Mutant (tokio):
-/// the front is taken for one reaped elsewhere, which "could not be waited on".
+/// sent nothing, and unreaped. The error says so, as for a report it could not read.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
@@ -463,8 +700,7 @@ fn macos_a_front_whose_identity_is_refused_is_left_and_noted() {
 
 /// macOS: a tree-walk spawn whose attach cannot read the front's identity (refused) leaves it
 /// unverified: sent nothing, and unreaped, and the error says so. The attach reads the root's
-/// identity only without the fd marker, which this spawn suppresses. Mutant (tokio): the attach
-/// failure's front is taken for one reaped elsewhere, which "could not be waited on".
+/// identity only without the fd marker, which this spawn suppresses.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_front_whose_attach_cannot_read_its_identity_is_left_and_noted() {

@@ -63,25 +63,24 @@ pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
             may_be_the_program: false,
             relays_term: false,
         }),
-        // pkexec execs the program, and a report never names `Auto`. run0 is left as it was: its
-        // backend is being removed (#354).
+        // pkexec execs the program, and a report never names `Auto`. run0 is not gated.
         ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
     }
 }
 
-/// The gate for a forced kill of the child `pid` that `via` launched. `in_cgroup`: the child is
-/// contained in a Linux cgroup, whose children are not gated. `running` reads, without reaping,
-/// whether the tracked process still runs, and is asked only about a front outside a cgroup; one
-/// that cannot be read is taken to run.
+/// The gate for a forced kill of the child `pid`, the `front` its spawn launched (if any).
+/// `in_cgroup`: the child is contained in a Linux cgroup, whose children are not gated. `running`
+/// reads, without reaping, whether the tracked process still runs, and is asked only about a front
+/// outside a cgroup; one that cannot be read is taken to run.
 pub(crate) fn kill_gate(
-    via: Option<&ElevatedVia>,
+    front: Option<Front>,
     pid: u32,
     in_cgroup: bool,
     running: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
     #[cfg(test)]
     seams::note_kill_gate();
-    let Some(front) = front(via).filter(|_| !in_cgroup) else {
+    let Some(front) = front.filter(|_| !in_cgroup) else {
         return Gate::Open;
     };
     match running() {
@@ -96,10 +95,10 @@ pub(crate) fn kill_gate(
     }
 }
 
-/// The gate for a `SIGTERM` to the child `pid` that `via` launched: closed only for a live front
-/// that does not relay it. `running` is asked only about such a front.
-pub(crate) fn terminate_gate(via: Option<&ElevatedVia>, pid: u32, running: impl FnOnce() -> io::Result<bool>) -> Gate {
-    let Some(front) = front(via).filter(|f| !f.relays_term) else {
+/// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
+/// for a live front that does not relay it. `running` is asked only about such a front.
+pub(crate) fn terminate_gate(front: Option<Front>, pid: u32, running: impl FnOnce() -> io::Result<bool>) -> Gate {
+    let Some(front) = front.filter(|f| !f.relays_term) else {
         return Gate::Open;
     };
     match running() {

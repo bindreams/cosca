@@ -53,10 +53,8 @@ impl Child {
     /// refused `pidfd_open`, which is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
-    /// is refused with [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable)
-    /// while osascript runs: a `SIGTERM` would end osascript, not the program. A `sudo` or `doas`
-    /// child's is sent: the wrapper relays it to the program, and with direct exec the tracked
-    /// process is the root program itself, which refuses it (`EPERM`).
+    /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`
+    /// would end osascript, not the program.
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
     /// executing its first instructions it has not yet registered with any console; an event
@@ -124,16 +122,21 @@ impl Child {
                 id = self.id.pid()
             );
         }
+        #[cfg(test)]
+        fault::run_hook(fault::HookPoint::BeforeEscalation);
         // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
         // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
-        // refused kill stays the raw `Io` it is on `main`.
+        // refused kill stays the raw `Io`.
         #[cfg(unix)]
         match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
             // An exit is permanent, so a refused signal to an exited front changes nothing.
-            crate::elevation::front::Gate::Exited => {
-                _ = self.proc.kill();
-            }
+            crate::elevation::front::Gate::Exited => match self.proc.kill() {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                }
+                other => other.map_err(Error::Io)?,
+            },
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
         }
         #[cfg(not(unix))]
@@ -417,7 +420,7 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
-    pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
+    pub(crate) use crate::graceful_hooks::{at, release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR`: a test that arms this seam expecting the sweep
     /// to skip (so the seam is never consumed by `take_force_kill_tree_error`) must still clear

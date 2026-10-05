@@ -51,11 +51,9 @@ pub enum ElevationErrorKind {
     #[error("no controlling terminal for interactive elevation")]
     NoTty,
     /// An unprivileged parent could not signal or stop its elevated child: the OS refused the
-    /// signal (EPERM on POSIX, ACCESS_DENIED on Windows), or the tracked process is a front that the
-    /// signal would end without stopping the elevated program, so nothing was sent. A front's kill
-    /// (see [`Child::kill`](crate::Child::kill)) is refused so, and so is osascript's `SIGTERM`
-    /// (see [`Child::terminate`](crate::Child::terminate)). `detail` says which, and whether the
-    /// child is still running.
+    /// signal (EPERM on POSIX, ACCESS_DENIED on Windows), or the tracked process is a front (see
+    /// [`Child::kill`](crate::Child::kill)), so nothing was sent. `detail` says which, and whether
+    /// the child is still running.
     #[error("could not signal or stop an elevated child")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to

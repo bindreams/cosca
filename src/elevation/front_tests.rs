@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::io;
 
-use super::{kill_gate, terminate_gate, Gate};
+use super::{front, kill_gate, terminate_gate, Gate};
 use crate::elevation::{Backend, ElevatedVia};
 use crate::error::{ElevationErrorKind, Error};
 
@@ -24,7 +24,7 @@ const NOT_FRONTS: [Option<ElevatedVia>; 5] = [
 /// The kill gate for `via`, outside a cgroup or in one, and whether it asked if the front runs.
 fn kill_gate_asking(via: Option<&ElevatedVia>, in_cgroup: bool, running: io::Result<bool>) -> (Gate, bool) {
     let asked = Cell::new(false);
-    let g = kill_gate(via, PID, in_cgroup, || {
+    let g = kill_gate(front(via), PID, in_cgroup, || {
         asked.set(true);
         running
     });
@@ -41,8 +41,6 @@ fn refusal_detail(g: Gate) -> String {
     }
 }
 
-/// Mutants: a front is signalled (`Open`); the detail names neither the pid nor the front; it
-/// claims a sudo pid is the wrapper when, with direct exec, it may be the program.
 #[skuld::test]
 fn a_live_front_outside_a_cgroup_is_closed_with_unkillable_naming_it() {
     for (via, name) in FRONTS {
@@ -60,7 +58,7 @@ fn a_live_front_outside_a_cgroup_is_closed_with_unkillable_naming_it() {
     }
 }
 
-/// An exited front has nothing of its own left to kill. Mutant: the exit is ignored.
+/// An exited front has nothing of its own left to kill.
 #[skuld::test]
 fn an_exited_front_is_exited() {
     for (via, _) in FRONTS {
@@ -69,8 +67,7 @@ fn an_exited_front_is_exited() {
     }
 }
 
-/// A child contained in a cgroup is not gated, and nothing is read about it. Mutant: a front in a
-/// cgroup is closed.
+/// A child contained in a cgroup is not gated, and nothing is read about it.
 #[skuld::test]
 fn a_front_in_a_cgroup_is_open() {
     for (via, _) in FRONTS {
@@ -80,8 +77,7 @@ fn a_front_in_a_cgroup_is_open() {
     }
 }
 
-/// A front whose state cannot be read is closed, and says why. Mutants: an unreadable state opens
-/// the gate; the reason is dropped.
+/// A front whose state cannot be read is closed, and says why.
 #[skuld::test]
 fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
     let sudo = ElevatedVia::Wrapped(Backend::Sudo);
@@ -90,7 +86,7 @@ fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
 }
 
 /// The tracked process is the program itself, or there is no elevation: signalled like any child,
-/// with nothing read. Mutant: pkexec or UAC counted as a front.
+/// with nothing read.
 #[skuld::test]
 fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
     for via in &NOT_FRONTS {
@@ -98,36 +94,35 @@ fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
             let (g, asked) = kill_gate_asking(via.as_ref(), in_cgroup, Ok(true));
             assert!(!asked, "{via:?}");
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
-            let g = terminate_gate(via.as_ref(), PID, || panic!("not asked"));
+            let g = terminate_gate(front(via.as_ref()), PID, || panic!("not asked"));
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
         }
     }
 }
 
-/// sudo and doas relay `SIGTERM` to the program: never gated. Mutant: every front's `SIGTERM` is
-/// refused.
+/// sudo and doas relay `SIGTERM` to the program: never gated.
 #[skuld::test]
 fn a_sigterm_to_a_relaying_front_is_open() {
     for via in [ElevatedVia::Wrapped(Backend::Sudo), ElevatedVia::Wrapped(Backend::Doas)] {
-        let g = terminate_gate(Some(&via), PID, || panic!("not asked"));
+        let g = terminate_gate(front(Some(&via)), PID, || panic!("not asked"));
         assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
     }
 }
 
-/// A `SIGTERM` would end osascript and orphan the program: refused while osascript runs, sent
-/// once it has exited. Mutants: osascript's `SIGTERM` is sent; its exit is ignored.
+/// A `SIGTERM` would end osascript and orphan the program: refused while osascript runs, sent once
+/// it has exited.
 #[skuld::test]
 fn a_sigterm_to_a_live_osascript_is_closed() {
     let osascript = ElevatedVia::MacosOsascript;
-    let detail = refusal_detail(terminate_gate(Some(&osascript), PID, || Ok(true)));
+    let detail = refusal_detail(terminate_gate(front(Some(&osascript)), PID, || Ok(true)));
     assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
     assert!(detail.contains("no SIGTERM was sent"), "{detail}");
-    let detail = refusal_detail(terminate_gate(Some(&osascript), PID, || {
+    let detail = refusal_detail(terminate_gate(front(Some(&osascript)), PID, || {
         Err(io::Error::other("peek refused"))
     }));
     assert!(detail.contains("peek refused"), "{detail}");
     assert!(matches!(
-        terminate_gate(Some(&osascript), PID, || Ok(false)),
+        terminate_gate(front(Some(&osascript)), PID, || Ok(false)),
         Gate::Open
     ));
 }

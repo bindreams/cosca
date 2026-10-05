@@ -183,28 +183,79 @@ fn io_context_keeps_the_os_error_as_its_source() {
     assert_eq!(source.raw_os_error(), Some(code));
 }
 
-/// A note keeps the variant, and an I/O error keeps its kind and its OS code as the source.
-/// Mutants: a noted error is rewrapped into another variant; the I/O kind or source is lost.
+/// A note keeps every variant and its other fields, appends to the detail, and keeps each `source`.
+/// An I/O error keeps its kind, and its OS code as the note's `source`.
 #[cfg(unix)]
 #[skuld::test]
-fn with_note_keeps_the_variant_and_appends() {
-    let unassessable = Error::Unassessable {
-        detail: "refused".into(),
-        source: None,
-    }
-    .with_note("left running");
-    assert!(matches!(&unassessable, Error::Unassessable { detail, .. } if detail == "refused; left running"));
-    let containment = Error::Containment {
-        detail: "attach".into(),
-    }
-    .with_note("left running");
-    assert!(matches!(&containment, Error::Containment { detail } if detail == "attach; left running"));
-    let Error::Io(io) = Error::Io(std::io::Error::from_raw_os_error(libc::EACCES)).with_note("left running") else {
+fn with_note_keeps_each_variant_and_appends() {
+    use crate::error::{ElevationErrorKind, RecordErrorKind};
+    use std::error::Error as _;
+    let os = || std::io::Error::from_raw_os_error(libc::EACCES);
+    let source_code = |e: &Error| {
+        e.source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error)
+    };
+    let note = "left running";
+
+    let Error::Io(io) = Error::Io(os()).with_note(note) else {
         panic!("an Io error stays Io");
     };
     assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(io.to_string().ends_with("; left running"), "{io}");
-    let source = std::error::Error::source(io.get_ref().expect("a custom payload")).expect("the original");
-    let original = source.downcast_ref::<std::io::Error>().expect("an io::Error");
+    let original = io
+        .get_ref()
+        .and_then(|p| p.source())
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the original is the note's source");
     assert_eq!(original.raw_os_error(), Some(libc::EACCES));
+
+    let e = Error::Unsupported {
+        op: "op".into(),
+        platform: "linux",
+        detail: "d".into(),
+    }
+    .with_note(note);
+    assert!(
+        matches!(&e, Error::Unsupported { op, platform: "linux", detail } if op == "op" && detail == "d; left running")
+    );
+    let e = Error::Containment { detail: "d".into() }.with_note(note);
+    assert!(matches!(&e, Error::Containment { detail } if detail == "d; left running"));
+    let e = Error::NoConsole { detail: "d".into() }.with_note(note);
+    assert!(matches!(&e, Error::NoConsole { detail } if detail == "d; left running"));
+    let e = Error::Elevation {
+        kind: ElevationErrorKind::AuthFailed,
+        detail: "d".into(),
+    }
+    .with_note(note);
+    assert!(matches!(
+        &e,
+        Error::Elevation { kind: ElevationErrorKind::AuthFailed, detail } if detail == "d; left running"
+    ));
+    let e = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(os()),
+    }
+    .with_note(note);
+    assert!(matches!(&e, Error::Unassessable { detail, .. } if detail == "d; left running"));
+    assert_eq!(source_code(&e), Some(libc::EACCES));
+    let e = Error::NotThreadGroupLeader {
+        pid: 7,
+        detail: "d".into(),
+        source: os(),
+    }
+    .with_note(note);
+    assert!(matches!(&e, Error::NotThreadGroupLeader { pid: 7, detail, .. } if detail == "d; left running"));
+    assert_eq!(source_code(&e), Some(libc::EACCES));
+    let e = Error::IdentityRecord {
+        kind: RecordErrorKind::ForeignPlatform,
+        detail: "d".into(),
+        source: Some(os()),
+    }
+    .with_note(note);
+    assert!(matches!(
+        &e,
+        Error::IdentityRecord { kind: RecordErrorKind::ForeignPlatform, detail, .. } if detail == "d; left running"
+    ));
+    assert_eq!(source_code(&e), Some(libc::EACCES));
 }

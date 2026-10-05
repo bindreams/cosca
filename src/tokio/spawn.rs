@@ -561,6 +561,17 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                     let fate = leave_unverified_front(&mut proc, crate::containment::RootIdentity::Unknown);
                     return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
                 }
+                #[cfg(target_os = "macos")]
+                let fate = {
+                    proc.forget_if_foreign();
+                    if proc.is_reaped() {
+                        crate::child::spawn::FrontFate::Unaccounted
+                    } else {
+                        proc.forget_because("is an elevation front, sent nothing, and left unreaped");
+                        crate::child::spawn::FrontFate::LeftUnreaped
+                    }
+                };
+                #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
                 return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
             }
@@ -599,6 +610,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 
     let mut child = Child::from_parts(proc, id, kill_on_drop, attachment, pipes, owned_std);
     child.set_elevation(elevation_report);
+    child.set_front(cmd.elevation_front());
     Ok(child)
 }
 

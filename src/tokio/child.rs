@@ -100,6 +100,8 @@ pub struct Child {
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// `Child`). Drives the universal-teardown kill mapping.
     elevation: Option<crate::elevation::ElevationReport>,
+    /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
+    front: Option<crate::elevation::front::Front>,
 }
 
 impl Child {
@@ -125,7 +127,13 @@ impl Child {
             tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
+            front: None,
         }
+    }
+
+    /// Set by the spawn, from its command.
+    pub(super) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
+        self.front = front;
     }
 
     /// The process backend. `pub(super)`: the sibling `pump` module borrows it for
@@ -199,12 +207,12 @@ impl Child {
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     pub(super) fn kill_gate(&self) -> crate::elevation::front::Gate {
-        kill_gate(self.elevation.as_ref(), &self.os, self.id.pid())
+        kill_gate(self.front, &self.os, self.id.pid())
     }
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     pub(super) fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.elevation.as_ref().map(|r| &r.via), self.id.pid(), || {
+        crate::elevation::front::terminate_gate(self.front, self.id.pid(), || {
             self.os.proc.as_ref().map_or(Ok(false), ProcSource::is_running)
         })
     }
@@ -506,9 +514,8 @@ impl Child {
     /// else.
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     ///
-    /// **An elevated child behind a front** outside a cgroup is not signalled while it runs: this
-    /// sends nothing and returns [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
-    /// See the sync [`Child::kill`](crate::Child::kill).
+    /// **An elevated child behind a front** outside a cgroup is not signalled while it runs: see the
+    /// sync [`Child::kill`](crate::Child::kill).
     pub fn kill(&mut self) -> Result<(), Error> {
         self.kill_sent().map(|_| ())
     }
@@ -544,7 +551,10 @@ impl Child {
         // kill returns EPERM/ACCESS_DENIED). A child that is already gone is `Ok`, sent or not.
         match self.proc_mut().signal(Sig::Kill) {
             // An exit is permanent, so a refused signal to an exited front changes nothing.
-            Err(_) if exited_front => Ok(Sent::Delivered),
+            Err(Error::Io(e)) if exited_front && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                Ok(Sent::Delivered)
+            }
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             Err(other) => Err(other),
             Ok(Sent::Gone) => {
@@ -982,7 +992,7 @@ impl Drop for Child {
             // A live elevation front outside a cgroup is not signalled: it is left running, and
             // named.
             #[cfg(unix)]
-            match kill_gate(self.elevation.as_ref(), &os, self.id.pid()) {
+            match kill_gate(self.front, &os, self.id.pid()) {
                 crate::elevation::front::Gate::Closed(unkillable) => {
                     log::warn!("Child::drop: the elevated child is left running: {unkillable}");
                 }
@@ -1011,11 +1021,11 @@ impl Drop for Child {
 /// What a forced kill of the child may do (see [`crate::elevation::front`]).
 #[cfg(unix)]
 fn kill_gate(
-    elevation: Option<&crate::elevation::ElevationReport>,
+    front: Option<crate::elevation::front::Front>,
     os: &OsResources,
     pid: u32,
 ) -> crate::elevation::front::Gate {
-    crate::elevation::front::kill_gate(elevation.map(|r| &r.via), pid, os.attached.is_cgroup(), || {
+    crate::elevation::front::kill_gate(front, pid, os.attached.is_cgroup(), || {
         os.proc.as_ref().map_or(Ok(false), ProcSource::is_running)
     })
 }

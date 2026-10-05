@@ -525,13 +525,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         Err((error, child)) => return Err(teardown_after_failed_adoption(child, error)),
     };
 
-    Ok(Child::from_parts(
-        ProcHandle::std(shared),
-        id,
-        parent_ends,
-        kill_on_drop,
-        attachment,
-    ))
+    let mut child = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
+    child.set_front(cmd.elevation_front());
+    Ok(child)
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
@@ -1431,8 +1427,7 @@ pub(crate) enum FrontFate {
     NotAFront,
     /// It had exited by the teardown, and was reaped.
     Reaped,
-    /// It was running, and is left unreaped: nothing waits for it, since a waiter would live as long
-    /// as the program. It stays a zombie once it exits.
+    /// It was running, and is left unreaped (it stays a zombie once it exits).
     LeftUnreaped,
     /// It could not be waited on: reaped by someone else, or unreadable.
     Unaccounted,

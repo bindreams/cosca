@@ -115,6 +115,9 @@ pub struct Child {
     tree_killed: crate::containment::TreeKilled,
     graceful: crate::graceful::GracefulMechanism,
     elevation: Option<crate::elevation::ElevationReport>,
+    /// The elevation front this child is, if any, as its spawn found it (see
+    /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
+    front: Option<crate::elevation::front::Front>,
 }
 
 impl Child {
@@ -135,7 +138,13 @@ impl Child {
             tree_killed: Default::default(),
             graceful: attachment.graceful,
             elevation: None,
+            front: None,
         }
+    }
+
+    /// Set by the spawn, from its command (see [`Child::front`](Self#structfield.front)).
+    pub(crate) fn set_front(&mut self, front: Option<crate::elevation::front::Front>) {
+        self.front = front;
     }
 
     /// Commit the spawn: apply `kill_on_drop` to the containment resource (see
@@ -230,17 +239,11 @@ impl Child {
     ///
     /// **An elevated child behind a front** ([`Backend::Sudo`](crate::elevation::Backend::Sudo),
     /// [`Backend::Doas`](crate::elevation::Backend::Doas),
-    /// [`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript)): the tracked
-    /// process is usually the wrapper, which runs as this user and outlives the root program it
-    /// launched, so killing it would orphan the program; with sudo's or doas's direct exec it is
-    /// the root program itself. While it runs, this sends it nothing and returns
+    /// [`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript)), outside a
+    /// Linux cgroup: the tracked process is usually the wrapper, which outlives the root program,
+    /// so a kill would orphan the program. While it runs, this sends nothing and returns
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), and
-    /// [`wait`](Child::wait) still returns only once the program has exited. A child contained in
-    /// a Linux cgroup ([`Containment::CgroupV2`]) is not covered by this: its kill signals the
-    /// tracked process as any child's does.
-    /// [`terminate`](Child::terminate) sends `SIGTERM` to the tracked process: `sudo` and `doas`
-    /// relay it to the program, and with direct exec the root program itself refuses it (`EPERM`).
-    /// For osascript, which would end without relaying it, `terminate` is refused.
+    /// [`wait`](Child::wait) still returns only once the program has exited.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -271,7 +274,15 @@ impl Child {
         match gate {
             Gate::Open => {}
             // An exit is permanent, so a refused signal to an exited front changes nothing.
-            Gate::Exited => return Ok(self.proc.kill_sent().unwrap_or(crate::signal::Sent::Delivered)),
+            Gate::Exited => {
+                return match self.proc.kill_sent() {
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        log::debug!("the kill of exited front pid {} was refused ({e})", self.id.pid());
+                        Ok(crate::signal::Sent::Delivered)
+                    }
+                    other => other.map_err(Error::Io),
+                }
+            }
             Gate::Closed(unkillable) => return Err(unkillable),
         }
         // A plain child returns Ok(()) once exited. EPERM on an elevated wrapper child becomes
@@ -284,20 +295,15 @@ impl Child {
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn kill_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::kill_gate(
-            self.elevation.as_ref().map(|r| &r.via),
-            self.id.pid(),
-            self.attached.is_cgroup(),
-            || self.proc.is_running(),
-        )
+        crate::elevation::front::kill_gate(self.front, self.id.pid(), self.attached.is_cgroup(), || {
+            self.proc.is_running()
+        })
     }
 
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.elevation.as_ref().map(|r| &r.via), self.id.pid(), || {
-            self.proc.is_running()
-        })
+        crate::elevation::front::terminate_gate(self.front, self.id.pid(), || self.proc.is_running())
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism

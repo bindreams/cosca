@@ -25,6 +25,7 @@ fn a_child_without_a_process() -> Child {
         tree_killed: Default::default(),
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
+        front: None,
     }
 }
 

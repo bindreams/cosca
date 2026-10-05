@@ -593,8 +593,8 @@ impl Command {
     ///
     /// An elevated child this process cannot signal is the one case the sync handle does not
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
-    /// So is an elevated child behind a front (see [`Child::kill`](crate::Child::kill)) outside a
-    /// cgroup: neither drop signals the front, and the sync drop leaves it unreaped. Each logs a
+    /// So is an elevated child behind a front outside a cgroup (see
+    /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
     /// `warn` naming it.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup

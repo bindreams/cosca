@@ -783,36 +783,32 @@ impl ProcSource {
         self.release();
     }
 
-    /// [`reap_now`](ProcSource::reap_now) for an elevation front: a kill of it would orphan the
-    /// elevated program, so it is sent nothing, and tokio's `Child` is forgotten, never handed to a
-    /// reaper. On Linux the sync spawn's front teardown reaps it through its pidfd if it has already
-    /// exited. Otherwise it is left unreaped, and stays a zombie once it exits. **Invariant:** no
+    /// [`reap_now`](ProcSource::reap_now) for an elevation front (see [`crate::elevation::front`]):
+    /// it is sent nothing, and tokio's `Child` is forgotten, never handed to a reaper. The sync
+    /// spawn's front teardown reaps it through its pidfd if it has already exited. **Invariant:** no
     /// `wait()` future for this child is in flight.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn leave_front(
         mut self,
         pid: u32,
         front: crate::elevation::front::Front,
     ) -> crate::child::spawn::FrontFate {
         self.forget_if_foreign();
-        #[cfg(target_os = "linux")]
-        {
-            let ProcSource::Tokio { pidfd, .. } = &mut self else {
-                return crate::child::spawn::FrontFate::Unaccounted;
-            };
-            let pidfd = pidfd.take();
-            self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
-            crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (pid, front);
-            if matches!(self, ProcSource::Foreign { .. }) {
-                return crate::child::spawn::FrontFate::Unaccounted;
-            }
-            self.forget_because("is an elevation front, sent nothing, and left unreaped");
-            crate::child::spawn::FrontFate::LeftUnreaped
-        }
+        let ProcSource::Tokio { pidfd, .. } = &mut self else {
+            // Only something that broke the reaping precondition (see `Command::contain`) leaves a
+            // spawn's backend foreign this early.
+            log::warn!(
+                "elevation front pid {pid}: its backend is foreign (reaped elsewhere), so it cannot be waited on"
+            );
+            debug_assert!(
+                false,
+                "elevation front pid {pid}: a spawn's backend is foreign before its teardown"
+            );
+            return crate::child::spawn::FrontFate::Unaccounted;
+        };
+        let pidfd = pidfd.take();
+        self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
+        crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front)
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the
