@@ -61,7 +61,15 @@ impl Acceptor<'_> {
             ];
             fds.extend(self.pending.iter().map(|c| PollFd::new(c, PollFlags::IN)));
             sys::poll_ready(&mut fds).map_err(|e| AcceptorFailure::Errno(e.raw_os_error()))?;
-            let stop = !fds[0].revents().is_empty();
+            let woken = !fds[0].revents().is_empty();
+            // A byte nobody here asked for came from a fork copy of the link: consume it.
+            let stop = woken && self.shared.is_stopping();
+            if woken && !stop {
+                let mut byte = [0u8];
+                if let Err(e) = rustix::io::read(&wake.reader, &mut byte) {
+                    log::debug!("consuming a stray wake byte: {e}");
+                }
+            }
             let incoming = !fds[1].revents().is_empty();
             let ready: Vec<bool> = fds[2..].iter().map(|f| !f.revents().is_empty()).collect();
             drop(fds);

@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 
 use rustix::io::Errno;
 
-use super::fork_guard::ForkGuard;
+use super::fork_guard::{ForkGuard, Origin};
 use super::private_dir::{PrivateDir, PrivateDirError};
 
 mod acceptor;
@@ -22,7 +22,7 @@ mod state;
 mod sys;
 
 use acceptor::Wake;
-use probe::Probe;
+use probe::{LinkEvent, Probe};
 use state::Shared;
 #[allow(unused_imports, reason = "no caller outside the link yet")]
 pub(crate) use {
@@ -121,7 +121,7 @@ impl ShimLink {
     }
 
     fn check_owner(&self) -> Result<(), NotOwner> {
-        let checked = outcome::owner_check(self.owner.is_original());
+        let checked = outcome::owner_check(self.owner.origin());
         debug_assert!(checked.is_ok(), "a fork copy of a ShimLink was used to control it");
         checked
     }
@@ -156,9 +156,9 @@ impl ShimLink {
         Ok(self.shared.observe())
     }
 
-    /// `Drop`'s body, where `original` says whether this is the process that bound the link. Only
-    /// that process tears it down. The stop byte, the path and the directory are the owner's (D21),
-    /// and a fork copy has no acceptor thread to join.
+    /// `Drop`'s body, for a process of this `origin`. Only the process that bound the link tears it
+    /// down. The stop byte, the path and the directory are the owner's (D21), and a fork copy has no
+    /// acceptor thread to join.
     ///
     /// A copy drops what it owns, but not what the acceptor thread holds. The connection, the wake
     /// pipe and the settled pipe are kept alive by `Arc`s of the thread, and the listener by the
@@ -166,12 +166,39 @@ impl ShimLink {
     /// They stay open in the copy until it execs or exits. That falls under the owner's accepted
     /// idle-root-shim residual; closing them by hand would need raw closes of descriptors the owner
     /// still uses.
-    fn release(&mut self, original: bool) {
-        if outcome::owner_check(original).is_err() {
-            std::mem::forget(self.acceptor.take());
-            return;
+    ///
+    /// An origin that cannot be told is a contract violation, and the process may be either. It does
+    /// only what is safe in both: refuses a pending start in its own memory (`try_lock`, so a copy
+    /// cannot hang), sets its own stop flag and writes the stop byte (a copy's byte is consumed and
+    /// ignored by the owner's acceptor), and removes nothing, joins nothing and leaves the directory.
+    /// The original's acceptor stops, and the original leaks its thread handle and directory.
+    fn release(&mut self, origin: Origin) {
+        match origin {
+            Origin::Original => self.teardown(),
+            Origin::Copy => std::mem::forget(self.acceptor.take()),
+            Origin::Unknown => {
+                log::warn!(
+                    "cannot tell whether this process bound the shim link at {}; stopping its acceptor without removing anything",
+                    self.shared.sock_path.display()
+                );
+                let refused = self.shared.refuse_pending_in_memory();
+                self.shared.request_stop();
+                let stop_written = self.write_stop().is_ok();
+                self.shared
+                    .probe
+                    .event(|| LinkEvent::UnknownOriginHandled { refused, stop_written });
+                std::mem::forget(self.acceptor.take());
+            }
         }
-        self.teardown();
+    }
+
+    fn write_stop(&self) -> rustix::io::Result<usize> {
+        loop {
+            match rustix::io::write(self.wake.writer.as_fd(), &[1]) {
+                Err(Errno::INTR) => continue,
+                other => return other,
+            }
+        }
     }
 
     /// D14's order: refuse a start still pending (which removes the path), stop the acceptor so its
@@ -189,12 +216,8 @@ impl ShimLink {
             self.shared.refuse_pending(&mut inner);
         }
         self.shared.probe.release();
-        let stopped = loop {
-            match rustix::io::write(self.wake.writer.as_fd(), &[1]) {
-                Err(Errno::INTR) => continue,
-                other => break other,
-            }
-        };
+        self.shared.request_stop();
+        let stopped = self.write_stop();
         match (stopped, self.acceptor.take()) {
             (Ok(_), Some(thread)) => {
                 if thread.join().is_err() {
@@ -223,7 +246,7 @@ impl ShimLink {
 
 impl Drop for ShimLink {
     fn drop(&mut self) {
-        self.release(self.owner.is_original());
+        self.release(self.owner.origin());
     }
 }
 

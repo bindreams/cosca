@@ -1,4 +1,4 @@
-//! Teardown (D14) and the pid that owns the link (D21).
+//! Teardown (D14) and the process that owns the link (D21).
 
 use super::super::fake_shim::{next_acceptor_event, FakeShim, Rig};
 use super::super::probe::LinkEvent;
@@ -65,9 +65,11 @@ fn teardown_removes_the_directory_and_closes_the_connection() {
     assert_eq!(shim.read_byte(), None, "the connection is closed");
 }
 
-/// A fork copy's real `Drop` leaves the owner's link as it was.
-#[skuld::test]
-fn fork_copy_drop_leaves_the_owner_intact() {
+/// Forks, runs `in_copy` on the child's copy of `link`, and checks that the owner's link is as it was:
+/// the path is there, the acceptor still answers `A`, and `kill` reaches the shim. A copy that tore
+/// the owner's link down would stop the owner's acceptor first (and hang in a join, in a thread that
+/// does not exist there); the test sees that through the owner's events, and kills the child itself.
+fn owner_survives_a_fork_copy(in_copy: fn(super::super::ShimLink)) {
     let rig = Rig::new();
     let socket = rig.link.dir().join(super::super::SOCKET_NAME);
     assert!(socket.exists());
@@ -77,16 +79,17 @@ fn fork_copy_drop_leaves_the_owner_intact() {
         events,
         tmp: _tmp,
     } = rig;
-    // SAFETY: the child only drops its copy of the link and `_exit`s. Its normal path takes only
-    // malloc's lock, which glibc and libmalloc reset across `fork`, and no other thread holds a lock
-    // the child takes: the copy's `Drop` locks nothing, and the acceptor thread, which does not exist
-    // in the child, is the only other user of the link's mutex. Nothing unwinds out of the child.
+    // SAFETY: the child only runs `in_copy` on its copy of the link and `_exit`s. Its normal path
+    // takes only malloc's lock, which glibc and libmalloc reset across `fork`, and no other thread
+    // holds a lock the child takes: the copy's `Drop` locks nothing (the unknown-origin path only
+    // tries the state lock), and the acceptor thread, which does not exist in the child, is the only
+    // other user of the link's mutex. Nothing unwinds out of the child.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
-        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(link)));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_copy(link)));
         // SAFETY: `_exit` is async-signal-safe and never returns.
-        unsafe { libc::_exit(if dropped.is_ok() { 0 } else { 101 }) };
+        unsafe { libc::_exit(if ran.is_ok() { 0 } else { 101 }) };
     }
     // The waiter only observes the exit (`WNOWAIT` leaves the zombie), so the child stays unreaped
     // and its pid stays ours until this thread reaps it.
@@ -108,8 +111,6 @@ fn fork_copy_drop_leaves_the_owner_intact() {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         status
     };
-    // A copy that tore the owner's link down would stop the owner's acceptor first (and hang in its
-    // join, in a thread that does not exist there).
     let first = next_acceptor_event(&events);
     if first != LinkEvent::ChildExited {
         // SAFETY: the child is unreaped, so its pid is still ours.
@@ -135,24 +136,67 @@ fn fork_copy_drop_leaves_the_owner_intact() {
     // `link` drops here, in its owner: the acceptor is joined.
 }
 
+/// A fork copy's real `Drop` leaves the owner's link as it was.
+#[skuld::test]
+fn fork_copy_drop_leaves_the_owner_intact() {
+    owner_survives_a_fork_copy(drop);
+}
+
+/// A copy whose guard cannot say who it is stops its own acceptor handling and writes the stop byte,
+/// which the owner's acceptor must consume and ignore: it has not been asked to stop.
+#[skuld::test]
+fn unknown_origin_in_a_fork_copy_leaves_the_owner_intact() {
+    owner_survives_a_fork_copy(|link| {
+        link.owner.make_unreadable();
+        drop(link);
+    });
+}
+
+/// In the original, an origin that cannot be told still refuses the pending start and stops the
+/// acceptor, and removes nothing.
+#[skuld::test]
+fn unknown_origin_in_the_original_stops_the_acceptor_and_removes_nothing() {
+    let Rig {
+        link,
+        probe: _probe,
+        events,
+        tmp: _tmp,
+    } = Rig::new();
+    let dir = link.dir().to_owned();
+    link.owner.make_unreadable();
+    drop(link);
+    assert_eq!(
+        next_acceptor_event(&events),
+        LinkEvent::UnknownOriginHandled {
+            refused: true,
+            stop_written: true
+        }
+    );
+    assert_eq!(
+        next_acceptor_event(&events),
+        LinkEvent::DrainStarted { path_exists: true }
+    );
+    assert_eq!(next_acceptor_event(&events), LinkEvent::AcceptorExited);
+    assert!(dir.join(super::super::SOCKET_NAME).exists(), "nothing is unlinked");
+    assert!(dir.is_dir(), "nothing is removed");
+}
+
 /// With no descriptor to spare, the owner check, every control call and `Drop` neither panic nor
 /// leak the acceptor: none of them opens a descriptor. A panic in `Drop` during an unwind aborts.
 #[skuld::test]
 fn control_and_drop_with_a_full_fd_table_do_not_panic() {
-    let fixture = crate::test_child::fixture_path!(fixture_full_fd_table);
-    crate::test_child::run_fixture_command(fixture, crate::test_child::fixture_command(fixture));
-}
-
-#[skuld::test]
-fn fixture_full_fd_table() {
-    if !crate::test_child::is_fixture_reexec() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(control_and_drop_with_a_full_fd_table_do_not_panic),
+        crate::test_spawn::spawn,
+    ) else {
         return;
-    }
+    };
     let rig = Rig::new();
+    let marker = rig.log_marker();
     let mut shim = rig.live();
     let dir = rig.link.dir().to_owned();
     let Rig { link, tmp: _tmp, .. } = rig;
-    let _restore = crate::test_child::exhaust_fds();
+    let _restore = crate::test_child::exhaust_fds(&done);
     assert!(
         std::fs::File::open("/dev/null").is_err(),
         "the precondition: no descriptor can be opened"
@@ -161,6 +205,17 @@ fn fixture_full_fd_table() {
     assert_eq!(link.try_wait().unwrap(), None);
     assert_eq!(link.kill().unwrap(), KillOutcome::Delivered);
     assert_eq!(shim.read_byte(), Some(b'K'));
+    let mark = crate::log_capture::mark();
     drop(link);
     assert!(!dir.exists(), "teardown still removed the directory");
+    // The final drain accepts once more. On Linux `accept4` reserves a descriptor before it looks at
+    // the queue, so a full table is `EMFILE` there, reported at teardown; on macOS an empty queue is
+    // `EAGAIN`, and nothing is reported.
+    let levels = crate::log_capture::levels_since(mark, &marker);
+    assert!(!levels.contains(&log::Level::Error), "{levels:?}");
+    assert_eq!(
+        levels.contains(&log::Level::Warn),
+        cfg!(target_os = "linux"),
+        "the accept at teardown: {levels:?}"
+    );
 }

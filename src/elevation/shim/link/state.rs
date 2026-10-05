@@ -6,6 +6,7 @@ use std::io::{PipeReader, PipeWriter};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use rustix::io::Errno;
@@ -62,6 +63,10 @@ pub(super) struct Shared {
     /// The euid a shim must have: root, in production.
     pub(super) peer_euid: u32,
     pub(super) probe: Probe,
+    /// Set in this process's memory before the stop byte is written. The acceptor stops only when it
+    /// is set: a byte written by a fork copy, which cannot set the owner's flag, is consumed and
+    /// ignored.
+    stopping: AtomicBool,
 }
 
 impl Shared {
@@ -81,6 +86,7 @@ impl Shared {
             sock_path,
             peer_euid,
             probe,
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -103,6 +109,26 @@ impl Shared {
             }
             Err(e) => log::warn!("cannot remove the socket {}: {e}", self.sock_path.display()),
         }
+    }
+
+    pub(super) fn request_stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// `Pending` to `Refused` in this process's memory only: no path is removed, and the lock is only
+    /// tried, since a fork copy may hold a snapshot of it locked. Returns whether it took effect.
+    pub(super) fn refuse_pending_in_memory(&self) -> bool {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return false;
+        };
+        if inner.start == StartState::Pending {
+            inner.start = StartState::Refused;
+        }
+        true
     }
 
     /// `Pending` to `Refused`, removing the path in the same critical section (D4).

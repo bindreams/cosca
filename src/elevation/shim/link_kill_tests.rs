@@ -91,6 +91,8 @@ fn kill_on_a_full_socket_is_unkillable_not_gone() {
 #[skuld::test]
 fn owner_check_refuses_a_fork_copy() {
     use super::super::outcome::{owner_check, NotOwner};
-    assert_eq!(owner_check(true), Ok(()));
-    assert_eq!(owner_check(false), Err(NotOwner));
+    use crate::elevation::shim::fork_guard::Origin;
+    assert_eq!(owner_check(Origin::Original), Ok(()));
+    assert_eq!(owner_check(Origin::Copy), Err(NotOwner));
+    assert_eq!(owner_check(Origin::Unknown), Err(NotOwner));
 }

@@ -35,6 +35,8 @@ pub(crate) enum LinkEvent {
     /// A waiter is about to poll `fds` descriptors; whether the outcome's settled signal is already
     /// raised.
     Polling { fds: usize, settled_readable: bool },
+    /// `Drop` could not tell whether this process made the link, and did what is safe either way.
+    UnknownOriginHandled { refused: bool, stop_written: bool },
     /// Injected by a test thread that waited for a child process.
     ChildExited,
 }
