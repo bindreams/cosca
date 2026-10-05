@@ -352,7 +352,7 @@ fn fixture_drop_with_a_full_fd_table() {
     let root = tempfile::tempdir().unwrap();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    crate::test_child::exhaust_fds();
+    let _restore = crate::test_child::exhaust_fds();
     assert!(
         std::fs::File::open("/dev/null").is_err(),
         "the precondition: no descriptor can be opened"

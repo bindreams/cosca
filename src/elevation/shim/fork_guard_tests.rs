@@ -42,7 +42,7 @@ fn fixture_check_with_a_full_fd_table() {
         return;
     }
     let guard = ForkGuard::new().unwrap();
-    crate::test_child::exhaust_fds();
+    let _restore = crate::test_child::exhaust_fds();
     assert!(
         std::fs::File::open("/dev/null").is_err(),
         "the precondition: no descriptor can be opened"
