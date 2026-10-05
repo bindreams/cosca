@@ -559,12 +559,8 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let front_before_attach = cmd.elevation_front().filter(|_| !in_cgroup);
     #[cfg(not(unix))]
     let _ = in_cgroup;
-    let reread = match crate::identity::ProcessId::of(pid) {
-        crate::identity::Resolved::Found(x) => x,
-        _ => id,
-    };
     let attach = crate::child::spawn::attach_or_fault(
-        reread,
+        id,
         #[cfg(windows)]
         proc_handle,
         prepared,
