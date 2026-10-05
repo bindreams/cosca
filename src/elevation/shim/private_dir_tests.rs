@@ -1,4 +1,5 @@
 use super::{check_facts, DirFacts, PrivateDir, PrivateDirError, Removal};
+use crate::identity::ProcessId;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -295,18 +296,43 @@ fn drop_logs_what_remove_logs() {
     assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
 }
 
+/// `who`, released as if it were the current process.
+fn drop_as(dir: &mut PrivateDir, who: ProcessId) {
+    dir.release(who);
+}
+
 #[skuld::test]
 fn a_fork_copys_drop_leaves_the_directory() {
     let root = tempfile::tempdir().unwrap();
     let mut dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    dir.release(std::process::id().wrapping_add(1));
+    drop_as(&mut dir, ProcessId::from_parts(std::process::id().wrapping_add(1), 7));
     assert!(
         path.is_dir(),
         "a pid that did not make the directory must not remove it"
     );
     drop(dir);
     assert!(!path.exists(), "the creator's drop still removes it");
+}
+
+/// In another pid namespace a fork copy can have the creator's pid (1, for a namespace's init); only
+/// its start identity differs.
+#[skuld::test]
+fn a_process_with_the_creators_pid_but_another_identity_leaves_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let mut dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    let me = ProcessId::current();
+    drop_as(
+        &mut dir,
+        ProcessId::from_parts(me.pid(), me.start_token_raw().wrapping_add(1)),
+    );
+    assert!(
+        path.is_dir(),
+        "the same pid with another start identity is another process"
+    );
+    drop(dir);
+    assert!(!path.exists());
 }
 
 fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {

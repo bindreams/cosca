@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{fchmod, fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
 use rustix::io::Errno;
 
+use crate::identity::ProcessId;
+
 mod facts;
 
 use facts::{check_facts, DirFacts};
@@ -54,7 +56,7 @@ pub(crate) struct PrivateDir {
     name: OsString,
     id: (u64, u64),
     path: PathBuf,
-    creator: u32,
+    creator: ProcessId,
     removed: bool,
 }
 
@@ -183,7 +185,7 @@ impl PrivateDir {
                 name,
                 id,
                 path,
-                creator: std::process::id(),
+                creator: ProcessId::current(),
                 removed: false,
             });
         }
@@ -199,17 +201,18 @@ impl PrivateDir {
     pub(crate) fn remove(mut self) -> Removal {
         debug_assert_eq!(
             self.creator,
-            std::process::id(),
+            ProcessId::current(),
             "removed by a pid that did not make it"
         );
         self.removed = true;
         self.remove_by_fd()
     }
 
-    /// `Drop`'s body, for `pid` as the current process: nothing unless `pid` made the directory
-    /// and it is not removed yet.
-    fn release(&mut self, pid: u32) {
-        if pid == self.creator && !self.removed {
+    /// `Drop`'s body, for `who` as the current process: nothing unless `who` made the directory
+    /// and it is not removed yet. The process is told apart by pid and start identity: a fork copy
+    /// in another pid namespace can have the creator's bare pid.
+    fn release(&mut self, who: ProcessId) {
+        if who == self.creator && !self.removed {
             self.removed = true;
             self.remove_by_fd();
         }
@@ -245,7 +248,7 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        self.release(std::process::id());
+        self.release(ProcessId::current());
     }
 }
 
