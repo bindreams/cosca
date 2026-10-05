@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{fchmod, fstat, mkdirat, openat, statat, unlinkat, AtFlags, FileType, Mode, OFlags, Stat, CWD};
 use rustix::io::Errno;
 
-use crate::identity::ProcessId;
+use super::fork_guard::ForkGuard;
 
 mod facts;
 
@@ -29,6 +29,8 @@ pub(crate) enum PrivateDirError {
     Unsafe { tmpdir: PathBuf, offender: PathBuf },
     #[error("cannot create the private directory {}: {source}", path.display())]
     Create { path: PathBuf, source: io::Error },
+    #[error("cannot set up the fork guard of the private directory: {0}")]
+    ForkGuard(io::Error),
 }
 
 /// What removing a [`PrivateDir`] found. Every outcome except `Removed` is logged: `Gone` at
@@ -56,7 +58,8 @@ pub(crate) struct PrivateDir {
     name: OsString,
     id: (u64, u64),
     path: PathBuf,
-    creator: ProcessId,
+    /// Tells the creating process from a fork copy of it (no I/O: `Drop` uses it).
+    creator: ForkGuard,
     removed: bool,
 }
 
@@ -144,6 +147,7 @@ impl PrivateDir {
         if !check_facts(&facts, euid) {
             return Err(unsafe_err(real));
         }
+        let creator = ForkGuard::new().map_err(PrivateDirError::ForkGuard)?;
         loop {
             let mut random = [0u8; 8];
             getrandom::fill(&mut random).map_err(|e| PrivateDirError::Create {
@@ -185,7 +189,7 @@ impl PrivateDir {
                 name,
                 id,
                 path,
-                creator: ProcessId::current(),
+                creator,
                 removed: false,
             });
         }
@@ -199,20 +203,16 @@ impl PrivateDir {
     /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Logs as [`Removal`]
     /// says. Only the pid that made the directory may call it.
     pub(crate) fn remove(mut self) -> Removal {
-        debug_assert_eq!(
-            self.creator,
-            ProcessId::current(),
-            "removed by a pid that did not make it"
-        );
+        debug_assert!(self.creator.is_original(), "removed by a process that did not make it");
         self.removed = true;
         self.remove_by_fd()
     }
 
-    /// `Drop`'s body, for `who` as the current process: nothing unless `who` made the directory
-    /// and it is not removed yet. The process is told apart by pid and start identity: a fork copy
-    /// in another pid namespace can have the creator's bare pid.
-    fn release(&mut self, who: ProcessId) {
-        if who == self.creator && !self.removed {
+    /// `Drop`'s body, where `original` says whether this is the creating process (not a fork copy
+    /// of it, which a bare pid cannot tell): nothing unless it is, and the directory is not removed
+    /// yet.
+    fn release(&mut self, original: bool) {
+        if original && !self.removed {
             self.removed = true;
             self.remove_by_fd();
         }
@@ -248,7 +248,7 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        self.release(ProcessId::current());
+        self.release(self.creator.is_original());
     }
 }
 

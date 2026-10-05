@@ -57,6 +57,22 @@ pub(crate) struct ClosedStdio {
     saved: [std::os::fd::OwnedFd; 3],
 }
 
+/// Lowers this process's descriptor limit to its lowest free descriptor, so that no further one can
+/// be made. Process-wide: only a re-exec'd fixture calls it.
+#[cfg(unix)]
+pub(crate) fn exhaust_fds() {
+    // SAFETY: `dup`, `close`, `getrlimit` and `setrlimit` on valid arguments.
+    unsafe {
+        let lowest_free = libc::dup(0);
+        assert!(lowest_free >= 0, "dup(0)");
+        libc::close(lowest_free);
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = lowest_free as libc::rlim_t;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+}
+
 /// Closes fds 0 to 2; see [`ClosedStdio`].
 #[cfg(unix)]
 pub(crate) fn close_stdio_keeping_a_copy() -> ClosedStdio {
@@ -877,7 +893,7 @@ fn write_gate_passed() {
 
 /// Spawns `cmd` (from [`fixture_command`]) under `spawn_lock()` and waits for it; panics as
 /// [`run_fixture_with_cwd`] documents.
-fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
+pub(crate) fn run_fixture_command(fixture: &str, mut cmd: std::process::Command) {
     crate::test_reexec::with_json_events(&mut cmd);
     let child = crate::test_spawn::spawn(&mut cmd).expect("spawn fixture child");
     finish_fixture_command(fixture, child);

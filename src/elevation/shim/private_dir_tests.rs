@@ -1,5 +1,4 @@
 use super::{check_facts, DirFacts, PrivateDir, PrivateDirError, Removal};
-use crate::identity::ProcessId;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -296,43 +295,70 @@ fn drop_logs_what_remove_logs() {
     assert!(crate::log_capture::levels_since(mark, &path_text).contains(&log::Level::Warn));
 }
 
-/// `who`, released as if it were the current process.
-fn drop_as(dir: &mut PrivateDir, who: ProcessId) {
-    dir.release(who);
-}
-
 #[skuld::test]
 fn a_fork_copys_drop_leaves_the_directory() {
     let root = tempfile::tempdir().unwrap();
     let mut dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    drop_as(&mut dir, ProcessId::from_parts(std::process::id().wrapping_add(1), 7));
+    dir.release(false);
     assert!(
         path.is_dir(),
-        "a pid that did not make the directory must not remove it"
+        "a process that did not make the directory must not remove it"
     );
     drop(dir);
     assert!(!path.exists(), "the creator's drop still removes it");
 }
 
-/// In another pid namespace a fork copy can have the creator's pid (1, for a namespace's init); only
-/// its start identity differs.
+/// The real thing: a forked child drops its copy of the directory.
 #[skuld::test]
-fn a_process_with_the_creators_pid_but_another_identity_leaves_the_directory() {
+fn a_real_fork_copys_drop_leaves_the_directory() {
     let root = tempfile::tempdir().unwrap();
-    let mut dir = PrivateDir::create_in(root.path()).unwrap();
+    let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
-    let me = ProcessId::current();
-    drop_as(
-        &mut dir,
-        ProcessId::from_parts(me.pid(), me.start_token_raw().wrapping_add(1)),
-    );
+    // SAFETY: the child only drops its copy (which takes malloc's lock, and glibc and libmalloc
+    // reset that across fork) and `_exit`s.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(dir)));
+        // SAFETY: `_exit` never returns.
+        unsafe { libc::_exit(if dropped.is_ok() { 0 } else { 101 }) };
+    }
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own unreaped child.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert!(
-        path.is_dir(),
-        "the same pid with another start identity is another process"
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "child status {status:#x}"
+    );
+    assert!(path.is_dir(), "the copy's drop must not remove the directory");
+    drop(dir);
+    assert!(!path.exists(), "the creator's drop removes it");
+}
+
+/// With no descriptor left, removing and dropping the directory neither panics nor fails: neither
+/// needs a new descriptor. A panic in `Drop` during an unwind aborts the process.
+#[skuld::test]
+fn dropping_with_a_full_fd_table_does_not_panic() {
+    let fixture = crate::test_child::fixture_path!(fixture_drop_with_a_full_fd_table);
+    crate::test_child::run_fixture_command(fixture, crate::test_child::fixture_command(fixture));
+}
+
+#[skuld::test]
+fn fixture_drop_with_a_full_fd_table() {
+    if !crate::test_child::is_fixture_reexec() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = PrivateDir::create_in(root.path()).unwrap();
+    let path = dir.path().to_owned();
+    crate::test_child::exhaust_fds();
+    assert!(
+        std::fs::File::open("/dev/null").is_err(),
+        "the precondition: no descriptor can be opened"
     );
     drop(dir);
-    assert!(!path.exists());
+    assert!(!path.exists(), "the drop still removed the directory");
 }
 
 fn open_fails(_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {

@@ -126,8 +126,8 @@ getrandom = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Broadcasts a cgroup leaf's drain from its pump to every wait, sync and async alike.
 event-listener = "5"
-# cgroup syscalls; typed `ioctl`, `prctl`, `pidfd_open`.
-rustix = { version = "1", features = ["process", "event", "net", "thread"] }
+# cgroup syscalls; typed `ioctl`, `prctl`, `pidfd_open`; `mm`: the fork guard's wipe-on-fork page.
+rustix = { version = "1", features = ["process", "event", "net", "thread", "mm"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Raw Mach threads for the tracer helper's thread-listing tests.
