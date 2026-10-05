@@ -220,7 +220,7 @@ impl Command {
     }
 
     /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_elevation_front(&mut self, front: Option<crate::elevation::front::Front>) {
         self.inner.set_elevation_front(front);
     }

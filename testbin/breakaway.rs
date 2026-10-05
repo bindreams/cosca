@@ -119,7 +119,7 @@ enum ChildHandle {
             dead_code,
             reason = "held only for its Drop side effect and to pin the pid; never read"
         )]
-        cosca::Child,
+        Box<cosca::Child>,
     ),
 }
 
@@ -134,7 +134,7 @@ impl crate::accept::Target for ChildHandle {
     fn has_exited(&mut self) -> bool {
         match self {
             ChildHandle::Raw(c) => crate::accept::Target::has_exited(c),
-            ChildHandle::Cosca(c) => crate::accept::Target::has_exited(c),
+            ChildHandle::Cosca(c) => crate::accept::Target::has_exited(&mut **c),
         }
     }
 }
@@ -201,7 +201,7 @@ fn spawn_child(vehicle: &str, request: bool, listener: &TcpListener, addr: &str)
             match cmd.spawn() {
                 Ok(c) => {
                     let pid = c.id().pid();
-                    ("Ok".to_string(), Some(ChildHandle::Cosca(c)), Some(pid))
+                    ("Ok".to_string(), Some(ChildHandle::Cosca(Box::new(c))), Some(pid))
                 }
                 Err(e) => (cosca_outcome(&e), None, None),
             }
