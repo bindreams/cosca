@@ -41,7 +41,7 @@ pub(crate) enum BindError {
     #[error("cannot set up the fork guard of the shim channel: {0}")]
     ForkGuard(io::Error),
     #[error(
-        "the shim's socket is bound relative to its directory through /proc/self/fd, which is not usable here ({source}); TMPDIR ({}) cannot hold it on this system",
+        "the shim's socket is bound relative to its directory through /proc/thread-self/fd, so /proc must be mounted and usable here ({source}); TMPDIR is {}",
         tmpdir.display()
     )]
     ProcUnusable {
@@ -81,24 +81,24 @@ impl ShimLink {
 
     pub(crate) fn bind_probed(tmp: &Path, peer_euid: u32, probe: Probe) -> Result<Self, BindError> {
         let owner = ForkGuard::new().map_err(BindError::ForkGuard)?;
-        // Before anything is created: a socket path that cannot fit `sun_path` is refused. A temp
-        // directory that cannot be resolved is reported by the private directory instead.
-        if let Ok(real) = std::fs::canonicalize(tmp) {
-            if let Err((length, limit)) = sys::full_path_fits(&real, SOCKET_NAME) {
-                return Err(BindError::TmpdirTooLong {
-                    tmpdir: tmp.to_owned(),
-                    length,
-                    limit,
-                });
-            }
+        // Resolved once, and shared with the private directory. The absolute check comes first, so a
+        // relative TMPDIR is reported as that. Before anything is created, a socket path too long
+        // for the platform is refused.
+        let real = PrivateDir::resolve(tmp)?;
+        if let Err((length, limit)) = sys::full_path_fits(&real, SOCKET_NAME) {
+            return Err(BindError::TmpdirTooLong {
+                tmpdir: tmp.to_owned(),
+                length,
+                limit,
+            });
         }
-        let dir = PrivateDir::create_unguarded(tmp)?;
+        let dir = PrivateDir::create_unguarded_resolved(tmp, real)?;
         let sock_path = dir.path().join(SOCKET_NAME);
-        // Any failure from here on removes what was made: the socket file, if it was bound, goes
-        // before the directory.
+        // Any failure from here on removes what was made: the socket, if it was bound, goes before
+        // the directory.
         let fail = |dir: PrivateDir, error: BindError| {
-            match std::fs::remove_file(&sock_path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            match sys::unlink_socket(dir.dir_fd(), SOCKET_NAME) {
+                Err(e) if e != Errno::NOENT => {
                     log::warn!("cannot remove the socket {}: {e}", sock_path.display());
                 }
                 _ => {}
@@ -135,7 +135,14 @@ impl ShimLink {
             let (reader, writer) = sys::pipe(&probe)?;
             let wake = Arc::new(Wake { reader, writer });
             let settled = sys::pipe(&probe)?;
-            let shared = Arc::new(Shared::new(sock_path.clone(), peer_euid, probe.clone(), settled));
+            let dir_fd = rustix::io::fcntl_dupfd_cloexec(dir.dir_fd(), 3)?;
+            let shared = Arc::new(Shared::new(
+                sock_path.clone(),
+                dir_fd,
+                peer_euid,
+                probe.clone(),
+                settled,
+            ));
             let thread = {
                 let (shared, wake) = (shared.clone(), wake.clone());
                 std::thread::Builder::new()

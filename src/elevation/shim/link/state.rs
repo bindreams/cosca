@@ -3,7 +3,7 @@
 //! No thread holds the lock across a blocking call: every socket call made under it is nonblocking.
 
 use std::io::{PipeReader, PipeWriter};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +57,10 @@ pub(super) struct Shared {
     /// Written once, when the outcome is set, so a waiter that found nothing to read and then lost
     /// the frame to another reader still wakes: it polls this next to `conn`.
     pub(super) settled: (PipeReader, PipeWriter),
+    /// Only for logs and tests: the socket is removed through `dir`, never by this path.
     pub(super) sock_path: PathBuf,
+    /// The private directory, open: the socket is removed relative to it.
+    dir: OwnedFd,
     /// The euid a shim must have: root, in production.
     pub(super) peer_euid: u32,
     pub(super) probe: Probe,
@@ -68,7 +71,13 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    pub(super) fn new(sock_path: PathBuf, peer_euid: u32, probe: Probe, settled: (PipeReader, PipeWriter)) -> Self {
+    pub(super) fn new(
+        sock_path: PathBuf,
+        dir: OwnedFd,
+        peer_euid: u32,
+        probe: Probe,
+        settled: (PipeReader, PipeWriter),
+    ) -> Self {
         Shared {
             inner: Mutex::new(Inner {
                 start: StartState::Pending,
@@ -82,6 +91,7 @@ impl Shared {
             conn: OnceLock::new(),
             settled,
             sock_path,
+            dir,
             peer_euid,
             probe,
             stopping: AtomicBool::new(false),
@@ -97,9 +107,9 @@ impl Shared {
         if std::mem::replace(&mut inner.unlinked, true) {
             return;
         }
-        match std::fs::remove_file(&self.sock_path) {
+        match sys::unlink_socket(self.dir.as_fd(), super::SOCKET_NAME) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Errno::NOENT) => {
                 log::debug!("the socket {} was already gone", self.sock_path.display());
             }
             Err(e) => log::warn!("cannot remove the socket {}: {e}", self.sock_path.display()),

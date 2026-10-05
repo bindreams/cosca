@@ -55,14 +55,17 @@ const SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
 
 /// The path to bind the socket named `name` in `dir` at.
 ///
-/// Linux: through `/proc/self/fd/<dir fd>`, so that `sun_path` holds a short name whatever the length
+/// Linux: through `/proc/thread-self/fd/<dir fd>` (`/proc/self` is the main thread's, which is wrong
+/// after `unshare(CLONE_FILES)` or when that thread is gone), so that `sun_path` holds a short name whatever the length
 /// of `TMPDIR`. The path is tried and compared with the descriptor before it is used; if `/proc` is
 /// not usable (not mounted, a different one mounted), that is the error, and there is no fallback to
 /// the long path.
 #[cfg(target_os = "linux")]
 pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
     use std::os::fd::AsRawFd;
-    let via_proc = probe.proc_root().join(format!("self/fd/{}", dir.dir_fd().as_raw_fd()));
+    let via_proc = probe
+        .proc_root()
+        .join(format!("thread-self/fd/{}", dir.dir_fd().as_raw_fd()));
     let opened = rustix::fs::openat(
         rustix::fs::CWD,
         &via_proc,
@@ -80,14 +83,23 @@ pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> io::Re
     Ok(via_proc.join(name))
 }
 
-/// Whether the socket's full path fits `sun_path`: `Err(limit)` if it does not, `limit` being the
-/// longest path (the field holds a terminating NUL). The path is `<real tmp>/<directory name>/<name>`.
-/// Only macOS binds by full path; Linux binds relative to the directory's descriptor.
-#[cfg(not(target_os = "linux"))]
-pub(super) fn full_path_fits(real_tmp: &Path, name: &str) -> Result<(), (usize, usize)> {
+/// The longest `<real tmp>/<directory name>/<name>` that works. macOS binds by that full path, so
+/// the limit is `sun_path` less its NUL. Linux binds through `/proc`, but the shim opens the
+/// directory by its full path (and a path of `PATH_MAX` or more cannot be opened), so the limit is
+/// `PATH_MAX` less the NUL.
+pub(super) fn socket_path_limit() -> usize {
+    #[cfg(target_os = "linux")]
+    return libc::PATH_MAX as usize - 1;
+    #[cfg(not(target_os = "linux"))]
     // SAFETY: an all-zero `sockaddr_un` is valid.
-    let limit = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len() - 1;
+    return unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len() - 1;
+}
+
+/// Whether the socket's full path, `<real tmp>/<directory name>/<name>`, is short enough.
+/// `Err((length, limit))`: it would be `length` bytes, over the longest that works, `limit`.
+pub(super) fn full_path_fits(real_tmp: &Path, name: &str) -> Result<(), (usize, usize)> {
     let length = real_tmp.as_os_str().len() + 1 + crate::elevation::shim::private_dir::NAME_LEN + 1 + name.len();
+    let limit = socket_path_limit();
     if length > limit {
         Err((length, limit))
     } else {
@@ -95,15 +107,16 @@ pub(super) fn full_path_fits(real_tmp: &Path, name: &str) -> Result<(), (usize, 
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn full_path_fits(_: &Path, _: &str) -> Result<(), (usize, usize)> {
-    Ok(())
-}
-
 /// macOS has no `bindat`, so the socket is bound at its full path.
 #[cfg(not(target_os = "linux"))]
 pub(super) fn socket_path(_: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
     Ok(dir.path().join(name))
+}
+
+/// Removes the socket named `name` from the directory open as `dir`: relative to the descriptor, so
+/// no path length matters.
+pub(super) fn unlink_socket(dir: BorrowedFd<'_>, name: &str) -> Result<(), Errno> {
+    rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty())
 }
 
 /// Binds the listener at `path`, nonblocking.

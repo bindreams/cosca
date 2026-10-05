@@ -19,7 +19,7 @@ impl FakeShim {
         {
             use std::os::fd::AsRawFd;
             let held = std::fs::File::open(dir)?;
-            UnixStream::connect(format!("/proc/self/fd/{}/{SOCKET_NAME}", held.as_raw_fd())).map(FakeShim)
+            UnixStream::connect(format!("/proc/thread-self/fd/{}/{SOCKET_NAME}", held.as_raw_fd())).map(FakeShim)
         }
         #[cfg(not(target_os = "linux"))]
         UnixStream::connect(dir.join(SOCKET_NAME)).map(FakeShim)
@@ -98,15 +98,24 @@ impl Rig {
     /// A link whose directory is under a temp directory nested deeper than `min_len` bytes.
     #[cfg(target_os = "linux")]
     pub(crate) fn deep(min_len: usize) -> Rig {
-        crate::log_capture::install();
         let tmp = tempfile::tempdir().expect("a temp directory");
-        let mut nested = tmp.path().to_owned();
-        while nested.as_os_str().len() <= min_len {
-            nested.push("n".repeat(40));
-        }
-        std::fs::create_dir_all(&nested).expect("the nested directories");
+        let base = crate::elevation::shim::private_dir::PrivateDir::resolve(tmp.path()).unwrap();
+        let nested = nested_of_len(&base, min_len + 1);
+        Rig::bind_at(tmp, &nested)
+    }
+
+    /// A link whose temp directory has exactly the real path length `len`.
+    pub(crate) fn at_real_len(len: usize) -> Rig {
+        let tmp = tempfile::tempdir().expect("a temp directory");
+        let base = crate::elevation::shim::private_dir::PrivateDir::resolve(tmp.path()).unwrap();
+        let nested = nested_of_len(&base, len);
+        Rig::bind_at(tmp, &nested)
+    }
+
+    fn bind_at(tmp: tempfile::TempDir, at: &Path) -> Rig {
+        crate::log_capture::install();
         let (probe, events) = super::probe::Probe::new();
-        let link = super::ShimLink::bind_probed(&nested, my_euid(), probe.clone()).expect("the link binds");
+        let link = super::ShimLink::bind_probed(at, my_euid(), probe.clone()).expect("the link binds");
         Rig {
             link,
             probe,
@@ -138,4 +147,27 @@ impl Rig {
     pub(crate) fn log_marker(&self) -> String {
         self.link.dir().display().to_string()
     }
+}
+
+/// Directories under `base` (a real path), made `0700`, so that the deepest has a path of exactly
+/// `len` bytes. Components are at most 200 bytes. `base` must be shorter than `len`.
+pub(crate) fn nested_of_len(base: &Path, len: usize) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut path = base.to_owned();
+    while path.as_os_str().len() < len {
+        let remaining = len - path.as_os_str().len();
+        assert!(remaining >= 2, "cannot reach {len} from {}", path.display());
+        let mut component = (remaining - 1).min(200);
+        if remaining - (component + 1) == 1 {
+            component -= 1;
+        }
+        path.push("n".repeat(component));
+    }
+    assert_eq!(path.as_os_str().len(), len);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&path)
+        .expect("the nested directories");
+    path
 }
