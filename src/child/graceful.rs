@@ -420,7 +420,9 @@ pub(crate) mod fault {
         crate::error::Error::Io(std::io::Error::other("forced kill_tree failure (test seam)"))
     }
 
-    pub(crate) use crate::graceful_hooks::{at, release_at, run_hook, HookPoint};
+    #[cfg(unix)]
+    pub(crate) use crate::graceful_hooks::at;
+    pub(crate) use crate::graceful_hooks::{release_at, run_hook, HookPoint};
 
     /// RAII disarm for `FORCE_KILL_TREE_ERROR`: a test that arms this seam expecting the sweep
     /// to skip (so the seam is never consumed by `take_force_kill_tree_error`) must still clear

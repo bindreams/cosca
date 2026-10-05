@@ -29,6 +29,7 @@ fn slot(point: HookPoint) -> &'static std::thread::LocalKey<OneShotHook> {
 }
 
 /// Run `hook` when the shutdown reaches `point`.
+#[cfg(unix)]
 pub(crate) fn at(point: HookPoint, hook: impl FnOnce() + 'static) -> Armed {
     arm(slot(point), hook)
 }
