@@ -166,7 +166,7 @@ impl ShimLink {
     fn teardown(&mut self) {
         // On macOS the acceptor takes `spawn_lock` to accept (D23), so joining it from a thread that
         // holds the lock would deadlock.
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
         debug_assert!(
             !crate::child::spawn::spawn_lock_held_by_this_thread(),
             "a ShimLink must not be dropped while holding spawn_lock"
