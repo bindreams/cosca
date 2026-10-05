@@ -7,8 +7,7 @@
 //! - **Linux:** one page marked `MADV_WIPEONFORK` (kernel 4.14, below the 5.6 floor), with a marker
 //!   byte set at creation. A fork copy reads zero. The check is a memory read and cannot fail.
 //! - **macOS:** the process's audit token (`task_info(mach_task_self(), TASK_AUDIT_TOKEN)`: pid and
-//!   pidversion), read at creation and again at each check. Unlike `proc_pidinfo`, it works under a
-//!   Seatbelt sandbox entered after creation. The read is a call that could in principle fail, so
+//!   pidversion), read at creation and again at each check. The read is a call that could in principle fail, so
 //!   [`Origin::Unknown`] exists: a contract violation, reported on stderr, and never taken for either
 //!   answer.
 //! - **Other platforms:** no exact mechanism, so [`ForkGuard::new`] is `Unsupported`.
@@ -37,7 +36,6 @@ pub(crate) fn warn_unlogged(message: &[u8]) {
 /// Created by the original; [`origin`](Self::origin) is [`Origin::Copy`] in a fork copy of it.
 pub(crate) struct ForkGuard {
     guard: imp::Guard,
-    /// A test makes the guard unable to say.
     #[cfg(test)]
     unreadable: std::sync::atomic::AtomicBool,
 }
@@ -52,7 +50,7 @@ impl ForkGuard {
         })
     }
 
-    /// Which process this is. Never panics in a release build; see [`Origin::Unknown`].
+    /// Which process this is. A failed read is `Unknown` (and a debug assertion).
     pub(crate) fn origin(&self) -> Origin {
         #[cfg(test)]
         if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {

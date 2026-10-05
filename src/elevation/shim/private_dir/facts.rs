@@ -31,7 +31,7 @@ pub(crate) struct DirFacts {
     /// The volume does not track ownership, so `uid` says nothing.
     pub(crate) ignores_ownership: bool,
     /// An ACL entry lets someone other than the euid and root add, remove or rename entries, or
-    /// grant themselves the right to. macOS only: Linux has no such ACLs in play here.
+    /// grant themselves the right to. macOS only.
     pub(crate) acl_grants_others: bool,
 }
 
@@ -62,9 +62,7 @@ impl DirFacts {
 }
 
 /// True if no user but `euid` and root can rename or remove the entries of this directory that
-/// `euid` or root own. That needs all of: the directory is owned by `euid` or root; its volume
-/// tracks ownership; no ACL entry lets others change entries; and it is either sticky (others
-/// may not touch entries they do not own) or not writable by group or others.
+/// `euid` or root own.
 ///
 /// In a sticky directory, others can still rename the entries they own. That is why the private
 /// directory is `0700` and owned by us, which this check does not vouch for.

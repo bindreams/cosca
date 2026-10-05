@@ -33,7 +33,7 @@ pub(crate) enum PrivateDirError {
     ForkGuard(io::Error),
 }
 
-/// [`PrivateDir::remove`] was asked by a process that is not the one that created the directory.
+/// [`PrivateDir::remove`] refused the caller's origin.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the private directory can only be removed by the process that created it, not by {0:?}")]
 pub(crate) struct NotOriginal(pub(crate) Origin);
@@ -43,13 +43,9 @@ pub(crate) struct NotOriginal(pub(crate) Origin);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Removal {
     Removed,
-    /// Already gone.
     Gone,
-    /// The name no longer holds the directory we made. Left alone.
     NotOurs,
-    /// Something is still inside. Left alone.
     NotEmpty,
-    /// The directory could not be removed.
     Failed(Errno),
 }
 
@@ -126,8 +122,8 @@ impl PrivateDir {
         Self::create_with(tmp, open_and_harden, false)
     }
 
-    /// [`create_in`](Self::create_in), where `open` opens the directory just made, in `parent`
-    /// under `name`, and returns its `stat`. A failure removes the directory.
+    /// [`create_in`](Self::create_in) with the opening of the new directory replaced by `open`. A
+    /// failure removes the directory.
     fn create_with(tmp: &Path, open: OpenMade, guarded: bool) -> Result<Self, PrivateDirError> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
@@ -217,8 +213,7 @@ impl PrivateDir {
 
     /// Removes the directory if the name still holds the one we made, by `(dev, ino)`, with
     /// `unlinkat` on the parent's descriptor. Never deletes anything inside. Logs as [`Removal`]
-    /// says. Refused, in release builds too, for any `origin` but [`Origin::Original`]: removing it
-    /// from a fork copy would take the original's.
+    /// says. Refused, in release builds too, for any `origin` but [`Origin::Original`].
     pub(crate) fn remove(mut self, origin: Origin) -> Result<Removal, NotOriginal> {
         if origin != Origin::Original {
             return Err(NotOriginal(origin));
@@ -227,9 +222,8 @@ impl PrivateDir {
         Ok(self.remove_by_fd())
     }
 
-    /// `Drop`'s body, for a process of this `origin`: nothing once removed, and nothing unless it is
-    /// the process that created the directory. An origin that cannot be told leaves the directory,
-    /// and says so without the `log` facade, which a fork copy must not touch.
+    /// `Drop`'s body: nothing once removed. An origin that cannot be told leaves the directory, and
+    /// says so without the `log` facade, which a fork copy must not touch.
     fn release(&mut self, origin: Origin) {
         if self.removed {
             return;

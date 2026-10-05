@@ -76,7 +76,6 @@ pub(crate) fn exhaust_fds(_alone: &crate::test_own_process::Completion) -> Resto
     }
 }
 
-/// Puts back the descriptor limit [`exhaust_fds`] lowered.
 #[cfg(unix)]
 #[must_use = "the limit stays lowered only while this lives"]
 pub(crate) struct RestoreNofile(libc::rlimit);
