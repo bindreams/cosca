@@ -6,7 +6,9 @@
 use std::process::ExitStatus;
 
 use crate::error::Error;
-use crate::signal::{RootState, Sent, Sig};
+#[cfg(unix)]
+use crate::signal::RootState;
+use crate::signal::{Sent, Sig};
 
 /// How [`ProcSource::wait_and_reap`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,23 +501,14 @@ impl ProcSource {
     ///   be read ([`exit_only::peek_verified`](crate::wait::exit_only)). A child with no unique id
     ///   (a spawn whose unique id was not adopted, see `adopted_id`) is `Unknown`: its unique-id
     ///   read was refused, and nothing shows the pid still names it.
-    /// - **Windows:** the process handle pins the process, so `Unreaped` until this handle reaped it.
     ///
     /// A child tokio reaped (`id()` is `None`) and a forgotten backend are `Reaped`.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    #[cfg(unix)]
     pub(crate) fn state(&self) -> RootState {
         match self {
-            #[cfg(unix)]
             ProcSource::Foreign { .. } => RootState::Reaped,
             ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped,
-            #[cfg(unix)]
             ProcSource::Tokio { child, .. } => self.state_of(child),
-            #[cfg(windows)]
-            ProcSource::Tokio { .. } => RootState::Unreaped,
-            #[cfg(windows)]
-            ProcSource::Raw(r) if r.is_reaped() => RootState::Reaped,
-            #[cfg(windows)]
-            ProcSource::Raw(_) => RootState::Unreaped,
         }
     }
 

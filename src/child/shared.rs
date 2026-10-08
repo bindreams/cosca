@@ -288,36 +288,28 @@ impl SharedChild {
     ///   `debug` record;
     /// - otherwise a peek through the handle decides (Linux: the pidfd; macOS: the pid, checked
     ///   against its unique id, with an unreadable id on a running child an error);
-    /// - Windows: the process handle pins the process, so `Unreaped` until this handle reaps.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
         use crate::signal::RootState;
         let lock = self.lock();
         if matches!(lock.state, State::E(_)) {
             return RootState::Reaped;
         }
-        #[cfg(windows)]
-        {
-            RootState::Unreaped
-        }
-        #[cfg(unix)]
-        {
-            let Some(target) = self.target() else {
-                // Only a test adopts a child that was already gone.
-                #[cfg(not(test))]
-                debug_assert!(false, "a production child always holds its handle");
-                log::debug!(
-                    "child {} has no handle (it was gone when adopted); treating it as reaped",
-                    self.id()
-                );
-                return RootState::Reaped;
-            };
-            #[cfg(target_os = "macos")]
-            let peeked = exit_only::peek_verified(&target);
-            #[cfg(not(target_os = "macos"))]
-            let peeked = exit_only::peek(&target);
-            RootState::of_peek(peeked)
-        }
+        let Some(target) = self.target() else {
+            // Only a test adopts a child that was already gone.
+            #[cfg(not(test))]
+            debug_assert!(false, "a production child always holds its handle");
+            log::debug!(
+                "child {} has no handle (it was gone when adopted); treating it as reaped",
+                self.id()
+            );
+            return RootState::Reaped;
+        };
+        #[cfg(target_os = "macos")]
+        let peeked = exit_only::peek_verified(&target);
+        #[cfg(not(target_os = "macos"))]
+        let peeked = exit_only::peek(&target);
+        RootState::of_peek(peeked)
     }
 
     /// The unique id this handle checks its by-pid actions against. Tests only.

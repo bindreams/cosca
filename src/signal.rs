@@ -1,6 +1,7 @@
 //! The signals cosca sends to a process it owns, and the one place each addressing mode's
 //! "already gone" is decided.
 
+#[cfg(unix)]
 use std::io;
 
 #[cfg(unix)]
@@ -43,8 +44,10 @@ pub(crate) enum Sent {
 ///
 /// One answer for every "is the root still ours?" question, so a drop, a walk and a failed-spawn
 /// cleanup cannot disagree about a root they all asked about.
+///
+/// Unix only: a Windows process handle pins its process, so nothing there asks.
+#[cfg(unix)]
 #[derive(Debug)]
-#[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
 pub(crate) enum RootState {
     /// The root is an unreaped child (a zombie at worst): its pid names it, and a signal through
     /// its handle reaches it.

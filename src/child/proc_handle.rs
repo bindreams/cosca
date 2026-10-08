@@ -48,17 +48,12 @@ impl ProcHandle {
         }
     }
 
-    /// Whether the root is still this handle's child to act on; see [`RootState`](crate::signal::RootState).
-    /// `Raw` (Windows) holds the process handle for life: `Reaped` once it has exited.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    /// Whether the root is still this handle's child to act on; see
+    /// [`RootState`](crate::signal::RootState).
+    #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        match self {
-            ProcHandle::Std(s) => s.state(),
-            #[cfg(windows)]
-            ProcHandle::Raw(r) if r.is_reaped() => crate::signal::RootState::Reaped,
-            #[cfg(windows)]
-            ProcHandle::Raw(_) => crate::signal::RootState::Unreaped,
-        }
+        let ProcHandle::Std(s) = self;
+        s.state()
     }
 
     /// Block until the child exits.
