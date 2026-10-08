@@ -73,7 +73,7 @@ jobs:
           pipx inject --force virtme-ng "setuptools==75.8.0"
 
       # The guest sees this checkout and the toolchain through the host's file system. The kernel is the
-      # pre-built mainline one for the tag. `uname -r` is printed first and must name the tag.
+      # pre-built mainline one for the tag; the script prints `uname -r` first and checks it names the tag.
       - name: Run the shim's tests on the old kernel
         timeout-minutes: 15
         shell: bash
@@ -81,12 +81,5 @@ jobs:
           KERNEL: ${{ matrix.kernel }}
         run: |
           set -euxo pipefail
-          vng --run "$KERNEL" --user root --cpus 2 --memory 2G --exec "
-            set -eux
-            uname -r
-            case \"\$(uname -r)\" in ${KERNEL#v}*) ;; *) echo \"booted \$(uname -r), not $KERNEL\"; exit 1;; esac
-            export PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}'
-            cd '$PWD'
-            cargo nextest run --locked --lib --no-fail-fast --no-tests=fail \
-              -E 'test(elevation::shim::run::) | test(elevation::shim::creds)'
-          "
+          vng --run "$KERNEL" --user root --cpus 2 --memory 2G \
+            --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL'"
