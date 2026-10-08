@@ -239,11 +239,25 @@ impl Child {
     ///
     /// **An elevated child behind a front** ([`Backend::Sudo`](crate::elevation::Backend::Sudo),
     /// [`Backend::Doas`](crate::elevation::Backend::Doas),
-    /// [`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript)), outside a
-    /// Linux cgroup: the tracked process is usually the wrapper, which outlives the root program,
-    /// so a kill would orphan the program. While it runs, this sends nothing and returns
+    /// [`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript)): the tracked
+    /// process is usually the wrapper, which outlives the root program, so a kill would orphan the
+    /// program. While it runs, it is sent no signal. In a Linux cgroup ([`Containment::CgroupV2`])
+    /// this kills through `cgroup.kill`, which reaches the front whatever its credentials, and every
+    /// process still in the cgroup. A process root moved out of the cgroup (as
+    /// `sudo systemd-run --scope` does) is not killed, and cosca cannot see it, so `Ok` says only
+    /// that the front and what was still in the cgroup were killed. Otherwise, including when the
+    /// front has left the cgroup, this sends nothing and returns
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), and
     /// [`wait`](Child::wait) still returns only once the program has exited.
+    ///
+    /// Whether the cgroup kill reached the front is read after it: by the cgroup id of its pidfd
+    /// (`PIDFD_GET_INFO`) on Linux 6.13 and later, looked for in the cgroup and the cgroups under
+    /// it, and by `/proc/<pid>/cgroup` otherwise. A killed process keeps its cgroup until it is
+    /// reaped, so a front the kill reached reads as in the cgroup. One that someone else moves out
+    /// after the kill, before it exits, reads as moved, and this returns `Unkillable` though the
+    /// front is dying. So does a failed `cgroup.kill`, naming the failure; the other cases are
+    /// listed on [`Command::contain`](crate::Command::contain). Before 6.13, a host whose `/proc`
+    /// would hide the front's cgroup refuses the spawn instead.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -283,6 +297,15 @@ impl Child {
                     other => other.map_err(Error::Io),
                 }
             }
+            // A signal after the cgroup kill could only be refused; whether the kill reached the
+            // tracked process is read after it.
+            Gate::CgroupOnly => {
+                self.attached
+                    .hard_kill_marking(&self.tree_killed)
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                self.cgroup_kill_reached()?;
+                return Ok(crate::signal::Sent::Delivered);
+            }
             Gate::Closed(unkillable) => return Err(unkillable),
         }
         // A plain child returns Ok(()) once exited. EPERM on an elevated wrapper child becomes
@@ -295,9 +318,26 @@ impl Child {
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn kill_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::kill_gate(self.front, self.id.pid(), self.attached.is_cgroup(), || {
-            self.proc.is_running()
-        })
+        let pid = self.id.pid();
+        crate::elevation::front::kill_gate(
+            self.front,
+            pid,
+            || self.proc.is_running(),
+            || self.attached.kill_reaches_across_credentials(pid, self.proc.pidfd()),
+        )
+    }
+
+    /// Whether a cgroup kill just written reached this child's tracked process, a front (see
+    /// [`crate::elevation::front::cgroup_kill_reached`]).
+    #[cfg(unix)]
+    fn cgroup_kill_reached(&self) -> Result<(), Error> {
+        let pid = self.id.pid();
+        crate::elevation::front::cgroup_kill_reached(
+            self.front,
+            pid,
+            || self.proc.is_running().map(|running| !running),
+            || self.attached.cgroup_names(pid, self.proc.pidfd()),
+        )
     }
 
     /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
@@ -346,8 +386,9 @@ impl Child {
     /// the `cgroup.kill` fork-race fix: see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     /// Without it, `wait_tree` also waits for a child that escaped the kill.
     ///
-    /// **An elevated child behind a front** (see [`kill`](Child::kill)) outside a cgroup: this
-    /// sends nothing, by its group or otherwise, and returns
+    /// **An elevated child behind a front** (see [`kill`](Child::kill)) is reached only through a
+    /// cgroup that holds it, and nothing is signalled after its kill. Under any other mechanism, or
+    /// once it has left the cgroup, this sends nothing and returns
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
@@ -399,12 +440,15 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        // `true` for an exited front: its backstop's signal could only be refused.
+        // Decided once: the gate is not asked again after the kill, when a killed front may read as
+        // neither exited nor in its cgroup. `None` for a child the backstop may signal; for a front
+        // it must not, `Some(true)` when the front is in the cgroup, `Some(false)` when it exited.
         #[cfg(unix)]
-        let exited_front = match self.kill_gate() {
+        let front = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),
-            crate::elevation::front::Gate::Open => false,
-            crate::elevation::front::Gate::Exited => true,
+            crate::elevation::front::Gate::Open => None,
+            crate::elevation::front::Gate::Exited => Some(false),
+            crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
@@ -412,10 +456,20 @@ impl Child {
         if self.attached.hard_kill_refused_to_walk(&group_result) {
             return group_result;
         }
-        // An exited front needs no backstop.
+        // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
+        // reached it is read after it. One whose kill failed may still have its program running:
+        // left alone. An exited front needs no backstop.
         #[cfg(unix)]
-        if exited_front {
-            return group_result;
+        if let Some(in_cgroup) = front {
+            return match group_result {
+                Ok(()) if in_cgroup => self.cgroup_kill_reached(),
+                Err(e) if in_cgroup => Err(crate::elevation::front::cgroup_kill_failed(
+                    self.front,
+                    self.id.pid(),
+                    e,
+                )),
+                other => other,
+            };
         }
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
@@ -747,8 +801,9 @@ pub(crate) mod fault {
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
 ///
-/// An elevated child behind a front outside a cgroup (see [`Child::kill`]) is not signalled while
-/// it runs: the drop leaves it running and unreaped, and warns.
+/// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
+/// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when
+/// that kill fails, the drop leaves it running and unreaped, and warns.
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -764,13 +819,16 @@ impl Drop for Child {
         // its number, until `teardown_on_drop` below.
         #[cfg(unix)]
         let view = crate::containment::DropView::read(self.id, self.proc.is_reaped(), &self.tree_killed);
-        // A live elevation front outside a cgroup is not signalled: it is left running, unreaped,
-        // and named.
+        // A live elevation front gets no signal of its own: outside a cgroup it is left running,
+        // unreaped, and named.
         #[cfg(unix)]
-        if let crate::elevation::front::Gate::Closed(unkillable) = self.kill_gate() {
-            log::warn!("Child::drop: the elevated child is left running and unreaped: {unkillable}");
-            return;
-        }
+        let cgroup_only = match self.kill_gate() {
+            crate::elevation::front::Gate::Closed(unkillable) => {
+                log::warn!("Child::drop: the elevated child is left running and unreaped: {unkillable}");
+                return;
+            }
+            gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
+        };
         #[cfg(unix)]
         let tree = self.attached.hard_kill_for_drop(view);
         #[cfg(not(unix))]
@@ -794,6 +852,20 @@ impl Drop for Child {
         // A reaped root is neither killed nor waited for: its number may name another child by now.
         #[cfg(unix)]
         if view.root_reaped {
+            return;
+        }
+        #[cfg(unix)]
+        if cgroup_only {
+            match tree.and_then(|()| self.cgroup_kill_reached()) {
+                // The cgroup kill ended it: reap it, sending nothing.
+                Ok(()) => self.proc.reap_after_tree_kill(),
+                // Never waited for: it may run as long as its program.
+                Err(e) => log::warn!(
+                    "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill did not end it \
+                     ({e}), and a kill of the front would orphan the elevated program",
+                    self.id.pid()
+                ),
+            }
             return;
         }
         self.proc.teardown_on_drop();

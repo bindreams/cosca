@@ -13,10 +13,65 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 
+/// `FILEID_KERNFS`: the type of a kernfs node's file handle, whose 8 bytes are the node's id.
+const FILEID_KERNFS: libc::c_int = 0xfe;
+
+/// The cgroup id of the cgroup directory `dir` names: its kernfs node id, read from its file
+/// handle. That carries all 64 bits on every architecture, where `stx_ino` carries only the low 32
+/// on a 32-bit kernel. It is the id `PIDFD_GET_INFO` gives a member.
+pub(crate) fn cgroup_id(dir: BorrowedFd<'_>) -> io::Result<u64> {
+    /// `struct file_handle` with room for a kernfs handle.
+    #[repr(C)]
+    struct KernfsHandle {
+        handle_bytes: libc::c_uint,
+        handle_type: libc::c_int,
+        f_handle: [u8; 8],
+    }
+    let mut handle = KernfsHandle {
+        handle_bytes: 8,
+        handle_type: 0,
+        f_handle: [0; 8],
+    };
+    let mut mount_id: libc::c_int = 0;
+    // SAFETY: `handle` is a `struct file_handle` whose `handle_bytes` is the room after its header,
+    // and the path is an empty C string, which `AT_EMPTY_PATH` reads as `dir` itself.
+    let rc = unsafe {
+        libc::name_to_handle_at(
+            dir.as_raw_fd(),
+            c"".as_ptr(),
+            (&raw mut handle).cast::<libc::file_handle>(),
+            &mut mount_id,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    id_of_handle(handle.handle_type, handle.handle_bytes, handle.f_handle)
+}
+
+/// The cgroup id a file handle of `handle_type` and `handle_bytes` bytes carries in `bytes`, in
+/// this machine's byte order (`kernfs_encode_fh`); an error for any other handle.
+pub(crate) fn id_of_handle(handle_type: libc::c_int, handle_bytes: libc::c_uint, bytes: [u8; 8]) -> io::Result<u64> {
+    if handle_type != FILEID_KERNFS || handle_bytes != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("not a cgroup's file handle (type {handle_type:#x}, {handle_bytes} bytes)"),
+        ));
+    }
+    Ok(u64::from_ne_bytes(bytes))
+}
+
 /// A leaf's directory and its parent, each held as an `O_PATH` descriptor.
 pub(crate) struct LeafDir {
-    parent: OwnedFd,
-    dir: OwnedFd,
+    /// Shared with the leaf's [`Subtree`](super::Subtree)s, which look for a sibling there.
+    parent: std::sync::Arc<OwnedFd>,
+    /// Shared with the leaf's [`Subtree`](super::Subtree)s, which read it after the leaf is gone.
+    dir: std::sync::Arc<OwnedFd>,
+    /// The ids of the cgroups [`remove_children`](Self::remove_children) removed, shared with the
+    /// leaf's [`Subtree`](super::Subtree)s: a task in one is in the subtree, which no walk can show
+    /// once it is removed.
+    swept: Swept,
     name: OsString,
 }
 
@@ -48,8 +103,9 @@ impl LeafDir {
             }
         };
         Ok(LeafDir {
-            parent,
-            dir,
+            parent: std::sync::Arc::new(parent),
+            dir: std::sync::Arc::new(dir),
+            swept: Swept::default(),
             name: name.into(),
         })
     }
@@ -64,19 +120,44 @@ impl LeafDir {
             let parent = open_dir(rustix::fs::CWD, path.parent().expect("a leaf path has a parent"))
                 .expect("open the leaf's parent");
             let dir = open_dir(&parent, &name).expect("open the leaf");
-            return LeafDir { parent, dir, name };
+            return LeafDir {
+                parent: std::sync::Arc::new(parent),
+                dir: std::sync::Arc::new(dir),
+                swept: Swept::default(),
+                name,
+            };
         }
         let gone = tempfile::tempdir().expect("tempdir");
         let parent = open_dir(rustix::fs::CWD, gone.path()).expect("open a stand-in parent");
         rustix::fs::mkdirat(&parent, &name, Mode::from_raw_mode(0o777)).expect("make a stand-in leaf");
         let dir = open_dir(&parent, &name).expect("open the stand-in leaf");
         rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).expect("remove the stand-in leaf");
-        LeafDir { parent, dir, name }
+        LeafDir {
+            parent: std::sync::Arc::new(parent),
+            dir: std::sync::Arc::new(dir),
+            swept: Swept::default(),
+            name,
+        }
     }
 
     /// The leaf's directory.
     pub(crate) fn dir(&self) -> BorrowedFd<'_> {
         self.dir.as_fd()
+    }
+
+    /// The leaf's directory, shared: it stays on the directory once the leaf is removed.
+    pub(crate) fn shared(&self) -> std::sync::Arc<OwnedFd> {
+        std::sync::Arc::clone(&self.dir)
+    }
+
+    /// The leaf's parent directory, shared.
+    pub(crate) fn shared_parent(&self) -> std::sync::Arc<OwnedFd> {
+        std::sync::Arc::clone(&self.parent)
+    }
+
+    /// The record of the cgroups the leaf's sweep removed (see [`Swept`]).
+    pub(crate) fn swept(&self) -> Swept {
+        self.swept.clone()
     }
 
     /// The leaf's parent directory.
@@ -164,12 +245,177 @@ impl LeafDir {
         Ok(rustix::fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR)?)
     }
 
+    /// The leaf's cgroup id (see [`cgroup_id`]).
+    pub(crate) fn id(&self) -> io::Result<u64> {
+        cgroup_id(self.dir.as_fd())
+    }
+
     /// Remove every child cgroup of the leaf, deepest first, and count those removed. A child that
     /// `rmdir` refuses as busy — something re-entered it — is left for the caller's next kill. A
     /// directory already gone has nothing left to remove.
     pub(crate) fn remove_children(&self) -> io::Result<usize> {
-        remove_children(self.dir.as_fd())
+        remove_children(self.dir.as_fd(), &self.swept)
     }
+}
+
+/// The ids of the cgroups a leaf's sweep removed, shared by the leaf and its subtrees. Holds one
+/// id per cgroup the leaf's tree made, so as many as that tree made.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Swept(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+impl Swept {
+    fn record(&self, id: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id);
+    }
+
+    /// Whether the sweep removed the cgroup `id`.
+    pub(crate) fn holds(&self, id: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id)
+    }
+}
+
+/// What a walk of the cgroups under a leaf found of one cgroup id (see [`find_descendant`]).
+#[derive(Debug)]
+pub(crate) enum Walked {
+    /// A cgroup under the leaf has the id.
+    Found,
+    /// No cgroup the walk could list has it, and it could list every one that it found: none was
+    /// behind a mount. A cgroup removed during the walk is not listed, and is not one the walk
+    /// could list.
+    Absent,
+    /// The walk could not list every cgroup: why.
+    Unknown(io::Error),
+}
+
+/// Whether a cgroup under `dir`, not `dir` itself, has the cgroup id `id` (see [`cgroup_id`]).
+///
+/// Breadth first, each cgroup opened from `dir` by its path relative to it, with `openat2`
+/// (`RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS`), read, and closed before the next:
+/// the walk holds two descriptors at most, however large the tree. A cgroup removed during the walk
+/// (`ENOENT`, or `ENODEV` from a removed directory's files) has nothing under it to find, and is
+/// skipped. A cgroup behind a mount (`EXDEV`) cannot be listed, so a walk that meets one answers
+/// [`Walked::Unknown`] if it finds nothing, as it does for any other failure: a cgroup this process
+/// may not read (`EACCES`), or one whose path from the leaf is longer than `PATH_MAX`
+/// (`ENAMETOOLONG`).
+///
+/// Its cost is one `openat2`, one `name_to_handle_at`, one `openat` and its `getdents` per cgroup:
+/// about 3 µs per cgroup, measured on Linux 7.0 (arm64, release build): 2.6 ms for 1000 cgroups
+/// side by side, 2.9 ms for 1110 nested three deep. It is bounded: the tree is finite, and the walk
+/// visits each cgroup at most once, since cgroup v2 refuses to rename or move a cgroup. It is sized
+/// by the cgroups the contained program made.
+pub(crate) fn find_descendant(dir: BorrowedFd<'_>, id: u64) -> Walked {
+    match walk(dir, id) {
+        Ok(Some(())) => Walked::Found,
+        Ok(None) => Walked::Absent,
+        Err(e) => Walked::Unknown(e),
+    }
+}
+
+/// [`find_descendant`]'s walk: `Some` once found, `None` once every cgroup was listed.
+fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
+    use std::collections::VecDeque;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let gone = |e: rustix::io::Errno| matches!(e, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV);
+    // Each cgroup still to look at, by its path relative to `dir`; `dir` itself first.
+    let mut pending: VecDeque<std::path::PathBuf> = VecDeque::from([std::path::PathBuf::from(".")]);
+    let mut behind_a_mount = None;
+    while let Some(path) = pending.pop_front() {
+        #[cfg(test)]
+        super::fault::run_before_walk_open(&path);
+        let cgroup = match open_beneath(dir, &path) {
+            Ok(cgroup) => cgroup,
+            Err(e) if gone(e) => continue,
+            Err(rustix::io::Errno::XDEV) => {
+                behind_a_mount.get_or_insert(path);
+                continue;
+            }
+            Err(e) => return Err(named(e, &path)),
+        };
+        if path.as_os_str() != "." {
+            match cgroup_id(cgroup.as_fd()) {
+                Ok(found) if found == id => return Ok(Some(())),
+                Ok(_) => {}
+                Err(e)
+                    if e.raw_os_error()
+                        .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno))) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            }
+        }
+        // Listing needs a readable descriptor; `cgroup` is `O_PATH`.
+        let entries = match rustix::fs::openat(
+            &cgroup,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .and_then(rustix::fs::Dir::new)
+        {
+            Ok(entries) => entries,
+            Err(e) if gone(e) => continue,
+            Err(e) => return Err(named(e, &path)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if gone(e) => break,
+                Err(e) => return Err(named(e, &path)),
+            };
+            let name = entry.file_name();
+            if !matches!(name.to_bytes(), b"." | b"..") && is_dir(cgroup.as_fd(), &entry)? {
+                pending.push_back(path.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
+            }
+        }
+    }
+    match behind_a_mount {
+        Some(path) => Err(io::Error::other(format!(
+            "{} is behind a mount, so the cgroups under it cannot be listed",
+            path.display()
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// `errno` from the walk at `path`, relative to the leaf.
+fn named(errno: rustix::io::Errno, path: &std::path::Path) -> io::Error {
+    let e = io::Error::from(errno);
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// Open the directory at `path` under `dir`, never across a mount or a symlink, nor out of `dir`.
+fn open_beneath(dir: BorrowedFd<'_>, path: &std::path::Path) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::ResolveFlags;
+
+    rustix::fs::openat2(
+        dir,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+    )
+}
+
+/// Whether `entry`, listed in `at`, is a directory: a cgroup's own interface files are files, and
+/// its child cgroups are its directories. One gone since is not.
+fn is_dir(at: BorrowedFd<'_>, entry: &rustix::fs::DirEntry) -> io::Result<bool> {
+    Ok(match entry.file_type() {
+        rustix::fs::FileType::Directory => true,
+        rustix::fs::FileType::Unknown => match rustix::fs::statat(at, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory,
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NODEV) => false,
+            Err(e) => return Err(e.into()),
+        },
+        _ => false,
+    })
 }
 
 /// A path through which a watch or an open reaches `fd`'s own inode, whatever is mounted over its
@@ -204,7 +450,7 @@ fn open_child_on_this_mount(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> rusti
     above_stdio(fd).map_err(|e| rustix::io::Errno::from_io_error(&e).unwrap_or(rustix::io::Errno::IO))
 }
 
-fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
+fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
     let gone = |e: rustix::io::Errno| matches!(e, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV);
     // Listing needs a readable descriptor; the held one is `O_PATH`.
     let listing = rustix::fs::openat(
@@ -250,11 +496,19 @@ fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
             Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
             Err(e) => return Err(e.into()),
         };
-        removed += remove_children(child.as_fd())?;
+        removed += remove_children(child.as_fd(), swept)?;
+        let child_id = cgroup_id(child.as_fd());
         // `dir` was reached without crossing a mount, so this removes a directory entry of the
         // leaf's own filesystem; one mounted on since is refused `EBUSY`, not followed.
         match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
-            Ok(()) => removed += 1,
+            Ok(()) => {
+                removed += 1;
+                // The name may lead to another cgroup since `child` was opened, if someone removed
+                // that one and made this; both were under the leaf, so the id is of one that was.
+                if let Ok(child_id) = child_id {
+                    swept.record(child_id);
+                }
+            }
             Err(e) if gone(e) || e == rustix::io::Errno::BUSY => {}
             Err(e) => return Err(e.into()),
         }
@@ -265,3 +519,7 @@ fn remove_children(dir: BorrowedFd<'_>) -> io::Result<usize> {
 #[cfg(test)]
 #[path = "dir_tests.rs"]
 mod dir_tests;
+
+#[cfg(test)]
+#[path = "dir_walk_tests.rs"]
+pub(crate) mod dir_walk_tests;

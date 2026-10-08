@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 
-use super::{fd_path, LeafDir};
+use super::{fd_path, id_of_handle, LeafDir};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
@@ -218,4 +218,18 @@ fn rmdir_spares_a_symlink_that_took_a_live_leafs_name() {
         moved.exists(),
         "the leaf behind the link must not be removed through it"
     );
+}
+
+/// A cgroup id is all 64 bits of a kernfs file handle, read in this machine's byte order; any
+/// other handle is no cgroup's.
+#[skuld::test]
+fn a_cgroup_id_is_decoded_from_its_kernfs_handle() {
+    const HIGH: u64 = 0x1_0000_0007;
+    assert_eq!(
+        id_of_handle(0xfe, 8, HIGH.to_ne_bytes()).expect("a kernfs handle"),
+        HIGH
+    );
+    // `FILEID_INO32_GEN`, as tmpfs gives: an inode and a generation, not a cgroup id.
+    id_of_handle(1, 8, HIGH.to_ne_bytes()).expect_err("not a kernfs handle");
+    id_of_handle(0xfe, 4, HIGH.to_ne_bytes()).expect_err("too short for a kernfs id");
 }

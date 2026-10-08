@@ -592,6 +592,17 @@ impl ProcSource {
         }
     }
 
+    /// The pidfd naming the child, if the backend holds one (Linux).
+    #[cfg(unix)]
+    pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match self.target()? {
+            #[cfg(target_os = "linux")]
+            crate::wait::exit_only::Target::PidFd(fd) => Some(fd),
+            #[allow(unreachable_patterns, reason = "a Linux backend's target is always its pidfd")]
+            _ => None,
+        }
+    }
+
     /// Whether the child is still running, read without reaping it: `false` once it is reaped, by
     /// tokio or by someone else, or has exited. On macOS a child with no unique id cannot be read.
     #[cfg(unix)]
@@ -799,6 +810,7 @@ impl ProcSource {
         mut self,
         pid: u32,
         front: crate::elevation::front::Front,
+        subtree: Option<&crate::containment::cgroup::Subtree>,
     ) -> crate::child::spawn::FrontFate {
         self.forget_if_foreign();
         let ProcSource::Tokio { pidfd, .. } = &mut self else {
@@ -815,7 +827,7 @@ impl ProcSource {
         };
         let pidfd = pidfd.take();
         self.forget_because("is an elevation front, sent nothing, and handed to the pidfd teardown");
-        crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front)
+        crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front, subtree)
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the

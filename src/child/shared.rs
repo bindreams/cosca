@@ -457,6 +457,13 @@ impl SharedChild {
         self.wait_inner(Some(deadline))
     }
 
+    /// The pidfd naming the child, if it holds one (Linux).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.pidfd.as_ref().map(AsFd::as_fd)
+    }
+
     /// Whether the child is still running, read without reaping it: `false` once it has exited,
     /// been reaped by us or by someone else, or was gone when adopted.
     #[cfg(unix)]

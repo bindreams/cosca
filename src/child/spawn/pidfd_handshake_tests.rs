@@ -1098,7 +1098,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let said = std::rc::Rc::new(RefCell::new(None));
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, None).err();
+    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, super::LeftFront::NotAFront).err();
     assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("the report was cut short"));
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(
@@ -1106,7 +1106,12 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         "{why}"
     );
 
-    super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport, None).err();
+    super::conclude(
+        Ok(Recorder(Rc::clone(&said))),
+        Outcome::NoReport,
+        super::LeftFront::NotAFront,
+    )
+    .err();
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
@@ -1236,11 +1241,14 @@ impl super::Spawned for NoChild {
     }
 }
 
-/// The front `sudo` leaves.
-fn sudo_front() -> Option<crate::elevation::front::Front> {
-    crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
-        crate::elevation::Backend::Sudo,
-    )))
+/// The front `sudo` leaves, left to the handshake.
+fn sudo_front() -> super::LeftFront {
+    super::LeftFront::Here(
+        crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
+            crate::elevation::Backend::Sudo,
+        )))
+        .expect("sudo leaves a front"),
+    )
 }
 
 /// A `cat` whose stdin this test holds, and a pidfd naming it.

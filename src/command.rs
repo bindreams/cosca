@@ -622,6 +622,31 @@ impl Command {
     /// Until `spawn` returns, nothing else in the process may reap the child: do not set `SIGCHLD`
     /// to `SIG_IGN` or run a reaper that calls `waitpid(-1, …)`/`wait()`, since that frees the pid
     /// for reuse by an unrelated process.
+    ///
+    /// # Linux: an elevated child behind a front
+    /// A `sudo` or `doas` front in a cgroup is killed through the cgroup alone, and whether that kill
+    /// reached it is read after it (see [`Child::kill`](crate::Child::kill)): on Linux 6.13 and
+    /// later by its pidfd's cgroup id, looked for in the cgroup and the cgroups under it, which the
+    /// elevated program may make; by `/proc/<pid>/cgroup` otherwise. Before 6.13 the spawn checks
+    /// first that `/proc` shows the cgroup of a process this one may not trace, as it may not trace
+    /// a front. Where it does not (a `/proc` mounted with `hidepid`, or one of an outer pid
+    /// namespace), the spawn returns [`Error::Unsupported`] before anything is spawned.
+    ///
+    /// The cgroup kill reaches every process still in the cgroup or under it. A process root moved
+    /// out of it (as `sudo systemd-run --scope` does) is not killed, and cosca cannot see it: an
+    /// `Ok` says only that the front and everything still in the cgroup were killed.
+    ///
+    /// A front no kill is shown to have reached is sent nothing and left unreaped, and the call
+    /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns, and a
+    /// failed spawn's error carries a note. That is the case when:
+    ///
+    /// - the `cgroup.kill` write fails (`kill` names the failure);
+    /// - someone else moves the front out of the cgroup before its kill, which then does not reach
+    ///   it, or after its kill, before it exits: that reads the same, though the front is dying;
+    /// - where `/proc` hides the front (`hidepid`) on 6.13 and later, the front is in a cgroup under
+    ///   the leaf that the walk of the leaf's cgroups cannot reach: one behind a mount, one this
+    ///   process may not read (as after root's `chmod`), one whose path from the leaf is longer than
+    ///   `PATH_MAX`, or one someone else removed after the kill.
     pub fn contain(&mut self) -> &mut Command {
         self.contain_with(ContainMode::Strongest)
     }
