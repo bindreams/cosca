@@ -431,16 +431,27 @@ impl CgroupLeaf {
     /// leaving its cgroup and can no longer be moved, and a front recorded outside it can no
     /// longer enter it: the record stays true once the leaf is gone.
     ///
-    /// The leaf is live here, so its own path reads plainly: a front that reads it with ` (deleted)`
+    /// While the leaf is live its own path reads plainly: a front that reads it with ` (deleted)`
     /// after it is in a live cgroup of that name beside it, and recorded outside. If the leaf is
-    /// already gone (removed by someone else), that path is undecidable, and nothing is recorded.
+    /// already gone (removed by someone else), or whether it is live cannot be read, that path is
+    /// undecidable, and nothing is recorded.
     fn record_watched_place(&self) {
         let (Some(pid), Some(path)) = (self.watched, &self.cgroup_path) else {
             return;
         };
-        let live =
-            || !matches!(self.dir.open("cgroup.events", rustix::fs::OFlags::PATH), Err(e) if removed_after_drain(&e));
-        match super::proc_names(path, pid, || live().then_some(false), false) {
+        // Outside only when the leaf's own file opens: the leaf is live. Any error, its removal or
+        // any other, leaves the path undecided.
+        let outside_if_live = || {
+            #[cfg(test)]
+            let opened = match fault::liveness_read_fails() {
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                None => self.dir.open("cgroup.events", rustix::fs::OFlags::PATH),
+            };
+            #[cfg(not(test))]
+            let opened = self.dir.open("cgroup.events", rustix::fs::OFlags::PATH);
+            opened.ok().map(|_| false)
+        };
+        match super::proc_names(path, pid, outside_if_live, false) {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(

@@ -41,6 +41,7 @@ thread_local! {
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -836,7 +837,7 @@ pub(crate) fn run_before_walk_open(path: &std::path::Path) {
 }
 
 /// While the guard lives, a leaf's cgroup id on this thread fails with `errno`, as
-/// `name_to_handle_at` does on a kernel without `CONFIG_FHANDLE` (`EOPNOTSUPP`).
+/// `name_to_handle_at` does on a kernel without `CONFIG_FHANDLE` (`ENOSYS`).
 pub(crate) fn fail_cgroup_id(errno: i32) -> FailCgroupId {
     CGROUP_ID_FAILS.with(|f| f.set(Some(errno)));
     FailCgroupId(())
@@ -853,4 +854,24 @@ impl Drop for FailCgroupId {
 
 pub(crate) fn cgroup_id_fails() -> Option<i32> {
     CGROUP_ID_FAILS.with(Cell::get)
+}
+
+/// While the guard lives, a leaf's read of whether it is live, before its removal on this thread,
+/// fails with `errno`, as an `openat` refused `EMFILE` does.
+pub(crate) fn fail_liveness_read(errno: i32) -> FailLivenessRead {
+    LIVENESS_READ_FAILS.with(|f| f.set(Some(errno)));
+    FailLivenessRead(())
+}
+
+#[must_use = "the liveness reads again as soon as the guard is dropped"]
+pub(crate) struct FailLivenessRead(());
+
+impl Drop for FailLivenessRead {
+    fn drop(&mut self) {
+        LIVENESS_READ_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn liveness_read_fails() -> Option<i32> {
+    LIVENESS_READ_FAILS.with(Cell::get)
 }

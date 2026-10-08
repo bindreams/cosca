@@ -531,7 +531,9 @@ pub(crate) fn failed_held_front_spawns(
         let result = spawn(&mut cmd);
         force_arm(false);
         // The filler kept the leaf busy, so the leaf's removal killed through it: the kill landed.
-        if let Some((filler, _stdin)) = filler.as_ref().zip(filler_stdin) {
+        // Its stdin is closed first, so a filler nothing killed exits 0 and the assertion fails.
+        if let Some((filler, stdin)) = filler.as_ref().zip(filler_stdin) {
+            drop(stdin);
             assert_eq!(
                 filler.wait().expect("wait").signal(),
                 Some(libc::SIGKILL),
@@ -906,9 +908,24 @@ fn cgroup_a_front_behind_a_mount_under_its_leaf_is_placed_through_proc(#[fixture
     });
 }
 
-/// A leaf records its watched front's place just before its removal, while the leaf is live: a
-/// front in a live cgroup beside it named as `/proc` prints the removed leaf is recorded outside,
-/// and a front in the leaf itself, killed, inside.
+/// Where a front is when its leaf records its place, before the leaf's removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordCase {
+    /// In a live cgroup beside the leaf named as `/proc` prints the removed leaf.
+    Namesake,
+    /// In the leaf itself, which the leaf's drop kills.
+    Leaf,
+    /// In the namesake, with the read of whether the leaf is live failing (`EMFILE`).
+    NamesakeLivenessUnread,
+    /// In the leaf, killed through it, and the leaf removed by someone else before its drop, so the
+    /// front's zombie reads the leaf's path with ` (deleted)` after it.
+    LeafRemovedFirst,
+}
+
+/// A leaf records its watched front's place just before its removal: outside for a front in a
+/// live namesake of the removed leaf, read while the leaf is live; inside for a front in the leaf.
+/// Nothing is recorded where the path is undecidable: the leaf's liveness cannot be read, or the
+/// leaf is already gone.
 #[skuld::test]
 fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::dir_walk_tests::Scratch;
@@ -921,27 +938,53 @@ fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] 
                 .display()
         )
     };
-    for in_leaf in [false, true] {
-        let leaf_path = scratch.make(&format!("leaf-{in_leaf}"));
+    for (n, case) in [
+        RecordCase::Namesake,
+        RecordCase::Leaf,
+        RecordCase::NamesakeLivenessUnread,
+        RecordCase::LeafRemovedFirst,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let leaf_path = scratch.make(&format!("leaf-{n}"));
         let mut leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
         leaf.set_cgroup_path_for_test(cgroup_of(&leaf_path));
         let placed = leaf.placed_for_test();
         let (front, stdin) = spawn_as(cat(), SUDO);
         let pid = front.id().pid();
         leaf.watch_front(pid);
-        let namesake = leaf_path.with_file_name(format!("leaf-{in_leaf} (deleted)"));
+        let namesake = leaf_path.with_file_name(format!("leaf-{n} (deleted)"));
+        let in_leaf = matches!(case, RecordCase::Leaf | RecordCase::LeafRemovedFirst);
         if in_leaf {
             std::fs::write(leaf_path.join("cgroup.procs"), pid.to_string()).expect("move the front into the leaf");
         } else {
             std::fs::create_dir(&namesake).expect("make the namesake");
             std::fs::write(namesake.join("cgroup.procs"), pid.to_string()).expect("move the front into the namesake");
         }
+        if case == RecordCase::LeafRemovedFirst {
+            std::fs::write(leaf_path.join("cgroup.kill"), "1").expect("kill through the leaf");
+            crate::test_child::wait_until_zombie(pid);
+            std::fs::remove_dir(&leaf_path).expect("remove the drained leaf, as a cgroup manager may");
+        }
+        let unread = (case == RecordCase::NamesakeLivenessUnread)
+            .then(|| crate::containment::cgroup::fault::fail_liveness_read(libc::EMFILE));
         // The leaf's drop kills what is in it, and removes it.
         drop(leaf);
-        assert_eq!(placed.of(pid), Some(in_leaf), "in the leaf: {in_leaf}");
+        drop(unread);
+        let expected = match case {
+            RecordCase::Namesake => Some(false),
+            RecordCase::Leaf => Some(true),
+            RecordCase::NamesakeLivenessUnread | RecordCase::LeafRemovedFirst => None,
+        };
+        assert_eq!(placed.of(pid), expected, "{case:?}");
         drop(stdin);
         let status = front.wait().expect("wait");
-        assert_eq!(status.signal(), in_leaf.then_some(libc::SIGKILL), "{status:?}");
+        assert_eq!(
+            status.signal(),
+            in_leaf.then_some(libc::SIGKILL),
+            "{case:?}: {status:?}"
+        );
         if !in_leaf {
             std::fs::remove_dir(&namesake).expect("remove the namesake");
         }
