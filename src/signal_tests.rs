@@ -224,3 +224,31 @@ mod macos {
         );
     }
 }
+
+// The root's state from a peek =====
+
+mod root_state {
+    use crate::signal::RootState;
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    /// Mutant: a reap by someone else is `Unknown`.
+    #[skuld::test]
+    fn a_foreign_reap_is_reaped() {
+        let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Gone)));
+        assert!(matches!(state, RootState::Reaped), "{state:?}");
+    }
+
+    /// A zombie held by launchd is not reaped: it is neither ours to reap nor gone, and its pid
+    /// stays pinned for a time nothing here bounds.
+    ///
+    /// Mutant: `Orphaned` is `Reaped`.
+    #[cfg(target_os = "macos")]
+    #[skuld::test]
+    fn an_orphaned_zombie_is_unknown_naming_launchd() {
+        let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Orphaned)));
+        assert!(
+            matches!(&state, RootState::Unknown(e) if e.to_string().contains("launchd")),
+            "{state:?}"
+        );
+    }
+}

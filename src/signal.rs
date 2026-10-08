@@ -67,6 +67,12 @@ impl RootState {
         use crate::wait::exit_only::Peek;
         match peeked {
             Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
+            // launchd holds the zombie, so the root is neither ours to reap nor gone: its pid stays
+            // pinned for a time nothing here bounds.
+            #[cfg(target_os = "macos")]
+            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unknown(io::Error::other(
+                "the root's zombie is held by launchd (its tracer died), so it is neither reaped nor ours to reap",
+            )),
             Ok(Peek::Foreign(_)) => RootState::Reaped,
             Err(e) => RootState::Unknown(e),
         }

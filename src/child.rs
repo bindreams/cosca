@@ -764,10 +764,16 @@ impl Drop for Child {
         //
         // On Unix, nothing that names the tree by the root's number runs once the root is reaped,
         // or when its handle cannot say: the handle's own answer (`RootState`), or the number no
-        // longer reading as this root. A foreign reap landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
-        // its number, until `teardown_on_drop` below.
+        // longer reading as this root. A foreign reap landing after this read is the accepted
+        // gap. An unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(self.id, || self.proc.state(), &self.tree_killed);
+        let view = crate::containment::DropView::read(
+            "Child::drop",
+            self.id,
+            &self.attached,
+            || self.proc.state(),
+            &self.tree_killed,
+        );
         // A live elevation front outside a cgroup is not signalled: it is left running, unreaped,
         // and named.
         #[cfg(unix)]

@@ -170,12 +170,18 @@ pub(crate) struct DropView {
 
 #[cfg(unix)]
 impl DropView {
-    /// Read the state both `Child` drops decide on: the root's number first, then `root`, the
-    /// handle's own answer ([`RootState`](crate::signal::RootState)). The handle is exact where the
-    /// number is not: a foreign reap followed by a same-tick reuse still reads as this root by its
-    /// start token.
+    /// Read the state a drop or a failed-spawn cleanup decides on: the root's number first, then
+    /// `root`, the handle's own answer ([`RootState`](crate::signal::RootState)). The handle is
+    /// exact where the number is not: a foreign reap followed by a same-tick reuse still reads as
+    /// this root by its start token.
+    ///
+    /// `label` names the caller in the log. A root the handle cannot answer for is warned about
+    /// here, once, naming what the caller will then leave alone (`attached`); no later step warns
+    /// of it again.
     pub(crate) fn read(
+        label: &str,
         id: crate::identity::ProcessId,
+        attached: &Attached,
         root: impl FnOnce() -> crate::signal::RootState,
         tree_killed: &TreeKilled,
     ) -> DropView {
@@ -183,18 +189,33 @@ impl DropView {
         let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
         let root = root();
-        if let RootState::Unknown(e) = &root {
-            log::warn!("Child::drop: RootState::Unknown: the root's ({root_pid}) own handle could not say whether it was reaped: {e}");
-        }
         let handle_reaped = matches!(root, RootState::Reaped);
-        if !handle_reaped && now.is_unknown() {
-            log::debug!(
-                "Child::drop: the root's number ({root_pid}) could not be read; treating the root as not reaped"
-            );
+        let root_reaped = crate::child::root_reaped(handle_reaped, id, now);
+        match &root {
+            RootState::Unknown(e) if !root_reaped => {
+                let left_alone = match attached.named_by_root_number(root_pid) {
+                    Some(action) => format!("so it does not {action}, whose number may belong to an unrelated process"),
+                    None => "and nothing it does names the tree by the root's number".to_owned(),
+                };
+                log::warn!(
+                    "{label}: RootState::Unknown: the root's ({root_pid}) own handle could not say whether it was reaped ({e}), {left_alone}"
+                );
+                if now.is_unknown() {
+                    log::debug!(
+                        "{label}: the root's number ({root_pid}) could not be read either; kills by that number are skipped"
+                    );
+                }
+            }
+            _ if !handle_reaped && now.is_unknown() => {
+                log::debug!(
+                    "{label}: the root's number ({root_pid}) could not be read; treating the root as not reaped"
+                );
+            }
+            _ => {}
         }
         DropView {
             root_pid,
-            root_reaped: crate::child::root_reaped(handle_reaped, id, now),
+            root_reaped,
             root,
             tree_killed: tree_killed.is_set(),
         }
@@ -466,8 +487,9 @@ impl Attached {
     /// A skip logs a `warn` naming what it skipped and the remedy (`kill_tree()` before the reap),
     /// or a `debug` when this handle already killed the tree completely (`view.tree_killed`).
     ///
-    /// The same skip, with the same warn, when the root's own handle could not say whether it is
-    /// reaped (`RootState::Unknown`): nothing then shows the number still names the root.
+    /// The same skip when the root's own handle could not say whether it is reaped
+    /// (`RootState::Unknown`): nothing then shows the number still names the root. [`DropView::read`]
+    /// has already warned of it, so the skip is a `debug`.
     #[cfg(unix)]
     pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> Result<(), crate::error::Error> {
         let Some(skipped) = self
@@ -490,11 +512,8 @@ impl Attached {
                  to end them (https://github.com/bindreams/cosca/issues/382)"
             );
         } else {
-            log::warn!(
-                "Child::drop: {why}, so this drop does not {skipped}, whose number may belong \
-                 to an unrelated process. Descendants of the root are not torn down by this drop; \
-                 call kill_tree() before wait() to end them"
-            );
+            // `DropView::read` warned of the unknown state.
+            log::debug!("Child::drop: {why}, so this drop does not {skipped}");
         }
         match self {
             #[cfg(target_os = "macos")]

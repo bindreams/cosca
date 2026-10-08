@@ -49,3 +49,34 @@ async fn tokio_kill_after_a_completed_wait_keeps_the_cached_status() {
     assert_eq!(again, status);
     assert_eq!(warns_since(mark), Vec::<String>::new());
 }
+
+/// A tokio drop whose root stays `Unknown` through every look warns once: the read, the skip, the
+/// second look and the forget are one event.
+///
+/// Mutants: the skip warns; the second look warns; the forget warns.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_tokio_drop_with_an_unknown_root_warns_once() {
+    use crate::wait::exit_only::seams::force_peeks;
+
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::Session);
+    let child = cmd.spawn().expect("spawn");
+    let pid = child.id().pid();
+    let mark = crate::log_capture::mark();
+    let _failed = force_peeks((0..8).map(|_| Err(std::io::Error::other("forced peek failure"))));
+
+    drop(child);
+
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
+    assert!(
+        warns[0].contains("RootState::Unknown") && warns[0].contains(&format!("pgid {pid}")),
+        "{warns:?}"
+    );
+}

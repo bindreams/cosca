@@ -557,19 +557,32 @@ impl ProcSource {
     /// forgotten.
     #[cfg(unix)]
     pub(crate) fn reaped_elsewhere(&self) -> bool {
+        let Some((pid, state)) = self.elsewhere() else {
+            return false;
+        };
+        if let RootState::Unknown(e) = &state {
+            log::warn!("child {pid} cannot be shown to be ours: RootState::Unknown, its peek failed: {e}");
+        }
+        true
+    }
+
+    /// [`reaped_elsewhere`](ProcSource::reaped_elsewhere) without the log, for a caller that has
+    /// already warned of the same root.
+    #[cfg(unix)]
+    pub(crate) fn reaped_elsewhere_quietly(&self) -> bool {
+        self.elsewhere().is_some()
+    }
+
+    /// The pid and non-`Unreaped` state of a child tokio has not reaped, if its handle shows one.
+    #[cfg(unix)]
+    fn elsewhere(&self) -> Option<(u32, RootState)> {
         let ProcSource::Tokio { child, .. } = self else {
-            return false;
+            return None;
         };
-        let Some(pid) = child.id() else {
-            return false;
-        };
+        let pid = child.id()?;
         match self.state_of(child) {
-            RootState::Unreaped => false,
-            RootState::Reaped => true,
-            RootState::Unknown(e) => {
-                log::warn!("child {pid} cannot be shown to be ours: RootState::Unknown, its peek failed: {e}");
-                true
-            }
+            RootState::Unreaped => None,
+            state => Some((pid, state)),
         }
     }
 
@@ -704,6 +717,21 @@ impl ProcSource {
     /// so the warning says what actually happened.
     #[cfg(unix)]
     pub(crate) fn forget_because(&mut self, why: &str) {
+        self.forget_at(log::Level::Warn, why);
+    }
+
+    /// [`forget_foreign`](ProcSource::forget_foreign) for a root the caller has already warned of:
+    /// the leak is logged at `debug`.
+    #[cfg(unix)]
+    pub(crate) fn forget_foreign_quietly(&mut self) {
+        self.forget_at(
+            log::Level::Debug,
+            "was reaped by someone else, or cannot be shown to be ours",
+        );
+    }
+
+    #[cfg(unix)]
+    fn forget_at(&mut self, level: log::Level, why: &str) {
         let ProcSource::Tokio {
             child,
             stdin,
@@ -728,7 +756,10 @@ impl ProcSource {
         } else {
             "tokio's SIGCHLD watch"
         };
-        log::warn!("child {pid} {why}; forgetting tokio's handle for it leaks {leak}");
+        log::log!(
+            level,
+            "child {pid} {why}; forgetting tokio's handle for it leaks {leak}"
+        );
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that

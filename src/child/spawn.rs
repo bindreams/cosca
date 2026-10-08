@@ -103,7 +103,13 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let view = crate::containment::DropView::read(child.id, || child.proc.state(), &child.tree_killed);
+    let view = crate::containment::DropView::read(
+        "finish_elevated",
+        child.id,
+        &child.attached,
+        || child.proc.state(),
+        &child.tree_killed,
+    );
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.

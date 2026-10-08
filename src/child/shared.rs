@@ -287,7 +287,7 @@ impl SharedChild {
     /// - a handle that was gone at adoption (no pidfd, no unique id) is `Reaped` too, with a
     ///   `debug` record;
     /// - otherwise a peek through the handle decides (Linux: the pidfd; macOS: the pid, checked
-    ///   against its unique id, with an unreadable id on a running child an error);
+    ///   against its unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
         use crate::signal::RootState;

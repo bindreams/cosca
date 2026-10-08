@@ -63,11 +63,12 @@ impl OsResources {
         self.proc.as_mut().expect(PROC_TAKEN)
     }
 
-    /// Whether the child's own handle shows its root reaped by someone else, which the start token
-    /// cannot tell for a reuse in the same tick. `false` when this handle reaped it itself.
+    /// Whether the child's own handle shows its root reaped by someone else, or cannot show it is
+    /// ours, which the start token cannot tell for a reuse in the same tick. `false` when this
+    /// handle reaped it itself. Logs nothing: the drop's first look warned.
     #[cfg(unix)]
     pub(crate) fn root_reaped_elsewhere(&self, own_reap: bool) -> bool {
-        !own_reap && self.proc.as_ref().is_some_and(ProcSource::reaped_elsewhere)
+        !own_reap && self.proc.as_ref().is_some_and(ProcSource::reaped_elsewhere_quietly)
     }
 
     /// Give up every resource, in declaration order, without waiting for anything.
@@ -162,7 +163,9 @@ impl Child {
     #[cfg(unix)]
     pub(super) fn kill_tree_members_unless_reaped(&self) -> Result<Option<String>, Error> {
         let view = crate::containment::DropView::read(
+            "finish_elevated",
             self.id,
+            &self.os.attached,
             || {
                 self.os
                     .proc
@@ -1013,7 +1016,9 @@ impl Drop for Child {
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         #[cfg(unix)]
         let view = crate::containment::DropView::read(
+            "Child::drop",
             self.id,
+            &os.attached,
             || {
                 os.proc
                     .as_ref()
@@ -1039,8 +1044,14 @@ impl Drop for Child {
         #[cfg(unix)]
         // Asked again: a reap can land after the read above (and before or during the root kill).
         if !own_reap && (view.root_reaped || os.root_reaped_elsewhere(own_reap)) {
+            // `DropView::read` already warned of a root its handle could not answer for.
+            let warned = matches!(view.root, crate::signal::RootState::Unknown(_)) && !view.root_reaped;
             if let Some(proc) = os.proc.as_mut() {
-                proc.forget_foreign();
+                if warned {
+                    proc.forget_foreign_quietly();
+                } else {
+                    proc.forget_foreign();
+                }
                 log::debug!(
                     "async child {} was reaped outside its handle; dropping it would reap by that number, so it was forgotten",
                     self.id.pid()

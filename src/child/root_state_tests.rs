@@ -15,7 +15,8 @@ fn warns_since(mark: usize) -> Vec<String> {
 
 /// This handle's own reap is `Reaped`, and nothing around it warns.
 ///
-/// Mutant: `SharedChild::state` reads its own recorded reap as `Unreaped`.
+/// Mutants: `SharedChild::state` reads its own recorded reap as `Unreaped`; it has no check of the
+/// recorded reap (the peek decides).
 #[skuld::test]
 fn state_after_own_wait_is_reaped_without_a_warn() {
     crate::log_capture::install();
@@ -23,7 +24,10 @@ fn state_after_own_wait_is_reaped_without_a_warn() {
     child.wait().expect("wait");
 
     let mark = crate::log_capture::mark();
+    // A peek would say `Running`: only the recorded reap says `Reaped`.
+    let running = crate::wait::exit_only::seams::force_peek_once(Ok(crate::wait::exit_only::Peek::Running));
     let state = child.proc.state();
+    drop(running);
     drop(child);
 
     assert!(matches!(state, RootState::Reaped), "{state:?}");
@@ -118,6 +122,61 @@ mod linux {
             "no killpg by an unconfirmed root's number"
         );
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pidfd)]);
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
+        assert!(
+            warns[0].contains(&format!("pgid {pid}")),
+            "the warn names the group left alone: {warns:?}"
+        );
+        assert!(
+            !crate::log_capture::contains_since(mark, "kill_tree()"),
+            "no wait happened and kill_tree has no RootState gate: no remedy to name"
+        );
+    }
+
+    /// The warn is labelled by the caller: a failed spawn's cleanup does not call itself a drop.
+    ///
+    /// Mutant: `DropView::read` hardcodes "Child::drop".
+    #[skuld::test]
+    fn the_unknown_warn_names_its_caller() {
+        crate::log_capture::install();
+        let _recorder = record_kill_group();
+        let (child, _writer) = session_blocker();
+        let mark = crate::log_capture::mark();
+        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+
+        let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+            .expect_err("the spawn fails");
+
+        // The cleanup's own drop afterwards reads a reaped root: another event, with its own warn.
+        let unknown: Vec<String> = warns_since(mark)
+            .into_iter()
+            .filter(|w| w.contains("RootState::Unknown"))
+            .collect();
+        assert_eq!(unknown.len(), 1, "{unknown:?} ({err:?})");
+        assert!(unknown[0].starts_with("finish_elevated:"), "{unknown:?}");
+    }
+
+    /// With the root's number unreadable too, the debug line does not claim the root is treated as
+    /// not reaped: its handle could not say, and the number-named kills are skipped.
+    ///
+    /// Mutant: the line keeps its "treating the root as not reaped" text.
+    #[skuld::test]
+    fn an_unknown_root_with_an_unreadable_number_does_not_claim_not_reaped() {
+        crate::log_capture::install();
+        let _recorder = record_kill_group();
+        let (child, _writer) = session_blocker();
+        let mark = crate::log_capture::mark();
+        let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
+        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+
+        drop(child);
+
+        assert!(
+            !crate::log_capture::contains_since(mark, "treating the root as not reaped"),
+            "{:?}",
+            crate::log_capture::records_since(mark, "number")
+        );
     }
 
     /// The same read, for a failed spawn's cleanup: the tree kill is skipped and the tree is not
@@ -130,7 +189,13 @@ mod linux {
         let (child, _writer) = session_blocker();
         let killed = crate::containment::TreeKilled::default();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-        let view = crate::containment::DropView::read(child.id, || child.proc.state(), &child.tree_killed);
+        let view = crate::containment::DropView::read(
+            "test",
+            child.id,
+            &child.attached,
+            || child.proc.state(),
+            &child.tree_killed,
+        );
         assert!(matches!(view.root, RootState::Unknown(_)), "{:?}", view.root);
 
         let skipped = child
