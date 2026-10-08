@@ -15,6 +15,8 @@ mod handshake_tests;
 mod outcome_tests;
 #[path = "run_tests/owner_tests.rs"]
 mod owner_tests;
+#[path = "run_tests/privileged_tests.rs"]
+mod privileged_tests;
 #[path = "run_tests/program_tests.rs"]
 mod program_tests;
 #[path = "run_tests/rig.rs"]
