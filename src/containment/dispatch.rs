@@ -186,15 +186,15 @@ impl DropView {
         if let RootState::Unknown(e) = &root {
             log::warn!("Child::drop: RootState::Unknown: the root's ({root_pid}) own handle could not say whether it was reaped: {e}");
         }
-        let own_reap = matches!(root, RootState::Reaped);
-        if !own_reap && now.is_unknown() {
+        let handle_reaped = matches!(root, RootState::Reaped);
+        if !handle_reaped && now.is_unknown() {
             log::debug!(
                 "Child::drop: the root's number ({root_pid}) could not be read; treating the root as not reaped"
             );
         }
         DropView {
             root_pid,
-            root_reaped: crate::child::root_reaped(own_reap, id, now),
+            root_reaped: crate::child::root_reaped(handle_reaped, id, now),
             root,
             tree_killed: tree_killed.is_set(),
         }
