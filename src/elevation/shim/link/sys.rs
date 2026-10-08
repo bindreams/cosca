@@ -53,12 +53,30 @@ const SEND_FLAGS: SendFlags = SendFlags::empty();
 #[cfg(not(target_os = "macos"))]
 const SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
 
-/// Why the socket's path could not be made.
+/// Why the socket's path could not be made. Only Linux goes through `/proc`, so only there can it
+/// fail.
+#[cfg(target_os = "linux")]
 pub(super) enum SocketPathError {
     /// `/proc` is not mounted, not this process's, or not readable.
     Proc(io::Error),
     /// Anything else (out of descriptors or memory).
     Other(io::Error),
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) enum SocketPathError {}
+
+impl SocketPathError {
+    /// Whether the error is about `/proc`, and the underlying error.
+    pub(super) fn into_parts(self) -> (bool, io::Error) {
+        #[cfg(target_os = "linux")]
+        return match self {
+            SocketPathError::Proc(e) => (true, e),
+            SocketPathError::Other(e) => (false, e),
+        };
+        #[cfg(not(target_os = "linux"))]
+        match self {}
+    }
 }
 
 /// The path to bind the socket named `name` in `dir` at.
@@ -86,7 +104,11 @@ pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> Result
     let opened = opened.map_err(|e| {
         // Only these say that `/proc` is not what it must be; running out of descriptors or memory
         // is not about `/proc`.
-        if matches!(e, Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::ACCESS) {
+        // EPERM is how TOMOYO and seccomp deny it; SELinux, AppArmor and Smack use EACCES.
+        if matches!(
+            e,
+            Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::ACCESS | Errno::PERM
+        ) {
             SocketPathError::Proc(e.into())
         } else {
             SocketPathError::Other(e.into())

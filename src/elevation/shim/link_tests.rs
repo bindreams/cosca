@@ -504,6 +504,7 @@ fn emfile_opening_through_proc_is_an_io_error_not_a_proc_error() {
         (Errno::NOTDIR, true),
         (Errno::LOOP, true),
         (Errno::ACCESS, true),
+        (Errno::PERM, true),
     ] {
         let (probe, _events) = super::probe::Probe::new();
         probe.fail_proc_open(errno);

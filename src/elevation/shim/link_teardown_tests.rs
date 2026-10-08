@@ -157,16 +157,24 @@ fn unknown_origin_in_a_fork_copy_leaves_the_owner_intact() {
 fn unknown_origin_in_the_original_stops_the_acceptor_and_removes_nothing() {
     let Rig {
         link,
-        probe: _probe,
+        probe,
         events,
         tmp: _tmp,
     } = Rig::new();
     let dir = link.dir().to_owned();
     let shared = link.shared.clone();
+    let wake = link.wake.clone();
+    // Held, so the acceptor cannot take the stop byte before it is checked for.
+    probe.hold_acceptor();
     link.owner.make_unreadable();
     drop(link);
-    // `drop` has returned, so its own event is already queued. The acceptor stops only on a stop
-    // request it can see, so check that before waiting for it: without one it would wait for ever.
+    assert!(
+        super::super::sys::is_readable(&wake.reader),
+        "the stop byte is in the wake pipe"
+    );
+    probe.release_acceptor();
+    // `drop` has returned, so its own event is already queued. The stop request and the byte were
+    // checked above as states, so the wait below is for an acceptor that has both.
     // The acceptor runs concurrently, so its events may come before or after.
     assert!(
         shared.is_stopping(),
