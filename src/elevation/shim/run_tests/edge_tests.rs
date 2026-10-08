@@ -33,8 +33,8 @@ fn fault_before_exec_kills_the_child_and_is_reported_as_its_status() {
         // A child that survived the signal is released, and then runs the program to its end.
         run.release_child_if_waiting();
         assert_eq!(
-            rig.link.link.wait().unwrap(),
-            LinkOutcome::Exited(number),
+            killed_by(rig.link.link.wait().unwrap()),
+            Some(number),
             "signal {number}"
         );
         assert!(!marker.exists(), "signal {number}: the program ran");
