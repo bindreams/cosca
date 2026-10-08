@@ -132,6 +132,20 @@ pub(crate) fn move_out_of_its_leaf(pid: u32) {
     std::fs::write(&procs, pid.to_string()).unwrap_or_else(|e| panic!("move {pid} into {procs}: {e}"));
 }
 
+/// Moves `pid` from its leaf into a new cgroup beside it, named as the leaf with ` (deleted)` after
+/// it, as `/proc` prints the leaf once it is removed.
+pub(crate) fn move_into_a_namesake_of_its_leaf(pid: u32) {
+    let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the front's cgroup");
+    let leaf = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a cgroup v2 `0::` line");
+    let namesake = format!("/sys/fs/cgroup{leaf} (deleted)");
+    std::fs::create_dir(&namesake).unwrap_or_else(|e| panic!("make {namesake}: {e}"));
+    std::fs::write(format!("{namesake}/cgroup.procs"), pid.to_string())
+        .unwrap_or_else(|e| panic!("move {pid} into {namesake}: {e}"));
+}
+
 /// Moves `pid` from its leaf into a cgroup two levels under it, `a/b`, as a program may make one,
 /// and returns that cgroup's directory.
 pub(crate) fn move_under_its_leaf(pid: u32) -> String {
@@ -150,7 +164,7 @@ pub(crate) fn move_under_its_leaf(pid: u32) -> String {
 /// The kill goes through `cgroup.kill`, and sends the front nothing after it.
 #[skuld::test]
 fn cgroup_kill_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     assert_eq!(child.containment(), Containment::CgroupV2);
     crate::wait::exit_only::seams::signals_sent();
     child.kill().expect("the cgroup kill reaches the program");
@@ -160,13 +174,15 @@ fn cgroup_kill_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _grou
         "nothing is signalled after it"
     );
     assert!(child.tree_killed.is_set(), "the kill must go through the cgroup");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
 /// `kill_tree` likewise.
 #[skuld::test]
 fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     crate::wait::exit_only::seams::signals_sent();
     child.kill_tree().expect("the cgroup kill reaches the program");
     assert_eq!(
@@ -175,6 +191,8 @@ fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup_alone(#[fixture(cgroup)] 
         "nothing is signalled after it"
     );
     assert!(child.tree_killed.is_set());
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -231,12 +249,14 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
 /// cgroup, and `kill`/`kill_tree` answer `Ok`.
 #[skuld::test]
 fn cgroup_kill_of_a_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_nobody_front();
+    let (child, stdin) = spawn_nobody_front();
     {
         let _refusing = WithoutKillCap::refusing(child.id().pid());
         child.kill().expect("the cgroup kill ends the front");
         child.kill_tree().expect("the cgroup kill ends the front");
     }
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -271,6 +291,42 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
     .expect_err("a failed write fails the spawn");
     let rendered = err.to_string();
     assert!(rendered.contains("the elevated child was terminated"), "{rendered}");
+}
+
+/// A failed password write whose cgroup kill fails refuses the front's kill as `kill` does,
+/// naming the failure, and sends the front nothing. The front then ends on its stdin, unsignalled,
+/// and the leaf the failed kill left behind is removed.
+#[skuld::test]
+fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#[fixture(cgroup)] _group: &Group) {
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.id().pid();
+    let leaf = leaf_of(&child).path().to_path_buf();
+    let err = {
+        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
+        crate::child::spawn::finish_elevated(
+            child,
+            Err(crate::error::Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+            }),
+        )
+        .expect_err("a failed write fails the spawn")
+    };
+    assert_front_refused_by_its_cgroup_kill(&err, pid);
+    drop(stdin);
+    assert_reaped_unsignalled(pid);
+    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
+}
+
+/// `err`, a failed password write's, says its front `pid` was refused as `kill` refuses a front
+/// whose cgroup kill failed.
+#[track_caller]
+pub(crate) fn assert_front_refused_by_its_cgroup_kill(err: &crate::error::Error, pid: u32) {
+    let text = err.to_string();
+    assert!(text.contains("the elevated child could not be terminated"), "{text}");
+    assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+    assert!(text.contains("no kill was sent"), "{text}");
+    assert!(text.contains("(its cgroup kill failed: "), "{text}");
 }
 
 /// A front that has left its leaf is out of the cgroup kill's reach: sent nothing, and refused.
@@ -386,6 +442,12 @@ pub(crate) enum LeafKill {
     /// The front is moved into a cgroup nested under its leaf, which the leaf's kill reaches, and
     /// `/proc` hides it (`hidepid`).
     LandsNestedHidden,
+    /// The leaf's kill lands on the front, whose place is read through `/proc` alone (no
+    /// `PIDFD_GET_INFO`): once the leaf is removed, `/proc` names it with ` (deleted)`.
+    LandsReadThroughProc,
+    /// The front is moved into a live cgroup beside its leaf named as `/proc` prints the removed
+    /// leaf, and its place is read through `/proc` alone.
+    MissesIntoNamesake,
 }
 
 /// A failed front spawn: its error, the front's pid, and the front's stdin, which the test holds
@@ -430,8 +492,13 @@ pub(crate) fn failed_held_front_spawns(
             LeafKill::LandsNestedHidden => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
                 move_under_its_leaf(fault::spawn_pid());
             })),
-            LeafKill::Lands | LeafKill::Fails => None,
+            LeafKill::MissesIntoNamesake => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
+                move_into_a_namesake_of_its_leaf(fault::spawn_pid());
+            })),
+            LeafKill::Lands | LeafKill::Fails | LeafKill::LandsReadThroughProc => None,
         };
+        let _missing = matches!(kill, LeafKill::LandsReadThroughProc | LeafKill::MissesIntoNamesake)
+            .then(crate::containment::cgroup::fault::miss_pidfd_info);
         let _hidden = (kill == LeafKill::LandsNestedHidden).then(crate::containment::cgroup::fault::hide_proc);
         let _failing = (kill == LeafKill::Fails).then(crate::containment::cgroup::fault::fail_kill_writes);
         force_arm(true);
@@ -498,9 +565,10 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
         drop(stdin.borrow_mut().take());
         let status = crate::child::front_kill_tests::reap(pid).expect("the front was left unreaped");
         assert!(status.success(), "front {pid} was signalled: {status:?}");
-        if kill == LeafKill::Fails {
-            let leaf = format!("/sys/fs/cgroup{path}");
-            std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf left behind, {leaf}: {e}"));
+        // The cgroup the front was left in, if the test made it or a failed kill left it behind.
+        if matches!(kill, LeafKill::Fails | LeafKill::MissesIntoNamesake) {
+            let left = format!("/sys/fs/cgroup{path}");
+            std::fs::remove_dir(&left).unwrap_or_else(|e| panic!("remove {left}: {e}"));
         }
     }
 }
@@ -516,6 +584,25 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
     assert_killed_by_the_leaf(&failures, &reaps);
+}
+
+/// A failed spawn's front, its place read through `/proc` alone, is killed by its leaf and reaped:
+/// once the leaf is removed `/proc` names it with ` (deleted)`, which the place recorded before the
+/// removal answers.
+#[skuld::test]
+fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    let _running = crate::child::spawn::fault::see_fronts_running();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
+    assert_killed_by_the_leaf(&failures, &reaps);
+}
+
+/// A failed spawn whose front was moved into a live cgroup named as `/proc` prints the removed leaf
+/// leaves it running: the place recorded before the leaf's removal says it was outside.
+#[skuld::test]
+fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
+    let kill = LeafKill::MissesIntoNamesake;
+    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)));
 }
 
 /// A failed spawn whose leaf's kill fails leaves its front running: in its leaf, but reached by
@@ -616,7 +703,7 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
 /// read, was reached: `kill` is `Ok`. The hook after the kill's write lets the waiter reap it.
 #[skuld::test]
 fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
@@ -629,6 +716,8 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixtu
             }
         });
         let _between = crate::elevation::front::seams::set_between_reach_reads(move || {
+            // The kill was written, so the front dies of it; one the kill missed exits 0 here.
+            drop(stdin);
             go_tx.send(()).expect("start the waiter");
             let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
             assert_eq!(status.signal(), Some(libc::SIGKILL), "the cgroup kill ended the front");
@@ -726,8 +815,9 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup
         let _hidden = crate::containment::cgroup::fault::hide_proc();
         child.kill().expect("the leaf's kill reaches a front nested under it");
     }
-    let status = child.wait().expect("wait");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
+    let status = child.wait().expect("wait");
     assert_eq!(
         status.signal(),
         Some(libc::SIGKILL),
@@ -765,8 +855,9 @@ fn cgroup_a_front_behind_a_mount_under_its_leaf_is_placed_through_proc(#[fixture
                     child.kill()
                 };
                 killed.expect("a front /proc places under its leaf was reached");
-                let status = child.wait().expect("wait");
+                // Closed first: a front nothing killed then exits 0, and the assertion fails.
                 drop(stdin);
+                let status = child.wait().expect("wait");
                 assert_eq!(
                     status.signal(),
                     Some(libc::SIGKILL),
@@ -776,30 +867,6 @@ fn cgroup_a_front_behind_a_mount_under_its_leaf_is_placed_through_proc(#[fixture
             .join()
             .expect("the spawning thread");
     });
-}
-
-/// A live cgroup beside the leaf named as the leaf with ` (deleted)` after it is not the leaf: a
-/// front moved into it is outside the leaf, by the walk and by `/proc` alike.
-#[skuld::test]
-fn cgroup_a_cgroup_named_as_the_removed_leaf_is_not_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pid = child.id().pid();
-    let leaf = leaf_of(&child).path().to_path_buf();
-    let mut name = leaf.file_name().expect("a leaf name").to_os_string();
-    name.push(" (deleted)");
-    let namesake = leaf.with_file_name(name);
-    std::fs::create_dir(&namesake).unwrap_or_else(|e| panic!("make {}: {e}", namesake.display()));
-    std::fs::write(namesake.join("cgroup.procs"), pid.to_string()).expect("move the front beside its leaf");
-    let by_walk = leaf_of(&child).names(pid, child.proc.pidfd());
-    let by_proc = {
-        let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
-        leaf_of(&child).names(pid, child.proc.pidfd())
-    };
-    // The test's own cleanup: the front back into its leaf, whose drop kills it, and the namesake.
-    std::fs::write(leaf.join("cgroup.procs"), pid.to_string()).expect("move the front back");
-    std::fs::remove_dir(&namesake).unwrap_or_else(|e| panic!("remove {}: {e}", namesake.display()));
-    assert!(!by_walk.expect("placed by the walk"), "the namesake is not the leaf");
-    assert!(!by_proc.expect("placed by /proc"), "the namesake is not the leaf");
 }
 
 /// Spawns `cmd`, marked as an elevation-derived `sudo` front, through `spawn`, and returns its
@@ -823,9 +890,19 @@ pub(crate) fn spawn_front_noting_fork<T>(
 /// forked for it: no front exists to kill, wait for or leave.
 #[track_caller]
 pub(crate) fn assert_refused_unforked<T: std::fmt::Debug>(result: Result<T, crate::error::Error>, forked: Option<u32>) {
+    assert_refused_unforked_naming(result, forked, "hidepid");
+}
+
+/// [`assert_refused_unforked`], for a refusal whose detail names `cause`.
+#[track_caller]
+pub(crate) fn assert_refused_unforked_naming<T: std::fmt::Debug>(
+    result: Result<T, crate::error::Error>,
+    forked: Option<u32>,
+    cause: &str,
+) {
     match result {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
-            assert!(detail.contains("hidepid"), "{detail}");
+            assert!(detail.contains(cause), "{detail}");
             assert!(detail.contains("before anything is spawned"), "{detail}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
@@ -847,6 +924,18 @@ fn cgroup_an_unplaceable_front_is_refused_before_its_fork(#[fixture(cgroup)] _gr
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn().map(drop));
     assert_refused_unforked(result, forked);
+}
+
+/// A host whose leaves give no cgroup id (`name_to_handle_at` refused, as on a kernel without
+/// `CONFIG_FHANDLE`) cannot place a front after a cgroup kill: an elevated, cgroup-contained spawn
+/// is refused before anything is forked.
+#[skuld::test]
+fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
+    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EOPNOTSUPP);
+    let mut cmd = in_cgroup(cat());
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn().map(drop));
+    assert_refused_unforked_naming(result, forked, "CONFIG_FHANDLE");
 }
 
 /// The refusal is decided before the fork with fds 0 and 1 closed too, where std's spawn returns

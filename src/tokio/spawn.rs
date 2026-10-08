@@ -349,8 +349,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         )?;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         #[cfg(target_os = "linux")]
-        if cmd.elevation_front().is_some() && prepared.cgroup_leaf.is_some() {
-            crate::containment::cgroup::front_placement()?;
+        if let Some(leaf) = prepared
+            .cgroup_leaf
+            .as_ref()
+            .filter(|_| cmd.elevation_front().is_some())
+        {
+            crate::containment::cgroup::front_placement(|| leaf.id())?;
         }
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
@@ -517,6 +521,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let subtree = front
         .and(prepared.cgroup_leaf.as_ref())
         .and_then(|leaf| leaf.subtree().ok());
+    #[cfg(unix)]
+    if front.is_some() {
+        prepared.watch_front(pid);
+    }
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
@@ -680,7 +688,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
+    let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {
         skipped = child.kill_tree_members_unless_reaped()?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
@@ -690,7 +698,10 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         })?;
         Ok(())
     });
-    let tree_killed = matches!(tree, Some(Ok(())));
+    let tree_failure = match &tree {
+        Some(Err(e)) => Some(e.to_string()),
+        _ => None,
+    };
     let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
     if let Some(action) = skipped {
         tree_note.push_str(&format!(
@@ -701,12 +712,11 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let root = match gate {
         // Not asked again after the kill: a killed front can read as neither exited nor in its
         // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if tree_killed => {
+        crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
             child.cgroup_kill_reached().map(|()| Sent::Delivered)
         }
-        crate::elevation::front::Gate::CgroupOnly => Err(Error::Containment {
-            detail: "its cgroup kill failed, and a kill of the front itself would orphan the elevated program".into(),
-        }),
+        // No kill reached the cgroup: refused as `kill` refuses, naming why.
+        crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
         gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
             child.kill_sent_gated(gate)

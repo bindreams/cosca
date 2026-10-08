@@ -185,12 +185,32 @@ pub(crate) fn cgroup_kill_failed(front: Option<Front>, pid: u32, error: Error) -
         debug_assert!(false, "only a front's cgroup kill is refused so");
         return error;
     };
-    refused(
-        front,
-        pid,
-        Signal::Kill,
-        Some(format!("its cgroup kill failed: {error}")),
-    )
+    cgroup_not_killed(front, pid, Some(&error.to_string()))
+}
+
+/// [`cgroup_not_killed`] for the child `pid`, whose gate found it a front in a cgroup.
+pub(crate) fn cgroup_not_killed_of(front: Option<Front>, pid: u32, failure: Option<&str>) -> Error {
+    let Some(front) = front else {
+        debug_assert!(false, "only a front's gate is CgroupOnly");
+        return Error::Containment {
+            detail: format!(
+                "pid {pid}'s cgroup was not killed{}",
+                failure.map_or(String::new(), |f| format!(": {f}"))
+            ),
+        };
+    };
+    cgroup_not_killed(front, pid, failure)
+}
+
+/// The refusal of a kill of the front `pid` whose cgroup no kill reached: its kill failed with
+/// `failure`, or (`None`) none was made. Nothing else was sent, since a kill of the front itself
+/// would orphan its elevated program.
+pub(crate) fn cgroup_not_killed(front: Front, pid: u32, failure: Option<&str>) -> Error {
+    let why = match failure {
+        Some(failure) => format!("its cgroup kill failed: {failure}"),
+        None => "its cgroup was not killed".to_owned(),
+    };
+    refused(front, pid, Signal::Kill, Some(why))
 }
 
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only

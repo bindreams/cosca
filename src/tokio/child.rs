@@ -209,6 +209,17 @@ impl Child {
     pub(super) fn kill_gate(&self) -> crate::elevation::front::Gate {
         kill_gate(self.front, &self.os, self.id.pid())
     }
+    /// Whether a kill through this child's cgroup landed.
+    #[cfg(unix)]
+    pub(super) fn cgroup_was_killed(&self) -> bool {
+        self.tree_killed.is_set()
+    }
+    /// The refusal of a kill of this front whose cgroup no kill reached (see
+    /// [`crate::elevation::front::cgroup_not_killed`]).
+    #[cfg(unix)]
+    pub(super) fn cgroup_not_killed(&self, failure: Option<&str>) -> Error {
+        crate::elevation::front::cgroup_not_killed_of(self.front, self.id.pid(), failure)
+    }
     /// Whether a cgroup kill just written reached this child's tracked process, a front (see
     /// [`crate::elevation::front::cgroup_kill_reached`]).
     #[cfg(unix)]
@@ -540,7 +551,9 @@ impl Child {
     ///
     /// **An elevated child behind a front** gets no signal of its own while it runs: in a Linux
     /// cgroup that holds it this kills, through `cgroup.kill`, what is still in the cgroup, and
-    /// otherwise it sends nothing. See the sync [`Child::kill`](crate::Child::kill).
+    /// otherwise it sends nothing. An elevated program that moves its front out of the cgroup and
+    /// back again around the kill can make an `Ok` false; `wait` stays truthful. See the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub fn kill(&mut self) -> Result<(), Error> {
         self.kill_sent().map(|_| ())
     }

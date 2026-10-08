@@ -21,8 +21,8 @@ fn subtree(leaf_id: u64, killed: bool) -> Subtree {
         leaf_id,
         None,
         None,
-        None,
         crate::containment::cgroup::Swept::default(),
+        super::PlacedAtRemoval::default(),
         Arc::new(AtomicBool::new(killed)),
     )
 }
@@ -49,9 +49,9 @@ fn subtree_of(fd: OwnedFd, swept: crate::containment::cgroup::Swept) -> Subtree 
     Subtree::new(
         HIGH,
         Some(Arc::new(fd)),
-        None,
         Some("/stand-in-leaf".to_owned()),
         swept,
+        super::PlacedAtRemoval::default(),
         Arc::new(AtomicBool::new(true)),
     )
 }
@@ -111,7 +111,7 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
 fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
     let _id = fault::force_pidfd_cgroup_id(HIGH);
     let _hidden = fault::hide_proc();
-    front_placement().expect("placeable by a pidfd's cgroup id");
+    front_placement(|| Ok(HIGH)).expect("placeable by a pidfd's cgroup id");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that shows a process this one may not trace makes fronts
@@ -119,7 +119,7 @@ fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
 #[skuld::test]
 fn without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts() {
     let _missing = fault::miss_pidfd_info();
-    front_placement().expect("this test's /proc hides nothing");
+    front_placement(|| Ok(HIGH)).expect("this test's /proc hides nothing");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that hides a process this one may not trace refuses an
@@ -128,7 +128,7 @@ fn without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts() {
 fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("hidepid"), "{detail}");
             assert!(detail.contains("before anything is spawned"), "{detail}");
@@ -144,7 +144,7 @@ fn without_pidfd_info_a_diverged_proc_view_refuses_naming_the_view() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _missing = fault::miss_pidfd_info();
     let _view = force_proc_view_once(ForcedView::Diverged);
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("an outer pid namespace's"), "{detail}");
             assert!(!detail.contains("hidepid"), "{detail}");
@@ -159,7 +159,7 @@ fn without_pidfd_info_an_unassessable_proc_view_refuses_naming_the_view() {
     use crate::identity::proc_view_fault::{force_proc_view_once, ForcedView};
     let _missing = fault::miss_pidfd_info();
     let _view = force_proc_view_once(ForcedView::Unassessable);
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(
                 detail.contains("could not be established (forced by a test)"),
@@ -185,10 +185,10 @@ fn the_placement_probe_answers_with_fds_0_and_1_closed() {
     };
     let _missing = fault::miss_pidfd_info();
     let restore = RestoreStdio::close(&done, &[0, 1]);
-    let shown = front_placement();
+    let shown = front_placement(|| Ok(HIGH));
     let hidden = {
         let _hidden = fault::hide_proc();
-        front_placement()
+        front_placement(|| Ok(HIGH))
     };
     drop(restore);
     shown.expect("this test's /proc hides nothing");
@@ -241,9 +241,9 @@ fn cgroup_a_task_in_a_cgroup_the_sweep_removed_is_in_the_subtree(#[fixture(cgrou
     let subtree = Subtree::new(
         HIGH,
         Some(leaf.shared()),
-        None,
         Some("/stand-in-leaf".to_owned()),
         leaf.swept(),
+        super::PlacedAtRemoval::default(),
         Arc::new(AtomicBool::new(true)),
     );
     assert!(holds_hidden(&subtree, sub).expect("no /proc read"));
@@ -268,24 +268,42 @@ fn a_task_the_walk_cannot_place_is_placed_through_proc() {
     }
 }
 
-/// `/proc`'s ` (deleted)` names the leaf only once the leaf is verifiably removed, and not when a
-/// live cgroup beside it bears the suffix in its name; a path under the leaf is under it either
-/// way.
+/// `/proc`'s ` (deleted)` after the leaf's own path is the removed leaf or a live namesake beside
+/// it: it is answered by the place recorded before the leaf's removal alone, undecidable without
+/// one, and never the leaf when the task's pidfd gave another cgroup id. A path under the leaf is
+/// under it either way.
 #[skuld::test]
-fn a_removed_leaf_is_named_only_once_it_is_verifiably_removed() {
+fn a_removed_leaf_is_answered_by_the_place_recorded_before_its_removal() {
     use super::names_leaf;
-    let ok = |b: bool| move || Ok::<bool, std::io::Error>(b);
-    let leaf = "/a/leaf";
-    assert!(names_leaf("/a/leaf", leaf, ok(false), ok(false)).expect("decided"));
-    assert!(names_leaf("/a/leaf/sub (deleted)", leaf, ok(false), ok(false)).expect("decided"));
+    let unasked = || -> Option<bool> { panic!("not asked") };
+    let (leaf, deleted) = ("/a/leaf", "/a/leaf (deleted)");
+    assert!(names_leaf(leaf, leaf, false, unasked).expect("decided"));
+    assert!(names_leaf("/a/leaf/sub (deleted)", leaf, true, unasked).expect("decided"));
     assert!(
-        !names_leaf("/a/leaf (deleted)", leaf, ok(false), ok(false)).expect("decided"),
-        "a live leaf"
+        names_leaf(deleted, leaf, false, || Some(true)).expect("decided"),
+        "recorded in the leaf"
     );
-    assert!(names_leaf("/a/leaf (deleted)", leaf, ok(true), ok(false)).expect("decided"));
-    names_leaf("/a/leaf (deleted)", leaf, ok(true), ok(true)).expect_err("the leaf or its namesake");
-    assert!(!names_leaf("/a/leafx (deleted)", leaf, ok(true), ok(false)).expect("decided"));
-    assert!(!names_leaf("/a/other", leaf, ok(true), ok(false)).expect("decided"));
+    assert!(
+        !names_leaf(deleted, leaf, false, || Some(false)).expect("decided"),
+        "recorded outside"
+    );
+    names_leaf(deleted, leaf, false, || None).expect_err("no record: the leaf or its namesake");
+    assert!(
+        !names_leaf(deleted, leaf, true, unasked).expect("decided"),
+        "another cgroup id"
+    );
+    assert!(!names_leaf("/a/leafx (deleted)", leaf, false, unasked).expect("decided"));
+}
+
+/// A record answers only for the task it was made for.
+#[skuld::test]
+fn a_recorded_place_answers_for_its_own_task_alone() {
+    let placed = super::PlacedAtRemoval::default();
+    assert_eq!(placed.of(7), None);
+    placed.record(7, true);
+    assert_eq!((placed.of(7), placed.of(8)), (Some(true), None));
+    placed.clear();
+    assert_eq!(placed.of(7), None);
 }
 
 /// A `/proc` that hides a process this one may not trace with `EPERM` (`hidepid=1`) refuses as one
@@ -294,7 +312,7 @@ fn a_removed_leaf_is_named_only_once_it_is_verifiably_removed() {
 fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -305,7 +323,7 @@ fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
 fn a_probe_child_that_stays_dumpable_fails_the_probe() {
     let _missing = fault::miss_pidfd_info();
     let _dumpable = fault::keep_probe_dumpable();
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("non-dumpable"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -316,9 +334,22 @@ fn a_probe_child_that_stays_dumpable_fails_the_probe() {
 #[skuld::test]
 fn a_refused_pidfd_info_refuses_naming_it() {
     let _failing = fault::fail_pidfd_info();
-    match front_placement() {
+    match front_placement(|| Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("PIDFD_GET_INFO failed"), "{detail}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// A leaf whose cgroup id cannot be read (`name_to_handle_at` refused, as without `CONFIG_FHANDLE`)
+/// gives no place to compare with: the spawn is refused, naming that, before anything else.
+#[skuld::test]
+fn a_leaf_whose_id_cannot_be_read_refuses_naming_it() {
+    match front_placement(|| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))) {
+        Err(crate::error::Error::Unsupported { detail, .. }) => {
+            assert!(detail.contains("CONFIG_FHANDLE"), "{detail}");
+            assert!(detail.contains("before anything is spawned"), "{detail}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }

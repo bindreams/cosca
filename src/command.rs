@@ -636,6 +636,12 @@ impl Command {
     /// out of it (as `sudo systemd-run --scope` does) is not killed, and cosca cannot see it: an
     /// `Ok` says only that the front and everything still in the cgroup were killed.
     ///
+    /// An elevated program that moves its front out of the cgroup and back again around the kill
+    /// can make that `Ok` false: the kill and a move are serialised, but nothing records which side
+    /// of the kill the front was on. [`wait`](crate::Child::wait) stays truthful, and returns once
+    /// the program is gone. No other party moves the front, and cosca makes no promise against a
+    /// hostile root program, which could as well trace cosca or rewrite its memory.
+    ///
     /// A front no kill is shown to have reached is sent nothing and left unreaped, and the call
     /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns, and a
     /// failed spawn's error carries a note. That is the case when:

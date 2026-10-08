@@ -70,12 +70,13 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 }
 
 /// Whether `/proc/<pid>/cgroup` names `leaf_path` (a unified-hierarchy path) or a cgroup under it
-/// (see [`names_leaf`]), with `leaf` and `parent` the leaf's directory and its parent's.
+/// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
+/// and `placed` is the task's recorded place at the leaf's removal, if any.
 pub(crate) fn proc_names(
     leaf_path: &str,
     pid: u32,
-    leaf: Option<BorrowedFd<'_>>,
-    parent: Option<BorrowedFd<'_>>,
+    placed: Option<&PlacedAtRemoval>,
+    other_id: bool,
 ) -> io::Result<bool> {
     #[cfg(test)]
     if let Some(errno) = super::fault::proc_hidden_as() {
@@ -102,79 +103,75 @@ pub(crate) fn proc_names(
     let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
-    names_leaf(
-        path,
-        leaf_path,
-        || leaf.map_or(Ok(false), removed),
-        || {
-            let name = leaf_path.rsplit('/').next().unwrap_or(leaf_path);
-            parent.map_or(Ok(false), |parent| exists(parent, &format!("{name}{DELETED}")))
-        },
-    )
+    names_leaf(path, leaf_path, other_id, || placed.and_then(|placed| placed.of(pid)))
 }
 
 /// What `/proc/<pid>/cgroup` prints after the path of a removed cgroup.
 const DELETED: &str = " (deleted)";
 
 /// Whether the cgroup `path` (from `/proc/<pid>/cgroup`) is the leaf at `leaf_path` or under it.
+///
 /// A removed cgroup's path is printed with [`DELETED`] after it, which a live cgroup may also have
 /// in its name. A path under the leaf is under it either way. The leaf's own path with the suffix
-/// is the leaf only if `leaf_removed` says the leaf is gone; and then only if
-/// `sibling_named_so` says no live cgroup beside it has that name, else it is undecidable.
+/// is the removed leaf or a live cgroup of that name beside it, which no read of `/proc` can tell
+/// apart: it is answered by `recorded`, the task's place recorded just before the leaf's removal,
+/// while the leaf's own path still read without the suffix (see [`PlacedAtRemoval`]). With no
+/// record it is undecidable. It is never the leaf when `other_id` says the task's pidfd gave a
+/// cgroup id other than the leaf's.
 pub(crate) fn names_leaf(
     path: &str,
     leaf_path: &str,
-    leaf_removed: impl FnOnce() -> io::Result<bool>,
-    sibling_named_so: impl FnOnce() -> io::Result<bool>,
+    other_id: bool,
+    recorded: impl FnOnce() -> Option<bool>,
 ) -> io::Result<bool> {
     if is_at_or_under(path, leaf_path) {
         return Ok(true);
     }
-    if path.strip_suffix(DELETED) != Some(leaf_path) || !leaf_removed()? {
+    if path.strip_suffix(DELETED) != Some(leaf_path) || other_id {
         return Ok(false);
     }
-    if sibling_named_so()? {
-        return Err(io::Error::other(format!(
-            "{path} is either the removed leaf or the live cgroup beside it of that name"
-        )));
-    }
-    Ok(true)
+    recorded().ok_or_else(|| {
+        io::Error::other(format!(
+            "{path} is either the removed leaf or a live cgroup of that name, and the task's place was not \
+             recorded before the leaf's removal"
+        ))
+    })
 }
 
-/// Whether the cgroup directory `dir` holds is removed: its files are gone with it.
-fn removed(dir: BorrowedFd<'_>) -> io::Result<bool> {
-    match rustix::fs::openat(
-        dir,
-        "cgroup.events",
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    ) {
-        Ok(_) => Ok(false),
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NODEV) => Ok(true),
-        Err(e) => Err(e.into()),
-    }
-}
+/// Where a leaf's watched elevation front was just before the leaf's last `rmdir`, by pid (see
+/// `CgroupLeaf::watch_front`), shared by the leaf and its subtrees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlacedAtRemoval(Arc<std::sync::Mutex<Option<(u32, bool)>>>);
 
-/// Whether `name` is in `dir`.
-fn exists(dir: BorrowedFd<'_>, name: &str) -> io::Result<bool> {
-    match rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Ok(true),
-        Err(rustix::io::Errno::NOENT) => Ok(false),
-        Err(e) => Err(e.into()),
+impl PlacedAtRemoval {
+    pub(crate) fn record(&self, pid: u32, inside: bool) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((pid, inside));
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Whether `pid` was recorded inside the leaf; `None` without a record for it.
+    pub(crate) fn of(&self, pid: u32) -> Option<bool> {
+        match *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            Some((recorded, inside)) if recorded == pid => Some(inside),
+            _ => None,
+        }
     }
 }
 
 /// A leaf's subtree, captured while the leaf exists, so a task can be placed in it even once the
-/// leaf is removed: the leaf's own cgroup id, its directory and its parent's, its unified-hierarchy
-/// path, the ids of the cgroups its sweep removed, and whether a kill through it has landed (the
-/// leaf's own record).
+/// leaf is removed: the leaf's own cgroup id, its directory, its unified-hierarchy path, the ids of
+/// the cgroups its sweep removed, its front's place before its removal, and whether a kill through
+/// it has landed (the leaf's own record).
 #[derive(Debug)]
 pub(crate) struct Subtree {
     leaf_id: u64,
     dir: Option<Arc<OwnedFd>>,
-    parent: Option<Arc<OwnedFd>>,
     path: Option<String>,
     swept: super::Swept,
+    placed: PlacedAtRemoval,
     killed: Arc<AtomicBool>,
 }
 
@@ -182,17 +179,17 @@ impl Subtree {
     pub(crate) fn new(
         leaf_id: u64,
         dir: Option<Arc<OwnedFd>>,
-        parent: Option<Arc<OwnedFd>>,
         path: Option<String>,
         swept: super::Swept,
+        placed: PlacedAtRemoval,
         killed: Arc<AtomicBool>,
     ) -> Subtree {
         Subtree {
             leaf_id,
             dir,
-            parent,
             path,
             swept,
+            placed,
             killed,
         }
     }
@@ -220,11 +217,7 @@ impl Subtree {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        let (leaf, parent) = (
-            self.dir.as_deref().map(AsFd::as_fd),
-            self.parent.as_deref().map(AsFd::as_fd),
-        );
-        proc_names(path, pid, leaf, parent).map_err(|e| {
+        proc_names(path, pid, Some(&self.placed), elsewhere).map_err(|e| {
             if elsewhere {
                 io::Error::new(
                     e.kind(),
@@ -298,10 +291,18 @@ fn dying_in(text: &str) -> Option<u64> {
 /// it, made non-dumpable (which it reports), then killed and reaped. Neither read depends on when the
 /// front would run: no front exists yet.
 ///
+/// First of all, the front's leaf must give its cgroup id (`leaf_id`, by `name_to_handle_at`,
+/// which a kernel built without `CONFIG_FHANDLE` refuses): every placement compares with it.
+///
 /// `Err` is the spawn's refusal: `Unsupported`, naming the cause.
-pub(crate) fn front_placement() -> Result<(), crate::error::Error> {
+pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Result<(), crate::error::Error> {
     use std::os::fd::AsFd;
 
+    if let Err(e) = leaf_id() {
+        return Err(unplaceable(format!(
+            "the leaf's cgroup id cannot be read (name_to_handle_at: {e}), as on a kernel without CONFIG_FHANDLE"
+        )));
+    }
     let own = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
         .map_err(|e| crate::error::Error::Io(crate::error::io_context("pidfd_open of this process", e.into())))?;
     match pidfd_cgroup_id(own.as_fd()) {

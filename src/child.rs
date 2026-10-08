@@ -258,6 +258,10 @@ impl Child {
     /// front is dying. So does a failed `cgroup.kill`, naming the failure; the other cases are
     /// listed on [`Command::contain`](crate::Command::contain). Before 6.13, a host whose `/proc`
     /// would hide the front's cgroup refuses the spawn instead.
+    ///
+    /// An elevated program that moves its front out of the cgroup and back again around the kill
+    /// can make an `Ok` false, as [`Command::contain`](crate::Command::contain) says; `wait` stays
+    /// truthful.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {

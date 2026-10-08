@@ -64,8 +64,7 @@ pub(crate) fn id_of_handle(handle_type: libc::c_int, handle_bytes: libc::c_uint,
 
 /// A leaf's directory and its parent, each held as an `O_PATH` descriptor.
 pub(crate) struct LeafDir {
-    /// Shared with the leaf's [`Subtree`](super::Subtree)s, which look for a sibling there.
-    parent: std::sync::Arc<OwnedFd>,
+    parent: OwnedFd,
     /// Shared with the leaf's [`Subtree`](super::Subtree)s, which read it after the leaf is gone.
     dir: std::sync::Arc<OwnedFd>,
     /// The ids of the cgroups [`remove_children`](Self::remove_children) removed, shared with the
@@ -103,7 +102,7 @@ impl LeafDir {
             }
         };
         Ok(LeafDir {
-            parent: std::sync::Arc::new(parent),
+            parent,
             dir: std::sync::Arc::new(dir),
             swept: Swept::default(),
             name: name.into(),
@@ -121,7 +120,7 @@ impl LeafDir {
                 .expect("open the leaf's parent");
             let dir = open_dir(&parent, &name).expect("open the leaf");
             return LeafDir {
-                parent: std::sync::Arc::new(parent),
+                parent,
                 dir: std::sync::Arc::new(dir),
                 swept: Swept::default(),
                 name,
@@ -133,7 +132,7 @@ impl LeafDir {
         let dir = open_dir(&parent, &name).expect("open the stand-in leaf");
         rustix::fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR).expect("remove the stand-in leaf");
         LeafDir {
-            parent: std::sync::Arc::new(parent),
+            parent,
             dir: std::sync::Arc::new(dir),
             swept: Swept::default(),
             name,
@@ -148,11 +147,6 @@ impl LeafDir {
     /// The leaf's directory, shared: it stays on the directory once the leaf is removed.
     pub(crate) fn shared(&self) -> std::sync::Arc<OwnedFd> {
         std::sync::Arc::clone(&self.dir)
-    }
-
-    /// The leaf's parent directory, shared.
-    pub(crate) fn shared_parent(&self) -> std::sync::Arc<OwnedFd> {
-        std::sync::Arc::clone(&self.parent)
     }
 
     /// The record of the cgroups the leaf's sweep removed (see [`Swept`]).

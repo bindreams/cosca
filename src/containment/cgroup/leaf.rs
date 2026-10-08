@@ -239,6 +239,12 @@ pub(crate) struct CgroupLeaf {
     /// tell a tree the caller killed, whose leaf has not drained yet, from one left running.
     /// [`terminate`](Self::terminate) does not set it: a SIGTERM can be caught.
     killed: std::sync::Arc<AtomicBool>,
+    /// The elevation front this leaf's child is, by pid, whose place is recorded in `placed` before
+    /// each `rmdir` (see [`watch_front`](Self::watch_front)).
+    watched: Option<u32>,
+    /// Where the watched front was when the leaf was last about to be removed, shared with the
+    /// leaf's [`Subtree`]s.
+    placed: super::PlacedAtRemoval,
     /// Whether a [`hard_kill`](Self::hard_kill) call failed for a real mechanism reason (not
     /// "leaf already gone", which sets `killed` above instead). A disarmed `Drop` reads it to
     /// `warn` that the caller's own `kill_tree()` never actually reached this leaf, rather than
@@ -385,21 +391,57 @@ impl CgroupLeaf {
         self.subtree()?.holds(pid, pidfd)
     }
 
+    /// The leaf's cgroup id (see [`cgroup_id`](super::cgroup_id)).
+    pub(crate) fn id(&self) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(errno) = fault::cgroup_id_fails() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        self.dir.id()
+    }
+
     /// The leaf as a place to read a task's membership in, once the leaf may be gone: its own
     /// cgroup id, its directory, its path, what its sweep removed, and whether a kill through it
     /// has landed.
     pub(crate) fn subtree(&self) -> io::Result<Subtree> {
         Ok(Subtree::new(
-            self.dir.id()?,
+            self.id()?,
             Some(self.dir.shared()),
-            Some(self.dir.shared_parent()),
             self.cgroup_path.clone(),
             self.dir.swept(),
+            self.placed.clone(),
             std::sync::Arc::clone(&self.killed),
         ))
     }
 
+    /// Watch the elevation front `pid`, this leaf's child: its place is recorded before each
+    /// `rmdir` of the leaf, while the leaf's own path still reads without ` (deleted)` (see
+    /// [`Subtree::holds`]).
+    pub(crate) fn watch_front(&mut self, pid: u32) {
+        self.watched = Some(pid);
+    }
+
+    /// Record where the watched front is, by `/proc/<pid>/cgroup`, before the leaf may be removed.
+    /// At an `rmdir` that succeeds, the leaf holds no live task, so a front recorded in it is past
+    /// leaving its cgroup and can no longer be moved, and a front recorded outside it can no
+    /// longer enter it: the record stays true once the leaf is gone.
+    fn record_watched_place(&self) {
+        let (Some(pid), Some(path)) = (self.watched, &self.cgroup_path) else {
+            return;
+        };
+        match super::proc_names(path, pid, None, false) {
+            Ok(inside) => self.placed.record(pid, inside),
+            Err(e) => {
+                log::debug!(
+                    "cgroup v2: elevation front pid {pid}'s place before its leaf's removal cannot be read ({e})"
+                );
+                self.placed.clear();
+            }
+        }
+    }
+
     fn rmdir_leaf(&self) -> io::Result<()> {
+        self.record_watched_place();
         #[cfg(test)]
         fault::record_leaf_step(|| {
             let events = self.dir.read("cgroup.events").unwrap_or_default();
@@ -679,6 +721,8 @@ impl CgroupLeaf {
             abandoned: false,
             armed: AtomicBool::new(true),
             killed: std::sync::Arc::new(AtomicBool::new(false)),
+            watched: None,
+            placed: super::PlacedAtRemoval::default(),
             kill_attempt_failed: AtomicBool::new(false),
         }
     }
@@ -867,6 +911,9 @@ impl CgroupLeaf {
         // Only a child that reported goes on to `exec`: one that named itself and sent no report
         // never runs the program, and is answered as any child.
         if front && received.report.is_some() {
+            if let Some(pid) = received.pid {
+                self.watch_front(pid);
+            }
             return self.abandon_front(&received);
         }
         // The child first, by its pidfd and as its group, whatever the leaf's own kill does: it
@@ -1492,6 +1539,8 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         abandoned: false,
         armed: AtomicBool::new(true),
         killed: std::sync::Arc::new(AtomicBool::new(false)),
+        watched: None,
+        placed: super::PlacedAtRemoval::default(),
         kill_attempt_failed: AtomicBool::new(false),
     })
 }

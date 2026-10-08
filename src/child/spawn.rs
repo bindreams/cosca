@@ -116,7 +116,10 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
             .hard_kill_marking_unless_reaped(view, &child.tree_killed)
             .map(|s| skipped = s)
     });
-    let tree_killed = matches!(tree, Some(Ok(())));
+    let tree_failure = match &tree {
+        Some(Err(e)) => Some(e.to_string()),
+        _ => None,
+    };
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     if let Some(action) = skipped {
         tree_note.push_str(&format!(
@@ -128,12 +131,15 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let root = match gate {
         // Not asked again after the kill: a killed front can read as neither exited nor in its
         // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if tree_killed => {
+        crate::elevation::front::Gate::CgroupOnly if child.tree_killed.is_set() => {
             child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
         }
-        crate::elevation::front::Gate::CgroupOnly => Err(Error::Containment {
-            detail: "its cgroup kill failed, and a kill of the front itself would orphan the elevated program".into(),
-        }),
+        // No kill reached the cgroup: refused as `kill` refuses, naming why.
+        crate::elevation::front::Gate::CgroupOnly => Err(crate::elevation::front::cgroup_not_killed_of(
+            child.front,
+            child.id().pid(),
+            tree_failure.as_deref(),
+        )),
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
         gate => child.kill_sent_gated(gate),
     };
@@ -379,8 +385,12 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             cmd.env_ops(),
         )?;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
-        if cmd.elevation_front().is_some() && prepared.cgroup_leaf.is_some() {
-            crate::containment::cgroup::front_placement()?;
+        if let Some(leaf) = prepared
+            .cgroup_leaf
+            .as_ref()
+            .filter(|_| cmd.elevation_front().is_some())
+        {
+            crate::containment::cgroup::front_placement(|| leaf.id())?;
         }
 
         let _guard = spawn_lock();
@@ -455,6 +465,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     let subtree = front
         .and(prepared.cgroup_leaf.as_ref())
         .and_then(|leaf| leaf.subtree().ok());
+    if front.is_some() {
+        prepared.watch_front(child.id());
+    }
     // Read the identity while we still own the un-reaped `std::process::Child`, and check the read
     // against the handle held since the spawn: a pid alone does not say whom it names once
     // something else has reaped the child. The attach takes this identity and does not re-read

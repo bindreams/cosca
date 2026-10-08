@@ -359,8 +359,10 @@ async fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing()
 #[skuld::test]
 async fn terminate_of_a_live_sudo_front_is_sent() {
     use std::os::unix::process::ExitStatusExt as _;
-    let (mut child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (mut child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     child.terminate().expect("sudo relays SIGTERM");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
 }
 

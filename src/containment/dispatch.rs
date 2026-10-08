@@ -114,6 +114,17 @@ impl Prepared {
         let _ = front;
         AbandonedChild::MaybeUnreachable
     }
+
+    /// Watch the elevation front `pid` this spawn forked: its cgroup leaf, if it has one, records
+    /// the front's place before its removal (see `CgroupLeaf::watch_front`).
+    pub(crate) fn watch_front(&mut self, pid: u32) {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut() {
+            leaf.watch_front(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
 }
 
 /// What became of the child of a spawn that failed with no handle left on it (see

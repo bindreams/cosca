@@ -86,18 +86,22 @@ fn assert_killed(pidfd: &OwnedFd) {
 
 #[skuld::test]
 async fn cgroup_kill_of_a_front_goes_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
-    let (mut child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     assert_eq!(child.containment(), Containment::CgroupV2);
     child.kill().expect("the cgroup kill reaches the program");
     assert!(child.tree_killed.is_set(), "the kill must go through the cgroup");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
 }
 
 #[skuld::test]
 async fn cgroup_kill_tree_of_a_front_goes_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
-    let (mut child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     child.kill_tree().expect("the cgroup kill reaches the program");
     assert!(child.tree_killed.is_set());
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -154,12 +158,14 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
 /// Async twin of the sync `cgroup_kill_of_a_front_that_refuses_signals_is_ok`.
 #[skuld::test]
 async fn cgroup_kill_of_a_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _group: &Group) {
-    let (mut child, _stdin) = spawn_nobody_front().await;
+    let (mut child, stdin) = spawn_nobody_front().await;
     {
         let _refusing = WithoutKillCap::refusing(child.id().pid());
         child.kill().expect("the cgroup kill ends the front");
         child.kill_tree().expect("the cgroup kill ends the front");
     }
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -322,6 +328,29 @@ async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fi
     );
 }
 
+/// Async twin of the sync `cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it`.
+#[skuld::test]
+async fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
+    let _running = crate::child::spawn::fault::see_fronts_running();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop)
+    });
+    assert_killed_by_the_leaf(&failures, &reaps);
+}
+
+/// Async twin of the sync `cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running`.
+#[skuld::test]
+async fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_cgroup_tests::{assert_left_running, failed_held_front_spawns, LeafKill};
+    let kill = LeafKill::MissesIntoNamesake;
+    assert_left_running(
+        kill,
+        failed_held_front_spawns(kill, |cmd| crate::tokio::spawn::spawn(cmd).map(drop)),
+    );
+}
+
 /// Async twin of the sync `cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid`.
 #[skuld::test]
 async fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(cgroup)] _group: &Group) {
@@ -331,8 +360,9 @@ async fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(#[fixture(
         let _hidden = crate::containment::cgroup::fault::hide_proc();
         child.kill().expect("the leaf's kill reaches a front nested under it");
     }
-    let status = child.wait().await.expect("wait");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
     drop(stdin);
+    let status = child.wait().await.expect("wait");
     assert_eq!(
         status.signal(),
         Some(libc::SIGKILL),
@@ -350,6 +380,48 @@ async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid
         crate::tokio::spawn::spawn(cmd).map(drop)
     });
     assert_killed_by_the_leaf(&failures, &reaps);
+}
+
+/// Async twin of the sync `cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork`.
+#[skuld::test]
+async fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
+    use crate::child::front_cgroup_tests::{assert_refused_unforked_naming, spawn_front_noting_fork};
+    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EOPNOTSUPP);
+    let mut cmd = crate::command::Command::new();
+    cmd.args(["cat"]).contain_with(ContainMode::Strongest);
+    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
+    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    assert_refused_unforked_naming(result, forked, "CONFIG_FHANDLE");
+}
+
+/// Async twin of the sync `cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does`.
+#[skuld::test]
+async fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    use crate::child::front_cgroup_tests::assert_front_refused_by_its_cgroup_kill;
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pid = child.id().pid();
+    let pidfd = pidfd_of(pid);
+    let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {
+        panic!("expected a cgroup leaf, got {:?}", child.os.attached);
+    };
+    let leaf = leaf.path().to_path_buf();
+    let err = {
+        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
+        crate::tokio::spawn::finish_elevated(
+            child,
+            Err(crate::error::Error::Elevation {
+                kind: crate::error::ElevationErrorKind::AuthFailed,
+                detail: "forced password-write failure".into(),
+            }),
+        )
+        .expect_err("a failed write fails the spawn")
+    };
+    assert_front_refused_by_its_cgroup_kill(&err, pid);
+    drop(stdin);
+    assert_eq!(ended(&pidfd), Some((Some(0), None)), "the front was signalled");
+    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
 /// Async twin of the sync `cgroup_an_unplaceable_front_is_refused_before_its_fork`.

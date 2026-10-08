@@ -40,6 +40,7 @@ thread_local! {
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
+    static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -832,4 +833,24 @@ pub(crate) fn run_before_walk_open(path: &std::path::Path) {
             h.borrow_mut().get_or_insert(hook);
         });
     }
+}
+
+/// While the guard lives, a leaf's cgroup id on this thread fails with `errno`, as
+/// `name_to_handle_at` does on a kernel without `CONFIG_FHANDLE` (`EOPNOTSUPP`).
+pub(crate) fn fail_cgroup_id(errno: i32) -> FailCgroupId {
+    CGROUP_ID_FAILS.with(|f| f.set(Some(errno)));
+    FailCgroupId(())
+}
+
+#[must_use = "the id reads again as soon as the guard is dropped"]
+pub(crate) struct FailCgroupId(());
+
+impl Drop for FailCgroupId {
+    fn drop(&mut self) {
+        CGROUP_ID_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn cgroup_id_fails() -> Option<i32> {
+    CGROUP_ID_FAILS.with(Cell::get)
 }
