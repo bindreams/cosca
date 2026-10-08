@@ -171,6 +171,11 @@ fn nested_attach_is_delegated() {
         };
         let attachment = attach(
             id,
+            #[cfg(target_os = "linux")]
+            crate::containment::cgroup::test_support::handle_of(
+                child.id(),
+                &crate::containment::cgroup::test_support::pidfd_of(child.id()),
+            ),
             #[cfg(windows)]
             proc_handle,
             prepared,
@@ -555,7 +560,15 @@ fn decide(leaf_path: &std::path::Path, report: ChildReport) -> (crate::containme
         is_root: true,
         cgroup_leaf: Some(leaf),
     };
-    super::attach_tree(crate::identity::ProcessId::current(), prepared).expect("attach_tree")
+    super::attach_tree(
+        crate::identity::ProcessId::current(),
+        crate::containment::cgroup::test_support::handle_of(
+            std::process::id(),
+            &crate::containment::cgroup::test_support::pidfd_of(std::process::id()),
+        ),
+        prepared,
+    )
+    .expect("attach_tree")
 }
 
 /// A leaf directory whose `cgroup.procs` lists some OTHER pid, never this test's.
@@ -653,29 +666,6 @@ fn a_degrade_never_kills_through_the_leaf() {
             "the unremoved leaf is reported once: {left_behind:?}"
         );
     }
-}
-
-/// A leaf whose report cannot be waited for (no pidfd) and was never entered degrades the spawn
-/// to its process group, removes the leaf, and never writes `cgroup.kill`.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_leaf_without_a_pidfd_degrades_without_a_kill() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-unwaitable");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let prepared = super::Prepared {
-        mode: Some(crate::containment::ContainMode::Strongest),
-        is_root: true,
-        cgroup_leaf: Some(crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone())),
-    };
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    let (containment, attached) =
-        super::attach_tree(crate::identity::ProcessId::current(), prepared).expect("attach_tree");
-
-    assert_eq!(containment, crate::containment::Containment::ProcessGroup);
-    assert!(matches!(attached, super::Attached::ProcessGroup(_)), "got {attached:?}");
-    assert!(!leaf_path.exists(), "the leaf must be removed");
 }
 
 // kill_on_drop's reach into the containment resource =====

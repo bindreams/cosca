@@ -8,7 +8,7 @@ use std::process::Stdio as StdStdio;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
-use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership, Settlement};
+use crate::child::spawn::{dup, front_after_verdict, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
 use crate::identity::Resolved;
@@ -486,13 +486,20 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         }
         return Err(not_adopted.error);
     }
+    // The pidfd the handshake opened, which the backend just built holds. Were it ever gone, the child
+    // is torn down as an unverifiable one: no panic after the fork.
+    #[cfg(target_os = "linux")]
+    let Some(handle) = proc.child_handle(pid) else {
+        debug_assert!(false, "a freshly spawned tokio child holds its pidfd");
+        proc.reap_now(pid);
+        return Err(crate::child::spawn::spawn_identity_error(Resolved::Unknown));
+    };
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
-    // and does not re-read the root's. (A Linux leaf's placement verdict still addresses the child
-    // by pid.)
+    // and does not re-read the root's.
     let resolved = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
@@ -508,12 +515,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
             #[cfg(unix)]
-            let settlement = Settlement::settle(&mut prepared, pid, cmd.elevation_front());
+            let left_front = front_after_verdict(
+                &mut prepared,
+                #[cfg(target_os = "linux")]
+                handle,
+                #[cfg(not(target_os = "linux"))]
+                pid,
+                cmd.elevation_front(),
+            );
             #[cfg(not(unix))]
-            let settlement = Settlement::settle(&mut prepared, pid, None);
+            let left_front = front_after_verdict(&mut prepared, pid, None);
             // An elevation front is sent nothing (see `ProcSource::leave_front`).
             #[cfg(unix)]
-            if let Some(front) = settlement.front {
+            if let Some(front) = left_front {
                 // macOS: a front whose identity was refused or found gone is left unverified, as the
                 // sync spawn leaves it.
                 #[cfg(target_os = "macos")]
@@ -528,7 +542,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
                 let _ = front;
-                return Err(settlement.finish(crate::child::spawn::spawn_identity_error(other), fate, pid));
+                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
             }
             let not_a_front = crate::child::spawn::FrontFate::NotAFront;
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
@@ -536,7 +550,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(target_os = "linux")]
             if matches!(other, Resolved::Unknown) {
                 proc.teardown_through_pidfd(pid);
-                return Err(settlement.finish(crate::child::spawn::spawn_identity_error(other), not_a_front, pid));
+                return Err(not_a_front.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
             }
             // macOS: nothing pins the pid, so a child the handle still cannot show ours is
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
@@ -545,7 +559,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 proc.forget_foreign();
             }
             proc.reap_now(pid);
-            return Err(settlement.finish(crate::child::spawn::spawn_identity_error(other), not_a_front, pid));
+            return Err(not_a_front.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
         }
     };
     #[cfg(test)]
@@ -561,28 +575,19 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let _ = in_cgroup;
     let attach = crate::child::spawn::attach_or_fault(
         id,
+        #[cfg(target_os = "linux")]
+        handle,
         #[cfg(windows)]
         proc_handle,
         prepared,
     );
     let attachment = match attach {
         Ok(v) => v,
-        Err(failed) => {
-            #[cfg(unix)]
-            let cmd_front = cmd.elevation_front();
-            #[cfg(not(unix))]
-            let cmd_front = None;
-            #[cfg(unix)]
-            let early_front = front_before_attach;
-            #[cfg(not(unix))]
-            let early_front = None;
-            let (error, settlement) = Settlement::of_failed_attach(failed, early_front, cmd_front);
-            #[cfg(not(unix))]
-            let _ = settlement;
+        Err(error) => {
             #[cfg(target_os = "macos")]
             crate::child::spawn::assert_attach_cannot_fail(&error);
             #[cfg(unix)]
-            if let Some(front) = settlement.front {
+            if let Some(front) = front_before_attach {
                 // macOS: a front is sent nothing and left unreaped, as the sync spawn leaves it.
                 #[cfg(target_os = "macos")]
                 let fate = {
@@ -592,7 +597,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 #[cfg(not(target_os = "macos"))]
                 let fate = proc.leave_front(pid, front);
                 let _ = front;
-                return Err(settlement.finish(error, fate, pid));
+                return Err(fate.note(error, front_before_attach, Some(pid)));
             }
             // macOS: killed and reaped through its verified unique id, as the sync spawn does, and
             // tokio's `Child` forgotten: its drop reaps by pid.
@@ -755,6 +760,10 @@ pub(crate) mod windows_raw;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn/placement_reuse_tests.rs"]
+mod placement_reuse_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/pidfd_tests.rs"]

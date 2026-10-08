@@ -54,11 +54,13 @@ const PROCEED: u8 = b'P';
 /// `spawn` returns before the child has placed itself.
 ///
 /// [`ReportChannel::wait`] therefore waits for the child itself: for the report, or for the
-/// child's exit, watched through a pidfd. The report is always sent before `exec`, so a child that
-/// exits without one never exec'd, so nothing of its is in the leaf, and `NotReported` says so. The channel's
-/// EOF is no substitute for the pidfd: every process this one forks while the channel is open
-/// inherits the child's end, so EOF would also wait for other threads' children to exec or exit —
-/// and forever on one that never execs.
+/// child's exit, watched through the child's own pidfd, which it handed over at the spawn handshake
+/// from before `exec`. That pidfd names the child whoever reaps it and whoever takes its number: a
+/// reaped child's pidfd is readable, so the wait ends. The report is always sent before `exec`, so
+/// a child that exits without one never exec'd, so nothing of its is in the leaf, and
+/// `NotReported` says so. The channel's EOF is no substitute for the pidfd: every process this one
+/// forks while the channel is open inherits the child's end, so EOF would also wait for other
+/// threads' children to exec or exit — and forever on one that never execs.
 ///
 /// Both ends sit at fd 3 or above. The child's stdio `dup2` cannot close its end there. The only
 /// later `dup2` is fd_map's mapping of fds 3 and up, whose hook the spawn registers after the
@@ -130,6 +132,16 @@ impl ReportChannel {
         })
     }
 
+    /// A duplicate of the child's end, so a test can keep the channel open past the child's exit.
+    #[cfg(test)]
+    pub(crate) fn dup_child_end_for_test(&self) -> std::os::fd::OwnedFd {
+        self.write
+            .as_ref()
+            .expect("the child's end is open until the wait")
+            .try_clone()
+            .expect("dup the child's end")
+    }
+
     /// A `Copy` handle to the child's end for capture by the `pre_exec` closure (which must not
     /// capture the owning `ReportChannel`: the leaf keeps it).
     pub(crate) fn slot(&self) -> ReportSlot {
@@ -143,53 +155,24 @@ impl ReportChannel {
         }
     }
 
-    /// Block until the report of `pid`, the child spawned with this channel's slot, is final, and
-    /// return it. See [`ReportChannel`] for why `spawn` returning is not enough.
-    ///
-    /// `pid` must be this process's own unreaped child, so no other process can hold its number
-    /// (see [`Command::contain`](crate::Command::contain) for what breaks that). If something
-    /// else reaped it, `pidfd_open` fails with `ESRCH` and the verdict decides without a pidfd.
-    ///
-    /// `Err` is `pidfd_open`'s: the child's exit cannot be watched, so only a report already
-    /// sent is final. Nothing blocks in that case; [`CgroupLeaf::take_placement`] decides without
-    /// the report.
-    pub(crate) fn wait(&mut self, pid: u32) -> Result<PlacementReport, io::Error> {
+    /// Block until the report of the child `pidfd` names, spawned with this channel's slot, is
+    /// final, and return it. See [`ReportChannel`] for why `spawn` returning is not enough, and for
+    /// why the wait goes through `pidfd`.
+    pub(crate) fn wait(&mut self, pidfd: std::os::fd::BorrowedFd<'_>) -> PlacementReport {
         use rustix::event::{poll, PollFd, PollFlags};
 
         // The parent's own copy would otherwise keep the channel open forever.
         self.write = None;
-        let pid = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .expect("a spawned child's pid is a positive i32");
         #[cfg(test)]
-        let pidfd = if let Some(errno) = fault::take_force_pidfd_failure() {
-            Err(errno)
-        } else {
-            rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-        };
-        #[cfg(not(test))]
-        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty());
-        let pidfd = match pidfd {
-            Ok(pidfd) => pidfd,
-            Err(e) => {
-                debug_assert_ne!(
-                    e,
-                    rustix::io::Errno::SRCH,
-                    "{pid:?} is not an unreaped child of this process: something else reaped it"
-                );
-                self.drain();
-                return self.received.report.ok_or(e.into());
-            }
-        };
+        fault::notify_wait_entry(std::os::fd::AsRawFd::as_raw_fd(&pidfd));
         loop {
             // An intent alone is not final: the report, or the child's exit, is.
             let closed = self.drain();
             if let Some(report) = self.received.report {
-                return Ok(report);
+                return report;
             }
             if closed {
-                return Ok(PlacementReport::NotReported);
+                return PlacementReport::NotReported;
             }
             let mut fds = [
                 PollFd::new(&self.read, PollFlags::IN),
@@ -209,7 +192,7 @@ impl ReportChannel {
             if !fds[1].revents().is_empty() {
                 // The child has exited: whatever it sent is queued.
                 self.drain();
-                return Ok(self.received.placement());
+                return self.received.placement();
             }
         }
     }
@@ -276,13 +259,6 @@ impl ReportChannel {
         }
     }
 
-    /// The report sent so far, read without blocking: final once the child has reported or can
-    /// no longer report.
-    pub(super) fn read_final(&mut self) -> PlacementReport {
-        self.drain();
-        self.received.placement()
-    }
-
     /// End the exchange by deciding: send *proceed*, then close. A child whose send then fails
     /// finds *proceed* queued, and carries on to `exec`.
     pub(super) fn proceed(mut self) {
@@ -316,7 +292,8 @@ impl ReportChannel {
     /// The report of a child that has already been reaped, or of reports sent from this process.
     pub(crate) fn report_for_test(mut self) -> PlacementReport {
         self.write = None;
-        self.read_final()
+        self.drain();
+        self.received.placement()
     }
 }
 

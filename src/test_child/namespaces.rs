@@ -4,9 +4,6 @@
 //! They need `CAP_SYS_ADMIN`, so they are a system-affecting group declared in `test_groups.rs` (see
 //! `docs/principles.md`). Run them in a container, VM, or CI's root lane, never on a developer host.
 
-mod chroot_scratch;
-pub(crate) use chroot_scratch::{remove_root as remove_chroot_root, ChrootScratch};
-
 use std::path::Path;
 
 pub(crate) use super::db_dir::SKULD_DB_DIR_ENV;
@@ -17,13 +14,6 @@ use rustix::thread::{unshare_unsafe, UnshareFlags};
 /// Re-exec this binary on `fixture`, to run as the child half of a test.
 pub(crate) fn run(fixture: &str) {
     super::run_fixture_command(fixture, super::fixture_command(fixture));
-}
-
-/// [`run`] with `env` set on the child only.
-pub(crate) fn run_with_env(fixture: &str, env: &[(&str, &Path)]) {
-    let mut cmd = super::fixture_command(fixture);
-    cmd.envs(env.iter().copied());
-    super::run_fixture_command(fixture, cmd);
 }
 
 /// [`run`] for a fixture that calls [`drop_to_nobody`]. Skuld opened its DB as root, and checks at
@@ -143,20 +133,4 @@ pub(crate) fn mount_tmpfs(target: &Path) {
         None::<&std::ffi::CStr>,
     )
     .unwrap_or_else(|e| panic!("mount tmpfs on {}: {e}", target.display()));
-}
-
-/// Make `dir` visible at the same absolute path inside `root`, in this process's mount namespace
-/// (enter a private one first), so that after [`chroot_into`]`(root)` a path to `dir` still names it.
-/// Creates the mount point's directories under `root`; the driver removes them
-/// ([`ChrootScratch::finish`]).
-pub(crate) fn bind_into_root(root: &Path, dir: &Path) {
-    let inside = root.join(dir.strip_prefix("/").expect("an absolute directory"));
-    std::fs::create_dir_all(&inside).unwrap_or_else(|e| panic!("mkdir the mount point {}: {e}", inside.display()));
-    bind_over(dir, &inside);
-}
-
-/// Make `root` this process's `/`, so an absolute path such as `/proc` is looked up beneath it.
-/// The working directory stays where it was.
-pub(crate) fn chroot_into(root: &Path) {
-    rustix::process::chroot(root).unwrap_or_else(|e| panic!("chroot {}: {e}", root.display()));
 }

@@ -1,4 +1,9 @@
-use crate::containment::cgroup::test_support::{block_on, childs_copy, entered_leaf_at, fork_running, reap};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd as _;
+
+use crate::containment::cgroup::test_support::{
+    block_on, childs_copy, entered_leaf_at, fork_running, handle_of, pidfd_of, reap,
+};
 use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
@@ -316,7 +321,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // final").
     for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
         assert_eq!(
-            channel.wait(member.0.id()).expect("open a pidfd"),
+            channel.wait(pidfd_of(member.0.id()).as_fd()),
             PlacementReport::Placed,
             "member {name}'s own report must survive the other member's spawn"
         );
@@ -733,7 +738,8 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
         if verdict_taken {
             // The verdict needs a live pid: this process's own stands in for the child.
             assert_eq!(
-                leaf.take_placement(std::process::id()).expect("decidable").is_ok(),
+                leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
+                    .is_ok(),
                 report == PlacementReport::Placed
             );
             assert!(!leaf.holds_spawn_resources());
@@ -959,7 +965,8 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
             // no-op. The slot's channel lives as long as `leaf`.
             _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
             assert!(
-                leaf.take_placement(std::process::id()).expect("decidable").is_err(),
+                leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
+                    .is_err(),
                 "a failed write is not a placement"
             );
             leaf
@@ -1400,8 +1407,7 @@ fn entered_real_leaf() -> (
     }
     let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member");
     let stdin = member.stdin.take().expect("piped stdin");
-    leaf.take_placement(member.id())
-        .expect("decidable")
+    leaf.take_placement(handle_of(member.id(), &pidfd_of(member.id())))
         .expect("the member entered the leaf");
     (leaf, member, stdin)
 }
@@ -2044,7 +2050,7 @@ fn take_placement_reports_an_unreadable_cgroup_procs() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
 
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    match leaf.take_placement(std::process::id()).expect("decidable") {
+    match leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id()))) {
         Err(NotPlaced::Unreadable {
             pid,
             path,
@@ -2084,7 +2090,7 @@ fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter()
     let waited = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
     assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
 
-    let verdict = leaf.take_placement(pid).expect("decidable");
+    let verdict = leaf.take_placement(handle_of(pid, &pidfd_of(pid)));
     child.wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent {
@@ -2145,7 +2151,7 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
         child
     });
 
-    let verdict = leaf.take_placement(pid).expect("decidable");
+    let verdict = leaf.take_placement(handle_of(pid, &pidfd_of(pid)));
     writer.join().expect("the writer").wait().expect("reap the child");
     match verdict {
         Err(NotPlaced::Absent { procs, child_state, .. }) => {
@@ -2158,232 +2164,6 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
         Err(other) => panic!("a readable cgroup.procs must be quoted: {other}"),
         Ok(()) => panic!("no child reported a placement"),
     }
-}
-
-// Deciding without a pidfd -----
-// `pidfd_open` can fail (a full fd table, a seccomp filter). Waiting on the report channel's EOF
-// instead could block forever, so the verdict closes the leaf or learns the child is in it.
-
-/// A leaf with no report and no member is removed, so the child can never enter it, and the
-/// spawn degrades to `NotPlaced::Unwaitable` with the pidfd seam's forced errno.
-///
-/// The degrade's log level is not asserted here: this scenario's forced `EMFILE` and
-/// `std::process::id()` match `dispatch_tests::a_leaf_without_a_pidfd_degrades_without_a_kill`'s
-/// exactly, so both tests' `log_degrade` calls would write indistinguishable records into the
-/// shared capture buffer and race when they run concurrently.
-/// `degrade_tests::an_unwaitable_verdict_logs_at_warn` covers the `Unwaitable` log path with its
-/// own unique marker instead.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn without_a_pidfd_an_unentered_leaf_is_closed_and_degrades() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-unwaitable");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    let verdict = leaf.take_placement(std::process::id()).expect("decidable");
-    assert!(
-        !crate::containment::cgroup::fault::pidfd_failure_armed(),
-        "the seam must be consumed by the wait"
-    );
-
-    match verdict {
-        Err(NotPlaced::Unwaitable { source, .. }) => {
-            assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
-        }
-        other => panic!("expected Unwaitable, got {other:?}"),
-    }
-    assert!(!leaf_path.exists(), "the leaf must be closed to the child");
-}
-
-/// A report already sent is final, pidfd or not, and the leaf is left alone.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn without_a_pidfd_a_report_already_sent_decides() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-sent");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    // SAFETY: the slot's channel lives as long as `leaf`.
-    unsafe { leaf.placement_slot().report_placed_for_test() };
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    assert!(matches!(leaf.take_placement(std::process::id()), Ok(Ok(()))));
-    assert!(leaf_path.exists(), "a placed child's leaf must not be removed");
-}
-
-/// A `Placed` that arrives after the report was checked, from a child whose tree has since
-/// exited: the leaf is gone, and the verdict is still the child's own report.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn without_a_pidfd_a_removed_leaf_reads_the_report_again() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-late");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let channel = leaf.report.take().expect("the channel");
-    // SAFETY: `channel` is open.
-    unsafe { channel.slot().report_placed_for_test() };
-
-    let source = std::io::Error::from_raw_os_error(libc::EMFILE);
-    let verdict = leaf.decide_unwaitable(std::process::id(), channel, source);
-    assert!(matches!(verdict, Ok(Ok(()))), "got {verdict:?}");
-    assert!(leaf.entered);
-    assert!(!leaf_path.exists());
-}
-
-/// A leaf that can be neither waited on nor removed fails the spawn: its child is killed, which
-/// ends its chance to enter. The child's report is then final, and the leaf is killed through
-/// only if it says `Placed` — otherwise nothing in it came from the child.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn without_a_pidfd_an_unremovable_leaf_kills_the_child_and_fails() {
-    use std::os::unix::process::ExitStatusExt;
-
-    for placed in [false, true] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let leaf_path = dir.path().join("cosca-unremovable");
-        std::fs::create_dir(&leaf_path).expect("create the leaf");
-        // `rmdir` fails with ENOTEMPTY: neither closed nor proven entered.
-        std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
-        let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-        // Blocked on a piped stdin so a no-kill mutant fails the SIGKILL assertion instead of hanging
-        // in `fail_closed`'s waitid; released by the before-exit-wait seam, which a real kill always beats.
-        let mut child =
-            crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-                .expect("spawn");
-        let stdin = child.stdin.take().expect("piped stdin");
-        let _armed = crate::containment::cgroup::fault::set_before_exit_wait(move || {
-            drop(stdin);
-        });
-
-        let err = if placed {
-            // A `Placed` the wait missed: sent after the check, as a child that just placed
-            // itself would.
-            let channel = leaf.report.take().expect("the channel");
-            // SAFETY: `channel` is open.
-            unsafe { channel.slot().report_placed_for_test() };
-            leaf.fail_closed(child.id(), channel, "the test cannot decide")
-        } else {
-            crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-            match leaf.take_placement(child.id()) {
-                Err(e) => e,
-                Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
-            }
-        };
-        crate::containment::cgroup::fault::run_before_exit_wait();
-        assert!(
-            err.to_string().contains("the child and its process group were killed"),
-            "got {err}"
-        );
-        assert_eq!(
-            child.wait().expect("reap the child").signal(),
-            Some(libc::SIGKILL),
-            "the child must be killed"
-        );
-        assert_eq!(
-            leaf_path.join("cgroup.kill").exists(),
-            placed,
-            "cgroup.kill must be written only for a child that reported Placed"
-        );
-    }
-}
-
-/// A child already in its real leaf is contained, pidfd or not: `rmdir` refuses an occupied leaf
-/// with `EBUSY`, and the child's own `/proc/<pid>/cgroup` shows the leaf.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_without_a_pidfd_a_child_in_its_leaf_is_contained(#[fixture(cgroup)] _group: &Group) {
-    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
-
-    use crate::containment::TreeDrain;
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    // The member reports through a channel of its own, so the leaf's has nothing queued.
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the member's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn the member");
-    // Dropped right after `hard_kill()`: after a real kill that is a no-op, and a skipped kill
-    // would let the member exit 0 on EOF, which the `SIGKILL` check below catches.
-    let stdin = member.stdin.take().expect("piped stdin");
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    let verdict = leaf.take_placement(member.id());
-    assert!(matches!(verdict, Ok(Ok(()))), "got {verdict:?}");
-    assert!(leaf.leaf_path.exists(), "a contained child's leaf must not be removed");
-
-    leaf.hard_kill().expect("kill through the leaf");
-    drop(stdin);
-    let status = member.wait().expect("reap the member");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "the member must be SIGKILLed by hard_kill, got {status:?}"
-    );
-    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
-}
-
-/// A real leaf occupied by something other than the child can be neither waited on nor closed,
-/// so the spawn fails and its child is killed. Its report then proves it never entered, so
-/// nothing in the leaf is cosca's to kill: the occupant survives.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_without_a_pidfd_a_leaf_occupied_by_another_process_fails_without_killing_it(
-    #[fixture(cgroup)] _group: &Group,
-) {
-    use std::io::{Read, Write};
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
-    use crate::containment::TreeDrain;
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    // `cat` echoes, so a round trip through it proves it alive.
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut occupant = crate::test_spawn::spawn(&mut cmd).expect("spawn the occupant");
-    // The child whose verdict is taken never touches the leaf. Blocked on a held stdin; see
-    // `an_abandoned_child_is_killed_with_the_group_it_leads` for the release.
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn the child");
-    let child_stdin = child.stdin.take().expect("piped stdin");
-    let _armed = crate::containment::cgroup::fault::set_before_exit_wait(move || drop(child_stdin));
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
-    crate::containment::cgroup::fault::run_before_exit_wait();
-    assert_eq!(
-        child.wait().expect("reap the child").signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed"
-    );
-    let mut echo = [0u8; 1];
-    occupant
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"x")
-        .expect("write to the occupant");
-    occupant
-        .stdout
-        .as_mut()
-        .expect("stdout")
-        .read_exact(&mut echo)
-        .expect("the occupant must still be alive to echo");
-    assert_eq!(&echo, b"x");
-
-    occupant.kill().expect("kill the occupant");
-    occupant.wait().expect("reap the occupant");
-    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
 }
 
 // What the placement hook returns -----
@@ -2602,63 +2382,6 @@ fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
     assert!(result.is_err(), "the spawn must fail");
 }
 
-/// A child that something else in this process already reaped — a `waitpid(-1)` reaper, or
-/// `SIGCHLD` set to `SIG_IGN` — breaks the verdict's precondition. In release the verdict still
-/// decides without a pidfd, and never signals a pid that is not this process's unreaped child.
-/// (Debug builds assert the precondition instead.)
-///
-/// No freed pid is ever obtained: a reaped pid may already be another process's. `pidfd_open`'s
-/// `ESRCH` is injected, and "not this process's child" is a live grandchild, which its own parent
-/// has not reaped, so its number cannot be reused.
-#[cfg(all(target_os = "linux", not(debug_assertions)))]
-#[skuld::test]
-fn a_child_reaped_elsewhere_is_decided_without_signalling_its_pid() {
-    use std::io::{BufRead, Read, Write};
-
-    // `pidfd_open` fails with ESRCH: the leaf is closed, and the spawn degrades.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-reaped");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    crate::containment::cgroup::fault::set_force_pidfd_errno(rustix::io::Errno::SRCH);
-    match leaf.take_placement(std::process::id()).expect("decidable") {
-        Err(NotPlaced::Unwaitable { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::ESRCH)),
-        other => panic!("expected Unwaitable, got {other:?}"),
-    }
-    assert!(!leaf_path.exists(), "the leaf must be closed");
-
-    // A pid that is not this process's child is never signalled. `cat` reads the shell's stdin
-    // through fd 3: an asynchronous list's own stdin is /dev/null.
-    let mut shell = crate::test_spawn::spawn(
-        std::process::Command::new("/bin/sh")
-            .args(["-c", "exec 3<&0; cat <&3 & echo $!; wait"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn the shell");
-    let mut stdout = std::io::BufReader::new(shell.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    stdout.read_line(&mut line).expect("read the grandchild's pid");
-    let grandchild: u32 = line.trim().parse().expect("a pid");
-
-    std::fs::create_dir(&leaf_path).expect("recreate the leaf");
-    std::fs::create_dir(leaf_path.join("occupant")).expect("occupy the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let channel = leaf.report.take().expect("the channel");
-    let err = leaf.fail_closed(grandchild, channel, "the test cannot decide");
-    assert!(err.to_string().contains("not signalled"), "got {err}");
-
-    let mut stdin = shell.stdin.take().expect("stdin");
-    stdin.write_all(b"x").expect("write to the grandchild");
-    let mut echo = [0u8; 1];
-    stdout
-        .read_exact(&mut echo)
-        .expect("the grandchild must be alive to echo: it must not have been signalled");
-    assert_eq!(&echo, b"x");
-    drop(stdin);
-    shell.wait().expect("reap the shell");
-}
-
 /// A leaf dropped before its verdict, with no report received and nothing in it, is removed: a
 /// removed leaf admits no member, so the in-flight report cannot matter.
 #[cfg(target_os = "linux")]
@@ -2759,16 +2482,6 @@ fn an_abandoned_child_is_killed_and_reaped_by_its_pidfd_when_the_leaf_kill_fails
         "the child must be killed by its pidfd"
     );
     assert!(reaped(&pidfd), "and reaped");
-}
-
-/// A pidfd for `pid`, this process's own unreaped child, taken while its pid is pinned.
-#[cfg(target_os = "linux")]
-fn pidfd_of(pid: u32) -> std::os::fd::OwnedFd {
-    rustix::process::pidfd_open(
-        rustix::process::Pid::from_raw(pid as i32).expect("a positive pid"),
-        rustix::process::PidfdFlags::empty(),
-    )
-    .expect("open a pidfd")
 }
 
 /// Whether the child `pidfd` names has been reaped — a question a pidfd, unlike a pid, can answer
@@ -3126,217 +2839,6 @@ fn an_abandoned_child_is_killed_with_the_group_it_leads() {
     );
 }
 
-/// A child cosca gives up on is killed as a group: between the last look at its report and the
-/// kill it can report, exec, and fork, and what it forks is in its process group, not the leaf.
-/// Each process in the tree holds the child's stdout, so reading it to EOF proves all are dead.
-/// The descendant is a `cat` blocked on a held stdin; see
-/// `an_abandoned_child_is_killed_with_the_group_it_leads` for the `set_before_exit_wait` release
-/// that makes a skipped kill fail at once instead of hanging in `fail_closed`.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn fail_closed_kills_the_childs_whole_process_group() {
-    use std::io::{BufRead, Read};
-    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandon-group");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // The child leads its own group, as a contained child does, and forks a descendant into it.
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("/bin/sh")
-            .args(["-c", "exec 3<&0; cat <&3 3<&- & echo forked; wait"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn");
-    // Moved into the hook below; `child.wait()` closes the child's own stdin, so it must come after.
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    stdout.read_line(&mut line).expect("read the child's line");
-    assert_eq!(
-        line, "forked\n",
-        "the descendant must exist before the child is given up on"
-    );
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || {
-        crate::test_child::write_to_possibly_dead_stdin(&mut stdin, b"x");
-        drop(stdin);
-    });
-    assert!(leaf.take_placement(child.id()).is_err(), "the spawn must fail");
-    crate::containment::cgroup::fault::run_before_exit_wait();
-    let mut rest = Vec::new();
-    stdout
-        .read_to_end(&mut rest)
-        .expect("read to EOF: every process holding stdout is dead");
-    assert!(
-        rest.is_empty(),
-        "the descendant echoed a byte written after take_placement — the group kill failed to \
-         reach it in time, got {rest:?}"
-    );
-    let status = child.wait().expect("reap the child");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "the child itself must be SIGKILLed by the group kill, got {status:?}"
-    );
-}
-
-/// A child cosca may not signal — it exec'd a setuid program — cannot be waited out: `fail_closed`
-/// would block for that program's whole life. It exec'd, so its report is final: the spawn fails
-/// at once, and the child, which cosca could not kill, is left running.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn fail_closed_does_not_wait_on_a_child_it_may_not_signal() {
-    use std::io::{Read, Write};
-    use std::os::unix::process::CommandExt;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandon-eperm");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // `cat` echoes, so a round trip through it proves it alive.
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("/bin/cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn");
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    crate::containment::cgroup::fault::set_force_signal_denied(true);
-    let err = match leaf.take_placement(child.id()) {
-        Err(e) => e,
-        Ok(verdict) => panic!("an undecidable verdict must fail the spawn, got {verdict:?}"),
-    };
-    assert!(
-        !crate::containment::cgroup::fault::signal_denied_armed(),
-        "the seam must be consumed by the kill"
-    );
-    assert!(err.to_string().contains("could not be signalled"), "got {err}");
-
-    let mut echo = [0u8; 1];
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"x")
-        .expect("write to the child");
-    child
-        .stdout
-        .as_mut()
-        .expect("stdout")
-        .read_exact(&mut echo)
-        .expect("the child must be alive: it could not be signalled");
-    assert_eq!(&echo, b"x");
-    child.kill().expect("kill the child");
-    child.wait().expect("reap the child");
-}
-
-/// An occupied leaf whose child's membership cannot be read is undecided, not "not the child":
-/// the spawn fails closed — its child killed — and the read's own error is the reason given.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_without_a_pidfd_an_unreadable_membership_fails_closed(#[fixture(cgroup)] _group: &Group) {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
-    use crate::containment::TreeDrain;
-    let mut leaf = crate::containment::cgroup::try_create_leaf().expect("a delegated cgroup v2 leaf");
-    // The child reports through a channel of its own, so the leaf's has nothing queued.
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the child's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    // Blocked on a held stdin; see `an_abandoned_child_is_killed_with_the_group_it_leads` for the
-    // release.
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped()).process_group(0);
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the child");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let _armed = crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
-
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    crate::containment::cgroup::fault::set_force_membership_unreadable(true);
-    let err = match leaf.take_placement(child.id()) {
-        Err(e) => e,
-        Ok(verdict) => panic!("an unreadable membership must fail closed, got {verdict:?}"),
-    };
-    crate::containment::cgroup::fault::run_before_exit_wait();
-    assert!(
-        !crate::containment::cgroup::fault::membership_unreadable_armed(),
-        "the seam must be consumed by the membership read"
-    );
-    assert!(err.to_string().contains("could not be read"), "got {err}");
-    assert_eq!(
-        child.wait().expect("reap the child").signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed"
-    );
-    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
-}
-
-/// A real leaf member must not read as "in the leaf" when the `/proc` view is not `Same`: `holds`
-/// errors naming the view, so the verdict fails closed and the child is killed.
-///
-/// Mutant: `holds` reads `/proc/{pid}/cgroup` without the view check.
-#[cfg(target_os = "linux")]
-fn assert_a_non_same_proc_view_fails_closed(view: crate::identity::proc_view_fault::ForcedView, cause: &str) {
-    use std::os::unix::process::ExitStatusExt;
-
-    use crate::containment::cgroup::test_support::occupied_leaf;
-    use crate::containment::TreeDrain;
-
-    let (mut leaf, mut child, _own) = occupied_leaf();
-    crate::containment::cgroup::fault::set_force_pidfd_failure(true);
-    crate::containment::cgroup::fault::set_force_leaf_busy(true);
-    let forced_view = crate::identity::proc_view_fault::force_proc_view_once(view);
-    let err = match leaf.take_placement(child.id()) {
-        Err(e) => e,
-        Ok(verdict) => panic!("{view:?} must fail closed, got {verdict:?}"),
-    };
-    drop(forced_view);
-    assert!(
-        !crate::containment::cgroup::fault::take_force_leaf_busy(),
-        "the seam must be consumed by decide_unwaitable"
-    );
-    assert!(matches!(err, crate::error::Error::Containment { .. }), "got {err:?}");
-    assert!(err.to_string().contains("could not be read"), "got {err}");
-    assert!(err.to_string().contains(cause), "the view must be named: {err}");
-    assert!(!leaf.entered, "{view:?} must never leave `entered` true");
-
-    assert_eq!(
-        child.wait().expect("reap the child").signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed"
-    );
-    assert_eq!(leaf.wait_drained(None).expect("drain"), TreeDrain::AllMembersExited);
-}
-
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_a_diverged_proc_view_never_reads_as_in_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    assert_a_non_same_proc_view_fails_closed(
-        crate::identity::proc_view_fault::ForcedView::Diverged,
-        "outer pid namespace",
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn cgroup_an_unassessable_proc_view_never_reads_as_in_the_leaf(#[fixture(cgroup)] _group: &Group) {
-    assert_a_non_same_proc_view_fails_closed(
-        crate::identity::proc_view_fault::ForcedView::Unassessable,
-        "could not be established",
-    );
-}
-
 /// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
 /// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
 #[cfg(target_os = "linux")]
@@ -3384,129 +2886,6 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &
     }
 }
 
-/// A child cosca may not signal, but whose report says `Placed`, is killed through its leaf — no
-/// credential check stands in `cgroup.kill`'s way. The error must say so, not that it is left
-/// running.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn fail_closed_reports_a_child_it_may_not_signal_as_killed_through_its_leaf_when_placed() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandon-eperm-placed");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn");
-    let channel = leaf.report.take().expect("the channel");
-    // SAFETY: `channel` is open.
-    unsafe { channel.slot().report_placed_for_test() };
-
-    crate::containment::cgroup::fault::set_force_signal_denied(true);
-    let err = leaf.fail_closed(child.id(), channel, "the test cannot decide");
-    let err = err.to_string();
-    assert!(err.contains("killed through its leaf"), "got {err}");
-    assert!(!err.contains("left running"), "got {err}");
-    assert_eq!(
-        std::fs::read_to_string(leaf_path.join("cgroup.kill")).expect("cgroup.kill"),
-        "1"
-    );
-
-    child.kill().expect("kill the child");
-    child.wait().expect("reap the child");
-}
-
-/// A child `fail_closed` may not signal, and whose report it has read, can still send: its report
-/// is final only because nothing it sends later is accepted. Its late intent fails, so it exits with
-/// `ABANDONED_EXIT` before touching the leaf, rather than enter a leaf the spawn was told it had not.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_send_after_fail_closed_read_the_report_is_refused() {
-    use std::os::fd::{AsRawFd, IntoRawFd};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-fail-closed-late-send");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let channel = leaf.report.take().expect("the channel");
-    let slot = channel.slot();
-    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
-    let procs_fd = procs_write.into_raw_fd();
-    let (gate_read, gate_write) = std::io::pipe().expect("open the gate");
-    let gate = gate_read.as_raw_fd();
-    let guard = fork_running(move || {
-        block_on(gate);
-        // SAFETY: this child's inherited copies of the channel's ends and the pipe.
-        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
-    // SAFETY: the parent's own copy, closed once.
-    unsafe { libc::close(procs_fd) };
-    drop(gate_read);
-
-    crate::containment::cgroup::fault::set_force_signal_denied(true);
-    crate::containment::cgroup::fault::set_after_final_read(move |pid| {
-        let mut gate_write = gate_write;
-        std::io::Write::write_all(&mut gate_write, b"x").expect("release the child");
-        // Its exit, not its reaping: the test reaps it below.
-        let pid = rustix::process::Pid::from_raw(pid as i32).expect("a positive pid");
-        while let Err(rustix::io::Errno::INTR) = rustix::process::waitid(
-            rustix::process::WaitId::Pid(pid),
-            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
-        ) {}
-    });
-    let err = leaf
-        .fail_closed(guard.pid(), channel, "the test cannot decide")
-        .to_string();
-    assert!(err.contains("could not be signalled"), "got {err}");
-
-    let pid = guard.defuse();
-    let mut status = 0;
-    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
-    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
-    assert!(libc::WIFEXITED(status), "status {status:#x}");
-    assert_eq!(libc::WEXITSTATUS(status), crate::containment::cgroup::ABANDONED_EXIT);
-    assert_eq!(
-        std::io::read_to_string(procs_read).expect("read the pipe"),
-        "",
-        "no placement write"
-    );
-}
-
-/// After killing through a placed child's leaf, a drain `fail_closed` cannot watch is reported, as
-/// `Drop`'s own kill-and-drain reports it — never dropped. A `cgroup.events` that is a directory
-/// opens but cannot be read, so the watch fails for real.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn fail_closed_reports_a_drain_it_could_not_watch() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandon-unwatchable");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("cgroup.events")).expect("make cgroup.events unreadable");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut child =
-        crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null())).expect("spawn");
-    // Released once the kill has landed, right before `fail_closed`'s exit wait: a real kill makes
-    // this a no-op, a skipped one lets the child exit 0 on EOF and fails the `SIGKILL` check below.
-    let stdin = child.stdin.take().expect("piped stdin");
-    let _release = crate::containment::cgroup::fault::set_before_exit_wait(move || drop(stdin));
-    let channel = leaf.report.take().expect("the channel");
-    // SAFETY: `channel` is open.
-    unsafe { channel.slot().report_placed_for_test() };
-
-    let err = leaf
-        .fail_closed(child.id(), channel, "the test cannot decide")
-        .to_string();
-    crate::containment::cgroup::fault::run_before_exit_wait();
-    assert!(err.contains("drain could not be watched"), "got {err}");
-    let status = child.wait().expect("reap the child");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGKILL),
-        "the child must be killed through the leaf, not merely reaped once it exits on its own"
-    );
-}
-
 /// A leaf's name carries 64 random bits past the pid and sequence number, which repeat across
 /// pid namespaces sharing a delegated parent, and across processes reusing a pid.
 #[cfg(target_os = "linux")]
@@ -3548,37 +2927,4 @@ fn end_child_refuses_inside_a_section() {
     let _section = crate::bounded::Section::enter();
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::end_child(&received)));
     assert!(refused.is_err(), "end_child must refuse inside a bounded section");
-}
-
-/// `fail_closed` waits for the killed child's exit, so it refuses a section before it signals
-/// anything.
-///
-/// Mutant: drop the assert from `fail_closed`.
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-#[skuld::test]
-fn fail_closed_refuses_inside_a_section() {
-    use std::os::unix::process::CommandExt;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-bounded-fail-closed");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    std::fs::create_dir(leaf_path.join("occupant")).expect("make the leaf unremovable");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("/bin/cat")
-            .stdin(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn");
-    let channel = leaf.report.take().expect("the channel");
-    let refused = {
-        let _section = crate::bounded::Section::enter();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            leaf.fail_closed(child.id(), channel, "the test cannot decide")
-        }))
-    };
-    // A refusal happens before the kill, so the child is still ours to end.
-    _ = child.kill();
-    child.wait().expect("reap the child");
-    assert!(refused.is_err(), "fail_closed must refuse inside a bounded section");
 }

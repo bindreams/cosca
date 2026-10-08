@@ -908,10 +908,6 @@ mod front_kill_tests;
 #[path = "child/front_cgroup_tests.rs"]
 mod front_cgroup_tests;
 
-#[cfg(all(test, target_os = "linux"))]
-#[path = "child/front_failed_closed_tests.rs"]
-mod front_failed_closed_tests;
-
 #[cfg(all(test, unix))]
 #[path = "child_pipe_conversion_tests.rs"]
 mod child_pipe_conversion_tests;

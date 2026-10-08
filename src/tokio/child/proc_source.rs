@@ -288,6 +288,13 @@ impl ProcSource {
         }
     }
 
+    /// The child as its spawn holds it, with the handshake pidfd. `None` for a forgotten backend.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_handle(&self, pid: u32) -> Option<crate::containment::ChildHandle<'_>> {
+        let crate::wait::exit_only::Target::PidFd(pidfd) = self.target()?;
+        Some(crate::containment::ChildHandle { pid, pidfd })
+    }
+
     /// Take tokio's own stdin stream (the Raw backend serves its piped std ends via `owned_std`,
     /// so it has none here).
     pub(crate) fn take_stdin(&mut self) -> Option<::tokio::process::ChildStdin> {

@@ -26,8 +26,8 @@
 //! (`ReportChannel`).
 //!
 //! # Placement reports: when one is final, and what cosca may kill
-//! Every decision about a leaf rests on these rules. `take_placement`, `decide_unwaitable`,
-//! `fail_closed`, `abandon_before_verdict` and `Drop` each apply them; none has a rule of its own.
+//! Every decision about a leaf rests on these rules. `take_placement`,
+//! `abandon_before_verdict` and `Drop` each apply them; none has a rule of its own.
 //!
 //! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying a pidfd for
 //! itself when it can open one, before it touches the leaf; then, after its `cgroup.procs` write,
@@ -36,9 +36,9 @@
 //! cannot come to name another process, whoever reaps the child.
 //!
 //! **One verdict.** The parent ends the exchange exactly once, by one of two acts:
-//! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit — or
-//!   decides without it; then it sends *proceed* and closes the channel. A child whose send fails
-//!   because the parent has decided finds *proceed* queued, and carries on.
+//! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit; then it
+//!   sends *proceed* and closes the channel. A child whose send fails because the parent has
+//!   decided finds *proceed* queued, and carries on.
 //! - *Abandon.* A spawn that failed before its verdict shuts the channel for reading. Every
 //!   message sent before that is still read; every send after it fails with no *proceed* queued,
 //!   and the child exits without `exec`. After abandonment no child execs, in or out of a leaf.

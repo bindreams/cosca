@@ -1,16 +1,11 @@
 use std::cell::Cell;
 
-/// A seam's hook, run with the child's pid.
-type PidHook = Box<dyn FnOnce(u32)>;
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
-    static FORCE_LEAF_BUSY: Cell<bool> = const { Cell::new(false) };
-    static AFTER_FINAL_READ: std::cell::RefCell<Option<PidHook>> = std::cell::RefCell::new(None);
     static FORCE_CHILD_PROC_DIR_FAILURE: Cell<bool> = const { Cell::new(false) };
     static BETWEEN_CHECK_AND_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ON_TAKE_PLACEMENT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static FORCE_FAIL_CLOSED: Cell<bool> = const { Cell::new(false) };
     static BEFORE_EXIT_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static SIGNALLED_BY_PID: Cell<usize> = const { Cell::new(0) };
     static HOOK_GATE: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
@@ -18,13 +13,13 @@ thread_local! {
     static BACKGROUND_REAP_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    static ON_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static BEFORE_STATE_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static WAITED_PIDFD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_CHILD_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static REAPED_ORPHANS: std::cell::RefCell<Vec<(u32, Option<i32>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
-    static FORCE_PIDFD_FAILURE: Cell<Option<rustix::io::Errno>> = const { Cell::new(None) };
-    static FORCE_SIGNAL_DENIED: Cell<bool> = const { Cell::new(false) };
-    static FORCE_MEMBERSHIP_UNREADABLE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<isize>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -236,50 +231,6 @@ pub(crate) fn report_channel_failure_armed() -> bool {
     FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.get())
 }
 
-/// Fail the NEXT `pidfd_open` of a report wait with `EMFILE`. The seccomp denial it also
-/// stands for is exercised for real, in a process of its own, by `tests/spawn_io.rs`.
-pub(crate) fn set_force_pidfd_failure(on: bool) {
-    FORCE_PIDFD_FAILURE.with(|f| f.set(on.then_some(rustix::io::Errno::MFILE)));
-}
-/// Fail the NEXT `pidfd_open` of a report wait with `errno` — `ESRCH` stands for a child
-/// something else already reaped, whose pid a test must never obtain for real: it may
-/// already be another process's. Release-only, like its one test: debug builds assert the
-/// precondition this breaks.
-#[cfg(not(debug_assertions))]
-pub(crate) fn set_force_pidfd_errno(errno: rustix::io::Errno) {
-    FORCE_PIDFD_FAILURE.with(|f| f.set(Some(errno)));
-}
-pub(crate) fn take_force_pidfd_failure() -> Option<rustix::io::Errno> {
-    FORCE_PIDFD_FAILURE.with(|f| f.take())
-}
-pub(crate) fn pidfd_failure_armed() -> bool {
-    FORCE_PIDFD_FAILURE.with(|f| f.get().is_some())
-}
-
-/// Deny the NEXT `fail_closed`'s signals with `EPERM`, as a child that exec'd a setuid program
-/// denies an unprivileged supervisor — which a root test lane cannot reproduce for real.
-pub(crate) fn set_force_signal_denied(on: bool) {
-    FORCE_SIGNAL_DENIED.with(|f| f.set(on));
-}
-pub(crate) fn take_force_signal_denied() -> bool {
-    FORCE_SIGNAL_DENIED.with(|f| f.replace(false))
-}
-pub(crate) fn signal_denied_armed() -> bool {
-    FORCE_SIGNAL_DENIED.with(|f| f.get())
-}
-
-/// Fail the NEXT read of a child's `/proc/<pid>/cgroup` with `EACCES`, as a `hidepid` or
-/// seccomp-restricted `/proc` can — which a root test lane cannot reproduce for its own child.
-pub(crate) fn set_force_membership_unreadable(on: bool) {
-    FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_membership_unreadable() -> bool {
-    FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.replace(false))
-}
-pub(crate) fn membership_unreadable_armed() -> bool {
-    FORCE_MEMBERSHIP_UNREADABLE.with(|f| f.get())
-}
-
 /// Make the NEXT placement write return `ret` without writing — 0, which no file a test can open
 /// returns for a one-byte write. A child forked from this thread inherits the flag and takes it.
 pub(crate) fn set_force_placement_write_result(ret: isize) {
@@ -321,6 +272,21 @@ pub(crate) fn notify_wait_polling() {
     }
 }
 
+/// Run `hook` at the start of the NEXT report wait on this thread, before it reads anything. The
+/// hook reads which pidfd that wait is given with [`waited_pidfd`], so a test can fail by assertion
+/// where a wrong one would block the wait forever.
+pub(crate) fn set_on_wait(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&ON_WAIT, hook)
+}
+pub(crate) fn notify_wait_entry(pidfd: std::os::fd::RawFd) {
+    WAITED_PIDFD.with(|p| p.set(Some(pidfd)));
+    crate::oneshot_hook::fire(&ON_WAIT);
+}
+/// The pidfd the report wait was given, as a raw fd number.
+pub(crate) fn waited_pidfd() -> Option<std::os::fd::RawFd> {
+    WAITED_PIDFD.with(|p| p.get())
+}
+
 /// Have the NEXT intent sent on this thread — or in a child forked from it, which inherits the
 /// flag — go without a pidfd, as when `pidfd_open` is denied in the child.
 pub(crate) fn set_force_child_pidfd_failure(on: bool) {
@@ -328,18 +294,6 @@ pub(crate) fn set_force_child_pidfd_failure(on: bool) {
 }
 pub(crate) fn take_force_child_pidfd_failure() -> bool {
     FORCE_CHILD_PIDFD_FAILURE.with(|f| f.replace(false))
-}
-
-/// Run `hook` with the child's pid in the NEXT `fail_closed` on this thread, once it has read the
-/// child's final report and before it acts on it — the window a late send must not slip through
-/// unread.
-pub(crate) fn set_after_final_read(hook: impl FnOnce(u32) + 'static) {
-    AFTER_FINAL_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-}
-pub(crate) fn run_after_final_read(pid: u32) {
-    if let Some(hook) = AFTER_FINAL_READ.with(|h| h.borrow_mut().take()) {
-        hook(pid);
-    }
 }
 
 /// Run `hook` in the NEXT abandonment on this thread, after it has read what the child sent and
@@ -370,17 +324,9 @@ pub(crate) fn take_background_reap_notifier() -> Option<std::sync::mpsc::Sender<
     BACKGROUND_REAP_NOTIFY.with(|n| n.borrow_mut().take())
 }
 
-/// Have the NEXT verdict on this thread that cannot wait find its leaf busy (`EBUSY`), as one
-/// holding another process would, without that process.
-pub(crate) fn set_force_leaf_busy(on: bool) {
-    FORCE_LEAF_BUSY.with(|f| f.set(on));
-}
-pub(crate) fn take_force_leaf_busy() -> bool {
-    FORCE_LEAF_BUSY.with(|f| f.replace(false))
-}
-
 /// Hold the NEXT placement hook run by a child forked from this thread — which inherits the flag —
 /// until a byte arrives on `gate`, so a test can order the child's hook after the parent's act.
+#[cfg(feature = "tokio")]
 pub(crate) fn set_hook_gate(gate: std::os::fd::RawFd) {
     HOOK_GATE.with(|g| g.set(Some(gate)));
 }
@@ -408,7 +354,7 @@ pub(crate) fn run_between_check_and_kill() {
     }
 }
 
-/// Run `hook` in the NEXT abandonment or `fail_closed` on this thread, after the child has been
+/// Run `hook` in the NEXT abandonment on this thread, after the child has been
 /// signalled and right before the wait for its exit. A test whose child blocks on a stdin it
 /// holds releases it here: a real kill has already landed, so the release changes nothing, while
 /// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
@@ -651,13 +597,11 @@ pub(crate) fn run_on_take_placement() {
     crate::oneshot_hook::fire(&ON_TAKE_PLACEMENT);
 }
 
-/// Make the NEXT placement verdict taken on this thread fail closed, through the real
-/// `fail_closed`: the child and its group are killed, and through its leaf if it entered. A spawn
-/// cannot reach that on its own, since its child's report is already received by the time the
-/// verdict is taken. Take semantics.
-pub(crate) fn set_force_fail_closed(on: bool) {
-    FORCE_FAIL_CLOSED.with(|f| f.set(on));
+/// Run `hook` in the NEXT `/proc` state read on this thread, just before it reads: the window in
+/// which the child can exit and its number change hands, after the look that found it running.
+pub(crate) fn set_before_state_read(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_STATE_READ, hook)
 }
-pub(crate) fn take_force_fail_closed() -> bool {
-    FORCE_FAIL_CLOSED.with(|f| f.replace(false))
+pub(crate) fn run_before_state_read() {
+    crate::oneshot_hook::fire(&BEFORE_STATE_READ);
 }
