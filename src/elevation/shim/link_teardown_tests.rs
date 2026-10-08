@@ -164,18 +164,27 @@ fn unknown_origin_in_the_original_stops_the_acceptor_and_removes_nothing() {
     let dir = link.dir().to_owned();
     link.owner.make_unreadable();
     drop(link);
-    assert_eq!(
-        next_acceptor_event(&events),
-        LinkEvent::UnknownOriginHandled {
+    // `drop` has returned, so its own event is already queued. Check it before waiting for the
+    // acceptor, which a missing stop byte would leave waiting for ever. The acceptor runs
+    // concurrently, so its events may come before or after.
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e| matches!(e, LinkEvent::UnknownOriginHandled { .. })) {
+        seen.push(next_acceptor_event(&events));
+    }
+    assert!(
+        seen.contains(&LinkEvent::UnknownOriginHandled {
             refused: true,
             stop_written: true
-        }
+        }),
+        "{seen:?}"
     );
-    assert_eq!(
-        next_acceptor_event(&events),
-        LinkEvent::DrainStarted { path_exists: true }
+    while !seen.contains(&LinkEvent::AcceptorExited) {
+        seen.push(next_acceptor_event(&events));
+    }
+    assert!(
+        seen.contains(&LinkEvent::DrainStarted { path_exists: true }),
+        "{seen:?}"
     );
-    assert_eq!(next_acceptor_event(&events), LinkEvent::AcceptorExited);
     assert!(dir.join(super::super::SOCKET_NAME).exists(), "nothing is unlinked");
     assert!(dir.is_dir(), "nothing is removed");
 }
