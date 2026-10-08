@@ -474,6 +474,11 @@ fn network_and_fuse_filesystems_are_refused() {
         (0x4750_4653, "GPFS"),
         (0x1983_0326, "BeeGFS"),
         (0xAAD7_AAEA, "PanFS"),
+        (0x0116_1970, "GFS2"),
+        (0x7461_636F, "OCFS2"),
+        (0xBEEF_DEAD, "StorNext"),
+        (0x0131_11A8, "IBRIX"),
+        (0x6163_6673, "ACFS"),
     ];
     for (magic, name) in refused {
         assert_eq!(refused_filesystem(magic), Some(name));
@@ -593,4 +598,17 @@ fn the_directory_fd_names_the_directory() {
         (by_fd.st_dev as u64, by_fd.st_ino as u64),
         (by_path.dev(), by_path.ino())
     );
+}
+
+/// `create_unguarded_resolved` is for a path from `resolve`. Debug builds refuse a relative one.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn an_unresolved_path_trips_the_debug_assertion() {
+    let root = tempfile::tempdir().unwrap();
+    let relative = std::path::PathBuf::from("relative/tmp");
+    let caught = std::panic::catch_unwind(|| PrivateDir::create_unguarded_resolved(root.path(), relative));
+    assert!(caught.is_err());
+    let dotted = root.path().join("..").join(root.path().file_name().unwrap());
+    let caught = std::panic::catch_unwind(|| PrivateDir::create_unguarded_resolved(root.path(), dotted));
+    assert!(caught.is_err());
 }

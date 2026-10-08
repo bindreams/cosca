@@ -61,7 +61,7 @@ fn mount_not_local(_: u32) -> bool {
 
 /// Filesystems whose permissions and ownership are decided by something other than this kernel's own
 /// view of local users: another host (NFS, SMB/CIFS, Ceph, AFS, kAFS, Coda, NCP, Lustre, GPFS,
-/// BeeGFS, PanFS), a hypervisor or its guest tools (9p, vboxsf, prl_fs, vmhgfs), or a user-space
+/// BeeGFS, PanFS, GFS2, OCFS2, StorNext, IBRIX, ACFS), a hypervisor or its guest tools (9p, vboxsf, prl_fs, vmhgfs), or a user-space
 /// daemon (FUSE). Neither the `0700` mode nor the rename protection the path check relies on holds
 /// there (root squashing, uid mapping, server-side policy), and Unix sockets are not reliable on
 /// them. The list follows coreutils' `stat.c` (`human_fstype`, which marks the same types remote or
@@ -86,6 +86,11 @@ const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x4750_4653, "GPFS"),
     (0x1983_0326, "BeeGFS"),
     (0xAAD7_AAEA, "PanFS"),
+    (0x0116_1970, "GFS2"),
+    (0x7461_636F, "OCFS2"),
+    (0xBEEF_DEAD, "StorNext"),
+    (0x0131_11A8, "IBRIX"),
+    (0x6163_6673, "ACFS"),
 ];
 
 /// The name of the network or user-space filesystem `fs_type` is, if it is one the private directory

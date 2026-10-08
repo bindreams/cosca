@@ -154,6 +154,17 @@ impl PrivateDir {
 
     /// [`create_unguarded`](Self::create_unguarded) for a `real` path from [`resolve`](Self::resolve).
     pub(crate) fn create_unguarded_resolved(tmp: &Path, real: PathBuf) -> Result<Self, PrivateDirError> {
+        debug_assert!(
+            real.is_absolute(),
+            "`real` must come from `resolve`: {}",
+            real.display()
+        );
+        debug_assert!(
+            real.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)),
+            "`real` must be canonical: {}",
+            real.display()
+        );
         Self::create_resolved(tmp, real, open_and_harden, false, None)
     }
 
