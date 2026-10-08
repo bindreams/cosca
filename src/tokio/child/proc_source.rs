@@ -524,7 +524,11 @@ impl ProcSource {
     #[cfg(unix)]
     fn state_of(
         &self,
-        #[cfg_attr(target_os = "linux", allow(unused_variables))] child: &::tokio::process::Child,
+        #[cfg_attr(
+            target_os = "linux",
+            allow(unused_variables, reason = "Linux peeks the pidfd, not the pid")
+        )]
+        child: &::tokio::process::Child,
     ) -> RootState {
         let ProcSource::Tokio { .. } = self else {
             return RootState::Reaped;
