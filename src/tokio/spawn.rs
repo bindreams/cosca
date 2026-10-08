@@ -710,6 +710,8 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             format!("the elevated child could not be terminated ({e})")
         }
     };
+    // The error reports what the cleanup did and left; the handle it drops now is not the caller's.
+    child.disarm_drop();
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),

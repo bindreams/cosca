@@ -383,7 +383,7 @@ impl ProcSource {
                 self.forget_foreign();
                 Err(gone())
             }
-            RootState::Unknown(failed) => Err(Error::Unassessable {
+            RootState::Unknown(failed) | RootState::Unpinned(failed) => Err(Error::Unassessable {
                 detail: format!("pid {pid}: the child cannot be shown to be ours; it was not waited on"),
                 source: Some(failed),
             }),
@@ -555,7 +555,7 @@ impl ProcSource {
     ///
     /// `false` for a child tokio itself already reaped (`id()` is `None`), and for one already
     /// forgotten.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(crate) fn reaped_elsewhere(&self) -> bool {
         let Some((pid, state)) = self.elsewhere() else {
             return false;
@@ -709,29 +709,34 @@ impl ProcSource {
     /// Forgetting leaks what tokio's `Child` holds — on Linux its pidfd and its reactor
     /// registration, on macOS its `SIGCHLD` watch — so it is logged at `warn`, naming the pid.
     #[cfg(unix)]
-    pub(crate) fn forget_foreign(&mut self) {
-        self.forget_because("was reaped by someone else, or cannot be shown to be ours");
+    pub(crate) fn forget_foreign(&mut self) -> &'static str {
+        self.forget_because("was reaped by someone else, or cannot be shown to be ours")
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign) for any reason: `why` completes "child N ...",
-    /// so the warning says what actually happened.
+    /// so the warning says what actually happened. Returns what the forget leaks.
     #[cfg(unix)]
-    pub(crate) fn forget_because(&mut self, why: &str) {
-        self.forget_at(log::Level::Warn, why);
+    pub(crate) fn forget_because(&mut self, why: &str) -> &'static str {
+        self.forget_at(log::Level::Warn, why)
     }
 
-    /// [`forget_foreign`](ProcSource::forget_foreign) for a root the caller has already warned of:
-    /// the leak is logged at `debug`.
+    /// [`forget_foreign`](ProcSource::forget_foreign) for a caller that reports the forget itself,
+    /// in its own one warn: the leak is logged at `debug`. Returns what the forget leaks.
     #[cfg(unix)]
-    pub(crate) fn forget_foreign_quietly(&mut self) {
+    pub(crate) fn forget_foreign_quietly(&mut self) -> &'static str {
         self.forget_at(
             log::Level::Debug,
             "was reaped by someone else, or cannot be shown to be ours",
-        );
+        )
     }
 
     #[cfg(unix)]
-    fn forget_at(&mut self, level: log::Level, why: &str) {
+    fn forget_at(&mut self, level: log::Level, why: &str) -> &'static str {
+        let leak = if cfg!(target_os = "linux") {
+            "tokio's pidfd and its reactor registration"
+        } else {
+            "tokio's SIGCHLD watch"
+        };
         let ProcSource::Tokio {
             child,
             stdin,
@@ -740,7 +745,7 @@ impl ProcSource {
             ..
         } = self
         else {
-            return;
+            return leak;
         };
         let pid = child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string());
         let foreign = ProcSource::Foreign {
@@ -751,24 +756,28 @@ impl ProcSource {
         std::mem::replace(self, foreign).forget();
         #[cfg(test)]
         super::drop_fault::note_forget();
-        let leak = if cfg!(target_os = "linux") {
-            "tokio's pidfd and its reactor registration"
-        } else {
-            "tokio's SIGCHLD watch"
-        };
         log::log!(
             level,
             "child {pid} {why}; forgetting tokio's handle for it leaks {leak}"
         );
+        leak
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that
-    /// release the backend without waiting: [`reaped_elsewhere`](ProcSource::reaped_elsewhere).
+    /// release the backend without waiting: the handle shows the child reaped elsewhere, not
+    /// pinned, or cannot be asked. One warn, naming the error when the handle could not say.
+    /// Returns what the forget leaks, if it forgot.
     #[cfg(unix)]
-    pub(crate) fn forget_if_foreign(&mut self) {
-        if self.reaped_elsewhere() {
-            self.forget_foreign();
-        }
+    pub(crate) fn forget_if_foreign(&mut self) -> Option<&'static str> {
+        let (_, state) = self.elsewhere()?;
+        let why = match &state {
+            RootState::Unknown(e) => format!("cannot be shown to be ours (RootState::Unknown: {e})"),
+            RootState::Unpinned(e) => format!("is not pinned by this process (RootState::Unpinned: {e})"),
+            RootState::Unreaped | RootState::Reaped => {
+                "was reaped by someone else, or cannot be shown to be ours".to_owned()
+            }
+        };
+        Some(self.forget_because(&why))
     }
 
     /// Guaranteed synchronous teardown for a spawn that failed after the fork: kill the child

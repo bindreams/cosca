@@ -99,7 +99,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
 /// and the note says it had exited. The front's gate is read once, for both kills.
 #[cfg(unix)]
-pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
@@ -110,6 +110,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         || child.proc.state(),
         &child.tree_killed,
     );
+    view.warn_unsettled("finish_elevated", true, None);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -165,6 +166,8 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
             format!("the elevated child could not be terminated ({e})")
         }
     };
+    // The error reports what the cleanup did and left; the handle it drops now is not the caller's.
+    child.kill_on_drop = false;
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),

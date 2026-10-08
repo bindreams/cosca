@@ -774,6 +774,8 @@ impl Drop for Child {
             || self.proc.state(),
             &self.tree_killed,
         );
+        #[cfg(unix)]
+        view.warn_unsettled("Child::drop", true, None);
         // A live elevation front outside a cgroup is not signalled: it is left running, unreaped,
         // and named.
         #[cfg(unix)]
@@ -802,8 +804,9 @@ impl Drop for Child {
         // never waits, rather than parking a runtime worker, and it must not collect, since tokio
         // owns that child and its own reaping.
         // A reaped root is neither killed nor waited for: its number may name another child by now.
+        // Neither is a root this process does not pin (macOS: launchd holds its zombie).
         #[cfg(unix)]
-        if view.root_reaped {
+        if view.leaves_root_alone() {
             return;
         }
         self.proc.teardown_on_drop();

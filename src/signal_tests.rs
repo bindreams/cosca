@@ -238,16 +238,16 @@ mod root_state {
         assert!(matches!(state, RootState::Reaped), "{state:?}");
     }
 
-    /// A zombie held by launchd is not reaped: it is neither ours to reap nor gone, and its pid
-    /// stays pinned for a time nothing here bounds.
+    /// A zombie held by launchd is not reaped, and this process does not pin it: it is neither ours
+    /// to reap nor gone, and nothing here bounds how long its pid stays pinned.
     ///
-    /// Mutant: `Orphaned` is `Reaped`.
+    /// Mutants: `Orphaned` is `Reaped`; `Orphaned` is `Unknown` (a root we still pin).
     #[cfg(target_os = "macos")]
     #[skuld::test]
-    fn an_orphaned_zombie_is_unknown_naming_launchd() {
+    fn an_orphaned_zombie_is_unpinned_naming_launchd() {
         let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Orphaned)));
         assert!(
-            matches!(&state, RootState::Unknown(e) if e.to_string().contains("launchd")),
+            matches!(&state, RootState::Unpinned(e) if e.to_string().contains("launchd")),
             "{state:?}"
         );
     }

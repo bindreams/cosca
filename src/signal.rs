@@ -58,6 +58,14 @@ pub(crate) enum RootState {
     /// neither reaped nor unreaped; callers skip what a reuse of the pid could redirect, and act
     /// only through the handle.
     Unknown(io::Error),
+    /// The root exists, but this process does not pin it (macOS: launchd holds its zombie after
+    /// its tracer died, and reaps it on its own schedule). Its pid is not ours: nothing may be
+    /// signalled or waited on by it, and nothing bounds how long it stays the root's.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS reports an unpinned root")
+    )]
+    Unpinned(io::Error),
 }
 
 #[cfg(unix)]
@@ -67,10 +75,10 @@ impl RootState {
         use crate::wait::exit_only::Peek;
         match peeked {
             Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
-            // launchd holds the zombie, so the root is neither ours to reap nor gone: its pid stays
-            // pinned for a time nothing here bounds.
+            // launchd holds the zombie, so the root is neither ours to reap nor gone, and this
+            // process does not pin its pid.
             #[cfg(target_os = "macos")]
-            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unknown(io::Error::other(
+            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unpinned(io::Error::other(
                 "the root's zombie is held by launchd (its tracer died), so it is neither reaped nor ours to reap",
             )),
             Ok(Peek::Foreign(_)) => RootState::Reaped,

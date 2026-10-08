@@ -136,7 +136,8 @@ mod linux {
 
     /// The warn is labelled by the caller: a failed spawn's cleanup does not call itself a drop.
     ///
-    /// Mutant: `DropView::read` hardcodes "Child::drop".
+    /// Mutants: `DropView::read` hardcodes "Child::drop"; the cleanup leaves the handle armed, so its
+    /// drop warns "already reaped" about a `Child` the caller never received.
     #[skuld::test]
     fn the_unknown_warn_names_its_caller() {
         crate::log_capture::install();
@@ -148,13 +149,11 @@ mod linux {
         let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
 
-        // The cleanup's own drop afterwards reads a reaped root: another event, with its own warn.
-        let unknown: Vec<String> = warns_since(mark)
-            .into_iter()
-            .filter(|w| w.contains("RootState::Unknown"))
-            .collect();
-        assert_eq!(unknown.len(), 1, "{unknown:?} ({err:?})");
-        assert!(unknown[0].starts_with("finish_elevated:"), "{unknown:?}");
+        // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
+        // disarmed and says nothing more.
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
+        assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
     }
 
     /// With the root's number unreadable too, the debug line does not claim the root is treated as
@@ -206,5 +205,64 @@ mod linux {
         assert!(skipped.is_some(), "the number-named kill must be skipped");
         assert!(!killed.is_set(), "a skipped kill must not mark the tree killed");
         assert_eq!(recorder.killed(), Vec::<i32>::new());
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use crate::send_log::{Capture, Via};
+    use crate::signal::Sig;
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::{Foreign, Peek};
+    use crate::ContainMode;
+
+    /// A tree-walk child: the walk names no marker holder, so the only sends are the root's own.
+    fn walked_blocker() -> (crate::Child, std::io::PipeWriter) {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        cmd.contain_with(ContainMode::TreeWalk);
+        (cmd.spawn().expect("spawn"), writer)
+    }
+
+    /// A root launchd holds is not pinned by this process: it is neither signalled nor waited on by
+    /// its pid, and the drop warns once.
+    ///
+    /// Mutant: `Unpinned` is `Unknown` (the drop kills by pid, and waits).
+    #[skuld::test]
+    fn an_orphaned_root_is_neither_signalled_nor_waited_on_and_warns_once() {
+        crate::log_capture::install();
+        let (child, writer) = walked_blocker();
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+        drop(child);
+        drop(writer);
+
+        assert_eq!(sends.entries(), vec![], "nothing may be sent to a root we do not pin");
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("launchd"), "{warns:?}");
+    }
+
+    /// Any other root we cannot get an answer for is still our unreaped child, pinned by us: the
+    /// drop still kills it through its handle (the pid, checked against its unique id).
+    ///
+    /// Mutant: every `Unknown` leaves the root alone.
+    #[skuld::test]
+    fn an_unknown_root_we_pin_is_still_killed_through_its_handle() {
+        crate::log_capture::install();
+        let (child, writer) = walked_blocker();
+        let pid = child.id().pid();
+        let sends = Capture::start();
+        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+
+        drop(child);
+        drop(writer);
+
+        assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
     }
 }

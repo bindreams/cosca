@@ -166,6 +166,9 @@ pub(crate) struct DropView {
     pub(crate) root_reaped: bool,
     /// This handle already killed the tree completely.
     pub(crate) tree_killed: bool,
+    /// What the tree teardown would do by the root's number, if anything: phrased as an action for
+    /// a log line ([`Attached::named_by_root_number`]).
+    pub(crate) left_alone: Option<String>,
 }
 
 #[cfg(unix)]
@@ -175,9 +178,9 @@ impl DropView {
     /// exact where the number is not: a foreign reap followed by a same-tick reuse still reads as
     /// this root by its start token.
     ///
-    /// `label` names the caller in the log. A root the handle cannot answer for is warned about
-    /// here, once, naming what the caller will then leave alone (`attached`); no later step warns
-    /// of it again.
+    /// Reading logs nothing about a root the handle cannot answer for (`Unknown`, `Unpinned`):
+    /// the caller reports it once, with [`warn_unsettled`](Self::warn_unsettled), when it knows
+    /// what else it did about it. `label` names the caller in the log lines.
     pub(crate) fn read(
         label: &str,
         id: crate::identity::ProcessId,
@@ -191,50 +194,97 @@ impl DropView {
         let root = root();
         let handle_reaped = matches!(root, RootState::Reaped);
         let root_reaped = crate::child::root_reaped(handle_reaped, id, now);
-        match &root {
-            RootState::Unknown(e) if !root_reaped => {
-                let left_alone = match attached.named_by_root_number(root_pid) {
-                    Some(action) => format!("so it does not {action}, whose number may belong to an unrelated process"),
-                    None => "and nothing it does names the tree by the root's number".to_owned(),
-                };
-                log::warn!(
-                    "{label}: RootState::Unknown: the root's ({root_pid}) own handle could not say whether it was reaped ({e}), {left_alone}"
-                );
-                if now.is_unknown() {
-                    log::debug!(
-                        "{label}: the root's number ({root_pid}) could not be read either; kills by that number are skipped"
-                    );
-                }
-            }
-            _ if !handle_reaped && now.is_unknown() => {
-                log::debug!(
-                    "{label}: the root's number ({root_pid}) could not be read; treating the root as not reaped"
-                );
-            }
-            _ => {}
-        }
-        DropView {
+        let view = DropView {
             root_pid,
             root_reaped,
             root,
             tree_killed: tree_killed.is_set(),
+            left_alone: attached.named_by_root_number(root_pid),
+        };
+        if now.is_unknown() && !handle_reaped {
+            if view.unsettled() {
+                log::debug!(
+                    "{label}: the root's number ({root_pid}) could not be read either; kills by that number are skipped"
+                );
+            } else {
+                log::debug!(
+                    "{label}: the root's number ({root_pid}) could not be read; treating the root as not reaped"
+                );
+            }
         }
+        view
+    }
+
+    /// The handle could not settle whether the root is still ours to act on, and nothing else did:
+    /// `Unknown`, or `Unpinned`.
+    pub(crate) fn unsettled(&self) -> bool {
+        !self.root_reaped
+            && matches!(
+                self.root,
+                crate::signal::RootState::Unknown(_) | crate::signal::RootState::Unpinned(_)
+            )
     }
 
     /// Whether the root's number may name another process, or cannot be shown to name the root:
     /// nothing that names the tree by that number may run.
     pub(crate) fn number_untrusted(&self) -> bool {
-        self.root_reaped || matches!(self.root, crate::signal::RootState::Unknown(_))
+        self.root_reaped || self.unsettled()
+    }
+
+    /// Whether the root itself is neither signalled nor waited on: it is reaped, or this process
+    /// does not pin it (so its pid is not ours).
+    pub(crate) fn leaves_root_alone(&self) -> bool {
+        self.root_reaped || matches!(self.root, crate::signal::RootState::Unpinned(_))
     }
 
     /// Why [`number_untrusted`](Self::number_untrusted), for a log line or a note.
     pub(crate) fn why_number_untrusted(&self) -> String {
+        use crate::signal::RootState;
         match &self.root {
-            crate::signal::RootState::Unknown(e) if !self.root_reaped => {
+            RootState::Unknown(e) if !self.root_reaped => {
                 format!("the root could not be shown to be unreaped (RootState::Unknown: {e})")
+            }
+            RootState::Unpinned(e) if !self.root_reaped => {
+                format!("the root is not pinned by this process (RootState::Unpinned: {e})")
             }
             _ => "the root is already reaped".to_owned(),
         }
+    }
+
+    /// The one `warn` for an [`unsettled`](Self::unsettled) root, naming `label`, the error, and
+    /// what the caller did about it: `armed` says whether a teardown was meant to run (a disarmed
+    /// drop skips nothing), and `leaked` what forgetting tokio's `Child` leaked, if it was
+    /// forgotten. Does nothing for a settled root. Callers call it once per event; every other
+    /// step logs at `debug`.
+    pub(crate) fn warn_unsettled(&self, label: &str, armed: bool, leaked: Option<&str>) {
+        use crate::signal::RootState;
+        if !self.unsettled() {
+            return;
+        }
+        let pid = self.root_pid;
+        let mut text = match &self.root {
+            RootState::Unpinned(e) => {
+                format!("{label}: RootState::Unpinned: the root ({pid}) is not pinned by this process ({e})")
+            }
+            RootState::Unknown(e) => format!(
+                "{label}: RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({e})"
+            ),
+            RootState::Unreaped | RootState::Reaped => return,
+        };
+        if armed {
+            if let Some(action) = &self.left_alone {
+                text.push_str(&format!(
+                    ", so it does not {action}, whose number may belong to an unrelated process"
+                ));
+            }
+            if matches!(self.root, RootState::Unpinned(_)) {
+                text.push_str("; the root itself is neither signalled nor waited on");
+            }
+        }
+        if let Some(leak) = leaked {
+            text.push_str(&format!("; forgetting tokio's handle for it leaks {leak}"));
+        }
+        log::warn!("{text}");
     }
 }
 
