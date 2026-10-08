@@ -34,6 +34,8 @@ MAX_CONCURRENT_VMS = 2
 GUEST_TREE = "~/cosca"
 CHECKPOINTS = ("start", "claimed", "locked", "counted", "cloned", "booted", "unlocked", "archived", "provisioned")
 PROVISION_SCRIPT = "scripts/devvm/provision/macos-rust.sh"
+# Read by .github/scripts/unattended-gui-elevation.py; written only by this driver, inside a guest.
+GUEST_MARKER = "/etc/cosca-devvm-guest"
 # Guest side of `fetch`: expands a leading `~/` in the guest, then tars the path. The `./` keeps the
 # name from being read as an option (`-x`) or, by bsdtar, as "copy entries from this archive" (`@x`).
 FETCH_SCRIPT = (
@@ -724,6 +726,13 @@ class MacosBackend:
             )
         if r.returncode != 0:
             raise UpError("provisioning failed")
+        marked = self.tart.exec(
+            name,
+            ["sudo", "sh", "-c", f"echo 'devvm guest' > {GUEST_MARKER}"],
+            gate=self._gate,
+        )
+        if marked.returncode != 0:
+            raise UpError("could not mark the guest as a devvm guest")
 
     def _archive_into_guest(self, name: str, sha: str) -> None:
         git = subprocess.Popen(

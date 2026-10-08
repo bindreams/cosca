@@ -50,8 +50,12 @@ the way [principles 9 and 10](docs/principles.md#9-tests-fail-loudly-and-never-s
 describe: `COSCA_TEST_<GROUP>=0` turns the group off (its tests report as ignored), and a
 system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To keep a group off
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
-table of `~/.cargo/config.toml`, except the presence gates in `tests/elevation.rs`
-(`COSCA_TEST_ELEVATION`, `_GUI`, `_RUN0`): `0` would enable them.
+table of `~/.cargo/config.toml`.
+
+`ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
+`osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
+`COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the `elevation_*` jobs in `.github/workflows/ci.yaml` do (passwords,
+polkit, `doas`).
 
 ### Tests that need root
 

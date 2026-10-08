@@ -86,3 +86,4 @@ test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_RO
 test_group!(CGROUP => cgroup, env = "COSCA_TEST_CGROUP", consent = "creates, kills and removes cgroup v2 leaves, runs process trees in them, and unshares file tables and mount namespaces to mount over them");
 test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attaches a tracer with ptrace to its own children as a debugger would, re-executes the test binary as that tracer (on macOS an ad-hoc signed copy with the debugger entitlement), and on Linux allows any process to trace its tracee");
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
+test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");

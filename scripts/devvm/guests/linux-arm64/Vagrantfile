@@ -49,4 +49,9 @@ Vagrant.configure("2") do |config|
     rsync__args: ["--archive", "--delete", "--chmod=D755,F444"]
 
   config.vm.provision "shell", path: "../../provision/linux-rust.sh", privileged: false
+
+  # Marks this machine as a devvm guest, which `.github/scripts/unattended-gui-elevation.py` requires before
+  # it weakens a machine's security. It lives here, in the guest's own provisioner, not in the reusable
+  # provisioning script, which could be run on a host.
+  config.vm.provision "shell", privileged: true, inline: "echo 'devvm guest' > /etc/cosca-devvm-guest"
 end

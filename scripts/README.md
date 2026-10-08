@@ -451,3 +451,35 @@ Each guest Vagrantfile works around this by loading
 middleware runs. This is loaded unconditionally (harmless on hosts where the bug doesn't
 reproduce) rather than gated behind a host check, since the same code path is used by every
 provider's forwarded-port handling, not just this tool's guests.
+
+## Unattended GUI elevation
+
+Tests of graphical elevation (`pkexec` with `Auth::Gui`, `osascript ... with administrator privileges`) wait
+for a person unless the machine is set up to approve them. CI's ELEVATION lanes call
+`.github/scripts/unattended-gui-elevation.py` for that. A developer can run the same setup in a devvm guest,
+never on their own machine: the script refuses unless the flag `--this-machine-is-disposable` is given and
+the machine is a GitHub-hosted runner or a devvm guest (marker file `/etc/cosca-devvm-guest`, written by the devvm
+driver when the guest is provisioned). Both are virtual machines. A container is not evidence of disposability: it is
+only as isolated as its mounts (a bind-mounted `/run/systemd/private`, `/etc/sudoers.d`, `/etc/polkit-1/rules.d`
+would reach the host), which a script cannot prove. One passes only on a disposable host (a job `container:` on a
+hosted runner inherits the runner's variables). On Linux and macOS the script must run as root and refuses otherwise.
+
+On Linux the script needs systemd as PID 1 and polkit 0.106 or later (JavaScript `rules.d`), and a `--user` that
+exists and is not root (polkit always authorizes root). It restarts `polkit.service`, then checks that the user can
+run `pkexec` with no agent; it refuses anything else before writing anything, and runs its commands with a scrubbed
+environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller). Today that means CI: devvm's Linux guests are
+Ubuntu 22.04 with polkit 0.105, which the script refuses, until they are upgraded.
+
+```sh
+# Linux guest: a polkit rule authorizes one account for every polkit action
+sudo python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user vagrant
+# macOS guest
+sudo python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+```
+
+On macOS this writes `system.privilege.admin allow`: **every account and process on the guest** gets
+administrator rights without authentication, not just one user.
+
+On a Windows guest do not use the script: provisioning resets the consent policy on every `up`, so use
+`devvm.py up windows-x64 --allow-elevation` (see [Windows guests](#windows-guests)), which sets
+`ConsentPromptBehaviorAdmin=0` and re-applies it each time.

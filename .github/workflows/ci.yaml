@@ -32,6 +32,8 @@ env:
   COSCA_TEST_SETUID: "0"
   # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
   COSCA_TEST_CGROUP: "0"
+  # The elevation tests gain real administrator or root privileges; only the three `elevation_*` jobs run them.
+  COSCA_TEST_ELEVATION: "0"
   # Windows groups. The drive-mapping test runs in one step below; the probes and canaries run
   # only in windows-probes.yaml.
   COSCA_TEST_DRIVE_MAPPING: "0"
@@ -86,7 +88,7 @@ jobs:
       - name: Test the signal forwarding and nextest wrapper scripts
         shell: bash
         working-directory: .github/scripts
-        run: python3 -m unittest -f forward_tests run_nextest_tests
+        run: python3 -m unittest -f forward_tests run_nextest_tests unattended_gui_elevation_tests
 
       # Forces pid reuse in a fresh PID namespace, so it needs root.
       - name: Test the signal forwarding script against pid reuse
@@ -603,6 +605,229 @@ jobs:
         if: (cancelled() || failure()) && matrix.os == 'darwin'
         timeout-minutes: 2
         run: ps -axo pid,ppid,pgid,stat,etime,command
+
+  # The ELEVATION group (`COSCA_TEST_ELEVATION`, off workflow-wide), selected by its label. Every runner here
+  # is an ephemeral VM, so the group consents. `-E binary(=elevation)`: the only binary with elevation tests;
+  # libtest binaries ignore `SKULD_LABELS` and would run whole.
+  elevation_linux:
+    name: Elevation (linux/amd64)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      COSCA_TEST_ELEVATION: "1"
+      COSCA_TEST_ELEVATION_CONSENT: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build tests
+        run: cargo nextest run --locked --no-run --features tokio --profile ci
+
+      # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
+      - name: Allow unattended GUI elevation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --check-only
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y polkitd pkexec opendoas
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER"
+
+      # `doas` lets the runner user run anything as root without a password (the `Backend::Doas` test).
+      - name: Provision doas
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf 'permit nopass %s as root\n' "$USER" | sudo tee /etc/doas.conf >/dev/null
+          doas -C /etc/doas.conf
+          test "$(doas -n id -u)" = 0
+
+      # Rules and password: see elevation-lane-sudoers.sh.
+      - name: Provision sudo
+        shell: bash
+        run: |
+          # No xtrace here: it would print the password before the mask takes effect.
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "COSCA_TEST_ELEVATION_PASSWORD=$password" >> "$GITHUB_ENV"
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/debug/cosca_testbin"
+
+      - name: Run elevation tests
+        timeout-minutes: 8
+        shell: bash
+        env:
+          SKULD_LABELS: elevation
+        run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --no-tests=fail -E 'binary(=elevation)'
+
+      - name: Check the JUnit result
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 9
+
+      - name: Remove the sudo rules
+        if: ${{ always() }}
+        shell: bash
+        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-linux-amd64
+
+      - name: Print the process table
+        if: cancelled() || failure()
+        timeout-minutes: 2
+        run: ps -eo pid,ppid,pgid,stat,etime,args
+
+  # macOS: the image grants `%admin NOPASSWD:ALL` to the runner user, so the tests run as a throwaway
+  # non-admin account (`coscaelev`), which that rule does not reach. `elevation-lane-sudoers.sh` gives it
+  # `sudo -n` for `id` and `cosca_testbin` only, and `whoami` asks the password the Stdin and Askpass tests
+  # deliver.
+  elevation_macos:
+    name: Elevation (darwin/arm64)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      COSCA_TEST_ELEVATION: "1"
+      COSCA_TEST_ELEVATION_CONSENT: "1"
+      SELECTION: binary(=elevation)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build tests
+        run: cargo nextest run --locked --no-run --features tokio --profile ci
+
+      - name: Allow unattended GUI elevation
+        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+
+      # The user runs a nextest archive extracted outside the checkout, which it can read.
+      - name: Archive the tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo nextest archive --locked --features tokio --archive-file "$RUNNER_TEMP/elevation.tar.zst"
+          mkdir -m 0777 "$RUNNER_TEMP/elevation-extract"
+          chmod -R a+rX "$PWD/target"
+          mkdir -p "$PWD/target/nextest/ci-elevation"
+          chmod -R a+rwX "$PWD/target/nextest"
+          d="$PWD"
+          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
+          sudo chmod -R a+rX "$HOME/.cargo/bin"
+          sudo chmod a+x "$RUNNER_TEMP"
+
+      # No xtrace: the password is handled here.
+      - name: Create the user and its sudo rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "COSCA_TEST_ELEVATION_PASSWORD=$password" >> "$GITHUB_ENV"
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --create-account coscaelev
+          # Listing extracts the archive, so the test binaries and `cosca_testbin` belong to the user.
+          sudo -u coscaelev -H "$(command -v cargo-nextest)" nextest list --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
+            --extract-to "$RUNNER_TEMP/elevation-extract" --workspace-remap "$PWD" > /dev/null
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable coscaelev "$RUNNER_TEMP/elevation-extract/target/debug/cosca_testbin"
+
+      - name: Run elevation tests
+        timeout-minutes: 8
+        shell: bash
+        # The forwarder runs as root (`sudo -E`), so the step's bound can signal the user's whole process tree.
+        run: |
+          exec python3 .github/scripts/run-nextest.py elevation sudo -E "$(command -v python3)" .github/scripts/forward.py \
+            sudo -u coscaelev -H env \
+            COSCA_TEST_ELEVATION=1 COSCA_TEST_ELEVATION_CONSENT=1 SKULD_LABELS=elevation \
+            COSCA_TEST_ELEVATION_PASSWORD="$COSCA_TEST_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
+            "$(command -v cargo-nextest)" nextest run --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
+            --extract-to "$RUNNER_TEMP/elevation-extract" --extract-overwrite --workspace-remap "$PWD" --no-tests=fail -E "$SELECTION"
+
+      - name: Check the JUnit result
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 8
+
+      - name: Remove the user and its sudo rules
+        if: ${{ always() }}
+        shell: bash
+        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup coscaelev
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-darwin-arm64
+
+      - name: Print the process table
+        if: cancelled() || failure()
+        timeout-minutes: 2
+        run: ps -axo pid,ppid,pgid,stat,etime,command
+
+  # Windows: see elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
+  elevation_windows:
+    name: Elevation (windows/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Allow unattended GUI elevation
+        shell: pwsh
+        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Archive the tests
+        shell: pwsh
+        run: cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$env:RUNNER_TEMP\elevation.tar.zst"
+
+      # Through run-nextest.ps1, which publishes the JUnit file (the `ci-elevation` profile). The throwaway administrator
+      # runs nextest from an archive extracted under C:\cosca-elevation-lane.
+      - name: Run elevation tests
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          NEXTEST_PROFILE: ci-elevation
+        run: ./.github/scripts/run-nextest.ps1 elevation pwsh -File ./.github/scripts/elevation-lane-windows.ps1 "$env:RUNNER_TEMP\elevation.tar.zst" (Get-Command cargo-nextest).Source
+
+      - name: Check the JUnit result
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 4
+
+      - name: Upload JUnit
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-windows-${{ matrix.arch }}
 
   # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
   # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest
