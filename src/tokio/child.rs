@@ -157,16 +157,23 @@ impl Child {
     /// [`kill_tree`](Self::kill_tree) adds, for a failed spawn, which kills and reaps the root
     /// separately. The root may already be reaped: when it is (this handle's own reap, the number
     /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
-    /// names the tree by the root's number runs, and the skipped action is returned as
-    /// `Ok(Some(action))`.
+    /// names the tree by the root's number runs, and why and what was skipped is returned as
+    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`).
     #[cfg(unix)]
     pub(super) fn kill_tree_members_unless_reaped(&self) -> Result<Option<String>, Error> {
-        let own_reap = self.os.proc.as_ref().is_none_or(ProcSource::is_reaped);
-        let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-        view.root_reaped |= self.os.root_reaped_elsewhere(own_reap);
+        let view = crate::containment::DropView::read(
+            self.id,
+            || {
+                self.os
+                    .proc
+                    .as_ref()
+                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+            },
+            &self.tree_killed,
+        );
         self.os
             .attached
-            .hard_kill_marking_unless_reaped(view, &self.tree_killed)
+            .hard_kill_marking_unless_reaped(&view, &self.tree_killed)
     }
 
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
@@ -888,6 +895,10 @@ mod child_drop_reaped_tests;
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/root_state_tests.rs"]
+mod root_state_tests;
+
 #[cfg(all(test, windows))]
 #[path = "child/windows_signal_tests.rs"]
 mod windows_signal_tests;
@@ -1001,11 +1012,15 @@ impl Drop for Child {
         #[cfg(unix)]
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         #[cfg(unix)]
-        let view = {
-            let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-            view.root_reaped |= os.root_reaped_elsewhere(own_reap);
-            view
-        };
+        let view = crate::containment::DropView::read(
+            self.id,
+            || {
+                os.proc
+                    .as_ref()
+                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+            },
+            &self.tree_killed,
+        );
         if self.kill_on_drop {
             // A live elevation front outside a cgroup is not signalled: it is left running, and
             // named.
@@ -1014,7 +1029,7 @@ impl Drop for Child {
                 crate::elevation::front::Gate::Closed(unkillable) => {
                     log::warn!("Child::drop: the elevated child is left running: {unkillable}");
                 }
-                _ => signal_on_drop(self.id, view, &mut os),
+                _ => signal_on_drop(self.id, &view, &mut os),
             }
             #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
@@ -1051,7 +1066,7 @@ fn kill_gate(
 /// The signals of a kill-on-drop drop: the tree, then the root.
 fn signal_on_drop(
     id: ProcessId,
-    #[cfg(unix)] view: crate::containment::DropView,
+    #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
 ) {

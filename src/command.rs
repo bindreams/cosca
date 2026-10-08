@@ -560,7 +560,10 @@ impl Command {
     /// that outlived the reaped root keeps running: call [`kill_tree`](crate::Child::kill_tree)
     /// **before** `wait()` to end it; once it has killed the tree completely, the skip is logged at
     /// `debug`. A root reaped by someone else is neither killed nor waited for by its number
-    /// either.
+    /// either. The evidence is the child's own handle (on Linux its pidfd), or the number no
+    /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
+    /// skipped and the warning names `RootState::Unknown`; the root itself is still killed through
+    /// its handle.
     ///
     /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
     /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable

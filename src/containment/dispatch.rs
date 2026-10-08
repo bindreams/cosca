@@ -156,10 +156,13 @@ impl Attachment {
 
 /// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct DropView {
     pub(crate) root_pid: u32,
-    /// The root has been reaped, so its number may name another process.
+    /// What the root's own handle says, read after the root's number.
+    pub(crate) root: crate::signal::RootState,
+    /// The root has been reaped, so its number may name another process: the handle says
+    /// `Reaped`, or the number no longer reads as this root.
     pub(crate) root_reaped: bool,
     /// This handle already killed the tree completely.
     pub(crate) tree_killed: bool,
@@ -167,11 +170,23 @@ pub(crate) struct DropView {
 
 #[cfg(unix)]
 impl DropView {
-    /// Read the state both `Child` drops decide on. `own_reap` is the handle's own knowledge
-    /// that it reaped the root; the root's number is read for the rest.
-    pub(crate) fn read(id: crate::identity::ProcessId, own_reap: bool, tree_killed: &TreeKilled) -> DropView {
+    /// Read the state both `Child` drops decide on: the root's number first, then `root`, the
+    /// handle's own answer ([`RootState`](crate::signal::RootState)). The handle is exact where the
+    /// number is not: a foreign reap followed by a same-tick reuse still reads as this root by its
+    /// start token.
+    pub(crate) fn read(
+        id: crate::identity::ProcessId,
+        root: impl FnOnce() -> crate::signal::RootState,
+        tree_killed: &TreeKilled,
+    ) -> DropView {
+        use crate::signal::RootState;
         let root_pid = id.pid();
         let now = crate::child::root_identity_now(root_pid);
+        let root = root();
+        if let RootState::Unknown(e) = &root {
+            log::warn!("Child::drop: RootState::Unknown: the root's ({root_pid}) own handle could not say whether it was reaped: {e}");
+        }
+        let own_reap = matches!(root, RootState::Reaped);
         if !own_reap && now.is_unknown() {
             log::debug!(
                 "Child::drop: the root's number ({root_pid}) could not be read; treating the root as not reaped"
@@ -180,7 +195,24 @@ impl DropView {
         DropView {
             root_pid,
             root_reaped: crate::child::root_reaped(own_reap, id, now),
+            root,
             tree_killed: tree_killed.is_set(),
+        }
+    }
+
+    /// Whether the root's number may name another process, or cannot be shown to name the root:
+    /// nothing that names the tree by that number may run.
+    pub(crate) fn number_untrusted(&self) -> bool {
+        self.root_reaped || matches!(self.root, crate::signal::RootState::Unknown(_))
+    }
+
+    /// Why [`number_untrusted`](Self::number_untrusted), for a log line or a note.
+    pub(crate) fn why_number_untrusted(&self) -> String {
+        match &self.root {
+            crate::signal::RootState::Unknown(e) if !self.root_reaped => {
+                format!("the root could not be shown to be unreaped (RootState::Unknown: {e})")
+            }
+            _ => "the root is already reaped".to_owned(),
         }
     }
 }
@@ -433,22 +465,35 @@ impl Attached {
     ///
     /// A skip logs a `warn` naming what it skipped and the remedy (`kill_tree()` before the reap),
     /// or a `debug` when this handle already killed the tree completely (`view.tree_killed`).
+    ///
+    /// The same skip, with the same warn, when the root's own handle could not say whether it is
+    /// reaped (`RootState::Unknown`): nothing then shows the number still names the root.
     #[cfg(unix)]
-    pub(crate) fn hard_kill_for_drop(&self, view: DropView) -> Result<(), crate::error::Error> {
-        let Some(skipped) = self.named_by_root_number(view.root_pid).filter(|_| view.root_reaped) else {
+    pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> Result<(), crate::error::Error> {
+        let Some(skipped) = self
+            .named_by_root_number(view.root_pid)
+            .filter(|_| view.number_untrusted())
+        else {
             return self.hard_kill();
         };
+        let why = view.why_number_untrusted();
         if view.tree_killed {
             log::debug!(
-                "Child::drop: the root is already reaped and this handle already killed the tree, \
+                "Child::drop: {why} and this handle already killed the tree, \
                  so this drop does not {skipped}"
             );
-        } else {
+        } else if view.root_reaped {
             log::warn!(
                 "Child::drop: the root is already reaped, so this drop does not {skipped}, \
                  whose number may now belong to an unrelated process. Descendants that outlived \
                  the reaped root are not torn down by this drop; call kill_tree() before wait() \
                  to end them (https://github.com/bindreams/cosca/issues/382)"
+            );
+        } else {
+            log::warn!(
+                "Child::drop: {why}, so this drop does not {skipped}, whose number may belong \
+                 to an unrelated process. Descendants of the root are not torn down by this drop; \
+                 call kill_tree() before wait() to end them"
             );
         }
         match self {
@@ -459,16 +504,20 @@ impl Attached {
     }
 
     /// [`hard_kill_marking`](Self::hard_kill_marking) for a handle that kills its tree while the
-    /// root may already be reaped: when it is, nothing that names the tree by the root's number
-    /// runs (see [`hard_kill_for_drop`](Self::hard_kill_for_drop)), and the skipped action is
-    /// returned as `Ok(Some(action))`. Otherwise the kill runs and is `Ok(None)` or its error.
+    /// root may already be reaped, or its handle could not say: then nothing that names the tree by
+    /// the root's number runs (see [`hard_kill_for_drop`](Self::hard_kill_for_drop)), the tree is
+    /// not marked killed, and why and what was skipped is returned as `Ok(Some(note))`. Otherwise
+    /// the kill runs and is `Ok(None)` or its error.
     #[cfg(unix)]
     pub(crate) fn hard_kill_marking_unless_reaped(
         &self,
-        view: DropView,
+        view: &DropView,
         killed: &TreeKilled,
     ) -> Result<Option<String>, crate::error::Error> {
-        let Some(skipped) = self.named_by_root_number(view.root_pid).filter(|_| view.root_reaped) else {
+        let Some(skipped) = self
+            .named_by_root_number(view.root_pid)
+            .filter(|_| view.number_untrusted())
+        else {
             return self.hard_kill_marking(killed).map(|()| None);
         };
         match self {
@@ -476,7 +525,10 @@ impl Attached {
             Attached::FdMarker(m) => m.hard_kill_holders_only()?,
             _ => {}
         }
-        Ok(Some(skipped))
+        Ok(Some(format!(
+            "{}, so its number may name another process, and the kill would {skipped}",
+            view.why_number_untrusted()
+        )))
     }
 
     /// Whether this child holds an actionable tree-teardown mechanism.

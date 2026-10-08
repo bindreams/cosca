@@ -52,6 +52,10 @@ mod kill_tree_view_tests;
 mod drop_reaped_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/root_state_tests.rs"]
+mod root_state_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
 pub(crate) mod front_kill_tests;
 
@@ -758,12 +762,12 @@ impl Drop for Child {
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
         //
-        // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
-        // this handle's own reap, or the number no longer reading as this root. A foreign reap
-        // landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
+        // On Unix, nothing that names the tree by the root's number runs once the root is reaped,
+        // or when its handle cannot say: the handle's own answer (`RootState`), or the number no
+        // longer reading as this root. A foreign reap landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
         // its number, until `teardown_on_drop` below.
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(self.id, self.proc.is_reaped(), &self.tree_killed);
+        let view = crate::containment::DropView::read(self.id, || self.proc.state(), &self.tree_killed);
         // A live elevation front outside a cgroup is not signalled: it is left running, unreaped,
         // and named.
         #[cfg(unix)]
@@ -772,7 +776,7 @@ impl Drop for Child {
             return;
         }
         #[cfg(unix)]
-        let tree = self.attached.hard_kill_for_drop(view);
+        let tree = self.attached.hard_kill_for_drop(&view);
         #[cfg(not(unix))]
         let tree = self.attached.hard_kill();
         if let Err(e) = &tree {

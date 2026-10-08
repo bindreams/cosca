@@ -1,7 +1,6 @@
 //! The signals cosca sends to a process it owns, and the one place each addressing mode's
 //! "already gone" is decided.
 
-#[cfg(unix)]
 use std::io;
 
 #[cfg(unix)]
@@ -38,6 +37,37 @@ pub(crate) enum Sent {
     Delivered,
     /// Nothing was delivered because the child is gone. Not an error; logged at `debug`.
     Gone,
+}
+
+/// Whether an owned child's root is still its own child to act on, as its own handle says.
+///
+/// One answer for every "is the root still ours?" question, so a drop, a walk and a failed-spawn
+/// cleanup cannot disagree about a root they all asked about.
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+pub(crate) enum RootState {
+    /// The root is an unreaped child (a zombie at worst): its pid names it, and a signal through
+    /// its handle reaches it.
+    Unreaped,
+    /// The root was reaped, by this handle or by someone else: its pid may name another process.
+    Reaped,
+    /// The handle could not say: a failed peek, or (macOS) a refused unique-id read. Treated as
+    /// neither reaped nor unreaped; callers skip what a reuse of the pid could redirect, and act
+    /// only through the handle.
+    Unknown(io::Error),
+}
+
+#[cfg(unix)]
+impl RootState {
+    /// What a peek through the root's own handle shows.
+    pub(crate) fn of_peek(peeked: io::Result<crate::wait::exit_only::Peek>) -> RootState {
+        use crate::wait::exit_only::Peek;
+        match peeked {
+            Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
+            Ok(Peek::Foreign(_)) => RootState::Reaped,
+            Err(e) => RootState::Unknown(e),
+        }
+    }
 }
 
 /// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit.

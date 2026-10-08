@@ -6,7 +6,7 @@
 use std::process::ExitStatus;
 
 use crate::error::Error;
-use crate::signal::{Sent, Sig};
+use crate::signal::{RootState, Sent, Sig};
 
 /// How [`ProcSource::wait_and_reap`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +178,7 @@ fn counted(child: ::tokio::process::Child) -> ::tokio::process::Child {
 
 /// Dropping a backend that nothing released or forgot (an unwind out of a caller does this) does
 /// the one safe thing: the untaken streams close with the fields, and tokio's `Child` goes to its
-/// own drop only if [`ProcSource::classify`] shows it ours, else it is forgotten. It is quiet where
+/// own drop only if [`ProcSource::state`] shows it ours, else it is forgotten. It is quiet where
 /// it matters: no `log` call while unwinding, since a logger that panics there aborts.
 ///
 /// Nothing is killed: the backend does not know whether the handle was armed.
@@ -191,7 +191,8 @@ impl Drop for ProcSource {
         let Some(child) = child.take() else {
             return;
         };
-        if self.classify(&child).0 == Ownership::Ours {
+        // A child tokio already reaped has nothing left to drop wrongly.
+        if child.id().is_none() || matches!(self.state_of(&child), RootState::Unreaped) {
             drop(counted(child));
         } else {
             std::mem::forget(child);
@@ -202,18 +203,6 @@ impl Drop for ProcSource {
             }
         }
     }
-}
-
-/// What a backend's own handle shows of its child.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ownership {
-    /// Running, or exited and unreaped, and named by the handle: tokio may reap it.
-    Ours,
-    /// Reaped by someone else: the pid may name another process by now.
-    Foreign,
-    /// The handle could not say (a failed peek, or no unique id to check): not tokio's to reap.
-    Unknown,
 }
 
 /// What waiting on a forgotten child answers: nothing of ours is left to wait for.
@@ -386,15 +375,15 @@ impl ProcSource {
         let Some(pid) = child.id() else {
             return Ok(());
         };
-        match self.classify(child) {
-            (Ownership::Ours, _) => Ok(()),
-            (Ownership::Foreign, _) => {
+        match self.state_of(child) {
+            RootState::Unreaped => Ok(()),
+            RootState::Reaped => {
                 self.forget_foreign();
                 Err(gone())
             }
-            (Ownership::Unknown, failed) => Err(Error::Unassessable {
+            RootState::Unknown(failed) => Err(Error::Unassessable {
                 detail: format!("pid {pid}: the child cannot be shown to be ours; it was not waited on"),
-                source: failed,
+                source: Some(failed),
             }),
         }
     }
@@ -502,50 +491,44 @@ impl ProcSource {
         }
     }
 
-    /// Whether the child's own handle shows it was reaped by someone else, or cannot show it is
-    /// ours, so tokio's `Child` must not be dropped (its drop reaps by pid, and the pid may name
-    /// another process by now): [`ownership`](Ownership) is not `Ours`. A child that cannot be
-    /// shown to be ours is logged, naming the failed peek if there was one.
-    ///
-    /// `false` for a child tokio itself already reaped, and for one already forgotten.
-    #[cfg(unix)]
-    pub(crate) fn reaped_elsewhere(&self) -> bool {
-        let ProcSource::Tokio { child, .. } = self else {
-            return false;
-        };
-        match self.classify(child) {
-            (Ownership::Ours, _) => false,
-            (Ownership::Foreign, _) => true,
-            (Ownership::Unknown, failed) => {
-                let pid = child.id().unwrap_or(0);
-                match failed {
-                    Some(e) => log::warn!("child {pid} cannot be shown to be ours: its peek failed: {e}"),
-                    None => log::warn!("child {pid} cannot be shown to be ours"),
-                }
-                true
-            }
-        }
-    }
-
-    /// Whether `child` (this backend's tokio `Child`, which may already be taken out of it) is ours,
-    /// reaped elsewhere, or neither can be shown, with the failed peek if there was one. Quiet: it
-    /// may run during an unwind.
+    /// Whether the root is still this backend's child to act on, from its own handle; see
+    /// [`RootState`]. Nothing is logged: it may run during an unwind.
     ///
     /// - **Linux:** a peek through the pidfd. Exact, with no start token to collide.
     /// - **macOS:** a peek that checks the pid's unique id, including that a running child's id can
     ///   be read ([`exit_only::peek_verified`](crate::wait::exit_only)). A child with no unique id
-    ///   (a spawn whose unique id was not adopted, see `adopted_id`): unknown.
+    ///   (a spawn whose unique id was not adopted, see `adopted_id`) is `Unknown`: its unique-id
+    ///   read was refused, and nothing shows the pid still names it.
+    /// - **Windows:** the process handle pins the process, so `Unreaped` until this handle reaped it.
     ///
-    /// A child tokio already reaped is `Ours`: nothing is left to drop wrongly.
-    #[cfg(unix)]
-    fn classify(&self, child: &::tokio::process::Child) -> (Ownership, Option<std::io::Error>) {
-        use crate::wait::exit_only::Peek;
-        let ProcSource::Tokio { .. } = self else {
-            return (Ownership::Foreign, None);
-        };
-        if child.id().is_none() {
-            return (Ownership::Ours, None);
+    /// A child tokio reaped (`id()` is `None`) and a forgotten backend are `Reaped`.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    pub(crate) fn state(&self) -> RootState {
+        match self {
+            #[cfg(unix)]
+            ProcSource::Foreign { .. } => RootState::Reaped,
+            ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped,
+            #[cfg(unix)]
+            ProcSource::Tokio { child, .. } => self.state_of(child),
+            #[cfg(windows)]
+            ProcSource::Tokio { .. } => RootState::Unreaped,
+            #[cfg(windows)]
+            ProcSource::Raw(r) if r.is_reaped() => RootState::Reaped,
+            #[cfg(windows)]
+            ProcSource::Raw(_) => RootState::Unreaped,
         }
+    }
+
+    /// [`state`](ProcSource::state) of a `Tokio` backend whose `child` may already be taken out of
+    /// it (the drop does that), for a child tokio has not reaped.
+    #[cfg(unix)]
+    fn state_of(
+        &self,
+        #[cfg_attr(target_os = "linux", allow(unused_variables))] child: &::tokio::process::Child,
+    ) -> RootState {
+        let ProcSource::Tokio { .. } = self else {
+            return RootState::Reaped;
+        };
         #[cfg(target_os = "linux")]
         let peeked = {
             let ProcSource::Tokio { pidfd, .. } = self else {
@@ -559,14 +542,37 @@ impl ProcSource {
                 unreachable!("checked above")
             };
             let (Some(pid), Some(identity)) = (child.id(), *identity) else {
-                return (Ownership::Unknown, None);
+                return RootState::Unknown(std::io::Error::other(
+                    "the child's unique id is unknown, so nothing shows its pid still names it",
+                ));
             };
             crate::wait::exit_only::peek_verified(&crate::wait::exit_only::Target::pid(pid, Some(identity)))
         };
-        match peeked {
-            Ok(Peek::Running | Peek::Exit(_)) => (Ownership::Ours, None),
-            Ok(Peek::Foreign(_)) => (Ownership::Foreign, None),
-            Err(e) => (Ownership::Unknown, Some(e)),
+        RootState::of_peek(peeked)
+    }
+
+    /// Whether the child's own handle shows it was reaped by someone else, or cannot show it is
+    /// ours, so tokio's `Child` must not be dropped (its drop reaps by pid, and the pid may name
+    /// another process by now): its [`state`](ProcSource::state) is not `Unreaped`. A child that
+    /// cannot be shown to be ours is logged, naming `RootState::Unknown` and the failed peek.
+    ///
+    /// `false` for a child tokio itself already reaped (`id()` is `None`), and for one already
+    /// forgotten.
+    #[cfg(unix)]
+    pub(crate) fn reaped_elsewhere(&self) -> bool {
+        let ProcSource::Tokio { child, .. } = self else {
+            return false;
+        };
+        let Some(pid) = child.id() else {
+            return false;
+        };
+        match self.state_of(child) {
+            RootState::Unreaped => false,
+            RootState::Reaped => true,
+            RootState::Unknown(e) => {
+                log::warn!("child {pid} cannot be shown to be ours: RootState::Unknown, its peek failed: {e}");
+                true
+            }
         }
     }
 

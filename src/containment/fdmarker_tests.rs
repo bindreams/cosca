@@ -1091,13 +1091,14 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     crate::log_capture::install();
     let view = crate::containment::DropView {
         root_pid: 4242,
+        root: crate::signal::RootState::Reaped,
         root_reaped: true,
         tree_killed: false,
     };
     let text = |marker| {
         let attached = crate::containment::Attached::FdMarker(marker);
         let mark = crate::log_capture::mark();
-        attached.hard_kill_for_drop(view).expect("the holders-only sweep");
+        attached.hard_kill_for_drop(&view).expect("the holders-only sweep");
         crate::log_capture::records_since_on_current_thread(mark, "Child::drop: the root is already reaped")
     };
 

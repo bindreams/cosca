@@ -679,11 +679,8 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         Ok(())
     });
     let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
-    if let Some(action) = skipped {
-        tree_note.push_str(&format!(
-            "; its contained tree was not killed: the root was already reaped, so its number may name another \
-             process, and the kill would {action}"
-        ));
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let root = match gate {
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),

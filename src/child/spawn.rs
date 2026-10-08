@@ -103,7 +103,7 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let view = crate::containment::DropView::read(child.id, child.proc.is_reaped(), &child.tree_killed);
+    let view = crate::containment::DropView::read(child.id, || child.proc.state(), &child.tree_killed);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -112,15 +112,12 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
-            .hard_kill_marking_unless_reaped(view, &child.tree_killed)
+            .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
             .map(|s| skipped = s)
     });
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
-    if let Some(action) = skipped {
-        tree_note.push_str(&format!(
-            "; its contained tree was not killed: the root was already reaped, so its number may name another \
-             process, and the kill would {action}"
-        ));
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let root = match gate {

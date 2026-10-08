@@ -39,12 +39,25 @@ impl ProcHandle {
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
     /// `Raw` (Windows) reads the process handle's signalled state: nothing is consumed there.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    #[cfg(test)]
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
             ProcHandle::Std(s) => s.is_reaped(),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.is_reaped(),
+        }
+    }
+
+    /// Whether the root is still this handle's child to act on; see [`RootState`](crate::signal::RootState).
+    /// `Raw` (Windows) holds the process handle for life: `Reaped` once it has exited.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        match self {
+            ProcHandle::Std(s) => s.state(),
+            #[cfg(windows)]
+            ProcHandle::Raw(r) if r.is_reaped() => crate::signal::RootState::Reaped,
+            #[cfg(windows)]
+            ProcHandle::Raw(_) => crate::signal::RootState::Unreaped,
         }
     }
 
