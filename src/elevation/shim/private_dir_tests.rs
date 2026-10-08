@@ -479,6 +479,7 @@ fn network_and_fuse_filesystems_are_refused() {
         (0xBEEF_DEAD, "StorNext"),
         (0x0131_11A8, "IBRIX"),
         (0x6163_6673, "ACFS"),
+        (0xA501_FCF5, "VxFS"),
     ];
     for (magic, name) in refused {
         assert_eq!(refused_filesystem(magic), Some(name));

@@ -61,12 +61,12 @@ fn mount_not_local(_: u32) -> bool {
 
 /// Filesystems whose permissions and ownership are decided by something other than this kernel's own
 /// view of local users: another host (NFS, SMB/CIFS, Ceph, AFS, kAFS, Coda, NCP, Lustre, GPFS,
-/// BeeGFS, PanFS, GFS2, OCFS2, StorNext, IBRIX, ACFS), a hypervisor or its guest tools (9p, vboxsf, prl_fs, vmhgfs), or a user-space
-/// daemon (FUSE). Neither the `0700` mode nor the rename protection the path check relies on holds
-/// there (root squashing, uid mapping, server-side policy), and Unix sockets are not reliable on
-/// them. The list follows coreutils' `stat.c` (`human_fstype`, which marks the same types remote or
-/// shared) for the types that fit that rule. Local filesystems, overlayfs and eCryptfs are not
-/// listed.
+/// BeeGFS, PanFS, GFS2, OCFS2, StorNext, IBRIX, ACFS, VxFS), a hypervisor or its guest tools (9p,
+/// vboxsf, prl_fs, vmhgfs), or a user-space daemon (FUSE). Neither the `0700` mode nor the rename
+/// protection the path check relies on holds there (root squashing, uid mapping, server-side
+/// policy), and Unix sockets are not reliable on them. The list follows coreutils' `stat.c`
+/// (`human_fstype`, which marks the same types remote or shared) for the types that fit that rule.
+/// Local filesystems, overlayfs and eCryptfs are not listed.
 const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x6969, "NFS"),
     (0x6573_5546, "FUSE"),
@@ -91,6 +91,7 @@ const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0xBEEF_DEAD, "StorNext"),
     (0x0131_11A8, "IBRIX"),
     (0x6163_6673, "ACFS"),
+    (0xA501_FCF5, "VxFS"),
 ];
 
 /// The name of the network or user-space filesystem `fs_type` is, if it is one the private directory
