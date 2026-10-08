@@ -133,8 +133,9 @@ fn shim_death_before_pdeathsig_is_119_and_never_execs() {
     let marker = tmp.path().join("ran");
     let mut run = rig.spawn(marker_program(&marker).inject(Inject::DieAfterFork).child_gate());
     let child = run.program_pid();
-    run.wait_for("child: waiting at gate");
-    run.wait_for("seam: shim exits after fork");
+    // The child writes its line, and may do so after the shim has gone.
+    run.wait_for_in_log("child: waiting at gate");
+    run.wait_for_in_log("seam: shim exits after fork");
     assert_eq!(run.wait_exit().code(), Some(118));
     // The shim is gone and its child, held at the gate, is ours now. It arms `PDEATHSIG` too late to
     // be told, sees that its parent is not the shim, and exits.

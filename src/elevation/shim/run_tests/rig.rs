@@ -505,6 +505,25 @@ impl Run {
         }
     }
 
+    /// Blocks until a line contains `needle`, ending only with the log itself: for a line that a
+    /// process other than the shim (its child, outliving it) writes, where the shim's exit says
+    /// nothing about whether the line is still to come. The log ends when every holder of its write
+    /// end has gone, and the shim has opened it by the time a test calls this.
+    pub(super) fn wait_for_in_log(&mut self, needle: &str) -> String {
+        loop {
+            self.log.drain();
+            if let Some(line) = self.log.lines.iter().find(|l| l.contains(needle)) {
+                return line.clone();
+            }
+            assert!(!self.log.eof, "the log ended without {needle:?}: {:#?}", self.log.lines);
+            let mut fds = [PollFd::new(&self.log.fifo, PollFlags::IN)];
+            match poll(&mut fds, None) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => panic!("poll: {e}"),
+            }
+        }
+    }
+
     /// Releases a gate once the shim is waiting at it.
     pub(super) fn release(&mut self, gate: Gate) {
         self.wait_for(&format!("gate: waiting at {}", gate.name()));
@@ -521,7 +540,7 @@ impl Run {
 
     /// Releases the child's gate once the child is waiting at it.
     pub(super) fn release_child(&mut self) {
-        self.wait_for("child: waiting at gate");
+        self.wait_for_in_log("child: waiting at gate");
         let fifo = self.child_gate.clone().expect("the child gate was requested");
         open_for_release(&fifo);
     }
