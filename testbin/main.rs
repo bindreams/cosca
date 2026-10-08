@@ -36,6 +36,7 @@ mod accept;
 #[path = "shim_hooks.rs"]
 mod shim_hooks;
 
+#[cfg(unix)]
 #[path = "setuid_stdin_block.rs"]
 mod setuid_stdin_block;
 
