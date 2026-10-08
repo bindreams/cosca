@@ -65,6 +65,11 @@ pub mod stdio;
 #[cfg(windows)]
 pub use containment::Job;
 pub use containment::{ContainMode, Containment};
+#[cfg(unix)]
+pub use elevation::shim::{init, installed};
+#[doc(hidden)]
+#[cfg(unix)]
+pub use elevation::shim::{init_with_test_hooks, Gate, Inject, ShimTestHooks};
 pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
 pub use graceful::GracefulMechanism;
 pub use stdio::{Fd, Stdio};
@@ -205,8 +210,18 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
     c
 }
 
+#[cfg(all(test, unix))]
+#[path = "../testbin/shim_hooks.rs"]
+mod shim_env_hooks;
+
 #[cfg(test)]
 fn main() {
+    // This binary is also the elevation shim in the shim's end-to-end tests: a process started with
+    // the shim's arguments runs it here and exits.
+    #[cfg(unix)]
+    init_with_test_hooks(&shim_env_hooks::HOOKS);
+    #[cfg(target_os = "linux")]
+    elevation::shim::owner_helper::run_if_requested();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

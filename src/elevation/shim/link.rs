@@ -191,6 +191,13 @@ impl ShimLink {
         self.shared.kill()
     }
 
+    /// A raw control byte to the shim (tests only).
+    #[cfg(test)]
+    pub(crate) fn send_control(&self, byte: u8) -> Result<(), Errno> {
+        self.check_owner().expect("the owner sends");
+        self.shared.send_control(byte)
+    }
+
     /// Blocks for the outcome. Call only after reaping the front: a still-pending start is refused
     /// here, so a late shim is answered `N`. A failure to wait leaves the outcome unset.
     pub(crate) fn wait(&self) -> Result<LinkOutcome, WaitError> {

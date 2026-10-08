@@ -172,7 +172,7 @@ impl Shared {
         let further = std::mem::replace(&mut inner.hello_seen, true);
         let path = self.sock_path.display();
         if inner.start == StartState::Pending {
-            match sys::send_byte(conn.as_fd(), Command::Allow.encode()) {
+            match sys::send_answer(conn.as_fd(), Command::Allow.encode()) {
                 Ok(()) => {
                     inner.start = StartState::Live;
                     let set = self.conn.set(conn);
@@ -198,7 +198,7 @@ impl Shared {
 
     /// Answers `N`; a failed send is only logged.
     pub(super) fn deny(&self, conn: &UnixStream) {
-        if let Err(e) = sys::send_byte(conn.as_fd(), Command::Deny.encode()) {
+        if let Err(e) = sys::send_answer(conn.as_fd(), Command::Deny.encode()) {
             log::debug!("cannot answer N at {}: {e}", self.sock_path.display());
         }
         self.probe.event(|| LinkEvent::Answered(Command::Deny));
@@ -326,6 +326,15 @@ impl Shared {
             outcome: inner.outcome,
             acceptor_failure: inner.failure,
         }
+    }
+
+    /// Writes `byte` to the shim's connection, whatever it is: the end-to-end tests send what
+    /// `terminate` and `detach` will (`T`, `D`), a ping, and bytes no one should send.
+    #[cfg(test)]
+    pub(super) fn send_control(&self, byte: u8) -> Result<(), Errno> {
+        let inner = self.lock();
+        assert_eq!(inner.start, StartState::Live, "a control byte needs a live shim");
+        sys::send_byte(self.conn.get().expect("Live has a connection").as_fd(), byte)
     }
 
     pub(super) fn kill(&self) -> Result<KillOutcome, KillError> {

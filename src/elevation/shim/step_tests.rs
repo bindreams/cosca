@@ -139,6 +139,19 @@ fn ping_with_test_hooks_pongs_only() {
 }
 
 #[skuld::test]
+fn a_signal_to_the_shim_kills_the_child_even_when_disarmed() {
+    let signaled = Events {
+        signaled: true,
+        ..Events::NONE
+    };
+    let mut armed = state();
+    assert_eq!(decide(&mut armed, &signaled), signal(ToChild::Kill));
+    let mut disarmed = state();
+    decide(&mut disarmed, &control(b'D'));
+    assert_eq!(decide(&mut disarmed, &signaled), signal(ToChild::Kill));
+}
+
+#[skuld::test]
 fn a_fired_child_is_reaped_and_forced_failure_is_lost() {
     let mut st = state();
     let exited = Events {

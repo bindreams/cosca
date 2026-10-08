@@ -248,6 +248,23 @@ pub(super) fn send_byte(conn: BorrowedFd<'_>, byte: u8) -> Result<(), Errno> {
     }
 }
 
+/// Sends the answer, `A` or `N`. Linux names cosca's pid, effective uid and effective gid explicitly
+/// (`SCM_CREDENTIALS`): the shim checks them against argv, and the kernel attaches only the real uid
+/// to a plain send, which a cosca whose real and effective uids differ would fail. macOS has the
+/// shim read cosca's token from the listener instead.
+pub(super) fn send_answer(conn: BorrowedFd<'_>, byte: u8) -> Result<(), Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::elevation::shim::creds::{send_with_credentials, Creds};
+        send_with_credentials(conn, byte, Creds::own_effective()).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock => Errno::AGAIN,
+            _ => Errno::from_io_error(&e).unwrap_or(Errno::IO),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    send_byte(conn, byte)
+}
+
 /// What one nonblocking read found.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Read {

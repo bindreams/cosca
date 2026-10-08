@@ -54,6 +54,8 @@ pub(crate) struct Events {
     pub(crate) owner_exited: bool,
     pub(crate) child_exited: bool,
     pub(crate) exec: ExecEvent,
+    /// A signal reached the shim (D8d): any signal stops the program.
+    pub(crate) signaled: bool,
     /// Test hook: supervision is forced to fail.
     pub(crate) forced_failure: bool,
 }
@@ -64,6 +66,7 @@ impl Events {
         owner_exited: false,
         child_exited: false,
         exec: ExecEvent::Nothing,
+        signaled: false,
         forced_failure: false,
     };
 }
@@ -103,6 +106,9 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
         if state.armed {
             actions.signal = Some(ToChild::Kill);
         }
+    }
+    if events.signaled {
+        actions.signal = Some(ToChild::Kill);
     }
     match events.control {
         Control::Nothing => {}
