@@ -70,7 +70,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y qemu-system-x86 busybox-static libvirt-dev dwarves
           pipx install "virtme-ng==${VIRTME_NG_VERSION}"
           # virtme-ng imports pkg_resources, which the runner's Python no longer ships.
-          pipx inject virtme-ng "setuptools==75.8.0"
+          pipx inject --force virtme-ng "setuptools==75.8.0"
 
       # The guest sees this checkout and the toolchain through the host's file system. The kernel is the
       # pre-built mainline one for the tag. `uname -r` is printed first and must name the tag.
