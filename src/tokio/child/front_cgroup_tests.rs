@@ -386,12 +386,12 @@ async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid
 #[skuld::test]
 async fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
     use crate::child::front_cgroup_tests::{assert_refused_unforked_naming, spawn_front_noting_fork};
-    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EOPNOTSUPP);
+    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::ENOSYS);
     let mut cmd = crate::command::Command::new();
     cmd.args(["cat"]).contain_with(ContainMode::Strongest);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let (result, forked) = spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
-    assert_refused_unforked_naming(result, forked, "CONFIG_FHANDLE");
+    assert_refused_unforked_naming(result, forked, "name_to_handle_at");
 }
 
 /// Async twin of the sync `cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does`.

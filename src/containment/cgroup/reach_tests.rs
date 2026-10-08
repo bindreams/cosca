@@ -342,15 +342,28 @@ fn a_refused_pidfd_info_refuses_naming_it() {
     }
 }
 
-/// A leaf whose cgroup id cannot be read (`name_to_handle_at` refused, as without `CONFIG_FHANDLE`)
-/// gives no place to compare with: the spawn is refused, naming that, before anything else.
+/// A host that gives no cgroup's id by `name_to_handle_at` (`ENOSYS` without `CONFIG_FHANDLE`,
+/// `EOPNOTSUPP` without export operations, `EPERM` from a seccomp filter) gives no place to
+/// compare with: the spawn is refused as unsupported, naming the errno, before anything else.
 #[skuld::test]
-fn a_leaf_whose_id_cannot_be_read_refuses_naming_it() {
-    match front_placement(|| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))) {
-        Err(crate::error::Error::Unsupported { detail, .. }) => {
-            assert!(detail.contains("CONFIG_FHANDLE"), "{detail}");
-            assert!(detail.contains("before anything is spawned"), "{detail}");
+fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
+    for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM] {
+        match front_placement(|| Err(std::io::Error::from_raw_os_error(errno))) {
+            Err(crate::error::Error::Unsupported { detail, .. }) => {
+                let named = std::io::Error::from_raw_os_error(errno).to_string();
+                assert!(detail.contains(&named), "{errno}: {detail}");
+                assert!(detail.contains("before anything is spawned"), "{errno}: {detail}");
+            }
+            other => panic!("{errno}: expected Unsupported, got {other:?}"),
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// Any other failure to read the leaf's id is the spawn's I/O error, not a claim about the host.
+#[skuld::test]
+fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
+    match front_placement(|| Err(std::io::Error::from_raw_os_error(libc::ENOMEM))) {
+        Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("leaf"), "{e}"),
+        other => panic!("expected Io, got {other:?}"),
     }
 }

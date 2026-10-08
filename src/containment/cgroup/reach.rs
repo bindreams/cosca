@@ -71,11 +71,11 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 
 /// Whether `/proc/<pid>/cgroup` names `leaf_path` (a unified-hierarchy path) or a cgroup under it
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
-/// and `placed` is the task's recorded place at the leaf's removal, if any.
+/// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 pub(crate) fn proc_names(
     leaf_path: &str,
     pid: u32,
-    placed: Option<&PlacedAtRemoval>,
+    recorded: impl FnOnce() -> Option<bool>,
     other_id: bool,
 ) -> io::Result<bool> {
     #[cfg(test)]
@@ -103,7 +103,7 @@ pub(crate) fn proc_names(
     let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
-    names_leaf(path, leaf_path, other_id, || placed.and_then(|placed| placed.of(pid)))
+    names_leaf(path, leaf_path, other_id, recorded)
 }
 
 /// What `/proc/<pid>/cgroup` prints after the path of a removed cgroup.
@@ -217,7 +217,7 @@ impl Subtree {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        proc_names(path, pid, Some(&self.placed), elsewhere).map_err(|e| {
+        proc_names(path, pid, || self.placed.of(pid), elsewhere).map_err(|e| {
             if elsewhere {
                 io::Error::new(
                     e.kind(),
@@ -291,17 +291,26 @@ fn dying_in(text: &str) -> Option<u64> {
 /// it, made non-dumpable (which it reports), then killed and reaped. Neither read depends on when the
 /// front would run: no front exists yet.
 ///
-/// First of all, the front's leaf must give its cgroup id (`leaf_id`, by `name_to_handle_at`,
-/// which a kernel built without `CONFIG_FHANDLE` refuses): every placement compares with it.
+/// First of all, the front's leaf must give its cgroup id (`leaf_id`, by `name_to_handle_at`):
+/// every placement compares with it. A kernel without `CONFIG_FHANDLE` answers `ENOSYS`, a
+/// filesystem with no export operations `EOPNOTSUPP`, and a seccomp filter may answer `EPERM`:
+/// each refuses the spawn as unsupported, naming the errno. Any other error is the spawn's `Io`.
 ///
-/// `Err` is the spawn's refusal: `Unsupported`, naming the cause.
+/// `Err` is the spawn's refusal: `Unsupported`, naming the cause, or `Io`.
 pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Result<(), crate::error::Error> {
     use std::os::fd::AsFd;
 
     if let Err(e) = leaf_id() {
-        return Err(unplaceable(format!(
-            "the leaf's cgroup id cannot be read (name_to_handle_at: {e}), as on a kernel without CONFIG_FHANDLE"
-        )));
+        return Err(match e.raw_os_error() {
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM) => unplaceable(format!(
+                "this host gives no cgroup's id by name_to_handle_at ({e}), as a kernel without CONFIG_FHANDLE, a \
+                 filesystem without export operations or a seccomp filter refuses it"
+            )),
+            _ => crate::error::Error::Io(crate::error::io_context(
+                "the cgroup id of the elevated front's leaf",
+                e,
+            )),
+        });
     }
     let own = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
         .map_err(|e| crate::error::Error::Io(crate::error::io_context("pidfd_open of this process", e.into())))?;

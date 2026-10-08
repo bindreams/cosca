@@ -418,6 +418,11 @@ impl CgroupLeaf {
     /// `rmdir` of the leaf, while the leaf's own path still reads without ` (deleted)` (see
     /// [`Subtree::holds`]).
     pub(crate) fn watch_front(&mut self, pid: u32) {
+        debug_assert!(
+            self.watched.is_none_or(|watched| watched == pid),
+            "a leaf watches one front: {:?}, then {pid}",
+            self.watched
+        );
         self.watched = Some(pid);
     }
 
@@ -425,11 +430,17 @@ impl CgroupLeaf {
     /// At an `rmdir` that succeeds, the leaf holds no live task, so a front recorded in it is past
     /// leaving its cgroup and can no longer be moved, and a front recorded outside it can no
     /// longer enter it: the record stays true once the leaf is gone.
+    ///
+    /// The leaf is live here, so its own path reads plainly: a front that reads it with ` (deleted)`
+    /// after it is in a live cgroup of that name beside it, and recorded outside. If the leaf is
+    /// already gone (removed by someone else), that path is undecidable, and nothing is recorded.
     fn record_watched_place(&self) {
         let (Some(pid), Some(path)) = (self.watched, &self.cgroup_path) else {
             return;
         };
-        match super::proc_names(path, pid, None, false) {
+        let live =
+            || !matches!(self.dir.open("cgroup.events", rustix::fs::OFlags::PATH), Err(e) if removed_after_drain(&e));
+        match super::proc_names(path, pid, || live().then_some(false), false) {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(
@@ -725,6 +736,16 @@ impl CgroupLeaf {
             placed: super::PlacedAtRemoval::default(),
             kill_attempt_failed: AtomicBool::new(false),
         }
+    }
+
+    /// Give a test leaf the unified-hierarchy path `/proc/<pid>/cgroup` prints for it.
+    pub(crate) fn set_cgroup_path_for_test(&mut self, path: String) {
+        self.cgroup_path = Some(path);
+    }
+
+    /// The record of the watched front's place, as the leaf's subtrees read it.
+    pub(crate) fn placed_for_test(&self) -> super::PlacedAtRemoval {
+        self.placed.clone()
     }
 
     /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.

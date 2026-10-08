@@ -139,8 +139,10 @@ fn kill_reads_the_front_its_spawn_found_not_its_report() {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
     child.set_elevation(report(ElevatedVia::Wrapped(Backend::Sudo)));
-    let _stdin = child.stdin().expect("stdin pipe");
+    let stdin = child.stdin().expect("stdin pipe");
     child.kill().expect("a child with no front is killed as any child");
+    // Closed first: a child nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 

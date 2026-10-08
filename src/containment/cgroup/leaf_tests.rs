@@ -2928,3 +2928,14 @@ fn end_child_refuses_inside_a_section() {
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::end_child(&received)));
     assert!(refused.is_err(), "end_child must refuse inside a bounded section");
 }
+
+/// A leaf watches one front: a second watch must name the same pid.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_leaf_watches_one_front() {
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::placeholder_for_test();
+    leaf.watch_front(7);
+    leaf.watch_front(7);
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| leaf.watch_front(8)));
+    assert!(second.is_err(), "a second front was watched");
+}

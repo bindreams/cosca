@@ -132,6 +132,16 @@ pub(crate) fn move_out_of_its_leaf(pid: u32) {
     std::fs::write(&procs, pid.to_string()).unwrap_or_else(|e| panic!("move {pid} into {procs}: {e}"));
 }
 
+/// The cgroup directory `pid` is in.
+pub(crate) fn cgroup_dir_of(pid: u32) -> String {
+    let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read the cgroup");
+    let path = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a cgroup v2 `0::` line");
+    format!("/sys/fs/cgroup{path}")
+}
+
 /// Moves `pid` from its leaf into a new cgroup beside it, named as the leaf with ` (deleted)` after
 /// it, as `/proc` prints the leaf once it is removed.
 pub(crate) fn move_into_a_namesake_of_its_leaf(pid: u32) {
@@ -485,6 +495,14 @@ pub(crate) fn failed_held_front_spawns(
         });
         // The spawn has returned from std, so the front has run its placement: it is in its leaf.
         // Both failures come after this point.
+        // A namesake front leaves the leaf empty, and an empty leaf is removed without a kill: a
+        // filler kept in it makes its kill land, so only the record answers for the front.
+        let (filler, filler_stdin) = if kill == LeafKill::MissesIntoNamesake {
+            let (filler, stdin) = spawn_as(cat(), SUDO);
+            (Some(Rc::new(filler)), Some(stdin))
+        } else {
+            (None, None)
+        };
         let _moved = match kill {
             LeafKill::MissesMovedFront => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
                 move_out_of_its_leaf(fault::spawn_pid())
@@ -492,9 +510,17 @@ pub(crate) fn failed_held_front_spawns(
             LeafKill::LandsNestedHidden => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
                 move_under_its_leaf(fault::spawn_pid());
             })),
-            LeafKill::MissesIntoNamesake => Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
-                move_into_a_namesake_of_its_leaf(fault::spawn_pid());
-            })),
+            LeafKill::MissesIntoNamesake => {
+                let filler = filler.clone();
+                Some(fault::set_at(fault::SpawnPoint::BeforeIdentity, move || {
+                    let pid = fault::spawn_pid();
+                    let leaf = cgroup_dir_of(pid);
+                    let filler = filler.as_ref().expect("a filler for the namesake case").id().pid();
+                    std::fs::write(format!("{leaf}/cgroup.procs"), filler.to_string())
+                        .unwrap_or_else(|e| panic!("move the filler into {leaf}: {e}"));
+                    move_into_a_namesake_of_its_leaf(pid);
+                }))
+            }
             LeafKill::Lands | LeafKill::Fails | LeafKill::LandsReadThroughProc => None,
         };
         let _missing = matches!(kill, LeafKill::LandsReadThroughProc | LeafKill::MissesIntoNamesake)
@@ -504,6 +530,14 @@ pub(crate) fn failed_held_front_spawns(
         force_arm(true);
         let result = spawn(&mut cmd);
         force_arm(false);
+        // The filler kept the leaf busy, so the leaf's removal killed through it: the kill landed.
+        if let Some((filler, _stdin)) = filler.as_ref().zip(filler_stdin) {
+            assert_eq!(
+                filler.wait().expect("wait").signal(),
+                Some(libc::SIGKILL),
+                "the leaf's kill"
+            );
+        }
         let err = result.expect_err("the forced arm fails the spawn");
         let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
             panic!("the seam must capture a resolved identity");
@@ -598,7 +632,10 @@ fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(
 }
 
 /// A failed spawn whose front was moved into a live cgroup named as `/proc` prints the removed leaf
-/// leaves it running: the place recorded before the leaf's removal says it was outside.
+/// leaves it running. A filler kept in the leaf makes the leaf's kill land, so nothing but the
+/// record tells the front from one the kill reached: before the leaf's removal, with the leaf live,
+/// the front read the leaf's path with ` (deleted)` after it, so it was recorded outside, and the
+/// record answers once the leaf is gone.
 #[skuld::test]
 fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::MissesIntoNamesake;
@@ -869,6 +906,48 @@ fn cgroup_a_front_behind_a_mount_under_its_leaf_is_placed_through_proc(#[fixture
     });
 }
 
+/// A leaf records its watched front's place just before its removal, while the leaf is live: a
+/// front in a live cgroup beside it named as `/proc` prints the removed leaf is recorded outside,
+/// and a front in the leaf itself, killed, inside.
+#[skuld::test]
+fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::cgroup::dir_walk_tests::Scratch;
+    let scratch = Scratch::new("record");
+    let cgroup_of = |path: &std::path::Path| {
+        format!(
+            "/{}",
+            path.strip_prefix("/sys/fs/cgroup")
+                .expect("under the cgroup root")
+                .display()
+        )
+    };
+    for in_leaf in [false, true] {
+        let leaf_path = scratch.make(&format!("leaf-{in_leaf}"));
+        let mut leaf = crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone());
+        leaf.set_cgroup_path_for_test(cgroup_of(&leaf_path));
+        let placed = leaf.placed_for_test();
+        let (front, stdin) = spawn_as(cat(), SUDO);
+        let pid = front.id().pid();
+        leaf.watch_front(pid);
+        let namesake = leaf_path.with_file_name(format!("leaf-{in_leaf} (deleted)"));
+        if in_leaf {
+            std::fs::write(leaf_path.join("cgroup.procs"), pid.to_string()).expect("move the front into the leaf");
+        } else {
+            std::fs::create_dir(&namesake).expect("make the namesake");
+            std::fs::write(namesake.join("cgroup.procs"), pid.to_string()).expect("move the front into the namesake");
+        }
+        // The leaf's drop kills what is in it, and removes it.
+        drop(leaf);
+        assert_eq!(placed.of(pid), Some(in_leaf), "in the leaf: {in_leaf}");
+        drop(stdin);
+        let status = front.wait().expect("wait");
+        assert_eq!(status.signal(), in_leaf.then_some(libc::SIGKILL), "{status:?}");
+        if !in_leaf {
+            std::fs::remove_dir(&namesake).expect("remove the namesake");
+        }
+    }
+}
+
 /// Spawns `cmd`, marked as an elevation-derived `sudo` front, through `spawn`, and returns its
 /// result with the pid it forked, if it reached its attach.
 pub(crate) fn spawn_front_noting_fork<T>(
@@ -926,16 +1005,16 @@ fn cgroup_an_unplaceable_front_is_refused_before_its_fork(#[fixture(cgroup)] _gr
     assert_refused_unforked(result, forked);
 }
 
-/// A host whose leaves give no cgroup id (`name_to_handle_at` refused, as on a kernel without
+/// A host whose leaves give no cgroup id (`name_to_handle_at` answers `ENOSYS` on a kernel without
 /// `CONFIG_FHANDLE`) cannot place a front after a cgroup kill: an elevated, cgroup-contained spawn
 /// is refused before anything is forked.
 #[skuld::test]
 fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
-    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EOPNOTSUPP);
+    let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::ENOSYS);
     let mut cmd = in_cgroup(cat());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn().map(drop));
-    assert_refused_unforked_naming(result, forked, "CONFIG_FHANDLE");
+    assert_refused_unforked_naming(result, forked, "name_to_handle_at");
 }
 
 /// The refusal is decided before the fork with fds 0 and 1 closed too, where std's spawn returns
