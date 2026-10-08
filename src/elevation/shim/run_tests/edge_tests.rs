@@ -46,9 +46,18 @@ fn fault_before_exec_kills_the_child_and_is_reported_as_its_status() {
     let marker = tmp.path().join("ran");
     let mut run = rig.spawn(marker_program(&marker).child_fault());
     run.wait_for("first byte: A");
-    assert_eq!(rig.link.link.wait().unwrap(), LinkOutcome::Exited(libc::SIGSEGV));
+    assert_eq!(killed_by(rig.link.link.wait().unwrap()), Some(libc::SIGSEGV));
     assert!(!marker.exists(), "the program ran");
     run.finish();
+}
+
+/// The signal a program died of, whether or not it dumped core (a core pattern that pipes to a handler
+/// can dump whatever the limit says).
+fn killed_by(outcome: LinkOutcome) -> Option<i32> {
+    match outcome {
+        LinkOutcome::Exited(status) if status & 0x7f != 0 => Some(status & 0x7f),
+        _ => None,
+    }
 }
 
 #[skuld::test]
