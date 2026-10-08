@@ -116,11 +116,15 @@ impl ShimLink {
         // so that a long `TMPDIR` cannot overflow `sun_path`.
         let bind_path = match sys::socket_path(&probe, &dir, SOCKET_NAME) {
             Ok(path) => path,
-            Err(source) => {
+            Err(sys::SocketPathError::Proc(source)) => {
                 let error = BindError::ProcUnusable {
                     tmpdir: tmp.to_owned(),
                     source,
                 };
+                return Err(fail(dir, error));
+            }
+            Err(sys::SocketPathError::Other(source)) => {
+                let error = io_err(&dir, source);
                 return Err(fail(dir, error));
             }
         };

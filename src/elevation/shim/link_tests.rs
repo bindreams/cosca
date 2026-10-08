@@ -441,7 +441,10 @@ fn a_proc_whose_descriptor_names_another_directory_is_refused() {
     let Err(error @ BindError::ProcUnusable { .. }) = super::ShimLink::bind_probed(tmp.path(), my_euid(), probe) else {
         panic!("a /proc that names another directory must refuse the bind");
     };
-    assert!(error.to_string().contains("/proc must be mounted"), "{error}");
+    assert!(
+        error.to_string().contains("is not this process's descriptor"),
+        "{error}"
+    );
     assert_eq!(
         std::fs::read_dir(&decoy).unwrap().count(),
         0,
@@ -484,4 +487,32 @@ fn the_socket_is_removed_through_the_directory_descriptor() {
         "the socket under its new name is removed"
     );
     assert_eq!(shim.read_byte(), Some(b'A'));
+}
+
+/// Running out of descriptors while opening through `/proc` is an I/O error, not a verdict on `/proc`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn emfile_opening_through_proc_is_an_io_error_not_a_proc_error() {
+    use super::super::link::BindError;
+    crate::log_capture::install();
+    let tmp = tempfile::tempdir().unwrap();
+    for (errno, is_proc) in [
+        (Errno::MFILE, false),
+        (Errno::NFILE, false),
+        (Errno::NOMEM, false),
+        (Errno::NOENT, true),
+        (Errno::NOTDIR, true),
+        (Errno::LOOP, true),
+        (Errno::ACCESS, true),
+    ] {
+        let (probe, _events) = super::probe::Probe::new();
+        probe.fail_proc_open(errno);
+        let bound = super::ShimLink::bind_probed(tmp.path(), my_euid(), probe);
+        match bound {
+            Err(BindError::ProcUnusable { .. }) => assert!(is_proc, "{errno:?}"),
+            Err(BindError::Io { .. }) => assert!(!is_proc, "{errno:?}"),
+            Err(other) => panic!("{errno:?}: {other}"),
+            Ok(_) => panic!("{errno:?} must fail the bind"),
+        }
+    }
 }

@@ -162,11 +162,16 @@ fn unknown_origin_in_the_original_stops_the_acceptor_and_removes_nothing() {
         tmp: _tmp,
     } = Rig::new();
     let dir = link.dir().to_owned();
+    let shared = link.shared.clone();
     link.owner.make_unreadable();
     drop(link);
-    // `drop` has returned, so its own event is already queued. Check it before waiting for the
-    // acceptor, which a missing stop byte would leave waiting for ever. The acceptor runs
-    // concurrently, so its events may come before or after.
+    // `drop` has returned, so its own event is already queued. The acceptor stops only on a stop
+    // request it can see, so check that before waiting for it: without one it would wait for ever.
+    // The acceptor runs concurrently, so its events may come before or after.
+    assert!(
+        shared.is_stopping(),
+        "the stop request is set before the byte is written"
+    );
     let mut seen = Vec::new();
     while !seen.iter().any(|e| matches!(e, LinkEvent::UnknownOriginHandled { .. })) {
         seen.push(next_acceptor_event(&events));

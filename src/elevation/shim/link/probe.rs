@@ -57,6 +57,9 @@ impl Probe {
     pub(super) fn event(&self, _: impl FnOnce() -> LinkEvent) {}
     pub(super) fn acceptor_gate(&self) {}
     pub(super) fn waiter_gate(&self) {}
+    pub(super) fn proc_open_error(&self) -> Option<rustix::io::Errno> {
+        None
+    }
     pub(super) fn proc_root(&self) -> std::path::PathBuf {
         "/proc".into()
     }
@@ -119,6 +122,7 @@ mod hooks {
         credential_failures: Mutex<usize>,
         listener_cloexec: Mutex<Option<bool>>,
         proc_root: Mutex<Option<std::path::PathBuf>>,
+        proc_open_error: Mutex<Option<Errno>>,
         panic_at_gate: AtomicBool,
         fds: Mutex<Vec<bool>>,
     }
@@ -151,6 +155,7 @@ mod hooks {
                 credential_failures: Mutex::new(0),
                 listener_cloexec: Mutex::new(None),
                 proc_root: Mutex::new(None),
+                proc_open_error: Mutex::new(None),
                 panic_at_gate: AtomicBool::new(false),
                 fds: Mutex::new(Vec::new()),
             };
@@ -218,6 +223,15 @@ mod hooks {
             *self
                 .hooks()
                 .settled_write_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(errno);
+        }
+
+        /// Opening the directory through `/proc` fails with `errno`.
+        pub(crate) fn fail_proc_open(&self, errno: Errno) {
+            *self
+                .hooks()
+                .proc_open_error
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(errno);
         }
@@ -345,6 +359,11 @@ mod hooks {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
+        }
+
+        pub(in crate::elevation::shim::link) fn proc_open_error(&self) -> Option<Errno> {
+            let h = self.0.as_ref()?;
+            h.proc_open_error.lock().unwrap_or_else(PoisonError::into_inner).take()
         }
 
         pub(in crate::elevation::shim::link) fn proc_root(&self) -> std::path::PathBuf {

@@ -53,6 +53,14 @@ const SEND_FLAGS: SendFlags = SendFlags::empty();
 #[cfg(not(target_os = "macos"))]
 const SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
 
+/// Why the socket's path could not be made.
+pub(super) enum SocketPathError {
+    /// `/proc` is not mounted, not this process's, or not readable.
+    Proc(io::Error),
+    /// Anything else (out of descriptors or memory).
+    Other(io::Error),
+}
+
 /// The path to bind the socket named `name` in `dir` at.
 ///
 /// Linux: through `/proc/thread-self/fd/<dir fd>` (`/proc/self` is the main thread's, which is wrong
@@ -61,24 +69,39 @@ const SEND_FLAGS: SendFlags = SendFlags::NOSIGNAL;
 /// not usable (not mounted, a different one mounted), that is the error, and there is no fallback to
 /// the long path.
 #[cfg(target_os = "linux")]
-pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
+pub(super) fn socket_path(probe: &Probe, dir: &PrivateDir, name: &str) -> Result<std::path::PathBuf, SocketPathError> {
     use std::os::fd::AsRawFd;
     let via_proc = probe
         .proc_root()
         .join(format!("thread-self/fd/{}", dir.dir_fd().as_raw_fd()));
-    let opened = rustix::fs::openat(
-        rustix::fs::CWD,
-        &via_proc,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    let (through_proc, own) = (rustix::fs::fstat(&opened)?, rustix::fs::fstat(dir.dir_fd())?);
+    let opened = match probe.proc_open_error() {
+        Some(injected) => Err(injected),
+        None => rustix::fs::openat(
+            rustix::fs::CWD,
+            &via_proc,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ),
+    };
+    let opened = opened.map_err(|e| {
+        // Only these say that `/proc` is not what it must be; running out of descriptors or memory
+        // is not about `/proc`.
+        if matches!(e, Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::ACCESS) {
+            SocketPathError::Proc(e.into())
+        } else {
+            SocketPathError::Other(e.into())
+        }
+    })?;
+    let (through_proc, own) = (
+        rustix::fs::fstat(&opened).map_err(|e| SocketPathError::Other(e.into()))?,
+        rustix::fs::fstat(dir.dir_fd()).map_err(|e| SocketPathError::Other(e.into()))?,
+    );
     if (through_proc.st_dev, through_proc.st_ino) != (own.st_dev, own.st_ino) {
-        return Err(io::Error::other(format!(
+        return Err(SocketPathError::Proc(io::Error::other(format!(
             "{} is not this process's descriptor {}",
             via_proc.display(),
             dir.dir_fd().as_raw_fd()
-        )));
+        ))));
     }
     Ok(via_proc.join(name))
 }
@@ -109,7 +132,7 @@ pub(super) fn full_path_fits(real_tmp: &Path, name: &str) -> Result<(), (usize, 
 
 /// macOS has no `bindat`, so the socket is bound at its full path.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn socket_path(_: &Probe, dir: &PrivateDir, name: &str) -> io::Result<std::path::PathBuf> {
+pub(super) fn socket_path(_: &Probe, dir: &PrivateDir, name: &str) -> Result<std::path::PathBuf, SocketPathError> {
     Ok(dir.path().join(name))
 }
 
