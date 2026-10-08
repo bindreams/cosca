@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::signals::{Inherited, FAULTS, TERMINATIONS};
-use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, Signal};
+use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted};
 use crate::elevation::shim::step::ToChild;
 
 /// A termination that reached the child before its `exec` (the first one).
@@ -273,11 +273,11 @@ unsafe fn child_body(p: &Prepared) -> ! {
     unsafe {
         libc::close(p.status_read);
         let mut record: libc::sigaction = std::mem::zeroed();
-        record.sa_sigaction = record_termination as usize;
+        record.sa_sigaction = record_termination as *const () as usize;
         record.sa_flags = libc::SA_RESTART;
         libc::sigfillset(&mut record.sa_mask);
         let mut noop: libc::sigaction = std::mem::zeroed();
-        noop.sa_sigaction = nothing as usize;
+        noop.sa_sigaction = nothing as *const () as usize;
         noop.sa_flags = libc::SA_RESTART;
         let mut default: libc::sigaction = std::mem::zeroed();
         default.sa_sigaction = libc::SIG_DFL;
@@ -368,7 +368,3 @@ impl Spawned {
         rustix::process::pidfd_send_signal(&self.pidfd, rustix_signal(to))
     }
 }
-
-/// Unused by the child: keeps [`Signal`] in the protocol's vocabulary for the report.
-#[allow(dead_code, reason = "documents the report's signal type")]
-type _ReportSignal = Signal;

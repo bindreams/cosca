@@ -27,15 +27,6 @@ pub enum Gate {
 }
 
 impl Gate {
-    #[doc(hidden)]
-    pub const ALL: [Gate; 5] = [
-        Gate::BeforeConnect,
-        Gate::BeforeIdentity,
-        Gate::AfterAnswer,
-        Gate::AfterFork,
-        Gate::BeforeLoop,
-    ];
-
     /// The name the shim's log gives the gate.
     #[doc(hidden)]
     pub fn name(self) -> &'static str {
@@ -69,16 +60,6 @@ pub enum Inject {
 }
 
 impl Inject {
-    #[doc(hidden)]
-    pub const ALL: [Inject; 6] = [
-        Inject::ForkFails,
-        Inject::PipeFails,
-        Inject::Clone3Enosys,
-        Inject::DieAfterFork,
-        Inject::StealReap,
-        Inject::ReapingHostThread,
-    ];
-
     #[doc(hidden)]
     pub fn name(self) -> &'static str {
         match self {

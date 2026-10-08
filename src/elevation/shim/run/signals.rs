@@ -104,7 +104,7 @@ pub(super) fn install(inherited: &Inherited, wake: RawFd) {
         };
         // SAFETY: an all-zero `sigaction` is valid; the handler is async-signal-safe.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = handler as usize;
+        action.sa_sigaction = handler as *const () as usize;
         action.sa_flags = libc::SA_RESTART;
         // SAFETY: `action.sa_mask` is a valid out-parameter.
         unsafe { libc::sigfillset(&mut action.sa_mask) };
