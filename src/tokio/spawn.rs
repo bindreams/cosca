@@ -663,7 +663,8 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         return Ok(child);
     };
     let view = child.read_root_view("finish_elevated");
-    view.warn_unsettled("finish_elevated", true, None);
+    // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
+    let mut leaked: Option<&'static str> = None;
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -685,6 +686,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let root_note = if view.unpinned_root() {
+        leaked = child.forget_unsettled();
         format!(
             "the elevated child was left alone, neither signalled nor waited on: {}",
             view.why_number_untrusted()
@@ -713,12 +715,17 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
             Err(e) => {
                 // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
-                child.proc_mut().forget_if_foreign();
+                if view.unsettled() {
+                    leaked = child.forget_unsettled();
+                } else {
+                    child.proc_mut().forget_if_foreign();
+                }
                 _ = child.try_wait();
                 format!("the elevated child could not be terminated ({e})")
             }
         }
     };
+    view.warn_unsettled("finish_elevated", true, leaked);
     // The error reports what the cleanup did and left; the handle it drops now is not the caller's.
     child.disarm_drop();
     Err(Error::Elevation {

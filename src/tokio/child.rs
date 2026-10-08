@@ -124,6 +124,15 @@ impl Child {
         }
     }
 
+    /// Forget tokio's `Child` for a root its handle cannot show is ours (`Unknown`, `Unpinned`),
+    /// without logging: the caller reports the forget in its one warn, with the leak this returns.
+    /// `None` if a second look shows the child ours after all, or it is already forgotten.
+    #[cfg(unix)]
+    pub(super) fn forget_unsettled(&mut self) -> Option<&'static str> {
+        let proc = self.os.proc.as_mut()?;
+        proc.reaped_elsewhere_quietly().then(|| proc.forget_foreign_quietly())
+    }
+
     /// Disarm the drop: for a failed spawn's cleanup, whose error reports what it did and left, so
     /// the handle it drops is not the caller's to be told about.
     #[cfg(unix)]

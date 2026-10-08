@@ -282,12 +282,23 @@ mod macos {
         (child, writer)
     }
 
-    /// Mutant: the holders-only sweep does not exclude the unpinned root.
+    /// Mutants: the holders-only sweep does not exclude the unpinned root; the sweep signals no
+    /// holder at all (the control fails).
     #[skuld::test]
     fn an_orphaned_root_in_a_session_tree_is_not_signalled_by_the_sweep() {
         crate::log_capture::install();
         let _groups = crate::containment::unix::fault::record_kill_group();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
+        // Control: a root that is a marker holder is swept when the handle says it is reaped, so
+        // the assertion below is not vacuous.
+        let (control, control_writer) = session_blocker();
+        let control_pid = control.id().pid();
+        let gone = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+        drop(control);
+        drop(gone);
+        drop(control_writer);
+        assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
+
         let (child, writer) = session_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();

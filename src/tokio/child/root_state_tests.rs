@@ -164,6 +164,35 @@ async fn a_disarmed_drop_with_an_unknown_root_does_not_claim_a_skipped_kill() {
     assert!(!warns[0].contains("does not"), "{warns:?}");
 }
 
+/// A failed spawn's cleanup whose root kill is refused, on an `Unknown` root: tokio's `Child` is
+/// forgotten once, under the one warn, which carries the leak.
+///
+/// Mutant: the refused-kill arm forgets with its own warn, besides the cleanup's.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
+    use crate::wait::exit_only::seams::force_peeks;
+
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (child, _writer) = session_blocker(true);
+    let mark = crate::log_capture::mark();
+    let _failed = force_peeks([failed_peek("forced"), failed_peek("forced")]);
+    let _kill = crate::tokio::child::fault::force_kill_failure();
+
+    let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+        .expect_err("the spawn fails");
+
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
+    assert!(
+        warns[0].starts_with("finish_elevated:")
+            && warns[0].contains("RootState::Unknown")
+            && warns[0].contains("leaks"),
+        "{warns:?}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
@@ -228,12 +257,22 @@ mod macos {
         (cmd.spawn().expect("spawn"), writer)
     }
 
-    /// Mutant: the holders-only sweep does not exclude the unpinned root.
+    /// Mutants: the holders-only sweep does not exclude the unpinned root; the sweep signals no
+    /// holder at all (the control fails).
     #[skuld::test]
     async fn an_orphaned_root_in_a_session_tree_is_not_signalled_by_the_sweep() {
         crate::log_capture::install();
         let _groups = crate::containment::unix::fault::record_kill_group();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
+        // Control: a root that is a marker holder is swept when the handle says it is reaped, so
+        // the assertion below is not vacuous.
+        let (control, _control_writer) = session_blocker();
+        let control_pid = control.id().pid();
+        let gone = force_peeks([Ok(Peek::Foreign(Foreign::Gone))]);
+        drop(control);
+        drop(gone);
+        assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
+
         let (child, _writer) = session_blocker();
         let pid = child.id().pid();
         let sends = Capture::start();
@@ -250,14 +289,17 @@ mod macos {
         );
     }
 
-    /// Mutant: `finish_elevated` signals and waits on the root regardless.
+    /// Mutants: `finish_elevated` signals and waits on the root regardless; it leaves the forget and
+    /// its warn to the drop of the handle (two warns, the leak in only one).
     #[skuld::test]
     async fn finish_elevated_leaves_an_orphaned_root_alone() {
         crate::log_capture::install();
         let (child, _writer) = walked_blocker();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        let _orphaned = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned))]);
+        // The cleanup's first look, then the second look of the drop of the handle it ends with.
+        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
@@ -266,6 +308,6 @@ mod macos {
         assert!(err.to_string().contains("left alone"), "{err}");
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].contains("launchd"), "{warns:?}");
+        assert!(warns[0].contains("launchd") && warns[0].contains("leaks"), "{warns:?}");
     }
 }
