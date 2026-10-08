@@ -160,9 +160,21 @@ impl Child {
     /// names the tree by the root's number runs, and why and what was skipped is returned as
     /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`).
     #[cfg(unix)]
-    pub(super) fn kill_tree_members_unless_reaped(&self) -> Result<Option<String>, Error> {
-        let view = crate::containment::DropView::read(
-            "finish_elevated",
+    pub(super) fn kill_tree_members_unless_reaped(
+        &self,
+        view: &crate::containment::DropView,
+    ) -> Result<Option<String>, Error> {
+        self.os
+            .attached
+            .hard_kill_marking_unless_reaped(view, &self.tree_killed)
+    }
+
+    /// What this child's own handle and the root's number say about the root, for a cleanup that
+    /// decides on both. Logs nothing about an unsettled root: the caller does, once.
+    #[cfg(unix)]
+    pub(super) fn read_root_view(&self, label: &str) -> crate::containment::DropView {
+        crate::containment::DropView::read(
+            label,
             self.id,
             &self.os.attached,
             || {
@@ -172,11 +184,7 @@ impl Child {
                     .map_or(crate::signal::RootState::Reaped, ProcSource::state)
             },
             &self.tree_killed,
-        );
-        view.warn_unsettled("finish_elevated", true, None);
-        self.os
-            .attached
-            .hard_kill_marking_unless_reaped(&view, &self.tree_killed)
+        )
     }
 
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its

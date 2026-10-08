@@ -231,6 +231,12 @@ impl DropView {
         self.root_reaped || self.unsettled()
     }
 
+    /// This process does not pin the root (macOS: launchd holds it), and nothing else shows it
+    /// reaped: its pid is not ours to signal or wait on.
+    pub(crate) fn unpinned_root(&self) -> bool {
+        !self.root_reaped && matches!(self.root, crate::signal::RootState::Unpinned(_))
+    }
+
     /// Whether the root itself is neither signalled nor waited on: it is reaped, or this process
     /// does not pin it (so its pid is not ours).
     pub(crate) fn leaves_root_alone(&self) -> bool {
@@ -567,7 +573,7 @@ impl Attached {
         }
         match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill_holders_only(),
+            Attached::FdMarker(m) => m.hard_kill_holders_only(view.unpinned_root().then(|| m.root())),
             _ => Ok(()),
         }
     }
@@ -591,7 +597,7 @@ impl Attached {
         };
         match self {
             #[cfg(target_os = "macos")]
-            Attached::FdMarker(m) => m.hard_kill_holders_only()?,
+            Attached::FdMarker(m) => m.hard_kill_holders_only(view.unpinned_root().then(|| m.root()))?,
             _ => {}
         }
         Ok(Some(format!(

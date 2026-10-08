@@ -391,7 +391,8 @@ async fn a_kill_on_drop_false_drop_of_an_armed_leaf_never_blocks() {
     assert!(!child.kill_on_drop, "the command opted out");
     let root = linux::Pidfd::of(&child);
     // The root stays alive: only the tree is killed.
-    child.kill_tree_members_unless_reaped().expect("kill the tree");
+    let view = child.read_root_view("test");
+    child.kill_tree_members_unless_reaped(&view).expect("kill the tree");
     let (steps, levels) = linux::dropped(child, name);
 
     assert_eq!(steps, ["rmdir populated 1", "kill"]);

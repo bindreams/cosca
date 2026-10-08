@@ -662,6 +662,8 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    let view = child.read_root_view("finish_elevated");
+    view.warn_unsettled("finish_elevated", true, None);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -669,7 +671,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
-        skipped = child.kill_tree_members_unless_reaped()?;
+        skipped = child.kill_tree_members_unless_reaped(&view)?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
         // naming a `wait_tree` the caller never gets.
@@ -682,32 +684,39 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
-    let root = match gate {
-        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate => child.kill_sent_gated(gate),
-    };
-    let root_note = match root {
-        Ok(Sent::Delivered) => {
-            child.wait_and_reap_blocking();
-            if exited_front {
-                "the elevated child had already exited, and was reaped".to_string()
-            } else {
-                "the elevated child was terminated".to_string()
+    let root_note = if view.unpinned_root() {
+        format!(
+            "the elevated child was left alone, neither signalled nor waited on: {}",
+            view.why_number_untrusted()
+        )
+    } else {
+        let root = match gate {
+            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+            gate => child.kill_sent_gated(gate),
+        };
+        match root {
+            Ok(Sent::Delivered) => {
+                child.wait_and_reap_blocking();
+                if exited_front {
+                    "the elevated child had already exited, and was reaped".to_string()
+                } else {
+                    "the elevated child was terminated".to_string()
+                }
             }
-        }
-        // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
-        // which may name another process by now.
-        Ok(Sent::Gone) if exited_front => {
-            "the elevated child had already exited, and was reaped by someone else".to_string()
-        }
-        Ok(Sent::Gone) => {
-            "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
-        }
-        Err(e) => {
-            // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
-            child.proc_mut().forget_if_foreign();
-            _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
+            // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
+            // which may name another process by now.
+            Ok(Sent::Gone) if exited_front => {
+                "the elevated child had already exited, and was reaped by someone else".to_string()
+            }
+            Ok(Sent::Gone) => {
+                "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
+            }
+            Err(e) => {
+                // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
+                child.proc_mut().forget_if_foreign();
+                _ = child.try_wait();
+                format!("the elevated child could not be terminated ({e})")
+            }
         }
     };
     // The error reports what the cleanup did and left; the handle it drops now is not the caller's.

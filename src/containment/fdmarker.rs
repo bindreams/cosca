@@ -803,6 +803,16 @@ use std::io;
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 
+/// What a sweep may do.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    /// Every channel: the group, the root's number, the ppid walk and the marker holders.
+    Full,
+    /// The marker holders alone, for a root whose number names no one reliably any more. `except`
+    /// is a holder to leave alone: the root, when this process does not pin it.
+    HoldersOnly { except: Option<ProcessId> },
+}
+
 /// The live marker for one contained tree.
 pub(crate) struct Marker {
     /// Held for the mechanism's whole life. See the module docs: this is what stops `handle`
@@ -944,8 +954,7 @@ impl Marker {
         self.pgid.is_some()
     }
 
-    /// The root the ppid walk starts from. Tests only.
-    #[cfg(test)]
+    /// The root the ppid walk starts from.
     pub(crate) fn root(&self) -> ProcessId {
         self.root
     }
@@ -1013,7 +1022,7 @@ impl Marker {
     /// surviving intact through this return value; see `sweep`'s own doc for where it is
     /// preserved.
     pub(crate) fn hard_kill(&self) -> Result<(), Error> {
-        self.hard_kill_impl(true)
+        self.hard_kill_impl(Scope::Full)
     }
 
     /// [`hard_kill`](Self::hard_kill) through the marker-holder channel alone. For a caller whose
@@ -1021,11 +1030,15 @@ impl Marker {
     /// the ppid walk from the root's pid all name their target by that number, which may now
     /// belong to an unrelated process, so none runs. A holder is named by the kernel object it
     /// holds, which no reuse of a pid number can change.
-    pub(crate) fn hard_kill_holders_only(&self) -> Result<(), Error> {
-        self.hard_kill_impl(false)
+    ///
+    /// `except` is a holder to leave alone: the root, when this process does not pin it (launchd
+    /// holds it), because signalling a process by a pid this process does not pin can hit whoever
+    /// reuses the pid.
+    pub(crate) fn hard_kill_holders_only(&self, except: Option<ProcessId>) -> Result<(), Error> {
+        self.hard_kill_impl(Scope::HoldersOnly { except })
     }
 
-    fn hard_kill_impl(&self, by_root_number: bool) -> Result<(), Error> {
+    fn hard_kill_impl(&self, scope: Scope) -> Result<(), Error> {
         self.check_read_end_still_valid()?;
         let mut seen: std::collections::HashSet<ProcessId> = std::collections::HashSet::new();
         // Folds together across every pass — see `sweep_pass`'s doc for why an earlier pass's
@@ -1047,7 +1060,7 @@ impl Marker {
                 &mut group_result,
                 &mut incomplete,
                 first_pass,
-                by_root_number,
+                scope,
             );
             first_pass = false;
             if !progressed {
@@ -1075,7 +1088,7 @@ impl Marker {
             &mut group_result,
             &mut incomplete,
             true,
-            true,
+            Scope::Full,
         );
         Self::finish_sweep(self.handle, group_result, incomplete)
     }
@@ -1247,8 +1260,13 @@ impl Marker {
         group_result: &mut Result<(), Error>,
         incomplete: &mut bool,
         first_pass: bool,
-        by_root_number: bool,
+        scope: Scope,
     ) -> bool {
+        let by_root_number = matches!(scope, Scope::Full);
+        let except = match scope {
+            Scope::HoldersOnly { except } => except,
+            Scope::Full => None,
+        };
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
         // `_ppid_denied` is intentionally NOT folded into `incomplete` — see this fn's doc.
@@ -1338,6 +1356,14 @@ impl Marker {
                     continue;
                 }
             };
+            if Some(id) == except {
+                log::debug!(
+                    "fd marker {:#x}: holder pid {} is not pinned by this process - not signaled",
+                    self.handle,
+                    h.pid
+                );
+                continue;
+            }
             if seen.insert(id) {
                 new_holders.push(id);
             }

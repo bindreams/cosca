@@ -127,43 +127,50 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let root = match gate {
-        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate => child.kill_sent_gated(gate),
-    };
-    let root_note = match root {
-        Ok(crate::signal::Sent::Gone) if exited_front => {
-            "the elevated child had already exited, and was reaped by someone else".to_string()
-        }
-        Ok(crate::signal::Sent::Gone) => {
-            "the elevated child could not be terminated (it was already reaped)".to_string()
-        }
-        Ok(crate::signal::Sent::Delivered) => {
-            #[cfg(test)]
-            fault::run_between_kill_and_wait();
-            match wait_killed_elevated(&child) {
-                Ok(_status) => {
-                    #[cfg(test)]
-                    fault::record_teardown_reap(child.id().pid(), _status);
-                    if exited_front {
-                        "the elevated child had already exited, and was reaped".to_string()
-                    } else {
-                        "the elevated child was terminated".to_string()
+    let root_note = if view.unpinned_root() {
+        format!(
+            "the elevated child was left alone, neither signalled nor waited on: {}",
+            view.why_number_untrusted()
+        )
+    } else {
+        let root = match gate {
+            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+            gate => child.kill_sent_gated(gate),
+        };
+        match root {
+            Ok(crate::signal::Sent::Gone) if exited_front => {
+                "the elevated child had already exited, and was reaped by someone else".to_string()
+            }
+            Ok(crate::signal::Sent::Gone) => {
+                "the elevated child could not be terminated (it was already reaped)".to_string()
+            }
+            Ok(crate::signal::Sent::Delivered) => {
+                #[cfg(test)]
+                fault::run_between_kill_and_wait();
+                match wait_killed_elevated(&child) {
+                    Ok(_status) => {
+                        #[cfg(test)]
+                        fault::record_teardown_reap(child.id().pid(), _status);
+                        if exited_front {
+                            "the elevated child had already exited, and was reaped".to_string()
+                        } else {
+                            "the elevated child was terminated".to_string()
+                        }
+                    }
+                    Err(e) if exited_front => {
+                        log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
+                        format!("the elevated child had already exited, but could not be reaped ({e})")
+                    }
+                    Err(e) => {
+                        log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
+                        format!("the elevated child was killed but could not be reaped ({e})")
                     }
                 }
-                Err(e) if exited_front => {
-                    log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child had already exited, but could not be reaped ({e})")
-                }
-                Err(e) => {
-                    log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child was killed but could not be reaped ({e})")
-                }
             }
-        }
-        Err(e) => {
-            _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
+            Err(e) => {
+                _ = child.try_wait();
+                format!("the elevated child could not be terminated ({e})")
+            }
         }
     };
     // The error reports what the cleanup did and left; the handle it drops now is not the caller's.

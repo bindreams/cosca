@@ -218,4 +218,54 @@ mod macos {
 
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
     }
+
+    fn session_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        cmd.contain_with(crate::ContainMode::Session);
+        (cmd.spawn().expect("spawn"), writer)
+    }
+
+    /// Mutant: the holders-only sweep does not exclude the unpinned root.
+    #[skuld::test]
+    async fn an_orphaned_root_in_a_session_tree_is_not_signalled_by_the_sweep() {
+        crate::log_capture::install();
+        let _groups = crate::containment::unix::fault::record_kill_group();
+        let holders = crate::containment::fdmarker::fault::record_holder_kills();
+        let (child, _writer) = session_blocker();
+        let pid = child.id().pid();
+        let sends = Capture::start();
+        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let _orphaned = force_peeks([orphaned(), orphaned()]);
+
+        drop(child);
+
+        assert_eq!(sends.entries(), vec![]);
+        assert!(
+            !holders.killed().contains(&pid),
+            "swept the root: {:?}",
+            holders.killed()
+        );
+    }
+
+    /// Mutant: `finish_elevated` signals and waits on the root regardless.
+    #[skuld::test]
+    async fn finish_elevated_leaves_an_orphaned_root_alone() {
+        crate::log_capture::install();
+        let (child, _writer) = walked_blocker();
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        let _orphaned = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+        let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+            .expect_err("the spawn fails");
+
+        assert_eq!(sends.entries(), vec![]);
+        assert!(err.to_string().contains("left alone"), "{err}");
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("launchd"), "{warns:?}");
+    }
 }

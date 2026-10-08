@@ -265,4 +265,64 @@ mod macos {
 
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
     }
+
+    /// A Session (fd-marker) tree: its holders-only sweep must not signal the root, which holds the
+    /// marker like any member but is not pinned by this process.
+    fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        cmd.contain_with(ContainMode::Session);
+        let child = cmd.spawn().expect("spawn");
+        assert!(
+            matches!(child.attached, crate::containment::Attached::FdMarker(_)),
+            "the test needs an fd marker"
+        );
+        (child, writer)
+    }
+
+    /// Mutant: the holders-only sweep does not exclude the unpinned root.
+    #[skuld::test]
+    fn an_orphaned_root_in_a_session_tree_is_not_signalled_by_the_sweep() {
+        crate::log_capture::install();
+        let _groups = crate::containment::unix::fault::record_kill_group();
+        let holders = crate::containment::fdmarker::fault::record_holder_kills();
+        let (child, writer) = session_blocker();
+        let pid = child.id().pid();
+        let sends = Capture::start();
+        let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+        drop(child);
+        drop(writer);
+
+        assert_eq!(sends.entries(), vec![]);
+        assert!(
+            !holders.killed().contains(&pid),
+            "swept the root: {:?}",
+            holders.killed()
+        );
+    }
+
+    /// A failed spawn's cleanup leaves an unpinned root alone, and its error says so.
+    ///
+    /// Mutant: `finish_elevated` signals and waits on the root regardless.
+    #[skuld::test]
+    fn finish_elevated_leaves_an_orphaned_root_alone() {
+        crate::log_capture::install();
+        let (child, writer) = walked_blocker();
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+        let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+            .expect_err("the spawn fails");
+        drop(writer);
+
+        assert_eq!(sends.entries(), vec![]);
+        assert!(err.to_string().contains("left alone"), "{err}");
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("launchd"), "{warns:?}");
+    }
 }

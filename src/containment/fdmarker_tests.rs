@@ -887,7 +887,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         true,
-        true,
+        super::Scope::Full,
     );
     drop(pass1_marker); // its scratch handle has no further use.
 
@@ -942,7 +942,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
         &mut group_result,
         &mut incomplete,
         false,
-        true,
+        super::Scope::Full,
     );
 
     // Keyed on THIS marker's handle, per the module docs' rule: the bare sentence is emitted by
