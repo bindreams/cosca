@@ -19,7 +19,7 @@ use crate::stdio::{Fd, Stdio};
 
 /// A valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`, ASCII only. A name
 /// with a comma / `=` / non-ASCII byte has no lossless place in `--preserve-env`'s
-/// comma-joined list or `--setenv=NAME=VALUE`.
+/// comma-joined list.
 fn valid_env_name(k: &OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let b = k.as_bytes();
@@ -55,8 +55,8 @@ fn preserve_env_flag(env: &[(OsString, OsString)]) -> Result<OsString, Error> {
 
 /// Build the full elevated argv. argv[0] is the injected ABSOLUTE `backend_path`.
 /// `env` MUST be pre-sanitized and sorted (see [`super::sanitize::EnvSanitizer::apply`]).
-/// `pkexec` and `run0` are told to run the program in the directory they are started in, as `sudo`
-/// and `doas` do unasked. Pure — no installed backend required.
+/// `pkexec` is told to run the program in the directory it is started in, as `sudo` and `doas` do
+/// unasked.
 pub(crate) fn build_argv(
     backend: Backend,
     backend_path: &OsStr,
@@ -100,25 +100,6 @@ pub(crate) fn build_argv(
                 !program_starts_with_dash(program),
                 "pkexec has no `--`; the structural gate refuses a leading-dash program"
             );
-        }
-        Backend::Run0 => {
-            argv.push("--pipe".into());
-            // `-D .`: run0 completes `.` against its own cwd.
-            argv.push("-D".into());
-            argv.push(".".into());
-            if matches!(auth, Auth::NonInteractive) {
-                argv.push("--no-ask-password".into());
-            }
-            for (k, v) in env {
-                if !valid_env_name(k) {
-                    return Err(unsupported_env_name(k));
-                }
-                let mut a = OsString::from("--setenv=");
-                a.push(k);
-                a.push("=");
-                a.push(v);
-                argv.push(a);
-            }
         }
         Backend::Auto => unreachable!("build_argv received unresolved Backend::Auto; the planner resolves Auto"),
     }
@@ -412,7 +393,6 @@ pub(crate) fn detect_with(
         elevated,
         has_tty: controlling_terminal_present(),
         available: BackendSet {
-            run0: on_path("run0"),
             sudo: on_path("sudo"),
             doas: on_path("doas"),
             pkexec,
@@ -638,15 +618,15 @@ fn checked_argv(cmd: &Command) -> Result<&[OsString], Error> {
 /// Program + args + directory for a POSIX backend: a `raw_executable()` program in the unelevated
 /// spawn's form ([`crate::resolve::exact::anchor_posix`] — `./tool`), and `current_dir()` as
 /// given, entered by the wrapper at `fork`. Reads nothing. Every backend runs the program in the
-/// directory it is started in: `sudo` and `doas` unasked, `pkexec` told `--keep-cwd` and `run0`
-/// `-D .` ([`build_argv`]).
+/// directory it is started in: `sudo` and `doas` unasked, `pkexec` told `--keep-cwd`
+/// ([`build_argv`]).
 ///
 /// `sudo` and `doas` read `./tool` against the directory object they inherited, after
 /// authenticating, so a rename of an ancestor during the prompt cannot swap the file loaded; an
 /// absolute path would be re-resolved then. Measured under `sudo -S`, blocked on its password
 /// while an ancestor was renamed and another tree moved into its place: the absolute path ran the
-/// substitute, `./tool` the original. `pkexec` and `run0` complete `./tool` against their cwd's
-/// path themselves, before authenticating, so under them that rename can still redirect it.
+/// substitute, `./tool` the original. `pkexec` completes `./tool` against its cwd's
+/// path itself, before authenticating, so under it that rename can still redirect it.
 ///
 /// A sudoers `runcwd` moves `sudo`'s child before the exec, and `./tool` is then read there —
 /// measured: `sudo: unable to execute ./tool: No such file or directory` under `runcwd=~`. That
@@ -704,7 +684,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
                 op: "elevating a leading-dash program under pkexec".into(),
                 platform: "unix",
                 detail: "pkexec cannot parse a `--` terminator, so a program starting with `-` would be taken \
-                         as a pkexec option; use sudo/doas/run0, or a path such as ./-x"
+                         as a pkexec option; use sudo/doas, or a path such as ./-x"
                     .into(),
             });
         }
@@ -713,8 +693,7 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
         return Err(Error::Unsupported {
             op: "fd >= 3 on an elevated POSIX child".into(),
             platform: "unix",
-            detail: "sudo/pkexec closefrom and run0's PID-1 reparent drop fds > 2; fd >= 3 needs the (deferred) broker"
-                .into(),
+            detail: "sudo/pkexec closefrom drops fds > 2; fd >= 3 needs the (deferred) broker".into(),
         });
     }
     let ops = cmd.env_ops();
@@ -732,15 +711,6 @@ fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) 
             platform: "unix",
             detail: "doas and pkexec expose no environment-forwarding mechanism; .env()/.envs() cannot cross them"
                 .into(),
-        });
-    }
-    if backend == Backend::Run0 && cmd.contain_request().mode.is_some() {
-        return Err(Error::Unsupported {
-            op: ".contain() + Backend::Run0".into(),
-            platform: "unix",
-            detail:
-                "run0 runs the target as a PID 1-parented transient unit outside our cgroup; containment cannot span it"
-                    .into(),
         });
     }
     if matches!(auth, Auth::Stdin(_)) && cmd.fds().contains_key(&Fd::STDIN) {
@@ -894,12 +864,13 @@ pub(crate) fn rewrite_with_host_and_cwd(
 
             // --- build the DERIVED command (the caller's Command stays intact) ---
             let mut new_ops: Vec<EnvOp> = Vec::new();
-            if backend == Backend::Sudo {
-                // sudo preserves these from its OWN env (named in --preserve-env); run0
-                // carried them in argv already; doas/pkexec were rejected above.
-                for (k, v) in &kept {
-                    new_ops.push(EnvOp::Set(k.clone(), v.clone()));
-                }
+            // sudo preserves these from its OWN env (named in --preserve-env); doas/pkexec were rejected above.
+            debug_assert!(
+                kept.is_empty() || backend == Backend::Sudo,
+                "only sudo forwards env; {backend:?} with a non-empty env was rejected above"
+            );
+            for (k, v) in &kept {
+                new_ops.push(EnvOp::Set(k.clone(), v.clone()));
             }
             if let Auth::Askpass(p) = &auth {
                 new_ops.push(EnvOp::Set(OsString::from("SUDO_ASKPASS"), p.as_os_str().to_os_string()));

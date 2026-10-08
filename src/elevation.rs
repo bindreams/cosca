@@ -1,5 +1,5 @@
 //! Cross-platform privilege elevation. Elevation wraps the CHILD (a
-//! `sudo`/`run0`/`doas`/`pkexec` prefix on POSIX; `ShellExecuteEx("runas")` on
+//! `sudo`/`doas`/`pkexec` prefix on POSIX; `ShellExecuteEx("runas")` on
 //! Windows), never the calling process.
 
 use std::ffi::OsString;
@@ -155,14 +155,12 @@ pub fn is_elevated() -> bool {
 }
 
 /// Which elevation program runs. `Auto` (default) detects among the CLI backends
-/// only — order `sudo` > `doas`. `run0` and `pkexec`/graphical elevation are
-/// explicit-only (`run0` spawns a PID-1-parented unit, not a descendant of the caller; a
+/// only — order `sudo` > `doas`. `pkexec`/graphical elevation is explicit-only (a
 /// library must not pop a polkit dialog unbidden).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]
     Auto,
-    Run0,
     Sudo,
     Doas,
     /// Requires Linux and polkit 121 or later (`pkexec --keep-cwd`); an older pkexec takes the flag
@@ -208,7 +206,7 @@ pub enum Auth {
 #[non_exhaustive]
 pub enum ElevatedStdio {
     /// POSIX: the child's stdio (fds 0-2) is wired exactly as the `Command`
-    /// configured it (`sudo`/`run0`/`doas`/`pkexec` pass those fds straight
+    /// configured it (`sudo`/`doas`/`pkexec` pass those fds straight
     /// through). fd >= 3 on an elevated POSIX child is `Unsupported`, not
     /// silently dropped.
     Passthrough,

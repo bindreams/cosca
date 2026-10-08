@@ -49,7 +49,7 @@ pub struct Payload {
 }
 
 /// How long a live payload may take to echo a handshake byte before the test calls it broken. A
-/// failure bound on a peer's response (an elevated payload is reached through sudo, doas, run0
+/// failure bound on a peer's response (an elevated payload is reached through sudo, doas
 /// or `runas`); a working payload answers at once and success never waits on it.
 const ECHO_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 

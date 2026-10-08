@@ -128,46 +128,6 @@ fn doas_noninteractive_no_env_emits_dash_n() {
 }
 
 #[skuld::test]
-fn run0_forces_pipe_and_forwards_env_via_setenv() {
-    let argv = build_argv(
-        Backend::Run0,
-        OsStr::new("/usr/bin/run0"),
-        &Auth::NonInteractive,
-        OsStr::new("id"),
-        &[],
-        &env(&[("A", "1"), ("B", "2")]),
-    )
-    .unwrap();
-    assert_eq!(
-        argv,
-        s(&[
-            "/usr/bin/run0",
-            "--pipe",
-            "-D",
-            ".",
-            "--no-ask-password",
-            "--setenv=A=1",
-            "--setenv=B=2",
-            "--",
-            "id"
-        ])
-    );
-}
-
-#[skuld::test]
-fn run0_rejects_an_unforwardable_env_name() {
-    let r = build_argv(
-        Backend::Run0,
-        OsStr::new("/usr/bin/run0"),
-        &Auth::NonInteractive,
-        OsStr::new("id"),
-        &[],
-        &env(&[("A=B", "1")]),
-    );
-    assert!(matches!(r, Err(crate::error::Error::Unsupported { .. })));
-}
-
-#[skuld::test]
 fn pkexec_gui_disables_internal_agent_and_uses_no_terminator() {
     // No `--` for pkexec (its option loop mis-parses it); --disable-internal-agent pins
     // the graphical-only contract.
@@ -212,21 +172,6 @@ fn pkexec_takes_a_program_with_equals_as_written() {
             "/opt/we=ird"
         ])
     );
-}
-
-/// `-D .` names the directory run0 is started in: run0 makes it absolute against its own cwd.
-#[skuld::test]
-fn run0_keeping_its_cwd_is_told_so() {
-    let argv = build_argv(
-        Backend::Run0,
-        OsStr::new("/usr/bin/run0"),
-        &Auth::Interactive,
-        OsStr::new("./tool"),
-        &[],
-        &[],
-    )
-    .unwrap();
-    assert_eq!(argv, s(&["/usr/bin/run0", "--pipe", "-D", ".", "--", "./tool"]));
 }
 
 #[skuld::test]
@@ -374,7 +319,6 @@ mod rewrite_tests {
             elevated: false,
             has_tty: true,
             available: BackendSet {
-                run0: None,
                 sudo: Some(PathBuf::from("/usr/bin/sudo")),
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
@@ -466,7 +410,6 @@ mod rewrite_tests {
     fn doas_or_pkexec_with_env_is_unsupported() {
         let doas_host = Host {
             available: BackendSet {
-                run0: None,
                 sudo: None,
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
@@ -486,7 +429,6 @@ mod rewrite_tests {
 
         let pk_host = Host {
             available: BackendSet {
-                run0: None,
                 sudo: None,
                 doas: None,
                 pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
@@ -503,34 +445,6 @@ mod rewrite_tests {
             rewrite_with_host(&mut c2, &pk_host),
             Err(Error::Unsupported { .. })
         ));
-    }
-
-    #[skuld::test]
-    fn run0_forwards_env_via_setenv() {
-        let host = Host {
-            available: BackendSet {
-                run0: Some(PathBuf::from("/usr/bin/run0")),
-                sudo: None,
-                doas: None,
-                pkexec: None,
-                osascript: None,
-            },
-            ..sudo_host()
-        };
-        let mut c = Command::new();
-        c.args(["id"])
-            .env("A", "1")
-            .elevation_backend(Backend::Run0)
-            .elevation_auth(Auth::NonInteractive);
-        let rw = rewrite_with_host(&mut c, &host).expect("rewrite");
-        assert!(derived_argv(&rw).contains(&OsString::from("--setenv=A=1")));
-        assert!(!rw
-            .derived
-            .as_ref()
-            .unwrap()
-            .env_ops()
-            .iter()
-            .any(|o| matches!(o, EnvOp::Set(k, _) if k == "A")));
     }
 
     #[skuld::test]
@@ -591,29 +505,6 @@ mod rewrite_tests {
         c.fd(3, Stdio::pipe_out()).unwrap();
         assert!(matches!(
             rewrite_with_host(&mut c, &sudo_host()),
-            Err(Error::Unsupported { .. })
-        ));
-    }
-
-    #[skuld::test]
-    fn run0_plus_contain_is_unsupported() {
-        let host = Host {
-            available: BackendSet {
-                run0: Some(PathBuf::from("/usr/bin/run0")),
-                sudo: None,
-                doas: None,
-                pkexec: None,
-                osascript: None,
-            },
-            ..sudo_host()
-        };
-        let mut c = Command::new();
-        c.args(["id"])
-            .elevation_backend(Backend::Run0)
-            .elevation_auth(Auth::NonInteractive)
-            .contain();
-        assert!(matches!(
-            rewrite_with_host(&mut c, &host),
             Err(Error::Unsupported { .. })
         ));
     }
@@ -705,7 +596,6 @@ mod rewrite_tests {
                 .elevation_auth(Auth::NonInteractive);
             let doas_host = Host {
                 available: BackendSet {
-                    run0: None,
                     sudo: None,
                     doas: Some(PathBuf::from("/usr/bin/doas")),
                     pkexec: None,
@@ -805,7 +695,6 @@ mod rewrite_tests {
             elevated,
             has_tty: false,
             available: BackendSet {
-                run0: None,
                 sudo: Some(PathBuf::from("/usr/bin/sudo")),
                 doas: None,
                 pkexec: None,
@@ -925,10 +814,9 @@ mod rewrite_tests {
         assert_eq!(rw.backend_path, Some(PathBuf::from("/usr/bin/sudo")));
     }
 
-    /// The elevation rewrite must carry the marker suppression onto the derived command, or the
-    /// derived `sudo …` spawn would install a marker its own wrapper immediately destroys.
-    /// `.contain()` + `Backend::Sudo` is NOT structurally rejected (only `Run0` is), so this path
-    /// is reachable and must be tested through the REAL rewrite, not just the setter/getter pair.
+    /// The rewrite must carry the marker suppression onto the derived command, or the derived `sudo …`
+    /// spawn would install a marker its own wrapper immediately destroys. Test it through the real
+    /// rewrite, not just the setter/getter pair.
     #[skuld::test]
     fn rewrite_suppresses_the_fd_marker_on_the_derived_command_while_keeping_containment() {
         let mut c = Command::new();

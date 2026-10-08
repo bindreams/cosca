@@ -5,8 +5,7 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 
 /// Loader/injection footguns that would otherwise be re-injected past `ld.so`'s
-/// setuid scrub (load-bearing for run0's `--setenv`, defense-in-depth for sudo's
-/// `--preserve-env`). Prefix families are matched in [`is_denied`].
+/// setuid scrub (defense-in-depth for sudo's `--preserve-env`). Prefix families are matched in [`is_denied`].
 pub(crate) const DEFAULT_DENYLIST: &[&str] = &[
     "IFS",
     "BASH_ENV",

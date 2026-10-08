@@ -241,7 +241,7 @@ impl Command {
     /// trigger is unavailable here), `std::process::Command` otherwise. Either way — `ShellExecuteEx`, or either
     /// already-elevated fallback — `elevate()` refuses anything but a fully qualified `.exe`/`.com` before that
     /// matters, so a bare or relative `executable` never reaches a search on the `elevate()` path at all. (On
-    /// POSIX, `elevate` goes through one of the POSIX elevation backends — `sudo`, `doas`, `run0`, `pkexec`,
+    /// POSIX, `elevate` goes through one of the POSIX elevation backends — `sudo`, `doas`, `pkexec`,
     /// `osascript` — none of which is `CreateProcessW`, so this rule, specific to Windows's raw backend, has
     /// nothing to resolve there either.)
     ///
@@ -396,10 +396,9 @@ impl Command {
     ///
     /// Every elevation backend derives the child's `argv[0]` from the program it is handed
     /// (`ShellExecuteEx`'s `lpFile`, the POSIX backends' and `osascript`'s exec): `./tool` under
-    /// `sudo`, `doas` and `osascript`; the path run0 completes `./tool` to (`/dir/tool`, measured on
-    /// 257–259); and the completed absolute path under `ShellExecuteEx`. `pkexec` refuses a relative
-    /// `raw_executable()` (see [`elevate`](Self::elevate)), and an absolute one is its `argv[0]` as
-    /// given. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
+    /// `sudo`, `doas` and `osascript`, and the completed absolute path under `ShellExecuteEx`. `pkexec`
+    /// refuses a relative `raw_executable()` (see [`elevate`](Self::elevate)), and an absolute one is
+    /// its `argv[0]` as given. So `raw_executable("tool").args(["tool"])` yields `argv[0] == "tool"`
     /// only unelevated, or from an already-elevated caller, which runs no backend and spawns
     /// with argv verbatim. Handing a backend the bare name instead would let it search for the
     /// image.
@@ -785,7 +784,6 @@ impl Command {
     ///
     /// - `sudo` and `doas` keep it by default; a sudoers `runcwd` moves `sudo`'s child —
     ///   measured, sudo 1.9.5–1.9.17 with `runcwd=~` ran it in `/root`.
-    /// - `run0` is passed `-D .`, its working-directory option (measured, systemd 257 and 259).
     /// - `pkexec` is passed `--keep-cwd`, and so requires Linux and polkit 121 or later; see
     ///   [`Backend::Pkexec`](crate::elevation::Backend::Pkexec).
     ///
@@ -795,8 +793,6 @@ impl Command {
     /// - `sudo` and `doas` are handed `./tool`, and read it against the directory they inherited,
     ///   after authenticating, so a rename of an ancestor during authentication cannot swap the
     ///   file; under a sudoers `runcwd`, `./tool` is not found.
-    /// - `run0` is handed `./tool` and completes it against its cwd's path before authenticating,
-    ///   so such a rename can redirect it.
     /// - `osascript`'s trampoline carries no cwd, so its shell `cd -P`s to the directory as an
     ///   absolute path completed against this process's cwd (read once), and runs `./tool` there.
     ///   A cwd with no usable path fails the spawn: an unlinked directory with `NotFound`, an

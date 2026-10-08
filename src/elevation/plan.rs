@@ -47,7 +47,6 @@ pub(crate) fn is_macos_gui_auto(os: Os, backend: Backend, auth: &Auth) -> bool {
 /// the validated path is exactly the one argv[0] emits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendSet {
-    pub run0: Option<PathBuf>,
     pub sudo: Option<PathBuf>,
     pub doas: Option<PathBuf>,
     pub pkexec: Option<PathBuf>,
@@ -61,7 +60,6 @@ impl BackendSet {
     /// The resolved absolute path for `backend`; `Auto` maps to sudo-then-doas.
     pub(crate) fn path(&self, backend: Backend) -> Option<&Path> {
         match backend {
-            Backend::Run0 => self.run0.as_deref(),
             Backend::Sudo => self.sudo.as_deref(),
             Backend::Doas => self.doas.as_deref(),
             Backend::Pkexec => self.pkexec.as_deref(),
@@ -289,18 +287,14 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSe
             detail: detail.into(),
         })
     };
-    // polkit and systemd are Linux stacks. Saying "not on PATH" on macOS reads as a
-    // fixable environment problem on a platform where neither will ever exist.
+    // polkit is a Linux stack. Saying "not on PATH" on macOS reads as a
+    // fixable environment problem on a platform where it will never exist.
     // sudo and doas are NOT in this list: both are portable and do run on macOS.
     if os == Os::MacOs {
         let impossible = match backend {
             Backend::Pkexec => Some(
                 "pkexec is a polkit (Linux) program and does not exist on macOS; \
                  use Backend::Auto with Auth::Gui for the macOS authentication dialog",
-            ),
-            Backend::Run0 => Some(
-                "run0 ships with systemd and does not exist on macOS; \
-                 use Backend::Auto (sudo), or Auth::Gui for the macOS authentication dialog",
             ),
             _ => None,
         };
@@ -356,7 +350,7 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSe
             let (kind, detail) = if matches!(auth, Auth::Askpass(_)) {
                 (
                     "Askpass",
-                    "askpass auth is sudo-only; run0/doas/pkexec have no askpass mechanism",
+                    "askpass auth is sudo-only; doas/pkexec have no askpass mechanism",
                 )
             } else {
                 (
