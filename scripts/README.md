@@ -72,16 +72,19 @@ forwards the remote command's real exit code as-is.
 
 ## Guests
 
-| Guest           | Box                                    | Provider arch | Host arch it's native on |
-| --------------- | -------------------------------------- | ------------- | ------------------------ |
-| `linux-x64`     | `generic/ubuntu2204` (qemu, amd64)     | x86-64        | x86-64                   |
-| `linux-arm64`   | `perk/ubuntu-2204-arm64` (qemu, arm64) | arm64         | arm64 (Apple Silicon)    |
-| `windows-x64`   | `stromweld/windows-10` (qemu, amd64)   | x86-64        | x86-64                   |
-| `macos-arm64`   | Tart, `macos-tahoe-base` (Cirrus)      | arm64         | arm64 (Apple Silicon)    |
-| `windows-arm64` | _(none — see below)_                   | —             | —                        |
+| Guest           | Box                                      | Provider arch | Host arch it's native on |
+| --------------- | ---------------------------------------- | ------------- | ------------------------ |
+| `linux-x64`     | `cloud-image/ubuntu-24.04` (qemu, amd64) | x86-64        | x86-64                   |
+| `linux-arm64`   | `perk/ubuntu-24.04-arm64` (qemu, arm64)  | arm64         | arm64 (Apple Silicon)    |
+| `windows-x64`   | `stromweld/windows-10` (qemu, amd64)     | x86-64        | x86-64                   |
+| `macos-arm64`   | Tart, `macos-tahoe-base` (Cirrus)        | arm64         | arm64 (Apple Silicon)    |
+| `windows-arm64` | _(none — see below)_                     | —             | —                        |
 
-Both Linux boxes run Ubuntu 22.04; systemd 249 there defaults to the unified cgroup v2
-hierarchy, which is why they're the guests for cosca's cgroup lanes.
+Both Linux boxes run Ubuntu 24.04; systemd 255 there defaults to the unified cgroup v2
+hierarchy, which is why they're the guests for cosca's cgroup lanes, and its polkit (124) reads
+JavaScript rules, so the ELEVATION group's Linux tests run in them (see
+[Unattended GUI elevation](#unattended-gui-elevation)). Provisioning installs `polkitd`, `pkexec`
+and `opendoas` for that.
 
 On the emulated architecture, QEMU falls back to TCG (software emulation) instead of
 HVF/KVM, which is dramatically slower — see [Windows guests](#windows-guests) for measured
@@ -467,8 +470,8 @@ hosted runner inherits the runner's variables). On Linux and macOS the script mu
 On Linux the script needs systemd as PID 1 and polkit 0.106 or later (JavaScript `rules.d`), and a `--user` that
 exists and is not root (polkit always authorizes root). It restarts `polkit.service`, then checks that the user can
 run `pkexec` with no agent; it refuses anything else before writing anything, and runs its commands with a scrubbed
-environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller). Today that means CI: devvm's Linux guests are
-Ubuntu 22.04 with polkit 0.105, which the script refuses, until they are upgraded.
+environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller). CI and the devvm Linux guests (Ubuntu 24.04,
+polkit 124) qualify.
 
 ```sh
 # Linux guest: a polkit rule authorizes one account for every polkit action

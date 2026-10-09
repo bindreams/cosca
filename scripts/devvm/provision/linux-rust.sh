@@ -12,6 +12,14 @@ else
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y build-essential >/dev/null
 fi
 
+# What the ELEVATION group's Linux tests elevate through (see the `elevation_linux` job in ci.yaml).
+if command -v pkexec >/dev/null 2>&1 && command -v doas >/dev/null 2>&1 && command -v pkaction >/dev/null 2>&1; then
+    echo "devvm: pkexec, polkit and doas already present, skipping apt install"
+else
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends polkitd pkexec opendoas >/dev/null
+fi
+
 if command -v cargo >/dev/null 2>&1; then
     echo "devvm: cargo already present ($(cargo --version)), skipping rustup install"
 else

@@ -11,8 +11,7 @@ What it changes, system-wide:
 - Linux: a polkit JavaScript rule that allows USER every action, so `pkexec` (`Auth::Gui`) needs no
   authentication agent. USER must be an existing, non-root account (polkit always authorizes root, so a root
   user would make the check below prove nothing). It needs polkit 0.106 or later (earlier versions read `.pkla`
-  files, not `rules.d`; today that means CI, and devvm once its Linux guests are upgraded from Ubuntu 22.04's 0.105)
-  and systemd as PID 1: it restarts `polkit.service`, which returns once the service reports itself ready. Any
+  files, not `rules.d`; CI and the devvm Linux guests, Ubuntu 24.04 with polkit 124, qualify) and systemd as PID 1: it restarts `polkit.service`, which returns once the service reports itself ready. Any
   other setup is refused before anything is written. It checks afterwards that USER can really run `pkexec`
   unattended. Every tool it needs (`pkaction`, `pkexec`, `runuser`, `systemctl`) is checked before the rule is
   written, and every command runs with a scrubbed environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller).

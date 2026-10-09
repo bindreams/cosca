@@ -73,13 +73,13 @@ GUESTS: dict[str, Guest] = {
     "linux-x64": Guest(
         name="linux-x64",
         communicator="ssh",
-        box="generic/ubuntu2204 (qemu/amd64)",
+        box="cloud-image/ubuntu-24.04 (qemu/amd64)",
         tree_path_posix="/home/vagrant/cosca",
     ),
     "linux-arm64": Guest(
         name="linux-arm64",
         communicator="ssh",
-        box="perk/ubuntu-2204-arm64 (qemu/arm64)",
+        box="perk/ubuntu-24.04-arm64 (qemu/arm64)",
         tree_path_posix="/home/vagrant/cosca",
     ),
     "macos-arm64": Guest(

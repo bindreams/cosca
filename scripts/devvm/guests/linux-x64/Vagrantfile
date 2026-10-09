@@ -8,8 +8,9 @@
 # `scripts/devvm.py up linux-x64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so
 # all state lands under .tmp/devvm/ in the worktree, never in the box's own directory.
 #
-# Box: generic/ubuntu2204, provider qemu, version pinned below. Built by roboxes/generic;
-# Ubuntu 22.04's systemd (249) defaults to the unified cgroup v2 hierarchy.
+# Box: cloud-image/ubuntu-24.04 (Canonical's), provider qemu, version pinned below. Ubuntu 24.04's
+# systemd (255) defaults to the unified cgroup v2 hierarchy, and its polkit (124) reads JavaScript
+# rules, which `.github/scripts/unattended-gui-elevation.py` needs (>= 0.106).
 
 require_relative "../_shared/fix_macos_port_check"
 require_relative "../_shared/fix_qemu_loopback_only"
@@ -17,8 +18,8 @@ require_relative "../_shared/fix_qemu_loopback_only"
 STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "generic/ubuntu2204"
-  config.vm.box_version = "4.3.12"
+  config.vm.box = "cloud-image/ubuntu-24.04"
+  config.vm.box_version = "20260926.0.0"
   # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
   # host silently excludes it from "usable providers" and `up` fails with a misleading "box
   # doesn't support requested provider" error, even though the box does publish a qemu
