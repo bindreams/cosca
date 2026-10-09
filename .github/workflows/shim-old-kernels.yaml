@@ -4,8 +4,10 @@
 # `waitid(P_PIDFD)`, `SCM_CREDENTIALS`), and its owner check does not need pidfs (Linux 6.9) or
 # `SO_PEERPIDFD` (6.5). The hosted runners' kernels are far newer, so this boots 5.6 (the project
 # floor) and 6.1 LTS (below both) under virtme-ng on the runner's KVM, prints `uname -r`, and runs
-# the shim's end-to-end tests there. The log is the measurement: every claim about old kernels in
-# the plan's D2 is replaced by it.
+# every test of `elevation::shim::` there: as the unprivileged user that built them, and as root for the
+# tests that need root (pid namespaces, a tracer, a uid switch). The log is the measurement: every claim
+# about old kernels in the plan's D2 is replaced by it. The guest writes a result file only on full
+# success, and the step fails without it, so a guest that failed or never ran cannot pass the job.
 #
 # Run it by hand with: gh workflow run shim-old-kernels.yaml
 name: shim-old-kernels
@@ -17,6 +19,7 @@ on:
       - "src/elevation/shim/**"
       - "testbin/shim_hooks.rs"
       - ".github/workflows/shim-old-kernels.yaml"
+      - ".github/scripts/shim-old-kernel-guest.sh"
   workflow_dispatch:
 
 concurrency:
@@ -76,6 +79,7 @@ jobs:
       # (the oops kills udev, so virtio-serial never appears and virtme-ng cannot run the command).
       # The guest sees this checkout and the toolchain through the host's file system. The kernel is the
       # pre-built mainline one for the tag; the script prints `uname -r` first and checks it names the tag.
+      # `--rwdir`: where the guest writes its result.
       - name: Run the shim's tests on the old kernel
         timeout-minutes: 15
         shell: bash
@@ -83,5 +87,11 @@ jobs:
           KERNEL: ${{ matrix.kernel }}
         run: |
           set -euxo pipefail
-          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G \
-            --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL'"
+          result="$RUNNER_TEMP/old-kernel/result"
+          mkdir -p "$(dirname "$result")"
+          rm -f "$result"
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G --rwdir "$(dirname "$result")" \
+            --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL' '$result' '$(id -u)' '$(id -g)'"
+          # vng's own exit status is not trusted to carry the guest's: the guest's result is.
+          cat "$result"
+          [[ "$(<"$result")" == "ok $KERNEL "* ]]
