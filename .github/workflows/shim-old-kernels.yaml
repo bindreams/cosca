@@ -72,6 +72,8 @@ jobs:
           # virtme-ng imports pkg_resources, which the runner's Python no longer ships.
           pipx inject --force virtme-ng "setuptools==75.8.0"
 
+      # `psi=0`: on 5.6, systemd-udevd's write to a cgroup's `memory.pressure` dereferences NULL in the kernel
+      # (the oops kills udev, so virtio-serial never appears and virtme-ng cannot run the command).
       # The guest sees this checkout and the toolchain through the host's file system. The kernel is the
       # pre-built mainline one for the tag; the script prints `uname -r` first and checks it names the tag.
       - name: Run the shim's tests on the old kernel
@@ -81,5 +83,5 @@ jobs:
           KERNEL: ${{ matrix.kernel }}
         run: |
           set -euxo pipefail
-          vng --run "$KERNEL" --verbose --user root --cpus 2 --memory 2G \
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G \
             --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL'"
