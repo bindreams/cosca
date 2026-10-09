@@ -100,8 +100,14 @@ fn exec_failure_with_a_stolen_reap_is_not_started() {
 fn shim_closing_its_own_fds_lets_the_reader_see_eof() {
     let rig = ShimRig::new();
     // The program closes its stdout and says so on stderr, then waits on stdin.
-    let mut run = rig.spawn(Spec::sh("exec 1>&-; echo closed >&2; read line; exit 0").stdin_held());
+    let mut run = rig.spawn(
+        Spec::sh("exec 1>&-; echo closed >&2; read line; exit 0")
+            .stdin_held()
+            .gate(crate::elevation::shim::hooks::Gate::BeforeLoop),
+    );
     let (mut stdout, mut stderr) = (run.take_stdout(), run.take_stderr());
+    // The shim has replaced its own stdio by the time it waits at this gate.
+    run.wait_for("gate: waiting at before-loop");
     let mut said = [0u8; 7];
     stderr.read_exact(&mut said).expect("the program's stderr");
     assert_eq!(&said, b"closed\n");
@@ -112,6 +118,7 @@ fn shim_closing_its_own_fds_lets_the_reader_see_eof() {
         Ok(0) => {}
         other => panic!("the shim's stdout did not reach end of file: {other:?}"),
     }
+    run.release(crate::elevation::shim::hooks::Gate::BeforeLoop);
     run.close_stdin();
     assert_eq!(rig.link.link.wait().unwrap(), LinkOutcome::Exited(0));
     run.finish();
