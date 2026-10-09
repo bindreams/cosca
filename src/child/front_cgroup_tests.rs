@@ -929,6 +929,7 @@ enum RecordCase {
 #[skuld::test]
 fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::dir_walk_tests::Scratch;
+    crate::log_capture::install();
     let scratch = Scratch::new("record");
     let cgroup_of = |path: &std::path::Path| {
         format!(
@@ -964,14 +965,32 @@ fn cgroup_a_leaf_records_its_fronts_place_before_its_removal(#[fixture(cgroup)] 
         }
         if case == RecordCase::LeafRemovedFirst {
             std::fs::write(leaf_path.join("cgroup.kill"), "1").expect("kill through the leaf");
-            crate::test_child::wait_until_zombie(pid);
+            // `rmdir` needs `populated 0`, which a waitable zombie does not imply: wait on the
+            // leaf's own drain watch (inotify on `cgroup.events`, no timeout) for it.
+            assert_eq!(
+                leaf.wait_drained(None).expect("wait for the leaf to drain"),
+                crate::containment::TreeDrain::AllMembersExited
+            );
             std::fs::remove_dir(&leaf_path).expect("remove the drained leaf, as a cgroup manager may");
         }
         let unread = (case == RecordCase::NamesakeLivenessUnread)
             .then(|| crate::containment::cgroup::fault::fail_liveness_read(libc::EMFILE));
+        let mark = crate::log_capture::mark();
         // The leaf's drop kills what is in it, and removes it.
         drop(leaf);
         drop(unread);
+        // An undecided path is the leaf's own path with ` (deleted)` after it, left unrecorded:
+        // that, and no other failure of the read, is what leaves no record.
+        let unrecorded =
+            crate::log_capture::records_since_on_current_thread(mark, "before its leaf's removal cannot be read");
+        if matches!(case, RecordCase::NamesakeLivenessUnread | RecordCase::LeafRemovedFirst) {
+            assert!(
+                unrecorded
+                    .iter()
+                    .any(|(_, text)| text.contains("is either the removed leaf or a live cgroup of that name")),
+                "{case:?}: {unrecorded:?}"
+            );
+        }
         let expected = match case {
             RecordCase::Namesake => Some(false),
             RecordCase::Leaf => Some(true),
