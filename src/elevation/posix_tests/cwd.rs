@@ -38,7 +38,6 @@ fn under(mut c: Command, backend: Backend) -> Command {
 fn every_backend_host() -> Host {
     Host {
         available: BackendSet {
-            run0: Some(PathBuf::from("/usr/bin/run0")),
             sudo: Some(PathBuf::from("/usr/bin/sudo")),
             doas: Some(PathBuf::from("/usr/bin/doas")),
             pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
@@ -224,12 +223,12 @@ fn an_elevated_exact_program_in_an_unlinked_cwd_fails_at_the_read() {
     }
 }
 
-/// sudo, doas and run0 are started in the caller's directory, as given, handed `./tool`, and run
-/// it there (`run0` told `-D .`). None of them needs this process's cwd as a path. pkexec refuses
+/// sudo and doas are started in the caller's directory, as given, handed `./tool`, and run
+/// it there. pkexec refuses
 /// a relative `raw_executable()` ([`pkexec_refuses_a_relative_raw_executable`]).
 #[skuld::test]
 fn a_cwd_keeping_backend_gets_the_program_anchored_to_the_inherited_cwd() {
-    for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
+    for backend in [Backend::Sudo, Backend::Doas] {
         for cwd in [None, Some("sub"), Some("/work")] {
             let mut c = under(exact_tool(cwd), backend);
             let rw = rewrite_reading_nothing(&mut c, &every_backend_host()).expect("rewrite");
@@ -238,14 +237,6 @@ fn a_cwd_keeping_backend_gets_the_program_anchored_to_the_inherited_cwd() {
                 a.ends_with(&["./tool".into(), "-x".into()]),
                 "{backend:?} {cwd:?}: {a:?}"
             );
-            let told: &[&str] = match backend {
-                Backend::Run0 => &["-D", "."],
-                _ => &[],
-            };
-            if !told.is_empty() {
-                let told: Vec<OsString> = told.iter().map(OsString::from).collect();
-                assert!(a.windows(told.len()).any(|w| w == told), "{backend:?}: {a:?}");
-            }
             assert_eq!(rw.derived.as_ref().expect("derived").cwd(), cwd.map(Path::new));
         }
     }
@@ -361,10 +352,10 @@ fn pkexec_is_launched_through_the_pinned_descriptor() {
     );
 }
 
-/// sudo, doas and run0 take a leading-dash program after their `--`, as written.
+/// sudo and doas take a leading-dash program after their `--`, as written.
 #[skuld::test]
 fn a_leading_dash_exact_program_reaches_the_others_as_written() {
-    for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
+    for backend in [Backend::Sudo, Backend::Doas] {
         let mut c = Command::new();
         c.raw_executable("-x/tool").args(["-x/tool"]);
         let mut c = under(c, backend);

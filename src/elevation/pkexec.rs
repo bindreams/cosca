@@ -101,7 +101,7 @@ impl PkexecVersion {
             platform: "unix",
             detail: format!(
                 "{why}; cosca passes pkexec --keep-cwd, which polkit {KEEP_CWD_SINCE} added, and an older \
-                 pkexec takes it for the program and searches PATH for it. Use sudo/doas/run0, or polkit \
+                 pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit \
                  {KEEP_CWD_SINCE} or later"
             ),
         })

@@ -72,7 +72,7 @@ pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
         ElevatedVia::Wrapped(Backend::Sudo) => Some(Front::Sudo),
         ElevatedVia::Wrapped(Backend::Doas) => Some(Front::Doas),
         ElevatedVia::MacosOsascript => Some(Front::Osascript),
-        // pkexec execs the program, and a report never names `Auto`. run0 is not gated.
+        // pkexec execs the program, and a report never names `Auto`.
         ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
     }
 }

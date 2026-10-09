@@ -33,7 +33,6 @@ fn win_host(elevated: bool) -> Host {
 
 fn all_backends() -> BackendSet {
     BackendSet {
-        run0: Some(PathBuf::from("/usr/bin/run0")),
         sudo: Some(PathBuf::from("/usr/bin/sudo")),
         doas: Some(PathBuf::from("/usr/bin/doas")),
         pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
@@ -73,7 +72,6 @@ fn already_elevated_runs_as_is() {
 
 #[skuld::test]
 fn auto_prefers_sudo_then_doas() {
-    // run0 present but Auto ignores it -> sudo.
     let h = unix_host(all_backends(), false, true);
     assert!(matches!(
         h.plan(Privilege::Elevated, Backend::Auto, Auth::Interactive),
@@ -85,7 +83,6 @@ fn auto_prefers_sudo_then_doas() {
     // only doas -> doas
     let h = unix_host(
         BackendSet {
-            run0: None,
             sudo: None,
             doas: Some(PathBuf::from("/usr/bin/doas")),
             pkexec: None,
@@ -104,11 +101,10 @@ fn auto_prefers_sudo_then_doas() {
 }
 
 #[skuld::test]
-fn auto_never_selects_run0_or_pkexec() {
-    // Only run0 + pkexec available: Auto must reject (BackendUnavailable), not pick either.
+fn auto_never_selects_pkexec() {
+    // Only pkexec available: Auto must reject (BackendUnavailable), not pick it.
     let h = unix_host(
         BackendSet {
-            run0: Some(PathBuf::from("/usr/bin/run0")),
             sudo: None,
             doas: None,
             pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
@@ -159,15 +155,12 @@ fn windows_unprivileged_elevates_via_uac() {
 fn structural_posix_matrix_is_privilege_independent() {
     let cases: &[(Backend, Auth)] = &[
         (Backend::Doas, Auth::Askpass(PathBuf::from("/x"))),
-        (Backend::Run0, Auth::Askpass(PathBuf::from("/x"))),
         (Backend::Doas, Auth::Stdin(crate::elevation::Secret::new("p"))),
-        (Backend::Run0, Auth::Stdin(crate::elevation::Secret::new("p"))),
         (Backend::Pkexec, Auth::Interactive),
         (Backend::Pkexec, Auth::NonInteractive),
         (Backend::Pkexec, Auth::Askpass(PathBuf::from("/x"))),
         (Backend::Sudo, Auth::Gui),
         (Backend::Doas, Auth::Gui),
-        (Backend::Run0, Auth::Gui),
         (Backend::Auto, Auth::Gui),
     ];
     for (backend, auth) in cases {
@@ -255,7 +248,6 @@ fn auto_resolving_to_doas_rejects_stdin() {
     for elevated in [false, true] {
         let h = unix_host(
             BackendSet {
-                run0: None,
                 sudo: None,
                 doas: Some(PathBuf::from("/usr/bin/doas")),
                 pkexec: None,
@@ -334,13 +326,12 @@ fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
     }
 }
 
-/// A macOS host: sudo exists, pkexec/run0/doas do not, osascript does.
+/// A macOS host: sudo exists, pkexec/doas do not, osascript does.
 fn macos_host(elevated: bool, has_tty: bool) -> Host {
     Host {
         elevated,
         has_tty,
         available: BackendSet {
-            run0: None,
             sudo: Some(PathBuf::from("/usr/bin/sudo")),
             doas: None,
             pkexec: None,
@@ -374,26 +365,9 @@ fn macos_pkexec_is_unsupported_not_backend_unavailable() {
 }
 
 #[skuld::test]
-fn macos_run0_is_unsupported_not_backend_unavailable() {
-    // Same reasoning as pkexec: run0 ships with systemd, so "not on PATH" would
-    // invite installing something that does not exist for this platform.
-    let mut h = macos_host(false, true);
-    h.available.run0 = Some(PathBuf::from("/usr/bin/run0"));
-    for auth in [Auth::Interactive, Auth::NonInteractive] {
-        match reject_error(h.plan(Privilege::Elevated, Backend::Run0, auth)) {
-            Error::Unsupported { platform, detail, .. } => {
-                assert_eq!(platform, "macos");
-                assert!(detail.contains("systemd"), "{detail}");
-            }
-            other => panic!("expected Unsupported, got {other}"),
-        }
-    }
-}
-
-#[skuld::test]
 fn macos_keeps_the_backends_that_really_do_run_there() {
     // sudo and doas are portable and DO exist on macOS, so they must not be swept
-    // into the impossible-backend guard alongside pkexec/run0.
+    // into the impossible-backend guard alongside pkexec.
     let mut h = macos_host(false, true);
     h.available.doas = Some(PathBuf::from("/usr/local/bin/doas"));
     for backend in [Backend::Sudo, Backend::Doas] {
@@ -465,8 +439,8 @@ fn macos_gui_needs_no_controlling_terminal() {
 #[skuld::test]
 fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
     // Auth::Gui names Authorization Services on macOS; no CLI wrapper is involved,
-    // so a forced sudo/doas/run0 is a config error, not something osascript runs.
-    for backend in [Backend::Sudo, Backend::Doas, Backend::Run0] {
+    // so a forced sudo/doas is a config error, not something osascript runs.
+    for backend in [Backend::Sudo, Backend::Doas] {
         let h = macos_host(false, true);
         // `plan_tests.rs` is NOT platform-gated, so asserting the message HERE is
         // what keeps this arm's wording checked on the Windows CI leg too.

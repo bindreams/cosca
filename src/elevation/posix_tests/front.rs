@@ -12,7 +12,6 @@ use std::path::PathBuf;
 fn every_backend_host() -> Host {
     Host {
         available: BackendSet {
-            run0: Some(PathBuf::from("/usr/bin/run0")),
             sudo: Some(PathBuf::from("/usr/bin/sudo")),
             doas: Some(PathBuf::from("/usr/bin/doas")),
             pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
@@ -47,14 +46,13 @@ fn front_named(backend: Backend, host: &Host) -> Option<&'static str> {
         .map(|front| front.name())
 }
 
-/// sudo and doas leave this process tracking a front; pkexec and run0 do not.
+/// sudo and doas leave this process tracking a front; pkexec does not.
 #[skuld::test]
-fn sudo_and_doas_name_a_front_and_pkexec_and_run0_do_not() {
+fn sudo_and_doas_name_a_front_and_pkexec_does_not() {
     let host = every_backend_host();
     assert_eq!(front_named(Backend::Sudo, &host), Some("sudo"));
     assert_eq!(front_named(Backend::Doas, &host), Some("doas"));
     assert_eq!(front_named(Backend::Pkexec, &host), None);
-    assert_eq!(front_named(Backend::Run0, &host), None);
 }
 
 /// An already-elevated caller runs the program itself: no front.

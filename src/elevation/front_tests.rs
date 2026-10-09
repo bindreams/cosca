@@ -13,10 +13,9 @@ const FRONTS: [(ElevatedVia, &str); 3] = [
     (ElevatedVia::MacosOsascript, "osascript"),
 ];
 
-const NOT_FRONTS: [Option<ElevatedVia>; 5] = [
+const NOT_FRONTS: [Option<ElevatedVia>; 4] = [
     None,
     Some(ElevatedVia::Wrapped(Backend::Pkexec)),
-    Some(ElevatedVia::Wrapped(Backend::Run0)),
     Some(ElevatedVia::WindowsUac),
     Some(ElevatedVia::AlreadyElevated),
 ];

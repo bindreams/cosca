@@ -68,7 +68,7 @@ fn the_probe_execs_the_pinned_file_with_dash_dash_version() {
 #[skuld::test]
 fn only_a_linux_gui_pkexec_request_from_a_non_root_caller_launches_pkexec() {
     assert!(launches_pkexec(Os::Linux, Backend::Pkexec, &Auth::Gui, false));
-    for backend in [Backend::Auto, Backend::Sudo, Backend::Doas, Backend::Run0] {
+    for backend in [Backend::Auto, Backend::Sudo, Backend::Doas] {
         assert!(!launches_pkexec(Os::Linux, backend, &Auth::Gui, false), "{backend:?}");
     }
     for auth in [

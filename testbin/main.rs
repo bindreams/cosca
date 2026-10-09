@@ -1499,7 +1499,7 @@ fn main() {
         // sends `<nonce> <pid>\n` (`args[3]` is the caller's per-run nonce; the pid is for
         // messages only), then echoes each byte the caller sends until it hangs up (EOF).
         // Loopback TCP is the channel because an elevated payload inherits nothing but stdio and
-        // can still dial out: pipes, pidfiles and extra fds do not cross sudo/doas/run0/`runas`.
+        // can still dial out: pipes, pidfiles and extra fds do not cross sudo/doas/`runas`.
         // Its death is observable to the caller as EOF on its end of the socket.
         "block-on-socket" => {
             let mut sock = std::net::TcpStream::connect(&args[2]).expect("connect readiness socket");
