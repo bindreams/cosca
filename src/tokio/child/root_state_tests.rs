@@ -193,6 +193,91 @@ async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
     );
 }
 
+/// A failed spawn's cleanup whose wait finds the child reaped behind its back, on an `Unknown`
+/// root: tokio's `Child` is forgotten once, under the one warn, which carries the leak.
+///
+/// Mutants: the wait's forget warns on its own; the cleanup forgets with `forget_foreign`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait_warns_once() {
+    use crate::wait::exit_only::seams::force_peeks;
+
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (child, _writer) = session_blocker(true);
+    let pid = child.id().pid();
+    let mark = crate::log_capture::mark();
+    let _failed = force_peeks([failed_peek("forced")]);
+    let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        super::child_reap_tests::reap_behind_the_owner(pid);
+    });
+
+    let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+        .expect_err("the spawn fails");
+
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
+    assert!(
+        warns[0].starts_with("finish_elevated:")
+            && warns[0].contains("RootState::Unknown")
+            && warns[0].contains("leaks"),
+        "{warns:?}"
+    );
+}
+
+/// The same for a root already gone when the kill is sent (`Sent::Gone`): the cleanup forgets
+/// tokio's `Child` and carries the leak in its own warn, not the handle's drop's.
+///
+/// Mutants: the `Gone` arm leaves the forget to the drop of the handle; the kill's own forget warns.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() {
+    use crate::wait::exit_only::seams::force_peeks;
+
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (child, writer) = session_blocker(true);
+    drop(writer);
+    super::child_reap_tests::reap_behind_the_owner(child.id().pid());
+    let mark = crate::log_capture::mark();
+    // The number still reads as the root, as after a same-tick reuse.
+    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Found(child.id()));
+    let _failed = force_peeks([failed_peek("forced"), failed_peek("forced")]);
+
+    let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
+        .expect_err("the spawn fails");
+
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
+    assert!(
+        warns[0].starts_with("finish_elevated:") && warns[0].contains("leaks"),
+        "{warns:?}"
+    );
+}
+
+/// When the second look shows the child reaped by someone else, the warn says so rather than
+/// "could not say whether it was reaped".
+///
+/// Mutant: the warn names only the first look.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_second_look_that_shows_a_foreign_reap_is_named() {
+    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (child, _writer) = session_blocker(true);
+    let mark = crate::log_capture::mark();
+    let _looks = force_peeks([failed_peek("forced"), Ok(Peek::Foreign(Foreign::Gone))]);
+
+    drop(child);
+
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("reaped by someone else"), "{warns:?}");
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
@@ -290,14 +375,15 @@ mod macos {
     }
 
     /// Mutants: `finish_elevated` signals and waits on the root regardless; it leaves the forget and
-    /// its warn to the drop of the handle (two warns, the leak in only one).
+    /// its warn to the drop of the handle (two warns, and neither carries the leak: the drop's own
+    /// look is the OS's, which shows the child ours).
     #[skuld::test]
     async fn finish_elevated_leaves_an_orphaned_root_alone() {
         crate::log_capture::install();
         let (child, _writer) = walked_blocker();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The cleanup's first look, then the second look of the drop of the handle it ends with.
+        // The cleanup's first look, then the second look of its own `forget_unsettled`.
         let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 

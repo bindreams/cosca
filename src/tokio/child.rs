@@ -128,9 +128,8 @@ impl Child {
     /// without logging: the caller reports the forget in its one warn, with the leak this returns.
     /// `None` if a second look shows the child ours after all, or it is already forgotten.
     #[cfg(unix)]
-    pub(super) fn forget_unsettled(&mut self) -> Option<&'static str> {
-        let proc = self.os.proc.as_mut()?;
-        proc.reaped_elsewhere_quietly().then(|| proc.forget_foreign_quietly())
+    pub(super) fn forget_unsettled(&mut self) -> Option<crate::containment::Forgot> {
+        self.os.proc.as_mut()?.forget_unsettled()
     }
 
     /// Disarm the drop: for a failed spawn's cleanup, whose error reports what it did and left, so
@@ -260,13 +259,19 @@ impl Child {
     /// mid-teardown, and a zombie keeps the credentials it died with), so the reap would be
     /// skipped on the ordinary success path.
     ///
+    /// A child something else reaped, or that cannot be shown to be ours, is forgotten instead,
+    /// quietly (nothing above `debug`): what the forget leaked is returned for the caller's one
+    /// warn. `None`: the child was waited for.
+    ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn wait_and_reap_blocking(&mut self) {
+    pub(super) fn wait_and_reap_blocking(&mut self) -> Option<crate::containment::Forgot> {
         let pid = self.id.pid();
-        if self.proc_mut().wait_and_reap(pid) == Waited::Foreign {
-            self.proc_mut().forget_foreign();
+        if self.proc_mut().wait_and_reap_at(pid, log::Level::Debug) == Waited::Foreign {
+            let leak = self.proc_mut().forget_foreign_quietly();
+            return Some(crate::containment::Forgot { leak, now: None });
         }
+        None
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -579,6 +584,21 @@ impl Child {
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's kill gate read by the caller.
     pub(crate) fn kill_sent_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
+        let sent = self.signal_gated(
+            #[cfg(unix)]
+            gate,
+        );
+        if matches!(sent, Ok(Sent::Gone)) {
+            // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
+            #[cfg(unix)]
+            self.proc_mut().forget_if_foreign();
+        }
+        sent
+    }
+
+    /// [`kill_sent_gated`](Child::kill_sent_gated) without forgetting a child that is gone: for a
+    /// caller that decides what to do with it, and what to log.
+    pub(crate) fn signal_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
@@ -602,13 +622,7 @@ impl Child {
             }
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             Err(other) => Err(other),
-            Ok(Sent::Gone) => {
-                // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
-                #[cfg(unix)]
-                self.proc_mut().forget_if_foreign();
-                Ok(Sent::Gone)
-            }
-            Ok(delivered) => Ok(delivered),
+            Ok(sent) => Ok(sent),
         }
     }
 
@@ -1045,7 +1059,7 @@ impl Drop for Child {
         );
         // What forgetting tokio's `Child` leaked, if this drop forgot it.
         #[cfg(unix)]
-        let mut forgot: Option<&'static str> = None;
+        let mut forgot: Option<crate::containment::Forgot> = None;
         if self.kill_on_drop {
             // A live elevation front outside a cgroup is not signalled: it is left running, and
             // named.
@@ -1066,12 +1080,16 @@ impl Drop for Child {
         if !own_reap && forgot.is_none() {
             if let Some(proc) = os.proc.as_mut() {
                 forgot = if view.root_reaped {
-                    Some(proc.forget_foreign())
+                    Some(crate::containment::Forgot {
+                        leak: proc.forget_foreign(),
+                        now: Some(crate::signal::RootState::Reaped),
+                    })
                 } else if view.unsettled() {
                     // The one warn below carries the error and the leak.
-                    proc.reaped_elsewhere_quietly().then(|| proc.forget_foreign_quietly())
+                    proc.forget_unsettled()
                 } else {
                     proc.forget_if_foreign()
+                        .map(|leak| crate::containment::Forgot { leak, now: None })
                 };
                 if forgot.is_some() {
                     log::debug!(
@@ -1083,7 +1101,7 @@ impl Drop for Child {
         }
         #[cfg(unix)]
         if !own_reap {
-            view.warn_unsettled("Child::drop", self.kill_on_drop, forgot);
+            view.warn_unsettled("Child::drop", self.kill_on_drop, forgot.as_ref());
         }
         os.release_without_waiting();
     }
@@ -1107,7 +1125,7 @@ fn signal_on_drop(
     #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
-    #[cfg(unix)] forgot: &mut Option<&'static str>,
+    #[cfg(unix)] forgot: &mut Option<crate::containment::Forgot>,
 ) {
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
@@ -1176,9 +1194,10 @@ fn signal_on_drop(
         {
             *forgot = if view.unsettled() {
                 // The drop's one warn carries the error and the leak.
-                proc.reaped_elsewhere_quietly().then(|| proc.forget_foreign_quietly())
+                proc.forget_unsettled()
             } else {
                 proc.forget_if_foreign()
+                    .map(|leak| crate::containment::Forgot { leak, now: None })
             };
         }
         if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {

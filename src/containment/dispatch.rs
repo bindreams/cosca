@@ -154,6 +154,21 @@ impl Attachment {
     }
 }
 
+/// What forgetting tokio's `Child` leaked, and what the second look at the root showed, for the one
+/// warn of an unsettled root ([`DropView::warn_unsettled`]).
+#[cfg(unix)]
+#[cfg_attr(
+    not(feature = "tokio"),
+    allow(dead_code, reason = "only the async child forgets tokio's `Child`")
+)]
+#[derive(Debug)]
+pub(crate) struct Forgot {
+    /// What the forget leaks (tokio's pidfd and reactor registration, or its `SIGCHLD` watch).
+    pub(crate) leak: &'static str,
+    /// What the handle said when it was asked again, if it was.
+    pub(crate) now: Option<crate::signal::RootState>,
+}
+
 /// What a `Child`'s drop knows about its root, for [`Attached::hard_kill_for_drop`].
 #[cfg(unix)]
 #[derive(Debug)]
@@ -262,13 +277,18 @@ impl DropView {
     /// drop skips nothing), and `leaked` what forgetting tokio's `Child` leaked, if it was
     /// forgotten. Does nothing for a settled root. Callers call it once per event; every other
     /// step logs at `debug`.
-    pub(crate) fn warn_unsettled(&self, label: &str, armed: bool, leaked: Option<&str>) {
+    pub(crate) fn warn_unsettled(&self, label: &str, armed: bool, forgot: Option<&Forgot>) {
         use crate::signal::RootState;
         if !self.unsettled() {
             return;
         }
         let pid = self.root_pid;
+        let reaped_now = forgot.is_some_and(|f| matches!(f.now, Some(RootState::Reaped)));
         let mut text = match &self.root {
+            // A second look that shows the reap names it, rather than the first look's doubt.
+            RootState::Unpinned(e) | RootState::Unknown(e) if reaped_now => format!(
+                "{label}: RootState::Reaped: the root ({pid}) was reaped by someone else (its own handle first could not say: {e})"
+            ),
             RootState::Unpinned(e) => {
                 format!("{label}: RootState::Unpinned: the root ({pid}) is not pinned by this process ({e})")
             }
@@ -287,8 +307,8 @@ impl DropView {
                 text.push_str("; the root itself is neither signalled nor waited on");
             }
         }
-        if let Some(leak) = leaked {
-            text.push_str(&format!("; forgetting tokio's handle for it leaks {leak}"));
+        if let Some(forgot) = forgot {
+            text.push_str(&format!("; forgetting tokio's handle for it leaks {}", forgot.leak));
         }
         log::warn!("{text}");
     }

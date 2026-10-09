@@ -331,6 +331,8 @@ pub(crate) mod dispatch;
 pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]
 pub(crate) use dispatch::DropView;
+#[cfg(all(unix, feature = "tokio"))]
+pub(crate) use dispatch::Forgot;
 #[allow(
     unused_imports,
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"

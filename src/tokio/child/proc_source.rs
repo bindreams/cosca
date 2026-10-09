@@ -566,13 +566,6 @@ impl ProcSource {
         true
     }
 
-    /// [`reaped_elsewhere`](ProcSource::reaped_elsewhere) without the log, for a caller that has
-    /// already warned of the same root.
-    #[cfg(unix)]
-    pub(crate) fn reaped_elsewhere_quietly(&self) -> bool {
-        self.elsewhere().is_some()
-    }
-
     /// The pid and non-`Unreaped` state of a child tokio has not reaped, if its handle shows one.
     #[cfg(unix)]
     fn elsewhere(&self) -> Option<(u32, RootState)> {
@@ -659,6 +652,20 @@ impl ProcSource {
     ///
     /// On [`Waited::Foreign`] the caller calls [`forget_foreign`](ProcSource::forget_foreign).
     pub(crate) fn wait_and_reap(&mut self, pid: u32) -> Waited {
+        self.wait_and_reap_at(pid, log::Level::Warn)
+    }
+
+    /// [`wait_and_reap`](ProcSource::wait_and_reap), logging what it finds that is not an exit at
+    /// `level`: for a caller that reports a [`Waited::Foreign`] itself, in its one warn.
+    pub(crate) fn wait_and_reap_at(
+        &mut self,
+        pid: u32,
+        #[cfg_attr(
+            not(target_os = "macos"),
+            allow(unused_variables, reason = "only macOS logs a non-exit")
+        )]
+        level: log::Level,
+    ) -> Waited {
         crate::bounded::assert_may_block("wait_and_reap");
         match self {
             #[cfg(unix)]
@@ -684,7 +691,7 @@ impl ProcSource {
                 };
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                wait_reapable(pid, *identity)
+                wait_reapable(pid, *identity, level)
             }
             #[cfg(windows)]
             ProcSource::Tokio { child, .. } => {
@@ -761,6 +768,16 @@ impl ProcSource {
             "child {pid} {why}; forgetting tokio's handle for it leaks {leak}"
         );
         leak
+    }
+
+    /// Forget tokio's `Child` for a root its handle cannot show is ours (`Unknown`, `Unpinned`) or
+    /// shows reaped, without logging: the caller reports the forget in its one warn. `None` if a
+    /// second look shows the child ours after all, or it is already forgotten.
+    #[cfg(unix)]
+    pub(crate) fn forget_unsettled(&mut self) -> Option<crate::containment::Forgot> {
+        let (_, now) = self.elsewhere()?;
+        let leak = self.forget_foreign_quietly();
+        Some(crate::containment::Forgot { leak, now: Some(now) })
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that
@@ -996,7 +1013,7 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd) -> Waited {
 /// Anything that cannot be shown to be ours is [`Waited::Foreign`] (see
 /// [`ProcSource::wait_and_reap`]).
 #[cfg(target_os = "macos")]
-fn wait_reapable(pid: u32, identity: u64) -> Waited {
+fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> Waited {
     use crate::wait::backend::{await_reapable, Waited as Awaited};
     match await_reapable(pid, Some(identity), None) {
         Ok(Awaited::Reapable) => {
@@ -1010,7 +1027,8 @@ fn wait_reapable(pid: u32, identity: u64) -> Waited {
         }
         Ok(Awaited::Gone) => Waited::Foreign,
         Ok(Awaited::Orphaned) => {
-            log::warn!(
+            log::log!(
+                level,
                 "wait_and_reap: child {pid} cannot be shown to be ours or reaped (launchd holds it, because its \
                  tracer died)"
             );
@@ -1024,7 +1042,7 @@ fn wait_reapable(pid: u32, identity: u64) -> Waited {
         }
         // Without proof the child is ours, tokio's by-pid reap must not run.
         Err(e) => {
-            log::warn!("wait_and_reap: waiting on child {pid} failed: {e}");
+            log::log!(level, "wait_and_reap: waiting on child {pid} failed: {e}");
             Waited::Foreign
         }
     }
