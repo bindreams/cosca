@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use super::child::{decode_report, Spawned};
 use super::log::Log;
 use crate::elevation::shim::protocol::NotExecuted;
-use crate::elevation::shim::step::{decide, Control, Events, ExecEvent, LoopState, ToChild};
+use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState, ToChild};
 
 /// What the loop ended with: the inputs of [`conclude`](crate::elevation::shim::step::conclude).
 pub(super) struct Finished {
@@ -94,7 +94,7 @@ impl Loop<'_> {
             events.child_exited = ready(&polled[1]);
             events.owner_exited = st.owner_watched && ready(&polled[3]);
             events.forced_failure = failure_fd >= 0 && ready(&polled[4]);
-            let (sock_ready, status_ready) = (st.conn_open && ready(&polled[2]), st.exec_pending && ready(&polled[5]));
+            let status_ready = st.exec_pending && ready(&polled[5]);
             if status_ready || (events.child_exited && st.exec_pending) {
                 match drain_status(self.status.as_raw_fd()) {
                     Status::Report(r) => {
@@ -109,19 +109,25 @@ impl Loop<'_> {
                     Status::Nothing => {}
                 }
             }
-            if sock_ready {
-                events.control = self.read_control();
+            // Every byte cosca has sent, in order, before the owner's exit or the connection's end: the
+            // poll's snapshot can have the owner's exit without the bytes that preceded it.
+            let mut controls = if st.conn_open { self.drain_control() } else { Vec::new() };
+            let last = controls.pop().unwrap_or(Control::Nothing);
+            for control in controls {
+                let earlier = Events {
+                    control,
+                    ..Events::NONE
+                };
+                let actions = decide(&mut self.state, &earlier);
+                self.perform(&earlier, &actions);
             }
+            events.control = last;
             let actions = decide(&mut self.state, &events);
             if actions.lost {
                 self.log.line(format_args!("seam: supervision forced to fail"));
                 break self.kill_and_reap();
             }
-            self.log_events(&events, &actions);
-            if let Some(to) = actions.signal {
-                let sent = self.child.signal(to);
-                self.log.line(format_args!("control: signal {to:?} rc={sent:?}"));
-            }
+            self.perform(&events, &actions);
             if actions.reap {
                 if let Some(done) = self.host_reap_done {
                     // Blocks until the host thread's reap is done: the child is exiting, so it ends.
@@ -143,6 +149,15 @@ impl Loop<'_> {
             reaped,
             lost,
             conn_open: self.state.conn_open,
+        }
+    }
+
+    /// Logs a step's events and sends its signal.
+    fn perform(&self, events: &Events, actions: &Actions) {
+        self.log_events(events, actions);
+        if let Some(to) = actions.signal {
+            let sent = self.child.signal(to);
+            self.log.line(format_args!("control: signal {to:?} rc={sent:?}"));
         }
     }
 
@@ -170,22 +185,41 @@ impl Loop<'_> {
         }
     }
 
-    fn read_control(&self) -> Control {
-        let mut byte = 0u8;
+    /// Reads without blocking what cosca has sent, in order: the bytes, then `Eof` if the connection ended.
+    fn drain_control(&self) -> Vec<Control> {
+        let mut controls = Vec::new();
         loop {
+            let mut byte = 0u8;
             // SAFETY: `byte` is valid for 1 byte.
-            let n = unsafe { libc::read(self.conn.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
-            return match n {
-                1 => Control::Byte(byte),
-                0 => Control::Eof,
-                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
-                // A reset is the connection ending.
-                _ => Control::Eof,
+            let n = unsafe {
+                libc::recv(
+                    self.conn.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
             };
+            match n {
+                1 => controls.push(Control::Byte(byte)),
+                0 => {
+                    controls.push(Control::Eof);
+                    return controls;
+                }
+                _ => match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::Interrupted => {}
+                    // Nothing more yet.
+                    std::io::ErrorKind::WouldBlock => return controls,
+                    // A reset is the connection ending.
+                    _ => {
+                        controls.push(Control::Eof);
+                        return controls;
+                    }
+                },
+            }
         }
     }
 
-    fn log_events(&self, events: &Events, actions: &crate::elevation::shim::step::Actions) {
+    fn log_events(&self, events: &Events, actions: &Actions) {
         if actions.violation {
             let Control::Byte(b) = events.control else {
                 unreachable!("a violation is a byte")

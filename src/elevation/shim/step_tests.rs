@@ -65,6 +65,42 @@ fn owner_exit_after_disarm_leaves_the_program() {
 }
 
 #[skuld::test]
+fn detach_and_owner_exit_in_one_round_leave_the_program() {
+    // Bytes already sent come first: the owner's exit counts as EOF only after them.
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'D'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), Actions::default());
+    assert!(!st.armed);
+    assert!(!st.owner_watched, "the watch has fired");
+}
+
+#[skuld::test]
+fn kill_and_owner_exit_in_one_round_kill_once() {
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'K'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), signal(ToChild::Kill));
+}
+
+#[skuld::test]
+fn terminate_and_owner_exit_in_one_round_kill() {
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'T'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), signal(ToChild::Kill));
+}
+
+#[skuld::test]
 fn eof_after_disarm_leaves_the_program_and_eof_before_it_kills() {
     let eof = Events {
         control: Control::Eof,

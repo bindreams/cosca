@@ -66,6 +66,52 @@ fn owner_exit_kills_the_program_despite_fd_copies() {
     assert_eq!(done.code, Some(128 + libc::SIGKILL), "{}", done.stderr);
 }
 
+/// A shim held before its loop, with the owner's bytes and exit queued behind it, then released.
+fn queued_then_owner_exit(bytes: &str) -> rig::Run {
+    let rig = ShimRig::new();
+    let mut owner = Owner::start("plain");
+    let mut run = owned_by(&rig, &owner, Spec::new("cat", &[]).stdin_held().gate(Gate::BeforeLoop));
+    run.wait_for("gate: waiting at before-loop");
+    // Everything is queued before the loop's first poll: its first round sees the bytes, the
+    // connection's end and the owner's exit together.
+    owner.send_and_exit(bytes);
+    run.release(Gate::BeforeLoop);
+    run
+}
+
+#[skuld::test]
+fn detach_then_owner_exit_leaves_the_program() {
+    let mut run = queued_then_owner_exit("D");
+    run.wait_for("owner exited (armed=false)");
+    run.close_stdin();
+    let done = run.finish();
+    assert_eq!(
+        done.code,
+        Some(0),
+        "the program was killed: {}\n{:#?}",
+        done.stderr,
+        done.lines
+    );
+    assert!(done.logged("disarmed"), "{:#?}", done.lines);
+}
+
+#[skuld::test]
+fn queued_control_bytes_all_apply_before_the_owner_exit() {
+    let mut run = queued_then_owner_exit("PPD");
+    run.wait_count("pong", 2);
+    run.wait_for("owner exited (armed=false)");
+    run.close_stdin();
+    let done = run.finish();
+    assert_eq!(
+        done.code,
+        Some(0),
+        "the program was killed: {}\n{:#?}",
+        done.stderr,
+        done.lines
+    );
+    assert!(done.logged("disarmed"), "{:#?}", done.lines);
+}
+
 #[skuld::test]
 fn foreign_writer_of_a_is_refused() {
     // A process holding a copy of the listener accepts the shim and answers `A`: before the shim's

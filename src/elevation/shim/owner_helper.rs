@@ -4,7 +4,8 @@
 //! The lib's test binary is also this helper: its `main` calls [`run_if_requested`] first. It binds
 //! a link in the directory it is given, prints `dir=<link dir>` and `pid=<its pid>`, and then lives
 //! until its stdin ends or it is killed. Its stdout carries what it observes, one event per line. The
-//! line `fork` on its stdin makes a fork copy of it, as `hold-copy` does at the start.
+//! line `fork` on its stdin makes a fork copy of it, as `hold-copy` does at the start; the line
+//! `send-exit <bytes>` sends each byte as a control byte to the shim and exits at once.
 //!
 //! Modes:
 //! - `plain`: the acceptor answers as usual.
@@ -24,6 +25,8 @@ use super::link::probe::Probe;
 use super::link::ShimLink;
 
 const FLAG: &str = "--cosca-shim-test-owner";
+/// The stdin command that sends control bytes and exits, followed by the bytes.
+pub(crate) const SEND_EXIT: &str = "send-exit ";
 
 /// Runs the helper and exits, if this process was started as one.
 pub(crate) fn run_if_requested() {
@@ -75,6 +78,13 @@ fn run(mode: &str, work: &Path) -> i32 {
             "fork" => {
                 fork_copy(|| {});
                 say("forked");
+            }
+            command if command.starts_with(SEND_EXIT) => {
+                for byte in command[SEND_EXIT.len()..].bytes() {
+                    link.send_control(byte).expect("the byte reaches the shim");
+                }
+                // No destructors: the process ends as cosca would when killed.
+                std::process::exit(0);
             }
             other => panic!("unknown command {other}"),
         }

@@ -40,6 +40,7 @@ pub(super) struct Spec {
     flag: Option<OsString>,
     dir: Option<PathBuf>,
     stdin_held: bool,
+    without_proc: bool,
 }
 
 impl Spec {
@@ -62,6 +63,7 @@ impl Spec {
             flag: None,
             dir: None,
             stdin_held: false,
+            without_proc: false,
         }
     }
 
@@ -143,6 +145,13 @@ impl Spec {
     /// The directory argv names, in place of the link's.
     pub(super) fn dir(mut self, dir: &Path) -> Spec {
         self.dir = Some(dir.to_owned());
+        self
+    }
+
+    /// The shim runs in a mount namespace of its own with `/proc` unmounted. The caller is in the
+    /// `namespaces` group: this changes the mount table of a namespace it creates, never the test's.
+    pub(super) fn without_proc(mut self) -> Spec {
+        self.without_proc = true;
         self
     }
 
@@ -240,7 +249,9 @@ impl ShimRig {
             command.current_dir(cwd);
         }
         let ignore = spec.ignore.clone();
-        // SAFETY: the closure calls only `setrlimit` and `signal`, which are async-signal-safe.
+        let without_proc = spec.without_proc;
+        // SAFETY: the closure calls only `setrlimit`, `signal`, `unshare`, `mount` and `umount2`, which are
+        // async-signal-safe.
         unsafe {
             command.pre_exec(move || {
                 // The tests make programs fault on purpose; leave no core files.
@@ -251,6 +262,19 @@ impl ShimRig {
                 libc::setrlimit(libc::RLIMIT_CORE, &no_core);
                 for signal in &ignore {
                     libc::signal(*signal, libc::SIG_IGN);
+                }
+                if without_proc
+                    && (libc::unshare(libc::CLONE_NEWNS) != 0
+                        || libc::mount(
+                            std::ptr::null(),
+                            c"/".as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_REC | libc::MS_PRIVATE,
+                            std::ptr::null(),
+                        ) != 0
+                        || libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH) != 0)
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
@@ -705,6 +729,15 @@ impl Owner {
                 return;
             }
         }
+    }
+
+    /// Has the owner send `bytes` as control bytes to its shim and exit at once, and reaps it.
+    pub(super) fn send_and_exit(&mut self, bytes: &str) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("the owner's stdin is open");
+        writeln!(stdin, "{}{bytes}", crate::elevation::shim::owner_helper::SEND_EXIT).expect("the owner is alive");
+        let status = self.child.wait().expect("the owner's exit");
+        assert!(status.success(), "the owner failed: {status:?}");
     }
 
     /// Ends the owner with SIGKILL, and reaps it.

@@ -24,6 +24,8 @@
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. [`ProcessId::current`](identity::ProcessId::current)
 //!   needs only a readable `/proc/self/stat`.
+//! - The elevation shim (`cosca::init`, Unix) needs `/proc` mounted: it reaches cosca's socket through
+//!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel

@@ -8,7 +8,7 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use rustix::fs::{open, Mode, OFlags};
+use rustix::fs::{open, stat, Mode, OFlags};
 use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
 use super::{Exit, Shim};
@@ -78,7 +78,10 @@ impl Shim {
         let socket = socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None)
             .map_err(|e| unreachable(self, format!("could not make a socket: {e}")))?;
         set_passcred(socket.as_fd()).map_err(|e| unreachable(self, format!("SO_PASSCRED: {e}")))?;
-        let path = format!("/proc/thread-self/fd/{}/{SOCKET_NAME}", dir.as_raw_fd());
+        // The probe comes first: without `/proc`, the connect below fails with a bare `ENOENT`.
+        let fd_path = format!("/proc/thread-self/fd/{}", dir.as_raw_fd());
+        stat(&fd_path).map_err(|e| unreachable(self, format!("/proc must be mounted: {fd_path}: {e}")))?;
+        let path = format!("{fd_path}/{SOCKET_NAME}");
         let address = SocketAddrUnix::new(&path).map_err(|e| unreachable(self, format!("{path}: {e}")))?;
         connect(&socket, &address).map_err(|e| unreachable(self, format!("could not reach cosca: {e}")))?;
         self.conn = Some(socket);

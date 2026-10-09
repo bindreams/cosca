@@ -101,15 +101,6 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
     if events.exec != ExecEvent::Nothing {
         state.exec_pending = false;
     }
-    if events.owner_exited && state.owner_watched {
-        state.owner_watched = false;
-        if state.armed {
-            actions.signal = Some(ToChild::Kill);
-        }
-    }
-    if events.signaled {
-        actions.signal = Some(ToChild::Kill);
-    }
     match events.control {
         Control::Nothing => {}
         Control::Eof => {
@@ -133,6 +124,17 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
                 actions.violation = true;
             }
         },
+    }
+    // The owner's exit counts as EOF, so the bytes cosca sent before it come first: a `D` and the
+    // exit in one round leave the program.
+    if events.owner_exited && state.owner_watched {
+        state.owner_watched = false;
+        if state.armed {
+            actions.signal = Some(ToChild::Kill);
+        }
+    }
+    if events.signaled {
+        actions.signal = Some(ToChild::Kill);
     }
     actions.reap = events.child_exited;
     actions

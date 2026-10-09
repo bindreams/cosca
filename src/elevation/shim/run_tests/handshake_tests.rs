@@ -5,6 +5,7 @@ use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::fake_shim::my_euid;
 use crate::elevation::shim::link::probe::LinkEvent;
 use crate::elevation::shim::link::KillOutcome;
+use crate::test_groups::{namespaces, Group};
 
 /// The shim's stderr lines.
 fn stderr_lines(stderr: &str) -> Vec<&str> {
@@ -31,6 +32,18 @@ fn wrong_identity_is_refused_before_hello_and_not_started() {
     assert!(done.stderr.contains("(exit 122)"), "{}", done.stderr);
     assert!(!done.logged("hello sent"), "{:#?}", done.lines);
     assert_eq!(rig.link.link.wait().unwrap(), not_started_unconnected());
+    assert!(!marker.exists(), "the program ran");
+}
+
+#[skuld::test]
+fn missing_proc_is_refused_and_says_proc_must_be_mounted(#[fixture(namespaces)] _group: &Group) {
+    let rig = ShimRig::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("ran");
+    let done = rig.run_to_end(marker_program(&marker).without_proc());
+    assert_eq!(done.code, Some(124), "{}\n{:#?}", done.stderr, done.lines);
+    assert!(done.stderr.contains("/proc must be mounted"), "{}", done.stderr);
+    assert!(!done.stderr.contains("could not reach cosca"), "{}", done.stderr);
     assert!(!marker.exists(), "the program ran");
 }
 
