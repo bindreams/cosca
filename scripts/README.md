@@ -86,6 +86,12 @@ JavaScript rules, so the ELEVATION group's Linux tests run in them (see
 [Unattended GUI elevation](#unattended-gui-elevation)). Provisioning installs `polkitd`, `pkexec`
 and `opendoas` for that.
 
+Each Vagrant guest's box, version and sha512 are pinned in its `box.json`, which the Vagrantfile
+uses as `box_url`: Vagrant checks a download only against the checksum in the metadata it was
+added from, so a pin in the Vagrantfile, or a box named from the catalog, would go unchecked. A
+box already in `~/.vagrant.d/boxes` is reused without being hashed again, so after changing a
+pin run `vagrant box remove <old box name>` (`vagrant box list` shows the names).
+
 On the emulated architecture, QEMU falls back to TCG (software emulation) instead of
 HVF/KVM, which is dramatically slower — see [Windows guests](#windows-guests) for measured
 numbers on this host.
@@ -165,9 +171,9 @@ expiring, it runs `slmgr /rearm` and reboots (via `reboot_windows_guest_and_wait
 rearm to take effect, then re-checks via WMI and fails loudly if the license still isn't
 current. `stromweld/windows-10` 202503.09.0 ships with 2 rearms; once those are spent,
 `devvm.py` refuses to proceed with a clear error rather than silently leaving a guest that
-can die mid-run — at that point the fix is bumping `config.vm.box_version` in
-`scripts/devvm/guests/windows-x64/Vagrantfile` to a newer build, not disabling activation
-checks. This is throwaway dev tooling; don't rely on this VM outliving a single
+can die mid-run — at that point the fix is bumping the box in
+`scripts/devvm/guests/windows-x64/` (the `config.vm.box` name and `box.json`) to a newer
+build, not disabling activation checks. This is throwaway dev tooling; don't rely on this VM outliving a single
 investigation.
 
 **No Vagrant shell provisioner — a real restart fuse, removed.** `windows-x64`'s Vagrantfile
@@ -470,8 +476,7 @@ hosted runner inherits the runner's variables). On Linux and macOS the script mu
 On Linux the script needs systemd as PID 1 and polkit 0.106 or later (JavaScript `rules.d`), and a `--user` that
 exists and is not root (polkit always authorizes root). It restarts `polkit.service`, then checks that the user can
 run `pkexec` with no agent; it refuses anything else before writing anything, and runs its commands with a scrubbed
-environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller). CI and the devvm Linux guests (Ubuntu 24.04,
-polkit 124) qualify.
+environment (no `SYSTEMCTL_FORCE_BUS` or `DBUS_*` from the caller). CI and the devvm Linux guests qualify.
 
 ```sh
 # Linux guest: a polkit rule authorizes one account for every polkit action

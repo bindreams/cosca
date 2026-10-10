@@ -5,8 +5,7 @@
 # itself if already done.
 set -euo pipefail
 
-# apt packages: a C linker, and what the ELEVATION group's Linux tests elevate through (see the
-# `elevation_linux` job in ci.yaml). One apt run, only if something is missing.
+# apt packages: a C linker, and what the ELEVATION group's Linux tests elevate through.
 APT_PACKAGES=()
 if command -v cc >/dev/null 2>&1; then
     echo "devvm: cc already present, skipping build-essential"
@@ -20,16 +19,22 @@ else
 fi
 
 if [ "${#APT_PACKAGES[@]}" -gt 0 ]; then
-    # A freshly booted guest can still be running cloud-init, and unattended-upgrades can take the
-    # dpkg lock at any time. Wait for cloud-init to finish (exit 2 is "finished, recoverable
-    # errors"), then stop the apt timers and unattended-upgrades for the duration of the install,
-    # and put back whichever of them were active, even if apt fails.
+    # A freshly booted guest can still be running cloud-init, and unattended-upgrade can hold the
+    # dpkg lock at any time. Wait for cloud-init: exit 0 is "done" and 2 is "done, recoverable
+    # errors"; any other status fails the provision. Stop the apt units so no new run starts.
+    # Stopping them does not end a run in progress (KillMode=process), so apt itself waits for
+    # its lock, without a bound. Put back the units that were active, even if apt fails.
     if command -v cloud-init >/dev/null 2>&1; then
         CLOUD_INIT_STATUS=0
         sudo cloud-init status --wait >/dev/null || CLOUD_INIT_STATUS=$?
-        if [ "$CLOUD_INIT_STATUS" -ne 0 ]; then
-            echo "devvm: cloud-init finished with exit status $CLOUD_INIT_STATUS, continuing" >&2
-        fi
+        case "$CLOUD_INIT_STATUS" in
+        0) ;;
+        2) echo "devvm: cloud-init finished with exit status 2 (recoverable errors), continuing" >&2 ;;
+        *)
+            echo "devvm: cloud-init status --wait failed with exit status $CLOUD_INIT_STATUS" >&2
+            exit 1
+            ;;
+        esac
     fi
 
     APT_TIMERS=(apt-daily.timer apt-daily-upgrade.timer)
@@ -51,11 +56,19 @@ if [ "${#APT_PACKAGES[@]}" -gt 0 ]; then
         fi
     done
     for unit in "${APT_TIMERS[@]}" "${APT_SERVICES[@]}"; do
-        sudo systemctl stop "$unit" 2>/dev/null || true
+        # A unit this image does not have is expected; any other failure to stop one is not.
+        if [ "$(systemctl show --property=LoadState --value "$unit")" = not-found ]; then
+            continue
+        fi
+        sudo systemctl stop "$unit" || {
+            echo "devvm: could not stop $unit" >&2
+            exit 1
+        }
     done
 
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends "${APT_PACKAGES[@]}" >/dev/null
+    APT_WAIT=(-o DPkg::Lock::Timeout=-1)
+    sudo apt-get "${APT_WAIT[@]}" update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_WAIT[@]}" install -qq -y --no-install-recommends "${APT_PACKAGES[@]}" >/dev/null
 
     restore_apt_units
     trap - EXIT

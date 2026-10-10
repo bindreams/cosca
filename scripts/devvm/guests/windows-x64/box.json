@@ -1,0 +1,18 @@
+{
+  "name": "stromweld/windows-10-202503.09.0",
+  "versions": [
+    {
+      "version": "202503.09.0",
+      "providers": [
+        {
+          "name": "libvirt",
+          "architecture": "amd64",
+          "default_architecture": true,
+          "url": "https://vagrantcloud.com/stromweld/boxes/windows-10/versions/202503.09.0/providers/libvirt/amd64/vagrant.box",
+          "checksum_type": "sha512",
+          "checksum": "0c5ce38d9b6f716423a7bcb2ee745024629c8055e21c64bb1e9f2d5745fc6e3e93bf602cc88c81d9fdc0313026caddceb66ffc78c2a960eed1245abef7912cfa"
+        }
+      ]
+    }
+  ]
+}

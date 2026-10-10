@@ -9,9 +9,9 @@
 # all state lands under .tmp/devvm/ in the worktree, never in the box's own directory.
 #
 # Box: cloud-image/ubuntu-24.04 (community-published, not Canonical's), provider qemu, version and
-# checksum pinned below. Ubuntu 24.04's
-# systemd (255) defaults to the unified cgroup v2 hierarchy, and its polkit (124) reads JavaScript
-# rules, which `.github/scripts/unattended-gui-elevation.py` needs (>= 0.106).
+# checksum pinned below. Ubuntu 24.04's systemd (255) defaults to the unified cgroup v2 hierarchy,
+# and its polkit (124) reads JavaScript rules, which `.github/scripts/unattended-gui-elevation.py`
+# needs (>= 0.106).
 
 require_relative "../_shared/fix_macos_port_check"
 require_relative "../_shared/fix_qemu_loopback_only"
@@ -19,15 +19,11 @@ require_relative "../_shared/fix_qemu_loopback_only"
 STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "cloud-image/ubuntu-24.04"
-  config.vm.box_version = "20260926.0.0"
-  # Vagrant Cloud publishes no checksum for this box, so this one was computed locally: the qemu/amd64
-  # box file (https://vagrantcloud.com/cloud-image/boxes/ubuntu-24.04/versions/20260926.0.0/providers/qemu/amd64/vagrant.box,
-  # 616977768 bytes) downloaded with `curl -X GET` and hashed with `shasum -a 512` on 2026-10-10.
-  # It pins the contents the version alone does not, but is trust-on-first-use: it proves the file
-  # is the one downloaded then, not that the publisher's upload was clean.
-  config.vm.box_download_checksum = "8a7246e43776ae46915eea33f3d0617c49d4968e18269b0c12a2ccdc843601fb532c9dd5533a327ba1fed082b218fd3266e042287895775bd821f796fa94534a"
-  config.vm.box_download_checksum_type = "sha512"
+  config.vm.box = "cloud-image/ubuntu-24.04-20260926.0.0"
+  # Pinned in box.json, the one place Vagrant checks a downloaded box against a checksum: a box named
+  # from the catalog is checked only against the catalog's. sha512 of the box file, computed locally by
+  # `curl -X GET` + `shasum -a 512` (TOFU).
+  config.vm.box_url = "file://#{File.expand_path("box.json", __dir__)}"
   # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
   # host silently excludes it from "usable providers" and `up` fails with a misleading "box
   # doesn't support requested provider" error, even though the box does publish a qemu
