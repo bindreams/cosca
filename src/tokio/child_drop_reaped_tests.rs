@@ -443,6 +443,7 @@ async fn cgroup_drop_after_wait_still_kills_the_tree_and_does_not_warn(#[fixture
         crate::containment::Attached::Cgroup(leaf) => leaf.path().to_path_buf(),
         other => panic!("a cgroup child holds its leaf, got {other:?}"),
     };
+    let _leaf_cleanup = cgroup_common::LeafGuard::new(leaf.clone());
     let mut started = [0u8; 8];
     child
         .stdout()

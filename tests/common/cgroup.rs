@@ -13,6 +13,35 @@ pub fn cgroup_of(pid: u32) -> std::path::PathBuf {
     std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
 }
 
+/// Removes `leaf` when dropped, so a test that fails (or panics) before its own [`drain_and_remove_leaf`] still leaves
+/// no leaf behind. Whatever still lives in the leaf is killed first (`cgroup.kill`), as the sockets that would release
+/// the members are dropped after this guard. On the success path the leaf is already gone, and every step here
+/// accepts that.
+///
+/// A panic inside the removal is caught: this runs while the test may already be unwinding, where a second panic
+/// aborts the test binary and every test in it.
+pub struct LeafGuard(std::path::PathBuf);
+
+impl LeafGuard {
+    pub fn new(leaf: std::path::PathBuf) -> LeafGuard {
+        LeafGuard(leaf)
+    }
+}
+
+impl Drop for LeafGuard {
+    fn drop(&mut self) {
+        let leaf = &self.0;
+        let removed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The leaf is gone on the success path, and `cgroup.kill` then does not exist.
+            let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
+            drain_and_remove_leaf(leaf);
+        }));
+        if removed.is_err() {
+            eprintln!("could not remove the leaf {}", leaf.display());
+        }
+    }
+}
+
 /// Wait for `leaf` to drain, then remove it, unless something else removes it first.
 ///
 /// A tree whose handle opted out of teardown, still running when the handle drops, leaves its leaf

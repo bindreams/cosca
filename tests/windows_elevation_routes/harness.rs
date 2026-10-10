@@ -968,20 +968,51 @@ impl ScratchAccount {
 }
 
 impl Drop for ScratchAccount {
+    /// Removes the account and the profile a logon with `LOGON_WITH_PROFILE` made for it (the profile
+    /// first, while the account exists). A failure of either fails the test, unless the test is already
+    /// failing (a second panic while unwinding aborts the binary), where it is only printed.
     fn drop(&mut self) {
-        match crate::common::output_locked(std::process::Command::new("net").args(["user", &self.user, "/delete"])) {
+        let mut failures = Vec::new();
+        // The profile directory and registry hive outlive `net user /delete`. `self.user` is one of two fixed
+        // alphanumeric names, so it needs no quoting. A profile that is still loaded fails to go and is reported.
+        let script = format!(
+            "$left = {{ Get-CimInstance Win32_UserProfile | Where-Object {{ $_.LocalPath -like '*\\{user}' }} }}; \
+             & $left | Remove-CimInstance -ErrorAction Stop; \
+             if (& $left) {{ exit 1 }}",
+            user = self.user
+        );
+        match crate::common::output_locked(std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])) {
             Ok(out) if out.status.success() => {}
-            Ok(out) => println!(
-                "PROBE scratch-account: `net user {} /delete` in Drop FAILED: status={} stdout={} stderr={}",
+            Ok(out) => failures.push(format!(
+                "removing the profile of {} FAILED: status={} stdout={} stderr={}",
                 self.user,
                 out.status,
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
-            ),
-            Err(e) => println!(
-                "PROBE scratch-account: `net user {} /delete` in Drop could not be run: {e}",
-                self.user
-            ),
+            )),
+            Err(e) => failures.push(format!("removing the profile of {} could not be run: {e}", self.user)),
+        }
+        match crate::common::output_locked(std::process::Command::new("net").args(["user", &self.user, "/delete"])) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => failures.push(format!(
+                "`net user {} /delete` FAILED: status={} stdout={} stderr={}",
+                self.user,
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )),
+            Err(e) => failures.push(format!("`net user {} /delete` could not be run: {e}", self.user)),
+        }
+        for failure in &failures {
+            println!("PROBE scratch-account: {failure}");
+        }
+        if !failures.is_empty() && !std::thread::panicking() {
+            panic!("the scratch account {} was not fully removed: {failures:?}", self.user);
         }
     }
 }

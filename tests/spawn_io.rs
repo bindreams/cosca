@@ -1453,6 +1453,7 @@ fn linux_cgroup_v2_kill_on_drop_false_removes_the_leaf_of_a_drained_tree(#[fixtu
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     child.kill_tree().expect("kill_tree");
     let _ = child.wait();
@@ -1496,6 +1497,7 @@ fn linux_cgroup_v2_kill_on_drop_false_kill_tree_still_waits_for_the_leaf_to_drai
     } = spawn_contained_echo_tree(false);
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     let mark = common::log_mark();
     child.kill_tree().expect("kill_tree");
@@ -1534,6 +1536,7 @@ fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: imp
         child.containment()
     );
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
     assert!(
         leaf.file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),
@@ -1550,6 +1553,32 @@ fn assert_opted_out_tree_survives(spawn: impl FnOnce() -> EchoTree, opt_out: imp
     drop(root);
     drop(grand);
     common::cgroup::drain_and_remove_leaf(&leaf);
+}
+
+/// A test that panics with a live member in its leaf still leaves no leaf: the guard kills the member and
+/// removes the leaf. Mutant: an empty `Drop`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn cgroup_leaf_guard_removes_a_leaf_with_a_live_member_when_the_test_panics(#[fixture(cgroup)] _group: &Group) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let leaf = common::cgroup::cgroup_of(std::process::id()).join(format!("cosca-{}-leaf-guard", std::process::id()));
+    std::fs::create_dir(&leaf).expect("make the leaf");
+    let mut member = common::spawn_locked(std::process::Command::new("sleep").arg("3600")).expect("spawn a member");
+    std::fs::write(leaf.join("cgroup.procs"), member.id().to_string()).expect("place the member in the leaf");
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = common::cgroup::LeafGuard::new(leaf.clone());
+        panic!("the test fails here");
+    }));
+
+    assert!(outcome.is_err());
+    assert!(!leaf.exists(), "the guard left {}", leaf.display());
+    assert_eq!(
+        member.wait().expect("reap the member").signal(),
+        Some(libc::SIGKILL),
+        "the guard must kill what is still in the leaf"
+    );
 }
 
 /// Run `f` with the calling thread pinned to one CPU, then restore its affinity. A child forked
