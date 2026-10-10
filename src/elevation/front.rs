@@ -152,6 +152,13 @@ pub(crate) fn cgroup_kill_reached(
             detail: format!("pid {pid}'s cgroup kill is not shown to have reached it: it is no front"),
         });
     };
+    let exited = || {
+        #[cfg(test)]
+        if seams::reach_reads_running() {
+            return Ok(false);
+        }
+        exited()
+    };
     let mut unread = Vec::new();
     match exited() {
         Ok(true) => return Ok(()),
@@ -293,6 +300,29 @@ pub(crate) mod seams {
         static GATES: Cell<Option<u32>> = const { Cell::new(None) };
         static BETWEEN_GATE_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BETWEEN_REACH_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static REACH_READS_RUNNING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While the guard lives, the checks of a cgroup kill on this thread read the front as still
+    /// running, whatever its cgroup kill did to it: a front just killed may or may not have exited
+    /// by the check's first read, and a test of what the check does with a front it cannot place
+    /// needs one that has not.
+    pub(crate) fn read_fronts_running_after_a_kill() -> ReachReadsRunning {
+        REACH_READS_RUNNING.with(|f| f.set(true));
+        ReachReadsRunning(())
+    }
+
+    #[must_use = "fronts are read as they are again as soon as the guard is dropped"]
+    pub(crate) struct ReachReadsRunning(());
+
+    impl Drop for ReachReadsRunning {
+        fn drop(&mut self) {
+            REACH_READS_RUNNING.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn reach_reads_running() -> bool {
+        REACH_READS_RUNNING.with(Cell::get)
     }
 
     /// Run `hook` once in the next kill gate on this thread, between its read of whether the front

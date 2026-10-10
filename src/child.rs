@@ -807,7 +807,8 @@ pub(crate) mod fault {
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when
-/// that kill fails, the drop leaves it running and unreaped, and warns.
+/// that kill fails, the drop leaves it running and unreaped, and warns, and its leaf kills nothing
+/// either: a `cgroup.kill` there would end the front.
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -828,6 +829,9 @@ impl Drop for Child {
         #[cfg(unix)]
         let cgroup_only = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => {
+                // Disarmed, or the leaf's own teardown would write `cgroup.kill` over the front
+                // this drop leaves alone.
+                self.attached.disarm();
                 log::warn!("Child::drop: the elevated child is left running and unreaped: {unkillable}");
                 return;
             }
@@ -860,15 +864,29 @@ impl Drop for Child {
         }
         #[cfg(unix)]
         if cgroup_only {
+            let landed = tree.is_ok();
             match tree.and_then(|()| self.cgroup_kill_reached()) {
                 // The cgroup kill ended it: reap it, sending nothing.
                 Ok(()) => self.proc.reap_after_tree_kill(),
-                // Never waited for: it may run as long as its program.
-                Err(e) => log::warn!(
-                    "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill did not end it \
-                     ({e}), and a kill of the front would orphan the elevated program",
-                    self.id.pid()
-                ),
+                // Never waited for: it may run as long as its program. Disarmed, or the leaf's own
+                // teardown would write `cgroup.kill` over a front a failed kill left running.
+                Err(e) => {
+                    self.attached.disarm();
+                    if landed {
+                        log::warn!(
+                            "Child::drop: elevation front pid {} is left unreaped: its cgroup kill landed but was not \
+                             shown to reach it ({e}), so it may have ended or still run, and a kill of the front would \
+                             orphan the elevated program",
+                            self.id.pid()
+                        );
+                    } else {
+                        log::warn!(
+                            "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill \
+                             failed ({e}), and a kill of the front would orphan the elevated program",
+                            self.id.pid()
+                        );
+                    }
+                }
             }
             return;
         }

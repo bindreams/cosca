@@ -155,6 +155,80 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
+/// Async twin of the sync `cgroup_a_drop_whose_placement_read_fails_leaves_the_front_running`. The
+/// leaf's release writes `cgroup.kill` over a busy leaf it was armed for. Mutant: "the drop does
+/// not disarm the leaf".
+#[skuld::test]
+async fn cgroup_a_drop_whose_placement_read_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pidfd = pidfd_of(child.id().pid());
+    let leaf = leaf_path_of(&child);
+    let mark = crate::log_capture::mark();
+    {
+        let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
+        drop(child);
+    }
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("is left running"), "{warns:?}");
+    drop(stdin);
+    assert_eq!(ended(&pidfd), Some((Some(0), None)), "the drop signalled the front");
+    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
+}
+
+/// Async twin of the sync `cgroup_a_drop_whose_first_cgroup_kill_fails_leaves_the_front_running`.
+#[skuld::test]
+async fn cgroup_a_drop_whose_first_cgroup_kill_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pidfd = pidfd_of(child.id().pid());
+    let leaf = leaf_path_of(&child);
+    let mark = crate::log_capture::mark();
+    {
+        let _failing = crate::containment::cgroup::fault::fail_next_kill_write();
+        drop(child);
+    }
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "is left running");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    drop(stdin);
+    assert_eq!(ended(&pidfd), Some((Some(0), None)), "the drop signalled the front");
+    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
+}
+
+/// Async twin of the sync `cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed`.
+#[skuld::test]
+async fn cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed(#[fixture(cgroup)] _group: &Group) {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let pidfd = pidfd_of(child.id().pid());
+    let unreadable = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _arming = crate::containment::cgroup::fault::set_before_kill_write({
+        let unreadable = std::rc::Rc::clone(&unreadable);
+        move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
+    });
+    let _running = crate::elevation::front::seams::read_fronts_running_after_a_kill();
+    let mark = crate::log_capture::mark();
+    drop(child);
+    drop(unreadable.take());
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop: elevation front");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("cgroup kill landed"), "{warns:?}");
+    assert!(!warns[0].1.contains("left running"), "{warns:?}");
+    assert_killed(&pidfd);
+}
+
+/// The directory of the leaf `child` is contained in.
+fn leaf_path_of(child: &Child) -> std::path::PathBuf {
+    match &child.os.attached {
+        crate::containment::Attached::Cgroup(leaf) => leaf.path().to_path_buf(),
+        other => panic!("expected a cgroup leaf, got {other:?}"),
+    }
+}
+
 /// Async twin of the sync `cgroup_kill_of_a_front_that_refuses_signals_is_ok`.
 #[skuld::test]
 async fn cgroup_kill_of_a_front_that_refuses_signals_is_ok(#[fixture(cgroup)] _group: &Group) {
@@ -263,7 +337,7 @@ async fn cgroup_drop_of_a_front_moved_out_during_its_kill_warns(#[fixture(cgroup
     drop(child);
     assert_eq!(roots.kills(), 0, "the drop sends the front no kill of its own");
     // The warning of a front whose cgroup kill did not reach it, not that of one never killed.
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "its cgroup kill did not end it");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "its cgroup kill landed but was not shown");
     assert_eq!(warns.len(), 1, "{warns:?}");
     drop(stdin);
     assert_eq!(ended(&pidfd), Some((Some(0), None)), "nothing signalled the front");

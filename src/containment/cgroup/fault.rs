@@ -31,6 +31,7 @@ thread_local! {
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
     static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -76,6 +77,26 @@ impl Drop for FailKillWrites {
 
 pub(crate) fn kill_writes_fail() -> bool {
     FAIL_KILL_WRITES.with(Cell::get)
+}
+
+/// The next `cgroup.kill` write on this thread fails with `EIO` and kills nothing; the writes after
+/// it succeed. A drop's own kill failing while the leaf's teardown, which writes after it, works.
+pub(crate) fn fail_next_kill_write() -> FailNextKillWrite {
+    FAIL_NEXT_KILL_WRITE.with(|f| f.set(true));
+    FailNextKillWrite(())
+}
+
+#[must_use = "the failure is cleared as soon as the guard is dropped"]
+pub(crate) struct FailNextKillWrite(());
+
+impl Drop for FailNextKillWrite {
+    fn drop(&mut self) {
+        FAIL_NEXT_KILL_WRITE.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn take_next_kill_write_failure() -> bool {
+    FAIL_NEXT_KILL_WRITE.with(|f| f.replace(false))
 }
 
 /// While the guard lives, this thread reads `PIDFD_GET_INFO` as missing, as on a kernel before

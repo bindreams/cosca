@@ -495,7 +495,7 @@ impl CgroupLeaf {
         #[cfg(test)]
         fault::run_before_kill_write();
         #[cfg(test)]
-        let written = if fault::kill_writes_fail() {
+        let written = if fault::kill_writes_fail() || fault::take_next_kill_write_failure() {
             Err(std::io::Error::from_raw_os_error(libc::EIO))
         } else {
             self.dir.write("cgroup.kill", KILL_PAYLOAD)
