@@ -6,12 +6,16 @@
 //! cosca's end of the channel.
 
 mod choice;
+pub(crate) mod codes;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub(crate) mod fork_guard;
 pub(crate) mod link;
+pub(crate) mod owner_watch;
 pub(crate) mod private_dir;
+pub(crate) mod program_path;
 pub(crate) mod protocol;
+pub(crate) mod step;
 
-#[allow(unused_imports, reason = "no caller yet")]
+#[allow(unused_imports, reason = "nothing outside the tests of this module uses it")]
 pub(crate) use choice::ShimChoice;
