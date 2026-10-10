@@ -275,15 +275,14 @@ impl Child {
         self.require_contained()?;
         #[cfg(unix)]
         self.refuse_unpinned("graceful_shutdown_tree")?;
-        // terminate_tree's own require_contained guard fires before any signal, so an
-        // uncontained child errors up front.
+        // `require_contained` above errors an uncontained child before any signal.
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {
-            fault::Forced::None => self.terminate_tree(),
+            fault::Forced::None => self.terminate_tree_signalling(),
             kind => Err(fault::forced_terminate_error(kind)),
         };
         #[cfg(not(test))]
-        let term_result = self.terminate_tree();
+        let term_result = self.terminate_tree_signalling();
 
         // Hold-and-continue ONLY for the error shapes that are ORDINARY outcomes rather than a
         // dead mechanism — see the sync `src/child/graceful.rs` twin's identical match for the
