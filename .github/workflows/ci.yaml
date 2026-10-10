@@ -656,25 +656,6 @@ jobs:
           $p | Wait-Process
           Write-Host 'none alive'
 
-      - name: THROWAWAY - control, an orphan outlives a plain step's timeout
-        id: win_c2
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        continue-on-error: true
-        timeout-minutes: 1
-        shell: pwsh
-        run: |
-          cmd /c "start /b ping -n 3600 127.0.0.1 > nul"
-          Start-Sleep 3600
-
-      - name: THROWAWAY - control result, the orphan is still alive
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        shell: pwsh
-        run: |
-          $alive = @(Get-Process ping -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited })
-          Write-Host "control after timeout: $($alive.Count) ping alive"
-          $alive | Stop-Process -Force
-          $alive | Wait-Process
-
       - name: THROWAWAY - orphan started through run-nextest.ps1, step timeout
         id: win_t2
         if: ${{ !cancelled() && matrix.os == 'windows' }}
@@ -890,7 +871,7 @@ jobs:
           exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             # forward.py made this shell a session leader, so its pid is the id of the group that holds the run.
             echo $$ > "$3"
-            python3 .github/scripts/straggler-throwaway.py 31337 &
+            ( trap : TERM; while :; do sleep 31337; done ) &
             sleep 3600
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
