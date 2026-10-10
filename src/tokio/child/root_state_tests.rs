@@ -124,18 +124,18 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
     );
 }
 
-/// One forget policy: an unsettled root is forgotten quietly, the leak left to the caller's one
-/// warn; any other root only on evidence, with a warn of its own; a root still shown ours is not
-/// forgotten.
+/// One forget policy, and a quiet one: a root the view shows reaped is forgotten on that evidence;
+/// any other only if a second look cannot show it ours, and the second look's answer is carried. A
+/// root still shown ours, or already forgotten, is not forgotten, and nothing is logged.
 ///
-/// Mutants: `forget_for` forgets an unsettled root loudly; forgets a trusted root quietly; forgets
-/// without evidence.
+/// Mutants: `forget_for` logs; forgets a trusted root without a second look; drops the second
+/// look's answer; forgets a backend that was already forgotten.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-async fn forget_for_forgets_an_unsettled_root_quietly_and_any_other_with_its_own_warn() {
+async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
     use crate::containment::dispatch::RootView;
     use crate::containment::DropView;
-    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
 
     crate::log_capture::install();
     let view = |root| DropView {
@@ -146,24 +146,38 @@ async fn forget_for_forgets_an_unsettled_root_quietly_and_any_other_with_its_own
 
     let (mut child, _writer) = session_blocker(false);
     let mark = crate::log_capture::mark();
-    let _failed = force_peek_once(failed_peek("forced"));
+    let looks = force_peek_once(failed_peek("forced"));
     let forgot = child
         .proc_mut()
         .forget_for(&view(RootView::Unknown(std::io::Error::other("first look"))))
         .expect("an unsettled root the second look cannot show ours is forgotten");
-    assert!(forgot.quiet && forgot.now.is_some(), "{forgot:?}");
+    assert_peeks_exhausted();
+    drop(looks);
+    assert!(matches!(forgot.now, Some(RootState::Unknown(_))), "{forgot:?}");
     assert_eq!(warns_since(mark), Vec::<String>::new());
+    // The backend is forgotten now: a second forget has nothing to forget, and leaks nothing.
+    assert!(child.proc_mut().forget_for(&view(RootView::Reaped)).is_none());
 
     let (mut child, _writer) = session_blocker(false);
     let mark = crate::log_capture::mark();
-    let _failed = force_peek_once(failed_peek("forced"));
+    let looks = force_peek_once(failed_peek("forced"));
     let forgot = child
         .proc_mut()
         .forget_for(&view(RootView::Trusted))
         .expect("a trusted root the second look cannot show ours is forgotten");
-    assert!(!forgot.quiet, "{forgot:?}");
-    let warns = warns_since(mark);
-    assert!(warns.len() == 1 && warns[0].contains(forgot.leak), "{warns:?}");
+    assert_peeks_exhausted();
+    drop(looks);
+    assert!(matches!(forgot.now, Some(RootState::Unknown(_))), "{forgot:?}");
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+
+    let (mut child, _writer) = session_blocker(false);
+    let mark = crate::log_capture::mark();
+    let forgot = child
+        .proc_mut()
+        .forget_for(&view(RootView::Reaped))
+        .expect("a root the view shows reaped is forgotten on that evidence");
+    assert!(forgot.now.is_none(), "{forgot:?}");
+    assert_eq!(warns_since(mark), Vec::<String>::new());
 
     let (mut child, _writer) = session_blocker(false);
     assert!(child.proc_mut().forget_for(&view(RootView::Trusted)).is_none());

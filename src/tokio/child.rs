@@ -95,6 +95,10 @@ pub struct Child {
     elevation: Option<crate::elevation::ElevationReport>,
     /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
     front: Option<crate::elevation::front::Front>,
+    /// A failed-spawn cleanup that left this handle armed already warned about its event, so the
+    /// drop that retries reports at `debug`.
+    #[cfg(unix)]
+    reported: bool,
 }
 
 impl Child {
@@ -121,26 +125,34 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
+            #[cfg(unix)]
+            reported: false,
         }
-    }
-
-    /// The containment this child owns.
-    #[cfg(unix)]
-    pub(super) fn attached(&self) -> &crate::containment::Attached {
-        &self.os.attached
     }
 
     /// See [`ProcSource::forget_for`].
     #[cfg(unix)]
-    pub(super) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<crate::containment::Forgot> {
+    pub(super) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<crate::child::drop_report::Forgot> {
         self.os.proc.as_mut()?.forget_for(view)
     }
 
-    /// Disarm the drop: for a failed spawn's cleanup, whose error reports what it did and left, so
-    /// the handle it drops is not the caller's to be told about.
+    /// Whether this handle already killed its tree completely.
     #[cfg(unix)]
-    pub(super) fn disarm_drop(&mut self) {
-        self.kill_on_drop = false;
+    pub(super) fn tree_killed(&self) -> bool {
+        self.tree_killed.is_set()
+    }
+
+    /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
+    /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
+    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is whether the
+    /// cleanup already warned of the event, so the drop does not warn of it twice.
+    #[cfg(unix)]
+    pub(super) fn end_cleanup(&mut self, settled: bool, warned: bool) {
+        if settled {
+            self.kill_on_drop = false;
+        } else {
+            self.reported = warned;
+        }
     }
 
     /// Set by the spawn, from its command.
@@ -263,22 +275,18 @@ impl Child {
     /// skipped on the ordinary success path.
     ///
     /// A child something else reaped, or that cannot be shown to be ours, is forgotten instead,
-    /// quietly (nothing above `debug`): what the forget leaked is returned for the caller's one
-    /// warn. `None`: the child was waited for.
+    /// quietly (nothing above `debug`): what the forget leaked, and why the wait found the child
+    /// foreign, are returned for the caller's one warn. `None`: the child was waited for.
     ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn wait_and_reap_blocking(&mut self) -> Option<crate::containment::Forgot> {
+    pub(super) fn wait_and_reap_blocking(&mut self) -> Option<crate::child::drop_report::Forgot> {
         let pid = self.id.pid();
-        if self.proc_mut().wait_and_reap_at(pid, log::Level::Debug) == Waited::Foreign {
-            let leak = self.proc_mut().forget_foreign_quietly();
-            return Some(crate::containment::Forgot {
-                leak,
-                now: None,
-                quiet: true,
-            });
+        let (waited, cause) = self.proc_mut().wait_and_reap_caused(pid, log::Level::Debug);
+        if waited != Waited::Foreign {
+            return None;
         }
-        None
+        self.proc_mut().forget_for_wait(cause)
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -1067,9 +1075,9 @@ impl Drop for Child {
             },
             &self.tree_killed,
         );
-        // What forgetting tokio's `Child` leaked, if this drop forgot it.
+        // What the drop's steps found, for its one report.
         #[cfg(unix)]
-        let mut forgot: Option<crate::containment::Forgot> = None;
+        let mut signals = DropSignals::default();
         // The elevation front this drop left running instead of signalling, if any.
         #[cfg(unix)]
         let mut front_left = None;
@@ -1079,7 +1087,7 @@ impl Drop for Child {
             #[cfg(unix)]
             match kill_gate(self.front, &os, self.id.pid()) {
                 crate::elevation::front::Gate::Closed(unkillable) => front_left = Some(unkillable),
-                _ => signal_on_drop(self.id, &view, &mut os, &mut forgot),
+                _ => signals = signal_on_drop(self.id, &view, &mut os, self.reported),
             }
             #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
@@ -1089,10 +1097,10 @@ impl Drop for Child {
         // child, so tokio's `Child` must not run its own drop, which reaps by pid. Asked again: a
         // reap can land after the read above (and before or during the root kill).
         #[cfg(unix)]
-        if !own_reap && forgot.is_none() {
+        if !own_reap && signals.forgot.is_none() {
             if let Some(proc) = os.proc.as_mut() {
-                forgot = proc.forget_for(&view);
-                if forgot.is_some() {
+                signals.forgot = proc.forget_for(&view);
+                if signals.forgot.is_some() {
                     log::debug!(
                         "async child {} cannot be shown to be ours (reaped outside its handle, unknown, or unpinned); \
                          dropping it would reap by that number, so it was forgotten",
@@ -1102,13 +1110,14 @@ impl Drop for Child {
             }
         }
         #[cfg(unix)]
-        view.warn_unsettled(
-            "Child::drop",
-            &os.attached,
-            self.kill_on_drop,
-            front_left.as_ref(),
-            forgot.as_ref(),
-        );
+        {
+            let mut report = crate::child::drop_report::DropReport::new("Child::drop", &view);
+            report.front = front_left.as_ref();
+            report.skipped = signals.skipped;
+            report.forgot = signals.forgot;
+            report.left = signals.left;
+            report.emit(self.reported);
+        }
         os.release_without_waiting();
     }
 }
@@ -1125,14 +1134,34 @@ fn kill_gate(
     })
 }
 
-/// The signals of a kill-on-drop drop: the tree, then the root.
+/// What the signals of a kill-on-drop drop found, for the drop's one report.
+#[cfg(unix)]
+type Signalled = DropSignals;
+#[cfg(not(unix))]
+type Signalled = ();
+
+#[cfg(unix)]
+#[derive(Default)]
+struct DropSignals {
+    /// What the tree kill skipped ([`DropKill::skipped`](crate::containment::dispatch::DropKill)).
+    skipped: Option<String>,
+    /// What forgetting tokio's `Child` leaked, if the failed root kill forgot it.
+    forgot: Option<crate::child::drop_report::Forgot>,
+    /// What the root kill could not do.
+    left: Vec<String>,
+}
+
+/// The signals of a kill-on-drop drop: the tree, then the root. `reported`: an earlier step of this
+/// same event already warned, so a failed tree kill is logged at `debug`.
 fn signal_on_drop(
     id: ProcessId,
     #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
-    #[cfg(unix)] forgot: &mut Option<crate::containment::Forgot>,
-) {
+    #[cfg(unix)] reported: bool,
+) -> Signalled {
+    #[allow(unused_mut, reason = "only the Unix signals collect anything")]
+    let mut signals = Signalled::default();
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
@@ -1147,7 +1176,11 @@ fn signal_on_drop(
     // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
     // was read, and tokio's orphan queue reaping by number afterwards.
     #[cfg(unix)]
-    let tree = os.attached.hard_kill_for_drop(view);
+    let tree = {
+        let kill = os.attached.hard_kill_for_drop(view);
+        signals.skipped = kill.skipped;
+        kill.result
+    };
     #[cfg(not(unix))]
     let tree = {
         _ = tree_killed;
@@ -1155,23 +1188,30 @@ fn signal_on_drop(
     };
     if let Err(e) = &tree {
         // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
-        log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        #[cfg(unix)]
+        let level = if reported { log::Level::Debug } else { log::Level::Warn };
+        #[cfg(not(unix))]
+        let level = log::Level::Warn;
+        log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
         if os.attached.hard_kill_refused_to_walk(&tree) {
             // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-            log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+            log::log!(
+                level,
+                "Child::drop: the root is killed regardless, so its descendants may be orphaned"
+            );
         }
     }
     // Already reaped, or not pinned by this process: no signal to issue.
     #[cfg(unix)]
     if view.leaves_root_alone() {
-        return;
+        return signals;
     }
     #[cfg(not(unix))]
     if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
-        return;
+        return signals;
     }
     let Some(proc) = os.proc.as_mut() else {
-        return;
+        return signals;
     };
     #[cfg(all(test, unix))]
     drop_fault::note_root_kill();
@@ -1192,18 +1232,23 @@ fn signal_on_drop(
     // possibly reused): the pid names nothing of ours to wait for.
     // Nothing is logged here: the drop forgets the child next, and logs that.
     if matches!(killed, Ok(Sent::Gone)) {
-        return;
+        return signals;
     }
     if killed.is_err() {
         // The `try_wait` below reaps by pid: forget a foreign reap first.
         #[cfg(unix)]
         {
-            *forgot = proc.forget_for(view);
+            signals.forgot = proc.forget_for(view);
         }
         if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {
-            log::warn!("async child {pid} could not be terminated on drop; leaving it running");
+            let left = format!("async child {pid} could not be terminated on drop; leaving it running");
+            #[cfg(unix)]
+            signals.left.push(left);
+            #[cfg(not(unix))]
+            log::warn!("{left}");
         }
     }
+    signals
 }
 
 /// Re-encodes a `waitid` result as a raw `wait` status.

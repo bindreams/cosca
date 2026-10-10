@@ -154,23 +154,6 @@ impl Attachment {
     }
 }
 
-/// What forgetting tokio's `Child` leaked, and what the second look at the root showed, for the one
-/// warn of the drop ([`DropView::warn_unsettled`]).
-#[cfg(unix)]
-#[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "only the async child forgets tokio's `Child`")
-)]
-#[derive(Debug)]
-pub(crate) struct Forgot {
-    /// What the forget leaks (tokio's pidfd and reactor registration, or its `SIGCHLD` watch).
-    pub(crate) leak: &'static str,
-    /// What the handle said when it was asked again, if it was.
-    pub(crate) now: Option<crate::signal::RootState>,
-    /// The forget logged nothing, so the one warn reports it.
-    pub(crate) quiet: bool,
-}
-
 /// What a drop or a failed-spawn cleanup knows of the root, from its own handle and its number.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -181,8 +164,8 @@ pub(crate) enum RootView {
     /// The handle could not say whether the root is reaped, and nothing else did.
     Unknown(std::io::Error),
     /// This process does not pin the root (macOS: launchd holds its zombie), and nothing else shows
-    /// it reaped.
-    Unpinned(std::io::Error),
+    /// it reaped. [`UNPINNED_WHY`](crate::signal::UNPINNED_WHY) says why.
+    Unpinned,
     /// The root is an unreaped child, and its number names it.
     Trusted,
 }
@@ -218,12 +201,22 @@ impl DropView {
         let state = root();
         let handle_reaped = matches!(state, RootState::Reaped);
         let root = if crate::child::root_reaped(handle_reaped, id, now) {
+            // The number shows the reap where the handle could not say; say so in the log.
+            match &state {
+                RootState::Unknown(e) => log::debug!(
+                    "{label}: the root's own handle could not say whether it was reaped ({e}), but its number shows it reaped"
+                ),
+                RootState::Unpinned => log::debug!(
+                    "{label}: the root is not pinned by this process, but its number shows it reaped"
+                ),
+                RootState::Unreaped | RootState::Reaped => {}
+            }
             RootView::Reaped
         } else {
             match state {
                 RootState::Unreaped => RootView::Trusted,
                 RootState::Unknown(e) => RootView::Unknown(e),
-                RootState::Unpinned(e) => RootView::Unpinned(e),
+                RootState::Unpinned => RootView::Unpinned,
                 RootState::Reaped => RootView::Reaped,
             }
         };
@@ -249,7 +242,7 @@ impl DropView {
     /// The handle could not settle whether the root is still ours to act on, and nothing else did:
     /// `Unknown`, or `Unpinned`.
     pub(crate) fn unsettled(&self) -> bool {
-        matches!(self.root, RootView::Unknown(_) | RootView::Unpinned(_))
+        matches!(self.root, RootView::Unknown(_) | RootView::Unpinned)
     }
 
     /// Whether the root's number may name another process, or cannot be shown to name the root:
@@ -261,81 +254,38 @@ impl DropView {
     /// This process does not pin the root (macOS: launchd holds it), and nothing else shows it
     /// reaped: its pid is not ours to signal or wait on.
     pub(crate) fn unpinned_root(&self) -> bool {
-        matches!(self.root, RootView::Unpinned(_))
+        matches!(self.root, RootView::Unpinned)
     }
 
     /// Whether the root itself is neither signalled nor waited on: it is reaped, or this process
     /// does not pin it (so its pid is not ours).
     pub(crate) fn leaves_root_alone(&self) -> bool {
-        matches!(self.root, RootView::Reaped | RootView::Unpinned(_))
+        matches!(self.root, RootView::Reaped | RootView::Unpinned)
     }
 
     /// Why [`number_untrusted`](Self::number_untrusted), for a log line or a note.
     pub(crate) fn why_number_untrusted(&self) -> String {
         match &self.root {
             RootView::Unknown(e) => format!("the root could not be shown to be unreaped (RootState::Unknown: {e})"),
-            RootView::Unpinned(e) => format!("the root is not pinned by this process (RootState::Unpinned: {e})"),
-            RootView::Reaped | RootView::Trusted => "the root is already reaped".to_owned(),
+            RootView::Unpinned => format!(
+                "the root is not pinned by this process (RootState::Unpinned: {})",
+                crate::signal::UNPINNED_WHY
+            ),
+            RootView::Reaped => "the root is already reaped".to_owned(),
+            RootView::Trusted => {
+                debug_assert!(false, "a trusted root's number is not untrusted");
+                "the root's number is trusted".to_owned()
+            }
         }
     }
 
-    /// The one `warn` of a drop, called once per event (every other step logs at `debug`). It
-    /// reports an unsettled root (`Unknown`, `Unpinned`), a forget that logged nothing, and an
-    /// elevation front left running (`front`, the error that says why). No-op otherwise.
-    ///
-    /// `armed`: a teardown was meant to run (a disarmed drop skips nothing). `forgot`: set if
-    /// tokio's `Child` was forgotten, so the warn carries its leak.
-    pub(crate) fn warn_unsettled(
-        &self,
-        label: &str,
-        attached: &Attached,
-        armed: bool,
-        front: Option<&crate::error::Error>,
-        forgot: Option<&Forgot>,
-    ) {
-        use crate::signal::RootState;
-        let pid = self.root_pid;
-        let quiet_forgot = forgot.filter(|f| f.quiet);
-        let reaped_now = forgot.is_some_and(|f| matches!(f.now, Some(RootState::Reaped)));
-        let mut text = match &self.root {
-            // A second look that shows the reap names it, rather than the first look's doubt.
-            RootView::Unpinned(e) | RootView::Unknown(e) if reaped_now => format!(
-                "{label}: RootState::Reaped: the root ({pid}) was reaped by someone else (its own handle first could not say: {e})"
-            ),
-            RootView::Unpinned(e) => {
-                format!("{label}: RootState::Unpinned: the root ({pid}) is not pinned by this process ({e})")
-            }
-            RootView::Unknown(e) => format!(
-                "{label}: RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({e})"
-            ),
-            RootView::Reaped | RootView::Trusted if quiet_forgot.is_some() => {
-                format!("{label}: child {pid} was reaped by someone else, or cannot be shown to be ours")
-            }
-            RootView::Reaped | RootView::Trusted => match front {
-                Some(why) => {
-                    log::warn!("{label}: the elevated child ({pid}) is left running: {why}");
-                    return;
-                }
-                None => return,
-            },
-        };
-        if armed && self.unsettled() {
-            if let Some(action) = attached.named_by_root_number(pid) {
-                text.push_str(&format!(
-                    ", so it does not {action}, whose number may belong to an unrelated process"
-                ));
-            }
-            if self.unpinned_root() {
-                text.push_str("; the root itself is neither signalled nor waited on");
-            }
-        }
-        if let Some(why) = front {
-            text.push_str(&format!("; the elevated child is left running: {why}"));
-        }
-        if let Some(forgot) = forgot {
-            text.push_str(&format!("; forgetting tokio's handle for it leaks {}", forgot.leak));
-        }
-        log::warn!("{text}");
+    /// What a kill by the root's number would do to the tree, when the number is untrusted and the
+    /// drop therefore skips it: `None` for a number that is trusted, or a mechanism that does not
+    /// name the tree by it.
+    pub(crate) fn skipped_action(&self, attached: &Attached) -> Option<String> {
+        attached
+            .named_by_root_number(self.root_pid)
+            .filter(|_| self.number_untrusted())
     }
 }
 
@@ -356,6 +306,16 @@ impl TreeKilled {
     pub(crate) fn is_set(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// What [`Attached::hard_kill_for_drop`] did to the tree.
+#[cfg(unix)]
+pub(crate) struct DropKill {
+    /// The kill's result.
+    pub(crate) result: Result<(), Error>,
+    /// What the drop did not do, because the root's number is untrusted and this handle had not
+    /// already killed the tree: the tree it names may outlive the drop.
+    pub(crate) skipped: Option<String>,
 }
 
 /// Owns the OS containment resource for a spawned child; `hard_kill`/`terminate`
@@ -585,41 +545,38 @@ impl Attached {
     /// could hit an unrelated process that reused the number. A macOS fd marker still sweeps its
     /// marker holders, which are named by identity. Cgroup and Job Object never skip.
     ///
-    /// A skip logs a `warn` naming what it skipped and the remedy (`kill_tree()` before the reap),
-    /// or a `debug` when this handle already killed the tree completely (`view.tree_killed`).
-    ///
     /// The same skip when the root's own handle could not say whether it is reaped
-    /// (`RootState::Unknown`): nothing then shows the number still names the root. The drop's
-    /// `warn_unsettled` reports the unsettled state; this step is `debug`.
+    /// (`RootState::Unknown`): nothing then shows the number still names the root.
+    ///
+    /// Logs nothing above `debug`: what the skip left undone is returned in
+    /// [`DropKill::skipped`], for the drop's one warn.
     #[cfg(unix)]
-    pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> Result<(), crate::error::Error> {
-        let Some(skipped) = self
-            .named_by_root_number(view.root_pid)
-            .filter(|_| view.number_untrusted())
-        else {
-            return self.hard_kill();
+    pub(crate) fn hard_kill_for_drop(&self, view: &DropView) -> DropKill {
+        let Some(skipped) = view.skipped_action(self) else {
+            return DropKill {
+                result: self.hard_kill(),
+                skipped: None,
+            };
         };
         let why = view.why_number_untrusted();
-        if view.tree_killed {
+        let left_behind = if view.tree_killed {
             log::debug!(
                 "Child::drop: {why} and this handle already killed the tree, \
                  so this drop does not {skipped}"
             );
-        } else if matches!(view.root, RootView::Reaped) {
-            log::warn!(
-                "Child::drop: the root is already reaped, so this drop does not {skipped}, \
-                 whose number may now belong to an unrelated process. Descendants that outlived \
-                 the reaped root are not torn down by this drop; call kill_tree() before wait() \
-                 to end them (https://github.com/bindreams/cosca/issues/382)"
-            );
+            None
         } else {
-            // The drop's `warn_unsettled` reports the unsettled state; this step is `debug`.
             log::debug!("Child::drop: {why}, so this drop does not {skipped}");
-        }
-        match self {
+            Some(skipped)
+        };
+        let result = match self {
             #[cfg(target_os = "macos")]
             Attached::FdMarker(m) => m.hard_kill_holders_only(view.unpinned_root().then(|| m.root())),
             _ => Ok(()),
+        };
+        DropKill {
+            result,
+            skipped: left_behind,
         }
     }
 
@@ -634,10 +591,7 @@ impl Attached {
         view: &DropView,
         killed: &TreeKilled,
     ) -> Result<Option<String>, crate::error::Error> {
-        let Some(skipped) = self
-            .named_by_root_number(view.root_pid)
-            .filter(|_| view.number_untrusted())
-        else {
+        let Some(skipped) = view.skipped_action(self) else {
             return self.hard_kill_marking(killed).map(|()| None);
         };
         match self {

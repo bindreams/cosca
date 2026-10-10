@@ -17,6 +17,9 @@ pub(crate) mod spawn;
 
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
+#[cfg(unix)]
+#[path = "child/drop_report.rs"]
+pub(crate) mod drop_report;
 #[path = "child/shared.rs"]
 pub(crate) mod shared;
 use proc_handle::ProcHandle;
@@ -126,6 +129,10 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
+    /// A failed-spawn cleanup that left this handle armed already warned about its event, so the
+    /// drop that retries reports at `debug` ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
+    #[cfg(unix)]
+    reported: bool,
 }
 
 impl Child {
@@ -147,6 +154,8 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
+            #[cfg(unix)]
+            reported: false,
         }
     }
 
@@ -765,41 +774,62 @@ impl Drop for Child {
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        //
-        // On Unix, nothing that names the tree by the root's number runs once the root is reaped,
-        // or when its handle cannot say: the handle's own answer (`RootState`), or the number no
-        // longer reading as this root. A foreign reap landing after this read is the accepted
-        // gap. An unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
         #[cfg(unix)]
+        self.drop_unix();
+        #[cfg(not(unix))]
+        {
+            let tree = self.attached.hard_kill();
+            if let Err(e) = &tree {
+                log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+                if self.attached.hard_kill_refused_to_walk(&tree) {
+                    log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+                }
+            }
+            self.proc.teardown_on_drop();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Child {
+    /// The kill-on-drop teardown, with one report of the event.
+    ///
+    /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
+    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
+    /// as this root. A foreign reap landing after the read is the accepted gap. An unreaped root
+    /// stays a zombie, pinning its number, until `teardown_on_drop`.
+    fn drop_unix(&mut self) {
+        use crate::child::drop_report::DropReport;
+
         let view = crate::containment::DropView::read("Child::drop", self.id, || self.proc.state(), &self.tree_killed);
         // A live elevation front outside a cgroup is not signalled: it is left running and
-        // unreaped. The drop's one warn names that and an unsettled root together.
-        #[cfg(unix)]
+        // unreaped.
         let gate = self.kill_gate();
-        #[cfg(unix)]
         let front = match &gate {
             crate::elevation::front::Gate::Closed(unkillable) => Some(unkillable),
             _ => None,
         };
-        #[cfg(unix)]
-        view.warn_unsettled("Child::drop", &self.attached, true, front, None);
-        #[cfg(unix)]
+        let mut report = DropReport::new("Child::drop", &view);
+        report.front = front;
         if front.is_some() {
+            report.emit(self.reported);
             return;
         }
-        #[cfg(unix)]
-        let tree = self.attached.hard_kill_for_drop(&view);
-        #[cfg(not(unix))]
-        let tree = self.attached.hard_kill();
-        if let Err(e) = &tree {
+        let kill = self.attached.hard_kill_for_drop(&view);
+        report.skipped = kill.skipped;
+        if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
             // logged, never asserted on.
-            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
-            if self.attached.hard_kill_refused_to_walk(&tree) {
+            let level = if self.reported { log::Level::Debug } else { log::Level::Warn };
+            log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
+            if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-                log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+                log::log!(
+                    level,
+                    "Child::drop: the root is killed regardless, so its descendants may be orphaned"
+                );
             }
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
@@ -809,11 +839,10 @@ impl Drop for Child {
         // owns that child and its own reaping.
         // A reaped root is neither killed nor waited for: its number may name another child by now.
         // Neither is a root this process does not pin (macOS: launchd holds its zombie).
-        #[cfg(unix)]
-        if view.leaves_root_alone() {
-            return;
+        if !view.leaves_root_alone() {
+            report.left.extend(self.proc.teardown_on_drop());
         }
-        self.proc.teardown_on_drop();
+        report.emit(self.reported);
     }
 }
 

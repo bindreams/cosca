@@ -98,6 +98,17 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// A live front outside a cgroup (see [`Child::kill`]) is signalled by neither kill: the root's
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
 /// and the note says it had exited. The front's gate is read once, for both kills.
+///
+/// A root whose handle could not say whether it is reaped (`RootState::Unknown`) is killed through
+/// its handle like any other, and the tree kills named by its number are skipped, as for a reaped
+/// root. A root this process does not pin (`RootState::Unpinned`, macOS) is left alone: neither
+/// signalled nor waited on, and the error says so. The event warns once: the unsettled root, a
+/// failed reap and any other leftover share one record, labelled `finish_elevated`.
+///
+/// The handle is disarmed only once the cleanup has settled both the tree and the root: each was
+/// killed, is gone, or was deliberately left alone (a reaped or unpinned root, a live front).
+/// Otherwise (a refused kill, a failed tree kill, a failed reap) the handle stays armed, so its drop
+/// tries again; that drop does not warn of the event a second time.
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -105,7 +116,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     let view =
         crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
-    view.warn_unsettled("finish_elevated", &child.attached, true, None, None);
+    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -117,11 +128,21 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
             .map(|s| skipped = s)
     });
+    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
+    // deliberately left alone because the root is reaped or unpinned.
+    let tree_settled = tree.is_none()
+        || child.tree_killed.is_set()
+        || (skipped.is_some() && view.leaves_root_alone());
+    let tree_warned = matches!(tree, Some(Err(_)));
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
+    // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
+    // deliberately not signalled (an unpinned root, a live front). A refused kill, or a reap that
+    // failed, leaves it to the handle's drop to try again.
+    let mut root_settled = true;
     let root_note = if view.unpinned_root() {
         format!(
             "the elevated child was left alone, neither signalled nor waited on: {}",
@@ -153,22 +174,35 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                         }
                     }
                     Err(e) if exited_front => {
-                        log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
+                        root_settled = false;
+                        report
+                            .left
+                            .push(format!("could not reap the exited elevated child pid {}: {e}", child.id().pid()));
                         format!("the elevated child had already exited, but could not be reaped ({e})")
                     }
                     Err(e) => {
-                        log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
+                        root_settled = false;
+                        report
+                            .left
+                            .push(format!("could not reap the killed elevated child pid {}: {e}", child.id().pid()));
                         format!("the elevated child was killed but could not be reaped ({e})")
                     }
                 }
             }
             Err(e) => {
+                root_settled = front_closed;
                 _ = child.try_wait();
                 format!("the elevated child could not be terminated ({e})")
             }
         }
     };
-    child.kill_on_drop = false;
+    let warned = report.emit(false);
+    if tree_settled && root_settled {
+        child.kill_on_drop = false;
+    } else {
+        // The drop tries again; it need not warn of the same event twice.
+        child.reported = warned || tree_warned;
+    }
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),

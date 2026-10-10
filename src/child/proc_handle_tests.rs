@@ -240,40 +240,50 @@ fn std_handle() -> (ProcHandle, std::process::ChildStdin) {
     (ProcHandle::std(shared), stdin)
 }
 
-/// The levels the teardown logged for its child, with the reap after the kill failing with
-/// `errno`.
+/// What the teardown returned and the levels it logged for its child, with the reap after the kill
+/// failing with `errno`.
 #[cfg(unix)]
-fn teardown_levels_when_the_reap_fails(errno: i32) -> Vec<log::Level> {
+fn teardown_when_the_reap_fails(errno: i32) -> (Option<String>, Vec<log::Level>) {
     use crate::child::shared::seams::{self, ForcedWait};
     crate::log_capture::install();
     let (handle, _stdin) = std_handle();
     let marker = format!("teardown of child {}", handle.id());
     let mark = crate::log_capture::mark();
     let forced = seams::force_unlocked_wait(ForcedWait::Errno(errno));
-    handle.teardown_on_drop();
+    let left = handle.teardown_on_drop();
     drop(forced);
     // The forced failure left the killed child unreaped: reap it for real.
     handle.wait().expect("reap the killed child");
-    crate::log_capture::records_since_on_current_thread(mark, &marker)
+    let levels = crate::log_capture::records_since_on_current_thread(mark, &marker)
         .into_iter()
         .map(|(level, _)| level)
-        .collect()
+        .collect();
+    (left, levels)
 }
 
-/// A reap that fails after the kill is not dropped silently.
+/// A reap that fails after the kill is not dropped silently: it is returned for the caller's one
+/// warn, and logged by nobody here.
 ///
-/// Mutant: `_ = s.wait()`.
+/// Mutants: `_ = s.wait()`; the teardown warns on its own.
 #[cfg(unix)]
 #[skuld::test]
-fn a_failed_teardown_reap_is_warned() {
-    assert_eq!(teardown_levels_when_the_reap_fails(libc::EIO), [log::Level::Warn]);
+fn a_failed_teardown_reap_is_returned_and_not_logged() {
+    let (left, levels) = teardown_when_the_reap_fails(libc::EIO);
+    assert!(
+        left.as_deref().is_some_and(|text| text.contains("the reap after the kill failed")),
+        "{left:?}"
+    );
+    assert_eq!(levels, Vec::<log::Level>::new());
 }
 
-/// `ECHILD` (someone else reaped the child) is logged, at `debug`.
+/// `ECHILD` (someone else reaped the child) is logged at `debug` and returns nothing.
 ///
-/// Mutant: every failure at `warn`; or none logged.
+/// Mutant: every failure is returned; or none logged.
 #[cfg(unix)]
 #[skuld::test]
 fn a_teardown_reap_that_meets_echild_is_debug() {
-    assert_eq!(teardown_levels_when_the_reap_fails(libc::ECHILD), [log::Level::Debug]);
+    assert_eq!(
+        teardown_when_the_reap_fails(libc::ECHILD),
+        (None, vec![log::Level::Debug])
+    );
 }

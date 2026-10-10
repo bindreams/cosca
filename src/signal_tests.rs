@@ -269,16 +269,13 @@ mod root_state {
         );
     }
 
-    /// An orphaned zombie (held by launchd) is `Unpinned`, and the error names launchd.
+    /// An orphaned zombie (held by launchd) is `Unpinned`.
     ///
     /// Mutants: `Orphaned` is `Reaped`; `Orphaned` is `Unknown` (a root we still pin).
     #[cfg(target_os = "macos")]
     #[skuld::test]
-    fn an_orphaned_zombie_is_unpinned_naming_launchd() {
+    fn an_orphaned_zombie_is_unpinned() {
         let state = RootState::of_peek(Ok(Peek::Foreign(Foreign::Orphaned)));
-        assert!(
-            matches!(&state, RootState::Unpinned(e) if e.to_string().contains("launchd")),
-            "{state:?}"
-        );
+        assert!(matches!(&state, RootState::Unpinned), "{state:?}");
     }
 }
