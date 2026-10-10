@@ -127,17 +127,21 @@ try {
     $existing = if ($recorded) { Get-LocalUser -Name $account -ErrorAction SilentlyContinue }
     if ($existing) {
         $sid = $existing.SID.Value
+        # Nothing of the account may be running when it is deleted: a process holds files, and keeps the profile and
+        # `$root` from going. Matched by SID as well as by name, while the account still resolves.
+        Invoke-CleanupStep 'stop the account processes' {
+            foreach ($candidate in Get-CimInstance Win32_Process) {
+                $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
+                $ownerSid = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+                if (($owner -and $owner.User -eq $account) -or ($ownerSid -and $ownerSid.Sid -eq $sid)) {
+                    Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
         # The ACE on the published JUnit directory names the account; remove it while the name still resolves. A failure
         # here does not stop the account's deletion.
         Invoke-CleanupStep 'remove the account from the JUnit directory ACL' { Set-Acl-Native $junitDir /remove "${account}" }
         Invoke-CleanupStep 'delete the account' { Remove-LocalUser $account -ErrorAction Stop }
-        # Nothing of the account may be running when its profile goes: stop what is left of its processes.
-        Invoke-CleanupStep 'stop the account processes' {
-            foreach ($candidate in Get-CimInstance Win32_Process) {
-                $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
-                if ($owner -and $owner.User -eq $account) { Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue }
-            }
-        }
         # Best effort: the registry hive of the logon stays loaded for minutes after everything of the run has
         # exited (measured on both hosted runners; no process of the account is left, and waiting does not
         # end it within the step's bound), and a loaded profile cannot be removed. The runner is an ephemeral VM.

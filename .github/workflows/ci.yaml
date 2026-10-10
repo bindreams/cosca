@@ -499,7 +499,7 @@ jobs:
           exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
             PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
-            mkdir "$CG"
+            mkdir "$CG" || exit 1
             # Back out of the lane cgroup and remove it on every exit; it fails if a test left a cgroup in it.
             leave() {
               echo $$ > "$PRIOR/cgroup.procs" && rmdir "$CG" && return
@@ -603,7 +603,13 @@ jobs:
         if: ${{ always() && steps.lin_helper.outcome != 'skipped' && steps.lin_helper.outcome != '' }}
         env:
           HELPER: ${{ steps.lin_helper.outputs.helper }}
-        run: if [ -n "${HELPER:-}" ]; then sudo rm -f -- "$HELPER"; fi
+        run: |
+          set -euo pipefail
+          case "${HELPER:-}" in
+            "") ;;
+            "$RUNNER_TEMP"/cosca_testbin_setuid) sudo rm -f -- "$HELPER" ;;
+            *) echo "refusing to remove $HELPER" >&2; exit 1 ;;
+          esac
 
       - name: Restore the directory modes (Linux)
         if: ${{ always() && steps.lin_setuid_archive.outcome != 'skipped' && steps.lin_setuid_archive.outcome != '' }}
@@ -804,7 +810,13 @@ jobs:
         shell: bash
         env:
           HELPER: ${{ steps.mac_helper.outputs.helper }}
-        run: if [ -n "${HELPER:-}" ]; then sudo rm -f -- "$HELPER"; fi
+        run: |
+          set -euo pipefail
+          case "${HELPER:-}" in
+            "") ;;
+            "$RUNNER_TEMP"/cosca_testbin_setuid) sudo rm -f -- "$HELPER" ;;
+            *) echo "refusing to remove $HELPER" >&2; exit 1 ;;
+          esac
 
       - name: Root lane (macOS) - archive the privilege tests
         id: mac_root_archive
@@ -885,6 +897,7 @@ jobs:
           for dir in "${SCRATCH:-}" "${EXTRACT:-}"; do
             [ -n "$dir" ] || continue
             case "$dir" in
+              *..*) echo "refusing to remove $dir: it contains .." >&2; exit 1 ;;
               /tmp/cosca-root-scratch.* | /tmp/cosca-root-extract.*) ;;
               *) echo "refusing to remove $dir" >&2; exit 1 ;;
             esac
