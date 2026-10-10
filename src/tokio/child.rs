@@ -1008,8 +1008,8 @@ impl Child {
 ///
 /// An elevated child behind a front (see [`kill`](Child::kill)) gets no signal of its own while it
 /// runs. In a cgroup that holds it, the tree's kill ends it. Otherwise, or when that kill fails,
-/// the drop signals nothing, its leaf kills nothing either (a `cgroup.kill` there would end the
-/// front), and it warns.
+/// the drop signals nothing and warns: the leaf's release still writes `cgroup.kill`, which ends the
+/// front if it is in the leaf, and nothing waits to see, so the front is left unreaped.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
@@ -1056,10 +1056,11 @@ impl Drop for Child {
             #[cfg(unix)]
             match kill_gate(self.front, &os, self.id.pid()) {
                 crate::elevation::front::Gate::Closed(unkillable) => {
-                    // Disarmed, or the leaf's release would write `cgroup.kill` over the front this
-                    // drop leaves alone.
-                    os.attached.disarm();
-                    log::warn!("Child::drop: the elevated child is left running: {unkillable}");
+                    log::warn!(
+                        "Child::drop: elevation front pid {}: {unkillable}; the front is killed through its cgroup if \
+                         it is still in it, and is left unreaped",
+                        self.id.pid()
+                    );
                 }
                 gate => signal_on_drop(
                     self.id,
@@ -1179,23 +1180,13 @@ fn signal_on_drop(
     // its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
     if let Some(front) = cgroup_front {
-        let landed = tree.is_ok();
         if let Err(e) = tree.and_then(|()| cgroup_kill_reached(Some(front), os, pid)) {
-            // Disarmed, or the leaf's release would write `cgroup.kill` over a front a failed kill
-            // left running.
-            os.attached.disarm();
-            if landed {
-                log::warn!(
-                    "Child::drop: elevation front pid {pid} is left alone: its cgroup kill landed but was not shown \
-                     to reach it ({e}), so it may have ended or still run, and a kill of the front would orphan the \
-                     elevated program"
-                );
-            } else {
-                log::warn!(
-                    "Child::drop: elevation front pid {pid} is left running: its cgroup kill failed ({e}), and a \
-                     kill of the front would orphan the elevated program"
-                );
-            }
+            // The leaf's release still writes `cgroup.kill`, which ends the front if it is in the
+            // leaf; nothing waits to see.
+            log::warn!(
+                "Child::drop: elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the \
+                 front is killed through its cgroup if it is still in it, and is left unreaped"
+            );
         }
         return;
     }

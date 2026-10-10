@@ -594,8 +594,10 @@ impl Command {
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
     /// So is an elevated child behind a front outside a cgroup (see
     /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
-    /// `warn` naming it. A front so left takes its tree with it: the drop disarms its cgroup leaf,
-    /// whose own `cgroup.kill` would end the front.
+    /// `warn` naming it. The rest of the tree is still killed: the drop's cgroup leaf stays armed, and
+    /// its `cgroup.kill` ends what it holds, a front among it. The sync drop waits for that and
+    /// reaps a front that has exited, and warns of one still running; the async drop waits for
+    /// nothing, and leaves the front unreaped.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
@@ -645,8 +647,7 @@ impl Command {
     /// a hostile root program, which could as well trace cosca or rewrite its memory.
     ///
     /// A front no kill is shown to have reached is sent nothing and left unreaped, and the call
-    /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns and its
-    /// leaf kills nothing either (a `cgroup.kill` there would end the front), and a failed spawn's
+    /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns, and a failed spawn's
     /// error carries a note. That is the case when:
     ///
     /// - the `cgroup.kill` write fails (`kill` names the failure);

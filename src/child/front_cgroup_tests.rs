@@ -255,84 +255,130 @@ fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(cgroup)
     std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
 }
 
-/// A drop that leaves a front alone because its place cannot be read leaves it alone for good: the
-/// leaf's own teardown, which fires `cgroup.kill` at an occupied leaf, must not end it behind the
-/// warning that says it is left running. Mutant: "the drop does not disarm the leaf".
-#[skuld::test]
-fn cgroup_a_drop_whose_placement_read_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
-    crate::log_capture::install();
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pid = child.id().pid();
-    let leaf = leaf_of(&child).path().to_path_buf();
-    let mark = crate::log_capture::mark();
-    {
-        let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
-        drop(child);
+/// A `cat` front, contained and reported as launched by `sudo`, that has also started a `sleep` in
+/// its leaf: another member of the tree. Returns the front, its stdin and a pidfd of the `sleep`.
+pub(crate) fn spawn_front_with_member() -> (crate::Child, PipeWriter, OwnedFd) {
+    let mut cmd = Command::new();
+    cmd.args(["sh", "-c", "sleep 1000 & echo $!; exec cat"]);
+    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
+    let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);
+    let mut line = Vec::new();
+    let mut stdout = child.stdout().expect("stdout pipe");
+    let mut byte = [0u8; 1];
+    while stdout.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
+        line.push(byte[0]);
     }
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("is left running"), "{warns:?}");
-    drop(stdin);
-    assert_reaped_unsignalled(pid);
-    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
+    let member: u32 = String::from_utf8(line)
+        .expect("utf8")
+        .trim()
+        .parse()
+        .expect("the sleep's pid");
+    (child, stdin, pidfd_of(member))
 }
 
-/// A drop whose own cgroup kill fails leaves the front alone for good: the leaf's teardown writes
-/// `cgroup.kill` again, and that write works. Mutant: "the drop does not disarm the leaf".
-#[skuld::test]
-fn cgroup_a_drop_whose_first_cgroup_kill_fails_leaves_the_front_running(#[fixture(cgroup)] _group: &Group) {
-    crate::log_capture::install();
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pid = child.id().pid();
-    let leaf = leaf_of(&child).path().to_path_buf();
-    let mark = crate::log_capture::mark();
-    {
-        let _failing = crate::containment::cgroup::fault::fail_next_kill_write();
-        drop(child);
-    }
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "is left running and unreaped");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    drop(stdin);
-    assert_reaped_unsignalled(pid);
-    std::fs::remove_dir(&leaf).unwrap_or_else(|e| panic!("remove the leaf {}: {e}", leaf.display()));
+/// Blocks until the process `pidfd` names (it need not be a child) has exited. Only for a process
+/// whose kill has been shown to have been written, so the wait is for the kill's effect.
+pub(crate) fn wait_until_exited(pidfd: &OwnedFd) {
+    let mut fds = [rustix::event::PollFd::from_borrowed_fd(
+        pidfd.as_fd(),
+        rustix::event::PollFlags::IN,
+    )];
+    while rustix::event::poll(&mut fds, None) == Err(rustix::io::Errno::INTR) {}
 }
 
-/// A drop whose cgroup kill landed but whose reach cannot be read does not claim the front runs:
-/// the kill may have ended it, and it is left unreaped. Mutant: "the warning says the front is
-/// left running".
-#[skuld::test]
-fn cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed(#[fixture(cgroup)] _group: &Group) {
+/// What a drop that keeps its leaf armed does with a front in the leaf: the leaf's kill ends the
+/// front and every other member, the drop reaps the front (a later `waitid` on its pidfd finds
+/// nothing to wait for), says so at `debug` with how it died, and never says the front is left
+/// running. `fault` arms whatever made the drop's own look at the front fail.
+#[track_caller]
+fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dyn std::any::Any>) {
     crate::log_capture::install();
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let (child, stdin, member) = spawn_front_with_member();
+    let front = pidfd_of(child.id().pid());
     let pid = child.id().pid();
-    let unreadable = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let _arming = crate::containment::cgroup::fault::set_before_kill_write({
-        let unreadable = std::rc::Rc::clone(&unreadable);
-        move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
+    // At the look: the front's end is awaited, after releasing its stdin so a front nothing killed
+    // ends too (and the status below says how).
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
+    let _look = crate::child::fault::set_before_front_look({
+        let stdin = std::rc::Rc::clone(&stdin);
+        move || {
+            drop(stdin.take());
+            crate::test_child::wait_until_zombie(pid);
+        }
     });
-    let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
+    crate::containment::cgroup::fault::record_leaf_steps();
+    let mark = crate::log_capture::mark();
+    {
+        let _fault = fault();
+        drop(child);
+    }
+    let steps = crate::containment::cgroup::fault::take_leaf_steps();
+    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
+    assert!(
+        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
+        "{said:?}"
+    );
+    assert!(reaped(&front), "the drop reaps the front its leaf's kill ended");
+    assert!(steps.iter().any(|s| s == "kill"), "{steps:?}");
+    wait_until_exited(&member);
+}
+
+/// A drop whose placement read fails (so it cannot tell the front is in its leaf) still lets the
+/// armed leaf kill the leaf, front included, and reaps the front after the leaf's drain. Mutants:
+/// "the drop disarms the leaf" (the front survives), "the drop does not reap".
+#[skuld::test]
+fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf_and_reaps_the_front(#[fixture(cgroup)] _group: &Group) {
+    assert_drop_kills_the_leaf_and_reaps_the_front(|| Box::new(crate::containment::cgroup::fault::fail_pidfd_info()));
+}
+
+/// A drop whose own first `cgroup.kill` write fails: the leaf's retry kills the leaf, and the front
+/// is reaped, with no word of it running. Mutants as above.
+#[skuld::test]
+fn cgroup_a_drop_whose_first_cgroup_kill_fails_kills_the_leaf_and_reaps_the_front(#[fixture(cgroup)] _group: &Group) {
+    assert_drop_kills_the_leaf_and_reaps_the_front(|| {
+        Box::new(crate::containment::cgroup::fault::fail_next_kill_write())
+    });
+}
+
+/// A drop whose kill landed but whose reach cannot be read: the front is looked at once the leaf
+/// has drained, found exited, and reaped. Mutant: "the drop warns the front is not reached without
+/// looking".
+#[skuld::test]
+fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fixture(cgroup)] _group: &Group) {
+    assert_drop_kills_the_leaf_and_reaps_the_front(|| {
+        let unreadable = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let arming = crate::containment::cgroup::fault::set_before_kill_write({
+            let unreadable = std::rc::Rc::clone(&unreadable);
+            move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
+        });
+        let running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
+        Box::new((arming, running, unreadable))
+    });
+}
+
+/// A front outside its leaf (moved out) is left running, with the warning true: the look finds it
+/// running. The rest of the leaf is killed all the same, since the leaf stays armed. Mutants: "the
+/// drop disarms the leaf" (the member survives), "the drop never looks" (no warning).
+#[skuld::test]
+fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, stdin, member) = spawn_front_with_member();
+    let pid = child.id().pid();
+    move_out_of_its_leaf(pid);
+    crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
     drop(child);
-    drop(unreadable.take());
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "Child::drop: elevation front");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].1.contains("cgroup kill landed"), "{warns:?}");
-    assert!(!warns[0].1.contains("left running"), "{warns:?}");
-    // The kill ended it, and the drop left it unreaped.
+    let steps = crate::containment::cgroup::fault::take_leaf_steps();
+    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Warn);
+    assert!(said[0].1.contains("is left running and unreaped"), "{said:?}");
+    assert!(steps.iter().any(|s| s == "kill"), "the leaf was killed: {steps:?}");
+    wait_until_exited(&member);
     drop(stdin);
-    let mut status = 0;
-    // SAFETY: `status` is a valid out-parameter.
-    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-    assert_eq!(
-        reaped,
-        pid as libc::pid_t,
-        "waitpid: {}",
-        std::io::Error::last_os_error()
-    );
-    assert!(
-        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
-        "raw status {status:#x}"
-    );
+    assert_reaped_unsignalled(pid);
 }
 
 /// A front whose signal is refused (direct exec: the root program) is still killed, through the
@@ -502,7 +548,7 @@ fn cgroup_drop_of_a_front_moved_out_during_its_kill_leaves_it_unreaped(#[fixture
     });
     let mark = crate::log_capture::mark();
     drop(child);
-    let warns = crate::log_capture::records_since_on_current_thread(mark, "is left unreaped");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "is left running and unreaped");
     assert_eq!(warns.len(), 1, "{warns:?}");
     drop(stdin.take().expect("the drop must not wait for the front"));
     assert_reaped_unsignalled(pid);

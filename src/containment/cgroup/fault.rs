@@ -40,6 +40,7 @@ thread_local! {
     static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -265,7 +266,15 @@ pub(crate) fn set_drain_blocking_notifier(notify: std::sync::mpsc::Sender<()>) {
 pub(crate) fn take_drain_blocking_notifier() {
     DRAIN_BLOCKING.with(|d| d.borrow_mut().take());
 }
+/// Run `hook` once when the next drain wait on this thread is about to block, before it does: a
+/// fixture that only the thing awaited would release can be checked, or released, here, so a
+/// mutant that never made it happen fails an assertion instead of hanging the wait.
+pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
+}
+
 pub(crate) fn notify_drain_blocking() {
+    crate::oneshot_hook::fire(&BEFORE_DRAIN_BLOCK);
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
             // The send must always run — `debug_assert!` does not evaluate its condition in a
@@ -358,6 +367,10 @@ pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
 /// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
 pub(crate) fn record_leaf_steps() {
     LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+/// The steps recorded so far, left in place.
+pub(crate) fn leaf_steps_so_far() -> Vec<String> {
+    LEAF_STEPS.with(|s| s.borrow().clone()).unwrap_or_default()
 }
 pub(crate) fn take_leaf_steps() -> Vec<String> {
     LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()

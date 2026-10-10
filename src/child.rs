@@ -313,6 +313,31 @@ impl Child {
             .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
     }
 
+    /// A drop's look at its elevation front, once its leaf has been torn down (killed through, and
+    /// drained): exited, it is reaped; running, it is not shown to have been in the leaf or to have
+    /// been reached, and is left, as `why` says. Non-blocking.
+    #[cfg(unix)]
+    fn look_at_front_after_teardown(&self, why: &dyn std::fmt::Display) {
+        let pid = self.id.pid();
+        #[cfg(all(test, target_os = "linux"))]
+        fault::run_before_front_look();
+        match self.proc.try_wait() {
+            Ok(Some(status)) => log::debug!(
+                "Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})"
+            ),
+            Ok(None) => log::warn!(
+                "Child::drop: elevation front pid {pid} is left running and unreaped: {why}, and a kill of the front \
+                 would orphan the elevated program"
+            ),
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
+            }
+            Err(e) => log::warn!(
+                "Child::drop: elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
+            ),
+        }
+    }
+
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
     #[cfg(unix)]
     fn kill_gate(&self) -> crate::elevation::front::Gate {
@@ -790,6 +815,26 @@ pub(crate) mod fault {
     pub(super) fn take_forced_root_read() -> Option<Resolved<ProcessId>> {
         FORCED.with(|f| f.take())
     }
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static BEFORE_FRONT_LOOK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    }
+
+    /// Run `hook` once on this thread when a drop is about to look at its elevation front, after its
+    /// leaf's teardown. On a kernel before 6.19 a task leaves its cgroup before it can be collected,
+    /// so a front the leaf's kill ended may still read as running at that point: a test that expects
+    /// it ended waits for that here, and releases a front nothing killed, so a mutant fails an
+    /// assertion on how the front died instead of hanging.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_before_front_look(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&BEFORE_FRONT_LOOK, hook)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn run_before_front_look() {
+        crate::oneshot_hook::fire(&BEFORE_FRONT_LOOK);
+    }
 }
 
 /// With `kill_on_drop` set (the default), hard-kills the contained tree, then kills and reaps the
@@ -800,8 +845,9 @@ pub(crate) mod fault {
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when
-/// that kill fails, the drop leaves it running and unreaped, and warns, and its leaf kills nothing
-/// either: a `cgroup.kill` there would end the front.
+/// that kill fails, the drop tears its leaf down all the same, which kills what the leaf holds and
+/// waits for it, and then looks at the front: one that has exited is reaped, and one still running,
+/// which the leaf did not hold, is left running and unreaped, with a warning.
 impl Drop for Child {
     fn drop(&mut self) {
         if !self.kill_on_drop {
@@ -822,10 +868,10 @@ impl Drop for Child {
         #[cfg(unix)]
         let cgroup_only = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => {
-                // Disarmed, or the leaf's own teardown would write `cgroup.kill` over the front
-                // this drop leaves alone.
-                self.attached.disarm();
-                log::warn!("Child::drop: the elevated child is left running and unreaped: {unkillable}");
+                // The leaf stays armed: its teardown kills what it holds, a front among it if it is
+                // in it. Run now, not at field drop, so the look at the front comes after it.
+                drop(std::mem::take(&mut self.attached));
+                self.look_at_front_after_teardown(&unkillable);
                 return;
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
@@ -857,28 +903,14 @@ impl Drop for Child {
         }
         #[cfg(unix)]
         if cgroup_only {
-            let landed = tree.is_ok();
             match tree.and_then(|()| self.cgroup_kill_reached()) {
                 // The cgroup kill ended it: reap it, sending nothing.
                 Ok(()) => self.proc.reap_after_tree_kill(),
-                // Never waited for: it may run as long as its program. Disarmed, or the leaf's own
-                // teardown would write `cgroup.kill` over a front a failed kill left running.
+                // Never waited for. The armed leaf still kills what it holds, retrying a kill that
+                // failed, and the front is looked at once that is done.
                 Err(e) => {
-                    self.attached.disarm();
-                    if landed {
-                        log::warn!(
-                            "Child::drop: elevation front pid {} is left unreaped: its cgroup kill landed but was not \
-                             shown to reach it ({e}), so it may have ended or still run, and a kill of the front would \
-                             orphan the elevated program",
-                            self.id.pid()
-                        );
-                    } else {
-                        log::warn!(
-                            "Child::drop: elevation front pid {} is left running and unreaped: its cgroup kill \
-                             failed ({e}), and a kill of the front would orphan the elevated program",
-                            self.id.pid()
-                        );
-                    }
+                    drop(std::mem::take(&mut self.attached));
+                    self.look_at_front_after_teardown(&e);
                 }
             }
             return;
