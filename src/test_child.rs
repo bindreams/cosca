@@ -297,7 +297,7 @@ pub(crate) fn wait_until_zombie(pid: u32) {
 
 /// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):
 /// `waitid` with `WNOHANG | WNOWAIT` consumes nothing. `false` once something reaped it.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) fn is_unreaped_child(pid: u32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable, WNOHANG never blocks.

@@ -1136,19 +1136,16 @@ fn kill_gate(
 }
 
 /// What the signals of a kill-on-drop drop found, for the drop's one report.
-#[cfg(unix)]
-type Signalled = DropSignals;
-#[cfg(not(unix))]
-type Signalled = ();
-
-#[cfg(unix)]
 #[derive(Default)]
 struct DropSignals {
     /// What the tree kill skipped ([`DropKill::skipped`](crate::containment::dispatch::DropKill)).
+    #[cfg(unix)]
     skipped: Option<String>,
     /// What forgetting tokio's `Child` leaked, if the failed root kill forgot it.
+    #[cfg(unix)]
     forgot: Option<crate::child::drop_report::Forgot>,
     /// What the root kill could not do.
+    #[cfg(unix)]
     left: Vec<String>,
 }
 
@@ -1160,9 +1157,9 @@ fn signal_on_drop(
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
     #[cfg(unix)] reported: bool,
-) -> Signalled {
+) -> DropSignals {
     #[allow(unused_mut, reason = "only the Unix signals collect anything")]
-    let mut signals = Signalled::default();
+    let mut signals = DropSignals::default();
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
