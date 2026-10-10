@@ -765,3 +765,51 @@ async fn cgroup_a_child_dead_before_its_report_is_no_front(#[fixture(cgroup)] _g
     assert!(!text.contains("what sudo left"), "no front, no note: {text}");
     assert_eq!(reap(pid), None, "the abandonment reaps the child");
 }
+
+/// Async twin of the sync `cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why`.
+#[skuld::test]
+async fn cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (child, stdin) = {
+        let _failing = crate::containment::cgroup::fault::fail_subtree(libc::EIO);
+        spawn_as(in_cgroup(cat()), SUDO)
+    };
+    let logs = crate::log_capture::records_since_on_current_thread(mark, "leaf subtree cannot be read");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].0, log::Level::Debug);
+    assert!(logs[0].1.contains("Input/output error"), "{logs:?}");
+    drop(stdin);
+    drop(child);
+}
+
+/// A contained front tokio drops after its fork, whose leaf's subtree cannot be read once the
+/// abandonment needs it, is left unreaped, and the error says it cannot be placed, naming the
+/// cause: not that it is outside its leaf's reach. Mutant: "an unreadable subtree answers `Ok(false)`".
+#[skuld::test]
+async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_naming_the_cause(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    use crate::child::front_kill_tests::reap;
+    crate::log_capture::install();
+    // The abandonment sees the front still running, as it can before the leaf's kill has ended it.
+    let _running = crate::child::spawn::fault::see_fronts_running();
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let mark = crate::log_capture::mark();
+    // The spawn captured its own subtree already: the failure is armed by the hook that runs as
+    // the spawn fails, so only the abandonment's read fails.
+    let failing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let (err, pid) = fail_a_contained_front_spawn(reader, {
+        let failing = std::rc::Rc::clone(&failing);
+        move |_| *failing.borrow_mut() = Some(crate::containment::cgroup::fault::fail_subtree(libc::EIO))
+    });
+    drop(failing.borrow_mut().take());
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
+    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.
+    drop(writer);
+    let status = reap(pid).expect("the front was left unreaped");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+}

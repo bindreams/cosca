@@ -389,7 +389,9 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
         // listing, which a removal during it then cannot have cut short unseen.
         if is_root {
             step_fault(&path, WalkStep::Alive)
-                .and_then(|()| rustix::fs::openat(&cgroup, "cgroup.events", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()))
+                .and_then(|()| {
+                    rustix::fs::openat(&cgroup, "cgroup.events", OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+                })
                 .map_err(|e| named(e, &path))?;
         }
     }
@@ -543,8 +545,20 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
             Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
             Err(e) => return Err(e.into()),
         };
+        // The id is what the sweep records of a cgroup it removes, so a cgroup whose id cannot be
+        // read is not removed: the leaf's own id read already showed this filesystem gives ids, so
+        // a failure here is a real one. A cgroup gone since it was opened has nothing to record.
+        let child_id = match cgroup_id(child.as_fd()) {
+            Ok(id) => id,
+            Err(e)
+                if e.raw_os_error()
+                    .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno))) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
         removed += remove_children(child.as_fd(), swept)?;
-        let child_id = cgroup_id(child.as_fd());
         // `dir` was reached without crossing a mount, so this removes a directory entry of the
         // leaf's own filesystem; one mounted on since is refused `EBUSY`, not followed.
         match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
@@ -552,9 +566,7 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
                 removed += 1;
                 // The name may lead to another cgroup since `child` was opened, if someone removed
                 // that one and made this; both were under the leaf, so the id is of one that was.
-                if let Ok(child_id) = child_id {
-                    swept.record(child_id);
-                }
+                swept.record(child_id);
             }
             Err(e) if gone(e) || e == rustix::io::Errno::BUSY => {}
             Err(e) => return Err(e.into()),

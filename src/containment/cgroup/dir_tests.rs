@@ -233,3 +233,18 @@ fn a_cgroup_id_is_decoded_from_its_kernfs_handle() {
     id_of_handle(1, 8, HIGH.to_ne_bytes()).expect_err("not a kernfs handle");
     id_of_handle(0xfe, 4, HIGH.to_ne_bytes()).expect_err("too short for a kernfs id");
 }
+
+/// A sweep that cannot read the id of a child cgroup returns the error and removes nothing: the id
+/// is what it records of a cgroup it removes, and a record it cannot make would let a front in the
+/// removed cgroup read as outside. The stand-in's directories are no cgroups, so their ids cannot
+/// be read. Mutant: "an unreadable id is ignored and the cgroup removed anyway".
+#[skuld::test]
+fn a_sweep_that_cannot_read_a_childs_id_returns_the_error_and_removes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).expect("make the child");
+    let leaf = LeafDir::open_for_test(dir.path());
+    let err = leaf.remove_children().expect_err("an unreadable id fails the sweep");
+    drop(err);
+    assert!(sub.exists(), "a cgroup whose id cannot be recorded is not removed");
+}

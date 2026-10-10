@@ -518,9 +518,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     let front = cmd.elevation_front();
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
-    let subtree = front
-        .and(prepared.cgroup_leaf.as_ref())
-        .and_then(|leaf| leaf.subtree().ok());
+    let subtree = crate::child::spawn::front_subtree(front.and(prepared.cgroup_leaf.as_ref()));
     #[cfg(unix)]
     if front.is_some() {
         prepared.watch_front(pid);

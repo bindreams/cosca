@@ -323,7 +323,12 @@ fn cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed(#[fixture(cgrou
     let mut status = 0;
     // SAFETY: `status` is a valid out-parameter.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-    assert_eq!(reaped, pid as libc::pid_t, "waitpid: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        reaped,
+        pid as libc::pid_t,
+        "waitpid: {}",
+        std::io::Error::last_os_error()
+    );
     assert!(
         libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
         "raw status {status:#x}"
@@ -1238,5 +1243,42 @@ pub(crate) fn assert_left_unsignalled(err: &crate::error::Error, pid: u32, stdin
 fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
     let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
+    assert_left_unsignalled(&err, pid, stdin);
+}
+
+/// A front spawn that cannot capture its leaf's subtree (the cgroup id read fails) says so at
+/// `debug`, with the cause: a failed spawn's teardown could not place the front. Mutant: "the
+/// error is dropped".
+#[skuld::test]
+fn cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (child, stdin) = {
+        let _failing = crate::containment::cgroup::fault::fail_subtree(libc::EIO);
+        spawn_as(in_cgroup(cat()), SUDO)
+    };
+    let logs = crate::log_capture::records_since_on_current_thread(mark, "leaf subtree cannot be read");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].0, log::Level::Debug);
+    assert!(logs[0].1.contains("Input/output error"), "{logs:?}");
+    drop(stdin);
+    drop(child);
+}
+
+/// A failed spawn's settled verdict for a child its leaf did not take says why at `debug`, with
+/// the leaf's diagnosis. Mutant: "the diagnosis is dropped".
+#[skuld::test]
+fn cgroup_a_failed_spawn_says_why_its_leaf_did_not_take_the_child(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (mut cmd, stdin) = front_its_leaf_did_not_take();
+    let mark = crate::log_capture::mark();
+    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| cmd.spawn().map(drop));
+    let logs = crate::log_capture::records_since_on_current_thread(mark, "not placed in its leaf");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].0, log::Level::Debug);
+    assert!(
+        logs[0].1.contains(&format!("child {pid} is not in the leaf cgroup")),
+        "{logs:?}"
+    );
     assert_left_unsignalled(&err, pid, stdin);
 }

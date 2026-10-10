@@ -404,6 +404,10 @@ impl CgroupLeaf {
     /// cgroup id, its directory, its path, what its sweep removed, and whether a kill through it
     /// has landed.
     pub(crate) fn subtree(&self) -> io::Result<Subtree> {
+        #[cfg(test)]
+        if let Some(errno) = fault::subtree_fails() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         Ok(Subtree::new(
             self.id()?,
             Some(self.dir.shared()),
@@ -973,13 +977,10 @@ impl CgroupLeaf {
     /// is killed through and removed as for any child, and the front itself is sent nothing. Its
     /// subtree is read first, so the front can still be placed in it once the leaf is gone.
     fn abandon_front(&mut self, received: &Received) -> Abandoned {
-        let subtree = match self.subtree() {
-            Ok(subtree) => Some(subtree),
-            Err(e) => {
-                log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
-                None
-            }
-        };
+        let subtree = self.subtree();
+        if let Err(e) = &subtree {
+            log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
+        }
         if self.entered {
             let killed = self.hard_kill().is_ok();
             self.remove_killing_through(killed, "after its spawn was abandoned");
@@ -988,8 +989,11 @@ impl CgroupLeaf {
         }
         // Any kill through the leaf, this one or the removal's own, ends what it held.
         end_front(received, |pid, pidfd| match &subtree {
-            Some(subtree) => subtree.reached(pid, pidfd),
-            None => Ok(false),
+            Ok(subtree) => subtree.reached(pid, pidfd),
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("its leaf's subtree cannot be read: {e}"),
+            )),
         })
     }
 
@@ -1293,7 +1297,7 @@ fn end_front(
         Err(e) => {
             log::warn!(
                 "cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be placed ({e}); it is left \
-                 running, unsignalled and unreaped"
+                 unsignalled and unreaped, and its leaf's kill may have ended it"
             );
             return Abandoned::Front(FrontFate::LeftUnreaped);
         }
@@ -1689,6 +1693,10 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[path = "leaf/release.rs"]
 mod release;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/end_front_tests.rs"]
+mod end_front_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]

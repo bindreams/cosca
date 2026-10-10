@@ -147,7 +147,10 @@ fn cgroup_the_walk_skips_a_cgroup_removed_mid_walk(#[fixture(cgroup)] _group: &G
     };
     let (hook, removed, _) = removing();
     assert!(matches!(find_descendant(root.as_fd(), target), Walked::Found));
-    assert!(removed.get(), "the walk reached `gone` before it found the target, and skipped it once removed");
+    assert!(
+        removed.get(),
+        "the walk reached `gone` before it found the target, and skipped it once removed"
+    );
     drop(hook);
     let (_hook, removed, under) = removing();
     let walked = find_descendant(root.as_fd(), under);

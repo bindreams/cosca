@@ -242,7 +242,24 @@ impl Subtree {
         let dir = self.dir.as_ref()?;
         match super::find_descendant(dir.as_fd(), id) {
             super::Walked::Found => Some(true),
-            super::Walked::Absent => (self.dying() == Some(0)).then_some(false),
+            super::Walked::Absent => match self.dying() {
+                Ok(Some(0)) => Some(false),
+                Ok(dying) => {
+                    log::debug!(
+                        "the cgroups under a leaf were all walked without finding cgroup {id}, but {} are removed \
+                         and not yet freed, so it is not shown to be outside",
+                        dying.map_or("an unknown number".to_owned(), |n| n.to_string())
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::debug!(
+                        "the cgroups under a leaf were all walked without finding cgroup {id}, but its cgroup.stat \
+                         cannot be read ({e}), so it is not shown to be outside"
+                    );
+                    None
+                }
+            },
             super::Walked::Unknown(e) => {
                 log::debug!("the cgroups under a leaf could not all be walked ({e})");
                 None
@@ -251,18 +268,21 @@ impl Subtree {
     }
 
     /// How many cgroups under the leaf are removed but not yet freed, by its `cgroup.stat`; `None`
-    /// if that cannot be read, as once the leaf is removed.
-    fn dying(&self) -> Option<u64> {
-        let dir = self.dir.as_ref()?;
+    /// if that holds no such count. An error if the file cannot be read, as once the leaf is
+    /// removed.
+    fn dying(&self) -> io::Result<Option<u64>> {
+        let dir = self
+            .dir
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the subtree holds no leaf directory"))?;
         let file = rustix::fs::openat(
             dir.as_fd(),
             "cgroup.stat",
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
-        )
-        .ok()?;
-        let text = io::read_to_string(std::fs::File::from(file)).ok()?;
-        dying_in(&text)
+        )?;
+        let text = io::read_to_string(std::fs::File::from(file))?;
+        Ok(dying_in(&text))
     }
 
     /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
@@ -366,10 +386,60 @@ enum Unreadable {
     Probe(io::Error),
 }
 
-/// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
-fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
+/// A forked probe child (see [`fork_probe`]).
+struct Probe {
+    pid: libc::pid_t,
+    /// Where the child reports whether it is dumpable and its parent-death signal, a byte each. Its
+    /// end closes when it exits.
+    ready_read: std::io::PipeReader,
+}
+
+/// Forks the probe child of `parent`, this process's pid as recorded before the fork. The child is
+/// made non-dumpable (`dumpable`: left so, for a test), reports `PR_GET_DUMPABLE` on `ready_read`,
+/// and waits to be killed. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and
+/// a parent that died before that took effect is no longer `parent`, so the child exits instead.
+fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
     use std::os::fd::AsRawFd;
 
+    let (ready_read, ready_write) = std::io::pipe()?;
+    let (ready_r, ready_w) = (ready_read.as_raw_fd(), ready_write.as_raw_fd());
+    // The fork is under the spawn lock, as every fork of cosca's is, so no other spawn's descriptor
+    // is copied into the child mid-handshake.
+    let _guard = crate::child::spawn::spawn_lock();
+    // SAFETY: the child makes only async-signal-safe syscalls, then waits for the parent's kill; it
+    // never returns into Rust.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: async-signal-safe syscalls in the forked child.
+        unsafe {
+            libc::close(ready_r);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            if libc::getppid() != parent {
+                libc::_exit(0);
+            }
+            if !dumpable {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+            }
+            // What the parent checks: this child is not dumpable, as a front is not, and dies with
+            // its parent.
+            let mut pdeathsig: libc::c_int = 0;
+            libc::prctl(libc::PR_GET_PDEATHSIG, (&raw mut pdeathsig) as libc::c_ulong, 0, 0, 0);
+            let report = [libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as u8, pdeathsig as u8];
+            libc::write(ready_w, report.as_ptr().cast(), report.len());
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(ready_write);
+    Ok(Probe { pid, ready_read })
+}
+
+/// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
+fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
     let proc_dir = match crate::identity::proc_view() {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
@@ -385,38 +455,13 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
             )))
         }
     };
-    let (ready_read, ready_write) = std::io::pipe().map_err(Unreadable::Probe)?;
-    let (ready_r, ready_w) = (ready_read.as_raw_fd(), ready_write.as_raw_fd());
-    // The fork is under the spawn lock, as every fork of cosca's is, so no other spawn's descriptor
-    // is copied into the child mid-handshake.
-    let _guard = crate::child::spawn::spawn_lock();
     #[cfg(test)]
     let dumpable = super::fault::probe_kept_dumpable();
     #[cfg(not(test))]
     let dumpable = false;
-    // SAFETY: the child makes only async-signal-safe syscalls, then waits for the parent's kill; it
-    // never returns into Rust.
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        // SAFETY: async-signal-safe syscalls in the forked child.
-        unsafe {
-            libc::close(ready_r);
-            if !dumpable {
-                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
-            }
-            // What the parent checks: this child is not dumpable, as a front is not.
-            let byte = libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as u8;
-            libc::write(ready_w, (&raw const byte).cast(), 1);
-            loop {
-                libc::pause();
-            }
-        }
-    }
-    if pid < 0 {
-        return Err(Unreadable::Probe(io::Error::last_os_error()));
-    }
-    drop(ready_write);
-    let mut ready = [0u8; 1];
+    let Probe { pid, ready_read } =
+        fork_probe(rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
+    let mut ready = [0u8; 2];
     let readied = loop {
         match std::io::Read::read(&mut &ready_read, &mut ready) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -430,12 +475,15 @@ fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
     #[cfg(not(test))]
     let hidden: Option<i32> = None;
     let read = match readied {
-        Ok(1) if ready[0] != 0 => Err(Unreadable::Probe(io::Error::other(
+        Ok(2) if ready[0] != 0 => Err(Unreadable::Probe(io::Error::other(
             "the probe's child could not make itself non-dumpable",
+        ))),
+        Ok(2) if i32::from(ready[1]) != libc::SIGKILL => Err(Unreadable::Probe(io::Error::other(
+            "the probe's child could not ask to die with its parent",
         ))),
         // The child is this process's own and unreaped, so its `/proc` entry exists: an error that
         // says otherwise, or refuses, is `/proc` hiding it.
-        Ok(1) => match hidden {
+        Ok(2) => match hidden {
             Some(errno) => Err(io::Error::from_raw_os_error(errno)),
             None => proc_dir.read_to_string(&format!("{pid}/cgroup")).map(drop),
         }

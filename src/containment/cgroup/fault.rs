@@ -46,6 +46,7 @@ thread_local! {
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -828,6 +829,26 @@ impl Drop for ForcedPidfdCgroupId {
 
 pub(crate) fn forced_pidfd_cgroup_id() -> Option<u64> {
     FORCED_PIDFD_CGROUP_ID.with(Cell::get)
+}
+
+/// While the guard lives, capturing a leaf's subtree on this thread fails with `errno`, as its
+/// cgroup id read does once the leaf's filesystem stops giving ids.
+pub(crate) fn fail_subtree(errno: i32) -> FailSubtree {
+    SUBTREE_FAILS.with(|f| f.set(Some(errno)));
+    FailSubtree(())
+}
+
+#[must_use = "the subtree is captured again as soon as the guard is dropped"]
+pub(crate) struct FailSubtree(());
+
+impl Drop for FailSubtree {
+    fn drop(&mut self) {
+        SUBTREE_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn subtree_fails() -> Option<i32> {
+    SUBTREE_FAILS.with(Cell::get)
 }
 
 /// A hook given the path, relative to the leaf, of each cgroup a descendant walk is about to open.

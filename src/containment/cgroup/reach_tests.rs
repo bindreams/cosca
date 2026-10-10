@@ -32,6 +32,8 @@ fn subtree(leaf_id: u64, killed: bool) -> Subtree {
 /// The directory is returned to outlive the subtree.
 fn stand_in_subtree(stat: Option<&str>) -> (Subtree, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // A live cgroup's file, which the walk reads to tell its root was not removed.
+    std::fs::write(dir.path().join("cgroup.events"), "populated 0\n").expect("write the stand-in cgroup.events");
     if let Some(stat) = stat {
         std::fs::write(dir.path().join("cgroup.stat"), stat).expect("write the stand-in cgroup.stat");
     }
@@ -229,6 +231,38 @@ fn a_task_the_walk_finds_nowhere_is_outside() {
     assert!(!holds_hidden(&leaf, HIGH + 1).expect("no /proc read"));
 }
 
+/// A walk that finds nothing, but cannot show the cgroup is not one removed and not yet freed (the
+/// leaf's `cgroup.stat` counts some, holds no count, or cannot be read), says so at `debug`, with the
+/// cause; one that proves it says nothing. Mutant: "the unproven absence is silent".
+#[skuld::test]
+fn a_walk_that_finds_nothing_but_cannot_prove_it_says_why() {
+    crate::log_capture::install();
+    let says = "so it is not shown to be outside";
+    for (stat, cause) in [
+        (Some("nr_dying_descendants 2\n"), Some("2 are removed")),
+        (Some("nr_descendants 0\n"), Some("an unknown number")),
+        (None, Some("cgroup.stat cannot be read")),
+        (Some("nr_dying_descendants 0\n"), None),
+    ] {
+        let (leaf, _dir) = stand_in_subtree(stat);
+        let mark = crate::log_capture::mark();
+        let held = holds_hidden(&leaf, HIGH + 1);
+        let logs = crate::log_capture::records_since_on_current_thread(mark, says);
+        match cause {
+            Some(cause) => {
+                held.expect_err("not shown outside, so placed through the hidden /proc");
+                assert_eq!(logs.len(), 1, "{stat:?}: {logs:?}");
+                assert_eq!(logs[0].0, log::Level::Debug, "{stat:?}");
+                assert!(logs[0].1.contains(cause), "{stat:?}: {logs:?}");
+            }
+            None => {
+                assert!(!held.expect("proven outside"));
+                assert_eq!(logs, [], "{stat:?}");
+            }
+        }
+    }
+}
+
 /// A task in a cgroup the sweep removed is in the subtree, once the leaf is gone too.
 #[skuld::test]
 fn cgroup_a_task_in_a_cgroup_the_sweep_removed_is_in_the_subtree(#[fixture(cgroup)] _group: &Group) {
@@ -366,4 +400,97 @@ fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("leaf"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
+}
+
+/// A forked probe, killed and reaped when dropped, so a probe a failing assertion would leave
+/// running does not outlive the test.
+struct ProbeGuard(OwnedFd);
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        // Already reaped by the test: nothing to signal.
+        if rustix::process::pidfd_send_signal(self.0.as_fd(), rustix::process::Signal::KILL).is_ok() {
+            drop(rustix::process::waitid(
+                rustix::process::WaitId::PidFd(self.0.as_fd()),
+                rustix::process::WaitIdOptions::EXITED,
+            ));
+        }
+    }
+}
+
+/// The probe child reports that it is non-dumpable and asks to die with its parent, both before it
+/// is read, and dies of `SIGKILL` once the thread that forked it has exited: a supervisor that dies
+/// mid-probe leaves no process paused for good. Mutant: "the probe sets no parent-death signal" (the
+/// report names it, so the test fails by assertion before it waits for the death).
+#[skuld::test]
+fn the_probe_child_dies_with_the_thread_that_forked_it() {
+    use std::io::Read as _;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    // `move`: a failing assertion unwinds out of this closure and drops `go_tx` before the scope
+    // joins the forking thread, which waits for it.
+    std::thread::scope(move |scope| {
+        scope.spawn(move || {
+            let parent = rustix::process::getpid().as_raw_nonzero().get();
+            let mut probe = super::fork_probe(parent, false).expect("fork the probe");
+            let mut report = [0u8; 2];
+            probe.ready_read.read_exact(&mut report).expect("the probe reports");
+            ready_tx.send((probe.pid, report)).expect("report the probe");
+            // The thread ends when the test lets it go, or when the test fails and drops `go_tx`.
+            drop(go_rx.recv());
+        });
+        let (pid, report) = ready_rx.recv().expect("the probe's pid");
+        let pidfd = ProbeGuard(
+            rustix::process::pidfd_open(
+                rustix::process::Pid::from_raw(pid).expect("a positive pid"),
+                rustix::process::PidfdFlags::empty(),
+            )
+            .expect("pidfd_open the probe"),
+        );
+        assert_eq!(
+            report,
+            [0, libc::SIGKILL as u8],
+            "non-dumpable, and killed with its parent"
+        );
+        go_tx.send(()).expect("let the forking thread end");
+        let status = rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.0.as_fd()),
+            rustix::process::WaitIdOptions::EXITED,
+        )
+        .expect("the probe ends with its forking thread")
+        .expect("a blocking waitid returns a status");
+        assert_eq!(status.terminating_signal(), Some(libc::SIGKILL));
+    });
+}
+
+/// A probe whose parent is already gone when it starts (so `getppid` is no longer the pid recorded
+/// before the fork) exits without reporting. Mutant: "the probe does not compare its parent".
+#[skuld::test]
+fn a_probe_whose_parent_is_gone_exits_without_reporting() {
+    use std::io::Read as _;
+
+    // Not this process's pid, so the child's `getppid` differs from it, as after a reparenting.
+    let not_the_parent = rustix::process::getpid().as_raw_nonzero().get() + 1;
+    let mut probe = super::fork_probe(not_the_parent, false).expect("fork the probe");
+    let pidfd = ProbeGuard(
+        rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(probe.pid).expect("a positive pid"),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .expect("pidfd_open the probe"),
+    );
+    // The child's end of the pipe closes with the child: end of file, with nothing reported. One
+    // read, so a probe that reports instead fails the assertion, and does not leave the read
+    // waiting for the end of a probe that pauses.
+    let mut reported = [0u8; 2];
+    let read = probe.ready_read.read(&mut reported).expect("read the probe's report");
+    assert_eq!(read, 0, "the probe reported {reported:?}");
+    let status = rustix::process::waitid(
+        rustix::process::WaitId::PidFd(pidfd.0.as_fd()),
+        rustix::process::WaitIdOptions::EXITED,
+    )
+    .expect("reap the probe")
+    .expect("a blocking waitid returns a status");
+    assert_eq!(status.exit_status(), Some(0));
 }

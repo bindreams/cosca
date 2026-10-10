@@ -147,3 +147,69 @@ fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _g
     assert!(cleanup.wait().expect("reap the cat").success());
     drop(child);
 }
+
+/// A front whose place the teardown cannot read is left unreaped and unwaited, with a debug note of
+/// the cause: the leaf's kill landed, but nothing shows it reached the front. Mutant: "an unreadable
+/// place is waited for".
+#[skuld::test]
+fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, pid, stdin) = contained_cat();
+    let observer = pidfd_of(pid);
+    let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
+    child.attached.hard_kill().expect("cgroup.kill");
+    let waited = Arc::new(AtomicBool::new(false));
+    let front = NotYetExited {
+        inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
+        reaps: false,
+        waited: Arc::clone(&waited),
+    };
+    let mark = crate::log_capture::mark();
+    let fate = {
+        let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
+        teardown_unadopted_or_front(front, sudo_front(), Some(&subtree))
+    };
+    assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert!(!waited.load(Ordering::SeqCst), "an unplaced front is not waited for");
+    let notes = crate::log_capture::records_since_on_current_thread(mark, "cgroup cannot be read");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].0, log::Level::Debug);
+    assert!(notes[0].1.contains("Input/output error"), "{notes:?}");
+    // The cat died of the leaf's kill; the teardown left it unreaped.
+    drop(stdin);
+    assert!(!reaped(&observer));
+    let mut cleanup = PidfdChild::new(Some(pid), observer);
+    cleanup.wait().expect("reap the cat");
+    drop(child);
+}
+
+/// A front the leaf's kill reached whose wait fails is unaccounted for, and the warning names the
+/// cause. Mutant: "a failed wait answers `Reaped`".
+#[skuld::test]
+fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, pid, stdin) = contained_cat();
+    let observer = pidfd_of(pid);
+    let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
+    child.attached.hard_kill().expect("cgroup.kill");
+    let waited = Arc::new(AtomicBool::new(false));
+    let front = NotYetExited {
+        inner: PidfdChild::new(Some(pid), pidfd_of(pid)),
+        reaps: false,
+        waited: Arc::clone(&waited),
+    };
+    let mark = crate::log_capture::mark();
+    let fate = teardown_unadopted_or_front(front, sudo_front(), Some(&subtree));
+    assert_eq!(fate, FrontFate::Unaccounted);
+    assert!(waited.load(Ordering::SeqCst), "a front the kill reached is waited for");
+    let warns = crate::log_capture::records_since_on_current_thread(mark, "could not be reaped");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].1.contains("waited on a front the leaf's kill did not reach"),
+        "{warns:?}"
+    );
+    drop(stdin);
+    let mut cleanup = PidfdChild::new(Some(pid), observer);
+    cleanup.wait().expect("reap the cat");
+    drop(child);
+}

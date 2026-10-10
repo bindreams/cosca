@@ -462,9 +462,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     };
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
-    let subtree = front
-        .and(prepared.cgroup_leaf.as_ref())
-        .and_then(|leaf| leaf.subtree().ok());
+    let subtree = front_subtree(front.and(prepared.cgroup_leaf.as_ref()));
     if front.is_some() {
         prepared.watch_front(child.id());
     }
@@ -1637,6 +1635,22 @@ pub(crate) fn settle_before_teardown(
         #[cfg(not(target_os = "linux"))]
         pid,
     );
+}
+
+/// The subtree of the leaf of an elevation front, captured while the leaf exists: a failure arm
+/// drops the leaf, killing it. One that cannot be read leaves the front unplaceable by the arm,
+/// which then leaves it unreaped.
+#[cfg(target_os = "linux")]
+pub(crate) fn front_subtree(
+    leaf: Option<&crate::containment::cgroup::CgroupLeaf>,
+) -> Option<crate::containment::cgroup::Subtree> {
+    match leaf?.subtree() {
+        Ok(subtree) => Some(subtree),
+        Err(e) => {
+            log::debug!("spawn: an elevation front's leaf subtree cannot be read ({e}); its teardown cannot place it");
+            None
+        }
+    }
 }
 
 /// [`teardown_unadopted`], unless `child` is an elevation front: a kill of that would orphan the

@@ -35,20 +35,6 @@ pub(crate) struct ChildHandle<'a> {
     pub(crate) pidfd: std::os::fd::BorrowedFd<'a>,
 }
 
-/// What [`Prepared::settle_verdict`] found of the child's placement in its cgroup leaf.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only a Linux cgroup leaf is settled")
-)]
-#[derive(Debug)]
-pub(crate) enum Settled {
-    /// The child is in its leaf, which contains it.
-    InLeaf,
-    /// No leaf holds the child: there is none, the child did not enter it, or the verdict was
-    /// already taken.
-    NotPlaced,
-}
-
 impl Prepared {
     /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
     /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
@@ -62,23 +48,22 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child:
     /// take the verdict, as `attach` would, so the leaf answers only for the tree and
-    /// never for the child the caller will reap. [`Settled::NotPlaced`] without a leaf, or once
-    /// the verdict is taken.
+    /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
+    /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
+    /// tree either way.
     pub(crate) fn settle_verdict(
         &mut self,
         #[cfg(target_os = "linux")] child: ChildHandle<'_>,
         #[cfg(not(target_os = "linux"))] pid: u32,
-    ) -> Settled {
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            return match leaf.take_placement(child) {
-                Ok(()) => Settled::InLeaf,
-                Err(_) => Settled::NotPlaced,
-            };
+            if let Err(e) = leaf.take_placement(child) {
+                log::debug!("cgroup v2: a failed spawn's child is not placed in its leaf: {e}");
+            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
-        Settled::NotPlaced
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
