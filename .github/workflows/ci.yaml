@@ -625,57 +625,6 @@ jobs:
 
       # Windows path-resolution canaries and the elevating ShellExecuteEx probes (the `PATH_PROBES` and
       # `SHELL_EXECUTE` groups). windows-probes.yaml runs the same canaries weekly, because `windows-latest` floats.
-      - name: THROWAWAY - control, an orphan outlives a plain step
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        shell: pwsh
-        run: |
-          cmd /c "start /b ping -n 3600 127.0.0.1 > nul"
-          $alive = @(Get-Process ping -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited })
-          Write-Host "control: $($alive.Count) ping alive"
-          if ($alive.Count -eq 0) { throw 'control: no orphan survived, the test proves nothing' }
-          $alive | Stop-Process -Force
-          $alive | Wait-Process
-
-      - name: THROWAWAY - orphan started through run-nextest.ps1, normal end
-        id: win_t1
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          Set-Content "$env:RUNNER_TEMP\straggle1.ps1" 'cmd /c "start /b ping -n 3600 127.0.0.1 > nul"'
-          ./.github/scripts/run-nextest.ps1 straggle1 pwsh -NoProfile -File "$env:RUNNER_TEMP\straggle1.ps1"
-
-      - name: THROWAWAY - no orphan after the normal end
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          # No time limit of ours: a surviving ping runs for an hour, so the step's bound fails it.
-          $p = @(Get-Process ping -ErrorAction SilentlyContinue)
-          Write-Host "after normal end: $($p.Count) ping process objects"
-          $p | Wait-Process
-          Write-Host 'none alive'
-
-      - name: THROWAWAY - orphan started through run-nextest.ps1, step timeout
-        id: win_t2
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        continue-on-error: true
-        timeout-minutes: 1
-        shell: pwsh
-        run: |
-          Set-Content "$env:RUNNER_TEMP\straggle2.ps1" 'cmd /c "start /b ping -n 3600 127.0.0.1 > nul"; Start-Sleep 3600'
-          ./.github/scripts/run-nextest.ps1 straggle2 pwsh -NoProfile -File "$env:RUNNER_TEMP\straggle2.ps1"
-
-      - name: THROWAWAY - no orphan after the timeout
-        if: ${{ always() && !cancelled() && matrix.os == 'windows' }}
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          $p = @(Get-Process ping -ErrorAction SilentlyContinue)
-          Write-Host "after timeout: $($p.Count) ping process objects"
-          $p | Wait-Process
-          Write-Host 'none alive'
-
       - name: Windows canaries
         if: ${{ !cancelled() && matrix.os == 'windows' }}
         timeout-minutes: 16
@@ -857,7 +806,7 @@ jobs:
       - name: Root lane (macOS, sudo -E)
         id: mac_root_run
         if: ${{ !cancelled() && steps.mac_root_dirs.outcome == 'success' }}
-        timeout-minutes: 1
+        timeout-minutes: 8
         shell: bash
         env:
           COSCA_TEST_ROOT: "1"
@@ -871,8 +820,6 @@ jobs:
           exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             # forward.py made this shell a session leader, so its pid is the id of the group that holds the run.
             echo $$ > "$3"
-            ( trap : TERM; while :; do sleep 31337; done ) &
-            sleep 3600
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
             status=0
@@ -884,14 +831,6 @@ jobs:
       # chown, which the elevation archive step then fails on. So the run's process group is killed, and confirmed
       # empty, before `target` is handed back. The group, not a copy of the workspace for root: a copy would leave the
       # stragglers running into the later lanes.
-      - name: THROWAWAY - the TERM-proof straggler is alive before the kill
-        if: ${{ always() && steps.mac_root_run.outcome != 'skipped' && steps.mac_root_run.outcome != '' }}
-        shell: bash
-        run: |
-          set -x
-          ps -axo pid,pgid,command | grep '[3]1337'
-          test "$(ps -axo command | grep -c '[3]1337')" -gt 0
-
       - name: Root lane (macOS) - end the root run's processes, then hand the target directory back
         if: ${{ always() && steps.mac_root_run.outcome != 'skipped' && steps.mac_root_run.outcome != '' }}
         timeout-minutes: 2
@@ -900,15 +839,6 @@ jobs:
           set -euxo pipefail
           bash .github/scripts/kill-group.sh "$RUNNER_TEMP/root-lane-macos.pgid"
           sudo chown -R "$(id -u):$(id -g)" "$PWD/target"
-
-      - name: THROWAWAY - the straggler is gone after the kill
-        if: ${{ always() && steps.mac_root_run.outcome != 'skipped' && steps.mac_root_run.outcome != '' }}
-        shell: bash
-        run: |
-          set -x
-          ps -axo pid,pgid,command | grep '[3]1337' || true
-          test "$(ps -axo command | grep -c '[3]1337')" -eq 0
-          test -z "$(find "$PWD/target" -not -user "$(id -u)" | head -n1)"
 
       - name: Root lane (macOS) - upload JUnit
         if: ${{ !cancelled() && steps.mac_helper_check.outcome != 'skipped' && steps.mac_helper_check.outcome != '' }}
