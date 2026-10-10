@@ -1,5 +1,7 @@
 use std::cell::Cell;
 
+use super::dir::WalkStep;
+
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
@@ -38,6 +40,7 @@ thread_local! {
     static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
+    static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
@@ -855,6 +858,32 @@ pub(crate) fn run_before_walk_open(path: &std::path::Path) {
             h.borrow_mut().get_or_insert(hook);
         });
     }
+}
+
+type WalkFailure = (std::path::PathBuf, WalkStep, i32);
+
+/// While the guard lives, `step` of the walk on this thread at the cgroup `path`, relative to the
+/// leaf (`.` is the leaf itself), fails with `errno`, as the OS answers a refusal that cannot be
+/// provoked on a real cgroup, such as a path past `PATH_MAX`.
+pub(crate) fn fail_walk_step(path: &str, step: WalkStep, errno: i32) -> FailWalkStep {
+    WALK_FAILURE.with(|f| *f.borrow_mut() = Some((path.into(), step, errno)));
+    FailWalkStep(())
+}
+
+#[must_use = "the step succeeds again as soon as the guard is dropped"]
+pub(crate) struct FailWalkStep(());
+
+impl Drop for FailWalkStep {
+    fn drop(&mut self) {
+        WALK_FAILURE.with(|f| f.borrow_mut().take());
+    }
+}
+
+pub(crate) fn walk_step_failure(path: &std::path::Path, step: WalkStep) -> Option<i32> {
+    WALK_FAILURE.with(|f| match &*f.borrow() {
+        Some((at, failing, errno)) if at == path && *failing == step => Some(*errno),
+        _ => None,
+    })
 }
 
 /// While the guard lives, a leaf's cgroup id on this thread fails with `errno`, as

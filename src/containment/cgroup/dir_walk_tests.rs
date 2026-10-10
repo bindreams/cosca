@@ -5,6 +5,8 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use super::{cgroup_id, find_descendant, Walked};
+use crate::containment::cgroup::fault::fail_walk_step;
+use crate::containment::cgroup::WalkStep;
 use crate::test_groups::{cgroup, Group};
 
 /// A cgroup under the lane's own, removed with every cgroup made under it when dropped. Removal is
@@ -143,13 +145,78 @@ fn cgroup_the_walk_skips_a_cgroup_removed_mid_walk(#[fixture(cgroup)] _group: &G
         });
         (hook, removed, id)
     };
-    let (hook, _, _) = removing();
+    let (hook, removed, _) = removing();
     assert!(matches!(find_descendant(root.as_fd(), target), Walked::Found));
+    assert!(removed.get(), "the walk reached `gone` before it found the target, and skipped it once removed");
     drop(hook);
     let (_hook, removed, under) = removing();
     let walked = find_descendant(root.as_fd(), under);
     assert!(matches!(walked, Walked::Absent), "{walked:?}");
     assert!(removed.get(), "the walk reached `gone`, and skipped it once removed");
+}
+
+/// A root removed before the walk lists anything leaves nothing listed, so nothing is known of the
+/// cgroup sought: `Unknown`, never `Absent`. Mutant: "a gone root is skipped like any gone cgroup".
+#[skuld::test]
+fn cgroup_a_walk_of_a_removed_root_cannot_tell(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-gone-root");
+    let root = scratch.fd();
+    std::fs::remove_dir(scratch.path()).expect("remove the root");
+    let walked = find_descendant(root.as_fd(), 1);
+    assert!(matches!(walked, Walked::Unknown(_)), "{walked:?}");
+}
+
+/// The same for a root that goes at any step: nothing, or not everything, of it was listed.
+/// Mutant: as above.
+#[skuld::test]
+fn cgroup_a_walk_of_a_root_gone_at_any_step_cannot_tell(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-gone-root-steps");
+    scratch.make("under");
+    let root = scratch.fd();
+    for step in [WalkStep::Open, WalkStep::List, WalkStep::Entries, WalkStep::Alive] {
+        for errno in [libc::ENOENT, libc::ENODEV] {
+            let _failing = fail_walk_step(".", step, errno);
+            let walked = find_descendant(root.as_fd(), 1);
+            assert!(matches!(walked, Walked::Unknown(_)), "{step:?} {errno}: {walked:?}");
+        }
+    }
+}
+
+/// A refusal the walk cannot get past is `Unknown`, never `Absent`: a path past `PATH_MAX`
+/// (`ENAMETOOLONG`) and a cgroup this process may not read (`EACCES`), at any step. Mutant: "the
+/// refusal is skipped like a removed cgroup".
+#[skuld::test]
+fn cgroup_a_walk_that_is_refused_cannot_tell(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-refused");
+    scratch.make("a/b");
+    let root = scratch.fd();
+    for step in [WalkStep::Open, WalkStep::Id, WalkStep::List, WalkStep::Entries] {
+        for errno in [libc::ENAMETOOLONG, libc::EACCES] {
+            let _failing = fail_walk_step("./a", step, errno);
+            let walked = find_descendant(root.as_fd(), 1);
+            assert!(matches!(walked, Walked::Unknown(_)), "{step:?} {errno}: {walked:?}");
+        }
+    }
+}
+
+/// A cgroup that is gone at a step after the walk's open of it (its id read, the open for its
+/// listing, its `getdents`) is skipped, as one gone at the open is: the rest of the tree is still
+/// searched. Mutant: "a gone cgroup after the open is an error".
+#[skuld::test]
+fn cgroup_a_walk_skips_a_cgroup_gone_after_its_open(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-gone-late");
+    scratch.make("a");
+    let target = id_at(&scratch.make("z/target"));
+    let root = scratch.fd();
+    for step in [WalkStep::Id, WalkStep::List, WalkStep::Entries] {
+        for errno in [libc::ENODEV, libc::ENOENT] {
+            let _failing = fail_walk_step("./a", step, errno);
+            let walked = find_descendant(root.as_fd(), target);
+            assert!(matches!(walked, Walked::Found), "{step:?} {errno}: {walked:?}");
+            let walked = find_descendant(root.as_fd(), 1);
+            assert!(matches!(walked, Walked::Absent), "{step:?} {errno}: {walked:?}");
+        }
+    }
 }
 
 /// The walk holds no descriptor from one cgroup to the next, however wide or deep the tree: each

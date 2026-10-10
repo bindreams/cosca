@@ -323,17 +323,24 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     while let Some(path) = pending.pop_front() {
         #[cfg(test)]
         super::fault::run_before_walk_open(&path);
-        let cgroup = match open_beneath(dir, &path) {
+        // A cgroup under `dir` that is gone has nothing under it to find. `dir` itself gone lists
+        // nothing, which says nothing of the cgroups that were under it.
+        let is_root = path.as_os_str() == ".";
+        let skippable = |e: rustix::io::Errno| gone(e) && !is_root;
+        let cgroup = match step_fault(&path, WalkStep::Open).and_then(|()| open_beneath(dir, &path)) {
             Ok(cgroup) => cgroup,
-            Err(e) if gone(e) => continue,
+            Err(e) if skippable(e) => continue,
             Err(rustix::io::Errno::XDEV) => {
                 behind_a_mount.get_or_insert(path);
                 continue;
             }
             Err(e) => return Err(named(e, &path)),
         };
-        if path.as_os_str() != "." {
-            match cgroup_id(cgroup.as_fd()) {
+        if !is_root {
+            match step_fault(&path, WalkStep::Id)
+                .map_err(io::Error::from)
+                .and_then(|()| cgroup_id(cgroup.as_fd()))
+            {
                 Ok(found) if found == id => return Ok(Some(())),
                 Ok(_) => {}
                 Err(e)
@@ -346,28 +353,44 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
             }
         }
         // Listing needs a readable descriptor; `cgroup` is `O_PATH`.
-        let entries = match rustix::fs::openat(
-            &cgroup,
-            ".",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .and_then(rustix::fs::Dir::new)
+        let entries = match step_fault(&path, WalkStep::List)
+            .and_then(|()| {
+                rustix::fs::openat(
+                    &cgroup,
+                    ".",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+            })
+            .and_then(rustix::fs::Dir::new)
         {
             Ok(entries) => entries,
-            Err(e) if gone(e) => continue,
+            Err(e) if skippable(e) => continue,
             Err(e) => return Err(named(e, &path)),
         };
+        let mut first = true;
         for entry in entries {
+            let entry = if std::mem::take(&mut first) {
+                step_fault(&path, WalkStep::Entries).and_then(|()| entry)
+            } else {
+                entry
+            };
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) if gone(e) => break,
+                Err(e) if skippable(e) => break,
                 Err(e) => return Err(named(e, &path)),
             };
             let name = entry.file_name();
             if !matches!(name.to_bytes(), b"." | b"..") && is_dir(cgroup.as_fd(), &entry)? {
                 pending.push_back(path.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
             }
+        }
+        // A removed `dir` still lists, as nothing: its files answer `ENODEV`, so read one, after the
+        // listing, which a removal during it then cannot have cut short unseen.
+        if is_root {
+            step_fault(&path, WalkStep::Alive)
+                .and_then(|()| rustix::fs::openat(&cgroup, "cgroup.events", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()))
+                .map_err(|e| named(e, &path))?;
         }
     }
     match behind_a_mount {
@@ -379,10 +402,40 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
     }
 }
 
+/// A step of the walk at one cgroup, as a test makes it fail (see `fault::fail_walk_step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkStep {
+    /// The `openat2` of the cgroup's path.
+    Open,
+    /// The read of the cgroup's id.
+    Id,
+    /// The `openat` of the cgroup for listing.
+    List,
+    /// The `getdents` of the listing.
+    Entries,
+    /// The read, after the listing of the walk's root, that shows it was not removed.
+    Alive,
+}
+
+/// What a test made `step` of the walk at `path` fail with, or `Ok`.
+fn step_fault(path: &std::path::Path, step: WalkStep) -> rustix::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = super::fault::walk_step_failure(path, step) {
+        return Err(rustix::io::Errno::from_raw_os_error(errno));
+    }
+    let _ = (path, step);
+    Ok(())
+}
+
 /// `errno` from the walk at `path`, relative to the leaf.
 fn named(errno: rustix::io::Errno, path: &std::path::Path) -> io::Error {
     let e = io::Error::from(errno);
-    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    let at = if path.as_os_str() == "." {
+        "the root of the walk".to_owned()
+    } else {
+        path.display().to_string()
+    };
+    io::Error::new(e.kind(), format!("{at}: {e}"))
 }
 
 /// Open the directory at `path` under `dir`, never across a mount or a symlink, nor out of `dir`.
