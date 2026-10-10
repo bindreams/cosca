@@ -81,6 +81,9 @@ jobs:
         shell: bash
         run: bash .github/scripts/release-script-tests.sh
 
+      - name: Test the directory-mode script
+        run: bash .github/scripts/dir-modes-tests.sh
+
       - name: Test sccache fallback script
         shell: bash
         run: bash .github/scripts/enable-sccache-tests.sh
@@ -572,9 +575,11 @@ jobs:
           cargo nextest archive --locked --target ${{ matrix.target }} --test group_teardown_setuid --archive-file "$RUNNER_TEMP/setuid-root.tar.zst"
           mkdir -m 0755 "$RUNNER_TEMP/setuid-root-extract"
           chmod -R a+rX "$PWD/target"
+          modes=("$RUNNER_TEMP")
           d="$PWD"
-          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
-          sudo chmod a+x "$RUNNER_TEMP"
+          while [ "$d" != / ]; do modes+=("$d"); d=$(dirname "$d"); done
+          bash .github/scripts/dir-modes.sh record "$RUNNER_TEMP/dir-modes" "${modes[@]}"
+          for d in "${modes[@]}"; do sudo chmod a+x "$d"; done
 
       - name: Run setuid-root process-group teardown test as root (Linux)
         if: matrix.os == 'linux'
@@ -595,6 +600,10 @@ jobs:
         if: ${{ always() && matrix.os == 'linux' }}
         run: |
           if [ -n "${COSCA_TEST_SETUID_HELPER:-}" ]; then sudo rm -f -- "$COSCA_TEST_SETUID_HELPER"; fi
+
+      - name: Restore the directory modes (Linux)
+        if: ${{ always() && matrix.os == 'linux' }}
+        run: bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes"
 
 
       # The libtest guard (.github/scripts/libtest_guard.py) checks that the test suite is complete: no

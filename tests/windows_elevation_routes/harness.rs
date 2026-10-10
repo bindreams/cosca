@@ -719,21 +719,78 @@ pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
     }
 }
 
+/// A scheduled task name, deleted when dropped, whatever the test does in between. A task that is still
+/// registered afterwards fails the test, unless it is already failing (a second panic while unwinding aborts the
+/// binary), where it is only printed. Made before the `/create`, so a `/create` that fails after registering
+/// still gets deleted; a task that was never registered is not a failure.
+struct ScheduledTask {
+    name: String,
+    delete_line: Option<String>,
+}
+
+impl ScheduledTask {
+    fn new(name: String) -> Self {
+        ScheduledTask {
+            name,
+            delete_line: None,
+        }
+    }
+
+    /// Deletes the task now, for the report line; [`Drop`] then finds nothing left to do.
+    fn delete(&mut self) -> String {
+        let line = match crate::common::output_locked(
+            std::process::Command::new("schtasks").args(["/delete", "/tn", &self.name, "/f"]),
+        ) {
+            Ok(out) => format!("{}", out.status),
+            Err(e) => format!("schtasks could not be run: {e}"),
+        };
+        self.delete_line = Some(line.clone());
+        line
+    }
+
+    fn is_registered(&self) -> Result<bool, String> {
+        crate::common::output_locked(std::process::Command::new("schtasks").args(["/query", "/tn", &self.name]))
+            .map(|out| out.status.success())
+            .map_err(|e| format!("schtasks could not be run: {e}"))
+    }
+}
+
+impl Drop for ScheduledTask {
+    fn drop(&mut self) {
+        if self.delete_line.is_none() {
+            self.delete();
+        }
+        let problem = match self.is_registered() {
+            Ok(false) => return,
+            Ok(true) => format!(
+                "the scheduled task {} is still registered after its deletion",
+                self.name
+            ),
+            Err(e) => format!("could not tell whether the scheduled task {} is gone: {e}", self.name),
+        };
+        if std::thread::panicking() {
+            println!("PROBE schtasks: {problem}");
+        } else {
+            panic!("{problem}");
+        }
+    }
+}
+
 /// Try to register a scheduled task at each run level and report what `schtasks` said, plus
 /// whether at least one `/create` call actually exited with a status — a caller for whom `schtasks`
 /// itself could never even be launched measured nothing, no matter how many report lines come back.
-/// Always attempts to delete what it created, on every path, and reports whether each `/delete`
-/// succeeded rather than discarding that result.
+/// Deletes what it created on every path, a panic included, and fails the test if a task is still
+/// registered afterwards.
 pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let mut any_create_exited = false;
     let name = format!("cosca-probe-{}", std::process::id());
     for level in ["HIGHEST", "LIMITED"] {
-        let tn = format!("{name}-{level}");
+        let mut task = ScheduledTask::new(format!("{name}-{level}"));
         match crate::common::output_locked(std::process::Command::new("schtasks").args([
             "/create",
             "/tn",
-            &tn,
+            &task.name,
             "/tr",
             "cmd.exe /c exit 0",
             "/sc",
@@ -755,10 +812,7 @@ pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
             }
             Err(e) => lines.push(format!("/rl {level} -> schtasks could not be run: {e}")),
         }
-        match crate::common::output_locked(std::process::Command::new("schtasks").args(["/delete", "/tn", &tn, "/f"])) {
-            Ok(out) => lines.push(format!("/rl {level} delete -> {}", out.status)),
-            Err(e) => lines.push(format!("/rl {level} delete -> schtasks could not be run: {e}")),
-        }
+        lines.push(format!("/rl {level} delete -> {}", task.delete()));
     }
     (lines, any_create_exited)
 }
