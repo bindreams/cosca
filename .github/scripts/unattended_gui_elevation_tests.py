@@ -228,6 +228,7 @@ class EnableLinux(unittest.TestCase):
                 init_comm=lambda p: "systemd",
                 getpwnam=ordinary,
                 environ=environment,
+                rule_path=os.path.join(tempfile.gettempdir(), "no-such-directory", "49.rules"),
             )
         self.assertEqual(len(seen), 4)  # pkaction, the pkexec before, systemctl, the pkexec after
         for env in seen:
