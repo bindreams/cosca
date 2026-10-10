@@ -484,8 +484,10 @@ fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_
     super::teardown_after_attach_failure(child, unique);
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Debug], "{records:?}");
-    assert!(records[1].1.contains("reaped by someone else"), "{records:?}");
+    // The debug lines come as they happen; the one warn comes last, with everything noted.
+    assert_eq!(levels, vec![log::Level::Debug, log::Level::Warn], "{records:?}");
+    assert!(records[0].1.contains("reaped by someone else"), "{records:?}");
+    assert!(records[1].1.contains("could not be killed"), "{records:?}");
     end_unsignalled_and_reap(pid);
 }
 
