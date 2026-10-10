@@ -65,6 +65,13 @@ STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 Vagrant.configure("2") do |config|
   config.vm.box = "stromweld/windows-10"
   config.vm.box_version = "202503.09.0"
+  # Vagrant Cloud publishes no checksum for this box, so this one was computed locally: the qemu/amd64
+  # box file (https://vagrantcloud.com/stromweld/boxes/windows-10/versions/202503.09.0/providers/qemu/amd64/vagrant.box,
+  # 6758810598 bytes) downloaded with `curl -X GET` and hashed with `shasum -a 512` on 2026-10-10.
+  # It pins the contents the version alone does not, but is trust-on-first-use: it proves the file
+  # is the one downloaded then, not that the publisher's upload was clean.
+  config.vm.box_download_checksum = "0c5ce38d9b6f716423a7bcb2ee745024629c8055e21c64bb1e9f2d5745fc6e3e93bf602cc88c81d9fdc0313026caddceb66ffc78c2a960eed1245abef7912cfa"
+  config.vm.box_download_checksum_type = "sha512"
   # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
   # host silently excludes it from "usable providers" and `up` fails with a misleading "box
   # doesn't support requested provider" error, even though the box does publish a qemu

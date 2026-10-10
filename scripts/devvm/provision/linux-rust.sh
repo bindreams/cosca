@@ -5,19 +5,60 @@
 # itself if already done.
 set -euo pipefail
 
+# apt packages: a C linker, and what the ELEVATION group's Linux tests elevate through (see the
+# `elevation_linux` job in ci.yaml). One apt run, only if something is missing.
+APT_PACKAGES=()
 if command -v cc >/dev/null 2>&1; then
-    echo "devvm: cc already present, skipping apt install"
+    echo "devvm: cc already present, skipping build-essential"
 else
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y build-essential >/dev/null
+    APT_PACKAGES+=(build-essential)
+fi
+if command -v pkexec >/dev/null 2>&1 && command -v doas >/dev/null 2>&1 && command -v pkaction >/dev/null 2>&1; then
+    echo "devvm: pkexec, polkit and doas already present, skipping their apt install"
+else
+    APT_PACKAGES+=(polkitd pkexec opendoas)
 fi
 
-# What the ELEVATION group's Linux tests elevate through (see the `elevation_linux` job in ci.yaml).
-if command -v pkexec >/dev/null 2>&1 && command -v doas >/dev/null 2>&1 && command -v pkaction >/dev/null 2>&1; then
-    echo "devvm: pkexec, polkit and doas already present, skipping apt install"
-else
+if [ "${#APT_PACKAGES[@]}" -gt 0 ]; then
+    # A freshly booted guest can still be running cloud-init, and unattended-upgrades can take the
+    # dpkg lock at any time. Wait for cloud-init to finish (exit 2 is "finished, recoverable
+    # errors"), then stop the apt timers and unattended-upgrades for the duration of the install,
+    # and put back whichever of them were active, even if apt fails.
+    if command -v cloud-init >/dev/null 2>&1; then
+        CLOUD_INIT_STATUS=0
+        sudo cloud-init status --wait >/dev/null || CLOUD_INIT_STATUS=$?
+        if [ "$CLOUD_INIT_STATUS" -ne 0 ]; then
+            echo "devvm: cloud-init finished with exit status $CLOUD_INIT_STATUS, continuing" >&2
+        fi
+    fi
+
+    APT_TIMERS=(apt-daily.timer apt-daily-upgrade.timer)
+    APT_SERVICES=(apt-daily.service apt-daily-upgrade.service unattended-upgrades.service)
+    RESTORE_UNITS=()
+    restore_apt_units() {
+        local unit
+        for unit in "${RESTORE_UNITS[@]}"; do
+            sudo systemctl start "$unit" || echo "devvm: could not restart $unit" >&2
+        done
+        RESTORE_UNITS=()
+    }
+    trap restore_apt_units EXIT
+    # Timers first so nothing restarts a service we are about to stop. Only the timers and
+    # unattended-upgrades.service are restored: the apt-daily*.service oneshots are timer-driven.
+    for unit in "${APT_TIMERS[@]}" unattended-upgrades.service; do
+        if systemctl is-active --quiet "$unit"; then
+            RESTORE_UNITS+=("$unit")
+        fi
+    done
+    for unit in "${APT_TIMERS[@]}" "${APT_SERVICES[@]}"; do
+        sudo systemctl stop "$unit" 2>/dev/null || true
+    done
+
     sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends polkitd pkexec opendoas >/dev/null
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends "${APT_PACKAGES[@]}" >/dev/null
+
+    restore_apt_units
+    trap - EXIT
 fi
 
 if command -v cargo >/dev/null 2>&1; then

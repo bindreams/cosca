@@ -8,8 +8,9 @@
 # `scripts/devvm.py up linux-arm64`, which sets VAGRANT_DOTFILE_PATH and DEVVM_STAGE_DIR so
 # all state lands under .tmp/devvm/ in the worktree, never in the box's own directory.
 #
-# Box: perk/ubuntu-24.04-arm64, provider qemu, version pinned below — the aarch64 cloud-init
-# box of the family the vagrant-qemu plugin's own README cites as a known-working example.
+# Box: perk/ubuntu-24.04-arm64 (community-published, not Canonical's), provider qemu, version and
+# checksum pinned below — the aarch64 cloud-init box of the family the vagrant-qemu plugin's own
+# README cites as a known-working example.
 # Ubuntu 24.04's systemd (255) defaults to the unified cgroup v2 hierarchy, and its polkit (124)
 # reads JavaScript rules, which `.github/scripts/unattended-gui-elevation.py` needs (>= 0.106).
 
@@ -21,6 +22,11 @@ STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 Vagrant.configure("2") do |config|
   config.vm.box = "perk/ubuntu-24.04-arm64"
   config.vm.box_version = "20250704"
+  # sha512 of the qemu/arm64 box file, as listed by the Vagrant Cloud API
+  # (GET https://app.vagrantup.com/api/v2/box/perk/ubuntu-24.04-arm64). Pins the contents, which
+  # the version alone does not.
+  config.vm.box_download_checksum = "22db4e99b377bf59b2546d28af5e2f0873e34acc1c3a56dc71e91a5f7ddec7986218f44aad7e24aff04f64eeb6b4fe719b8befb75627f4adab251f37a6fa7b66"
+  config.vm.box_download_checksum_type = "sha512"
   # Pin explicitly rather than rely on Vagrant's host-architecture auto-detection matching by
   # accident — see the box_architecture comment in the windows-x64/linux-x64 Vagrantfiles.
   config.vm.box_architecture = "arm64"
