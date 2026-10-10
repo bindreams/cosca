@@ -154,9 +154,9 @@ jobs:
           - os: linux
             arch: amd64
             # 26.04: the elevation lane needs polkit 0.106 or later, and its `polkit.service` is
-            # `Type=notify-reload` there. The root lanes' containers run `ubuntu:26.04`, the runner's own glibc.
+            # `Type=notify-reload` there.
             runner: ubuntu-26.04
-            # ubuntu:26.04 (multi-arch index digest)
+            # ubuntu:26.04
             root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
             timeout: 30
             target: x86_64-unknown-linux-gnu
@@ -165,7 +165,7 @@ jobs:
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            # ubuntu:24.04 (multi-arch index digest)
+            # ubuntu:24.04
             root_image: ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
             timeout: 29
             target: aarch64-unknown-linux-gnu
@@ -615,90 +615,23 @@ jobs:
 
       # Lanes that run after the unprivileged tests =====
       #
-      # Every lane below is a step group of this required job. Order: the Windows canaries, then the root
-      # lanes, then elevation. `unattended-gui-elevation.py` changes system policy, so elevation goes last as a
-      # second line of defence; correctness does not rest on it. Every step that reverts a lane's changes runs
+      # Every lane below is a step group of this required job. Order: the Windows canaries, the root lanes, then
+      # elevation. `unattended-gui-elevation.py` changes system policy, so elevation goes last as a second line of
+      # defence; correctness does not rest on it. The macOS setuid and the elevation tests were built by
+      # `Build tests (tokio feature)`. Every step that reverts a lane's changes runs
       # `always()`, straight after its own lane. The lanes' steps run `!cancelled()`, so one red lane does not hide
       # another, and each step also requires its own lane's earlier step to have succeeded. Each lane's
       # `COSCA_TEST_<GROUP>` variables are set on its own steps, never job-wide.
 
       # Windows path-resolution canaries and the elevating ShellExecuteEx probes (the `PATH_PROBES` and
-      # `SHELL_EXECUTE` groups). `--no-capture`: the surveys report only through stdout, and every canary prints
-      # what it measured before asserting on it. Each canary that passes leaves a marker named after itself
-      # (`mark_canary_passed`). windows-probes.yaml runs the same canaries weekly, because `windows-latest` floats.
-      - name: Windows canaries - path resolution
-        id: win_canary
+      # `SHELL_EXECUTE` groups). windows-probes.yaml runs the same canaries weekly, because `windows-latest` floats.
+      - name: Windows canaries
         if: ${{ !cancelled() && matrix.os == 'windows' }}
-        timeout-minutes: 8
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-          COSCA_TEST_PATH_PROBES: "1"
-          COSCA_TEST_PATH_PROBES_CONSENT: "1"
-          SKULD_LABELS: path_probes
-          TARGET: ${{ matrix.target }}
-        run: |
-          mkdir "$COSCA_CANARY_MARKERS"
-          cargo nextest run --locked --profile ci-canary --target "$TARGET" --test windows_path_resolution --no-capture --no-tests=fail
-
-      # A canary filter matching nothing would otherwise pass having asserted nothing. Runs after a failure too,
-      # so the log shows which canaries passed.
-      - name: Windows canaries - require that a canary ran
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-        run: |
-          shopt -s nullglob
-          passed=("$COSCA_CANARY_MARKERS"/*)
-          if ((${#passed[@]} == 0)); then
-            echo "::error::no canary ran: the run asserted nothing about the platform"
-            exit 1
-          fi
-          printf 'canary passed: %s\n' "${passed[@]##*/}"
-
-      # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without a prompt, and
-      # register one volatile App Paths key in HKLM and one in HKCU, deleting each again; a volatile parent key
-      # they had to create can stay behind until the next logon session. They measure an ELEVATED caller's launch,
-      # not the consent route cosca takes from an unelevated one. They share machine-wide state (the App Paths
-      # keys) and must not run concurrently; `--no-capture` and the `windows-shell-execute` test group (one thread,
-      # `.config/nextest.toml`) both guarantee that.
-      - name: Windows canaries - elevating ShellExecuteEx probes
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        timeout-minutes: 8
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-          COSCA_TEST_SHELL_EXECUTE: "1"
-          COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
-          SKULD_LABELS: shell_execute
-          TARGET: ${{ matrix.target }}
-        run: |
-          mkdir "$COSCA_CANARY_MARKERS"
-          cargo nextest run --locked --profile ci-shell-execute --target "$TARGET" --test windows_shell_execute --no-capture --no-tests=fail
-
-      - name: Windows canaries - require that an elevating probe ran
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-        run: |
-          shopt -s nullglob
-          passed=("$COSCA_CANARY_MARKERS"/*)
-          if ((${#passed[@]} == 0)); then
-            echo "::error::no elevating probe ran: the run asserted nothing about ShellExecuteEx"
-            exit 1
-          fi
-          printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
-
-      - name: Windows canaries - upload JUnit
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        uses: ./.github/actions/upload-junit
+        timeout-minutes: 16
+        uses: ./.github/actions/windows-canaries
         with:
-          name: canary-windows-${{ matrix.arch }}
-          path: |
-            ${{ github.workspace }}/target/nextest/ci-canary/junit.xml
-            ${{ github.workspace }}/target/nextest/ci-shell-execute/junit.xml
+          target: ${{ matrix.target }}
+          artifact: canary-windows-${{ matrix.arch }}
 
       # Root lanes (Linux) =====
       #
@@ -706,8 +639,6 @@ jobs:
       # unprivileged and opt out of them (`COSCA_TEST_ROOT=0`). Each lane runs the nextest archive in a container
       # (.github/actions/root-lane), so it needs no toolchain there. Before nextest, `root-lane-check.sh` fails the
       # lane unless its EXPECT_* privilege state holds. The archive reuses the build of `Build tests`.
-      #
-      # The container image matches the runner's glibc (`matrix.root_image`): the runner built the test binaries.
       #
       # What each lane adds:
       #   root:           the base case.
@@ -830,7 +761,6 @@ jobs:
           HELPER: ${{ steps.mac_helper.outputs.helper }}
         run: bash .github/scripts/setuid-lane-check.sh "$HELPER"
 
-      # The tests were built by `Build tests (tokio feature)`.
       - name: Root lane (macOS) - run the setuid tests
         if: ${{ !cancelled() && steps.mac_helper_check.outcome == 'success' }}
         timeout-minutes: 8
@@ -872,8 +802,7 @@ jobs:
             echo "tmpdir=$COSCA_ROOT_TMPDIR"
           } >> "$GITHUB_OUTPUT"
 
-      # `sudo -E` keeps `TMPDIR`. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned. The step after it
-      # hands `target` back to the runner user, so later lanes can write to it.
+      # `sudo -E` keeps `TMPDIR`.
       - name: Root lane (macOS, sudo -E)
         id: mac_root_run
         if: ${{ !cancelled() && steps.mac_root_dirs.outcome == 'success' }}
@@ -889,21 +818,30 @@ jobs:
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
           exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
+            # forward.py made this shell a session leader, so its pid is the id of the group that holds the run.
+            echo $$ > "$3"
             test "$(id -u)" = 0
             test "$(stat -f %u "$TMPDIR")" = 0
             status=0
             SKULD_LABELS=root "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "$PRIVILEGE_TESTS" || status=1
             exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR" "$RUNNER_TEMP/root-lane-macos.pgid"
 
-      # Root wrote into `target`; hand it back even when the lane was killed, or the elevation archive step fails on it.
-      - name: Root lane (macOS) - hand the target directory back
+      # A timed-out run can leave root processes behind, and they would write root-owned files into `target` after the
+      # chown, which the elevation archive step then fails on. So the run's process group is killed, and confirmed
+      # empty, before `target` is handed back. The group, not a copy of the workspace for root: a copy would leave the
+      # stragglers running into the later lanes.
+      - name: Root lane (macOS) - end the root run's processes, then hand the target directory back
         if: ${{ always() && steps.mac_root_run.outcome != 'skipped' && steps.mac_root_run.outcome != '' }}
+        timeout-minutes: 2
         shell: bash
-        run: sudo chown -R "$(id -u):$(id -g)" "$PWD/target"
+        run: |
+          set -euxo pipefail
+          bash .github/scripts/kill-group.sh "$RUNNER_TEMP/root-lane-macos.pgid"
+          sudo chown -R "$(id -u):$(id -g)" "$PWD/target"
 
       - name: Root lane (macOS) - upload JUnit
-        if: ${{ !cancelled() && steps.mac_helper.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.mac_helper_check.outcome != 'skipped' && steps.mac_helper_check.outcome != '' }}
         uses: ./.github/actions/upload-junit
         with:
           name: resolve_root_lane_macos-darwin-arm64
@@ -925,7 +863,7 @@ jobs:
       # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
       # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
       # `unattended-gui-elevation.py --revert` (`if: always()`) and remove the apt-installed polkit and doas
-      # packages. That PR adds the mode; whichever of the two PRs merges second wires it in here.
+      # packages.
       - name: Elevation (Linux) - allow unattended GUI elevation
         id: lin_elev_policy
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
@@ -1006,15 +944,13 @@ jobs:
       # (`coscaelev`), which that rule does not reach. `elevation-lane-sudoers.sh` gives it `sudo -n` for `id` and
       # `cosca_testbin` only, and `whoami` asks the password the Stdin and Askpass tests deliver.
       # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
-      # `unattended-gui-elevation.py --revert` (`if: always()`), which restores the authorizationdb right. That PR
-      # adds the mode; whichever of the two PRs merges second wires it in here.
+      # `unattended-gui-elevation.py --revert` (`if: always()`), which restores the authorizationdb right.
       - name: Elevation (macOS) - allow unattended GUI elevation
         id: mac_elev_policy
         if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
         run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
 
-      # The user runs a nextest archive extracted outside the checkout, which it can read. The tests were built by
-      # `Build tests (tokio feature)`.
+      # The user runs a nextest archive extracted outside the checkout, which it can read.
       - name: Elevation (macOS) - archive the tests
         id: mac_elev_archive
         if: ${{ !cancelled() && steps.mac_elev_policy.outcome == 'success' }}
@@ -1092,15 +1028,13 @@ jobs:
       #
       # See elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
       # TODO(azhukova/revert-system-changes): after the lane, run `unattended-gui-elevation.py --revert`
-      # (`if: always()`) and make sure the administrator account is removed even when the script is killed. That PR
-      # adds both; whichever of the two PRs merges second wires them in here.
+      # (`if: always()`) and make sure the administrator account is removed even when the script is killed.
       - name: Elevation (Windows) - allow unattended GUI elevation
         id: win_elev_policy
         if: ${{ !cancelled() && matrix.os == 'windows' }}
         shell: pwsh
         run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
 
-      # The tests were built by `Build tests (tokio feature)`.
       - name: Elevation (Windows) - archive the tests
         id: win_elev_archive
         if: ${{ !cancelled() && steps.win_elev_policy.outcome == 'success' }}

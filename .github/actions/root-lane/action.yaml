@@ -46,6 +46,8 @@ runs:
     # of it, so the container never writes into the job's `target`. root-lane.sh copies the JUnit
     # file out to the lane's `junit` directory. Both are mode 0777 because the `uid 1000` lane is
     # not the runner's user.
+    #
+    # `target/nextest` is the mountpoint; docker cannot create it inside the read-only checkout.
     - name: Make the lane's nextest store and JUnit directory writable inside the container
       shell: bash
       env:
@@ -53,7 +55,7 @@ runs:
       run: |
         set -euxo pipefail
         lane="$RUNNER_TEMP/root-lane/${SLUG:?}"
-        mkdir -p "$lane/nextest" "$lane/junit"
+        mkdir -p "$GITHUB_WORKSPACE/target/nextest" "$lane/nextest" "$lane/junit"
         chmod 0777 "$lane/nextest" "$lane/junit"
 
     # The container is the sandbox, so consent is given here.

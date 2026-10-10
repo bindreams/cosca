@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the privilege tests inside a root-lane container (see `.github/actions/root-lane` and the root lanes of the test job in ci.yaml).
+# Run the privilege tests inside a root-lane container (see `.github/actions/root-lane`).
 # Environment: PREFIX (words that change identity, may be empty), PRIVILEGE_TESTS (nextest
 # filterset), FOREIGN_TMPDIR, and the EXPECT_* variables root-lane-check.sh reads.
 set -euxo pipefail

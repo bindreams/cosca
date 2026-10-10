@@ -12,7 +12,7 @@ inputs:
   path:
     description: >
       What to upload (a multi-line list is fine): files or directories. Defaults to the whole
-      `$RUNNER_TEMP/junit` directory. A lane that runs after another lane's files were uploaded names its own.
+      `$RUNNER_TEMP/junit` directory.
     required: false
     default: ""
 runs:
