@@ -797,6 +797,10 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity, which
         // no-ops if `ProcessId::of` transiently fails to resolve — this handle-based kill
         // covers that, so its failure is contract-relevant.
+        // Read again: the sweep above can be long, and a root orphaned meanwhile is no longer ours.
+        #[cfg(unix)]
+        let backstop = self.refuse_unpinned("kill_tree").and_then(|()| self.kill());
+        #[cfg(not(unix))]
         let backstop = self.kill();
         // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
