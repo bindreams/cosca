@@ -110,16 +110,18 @@ try {
                 $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
                 if ($owner -and $owner.User -eq $account) { Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue }
             }
-            try {
-                Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
-            } catch {
-                Write-Host "profile removal failed: $_"
-                Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Format-List LocalPath, Loaded, RefCount | Out-String | Write-Host
-                Get-CimInstance Win32_Process | ForEach-Object {
-                    $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
-                    "$($_.ProcessId) $($_.Name) owner=$($o.User)"
-                } | Write-Host
-                throw
+            # The profile service unloads the registry hive some time after the last handle to the logon has gone, and
+            # the removal fails with a sharing violation until it has: retry that one error, nothing else.
+            $reported = $false
+            while ($true) {
+                try {
+                    Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+                    break
+                } catch {
+                    if ($_.Exception.Message -notmatch 'being used by another process') { throw }
+                    if (-not $reported) { Write-Host "waiting for the profile of $account to unload"; $reported = $true }
+                    Start-Sleep -Seconds 1
+                }
             }
             if (Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'") { throw "the profile of $account is still there after its removal" }
         }
