@@ -158,7 +158,7 @@ jobs:
             runner: ubuntu-26.04
             # ubuntu:26.04
             root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
-            timeout: 30
+            timeout: 60
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -937,6 +937,137 @@ jobs:
         with:
           name: elevation-linux-amd64
           path: ${{ runner.temp }}/junit/elevation.xml
+
+      # Shim on old kernels (Linux amd64) =====
+      #
+      # The shim uses only calls that exist by Linux 5.4 (`pidfd_open`, `clone3`/`CLONE_PIDFD`, `waitid(P_PIDFD)`,
+      # `SCM_CREDENTIALS`), and its owner check needs neither pidfs (Linux 6.9) nor `SO_PEERPIDFD` (6.5). The hosted
+      # runners' kernels are far newer, so these steps boot 5.6 (the project floor) and 6.1 LTS (below both) under
+      # virtme-ng on the runner's KVM and run the tests of `elevation::shim::` there, as the unprivileged user that
+      # built them (with a setuid-root copy of the test binary for the test that refuses one) and as root for the tests
+      # that need root. The guest (.github/scripts/shim-old-kernel-guest.sh) prints `uname -r` and writes its result
+      # file only on full success; each kernel's check step fails without the exact result, so a guest that failed or
+      # never ran cannot pass the job.
+      - name: "Shim on Linux: install virtme-ng and allow KVM"
+        id: shim_vng
+        if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        shell: bash
+        env:
+          VIRTME_NG_VERSION: "1.30"
+        run: |
+          set -euxo pipefail
+          # The runner image has /dev/kvm, but only for the kvm group.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          ls -l /dev/kvm
+          test -w /dev/kvm
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86 busybox-static libvirt-dev dwarves
+          pipx install "virtme-ng==${VIRTME_NG_VERSION}"
+          # virtme-ng imports pkg_resources, which the runner's Python does not ship.
+          pipx inject --force virtme-ng "setuptools==75.8.0"
+
+      # The guest runs `cargo nextest run --lib` on this checkout, so the library's tests are built here first. The
+      # test that refuses a setuid copy of the shim runs a setuid-root copy of the test binary, which the guest makes;
+      # the binary is built here, as the user who owns the checkout.
+      - name: "Shim on Linux: build the tests and the test binary"
+        id: shim_build
+        if: ${{ !cancelled() && steps.shim_vng.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo nextest run --locked --lib --no-run
+          testbin="$(cargo build --locked --bin cosca_testbin --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)"
+          test -x "$testbin"
+          echo "testbin=$testbin" >> "$GITHUB_OUTPUT"
+
+      # `psi=0`: on 5.6, systemd-udevd's write to a cgroup's `memory.pressure` dereferences NULL in the kernel (the oops
+      # kills udev, so virtio-serial never appears and virtme-ng cannot run the command). The guest sees this checkout
+      # and the toolchain through the host's file system. The kernel is the pre-built mainline one for the tag; the
+      # guest prints `uname -r` first and checks it names the tag. `--rwdir`: where the guest writes its result.
+      - name: "Shim on Linux v5.6: run the tests"
+        id: shim_v56_run
+        if: ${{ !cancelled() && steps.shim_build.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          KERNEL: v5.6
+          COSCA_TESTBIN: ${{ steps.shim_build.outputs.testbin }}
+        run: |
+          set -euxo pipefail
+          dir="$RUNNER_TEMP/old-kernel-$KERNEL"
+          mkdir -p "$dir"
+          rm -f "$dir/result"
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G --rwdir "$dir" \
+            --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL' '$dir/result' '$(id -u)' '$(id -g)' '$COSCA_TESTBIN'" \
+            2>&1 | tee "$dir/log"
+
+      # vng's own exit status is not trusted to carry the guest's: the guest's result is.
+      - name: "Shim on Linux v5.6: check the result"
+        id: shim_v56_check
+        if: ${{ !cancelled() && (steps.shim_v56_run.outcome == 'success' || steps.shim_v56_run.outcome == 'failure') }}
+        shell: bash
+        env:
+          KERNEL: v5.6
+        run: |
+          set -euxo pipefail
+          cat "$RUNNER_TEMP/old-kernel-$KERNEL/result"
+          [[ "$(<"$RUNNER_TEMP/old-kernel-$KERNEL/result")" == "ok $KERNEL "* ]]
+
+      - name: "Shim on Linux v5.6: upload the log and result"
+        if: ${{ !cancelled() && steps.shim_v56_run.outcome != 'skipped' && steps.shim_v56_run.outcome != '' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: shim-old-kernel-v56-linux-amd64
+          path: |
+            ${{ runner.temp }}/old-kernel-v5.6/log
+            ${{ runner.temp }}/old-kernel-v5.6/result
+
+      # `psi=0`: on 5.6, systemd-udevd's write to a cgroup's `memory.pressure` dereferences NULL in the kernel (the oops
+      # kills udev, so virtio-serial never appears and virtme-ng cannot run the command). The guest sees this checkout
+      # and the toolchain through the host's file system. The kernel is the pre-built mainline one for the tag; the
+      # guest prints `uname -r` first and checks it names the tag. `--rwdir`: where the guest writes its result.
+      - name: "Shim on Linux v6.1: run the tests"
+        id: shim_v61_run
+        if: ${{ !cancelled() && steps.shim_build.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          KERNEL: v6.1
+          COSCA_TESTBIN: ${{ steps.shim_build.outputs.testbin }}
+        run: |
+          set -euxo pipefail
+          dir="$RUNNER_TEMP/old-kernel-$KERNEL"
+          mkdir -p "$dir"
+          rm -f "$dir/result"
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G --rwdir "$dir" \
+            --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL' '$dir/result' '$(id -u)' '$(id -g)' '$COSCA_TESTBIN'" \
+            2>&1 | tee "$dir/log"
+
+      # vng's own exit status is not trusted to carry the guest's: the guest's result is.
+      - name: "Shim on Linux v6.1: check the result"
+        id: shim_v61_check
+        if: ${{ !cancelled() && (steps.shim_v61_run.outcome == 'success' || steps.shim_v61_run.outcome == 'failure') }}
+        shell: bash
+        env:
+          KERNEL: v6.1
+        run: |
+          set -euxo pipefail
+          cat "$RUNNER_TEMP/old-kernel-$KERNEL/result"
+          [[ "$(<"$RUNNER_TEMP/old-kernel-$KERNEL/result")" == "ok $KERNEL "* ]]
+
+      - name: "Shim on Linux v6.1: upload the log and result"
+        if: ${{ !cancelled() && steps.shim_v61_run.outcome != 'skipped' && steps.shim_v61_run.outcome != '' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: shim-old-kernel-v61-linux-amd64
+          path: |
+            ${{ runner.temp }}/old-kernel-v6.1/log
+            ${{ runner.temp }}/old-kernel-v6.1/result
 
       # Elevation (macOS) =====
       #

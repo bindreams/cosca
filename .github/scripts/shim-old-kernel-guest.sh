@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs inside the virtme-ng guest of shim-old-kernels.yaml. Checks which kernel booted, then runs the
+# Runs inside the virtme-ng guest of the "Shim on Linux" steps in ci.yaml. Checks which kernel booted, then runs the
 # elevation shim's tests on it: first as the unprivileged user that built them, with a setuid-root copy
 # of the test binary for the test that refuses one, then as root for the tests that need root. It
 # writes <result file> only on full success ("ok <tag> <uname -r>"); the host step reads that file,
