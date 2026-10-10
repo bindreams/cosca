@@ -1022,6 +1022,10 @@ mod root_state_tests;
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/unpinned_public_tests.rs"]
+mod unpinned_public_tests;
+
 #[cfg(all(test, windows))]
 #[path = "child/windows_signal_tests.rs"]
 mod windows_signal_tests;
