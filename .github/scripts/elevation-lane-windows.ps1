@@ -12,6 +12,10 @@
 # The account cannot read the runner's profile, so it runs a copy of cargo-nextest and an extraction of the
 # archive under C:\cosca-elevation-lane, and it writes its JUnit file into the workspace's `target\nextest\<profile>`.
 # The script exits with nextest's exit code. It creates an account, so it refuses outside a hosted runner.
+#
+# Everything it creates it removes, on failure too: the account (which must not exist beforehand, and is recorded in
+# `$root\account` before it is created, so only that account is deleted), its profile, the ACE it was given on the
+# JUnit directory, and `$root`.
 $ErrorActionPreference = 'Stop'
 
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
@@ -34,6 +38,8 @@ $work = Join-Path $root 'work'
 $bin = Join-Path $root 'bin'
 $extract = Join-Path $work 'extract'
 $out = Join-Path $work 'out.txt'
+$tmp = Join-Path $work 'tmp'
+$accountRecord = Join-Path $root 'account'
 $nextestProfile = $env:NEXTEST_PROFILE
 if (-not $nextestProfile) { throw 'NEXTEST_PROFILE must name the profile whose JUnit file the caller publishes' }
 $junitDir = Join-Path $workspace "target\nextest\$nextestProfile"
@@ -48,23 +54,45 @@ function Set-Acl-Native {
     if ($LASTEXITCODE -ne 0) { throw "icacls $args failed with exit code $LASTEXITCODE" }
 }
 
-New-Item -ItemType Directory -Force $marker, $work, $bin, $extract, $junitDir | Out-Null
-Copy-Item -LiteralPath $archive -Destination (Join-Path $bin 'elevation.tar.zst')
-Copy-Item -LiteralPath $nextestExe -Destination (Join-Path $bin 'cargo-nextest.exe')
-# The marker directory is what the elevated child writes to and the unelevated test reads: only
-# administrators may write it, everyone may read it.
-Set-Acl-Native $marker /inheritance:r
-Set-Acl-Native $marker /grant '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
-Set-Acl-Native $bin /grant '*S-1-5-32-545:(OI)(CI)RX'
+# Nothing is adopted: a directory or an account that exists already is not ours to fill, or to delete.
+if (Test-Path -LiteralPath $root) { throw "$root already exists; refusing to adopt it" }
+if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account already exists; refusing to adopt it" }
 
-New-LocalUser $account -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires | Out-Null
+$rootCreated = $false
+$failures = @()
+# Each cleanup step runs whatever the others did, and the failures are reported together at the end.
+function Invoke-CleanupStep {
+    param([string]$What, [scriptblock]$Body)
+    try { & $Body } catch {
+        $script:failures += "${What}: $_"
+        Write-Host "::error::cleanup step failed: ${What}: $_"
+    }
+}
+
 try {
+    New-Item -ItemType Directory $root | Out-Null
+    $rootCreated = $true
+    New-Item -ItemType Directory -Force $marker, $work, $tmp, $bin, $extract, $junitDir | Out-Null
+    Copy-Item -LiteralPath $archive -Destination (Join-Path $bin 'elevation.tar.zst')
+    Copy-Item -LiteralPath $nextestExe -Destination (Join-Path $bin 'cargo-nextest.exe')
+    # The marker directory is what the elevated child writes to and the unelevated test reads: only
+    # administrators may write it, everyone may read it.
+    Set-Acl-Native $marker /inheritance:r
+    Set-Acl-Native $marker /grant '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    Set-Acl-Native $bin /grant '*S-1-5-32-545:(OI)(CI)RX'
+
+    # The record first, then the account: a record without an account is fine for the cleanup, an account without one
+    # would be left behind.
+    Set-Content -LiteralPath $accountRecord -Value $account -Encoding ascii
+    New-LocalUser $account -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires | Out-Null
     Add-LocalGroupMember -Group 'Administrators' -Member $account
     Set-Acl-Native $work /grant "${account}:(OI)(CI)M"
     Set-Acl-Native $junitDir /grant "${account}:(OI)(CI)M"
 
     $script = Join-Path $work 'run.cmd'
     @(
+        "set TEMP=$tmp",
+        "set TMP=$tmp",
         'set COSCA_TEST_ELEVATION=1',
         'set COSCA_TEST_ELEVATION_CONSENT=1',
         'set COSCA_TEST_ELEVATION_EXPECT_KILL=ok',
@@ -74,17 +102,63 @@ try {
         "`"$(Join-Path $bin 'cargo-nextest.exe')`" nextest run --archive-file `"$(Join-Path $bin 'elevation.tar.zst')`" --extract-to `"$extract`" --workspace-remap `"$workspace`" --no-tests=fail -E `"binary(=elevation)`" > `"$out`" 2>&1"
     ) | Set-Content -Path $script -Encoding ascii
 
-    $credential = New-Object System.Management.Automation.PSCredential(
-        "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $password -AsPlainText -Force))
-    $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
-        -LoadUserProfile -WorkingDirectory $work -Wait -PassThru
-    $exitCode = $process.ExitCode
+    # The logon happens in a pwsh of its own, which is gone when the run is over: nothing of this script then holds
+    # the logon session, and the account's profile hive can unload.
+    $launcher = {
+        param($account, $script, $work)
+        $credential = New-Object System.Management.Automation.PSCredential(
+            "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $env:COSCA_LANE_PASSWORD -AsPlainText -Force))
+        $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
+            -WorkingDirectory $work -Wait -PassThru
+        exit $process.ExitCode
+    }
+    $env:COSCA_LANE_PASSWORD = $password
+    try {
+        & pwsh -NoProfile -NonInteractive -Command $launcher -args $account, $script, $work
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:COSCA_LANE_PASSWORD
+    }
 } finally {
-    # Stop on a failed removal: the step fails, and no exit path leaves the account behind unnoticed.
-    Remove-LocalUser $account -ErrorAction Stop
-    if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }
+    Invoke-CleanupStep 'print the run output' {
+        if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out }
+    }
+    $recorded = (Test-Path -LiteralPath $accountRecord) -and ((Get-Content -LiteralPath $accountRecord -Raw).Trim() -eq $account)
+    $existing = if ($recorded) { Get-LocalUser -Name $account -ErrorAction SilentlyContinue }
+    if ($existing) {
+        $sid = $existing.SID.Value
+        # Nothing of the account may be running when it is deleted: a process holds files, and keeps the profile and
+        # `$root` from going. Matched by SID as well as by name, while the account still resolves.
+        Invoke-CleanupStep 'stop the account processes' {
+            foreach ($candidate in Get-CimInstance Win32_Process) {
+                $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
+                $ownerSid = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+                if (($owner -and $owner.User -eq $account) -or ($ownerSid -and $ownerSid.Sid -eq $sid)) {
+                    Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        # The ACE on the published JUnit directory names the account; remove it while the name still resolves. A failure
+        # here does not stop the account's deletion.
+        Invoke-CleanupStep 'remove the account from the JUnit directory ACL' { Set-Acl-Native $junitDir /remove "${account}" }
+        Invoke-CleanupStep 'delete the account' { Remove-LocalUser $account -ErrorAction Stop }
+        # Best effort: the registry hive of the logon stays loaded for minutes after everything of the run has
+        # exited (measured on both hosted runners; no process of the account is left, and waiting does not
+        # end it within the step's bound), and a loaded profile cannot be removed. The runner is an ephemeral VM.
+        try {
+            Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+        } catch {
+            Write-Host "::warning::the profile of $account is still loaded and was left behind: $_"
+        }
+        Invoke-CleanupStep 'confirm the account is gone' {
+            if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }
+        }
+    }
+    if ($rootCreated) {
+        Invoke-CleanupStep "remove $root" { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop }
+    }
+    if ($failures.Count -gt 0) { throw "cleanup failed: $($failures -join '; ')" }
 }
 
-Get-Content -LiteralPath $out
 Write-Host "nextest exit code: $exitCode"
 exit $exitCode

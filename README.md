@@ -55,7 +55,11 @@ table of `~/.cargo/config.toml`.
 `ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
 `osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
 `COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the `elevation_*` jobs in `.github/workflows/ci.yaml` do (passwords,
-polkit, `doas`).
+polkit, `doas`). Those setups change system policy (the polkit rule, the macOS authorization right, the Windows
+`ConsentPromptBehaviorAdmin` value), so undo them when you are done: `unattended-gui-elevation.py` saves the prior
+state and restores it with `--revert` (same guard and root check as enabling; on Linux pass the same `--user`), and
+`elevation-lane-sudoers.sh --cleanup` and `elevation-lane-linux.sh --cleanup` undo the rest. The CI jobs run these
+on failure as well as on success.
 
 ### Tests that need root
 

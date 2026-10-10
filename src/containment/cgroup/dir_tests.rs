@@ -84,6 +84,12 @@ fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Grou
     let name = format!("cosca-{}-sweep", std::process::id());
     let sub = parent.join(&name).join("sub");
     let sub_in_thread = sub.clone();
+    // The leaf and its child cgroup are removed on every exit, a failing one too: a panic in the thread below
+    // would otherwise skip the removal at the end.
+    let _cleanup = RemoveCgroups {
+        child: sub.clone(),
+        leaf: parent.join(&name),
+    };
 
     let swept = std::thread::spawn(move || {
         use std::ffi::CString;
@@ -141,14 +147,45 @@ fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Grou
         "the bind must not outlive its namespace; refusing to clean up"
     );
     let survived = victim.path().join("keep/me").is_dir();
-    std::fs::remove_dir(&sub).expect("remove the child cgroup");
-    std::fs::remove_dir(sub.parent().expect("the leaf")).expect("remove the leaf");
 
     swept.expect("the sweep");
     assert!(
         survived,
         "the sweep crossed the mount and deleted the victim's directories"
     );
+}
+
+/// Removes a child cgroup and its leaf by `rmdir` alone, unless the child is still a mount point in this namespace:
+/// nothing is removed through a mount. A cgroup that is already gone is fine.
+struct RemoveCgroups {
+    child: std::path::PathBuf,
+    leaf: std::path::PathBuf,
+}
+
+impl Drop for RemoveCgroups {
+    fn drop(&mut self) {
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        if mounts.lines().any(|l| l.contains(&*self.child.to_string_lossy())) {
+            report(format!("{} is mounted; refusing to clean up", self.child.display()));
+            return;
+        }
+        for path in [&self.child, &self.leaf] {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => report(format!("could not remove {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+/// A cleanup failure fails the test, unless it is already failing: a second panic while unwinding aborts the binary.
+fn report(message: String) {
+    if std::thread::panicking() {
+        eprintln!("{message}");
+    } else {
+        panic!("{message}");
+    }
 }
 
 /// `rmdir` removes the leaf it holds.
