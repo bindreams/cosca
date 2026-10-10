@@ -207,10 +207,8 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # Per-job failure bound (minutes), about 1.5x the slowest wall time measured over the runs of #626, lanes
-    # included: linux/amd64 19.6 (bound 30), linux/arm64 18.9 (29), darwin/arm64 26.9 (41), darwin/amd64 34.9
-    # (53), windows/amd64 32.5 (51), windows/arm64 33.8 (51). The clippy powerset release step dominates the
-    # Windows jobs.
+    # Failure bound per job (minutes): about 1.5x the slowest measured wall time, lanes included. The clippy powerset
+    # release step dominates the Windows jobs.
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
