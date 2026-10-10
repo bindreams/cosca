@@ -34,6 +34,10 @@
 //! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
 //! described under [`Command::kill_on_drop`].
 //!
+//! Linux 5.6 on its own oopses under systemd 254 or newer: `systemd-udevd` writes a cgroup's
+//! `memory.pressure`, and that write dereferences NULL in the 5.6 kernel. cosca does not touch
+//! pressure-stall information; the CI guest boots 5.6 with `psi=0` for that reason.
+//!
 //! # A child under a debugger
 //!
 //! A debugger that traces a [`Child`] owns its signal delivery: a graceful signal, such as the
