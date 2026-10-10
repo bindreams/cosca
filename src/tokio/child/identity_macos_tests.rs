@@ -377,13 +377,33 @@ async fn macos_tokio_treewalk_attach_reads_nothing_by_pid() {
     );
 }
 
-/// Async twin of `macos_sync_spawn_of_an_unreported_child_leaves_it_running_and_says_so`.
+/// Async twin of `macos_sync_spawn_of_an_unreported_child_kills_and_reaps_it`.
 #[skuld::test]
-async fn macos_tokio_spawn_of_an_unreported_child_leaves_it_running_and_says_so() {
+async fn macos_tokio_spawn_of_an_unreported_child_kills_and_reaps_it() {
+    use crate::child::spawn::identity_macos_tests::assert_reaped_and_warned_once;
+    crate::log_capture::install();
+    let (mut cmd, writer) = tokio_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = crate::child::spawn::unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "an unreported child is killed and reaped");
+    assert_reaped_and_warned_once(id.pid(), mark);
+    drop(writer);
+}
+
+/// Async twin of `macos_sync_spawn_of_an_unreported_front_leaves_it_running_and_says_so`.
+#[skuld::test]
+async fn macos_tokio_spawn_of_an_unreported_front_leaves_it_running_and_says_so() {
     use crate::child::spawn::identity_macos_tests::{end_unsignalled_and_reap, has_not_exited};
     use crate::elevation::{front::front, ElevatedVia};
     crate::log_capture::install();
-    for front in [None, front(Some(&ElevatedVia::MacosOsascript))] {
+    for front in [front(Some(&ElevatedVia::MacosOsascript))] {
         let (mut cmd, writer) = tokio_blocker();
         cmd.set_elevation_front(front);
         let mark = crate::log_capture::mark();
