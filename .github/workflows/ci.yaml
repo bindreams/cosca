@@ -157,7 +157,7 @@ jobs:
             # `Type=notify-reload` there. The root lanes' containers run `ubuntu:26.04`, the runner's own glibc.
             runner: ubuntu-26.04
             root_image: ubuntu:26.04
-            timeout: 26
+            timeout: 30
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -172,7 +172,7 @@ jobs:
           - os: darwin
             arch: arm64
             runner: macos-latest
-            timeout: 35
+            timeout: 41
             target: aarch64-apple-darwin
             other: x86_64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -189,7 +189,7 @@ jobs:
           - os: windows
             arch: amd64
             runner: windows-latest
-            timeout: 50
+            timeout: 51
             target: x86_64-pc-windows-msvc
             other: aarch64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
@@ -199,16 +199,15 @@ jobs:
           - os: windows
             arch: arm64
             runner: windows-11-arm
-            timeout: 45
+            timeout: 51
             target: aarch64-pc-windows-msvc
             other: x86_64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # Per-job failure bound, 1.5x the slowest measured wall time (minutes), lanes included; the PR that folded
-    # the lanes in (#626) has the numbers. Measured max: linux/amd64 17 (13 + the root and elevation lanes
-    # that ran as their own jobs before), linux/arm64 19, darwin/arm64 23, darwin/amd64 35, windows/amd64 34,
-    # windows/arm64 29. The clippy powerset release step dominates the Windows jobs.
+    # Per-job failure bound, 1.5x the slowest wall time measured over two runs of #626, lanes included
+    # (minutes): linux/amd64 19.6, linux/arm64 18.9, darwin/arm64 26.9, darwin/amd64 34.9, windows/amd64 34,
+    # windows/arm64 33.8. The clippy powerset release step dominates the Windows jobs.
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
