@@ -1907,7 +1907,7 @@ pub(crate) mod fault {
     thread_local! {
         #[cfg(not(target_os = "macos"))]
         static FRONTS_SEEN_RUNNING: Cell<bool> = const { Cell::new(false) };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         static FRONTS_EXIT_FIRST: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1958,7 +1958,7 @@ pub(crate) mod fault {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn fronts_exit_before_teardown() -> bool {
         FRONTS_EXIT_FIRST.with(Cell::get)
     }
