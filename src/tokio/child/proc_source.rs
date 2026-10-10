@@ -1058,6 +1058,20 @@ impl ProcSource {
         fate
     }
 
+    /// macOS: kills and reaps a child that had not reported its unique id when its spawn returned.
+    /// It may have exec'd, and this process is its parent with it unreaped, so the number is pinned
+    /// (see `kill_and_reap_unreported`). Tokio's `Child` is then forgotten, never dropped, because its
+    /// drop would `waitpid` a number already collected; the event's one warn says what that leaks.
+    /// Consumes the backend. **Invariant:** no `wait()` future for this child is in flight.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reap_unreported(mut self, pid: u32) -> ChildFate {
+        crate::bounded::assert_may_block("reap_unreported");
+        let done = crate::child::spawn::kill_and_reap_unreported(pid);
+        let reaped = matches!(done.fate, ChildFate::Reaped | ChildFate::Gone);
+        let leak = self.forget_quietly(reaped).map(|(_, leak)| leak);
+        done.warn(pid, leak)
+    }
+
     /// Collects the exit status of a child [`wait_and_reap`](ProcSource::wait_and_reap) saw exit and
     /// showed ours, so that `Reaped` is said of a status that was collected: the wait only
     /// observes the exit, and tokio would otherwise collect it when the backend is released.

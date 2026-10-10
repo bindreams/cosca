@@ -392,7 +392,11 @@ async fn macos_tokio_spawn_of_an_unreported_child_kills_and_reaps_it() {
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
     };
-    assert_eq!(fate, crate::error::ChildFate::Reaped, "an unreported child is killed and reaped");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "an unreported child is killed and reaped"
+    );
     assert_reaped_and_warned_once(id.pid(), mark);
     drop(writer);
 }
@@ -403,7 +407,8 @@ async fn macos_tokio_spawn_of_an_unreported_front_leaves_it_running_and_says_so(
     use crate::child::spawn::identity_macos_tests::{end_unsignalled_and_reap, has_not_exited};
     use crate::elevation::{front::front, ElevatedVia};
     crate::log_capture::install();
-    for front in [front(Some(&ElevatedVia::MacosOsascript))] {
+    {
+        let front = front(Some(&ElevatedVia::MacosOsascript));
         let (mut cmd, writer) = tokio_blocker();
         cmd.set_elevation_front(front);
         let mark = crate::log_capture::mark();
