@@ -84,6 +84,39 @@ pub(crate) enum RootState {
 )]
 pub(crate) const UNPINNED_WHY: &str = "launchd holds its zombie (its tracer died), so it is not ours to reap";
 
+/// The refusal of a signal to a root that is [`RootState::Unpinned`]. `Unassessable` with no
+/// `source`: nothing was asked of the OS, and the crate refuses to act on a pid it does not pin.
+/// `op` names the call that sent nothing.
+#[cfg(target_os = "macos")]
+pub(crate) fn unpinned_refusal(pid: u32, op: &str) -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: format!("pid {pid}: the child cannot be shown to be ours ({UNPINNED_WHY}); {op} sent nothing"),
+        source: None,
+    }
+}
+
+/// Refuse `op` if the root's own handle says this process does not pin it. Called first by every
+/// public path that signals the root or its tree, so none sends a signal by number to a pid launchd
+/// may reap and reuse. macOS only: no other platform reports an unpinned root, and `state` is not
+/// read there.
+///
+/// The check can pass, the tracer can then die, and the signal can still land on a launchd-held
+/// zombie. Only the audit-token signal of #55 closes that window.
+#[cfg(unix)]
+pub(crate) fn refuse_unpinned(
+    pid: u32,
+    op: &str,
+    state: impl FnOnce() -> RootState,
+) -> Result<(), crate::error::Error> {
+    #[cfg(target_os = "macos")]
+    if matches!(state(), RootState::Unpinned) {
+        return Err(unpinned_refusal(pid, op));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (pid, op, state);
+    Ok(())
+}
+
 #[cfg(unix)]
 impl RootState {
     /// What a peek through the root's own handle shows.
