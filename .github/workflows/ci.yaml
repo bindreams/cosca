@@ -82,6 +82,7 @@ jobs:
         run: bash .github/scripts/release-script-tests.sh
 
       - name: Test the directory-mode script
+        shell: bash
         run: bash .github/scripts/dir-modes-tests.sh
 
       - name: Test sccache fallback script
@@ -569,6 +570,7 @@ jobs:
       # nextest run an archive there: its default extraction directory is root-only. `sudo --preserve-env` keeps
       # COSCA_TEST_SETUID_HELPER and the group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
       - name: Archive the setuid-root process-group teardown test (Linux)
+        id: lin_setuid_archive
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
@@ -598,12 +600,13 @@ jobs:
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
       - name: Remove the setuid-root helper (Linux)
-        if: ${{ always() && matrix.os == 'linux' }}
-        run: |
-          if [ -n "${COSCA_TEST_SETUID_HELPER:-}" ]; then sudo rm -f -- "$COSCA_TEST_SETUID_HELPER"; fi
+        if: ${{ always() && steps.lin_helper.outcome != 'skipped' && steps.lin_helper.outcome != '' }}
+        env:
+          HELPER: ${{ steps.lin_helper.outputs.helper }}
+        run: if [ -n "${HELPER:-}" ]; then sudo rm -f -- "$HELPER"; fi
 
       - name: Restore the directory modes (Linux)
-        if: ${{ always() && matrix.os == 'linux' }}
+        if: ${{ always() && steps.lin_setuid_archive.outcome != 'skipped' && steps.lin_setuid_archive.outcome != '' }}
         run: bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes"
 
 
@@ -796,6 +799,13 @@ jobs:
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
 
+      - name: Root lane (macOS) - remove the setuid-root helper
+        if: ${{ always() && steps.mac_helper.outcome != 'skipped' && steps.mac_helper.outcome != '' }}
+        shell: bash
+        env:
+          HELPER: ${{ steps.mac_helper.outputs.helper }}
+        run: if [ -n "${HELPER:-}" ]; then sudo rm -f -- "$HELPER"; fi
+
       - name: Root lane (macOS) - archive the privilege tests
         id: mac_root_archive
         if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
@@ -864,6 +874,27 @@ jobs:
           bash .github/scripts/kill-group.sh "$RUNNER_TEMP/root-lane-macos.pgid"
           sudo chown -R "$(id -u):$(id -g)" "$PWD/target"
 
+      - name: Root lane (macOS) - remove the root-owned scratch and extraction directories
+        if: ${{ always() && steps.mac_root_dirs.outcome != 'skipped' && steps.mac_root_dirs.outcome != '' }}
+        shell: bash
+        env:
+          SCRATCH: ${{ steps.mac_root_dirs.outputs.tmpdir }}
+          EXTRACT: ${{ steps.mac_root_dirs.outputs.extract_dir }}
+        run: |
+          set -euo pipefail
+          for dir in "${SCRATCH:-}" "${EXTRACT:-}"; do
+            [ -n "$dir" ] || continue
+            case "$dir" in
+              /tmp/cosca-root-scratch.* | /tmp/cosca-root-extract.*) ;;
+              *) echo "refusing to remove $dir" >&2; exit 1 ;;
+            esac
+            # Never remove through a mount: macOS rm has no --one-file-system. `/tmp` is a symlink to `/private/tmp`,
+            # and `mount` prints the real path; the extraction directory is root-only, so resolve it as root.
+            real="$(sudo sh -c 'cd "$1" && pwd -P' sh "$dir")"
+            if mount | grep -F -e " on $real (" -e " on $real/"; then echo "$real holds a mount; not removing it" >&2; exit 1; fi
+            sudo rm -rf -- "${dir:?}"
+          done
+
       - name: Root lane (macOS) - upload JUnit
         if: ${{ !cancelled() && steps.mac_helper_check.outcome != 'skipped' && steps.mac_helper_check.outcome != '' }}
         uses: ./.github/actions/upload-junit
@@ -885,9 +916,8 @@ jobs:
       # binaries ignore `SKULD_LABELS` and would run whole.
       #
       # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
-      # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
-      # `unattended-gui-elevation.py --revert` (`if: always()`) and remove the apt-installed polkit and doas
-      # packages.
+      # Reverted after the lane: `unattended-gui-elevation.py --revert`, then `elevation-lane-linux.sh --cleanup`, which
+      # purges what apt installed here and restores `/etc/doas.conf`.
       - name: Elevation (Linux) - allow unattended GUI elevation
         id: lin_elev_policy
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
@@ -895,6 +925,7 @@ jobs:
         run: |
           set -euxo pipefail
           python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --check-only
+          bash .github/scripts/elevation-lane-linux.sh --this-machine-is-disposable --record
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y polkitd pkexec opendoas
           sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER"
@@ -955,6 +986,16 @@ jobs:
           COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
         run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
 
+      - name: Elevation (Linux) - revert unattended GUI elevation
+        if: ${{ always() && steps.lin_elev_policy.outcome != 'skipped' && steps.lin_elev_policy.outcome != '' }}
+        shell: bash
+        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER" --revert
+
+      - name: Elevation (Linux) - remove doas and the polkit packages
+        if: ${{ always() && steps.lin_elev_policy.outcome != 'skipped' && steps.lin_elev_policy.outcome != '' }}
+        shell: bash
+        run: bash .github/scripts/elevation-lane-linux.sh --this-machine-is-disposable --cleanup
+
       - name: Elevation (Linux) - upload JUnit
         if: ${{ !cancelled() && steps.lin_elev_run.outcome != 'skipped' && steps.lin_elev_run.outcome != '' }}
         uses: ./.github/actions/upload-junit
@@ -967,8 +1008,7 @@ jobs:
       # The image grants `%admin NOPASSWD:ALL` to the runner user, so the tests run as a throwaway non-admin account
       # (`coscaelev`), which that rule does not reach. `elevation-lane-sudoers.sh` gives it `sudo -n` for `id` and
       # `cosca_testbin` only, and `whoami` asks the password the Stdin and Askpass tests deliver.
-      # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
-      # `unattended-gui-elevation.py --revert` (`if: always()`), which restores the authorizationdb right.
+      # Reverted after the lane: `unattended-gui-elevation.py --revert` restores the authorizationdb right.
       - name: Elevation (macOS) - allow unattended GUI elevation
         id: mac_elev_policy
         if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
@@ -983,13 +1023,17 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/elevation.tar.zst"
           mkdir -m 0777 "$RUNNER_TEMP/elevation-extract"
+          # The checkout's own build output, not system policy: nothing to revert.
           chmod -R a+rX "$PWD/target"
           mkdir -p "$PWD/target/nextest/ci-elevation"
           chmod -R a+rwX "$PWD/target/nextest"
+          modes=("$RUNNER_TEMP")
           d="$PWD"
-          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
+          while [ "$d" != / ]; do modes+=("$d"); d=$(dirname "$d"); done
+          bash .github/scripts/dir-modes.sh record "$RUNNER_TEMP/dir-modes" "${modes[@]}"
+          bash .github/scripts/dir-modes.sh record-tree "$RUNNER_TEMP/dir-modes-cargo" "$HOME/.cargo/bin"
+          for d in "${modes[@]}"; do sudo chmod a+x "$d"; done
           sudo chmod -R a+rX "$HOME/.cargo/bin"
-          sudo chmod a+x "$RUNNER_TEMP"
 
       # No xtrace: the password is handled here. It goes to the run step as an output.
       - name: Elevation (macOS) - create the user and its sudo rules
@@ -1041,6 +1085,19 @@ jobs:
         shell: bash
         run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup coscaelev
 
+      - name: Elevation (macOS) - revert unattended GUI elevation
+        if: ${{ always() && steps.mac_elev_policy.outcome != 'skipped' && steps.mac_elev_policy.outcome != '' }}
+        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --revert
+
+      - name: Elevation (macOS) - restore the directory modes
+        if: ${{ always() && steps.mac_elev_archive.outcome != 'skipped' && steps.mac_elev_archive.outcome != '' }}
+        shell: bash
+        run: |
+          status=0
+          bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes" || status=1
+          bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes-cargo" || status=1
+          exit "$status"
+
       - name: Elevation (macOS) - upload JUnit
         if: ${{ !cancelled() && steps.mac_elev_run.outcome != 'skipped' && steps.mac_elev_run.outcome != '' }}
         uses: ./.github/actions/upload-junit
@@ -1051,8 +1108,8 @@ jobs:
       # Elevation (Windows) =====
       #
       # See elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
-      # TODO(azhukova/revert-system-changes): after the lane, run `unattended-gui-elevation.py --revert`
-      # (`if: always()`) and make sure the administrator account is removed even when the script is killed.
+      # Reverted after the lane: `unattended-gui-elevation.py --revert`. The administrator account is removed by the
+      # script's own `finally`.
       - name: Elevation (Windows) - allow unattended GUI elevation
         id: win_elev_policy
         if: ${{ !cancelled() && matrix.os == 'windows' }}
@@ -1075,6 +1132,11 @@ jobs:
         env:
           NEXTEST_PROFILE: ci-elevation
         run: ./.github/scripts/run-nextest.ps1 elevation pwsh -File ./.github/scripts/elevation-lane-windows.ps1 "$env:RUNNER_TEMP\elevation.tar.zst" (Get-Command cargo-nextest).Source
+
+      - name: Elevation (Windows) - revert unattended GUI elevation
+        if: ${{ always() && steps.win_elev_policy.outcome != 'skipped' && steps.win_elev_policy.outcome != '' }}
+        shell: pwsh
+        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --revert
 
       - name: Elevation (Windows) - check the JUnit result
         if: ${{ !cancelled() && steps.win_elev_run.outcome == 'success' }}
