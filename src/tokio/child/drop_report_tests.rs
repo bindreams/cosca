@@ -367,3 +367,45 @@ mod linux {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::super::root_state_tests::warns_since;
+    use crate::tokio::Command;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    /// A failed spawn's teardown whose wait finds the zombie held by launchd (its tracer died)
+    /// forgets tokio's `Child` under one warn, which names launchd and carries the leak.
+    ///
+    /// Mutants: the wait warns on its own besides the forget's; the forget's warn omits the wait's
+    /// cause.
+    #[skuld::test]
+    async fn reap_now_warns_once_for_an_orphaned_zombie_during_its_wait() {
+        crate::log_capture::install();
+        let (stdin, writer) = crate::test_child::held_writer_stdin();
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(stdin).expect("set stdin");
+        cmd.contain_with(crate::ContainMode::TreeWalk);
+        cmd.kill_on_drop(false);
+        let mut child = cmd.spawn().expect("spawn");
+        let pid = child.id().pid();
+        let proc = child.os.proc.take().expect("the backend");
+        let mark = crate::log_capture::mark();
+        let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+        proc.reap_now(pid);
+
+        assert_peeks_exhausted();
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("launchd") && warns[0].contains("leaks"),
+            "the one warn carries the wait's cause and the leak: {warns:?}"
+        );
+        // The kill was delivered; the zombie is the test's to collect.
+        drop(writer);
+        crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
+    }
+}
