@@ -946,26 +946,19 @@ pub(crate) struct ScratchAccount {
 }
 
 impl ScratchAccount {
-    /// Creates the account, first deleting any account of the same name left behind by an earlier
-    /// run on this host: `does_create_process_with_logon_elevate` and
-    /// `which_logon_types_return_a_filtered_token` both create their scratch accounts under the
-    /// same two fixed names (`coscaprobeadm`/`coscaprobestd`; see this crate's module doc), so a
-    /// leftover from a run that crashed before `Drop` ran would otherwise make `/add` fail and
-    /// cascade into every other probe in the `windows-elevation-routes` test group. The pre-create
-    /// `/delete`'s result is printed either way — "account not found" is the expected, silent case
-    /// on a clean host, but a genuine permissions failure here should be visible rather than
-    /// swallowed into `/add`'s own error.
+    /// Creates the account, refusing one that exists already: it is not this test's to adopt or delete (the two
+    /// fixed names, `coscaprobeadm` and `coscaprobestd`, are shared by the probes of this crate, so a leftover from
+    /// a run that crashed before `Drop` ran has to be removed by hand, and says so).
     pub(crate) fn create(user: &str, admin: bool) -> Result<Self, String> {
-        match crate::common::output_locked(std::process::Command::new("net").args(["user", user, "/delete"])) {
+        match crate::common::output_locked(std::process::Command::new("net").args(["user", user])) {
             Ok(out) if out.status.success() => {
-                println!("PROBE scratch-account: deleted a leftover account {user} before creating it fresh");
+                return Err(format!(
+                    "the account {user} exists already; refusing to adopt or delete it (remove it with `net user {user} /delete` \
+                     if an earlier run left it behind)"
+                ));
             }
-            Ok(out) => println!(
-                "PROBE scratch-account: pre-create `net user {user} /delete` -> {} (expected when no \
-                 leftover account exists)",
-                out.status
-            ),
-            Err(e) => println!("PROBE scratch-account: pre-create `net user {user} /delete` could not be run: {e}"),
+            Ok(_) => {}
+            Err(e) => return Err(format!("could not run `net user {user}`: {e}")),
         }
 
         // Satisfies the default complexity policy and stays within 14 characters: `net user` turns

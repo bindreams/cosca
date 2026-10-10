@@ -54,12 +54,14 @@ environment (classic sudo and sudo-rs alike) and so drops the CI variables: pass
 """
 
 import argparse
+import base64
 import json
 import os
 import platform
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -183,6 +185,23 @@ def pkexec_grants(user, env):
     return check, check.returncode == 0 and check.stdout.strip() == "0"
 
 
+def write_atomically(path, data, mode, uid=None, gid=None):
+    """Writes `data` to `path` so a reader never sees a half-written file, and leaves no temporary file behind."""
+    temporary = path + ".new"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(data)
+        os.chmod(temporary, mode)
+        if uid is not None:
+            os.chown(temporary, uid, gid)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def enable_linux(
     user, save, isdir=os.path.isdir, init_comm=comm_of, getpwnam=None, environ=os.environ, rule_path=POLKIT_RULE_PATH
 ):
@@ -201,20 +220,22 @@ def enable_linux(
     if not supported:
         sys.exit(f"polkit is too old for rules.d JavaScript rules (needs 0.106 or later): {version.strip()}")
 
-    # The prior state: the rule file (absent, or its content) and whether USER already had a grant.
+    # The prior state: the rule file (absent, or its bytes, mode and owner) and whether USER already had a grant.
     try:
-        with open(rule_path, encoding="ascii") as rule:
-            prior_rule = rule.read()
+        with open(rule_path, "rb") as rule:
+            prior_bytes = rule.read()
+        meta = os.stat(rule_path)
+        prior_rule = {
+            "bytes": base64.b64encode(prior_bytes).decode("ascii"),
+            "mode": stat.S_IMODE(meta.st_mode),
+            "uid": meta.st_uid,
+            "gid": meta.st_gid,
+        }
     except FileNotFoundError:
         prior_rule = None
     save({"rule": prior_rule, "granted": pkexec_grants(user, env)[1]})
 
-    # Atomic: polkitd never reads a half-written rule.
-    temporary = rule_path + ".new"
-    with open(temporary, "w", encoding="ascii") as rule:
-        rule.write(POLKIT_RULE.format(user=user))
-    os.chmod(temporary, 0o644)
-    os.replace(temporary, rule_path)
+    write_atomically(rule_path, POLKIT_RULE.format(user=user).encode("ascii"), 0o644)
 
     # `systemctl restart` returns once polkit.service is up: it notifies readiness (Type=notify-reload on Ubuntu 26.04).
     subprocess.run(["systemctl", "restart", "polkit"], check=True, env=env)
@@ -236,11 +257,14 @@ def revert_linux(user, prior, environ=os.environ, rule_path=POLKIT_RULE_PATH):
         except FileNotFoundError:
             pass
     else:
-        temporary = rule_path + ".new"
-        with open(temporary, "w", encoding="ascii") as rule:
-            rule.write(prior["rule"])
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, rule_path)
+        prior_rule = prior["rule"]
+        write_atomically(
+            rule_path,
+            base64.b64decode(prior_rule["bytes"]),
+            prior_rule["mode"],
+            prior_rule["uid"],
+            prior_rule["gid"],
+        )
     subprocess.run(["systemctl", "restart", "polkit"], check=True, env=env)
     check, granted = pkexec_grants(user, env)
     if granted != prior["granted"]:

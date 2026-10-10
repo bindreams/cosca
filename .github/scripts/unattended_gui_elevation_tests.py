@@ -519,6 +519,38 @@ class Linux(unittest.TestCase):
         self.assertIn("still differs", str(raised.exception))
         self.assertTrue(os.path.exists(self.state), "the state file must survive a failed revert")
 
+    def test_a_prior_rule_comes_back_byte_for_byte_with_its_mode(self):
+        # Mutant: the rule is read as text, or restored with a fixed mode.
+        original = b"// crlf\r\n\xff\xfe not text\r\n"
+        with open(self.rule, "wb") as handle:
+            handle.write(original)
+        os.chmod(self.rule, 0o600)
+        polkit = FakePolkit(self.rule)
+        self.main(["--user", "runner"], polkit)
+        self.assertEqual(os.stat(self.rule).st_mode & 0o777, 0o644)
+        self.main(["--user", "runner", "--revert"], polkit)
+        with open(self.rule, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertEqual(os.stat(self.rule).st_mode & 0o777, 0o600)
+
+    def test_a_failed_enable_leaves_no_temporary_rule(self):
+        # Mutant: the temporary file is not removed when the replace fails.
+        polkit = FakePolkit(self.rule)
+        with mock.patch.object(script.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                self.main(["--user", "runner"], polkit)
+        self.assertFalse(os.path.exists(self.rule + ".new"))
+
+    def test_a_failed_revert_leaves_no_temporary_rule(self):
+        with open(self.rule, "wb") as handle:
+            handle.write(b"prior")
+        polkit = FakePolkit(self.rule)
+        self.main(["--user", "runner"], polkit)
+        with mock.patch.object(script.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                self.main(["--user", "runner", "--revert"], polkit)
+        self.assertFalse(os.path.exists(self.rule + ".new"))
+
     def test_a_grant_that_existed_before_is_not_a_failure_to_revert(self):
         polkit = FakePolkit(self.rule, granted_without_rule=True)
         self.main(["--user", "runner"], polkit)

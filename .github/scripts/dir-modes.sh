@@ -29,6 +29,8 @@ fi
 shift 2
 for path in "$@"; do
     [[ "$path" == /* ]] || { echo "not an absolute path: $path" >&2; exit 2; }
+    # `chmod` follows a symlink, so a restore would set the mode of whatever it points at.
+    [[ ! -L "$path" ]] || { echo "$path is a symlink; refusing to record it" >&2; exit 2; }
 done
 
 case "$command" in
@@ -43,7 +45,7 @@ record | record-tree)
         if [[ "$command" == record-tree ]]; then
             while IFS= read -r -d '' entry; do
                 printf '%s %s\0' "$(mode_of "$entry")" "$entry" >>"$partial"
-            done < <(find "$path" -print0)
+            done < <(find "$path" -not -type l -print0)
         else
             printf '%s %s\0' "$(mode_of "$path")" "$path" >>"$partial"
         fi
@@ -61,7 +63,13 @@ restore)
         path="${record#* }"
         # A path that is gone has no mode to restore.
         [[ -e "$path" ]] || continue
-        sudo chmod "$mode" "$path"
+        # Never through a symlink: `chmod` would change its target.
+        [[ ! -L "$path" ]] || continue
+        if ! sudo chmod "$mode" "$path"; then
+            echo "chmod $mode $path failed" >&2
+            failed=1
+            continue
+        fi
         if [[ "$(mode_of "$path")" != "$mode" ]]; then
             echo "$path reads back $(mode_of "$path") after restoring $mode" >&2
             failed=1

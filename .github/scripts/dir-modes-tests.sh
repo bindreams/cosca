@@ -47,4 +47,42 @@ printf '#!/bin/sh\nexit 0\n' >"$scratch/bin/sudo"
 chmod 755 "$scratch/a"
 if bash "$script" restore "$scratch/again" 2>/dev/null; then fail "a restore that changed nothing passed"; fi
 [[ -e "$scratch/again" ]] || fail "the state file was removed after a failed restore"
+# A symlink is never followed: neither recorded nor restored, so its target keeps its own mode.
+mkdir -p "$scratch/links/dir"
+touch "$scratch/outside"
+chmod 600 "$scratch/outside"
+ln -s "$scratch/outside" "$scratch/links/dir/link"
+chmod 750 "$scratch/links/dir"
+bash "$script" record-tree "$scratch/state-links" "$scratch/links"
+chmod a+rx "$scratch/links/dir"
+printf '#!/bin/sh\nexec "$@"\n' >"$scratch/bin/sudo"
+bash "$script" restore "$scratch/state-links"
+[[ "$(mode_of "$scratch/outside")" == 600 ]] || fail "the symlink target is $(mode_of "$scratch/outside")"
+[[ "$(mode_of "$scratch/links/dir")" == 750 ]] || fail "links/dir is $(mode_of "$scratch/links/dir")"
+if bash "$script" record "$scratch/state-link-arg" "$scratch/links/dir/link" 2>/dev/null; then fail "a symlink argument was accepted"; fi
+[[ ! -e "$scratch/state-link-arg" ]] || fail "a refused record left a state file"
+
+# A symlink in the state (written by hand) is skipped on restore.
+printf '777 %s\0' "$scratch/links/dir/link" >"$scratch/state-hand"
+bash "$script" restore "$scratch/state-hand"
+[[ "$(mode_of "$scratch/outside")" == 600 ]] || fail "a hand-written symlink record changed the target to $(mode_of "$scratch/outside")"
+
+# Spaces in paths.
+mkdir -p "$scratch/with space/in side"
+chmod 700 "$scratch/with space" "$scratch/with space/in side"
+bash "$script" record-tree "$scratch/state-space" "$scratch/with space"
+chmod -R a+rx "$scratch/with space"
+bash "$script" restore "$scratch/state-space"
+[[ "$(mode_of "$scratch/with space/in side")" == 700 ]] || fail "spaces: $(mode_of "$scratch/with space/in side")"
+
+# One failing path does not stop the others from being restored, and the run still fails.
+mkdir -p "$scratch/p" "$scratch/q"
+chmod 700 "$scratch/p" "$scratch/q"
+bash "$script" record "$scratch/state-two" "$scratch/p" "$scratch/q"
+chmod 755 "$scratch/p" "$scratch/q"
+# shellcheck disable=SC2016 # the generated script expands its own arguments
+printf '#!/bin/sh\n[ "$3" = "%s" ] && exit 1\nexec "$@"\n' "$scratch/p" >"$scratch/bin/sudo"
+if bash "$script" restore "$scratch/state-two" 2>/dev/null; then fail "a failed chmod passed"; fi
+[[ "$(mode_of "$scratch/q")" == 700 ]] || fail "the path after the failure was not restored: $(mode_of "$scratch/q")"
+[[ -e "$scratch/state-two" ]] || fail "the state file was removed after a failed restore"
 echo "dir-modes tests passed"

@@ -574,6 +574,7 @@ jobs:
           set -euxo pipefail
           cargo nextest archive --locked --target ${{ matrix.target }} --test group_teardown_setuid --archive-file "$RUNNER_TEMP/setuid-root.tar.zst"
           mkdir -m 0755 "$RUNNER_TEMP/setuid-root-extract"
+          # The checkout's own build output, not system policy: nothing to revert.
           chmod -R a+rX "$PWD/target"
           modes=("$RUNNER_TEMP")
           d="$PWD"
