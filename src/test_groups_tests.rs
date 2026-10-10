@@ -90,10 +90,7 @@ fn require_enabled_fails_only_for_0() {
 /// Mutant: setup grants without consent.
 #[skuld::test]
 fn require_consent_grants_only_on_exactly_1() {
-    assert!(matches!(
-        require_consent("COSCA_TEST_X", "does a thing", env(&[("COSCA_TEST_X_CONSENT", "1")])),
-        Ok(_)
-    ));
+    assert!(require_consent("COSCA_TEST_X", "does a thing", env(&[("COSCA_TEST_X_CONSENT", "1")])).is_ok());
     let off = [("COSCA_TEST_X", "0"), ("COSCA_TEST_X_CONSENT", "1")];
     let why = require_consent("COSCA_TEST_X", "does a thing", env(&off))
         .err()
