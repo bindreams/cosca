@@ -541,13 +541,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 proc.forget_because("died before exec");
                 SpawnFailure::NotStarted(error)
             }
-            // It may yet report and `exec`: forgotten, as a corpse would be, but left running.
-            Unadoptable::Unreported => {
+            // An elevation front is sent nothing: forgotten and left running, as for an unverified one.
+            Unadoptable::Unreported if front.is_some() => {
                 proc.forget_because(
-                    "had not reported its unique id when its spawn returned; it is not adopted, and may be running",
+                    "had not reported its unique id when its spawn returned; it is an elevation front, so it is not \
+                     adopted, and may be running",
                 );
                 SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
             }
+            // It may have exec'd, and its parent is this process with it unreaped: killed and reaped by pid.
+            Unadoptable::Unreported => SpawnFailure::started(error, proc.reap_unreported(pid)),
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {

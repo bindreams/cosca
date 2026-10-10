@@ -756,7 +756,7 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Pr
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let fate = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
+    let fate = kill_and_reap_noting(pid, Some(unique), id, &mut notes, &mut breach);
     if !notes.is_empty() {
         log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
     }
@@ -765,21 +765,68 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
     fate
 }
 
+/// What [`kill_and_reap_unreported`] did, before the event's one `warn`.
+#[cfg(target_os = "macos")]
+pub(crate) struct Unreported {
+    pub(crate) fate: ChildFate,
+    notes: Vec<String>,
+    breach: Option<String>,
+}
+
+/// Kills and reaps `pid`, a child of this process that had not reported its unique id when its spawn
+/// returned. It may have exec'd, and it is unreaped, so its number is pinned: it is signalled and
+/// waited on by pid. Warns nothing: [`Unreported::warn`] does, once.
+#[cfg(target_os = "macos")]
+pub(crate) fn kill_and_reap_unreported(pid: u32) -> Unreported {
+    let mut notes = Vec::new();
+    let mut breach = None;
+    let fate = kill_and_reap_noting(pid, None, None, &mut notes, &mut breach);
+    Unreported { fate, notes, breach }
+}
+
+#[cfg(target_os = "macos")]
+impl Unreported {
+    /// The event's one `warn`: what happened to child `pid`, with what a caller forgot (`leak`).
+    pub(crate) fn warn(self, pid: u32, leak: Option<&str>) -> ChildFate {
+        let mut said = format!(
+            "child {pid} had not reported its unique id when its spawn returned, so it may have started the \
+             program; it was not adopted, and was killed and reaped as this process's own child: {:?}",
+            self.fate
+        );
+        for note in &self.notes {
+            said.push_str("; ");
+            said.push_str(note);
+        }
+        if let Some(leak) = leak {
+            said.push_str(&format!("; forgetting tokio's handle for it leaks {leak}"));
+        }
+        log::warn!("{said}");
+        // After the log: an assertion that fires first would take the warn with it.
+        debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
+        self.fate
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn kill_and_reap_noting(
     pid: u32,
-    unique: u64,
+    unique: Option<u64>,
     id: Option<ProcessId>,
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
 ) -> ChildFate {
-    use crate::signal::{via_verified_pid, Sent, Sig};
+    use crate::signal::{via_owned_pid, via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
     use crate::wait::exit_only::Foreign;
 
-    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_verified_pid(pid, Some(unique), Sig::Kill) {
-        Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
+    let target = crate::wait::exit_only::Target::pid(pid, unique);
+    // No unique id: the caller owns the unreaped child, so the number is pinned and is signalled as is.
+    let sent = match unique {
+        Some(_) => via_verified_pid(pid, unique, Sig::Kill),
+        None => via_owned_pid(pid, Sig::Kill),
+    };
+    match sent {
+        Ok(Sent::Delivered) => match await_reapable(pid, unique, None) {
             Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
             Ok(Waited::Gone) => {
                 log::debug!("spawn teardown: pid {pid} was reaped by someone else");
@@ -803,7 +850,7 @@ fn kill_and_reap_noting(
             Foreign::Gone.fate(false)
         }
         Ok(Sent::Unverified) => {
-            debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
+            debug_assert!(false, "a kill by a unique id or by an owned pid is never unverified");
             notes.push("could not be verified, so it was not signalled".to_owned());
             ChildFate::Running { id }
         }
@@ -880,9 +927,10 @@ fn reap_verified(
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
 /// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects, and the program did not start. A child that had not reported is left
-/// running and unreaped. Any other is left as `leave_unverified_child` leaves it. Either of those may
-/// have started the program, and the error notes that a `front` is left unreaped.
+/// corpse nothing collects, and the program did not start. A child that had not reported may have
+/// started the program, and is this process's own unreaped child, so it is killed and reaped by pid;
+/// a `front` is left running and unreaped instead, and the error notes it. Any other is left as
+/// `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
@@ -904,16 +952,23 @@ fn abandon_unadopted(
         Unadoptable::Unreported => {
             #[cfg(test)]
             fault::capture(ProcessId::of(pid));
-            log::warn!(
-                "child {pid} had not reported its unique id when its spawn returned; it is not adopted, nothing is \
-                 signalled or waited on by pid, and it may be running"
-            );
+            // A front is sent nothing: it is left running and unreaped, with its note.
+            if front.is_some() {
+                log::warn!(
+                    "child {pid} had not reported its unique id when its spawn returned; it is an elevation front, \
+                     so it is not adopted, nothing is signalled or waited on by pid, and it may be running"
+                );
+                drop(child);
+                return SpawnFailure::started(
+                    FrontFate::LeftUnreaped.note(error, front, Some(pid)),
+                    // No unique id was read, so there is no identity to give.
+                    ChildFate::Running { id: None },
+                );
+            }
+            // Its parent is this process and it is unreaped: killed and reaped, exactly.
+            let fate = kill_and_reap_unreported(pid).warn(pid, None);
             drop(child);
-            SpawnFailure::started(
-                FrontFate::LeftUnreaped.note(error, front, Some(pid)),
-                // No unique id was read, so there is no identity to give.
-                ChildFate::Running { id: None },
-            )
+            SpawnFailure::started(error, fate)
         }
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.

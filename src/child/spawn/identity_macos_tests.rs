@@ -788,7 +788,11 @@ fn macos_sync_spawn_of_an_unreported_child_kills_and_reaps_it() {
         panic!("the spawn captured the child");
     };
     let pid = id.pid();
-    assert_eq!(fate, crate::error::ChildFate::Reaped, "an unreported child is killed and reaped");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "an unreported child is killed and reaped"
+    );
     assert_reaped_and_warned_once(pid, mark);
     drop(writer);
 }
@@ -826,7 +830,8 @@ pub(crate) fn assert_reaped_and_warned_once(pid: u32, mark: usize) {
 fn macos_sync_spawn_of_an_unreported_front_leaves_it_running_and_says_so() {
     use crate::elevation::{front::front, ElevatedVia};
     crate::log_capture::install();
-    for front in [front(Some(&ElevatedVia::MacosOsascript))] {
+    {
+        let front = front(Some(&ElevatedVia::MacosOsascript));
         let (mut cmd, writer) = sync_blocker();
         cmd.set_elevation_front(front);
         let mark = crate::log_capture::mark();
