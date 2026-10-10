@@ -234,13 +234,12 @@ fn a_child_killed_before_its_report_is_missing_on_ok() {
 }
 
 /// A report found unwritten, and a child killed by a signal after that: the spawn answers that the
-/// program may have started and that the child may be running, with no identity. The child is a
-/// corpse by the time anyone looks, and the spawn cannot know: it left the child unadopted and
-/// unreaped, and no one collects it (a known leak, tracked as #622). The seam closes the report pipe's
-/// write end before the child dies, which would make the parent read `Missing`, so the parent's
-/// read is forced to find nothing.
+/// program may have started, with no identity. The child may be a corpse by the time anyone looks,
+/// and the spawn cannot know; it is this process's unreaped child, so the spawn kills it and
+/// collects its status: `Reaped`. The seam closes the report pipe's write end before the child dies,
+/// which would make the parent read `Missing`, so the parent's read is forced to find nothing.
 ///
-/// Mutant: the spawn answers that the program did not start, or `Gone`.
+/// Mutant: the spawn answers that the program did not start, `Gone`, or leaves the child `Running`.
 #[skuld::test]
 fn an_unwritten_report_then_a_killed_child_is_answered_may_be_running() {
     let _killed = seams::force_child_killed_before_report();
@@ -249,5 +248,5 @@ fn an_unwritten_report_then_a_killed_child_is_answered_may_be_running() {
     cmd.args(["/usr/bin/true"]);
     let error = cmd.spawn().expect_err("an unreported child is not adopted");
     let (_error, fate) = crate::child::spawn::failure::expect_may_have_started_with(error);
-    assert_eq!(fate, crate::error::ChildFate::Running { id: None });
+    assert_eq!(fate, crate::error::ChildFate::Reaped);
 }
