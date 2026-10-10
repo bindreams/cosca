@@ -5,8 +5,8 @@
 //! strings, and that model depends on platform facts like these: how trailing dots and spaces,
 //! `.`/`..`, verbatim `\\?\` prefixes, UNC and device roots and stream suffixes resolve.
 //! `windows-latest` is a floating label: a Windows build can change those facts with no commit
-//! here, so the `windows-probes` workflow runs this file on pull requests touching the code that
-//! depends on it, weekly, and on demand.
+//! here, so the `Test (windows/...)` jobs of `ci.yaml` run this file on every pull request, and the
+//! `windows-probes` workflow runs it weekly and on demand.
 //!
 //! This file describes the platform only. It does not say what any gate in the tree does.
 //!

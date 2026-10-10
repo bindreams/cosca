@@ -24,7 +24,7 @@ env:
   PRIVILEGE_TESTS: "binary(cosca) | binary(process_root)"
   # Real uid switching needs real root that can `setuid`; only those lanes turn it on.
   COSCA_TEST_UID_SWITCH: "0"
-  # System-affecting groups are off workflow-wide; the root lane opts back in.
+  # System-affecting groups are off workflow-wide; each lane opts back in on its own steps.
   COSCA_TEST_NAMESPACES: "0"
   # The tracer tests run in the two tracer steps of the test job below.
   COSCA_TEST_TRACER: "0"
@@ -32,9 +32,9 @@ env:
   COSCA_TEST_SETUID: "0"
   # The cgroup tests need a delegated cgroup; only the cgroup lane below runs them.
   COSCA_TEST_CGROUP: "0"
-  # The elevation tests gain real administrator or root privileges; only the three `elevation_*` jobs run them.
+  # The elevation tests gain real administrator or root privileges; only the elevation steps of the test job run them.
   COSCA_TEST_ELEVATION: "0"
-  # Windows groups. The drive-mapping test runs in one step below; the probes and canaries run
+  # Windows groups. The drive-mapping test and the canaries run in steps of the test job; the executing probes run
   # only in windows-probes.yaml.
   COSCA_TEST_DRIVE_MAPPING: "0"
   COSCA_TEST_PATH_PROBES: "0"
@@ -153,13 +153,17 @@ jobs:
         include:
           - os: linux
             arch: amd64
-            runner: ubuntu-latest
+            # 26.04: the elevation lane needs polkit 0.106 or later, and its `polkit.service` is
+            # `Type=notify-reload` there. The root lanes' containers run `ubuntu:26.04`, the runner's own glibc.
+            runner: ubuntu-26.04
+            root_image: ubuntu:26.04
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+            root_image: ubuntu:24.04
             target: aarch64-unknown-linux-gnu
             other: x86_64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -195,9 +199,8 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # The slowest lanes are darwin/amd64 (1971 s at most) and windows/amd64 (1848 s), guard and
-    # self-test included. 50 min is 1.5x the slowest. All lanes share this bound.
-    timeout-minutes: 50
+    # PLACEHOLDER while the consolidated jobs are measured.
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -463,7 +466,7 @@ jobs:
       # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the tests
       # labelled `cgroup` explicitly, which keep in this lane what the old `test(/cgroup/)` name filter selected;
       # most use fake leaves and also run in the main lanes) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
-      # throwaway runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
+      # CI runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
       #
       # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
       # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
@@ -484,7 +487,7 @@ jobs:
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
-            # A delegated cgroup and root on a throwaway runner, so consent is given.
+            # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
@@ -595,6 +598,507 @@ jobs:
         with:
           name: test-${{ matrix.os }}-${{ matrix.arch }}
 
+      # Lanes that run after the unprivileged tests =====
+      #
+      # Every lane below is a step group of this required job. Order: the Windows canaries, then the root
+      # lanes, then elevation. `unattended-gui-elevation.py` changes system policy, so elevation goes last as a
+      # second line of defence; correctness does not rest on it. Every step that reverts a lane's changes runs
+      # `always()`, straight after its own lane. The lanes' steps run `!cancelled()`, so one red lane does not hide
+      # another, and each step also requires its own lane's earlier step to have succeeded. Each lane's
+      # `COSCA_TEST_<GROUP>` variables are set on its own steps, never job-wide.
+
+      # Windows path-resolution canaries and the elevating ShellExecuteEx probes (the `PATH_PROBES` and
+      # `SHELL_EXECUTE` groups). `--no-capture`: the surveys report only through stdout, and every canary prints
+      # what it measured before asserting on it. Each canary that passes leaves a marker named after itself
+      # (`mark_canary_passed`). windows-probes.yaml runs the same canaries weekly, because `windows-latest` floats.
+      - name: Windows canaries - path resolution
+        id: win_canary
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+          COSCA_TEST_PATH_PROBES: "1"
+          COSCA_TEST_PATH_PROBES_CONSENT: "1"
+          SKULD_LABELS: path_probes
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir "$COSCA_CANARY_MARKERS"
+          cargo nextest run --locked --profile ci --target "$TARGET" --test windows_path_resolution --no-capture --no-tests=fail
+
+      # A canary filter matching nothing would otherwise pass having asserted nothing. Runs after a failure too,
+      # so the log shows which canaries passed.
+      - name: Windows canaries - require that a canary ran
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_CANARY_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no canary ran: the run asserted nothing about the platform"
+            exit 1
+          fi
+          printf 'canary passed: %s\n' "${passed[@]##*/}"
+
+      # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without a prompt, and
+      # register one volatile App Paths key in HKLM and one in HKCU, deleting each again; a volatile parent key
+      # they had to create can stay behind until the next logon session. They measure an ELEVATED caller's launch,
+      # not the consent route cosca takes from an unelevated one. They share machine-wide state (the App Paths
+      # keys) and must not run concurrently; `--no-capture` and the `windows-shell-execute` test group (one thread,
+      # `.config/nextest.toml`) both guarantee that.
+      - name: Windows canaries - elevating ShellExecuteEx probes
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+          COSCA_TEST_SHELL_EXECUTE: "1"
+          COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
+          SKULD_LABELS: shell_execute
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir "$COSCA_CANARY_MARKERS"
+          cargo nextest run --locked --profile ci --target "$TARGET" --test windows_shell_execute --no-capture --no-tests=fail
+
+      - name: Windows canaries - require that an elevating probe ran
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        shell: bash
+        env:
+          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+        run: |
+          shopt -s nullglob
+          passed=("$COSCA_CANARY_MARKERS"/*)
+          if ((${#passed[@]} == 0)); then
+            echo "::error::no elevating probe ran: the run asserted nothing about ShellExecuteEx"
+            exit 1
+          fi
+          printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
+
+      # Root lanes (Linux) =====
+      #
+      # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`); the steps above are
+      # unprivileged and opt out of them (`COSCA_TEST_ROOT=0`). Each lane runs the nextest archive in a container
+      # (.github/actions/root-lane), so it needs no toolchain there. Before nextest, `root-lane-check.sh` fails the
+      # lane unless its EXPECT_* privilege state holds. The archive reuses the build of `Build tests`.
+      #
+      # The container image matches the runner's glibc (`matrix.root_image`): the runner built the test binaries.
+      #
+      # What each lane adds:
+      #   root:           the base case.
+      #   unshare -r:     root in a fresh user namespace, which holds `CAP_DAC_READ_SEARCH`.
+      #   DAC_READ_SEARCH: root with that capability added directly.
+      #   foreign TMPDIR: an ambient `TMPDIR` the dropped identity cannot search.
+      #   uid 1000:       not root, `CAP_DAC_OVERRIDE` ambient. The exec-child test runs (its
+      #                   precondition is a DAC bypass, not uid 0), but a non-root `execve` regains
+      #                   nothing, so only the root lanes catch a deleted `no_new_privs`.
+      # Capability masks: `CAP_DAC_OVERRIDE` is 0x2, `CAP_DAC_READ_SEARCH` is 0x4.
+      - name: Root lanes - archive the privilege tests (Linux)
+        id: root_archive
+        if: ${{ !cancelled() && matrix.os == 'linux' }}
+        timeout-minutes: 10
+        run: cargo nextest archive --locked --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/root-lane.tar.zst"
+
+      - name: Root lane (root)
+        if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/root-lane
+        with:
+          slug: root
+          image: ${{ matrix.root_image }}
+          uid_switch: "1"
+          expect_uid: "0"
+          expect_capeff_has: "0x2"
+          expect_capeff_lacks: "0x4"
+          expect_capamb: "0x0"
+          artifact: resolve_root_lanes-linux-${{ matrix.arch }}-root
+
+      - name: Root lane (root, unshare -r)
+        if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/root-lane
+        with:
+          slug: unshare
+          image: ${{ matrix.root_image }}
+          uid_switch: "0" # `unshare -r` maps no uid 65534
+          docker_flags: "--cap-add SYS_ADMIN" # `unshare -r` needs it
+          prefix: "unshare -r "
+          expect_uid: "0"
+          expect_capeff_has: "0x6"
+          expect_capeff_lacks: "0x0"
+          expect_capamb: "0x0"
+          expect_userns: "1"
+          artifact: resolve_root_lanes-linux-${{ matrix.arch }}-unshare
+
+      - name: Root lane (root, DAC_READ_SEARCH)
+        if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/root-lane
+        with:
+          slug: dac-read-search
+          image: ${{ matrix.root_image }}
+          uid_switch: "1"
+          docker_flags: "--cap-add DAC_READ_SEARCH"
+          expect_uid: "0"
+          expect_capeff_has: "0x6"
+          expect_capeff_lacks: "0x0"
+          expect_capamb: "0x0"
+          artifact: resolve_root_lanes-linux-${{ matrix.arch }}-dac-read-search
+
+      - name: Root lane (root, foreign TMPDIR)
+        if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/root-lane
+        with:
+          slug: foreign-tmpdir
+          image: ${{ matrix.root_image }}
+          uid_switch: "1"
+          expect_uid: "0"
+          expect_capeff_has: "0x2"
+          expect_capeff_lacks: "0x4"
+          expect_capamb: "0x0"
+          foreign_tmpdir: "true"
+          artifact: resolve_root_lanes-linux-${{ matrix.arch }}-foreign-tmpdir
+
+      - name: Root lane (uid 1000, CAP_DAC_OVERRIDE ambient)
+        if: ${{ !cancelled() && steps.root_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/root-lane
+        with:
+          slug: uid-1000
+          image: ${{ matrix.root_image }}
+          uid_switch: "0" # not root, so it cannot `setuid`
+          prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
+          expect_uid: "1000"
+          expect_capeff_has: "0x2"
+          expect_capeff_lacks: "0x4"
+          expect_capamb: "0x2"
+          artifact: resolve_root_lanes-linux-${{ matrix.arch }}-uid-1000
+
+      # Root lane (macOS) =====
+      #
+      # Root on macOS, where a fixture drops by changing uid and re-execs a copy of the test binary. No container
+      # on macOS runners, so this runs under `sudo`. The setuid group runs first, as it did in its own job.
+      - name: Root lane (macOS) - set up the setuid-root helper
+        id: mac_helper
+        if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euxo pipefail
+          BIN=$(cargo build --locked --target "$TARGET" --bin cosca_testbin --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
+            | grep -v '^null$' | grep . | head -n1)
+          test -x "$BIN"
+          HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
+          cp "$BIN" "$HELPER"
+          sudo chown root:wheel "$HELPER"
+          sudo chmod 4755 "$HELPER"
+          echo "helper=$HELPER" >> "$GITHUB_OUTPUT"
+
+      - name: Root lane (macOS) - check the setuid lane
+        id: mac_helper_check
+        if: ${{ !cancelled() && steps.mac_helper.outcome == 'success' }}
+        shell: bash
+        env:
+          HELPER: ${{ steps.mac_helper.outputs.helper }}
+        run: bash .github/scripts/setuid-lane-check.sh "$HELPER"
+
+      # The tests were built by `Build tests (tokio feature)`.
+      - name: Root lane (macOS) - run the setuid tests
+        if: ${{ !cancelled() && steps.mac_helper_check.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_TEST_SETUID: "1"
+          COSCA_TEST_SETUID_CONSENT: "1"
+          COSCA_TEST_SETUID_HELPER: ${{ steps.mac_helper.outputs.helper }}
+          SKULD_LABELS: setuid
+        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
+
+      - name: Root lane (macOS) - archive the privilege tests
+        id: mac_root_archive
+        if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
+        timeout-minutes: 10
+        run: cargo nextest archive --locked --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/root-lane-macos.tar.zst"
+
+      # Two directories:
+      # - `TMPDIR`, root-owned 0755. The ambient `TMPDIR` must be searchable by uid 65534, which
+      #   the runner user's own per-app `TMPDIR` is not. It is not writable by 65534 either, so a
+      #   fixture that ignores its scratch directory fails.
+      # - nextest's extraction directory, root-owned 0700. The test binary then sits somewhere uid
+      #   65534 cannot enter, so a fixture passes only if the driver re-execs a copy of it.
+      # Passed to the run step as outputs, not through `GITHUB_ENV`, so no other step sees them.
+      - name: Root lane (macOS) - create root-owned scratch and extraction directories
+        id: mac_root_dirs
+        if: ${{ !cancelled() && steps.mac_root_archive.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          COSCA_ROOT_TMPDIR="$(sudo mktemp -d /tmp/cosca-root-scratch.XXXXXX)"
+          sudo chown root:wheel "$COSCA_ROOT_TMPDIR"
+          sudo chmod 0755 "$COSCA_ROOT_TMPDIR"
+          COSCA_EXTRACT_DIR="$(sudo mktemp -d /tmp/cosca-root-extract.XXXXXX)"
+          sudo chown root:wheel "$COSCA_EXTRACT_DIR"
+          sudo chmod 0700 "$COSCA_EXTRACT_DIR"
+          {
+            echo "extract_dir=$COSCA_EXTRACT_DIR"
+            echo "tmpdir=$COSCA_ROOT_TMPDIR"
+          } >> "$GITHUB_OUTPUT"
+
+      # `sudo -E` keeps `TMPDIR`. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned. The root
+      # shell hands `target` back to the runner user, so later lanes can write to it.
+      - name: Root lane (macOS, sudo -E)
+        id: mac_root_run
+        if: ${{ !cancelled() && steps.mac_root_dirs.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_TEST_ROOT: "1"
+          COSCA_TEST_ROOT_CONSENT: "1"
+          COSCA_TEST_UID_SWITCH: "1"
+          COSCA_TEST_UID_SWITCH_CONSENT: "1"
+          TMPDIR: ${{ steps.mac_root_dirs.outputs.tmpdir }}
+          COSCA_EXTRACT_DIR: ${{ steps.mac_root_dirs.outputs.extract_dir }}
+        run: |
+          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
+          exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
+            test "$(id -u)" = 0
+            test "$(stat -f %u "$TMPDIR")" = 0
+            status=0
+            SKULD_LABELS=root "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "$PRIVILEGE_TESTS" || status=1
+            chown -R "$3" "$PWD/target"
+            exit "$status"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR" "$(id -u):$(id -g)"
+
+      - name: Root lane (macOS) - upload JUnit
+        if: ${{ !cancelled() && steps.mac_helper.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: resolve_root_lane_macos-darwin-arm64
+          path: |
+            ${{ runner.temp }}/junit/setuid.xml
+            ${{ runner.temp }}/junit/root.xml
+
+      - name: Root lane (macOS) - print the process table
+        if: ${{ steps.mac_helper.outcome != 'skipped' && (failure() || cancelled()) }}
+        timeout-minutes: 2
+        run: ps -axo pid,ppid,pgid,stat,etime,command
+
+      # Elevation (Linux) =====
+      #
+      # The ELEVATION group (`COSCA_TEST_ELEVATION`, off workflow-wide), selected by its label. This is a CI
+      # runner, so the group consents. `-E binary(=elevation)`: the only binary with elevation tests; libtest
+      # binaries ignore `SKULD_LABELS` and would run whole.
+      #
+      # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
+      # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
+      # `unattended-gui-elevation.py --revert` (`if: always()`) and remove the apt-installed polkit and doas
+      # packages. That PR adds the mode; whichever of the two PRs merges second wires it in here.
+      - name: Elevation (Linux) - allow unattended GUI elevation
+        id: lin_elev_policy
+        if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --check-only
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y polkitd pkexec opendoas
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER"
+
+      # `doas` lets the runner user run anything as root without a password (the `Backend::Doas` test).
+      - name: Elevation (Linux) - provision doas
+        id: lin_elev_doas
+        if: ${{ !cancelled() && steps.lin_elev_policy.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf 'permit nopass %s as root\n' "$USER" | sudo tee /etc/doas.conf >/dev/null
+          doas -C /etc/doas.conf
+          test "$(doas -n id -u)" = 0
+
+      # Rules and password: see elevation-lane-sudoers.sh. The password goes to the run step as an output, not
+      # through `GITHUB_ENV`.
+      - name: Elevation (Linux) - provision sudo
+        id: lin_elev_sudo
+        if: ${{ !cancelled() && steps.lin_elev_doas.outcome == 'success' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # No xtrace here: it would print the password before the mask takes effect.
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "password=$password" >> "$GITHUB_OUTPUT"
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/$TARGET/debug/cosca_testbin"
+
+      - name: Elevation (Linux) - run the elevation tests
+        id: lin_elev_run
+        if: ${{ !cancelled() && steps.lin_elev_sudo.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_TEST_ELEVATION: "1"
+          COSCA_TEST_ELEVATION_CONSENT: "1"
+          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
+          SKULD_LABELS: elevation
+        run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --target ${{ matrix.target }} --no-tests=fail -E 'binary(=elevation)'
+
+      - name: Elevation (Linux) - check the JUnit result
+        if: ${{ !cancelled() && steps.lin_elev_run.outcome == 'success' }}
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 9
+
+      - name: Elevation (Linux) - print the process table
+        if: ${{ steps.lin_elev_run.outcome == 'failure' || steps.lin_elev_run.outcome == 'cancelled' }}
+        timeout-minutes: 2
+        run: ps -eo pid,ppid,pgid,stat,etime,args
+
+      - name: Elevation (Linux) - remove the sudo rules
+        if: ${{ always() && steps.lin_elev_sudo.outcome != 'skipped' && steps.lin_elev_sudo.outcome != '' }}
+        shell: bash
+        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
+
+      - name: Elevation (Linux) - upload JUnit
+        if: ${{ !cancelled() && steps.lin_elev_run.outcome != 'skipped' && steps.lin_elev_run.outcome != '' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-linux-amd64
+          path: ${{ runner.temp }}/junit/elevation.xml
+
+      # Elevation (macOS) =====
+      #
+      # The image grants `%admin NOPASSWD:ALL` to the runner user, so the tests run as a throwaway non-admin account
+      # (`coscaelev`), which that rule does not reach. `elevation-lane-sudoers.sh` gives it `sudo -n` for `id` and
+      # `cosca_testbin` only, and `whoami` asks the password the Stdin and Askpass tests deliver.
+      # TODO(azhukova/revert-system-changes): after the lane's cleanup, run
+      # `unattended-gui-elevation.py --revert` (`if: always()`), which restores the authorizationdb right. That PR
+      # adds the mode; whichever of the two PRs merges second wires it in here.
+      - name: Elevation (macOS) - allow unattended GUI elevation
+        id: mac_elev_policy
+        if: ${{ !cancelled() && matrix.os == 'darwin' && matrix.arch == 'arm64' }}
+        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+
+      # The user runs a nextest archive extracted outside the checkout, which it can read. The tests were built by
+      # `Build tests (tokio feature)`.
+      - name: Elevation (macOS) - archive the tests
+        id: mac_elev_archive
+        if: ${{ !cancelled() && steps.mac_elev_policy.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/elevation.tar.zst"
+          mkdir -m 0777 "$RUNNER_TEMP/elevation-extract"
+          chmod -R a+rX "$PWD/target"
+          mkdir -p "$PWD/target/nextest/ci-elevation"
+          chmod -R a+rwX "$PWD/target/nextest"
+          d="$PWD"
+          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
+          sudo chmod -R a+rX "$HOME/.cargo/bin"
+          sudo chmod a+x "$RUNNER_TEMP"
+
+      # No xtrace: the password is handled here. It goes to the run step as an output.
+      - name: Elevation (macOS) - create the user and its sudo rules
+        id: mac_elev_user
+        if: ${{ !cancelled() && steps.mac_elev_archive.outcome == 'success' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "password=$password" >> "$GITHUB_OUTPUT"
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --create-account coscaelev
+          # Listing extracts the archive, so the test binaries and `cosca_testbin` belong to the user.
+          sudo -u coscaelev -H "$(command -v cargo-nextest)" nextest list --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
+            --extract-to "$RUNNER_TEMP/elevation-extract" --workspace-remap "$PWD" > /dev/null
+          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable coscaelev "$RUNNER_TEMP/elevation-extract/target/$TARGET/debug/cosca_testbin"
+
+      - name: Elevation (macOS) - run the elevation tests
+        id: mac_elev_run
+        if: ${{ !cancelled() && steps.mac_elev_user.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.mac_elev_user.outputs.password }}
+          SELECTION: binary(=elevation)
+        # The forwarder runs as root (`sudo -E`), so the step's bound can signal the user's whole process tree.
+        run: |
+          exec python3 .github/scripts/run-nextest.py elevation sudo -E "$(command -v python3)" .github/scripts/forward.py \
+            sudo -u coscaelev -H env \
+            COSCA_TEST_ELEVATION=1 COSCA_TEST_ELEVATION_CONSENT=1 SKULD_LABELS=elevation \
+            COSCA_TEST_ELEVATION_PASSWORD="$COSCA_TEST_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
+            "$(command -v cargo-nextest)" nextest run --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
+            --extract-to "$RUNNER_TEMP/elevation-extract" --extract-overwrite --workspace-remap "$PWD" --no-tests=fail -E "$SELECTION"
+
+      - name: Elevation (macOS) - check the JUnit result
+        if: ${{ !cancelled() && steps.mac_elev_run.outcome == 'success' }}
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 8
+
+      - name: Elevation (macOS) - print the process table
+        if: ${{ steps.mac_elev_run.outcome == 'failure' || steps.mac_elev_run.outcome == 'cancelled' }}
+        timeout-minutes: 2
+        run: ps -axo pid,ppid,pgid,stat,etime,command
+
+      - name: Elevation (macOS) - remove the user and its sudo rules
+        if: ${{ always() && steps.mac_elev_user.outcome != 'skipped' && steps.mac_elev_user.outcome != '' }}
+        shell: bash
+        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup coscaelev
+
+      - name: Elevation (macOS) - upload JUnit
+        if: ${{ !cancelled() && steps.mac_elev_run.outcome != 'skipped' && steps.mac_elev_run.outcome != '' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-darwin-arm64
+          path: ${{ runner.temp }}/junit/elevation.xml
+
+      # Elevation (Windows) =====
+      #
+      # See elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
+      # TODO(azhukova/revert-system-changes): after the lane, run `unattended-gui-elevation.py --revert`
+      # (`if: always()`) and make sure the administrator account is removed even when the script is killed. That PR
+      # adds both; whichever of the two PRs merges second wires them in here.
+      - name: Elevation (Windows) - allow unattended GUI elevation
+        id: win_elev_policy
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        shell: pwsh
+        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
+
+      # The tests were built by `Build tests (tokio feature)`.
+      - name: Elevation (Windows) - archive the tests
+        id: win_elev_archive
+        if: ${{ !cancelled() && steps.win_elev_policy.outcome == 'success' }}
+        shell: pwsh
+        run: cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$env:RUNNER_TEMP\elevation.tar.zst"
+
+      # Through run-nextest.ps1, which publishes the JUnit file (the `ci-elevation` profile). The throwaway administrator
+      # runs nextest from an archive extracted under C:\cosca-elevation-lane.
+      - name: Elevation (Windows) - run the elevation tests
+        id: win_elev_run
+        if: ${{ !cancelled() && steps.win_elev_archive.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          NEXTEST_PROFILE: ci-elevation
+        run: ./.github/scripts/run-nextest.ps1 elevation pwsh -File ./.github/scripts/elevation-lane-windows.ps1 "$env:RUNNER_TEMP\elevation.tar.zst" (Get-Command cargo-nextest).Source
+
+      - name: Elevation (Windows) - check the JUnit result
+        if: ${{ !cancelled() && steps.win_elev_run.outcome == 'success' }}
+        shell: bash
+        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 4
+
+      - name: Elevation (Windows) - upload JUnit
+        if: ${{ !cancelled() && steps.win_elev_run.outcome != 'skipped' && steps.win_elev_run.outcome != '' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: elevation-windows-${{ matrix.arch }}
+          path: ${{ runner.temp }}/junit/elevation.xml
+
       # Names the stuck process after a hang or failure. Windows has no `ps`.
       - name: Print the process table (Linux)
         if: (cancelled() || failure()) && matrix.os == 'linux'
@@ -606,455 +1110,3 @@ jobs:
         timeout-minutes: 2
         run: ps -axo pid,ppid,pgid,stat,etime,command
 
-  # The ELEVATION group (`COSCA_TEST_ELEVATION`, off workflow-wide), selected by its label. Every runner here
-  # is an ephemeral VM, so the group consents. `-E binary(=elevation)`: the only binary with elevation tests;
-  # libtest binaries ignore `SKULD_LABELS` and would run whole.
-  elevation_linux:
-    name: Elevation (linux/amd64)
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    env:
-      COSCA_TEST_ELEVATION: "1"
-      COSCA_TEST_ELEVATION_CONSENT: "1"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Build tests
-        run: cargo nextest run --locked --no-run --features tokio --profile ci
-
-      # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
-      - name: Allow unattended GUI elevation
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --check-only
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y polkitd pkexec opendoas
-          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER"
-
-      # `doas` lets the runner user run anything as root without a password (the `Backend::Doas` test).
-      - name: Provision doas
-        shell: bash
-        run: |
-          set -euxo pipefail
-          printf 'permit nopass %s as root\n' "$USER" | sudo tee /etc/doas.conf >/dev/null
-          doas -C /etc/doas.conf
-          test "$(doas -n id -u)" = 0
-
-      # Rules and password: see elevation-lane-sudoers.sh.
-      - name: Provision sudo
-        shell: bash
-        run: |
-          # No xtrace here: it would print the password before the mask takes effect.
-          set -euo pipefail
-          password="$(openssl rand -hex 16)"
-          echo "::add-mask::$password"
-          echo "COSCA_TEST_ELEVATION_PASSWORD=$password" >> "$GITHUB_ENV"
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/debug/cosca_testbin"
-
-      - name: Run elevation tests
-        timeout-minutes: 8
-        shell: bash
-        env:
-          SKULD_LABELS: elevation
-        run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --no-tests=fail -E 'binary(=elevation)'
-
-      - name: Check the JUnit result
-        shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 9
-
-      - name: Remove the sudo rules
-        if: ${{ always() }}
-        shell: bash
-        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
-
-      - name: Upload JUnit
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/upload-junit
-        with:
-          name: elevation-linux-amd64
-
-      - name: Print the process table
-        if: cancelled() || failure()
-        timeout-minutes: 2
-        run: ps -eo pid,ppid,pgid,stat,etime,args
-
-  # macOS: the image grants `%admin NOPASSWD:ALL` to the runner user, so the tests run as a throwaway
-  # non-admin account (`coscaelev`), which that rule does not reach. `elevation-lane-sudoers.sh` gives it
-  # `sudo -n` for `id` and `cosca_testbin` only, and `whoami` asks the password the Stdin and Askpass tests
-  # deliver.
-  elevation_macos:
-    name: Elevation (darwin/arm64)
-    runs-on: macos-latest
-    timeout-minutes: 30
-    env:
-      COSCA_TEST_ELEVATION: "1"
-      COSCA_TEST_ELEVATION_CONSENT: "1"
-      SELECTION: binary(=elevation)
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Build tests
-        run: cargo nextest run --locked --no-run --features tokio --profile ci
-
-      - name: Allow unattended GUI elevation
-        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
-
-      # The user runs a nextest archive extracted outside the checkout, which it can read.
-      - name: Archive the tests
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cargo nextest archive --locked --features tokio --archive-file "$RUNNER_TEMP/elevation.tar.zst"
-          mkdir -m 0777 "$RUNNER_TEMP/elevation-extract"
-          chmod -R a+rX "$PWD/target"
-          mkdir -p "$PWD/target/nextest/ci-elevation"
-          chmod -R a+rwX "$PWD/target/nextest"
-          d="$PWD"
-          while [ "$d" != / ]; do sudo chmod a+x "$d"; d=$(dirname "$d"); done
-          sudo chmod -R a+rX "$HOME/.cargo/bin"
-          sudo chmod a+x "$RUNNER_TEMP"
-
-      # No xtrace: the password is handled here.
-      - name: Create the user and its sudo rules
-        shell: bash
-        run: |
-          set -euo pipefail
-          password="$(openssl rand -hex 16)"
-          echo "::add-mask::$password"
-          echo "COSCA_TEST_ELEVATION_PASSWORD=$password" >> "$GITHUB_ENV"
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --create-account coscaelev
-          # Listing extracts the archive, so the test binaries and `cosca_testbin` belong to the user.
-          sudo -u coscaelev -H "$(command -v cargo-nextest)" nextest list --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
-            --extract-to "$RUNNER_TEMP/elevation-extract" --workspace-remap "$PWD" > /dev/null
-          COSCA_TEST_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable coscaelev "$RUNNER_TEMP/elevation-extract/target/debug/cosca_testbin"
-
-      - name: Run elevation tests
-        timeout-minutes: 8
-        shell: bash
-        # The forwarder runs as root (`sudo -E`), so the step's bound can signal the user's whole process tree.
-        run: |
-          exec python3 .github/scripts/run-nextest.py elevation sudo -E "$(command -v python3)" .github/scripts/forward.py \
-            sudo -u coscaelev -H env \
-            COSCA_TEST_ELEVATION=1 COSCA_TEST_ELEVATION_CONSENT=1 SKULD_LABELS=elevation \
-            COSCA_TEST_ELEVATION_PASSWORD="$COSCA_TEST_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
-            "$(command -v cargo-nextest)" nextest run --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
-            --extract-to "$RUNNER_TEMP/elevation-extract" --extract-overwrite --workspace-remap "$PWD" --no-tests=fail -E "$SELECTION"
-
-      - name: Check the JUnit result
-        shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 8
-
-      - name: Remove the user and its sudo rules
-        if: ${{ always() }}
-        shell: bash
-        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup coscaelev
-
-      - name: Upload JUnit
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/upload-junit
-        with:
-          name: elevation-darwin-arm64
-
-      - name: Print the process table
-        if: cancelled() || failure()
-        timeout-minutes: 2
-        run: ps -axo pid,ppid,pgid,stat,etime,command
-
-  # Windows: see elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
-  elevation_windows:
-    name: Elevation (windows/${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - arch: arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Allow unattended GUI elevation
-        shell: pwsh
-        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Archive the tests
-        shell: pwsh
-        run: cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$env:RUNNER_TEMP\elevation.tar.zst"
-
-      # Through run-nextest.ps1, which publishes the JUnit file (the `ci-elevation` profile). The throwaway administrator
-      # runs nextest from an archive extracted under C:\cosca-elevation-lane.
-      - name: Run elevation tests
-        timeout-minutes: 8
-        shell: pwsh
-        env:
-          NEXTEST_PROFILE: ci-elevation
-        run: ./.github/scripts/run-nextest.ps1 elevation pwsh -File ./.github/scripts/elevation-lane-windows.ps1 "$env:RUNNER_TEMP\elevation.tar.zst" (Get-Command cargo-nextest).Source
-
-      - name: Check the JUnit result
-        shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 4
-
-      - name: Upload JUnit
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/upload-junit
-        with:
-          name: elevation-windows-${{ matrix.arch }}
-
-  # The unit tests that need root or a DAC-bypass capability (`PRIVILEGE_TESTS`). The `test` matrix
-  # above is unprivileged and opts out of them (`COSCA_TEST_ROOT=0`). Each lane runs a nextest
-  # archive in a container, so it needs no toolchain. Before nextest, `root-lane-check.sh` fails the
-  # lane unless its EXPECT_* privilege state holds.
-  #
-  # What each lane adds:
-  #   root:           the base case.
-  #   unshare -r:     root in a fresh user namespace, which holds `CAP_DAC_READ_SEARCH`.
-  #   DAC_READ_SEARCH: root with that capability added directly.
-  #   foreign TMPDIR: an ambient `TMPDIR` the dropped identity cannot search.
-  #   uid 1000:       not root, `CAP_DAC_OVERRIDE` ambient. The exec-child test runs (its
-  #                   precondition is a DAC bypass, not uid 0), but a non-root `execve` regains
-  #                   nothing, so only the root lanes catch a deleted `no_new_privs`.
-  # Capability masks: `CAP_DAC_OVERRIDE` is 0x2, `CAP_DAC_READ_SEARCH` is 0x4.
-  resolve_root_lanes:
-    name: Root lane (${{ matrix.lane }})
-    runs-on: ubuntu-24.04 # matches the `ubuntu:24.04` run image's glibc
-    # Largest measured lane: 87s; 15 minutes is about 10x.
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: root
-            slug: root
-            docker_flags: ""
-            uid_switch: "1"
-            prefix: ""
-            expect_uid: "0"
-            expect_capeff_has: "0x2"
-            expect_capeff_lacks: "0x4"
-            expect_capamb: "0x0"
-          - lane: root, unshare -r
-            slug: unshare
-            uid_switch: "0" # `unshare -r` maps no uid 65534
-            docker_flags: "--cap-add SYS_ADMIN" # `unshare -r` needs it
-            prefix: "unshare -r "
-            expect_uid: "0"
-            expect_capeff_has: "0x6"
-            expect_capeff_lacks: "0x0"
-            expect_capamb: "0x0"
-            expect_userns: "1"
-          - lane: root, DAC_READ_SEARCH
-            slug: dac-read-search
-            docker_flags: "--cap-add DAC_READ_SEARCH"
-            uid_switch: "1"
-            prefix: ""
-            expect_uid: "0"
-            expect_capeff_has: "0x6"
-            expect_capeff_lacks: "0x0"
-            expect_capamb: "0x0"
-          - lane: root, foreign TMPDIR
-            slug: foreign-tmpdir
-            docker_flags: ""
-            uid_switch: "1"
-            prefix: ""
-            expect_uid: "0"
-            expect_capeff_has: "0x2"
-            expect_capeff_lacks: "0x4"
-            expect_capamb: "0x0"
-            foreign_tmpdir: "true"
-          - lane: uid 1000, CAP_DAC_OVERRIDE ambient
-            slug: uid-1000
-            uid_switch: "0" # not root, so it cannot `setuid`
-            docker_flags: ""
-            prefix: "setpriv --reuid 1000 --regid 1000 --clear-groups --inh-caps +dac_override --ambient-caps +dac_override "
-            expect_uid: "1000"
-            expect_capeff_has: "0x2"
-            expect_capeff_lacks: "0x4"
-            expect_capamb: "0x2"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Archive the privilege tests
-        timeout-minutes: 10
-        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane.tar.zst"
-
-      # The checkout is mounted read-only below, and nextest writes its store under the remapped
-      # workspace's `target/nextest`. That directory is mounted writable on top of it. The JUnit
-      # file is copied out to `$RUNNER_TEMP/junit` by root-lane.sh. Both are mode 0777 because the
-      # `uid 1000` lane is not the runner's user.
-      - name: Make the nextest store and the JUnit directory writable inside the container
-        run: |
-          set -euxo pipefail
-          mkdir -p target/nextest "$RUNNER_TEMP/junit"
-          chmod 0777 target/nextest "$RUNNER_TEMP/junit"
-
-      # The container is the sandbox, so consent is given here.
-      # `exec` and `--init`: the runner signals only this shell, `docker run` forwards the signal to
-      # the container's pid 1, and an init process passes it on to the lane's script.
-      - name: Run lane
-        timeout-minutes: 8
-        run: |
-          set -euxo pipefail
-          exec docker run --rm --init --network none ${{ matrix.docker_flags }} \
-            -v "$PWD":/repo:ro \
-            -v "$PWD/target/nextest":/repo/target/nextest \
-            -v "$RUNNER_TEMP":/artifacts:ro \
-            -v "$RUNNER_TEMP/junit":/junit-out \
-            -v "$(command -v cargo-nextest)":/usr/local/bin/cargo-nextest:ro \
-            -e COSCA_TEST_ROOT=1 \
-            -e COSCA_TEST_ROOT_CONSENT=1 \
-            -e PRIVILEGE_TESTS \
-            -e COSCA_TEST_UID_SWITCH="${{ matrix.uid_switch }}" \
-            -e COSCA_TEST_UID_SWITCH_CONSENT=1 \
-            -e FOREIGN_TMPDIR="${{ matrix.foreign_tmpdir }}" \
-            -e PREFIX="${{ matrix.prefix }}" \
-            -e EXPECT_UID="${{ matrix.expect_uid }}" \
-            -e EXPECT_CAPEFF_HAS="${{ matrix.expect_capeff_has }}" \
-            -e EXPECT_CAPEFF_LACKS="${{ matrix.expect_capeff_lacks }}" \
-            -e EXPECT_CAPAMB="${{ matrix.expect_capamb }}" \
-            -e EXPECT_USERNS="${{ matrix.expect_userns }}" \
-            ubuntu:24.04 \
-            bash /repo/.github/scripts/root-lane.sh
-
-      - name: Upload JUnit
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/upload-junit
-        with:
-          name: resolve_root_lanes-linux-amd64-${{ matrix.slug }}
-
-      - name: Print the process table
-        if: cancelled() || failure()
-        timeout-minutes: 2
-        run: ps -eo pid,ppid,pgid,stat,etime,args
-
-  # Root on macOS, where a fixture drops by changing uid and re-execs a copy of the test binary.
-  # No container on macOS runners, so this runs under `sudo`.
-  resolve_root_lane_macos:
-    name: Root lane (macOS, sudo -E)
-    runs-on: macos-latest
-    # Largest measured: 93s; 15 minutes is about 10x.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: ./.github/actions/setup-rust
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Set up setuid-root helper (macOS)
-        run: |
-          set -euxo pipefail
-          BIN=$(cargo build --locked --bin cosca_testbin --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -x "$BIN"
-          HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
-          cp "$BIN" "$HELPER"
-          sudo chown root:wheel "$HELPER"
-          sudo chmod 4755 "$HELPER"
-          echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
-
-      - name: Check the setuid lane (macOS)
-        run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
-
-      - name: Build setuid tests (macOS)
-        run: cargo nextest run --locked --no-run --features tokio --profile ci -E 'binary(cosca)'
-
-      - name: Run setuid tests (macOS)
-        timeout-minutes: 8
-        env:
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
-          SKULD_LABELS: setuid
-        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio -E 'binary(cosca)'
-
-      - name: Archive the privilege tests
-        timeout-minutes: 10
-        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/root-lane-macos.tar.zst"
-
-      # Two directories:
-      # - `TMPDIR`, root-owned 0755. The ambient `TMPDIR` must be searchable by uid 65534, which
-      #   the runner user's own per-app `TMPDIR` is not. It is not writable by 65534 either, so a
-      #   fixture that ignores its scratch directory fails.
-      # - nextest's extraction directory, root-owned 0700. The test binary then sits somewhere uid
-      #   65534 cannot enter, so a fixture passes only if the driver re-execs a copy of it.
-      - name: Create root-owned scratch and extraction directories
-        run: |
-          set -euxo pipefail
-          COSCA_ROOT_TMPDIR="$(sudo mktemp -d /tmp/cosca-root-scratch.XXXXXX)"
-          sudo chown root:wheel "$COSCA_ROOT_TMPDIR"
-          sudo chmod 0755 "$COSCA_ROOT_TMPDIR"
-          COSCA_EXTRACT_DIR="$(sudo mktemp -d /tmp/cosca-root-extract.XXXXXX)"
-          sudo chown root:wheel "$COSCA_EXTRACT_DIR"
-          sudo chmod 0700 "$COSCA_EXTRACT_DIR"
-          {
-            echo "COSCA_EXTRACT_DIR=$COSCA_EXTRACT_DIR"
-            echo "TMPDIR=$COSCA_ROOT_TMPDIR"
-          } >> "$GITHUB_ENV"
-
-      # `sudo -E` keeps `TMPDIR`; the runner is ephemeral and single-tenant, so consent is given
-      # here. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned.
-      - name: Run root lane (macOS)
-        timeout-minutes: 8
-        env:
-          COSCA_TEST_ROOT: "1"
-          COSCA_TEST_ROOT_CONSENT: "1"
-          COSCA_TEST_UID_SWITCH: "1"
-          COSCA_TEST_UID_SWITCH_CONSENT: "1"
-        run: |
-          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
-            test "$(id -u)" = 0
-            test "$(stat -f %u "$TMPDIR")" = 0
-            SKULD_LABELS=root "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "$PRIVILEGE_TESTS"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
-
-
-      - name: Upload JUnit
-        if: ${{ !cancelled() }}
-        uses: ./.github/actions/upload-junit
-        with:
-          name: resolve_root_lane_macos-darwin-arm64
-
-      - name: Print the process table
-        if: cancelled() || failure()
-        timeout-minutes: 2
-        run: ps -axo pid,ppid,pgid,stat,etime,command

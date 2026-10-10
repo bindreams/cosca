@@ -1,4 +1,7 @@
-# Windows path-resolution and ShellExecuteEx canaries.
+# Windows path-resolution and ShellExecuteEx canaries, on a schedule and by hand.
+#
+# Pull requests run the same canaries as steps of the required `Test (windows/...)` jobs in ci.yaml, so this
+# workflow no longer has a pull-request trigger. It stays for the weekly re-measurement and for dispatch.
 #
 # Runs the platform canaries in tests/windows_path_resolution.rs and the elevating ones in
 # tests/windows_shell_execute.rs on real Windows runners; see those files for what is asserted and
@@ -19,35 +22,6 @@
 name: windows-probes
 
 on:
-  # Every change to code whose correctness depends on these facts.
-  pull_request:
-    paths:
-      - "src/child/spawn.rs"
-      - "src/child/spawn/batch_gate.rs"
-      - "src/child/spawn/batch_gate/**"
-      - "src/resolve.rs"
-      - "src/child/spawn/windows_raw.rs"
-      - "src/child/spawn/windows_raw/resolve.rs"
-      - "src/tokio/spawn/windows_raw.rs"
-      - "src/elevation/windows.rs"
-      - "src/elevation/shell_file.rs"
-      - "tests/windows_path_resolution.rs"
-      - "tests/windows_path_resolution/**"
-      - "tests/windows_shell_execute.rs"
-      - "tests/common/windows_probe.rs"
-      # The probes' group declarations and labels.
-      - "src/test_groups.rs"
-      - "src/test_harness.rs"
-      # The canary's payload is built from here.
-      - "testbin/**"
-      # Which `windows` crate features are enabled decides what the probes can call.
-      - "Cargo.toml"
-      - "Cargo.lock"
-      # `terminate-after` and other nextest profile settings the probes' own bounds are chosen against.
-      - ".config/nextest.toml"
-      - ".github/actions/setup-rust/**"
-      - ".github/ci-toolchain"
-      - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
   schedule:
     - cron: "17 5 * * 1"
@@ -81,11 +55,10 @@ permissions:
   contents: read
 
 # A concurrency group holds one pending run, and a newly queued run cancels the pending one
-# whatever `cancel-in-progress` says. Only PR runs may supersede each other; a schedule or dispatch
-# run gets a group of its own so none is ever dropped.
+# whatever `cancel-in-progress` says. Every run gets a group of its own so none is ever dropped.
 concurrency:
-  group: windows-probes-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: windows-probes-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   # The probe groups (principle 9) are off unless a step below opts in; each runner is the sandbox
@@ -101,8 +74,8 @@ env:
 jobs:
   path-resolution:
     name: Path canary (${{ matrix.runner }})
-    # Only a dispatch can opt out, and only by refusing both steps this job can run; pull requests
-    # and the schedule always run it.
+    # Only a dispatch can opt out, and only by refusing both steps this job can run; the schedule
+    # always runs it.
     if: github.event_name != 'workflow_dispatch' || inputs.run_canary || inputs.elevating
     strategy:
       fail-fast: false
@@ -145,8 +118,7 @@ jobs:
       # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without
       # a prompt, and register one volatile App Paths key in HKLM and one in HKCU, deleting each
       # again; a volatile parent key they had to create can stay behind until the runner is gone.
-      # They run on every schedule and pull-request run too, so a change to that code, or a new
-      # Windows build, re-measures it. They measure an ELEVATED caller's launch, not the consent
+      # They run on every schedule run too, so a new Windows build re-measures it. They measure an ELEVATED caller's launch, not the consent
       # route cosca takes from an unelevated one, so the elevated path's rules do not rest on them.
       # These tests share machine-wide state (the App Paths keys) and must not run concurrently
       # with each other. `--no-capture` already forces nextest to run every test in this
