@@ -20,7 +20,9 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      - "build.rs"
       - "src/lib.rs"
+      - "src/log_capture.rs"
       - "src/child/spawn.rs"
       - "src/elevation/shim.rs"
       - "src/elevation/shim/**"
@@ -28,6 +30,8 @@ on:
       - "src/test_*/**"
       - "testbin/main.rs"
       - "testbin/shim_hooks.rs"
+      - ".config/nextest.toml"
+      - ".github/ci-toolchain"
       - ".github/actions/setup-rust/**"
       - ".github/workflows/shim-old-kernels.yaml"
       - ".github/scripts/shim-old-kernel-guest.sh"
