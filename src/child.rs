@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::io::{PipeReader, PipeWriter};
 
+#[cfg(unix)]
+use crate::child::proc_handle::Torn;
 use crate::command::Command;
 use crate::containment::Containment;
 use crate::error::Error;
@@ -15,6 +17,9 @@ pub(crate) mod pump;
 #[path = "child/spawn.rs"]
 pub(crate) mod spawn;
 
+#[cfg(unix)]
+#[path = "child/drop_report.rs"]
+pub(crate) mod drop_report;
 #[path = "child/proc_handle.rs"]
 pub(crate) mod proc_handle;
 #[path = "child/shared.rs"]
@@ -50,6 +55,14 @@ mod kill_tree_view_tests;
 #[cfg(all(test, unix))]
 #[path = "child/drop_reaped_tests.rs"]
 mod drop_reaped_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child/root_state_tests.rs"]
+mod root_state_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child/drop_report_tests.rs"]
+mod drop_report_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
@@ -118,6 +131,11 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
+    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
+    /// retries reports a repeat of it at `debug` and anything new at `warn`
+    /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
+    #[cfg(unix)]
+    reported: Vec<crate::child::drop_report::PartKey>,
 }
 
 impl Child {
@@ -139,6 +157,8 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
+            #[cfg(unix)]
+            reported: Vec::new(),
         }
     }
 
@@ -340,7 +360,7 @@ impl Child {
     ///   and reaped; outside it, or in it with no kill landed, it is running, and is left, as `why`
     ///   says. A place that cannot be read is said so, and is not called running.
     #[cfg(unix)]
-    fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> crate::error::ChildFate {
+    fn tear_down_leaf_and_look_at_front(&mut self, why: &dyn std::fmt::Display) -> Torn {
         use crate::error::ChildFate;
         let pid = self.id.pid();
         // Captured while the leaf exists: it places the front once the leaf is gone.
@@ -362,70 +382,71 @@ impl Child {
         let looked = self.proc.try_wait();
         let reaped = |status: std::process::ExitStatus| {
             log::debug!("Child::drop: elevation front pid {pid} was killed through its cgroup and reaped ({status})");
-            ChildFate::Reaped
+            Torn::new(ChildFate::Reaped)
         };
-        let left = ChildFate::Running { id: Some(self.id) };
+        let running = ChildFate::Running { id: Some(self.id) };
         match looked {
             Ok(Some(status)) => reaped(status),
             Ok(None) => {
                 #[cfg(target_os = "linux")]
-                match subtree {
+                let note = match subtree {
                     Some(Ok(subtree)) => match subtree.reached(pid, self.proc.pidfd()) {
                         // Dying: its kill is pending, so this wait ends.
                         Ok(true) => match self.wait_for_dying_front() {
                             Ok(status) => reaped(status),
                             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
-                                ChildFate::Gone
+                                // The cgroup kill landed first: delivered, so `Killed`.
+                                Torn::new(crate::wait::exit_only::Foreign::Gone.fate(true))
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "Child::drop: elevation front pid {pid} was killed through its cgroup, and could not be \
-                                     reaped ({e})"
-                                );
-                                ChildFate::Killed
-                            }
+                            Err(e) => Torn {
+                                fate: ChildFate::Killed,
+                                left: Some(format!(
+                                    "elevation front pid {pid} was killed through its cgroup, and could not be reaped ({e})"
+                                )),
+                            },
                         },
-                        Ok(false) => {
-                            self.warn_front_left_running(why);
-                            left
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Child::drop: elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), \
-                                 so it is not known whether the cgroup kill ended it"
-                            );
-                            ChildFate::Unknown
-                        }
+                        Ok(false) => Torn {
+                            fate: running,
+                            left: Some(self.front_left_running(why)),
+                        },
+                        Err(e) => Torn {
+                            fate: ChildFate::Unknown,
+                            left: Some(format!(
+                                "elevation front pid {pid} is left unreaped: where it is cannot be read ({e}), so it is \
+                                 not known whether the cgroup kill ended it"
+                            )),
+                        },
                     },
-                    Some(Err(e)) => {
-                        log::warn!(
-                            "Child::drop: elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read \
-                             ({e}), so it is not known whether the cgroup kill ended it"
-                        );
-                        ChildFate::Unknown
-                    }
-                    None => {
-                        self.warn_front_left_running(why);
-                        left
-                    }
-                }
+                    Some(Err(e)) => Torn {
+                        fate: ChildFate::Unknown,
+                        left: Some(format!(
+                            "elevation front pid {pid} is left unreaped: its leaf's subtree cannot be read ({e}), so it \
+                             is not known whether the cgroup kill ended it"
+                        )),
+                    },
+                    None => Torn {
+                        fate: running,
+                        left: Some(self.front_left_running(why)),
+                    },
+                };
                 #[cfg(not(target_os = "linux"))]
-                {
-                    self.warn_front_left_running(why);
-                    left
-                }
+                let note = Torn {
+                    fate: running,
+                    left: Some(self.front_left_running(why)),
+                };
+                note
             }
             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
-                ChildFate::Gone
+                Torn::new(ChildFate::Gone)
             }
-            Err(e) => {
-                log::warn!(
-                    "Child::drop: elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
-                );
-                ChildFate::Unknown
-            }
+            Err(e) => Torn {
+                fate: ChildFate::Unknown,
+                left: Some(format!(
+                    "elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
+                )),
+            },
         }
     }
 
@@ -438,12 +459,12 @@ impl Child {
     }
 
     #[cfg(unix)]
-    fn warn_front_left_running(&self, why: &dyn std::fmt::Display) {
-        log::warn!(
-            "Child::drop: elevation front pid {} is left running and unreaped: {why}, and a kill of the front would \
-             orphan the elevated program",
+    fn front_left_running(&self, why: &dyn std::fmt::Display) -> String {
+        format!(
+            "elevation front pid {} is left running and unreaped: {why}, and a kill of the front would orphan the \
+             elevated program",
             self.id.pid()
-        );
+        )
     }
 
     /// What a forced kill of this child may do (see [`crate::elevation::front`]).
@@ -1017,43 +1038,75 @@ impl Child {
 
     /// The kill-on-drop teardown, answering what became of the child.
     fn tear_down(&mut self) -> crate::error::ChildFate {
-        #[cfg(unix)]
-        use crate::error::ChildFate;
         // Hard-kill the contained tree (if any) — on Linux cgroup.kill reaches an elevated
         // subtree — then tear the direct child down. The dispatcher preserves the Unix
         // kill-before-wait order and NEVER blocks on an unkillable elevated child.
-        //
-        // On Unix, nothing that names the tree by the root's number runs once the root is reaped:
-        // this handle's own reap, or the number no longer reading as this root. A foreign reap
-        // landing after this read is the accepted gap. An unreaped root stays a zombie, pinning
-        // its number, until `teardown_on_drop` below.
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(self.id, self.proc.is_reaped(), &self.tree_killed);
+        {
+            self.drop_unix()
+        }
+        #[cfg(not(unix))]
+        {
+            let mut left = Vec::new();
+            let tree = self.attached.hard_kill();
+            if let Err(e) = &tree {
+                let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
+                    "; the root is killed regardless, so its descendants may be orphaned"
+                } else {
+                    ""
+                };
+                left.push(format!("contained-tree teardown did not fully succeed: {e}{orphaned}"));
+            }
+            let torn = self.proc.teardown_on_drop(self.id);
+            left.extend(torn.left);
+            if !left.is_empty() {
+                log::warn!("Child::drop: {}", left.join("; "));
+            }
+            torn.fate
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Child {
+    /// The kill-on-drop teardown, with one report of the event.
+    ///
+    /// Nothing that names the tree by the root's number runs once the root is reaped, or when its
+    /// handle cannot say: the handle's own answer (`RootState`), or the number no longer reading
+    /// as this root. A foreign reap landing after the read is the accepted gap. An unreaped root
+    /// stays a zombie, pinning its number, until `teardown_on_drop`.
+    fn drop_unix(&mut self) -> crate::error::ChildFate {
+        use crate::child::drop_report::DropReport;
+        use crate::error::ChildFate;
+
+        let view = crate::containment::DropView::read("Child::drop", self.id, || self.proc.state(), &self.tree_killed);
+        let mut report = DropReport::new("Child::drop", &view);
         // A live elevation front gets no signal of its own: outside a cgroup it is left running,
         // unreaped, and named.
-        #[cfg(unix)]
         let cgroup_only = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
-                return self.tear_down_leaf_and_look_at_front(&unkillable);
+                let torn = self.tear_down_leaf_and_look_at_front(&unkillable);
+                report.left.extend(torn.left);
+                report.emit(&self.reported);
+                return torn.fate;
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
         };
-        #[cfg(unix)]
-        let tree = self.attached.hard_kill_for_drop(view);
-        #[cfg(not(unix))]
-        let tree = self.attached.hard_kill();
-        if let Err(e) = &tree {
+        let kill = self.attached.hard_kill_for_drop(&view);
+        report.skipped = kill.skipped;
+        if let Err(e) = &kill.result {
             // A live member refused, or couldn't be confirmed — visible, not silently
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
-            // logged, never asserted on.
-            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
-            if self.attached.hard_kill_refused_to_walk(&tree) {
+            // reported, never asserted on.
+            let mut tree = format!("contained-tree teardown did not fully succeed: {e}");
+            if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-                log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+                tree.push_str("; the root is killed regardless, so its descendants may be orphaned");
             }
+            report.tree = Some(tree);
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
@@ -1061,25 +1114,32 @@ impl Child {
         // never waits, rather than parking a runtime worker, and it must not collect, since tokio
         // owns that child and its own reaping.
         // A reaped root is neither killed nor waited for: its number may name another child by now.
-        #[cfg(unix)]
-        if view.root_reaped {
-            return if self.proc.is_reaped() {
+        // Neither is a root this process does not pin (macOS: launchd holds its zombie). Its fate is
+        // `Reaped` by this handle's own reap, else `Gone`: nothing was signalled, so a root someone
+        // else reaped or launchd holds is `Gone`, as the classifier has it.
+        let fate = if view.leaves_root_alone() {
+            if self.proc.is_reaped() {
                 ChildFate::Reaped
             } else {
                 ChildFate::Gone
+            }
+        } else {
+            let torn = if cgroup_only {
+                match kill.result.and_then(|()| self.cgroup_kill_reached()) {
+                    // The cgroup kill ended it: reap it, sending nothing.
+                    Ok(()) => self.proc.reap_after_tree_kill(),
+                    // Never waited for. The armed leaf still kills what it holds, retrying a kill
+                    // that failed, and the front is looked at once that is done.
+                    Err(e) => self.tear_down_leaf_and_look_at_front(&e),
+                }
+            } else {
+                self.proc.teardown_on_drop(self.id)
             };
-        }
-        #[cfg(unix)]
-        if cgroup_only {
-            return match tree.and_then(|()| self.cgroup_kill_reached()) {
-                // The cgroup kill ended it: reap it, sending nothing.
-                Ok(()) => self.proc.reap_after_tree_kill(),
-                // Never waited for. The armed leaf still kills what it holds, retrying a kill that
-                // failed, and the front is looked at once that is done.
-                Err(e) => self.tear_down_leaf_and_look_at_front(&e),
-            };
-        }
-        self.proc.teardown_on_drop(self.id)
+            report.left.extend(torn.left);
+            torn.fate
+        };
+        report.emit(&self.reported);
+        fate
     }
 }
 

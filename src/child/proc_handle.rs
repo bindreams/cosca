@@ -8,9 +8,25 @@ use std::process::ExitStatus;
 use std::time::Instant;
 
 use super::shared::SharedChild;
+use crate::error::ChildFate;
 
 #[cfg(windows)]
 use super::spawn::windows_raw::RawChild;
+
+/// What a teardown of the root did: the child's fate, and what it could not do, for the event's one
+/// warn (a child it could not signal and left running, a reap that failed after the kill).
+#[derive(Debug)]
+pub(crate) struct Torn {
+    pub(crate) fate: ChildFate,
+    pub(crate) left: Option<String>,
+}
+
+impl Torn {
+    /// A teardown with nothing to warn of.
+    pub(crate) fn new(fate: ChildFate) -> Torn {
+        Torn { fate, left: None }
+    }
+}
 
 /// The process backend behind an owned [`Child`](super::Child).
 #[derive(Debug)]
@@ -38,14 +54,22 @@ impl ProcHandle {
     /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
-    /// `Raw` (Windows) reads the process handle's signalled state: nothing is consumed there.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    /// `Raw` (Windows) reads the reap its own wait recorded: nothing is consumed there, so an exit
+    /// nobody waited on yet is not a reap.
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
             ProcHandle::Std(s) => s.is_reaped(),
             #[cfg(windows)]
             ProcHandle::Raw(r) => r.is_reaped(),
         }
+    }
+
+    /// Whether the root is still this handle's child to act on; see
+    /// [`RootState`](crate::signal::RootState).
+    #[cfg(unix)]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        let ProcHandle::Std(s) = self;
+        s.state()
     }
 
     /// Block until the child exits.
@@ -113,23 +137,27 @@ impl ProcHandle {
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
+    /// Returns a failed reap for the caller's one warn, as [`teardown_on_drop`](Self::teardown_on_drop)
+    /// does.
     #[cfg(unix)]
-    pub(crate) fn reap_after_tree_kill(&self) -> crate::error::ChildFate {
+    pub(crate) fn reap_after_tree_kill(&self) -> Torn {
         use crate::error::ChildFate;
         match self {
             ProcHandle::Std(s) => {
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
                 match s.wait() {
-                    Ok(_) => ChildFate::Reaped,
-                    Err(e) => {
-                        log_teardown_wait_failure(s.id(), &e);
-                        if e.raw_os_error() == Some(libc::ECHILD) {
-                            ChildFate::Gone
+                    Ok(_) => Torn::new(ChildFate::Reaped),
+                    // The tree kill was delivered: a wait that finds the exit collected elsewhere, or
+                    // fails, is `Killed` (see `Foreign::fate`).
+                    Err(e) => Torn {
+                        fate: if e.raw_os_error() == Some(libc::ECHILD) {
+                            crate::wait::exit_only::Foreign::Gone.fate(true)
                         } else {
                             ChildFate::Killed
-                        }
-                    }
+                        },
+                        left: teardown_wait_failure(s.id(), &e),
+                    },
                 }
             }
         }
@@ -151,7 +179,11 @@ impl ProcHandle {
     /// setuid helper, or `sudo` spawned with no `.elevate()`) also returns EPERM, and
     /// keying on a request flag would take the blocking `wait()` and hang Drop forever.
     /// The Windows `Raw` arm handles its own higher-integrity runas case via its flag.
-    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::error::ChildFate {
+    ///
+    /// Returns the child's fate, and what it could not do for the caller's one warn: a child it
+    /// could not signal and left running, or a reap that failed after the kill. It logs neither
+    /// above `debug`. (The Windows `Raw` arm still logs its own refusal.)
+    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> Torn {
         use crate::error::ChildFate;
         #[cfg(all(test, unix))]
         crate::child::fault::note_root_teardown();
@@ -170,31 +202,46 @@ impl ProcHandle {
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
                     StdTeardown::ReapBlocking => match s.wait() {
-                        Ok(_) => ChildFate::Reaped,
+                        Ok(_) => Torn::new(ChildFate::Reaped),
                         Err(e) => {
-                            log_teardown_wait_failure(s.id(), &e);
+                            let left = teardown_wait_failure(s.id(), &e);
                             #[cfg(unix)]
                             if e.raw_os_error() == Some(libc::ECHILD) {
                                 // Delivered, the kill is `Killed`; found nothing to signal, `Gone`.
-                                return crate::wait::exit_only::Foreign::Gone.fate(delivered);
+                                return Torn {
+                                    fate: crate::wait::exit_only::Foreign::Gone.fate(delivered),
+                                    left,
+                                };
                             }
-                            ChildFate::Killed
+                            // A failed wait shows what became of the child only if the kill was delivered.
+                            #[cfg(unix)]
+                            let fate = if delivered {
+                                ChildFate::Killed
+                            } else {
+                                ChildFate::Unknown
+                            };
+                            #[cfg(not(unix))]
+                            let fate = ChildFate::Killed;
+                            Torn { fate, left }
                         }
                     },
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
-                    // child is still running (an elevated child we cannot signal), warn.
+                    // child is still running (an elevated child we cannot signal), report it.
                     StdTeardown::ReapNonBlocking => {
                         let looked = s.try_wait();
                         let still_running = !matches!(looked, Ok(Some(_)));
                         let permission_denied =
                             matches!(&kill_result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied);
-                        if still_running && permission_denied {
-                            log::warn!(
+                        let left = (still_running && permission_denied).then(|| {
+                            format!(
                                 "elevated child {} could not be terminated on drop (permission denied); leaving it running",
                                 s.id()
-                            );
+                            )
+                        });
+                        Torn {
+                            fate: crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id)),
+                            left,
                         }
-                        crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id))
                     }
                 }
             }
@@ -205,16 +252,18 @@ impl ProcHandle {
 }
 
 /// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected
-/// and quiet; anything else leaves a zombie or an unread exit, and is a `warn`.
-fn log_teardown_wait_failure(pid: u32, e: &io::Error) {
+/// and logged at `debug`; anything else leaves a zombie or an unread exit, and is returned for the
+/// caller's warn.
+fn teardown_wait_failure(pid: u32, e: &io::Error) -> Option<String> {
     #[cfg(unix)]
     let gone = e.raw_os_error() == Some(libc::ECHILD);
     #[cfg(windows)]
     let gone = false;
     if gone {
         log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
+        None
     } else {
-        log::warn!("teardown of child {pid}: the reap after the kill failed: {e}");
+        Some(format!("teardown of child {pid}: the reap after the kill failed: {e}"))
     }
 }
 

@@ -137,6 +137,7 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
         }
     });
     let outcome = cmd.spawn();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
@@ -195,12 +196,18 @@ fn macos_sync_spawn_identity_with_a_refused_reread_is_unassessable() {
         "the child is left, its identity unread"
     );
     assert!(left, "the child must be left running, unreaped");
+    // The failed re-read and the teardown that leaves the child are one event: one warn.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            "could not be checked against its handle (forced re-read refusal 5d1b)"
-        ),
-        "the failed re-read is warned at the call, naming its own error"
+        warns[0]
+            .1
+            .contains("could not be checked against its handle (forced re-read refusal 5d1b)")
+            && warns[0].1.contains("leaving it unreaped"),
+        "the one warn names the failed re-read and what became of the child: {warns:?}"
     );
 }
 
@@ -232,9 +239,18 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
         "a hold by launchd has exited, and says its zombie is held: {err:?}"
     );
     assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
+    // The hold and the teardown that leaves the child are one event: one warn.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        crate::log_capture::contains_since(mark, &format!("child {}: launchd holds its zombie", pid.get())),
-        "the hold is warned at the call, naming the pid"
+        warns[0]
+            .1
+            .contains(&format!("child {}: launchd holds its zombie", pid.get()))
+            && warns[0].1.contains("reaped by someone else"),
+        "the one warn names the hold and the pid, and what became of the child: {warns:?}"
     );
 }
 
@@ -513,15 +529,19 @@ fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_
     assert_eq!(fate, crate::error::ChildFate::Gone, "another process holds the pid");
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Debug], "{records:?}");
-    assert!(records[1].1.contains("reaped by someone else"), "{records:?}");
+    // The debug lines come as they happen; the one warn comes last, with everything noted.
+    assert_eq!(levels, vec![log::Level::Debug, log::Level::Warn], "{records:?}");
+    assert!(records[0].1.contains("reaped by someone else"), "{records:?}");
+    assert!(records[1].1.contains("could not be killed"), "{records:?}");
     end_unsignalled_and_reap(pid);
 }
 
 /// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Gone`, with a `warn`
-/// saying so, not a `debug` claim of a foreign reap.
+/// saying so, not a `debug` claim of a foreign reap. The refused kill and the unverifiable reap are
+/// one event, so they share one warn.
 ///
-/// Mutants: `Foreign::Orphaned` is logged as a reaped-by-someone-else `debug`; or it is `Unknown`.
+/// Mutants: `Foreign::Orphaned` is logged as a reaped-by-someone-else `debug`; or it is `Unknown`; the
+/// kill and the reap warn separately.
 #[skuld::test]
 fn macos_attach_failure_teardown_of_an_orphaned_child_is_gone_and_warns() {
     use crate::wait::exit_only::{Foreign, Peek};
@@ -533,17 +553,28 @@ fn macos_attach_failure_teardown_of_an_orphaned_child_is_gone_and_warns() {
     let _refused = refuse_the_kill();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     let fate = teardown(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
-    assert!(records[1].1.contains("launchd holds its zombie"), "{records:?}");
+    assert_eq!(
+        levels,
+        vec![log::Level::Warn],
+        "one warn for the one event: {records:?}"
+    );
+    assert!(
+        records[0].1.contains("could not be killed")
+            && records[0].1.contains("cannot be shown to be ours")
+            && records[0].1.contains("launchd holds its zombie"),
+        "{records:?}"
+    );
     end_unsignalled_and_reap(pid);
 }
 
-/// An id read the OS refuses (a MACF denial) is not shown ours or reaped: a `warn`, and `Unknown`.
+/// An id read the OS refuses (a MACF denial) is not shown ours or reaped: a `warn`, shared with the
+/// refused kill, and `Unknown`.
 ///
-/// Mutant: the reap is unverified, so a refusal reads as `Running` or as a reap by another party.
+/// Mutants: the kill and the reap warn separately; the reap is unverified, so a refusal reads as `Running` or as a reap by another party.
 #[skuld::test]
 fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown_ours() {
     crate::log_capture::install();
@@ -556,8 +587,15 @@ fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown
     assert_eq!(fate, crate::error::ChildFate::Unknown, "a refused read shows nothing");
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
-    assert!(records[1].1.contains("cannot be shown to be ours"), "{records:?}");
+    assert_eq!(
+        levels,
+        vec![log::Level::Warn],
+        "one warn for the one event: {records:?}"
+    );
+    assert!(
+        records[0].1.contains("could not be killed") && records[0].1.contains("cannot be shown to be ours"),
+        "{records:?}"
+    );
     end_unsignalled_and_reap(pid);
 }
 
@@ -616,6 +654,7 @@ fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     let fate = teardown(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(
         fate,
         crate::error::ChildFate::Killed,

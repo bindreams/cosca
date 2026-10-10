@@ -60,6 +60,7 @@ async fn macos_tokio_spawn_identity_with_a_different_unique_id_is_gone() {
         }
     });
     let outcome = cmd.spawn();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
@@ -84,6 +85,8 @@ async fn macos_tokio_spawn_identity_held_by_launchd_is_gone() {
         let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
         move || arm_launchd_hold(&pid, &armed, writer)
     });
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let outcome = cmd.spawn();
     drop(armed);
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
@@ -94,6 +97,18 @@ async fn macos_tokio_spawn_identity_held_by_launchd_is_gone() {
         "a hold by launchd has exited, and says its zombie is held: {err:?}"
     );
     assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
+    // The hold and the teardown that forgets the child are one event: one warn.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0]
+            .1
+            .contains(&format!("child {}: launchd holds its zombie", pid.get())),
+        "the one warn names the hold and the pid: {warns:?}"
+    );
 }
 
 /// As the sync twin: the failed re-read fails the spawn `Unassessable` and warns. Nothing pins
@@ -134,12 +149,18 @@ async fn macos_tokio_spawn_identity_with_a_refused_reread_is_unassessable_and_le
         crate::error::ChildFate::Running { id: None },
         "the child is left, its identity unread"
     );
+    // The failed re-read and the forget that leaves the child are one event: one warn.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            "could not be checked against its handle (forced re-read refusal 5d1b)"
-        ),
-        "the failed re-read is warned at the call, naming its own error"
+        warns[0]
+            .1
+            .contains("could not be checked against its handle (forced re-read refusal 5d1b)")
+            && warns[0].1.contains("leaks"),
+        "the one warn names the failed re-read and the leak: {warns:?}"
     );
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");

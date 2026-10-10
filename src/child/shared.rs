@@ -275,9 +275,36 @@ impl SharedChild {
 
     /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
     /// someone else is not seen here.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lock().state, State::E(_))
+    }
+
+    /// Whether the root is still this handle's child to act on, from the handle's own evidence,
+    /// read under the lock so none of our reaps lands between the state and the peek.
+    ///
+    /// A peek through the handle decides (Linux: the pidfd; macOS: the pid, checked against its
+    /// unique id, with an unreadable id on a running child an error).
+    #[cfg(unix)]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        use crate::signal::RootState;
+        let lock = self.lock();
+        if matches!(lock.state, State::E(_)) {
+            return RootState::Reaped;
+        }
+        let Some(target) = self.target() else {
+            #[cfg(not(test))]
+            debug_assert!(false, "a production child always holds its handle");
+            log::debug!(
+                "child {} has no handle (it was gone when adopted); treating it as reaped",
+                self.id()
+            );
+            return RootState::Reaped;
+        };
+        #[cfg(target_os = "macos")]
+        let peeked = exit_only::peek_verified(&target);
+        #[cfg(not(target_os = "macos"))]
+        let peeked = exit_only::peek(&target);
+        RootState::of_peek(peeked)
     }
 
     /// The unique id this handle checks its by-pid actions against. Tests only.

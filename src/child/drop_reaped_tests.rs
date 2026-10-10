@@ -367,9 +367,12 @@ fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
 }
 
 /// A failed elevated spawn's cleanup kills the tree, then kills and reaps the root, then drops the
-/// handle: an internal path with no call order for the user to change.
+/// handle: an internal path with no call order for the user to change, and a handle the caller never
+/// received. It is disarmed, so the drop says nothing at all.
+///
+/// Mutant: the cleanup leaves the handle armed (the drop logs its skip).
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_drops_its_handle_at_debug() {
+fn a_failed_elevated_spawns_cleanup_drops_its_handle_silently() {
     crate::log_capture::install();
     let recorder = record_kill_group();
     let child = session(&["sleep", "300"]).spawn().expect("spawn");
@@ -390,7 +393,7 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_at_debug() {
         "the group's kill and the root's reap"
     );
     recorder.assert_killed_only(pid as i32);
-    assert_skipped_at_debug(mark);
+    assert_eq!(crate::log_capture::records_since_on_current_thread(mark, WARN), []);
 }
 
 /// A `kill_tree` that failed may have left members running, so the drop still warns. Mutant: the
