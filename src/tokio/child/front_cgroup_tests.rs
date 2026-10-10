@@ -14,6 +14,7 @@ use crate::child::front_cgroup_tests::{
 };
 use crate::child::front_kill_tests::assert_unkillable_front;
 use crate::elevation::{Backend, ElevatedVia};
+use crate::error::ChildFate;
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
@@ -315,6 +316,12 @@ async fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(
         }),
     )
     .expect_err("a failed write fails the spawn");
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the cgroup kill ended the front and the teardown reaped it"
+    );
     let rendered = err.to_string();
     assert!(rendered.contains("the elevated child was terminated"), "{rendered}");
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
@@ -405,6 +412,12 @@ async fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _g
         }),
     )
     .expect_err("a failed write fails the spawn");
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the cgroup kill ended the front and the teardown reaped it"
+    );
     assert!(err.to_string().contains("the elevated child was terminated"), "{err}");
     assert_eq!(gates.count(), 1);
 }
@@ -423,7 +436,9 @@ async fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cg
     use crate::child::front_cgroup_tests::{assert_killed_by_the_leaf, failed_held_front_spawns, LeafKill};
     let _running = crate::child::spawn::fault::see_fronts_running();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
-    let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
+    });
     assert_killed_by_the_leaf(&failures, &reaps);
 }
 
@@ -434,7 +449,9 @@ async fn cgroup_a_failed_spawn_whose_leaf_kill_fails_leaves_the_front_running(#[
     let kill = LeafKill::Fails;
     assert_left_running(
         kill,
-        failed_held_front_spawns(kill, |cmd| crate::tokio::spawn::spawn(cmd).map(drop)),
+        failed_held_front_spawns(kill, |cmd| {
+            crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
+        }),
     );
 }
 
@@ -445,7 +462,9 @@ async fn cgroup_a_failed_spawn_leaves_a_front_moved_out_of_its_leaf_running(#[fi
     let kill = LeafKill::MissesMovedFront;
     assert_left_running(
         kill,
-        failed_held_front_spawns(kill, |cmd| crate::tokio::spawn::spawn(cmd).map(drop)),
+        failed_held_front_spawns(kill, |cmd| {
+            crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
+        }),
     );
 }
 
@@ -456,7 +475,7 @@ async fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fi
     let _running = crate::child::spawn::fault::see_fronts_running();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop)
+        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
     assert_killed_by_the_leaf(&failures, &reaps);
 }
@@ -468,7 +487,9 @@ async fn cgroup_a_failed_spawn_leaves_a_front_in_a_namesake_of_its_leaf_running(
     let kill = LeafKill::MissesIntoNamesake;
     assert_left_running(
         kill,
-        failed_held_front_spawns(kill, |cmd| crate::tokio::spawn::spawn(cmd).map(drop)),
+        failed_held_front_spawns(kill, |cmd| {
+            crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
+        }),
     );
 }
 
@@ -498,7 +519,7 @@ async fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid
     let _running = crate::child::spawn::fault::see_fronts_running();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| {
-        crate::tokio::spawn::spawn(cmd).map(drop)
+        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
     assert_killed_by_the_leaf(&failures, &reaps);
 }
@@ -511,7 +532,8 @@ async fn cgroup_a_front_whose_leaf_gives_no_id_is_refused_before_its_fork(#[fixt
     let mut cmd = crate::command::Command::new();
     cmd.args(["cat"]).contain_with(ContainMode::Strongest);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let (result, forked) =
+        spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into));
     assert_refused_unforked_naming(result, forked, "name_to_handle_at");
 }
 
@@ -522,7 +544,8 @@ async fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_
 ) {
     use crate::child::front_cgroup_tests::assert_front_refused_by_its_cgroup_kill;
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pid = child.id().pid();
+    let id = child.id();
+    let pid = id.pid();
     let pidfd = pidfd_of(pid);
     let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {
         panic!("expected a cgroup leaf, got {:?}", child.os.attached);
@@ -539,6 +562,12 @@ async fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_
         )
         .expect_err("a failed write fails the spawn")
     };
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Running { id: Some(id) },
+        "a front its cgroup kill did not end may be running"
+    );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
     drop(stdin);
     assert_eq!(ended(&pidfd), Some((Some(0), None)), "the front was signalled");
@@ -557,7 +586,8 @@ async fn cgroup_an_unplaceable_front_is_refused_before_its_fork(#[fixture(cgroup
         .contain_with(ContainMode::Strongest)
         .kill_on_drop(true);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let (result, forked) =
+        spawn_front_noting_fork(cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into));
     assert_refused_unforked(result, forked);
 }
 
@@ -587,15 +617,19 @@ fn fail_a_contained_front_spawn(
         [],
         "the abandonment signals no front"
     );
-    (err, pid)
+    (err.into(), pid)
 }
 
 /// `err` keeps its `Io` variant and notes, once, the front's `fate`.
 #[track_caller]
-fn assert_front_noted(err: &crate::error::Error, fate: &str) {
-    let crate::error::Error::Io(io) = err else {
+fn assert_front_noted(err: &crate::error::Error, fate: &str, expected: ChildFate) {
+    let crate::error::Error::MayHaveStarted { source, fate: got, .. } = err else {
+        panic!("the spawn may have started: {err:?}");
+    };
+    let crate::error::Error::Io(io) = &**source else {
         panic!("the spawn's error keeps its variant: {err:?}");
     };
+    assert_eq!(*got, expected, "what the failed spawn did with the front: {err:?}");
     assert_eq!(io.raw_os_error(), None, "noted, with the original as its source: {io}");
     let text = err.to_string();
     assert_eq!(text.matches("the spawned child is what sudo left").count(), 1, "{text}");
@@ -611,7 +645,7 @@ async fn cgroup_a_contained_front_tokio_drops_is_killed_through_its_leaf_and_rea
     let _running = crate::child::spawn::fault::see_fronts_running();
     let (reader, writer) = std::io::pipe().expect("pipe");
     let (err, pid) = fail_a_contained_front_spawn(reader, |_| {});
-    assert_front_noted(&err, "its cgroup's kill ended it, and it was reaped");
+    assert_front_noted(&err, "its cgroup's kill ended it, and it was reaped", ChildFate::Reaped);
     drop(writer);
     assert_eq!(reap(pid), None, "the abandonment reaps the front");
 }
@@ -633,7 +667,11 @@ async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixtur
         move || drop(writer.borrow_mut().take())
     });
     let (err, pid) = fail_a_contained_front_spawn(reader, move_out_of_its_leaf);
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Running { id: None },
+    );
     assert!(
         writer.borrow().is_some(),
         "the abandonment waited on a front outside its leaf"
@@ -654,7 +692,11 @@ async fn cgroup_a_contained_front_that_exited_outside_its_leaf_is_reaped(#[fixtu
         drop(writer);
         crate::test_child::wait_until_zombie(pid);
     });
-    assert_front_noted(&err, "it had exited, or its cgroup's kill ended it, and it was reaped");
+    assert_front_noted(
+        &err,
+        "it had exited, or its cgroup's kill ended it, and it was reaped",
+        ChildFate::Reaped,
+    );
     assert_eq!(reap(pid), None, "the abandonment reaps the exited front");
 }
 
@@ -689,7 +731,11 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
             }
         })
     };
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Running { id: None },
+    );
     assert!(
         writer.borrow().is_some(),
         "the abandonment waited on a front no kill reached"
@@ -705,7 +751,9 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
 #[skuld::test]
 async fn cgroup_a_front_its_leaf_did_not_take_is_left_by_a_failed_identity_check(#[fixture(cgroup)] _group: &Group) {
     let (mut cmd, stdin) = front_its_leaf_did_not_take();
-    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| crate::tokio::spawn::spawn(cmd).map(drop));
+    let (err, pid) = fail_the_identity_check(&mut cmd, |cmd| {
+        crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
+    });
     assert_left_unsignalled(&err, pid, stdin);
 }
 
@@ -723,6 +771,12 @@ async fn cgroup_a_front_its_leaf_did_not_take_is_left_when_tokio_drops_it(#[fixt
             .map(drop)
             .expect_err("the forced failure fails the spawn")
     };
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        ChildFate::Running { id: None },
+        "a front its leaf did not take is left unreaped"
+    );
     let pid = fault::take_forgotten_pid().expect("the seam forked a child");
     let crate::error::Error::Io(io) = &err else {
         panic!("the spawn's error keeps its variant: {err:?}");
@@ -768,7 +822,7 @@ fn fail_a_contained_front_spawn_where(
     leaf_fault::take_force_child_pidfd_failure();
     leaf_fault::take_force_child_proc_dir_failure();
     let pid = fault::take_forgotten_pid().expect("the seam forked a child");
-    (err, pid)
+    (err.into(), pid)
 }
 
 /// A contained front whose intent named it by no handle (both its `pidfd_open` and its `/proc` open
@@ -905,7 +959,11 @@ async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_nami
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Unknown,
+    );
     // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.
     drop(writer);
     let status = reap(pid).expect("the front was left unreaped");

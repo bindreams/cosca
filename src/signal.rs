@@ -36,8 +36,19 @@ impl Sig {
 pub(crate) enum Sent {
     /// The signal was handed to the OS for the child.
     Delivered,
-    /// Nothing was delivered because the child is gone. Not an error; logged at `debug`.
+    /// Nothing was delivered because the child is gone: reaped, or its pid no longer names it. Not
+    /// an error; logged at `debug`.
     Gone,
+    /// Nothing was delivered because there was nothing to verify the pid against (macOS: no unique
+    /// id is held). The child may be running. Not an error; logged at `debug`.
+    #[cfg_attr(
+        not(any(target_os = "macos", all(unix, feature = "tokio"))),
+        allow(
+            dead_code,
+            reason = "only macOS's by-pid send and tokio's forgotten backend cannot verify a process"
+        )
+    )]
+    Unverified,
 }
 
 /// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit.
@@ -104,7 +115,7 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     };
     let Some(expected) = identity else {
         log::debug!("child {pid} holds no unique id; {sig:?} not sent");
-        return Ok(Sent::Gone);
+        return Ok(Sent::Unverified);
     };
     match uniq_info(pid, ReadPurpose::Kill) {
         UniqRead::Found(now) if now.unique_id == expected => {}

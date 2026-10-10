@@ -2,8 +2,9 @@
 //! (`crate::child::spawn::fault`). In the library (not `tests/`) because the seam is
 //! `pub(crate)`/`#[cfg(test)]` and only reachable from within the crate.
 
+use crate::child::spawn::failure::{expect_may_have_started_with, expect_not_started};
 use crate::child::spawn::fault;
-use crate::error::Error;
+use crate::error::{ChildFate, Error};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 use crate::tokio::Command;
@@ -46,7 +47,14 @@ async fn identity_failure_reaps_the_spawned_child() {
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
 
-    let err = err.expect("forced identity-vanish must make spawn return Err");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        err.expect("forced identity-vanish must make spawn return Err"),
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the teardown killed and reaped the child"
+    );
     assert!(
         matches!(err, Error::Io(_)),
         "identity-vanish surfaces as an Io error, got {err:?}"
@@ -64,7 +72,8 @@ async fn attach_failure_reaps_the_spawned_child() {
     let err = cmd.spawn().err();
     fault::set_force_attach_failure(false);
 
-    let err = err.expect("forced attach failure must make spawn return Err");
+    let (err, fate) = expect_may_have_started_with(err.expect("forced attach failure must make spawn return Err"));
+    assert_eq!(fate, ChildFate::Reaped, "the teardown killed and reaped the child");
     assert!(
         matches!(err, Error::Containment { .. }),
         "a real attach failure surfaces as Error::Containment, got {err:?}"
@@ -90,27 +99,25 @@ async fn a_bare_exact_name_loads_the_file_in_the_childs_cwd_not_one_on_path() {
 }
 
 /// tokio can fail a spawn after its fork succeeded (`build_child`: stdio registration, its pidfd
-/// reaper, its signal driver), dropping the child neither killed nor reaped. The spawn's cgroup
-/// leaf then drops with that child alive and possibly in it: it must be killed through, not left
-/// running in a leaked leaf.
+/// reaper, its signal driver), dropping the child neither killed nor reaped. The spawn's handshake
+/// pidfd then kills and reaps it, so no live child is left in the spawn's cgroup leaf, and the
+/// answer says it was reaped.
+///
+/// Mutant: the handshake leaves the dropped child, or answers another fate.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn cgroup_a_post_fork_tokio_failure_leaves_no_live_child_in_a_leaked_leaf(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = blocker();
     cmd.contain();
-    fault::set_force_post_fork_failure(true);
-    assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
+    let (_err, fate) = {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        expect_may_have_started_with(cmd.spawn().expect_err("the forced failure must fail the spawn"))
+    };
+    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     let leaf = fault::take_forgotten_leaf().expect("the dropped spawn was contained in a leaf");
 
     let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
-
-    // Nothing owns the child any more, so the dropped leaf must both kill and reap it.
-    let reaped = crate::containment::cgroup::fault::take_reaped_orphans();
-    assert!(
-        reaped.contains(&(pid, Some(libc::SIGKILL))),
-        "the child {pid} in the dropped leaf must be killed, got {reaped:?}"
-    );
     assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
     // An empty leaf `Drop` could not remove right after its kill is a known exit-lag gap, not this:
     // no leaf of this spawn may still hold a live process.
@@ -216,9 +223,12 @@ fn drive_until_reaped(
     }
 }
 
-/// A tokio spawn that fails with no cgroup leaf to kill through says a forked child may have been
-/// left running out of reach — tokio can drop a child it forked and return no pid. Here the seam
-/// forces that failure under a tree walk, which holds no leaf.
+/// A tokio spawn that fails with no cgroup leaf to kill through warns that a forked child may have
+/// been left running out of reach, unless its spawn collected it: tokio can drop a child it forked
+/// and return no pid. Here the failure comes under a tree walk, which holds no leaf, and the
+/// handshake's pidfd reaps the child: the answer says so.
+///
+/// Mutant: the handshake leaves the dropped child, or the warning is dropped.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreachable() {
@@ -227,18 +237,21 @@ async fn a_post_fork_tokio_failure_without_a_leaf_says_the_child_may_be_unreacha
     let mut cmd = blocker();
     cmd.contain_with(crate::ContainMode::TreeWalk);
     let mark = crate::log_capture::mark();
-    fault::set_force_post_fork_failure(true);
-    assert!(cmd.spawn().is_err(), "the forced failure must fail the spawn");
+    let (_err, fate) = {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        expect_may_have_started_with(cmd.spawn().expect_err("the forced failure must fail the spawn"))
+    };
+    assert_eq!(fate, ChildFate::Reaped, "killed and reaped through its pidfd");
     let pid = fault::take_forgotten_pid().expect("the seam dropped a child");
     assert!(
-        warned_for(mark, pid, "nothing can reach it"),
+        crate::log_capture::records_since(mark, "nothing can reach it")
+            .iter()
+            .zip(crate::log_capture::levels_since(mark, "nothing can reach it"))
+            .any(|(_, level)| level == log::Level::Warn),
         "the failure must say the child may be left running"
     );
-
-    // The seam's child is still this process's unreaped child, so its pid is safe to signal.
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).expect("kill the dropped child");
-    nix::sys::wait::waitpid(pid, None).expect("reap the dropped child");
+    let pidfd = fault::take_forgotten_pidfd().expect("the seam took a pidfd for the child");
+    assert!(reaped_through(&pidfd), "the child {pid} must be reaped");
 }
 
 /// The abandoned-child warning is at `warn` on every call, including a repeat, through the real
@@ -253,8 +266,8 @@ fn the_unreachable_child_warning_is_every_time() {
 
     for child in [AbandonedChild::MaybeUnreachable, AbandonedChild::MaybeUnreaped] {
         let mark = crate::log_capture::mark();
-        _ = super::abandoned_error(child, error(), None);
-        _ = super::abandoned_error(child, error(), None);
+        super::warn_for_abandoned(child, &error());
+        super::warn_for_abandoned(child, &error());
 
         assert_eq!(
             crate::log_capture::levels_since(mark, marker),
@@ -274,7 +287,7 @@ fn ended_abandoned_child_logs_nothing() {
     let marker = "cosca-abandoned-ended-probe-3a17";
 
     let mark = crate::log_capture::mark();
-    _ = super::abandoned_error(AbandonedChild::Ended, error, None);
+    super::warn_for_abandoned(AbandonedChild::Ended, &error);
 
     assert_eq!(crate::log_capture::levels_since(mark, marker), Vec::<log::Level>::new());
 }
@@ -650,7 +663,10 @@ async fn a_failed_password_write_kills_the_contained_tree() {
 
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     assert!(
@@ -719,7 +735,10 @@ async fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
 
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
     leaf_fault::take_drain_blocking_notifier();
     exiting.join().expect("the exiting thread");
@@ -760,7 +779,10 @@ async fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
     assert!(
         matches!(
@@ -818,7 +840,11 @@ async fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let err = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    let (err, fate) = err;
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "killed and reaped");
     teardown.assert_killed();
 
     let reaped = reaped(pid);
@@ -850,7 +876,10 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
@@ -897,7 +926,10 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
             detail: "forced password-write failure".into(),
         }),
     )
-    .expect_err("the spawn fails");
+    .expect_err("the spawn fails")
+    .expect_may_have_started_with();
+    let (err, fate) = err;
+    assert_eq!(fate, crate::error::ChildFate::Gone, "reaped by someone else");
 
     let Error::Elevation { detail, .. } = err else {
         panic!("expected an Elevation error, got {err:?}");
@@ -909,4 +941,215 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
     );
     assert!(detail.contains("process group"), "{detail}");
     assert!(detail.contains("already reaped"), "{detail}");
+}
+
+// Whether the program could have started =====
+
+/// A refusal before the fork, here of a merge into a merge, did not start the program.
+///
+/// Mutant: stdio resolution answers that the program may have started.
+#[skuld::test]
+async fn a_refused_stdio_setup_did_not_start_the_program() {
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdout(crate::stdio::Stdio::merge(crate::stdio::Fd::STDERR))
+        .expect("stdout");
+    cmd.stderr(crate::stdio::Stdio::merge(crate::stdio::Fd::STDOUT))
+        .expect("stderr");
+    let err = expect_not_started(cmd.spawn().expect_err("a merge into a merge is refused"));
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+/// A failed exec through tokio may have started the program, on every platform: tokio can fail a
+/// spawn after std's succeeded, and its error does not say which failed.
+///
+/// Mutant: a failed tokio spawn answers that the program did not start.
+#[skuld::test]
+async fn a_failed_exec_may_have_started_the_program() {
+    let mut cmd = Command::new();
+    cmd.args(["cosca-no-such-program-142"]);
+    let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
+    // Linux's handshake finds std had collected the child whose exec failed. Elsewhere nothing holds
+    // it, so it may be running.
+    let expected = if cfg!(target_os = "linux") {
+        ChildFate::Gone
+    } else {
+        ChildFate::Running { id: None }
+    };
+    assert_eq!(fate, expected);
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+        "{err:?}"
+    );
+}
+
+/// `output`, `status` and `read` say the program may have started for any failure after the spawn:
+/// here `read`'s invalid UTF-8.
+///
+/// Mutant: a failure after the spawn returns its cause bare.
+#[cfg(unix)]
+#[skuld::test]
+async fn run_to_completion_failures_after_the_spawn_may_have_started() {
+    let mut cmd = Command::new();
+    cmd.args(["printf", "\\377"]);
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        cmd.read().await.expect_err("invalid UTF-8 fails `read`"),
+    );
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "`read` collected the exit");
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+        "{err:?}"
+    );
+}
+
+/// Outside a runtime, a tokio spawn is refused before anything is made.
+///
+/// Mutant: the refusal answers that the program may have started.
+#[skuld::test]
+fn a_spawn_outside_a_runtime_did_not_start_the_program() {
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    expect_not_started(cmd.spawn().expect_err("no runtime, no spawn"));
+}
+
+/// A command with no program is refused before anything is made.
+///
+/// Mutant: building the `std` command answers that the program may have started.
+#[skuld::test]
+async fn a_command_with_no_program_did_not_start() {
+    let err = expect_not_started(Command::new().spawn().expect_err("no program, no spawn"));
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+}
+
+/// An elevated spawn its backend cannot express is refused before any backend runs.
+///
+/// Mutant: the elevation rewrite answers that the program may have started.
+#[cfg(unix)]
+#[skuld::test]
+async fn an_elevation_refused_for_its_shape_did_not_start() {
+    let mut cmd = Command::new();
+    cmd.args(["/bin/sh", "-c", "true"]).elevate();
+    cmd.fd(3, crate::stdio::Stdio::null()).expect("fd 3");
+    let err = expect_not_started(cmd.spawn().expect_err("fd >= 3 is refused under elevation"));
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+/// Linux: a pidfd handshake whose channel cannot be made fails before the fork.
+///
+/// Mutant: the handshake's `open` answers that the program may have started.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_handshake_that_cannot_open_did_not_start() {
+    let _armed = crate::child::spawn::pidfd_handshake::fault::fail_done_fd(rustix::io::Errno::MFILE);
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
+    assert!(
+        matches!(err, Error::Io(ref e) if e.to_string() == format!("eventfd: {}", std::io::Error::from_raw_os_error(libc::EMFILE))),
+        "{err:?}"
+    );
+}
+
+/// Windows: a creation flag the std path refuses is refused in `prepare`, before `CreateProcess`.
+///
+/// Mutant: `prepare` answers that the program may have started.
+#[cfg(windows)]
+#[skuld::test]
+async fn a_refused_creation_flag_did_not_start_the_program() {
+    let mut cmd = Command::new();
+    cmd.args(["cmd", "/C", "exit 0"])
+        .contain()
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
+    let err = expect_not_started(cmd.spawn().expect_err("a reserved bit must be refused"));
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+// The fate of a child a failed spawn abandoned with no handle on it =====
+
+/// Off Linux nothing says more of an abandoned child than that it may be running out of reach.
+///
+/// Mutant: the arm answers another fate, or drops the identity-less `Running`.
+#[cfg(not(target_os = "linux"))]
+#[skuld::test]
+fn an_abandoned_child_nothing_reaches_may_be_running() {
+    use crate::containment::AbandonedChild;
+    assert_eq!(
+        super::abandoned_fate(AbandonedChild::MaybeUnreachable),
+        ChildFate::Running { id: None }
+    );
+}
+
+/// Only a Linux cgroup leaf abandons a child as ended or unreaped; elsewhere either is a contract
+/// breach, asserted in debug. It claims nothing (`Unknown`), and in particular never `Killed`.
+///
+/// Mutants: `Ended` is `Killed`, which says a kill was delivered; either arm is silent.
+#[cfg(not(target_os = "linux"))]
+#[skuld::test]
+fn an_abandoned_child_only_a_linux_leaf_can_report_asserts() {
+    use crate::containment::AbandonedChild;
+    for abandoned in [AbandonedChild::Ended, AbandonedChild::MaybeUnreaped] {
+        let outcome = std::panic::catch_unwind(|| super::abandoned_fate(abandoned));
+        if cfg!(debug_assertions) {
+            assert!(outcome.is_err(), "{abandoned:?} must assert");
+        } else {
+            assert_eq!(outcome.expect("no assertion in release"), ChildFate::Unknown);
+        }
+    }
+}
+
+/// macOS and Windows: tokio can fail a spawn after its fork, dropping the child neither killed nor
+/// reaped. Nothing holds it, so the spawn answers that the program may have started, and that the
+/// child may be running with no identity read.
+///
+/// Mutant: the arm answers another fate (`Killed`, as an ended child would be), or the spawn answers
+/// that the program did not start.
+#[cfg(not(target_os = "linux"))]
+#[skuld::test]
+async fn a_tokio_spawn_failing_after_the_fork_leaves_the_child_running_and_says_so() {
+    crate::tokio::test_runtime::assert_current_thread();
+    #[cfg(unix)]
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    #[cfg(not(unix))]
+    let stdin = crate::test_child::leaked_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let error = {
+        let _failing = fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().expect_err("the forced failure fails the spawn")
+    };
+    let (_error, fate) = expect_may_have_started_with(error);
+    assert_eq!(fate, ChildFate::Running { id: None });
+    let pid = fault::take_forgotten_pid().expect("the seam forked a child");
+    // The forgotten child exits once its stdin closes; here it is ours to collect.
+    #[cfg(unix)]
+    {
+        drop(writer);
+        let mut status = 0;
+        // SAFETY: reaps this test's own forgotten child, which nothing else reaps.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(
+            reaped, pid as libc::pid_t,
+            "the forgotten child is still ours to collect"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// What a leaf's abandonment found of an elevation front is what the spawn answers: reaped through
+/// the leaf is `Reaped`, left running is `Running`, and a place that cannot be read or a front that
+/// cannot be waited on is `Unknown`, never `Running` or `Killed`.
+///
+/// Mutant: an arm answers another fate.
+#[skuld::test]
+fn a_front_the_leaf_found_is_answered_by_what_became_of_it() {
+    use crate::child::spawn::FrontFate;
+    assert_eq!(super::front_child_fate(FrontFate::Reaped), ChildFate::Reaped);
+    assert_eq!(
+        super::front_child_fate(FrontFate::LeftUnreaped),
+        ChildFate::Running { id: None }
+    );
+    assert_eq!(super::front_child_fate(FrontFate::Unplaced), ChildFate::Unknown);
+    assert_eq!(super::front_child_fate(FrontFate::Unaccounted), ChildFate::Unknown);
 }

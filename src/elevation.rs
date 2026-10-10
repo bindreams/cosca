@@ -44,6 +44,11 @@ pub(crate) mod plan;
 #[cfg(unix)]
 #[path = "elevation/posix.rs"]
 pub(crate) mod posix;
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows ShellExecuteEx launch classifies its failures")
+)]
+pub(crate) mod runas_failure;
 pub(crate) mod sanitize;
 #[cfg_attr(
     not(windows),
@@ -284,6 +289,14 @@ pub enum ElevatedVia {
     MacosOsascript,
     /// The process was already elevated, so no wrapper was needed.
     AlreadyElevated,
+}
+
+impl ElevatedVia {
+    /// Whether the child cosca spawns is a backend whose elevated program is its own child, and may
+    /// outlive it.
+    pub(crate) fn program_outlives_child(&self) -> bool {
+        matches!(self, ElevatedVia::Wrapped(_) | ElevatedVia::MacosOsascript)
+    }
 }
 
 /// The planner's privilege target.

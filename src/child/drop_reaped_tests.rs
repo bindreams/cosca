@@ -376,13 +376,19 @@ fn a_failed_elevated_spawns_cleanup_drops_its_handle_at_debug() {
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
-    let err = super::spawn::finish_elevated(
+    let (err, fate) = super::spawn::finish_elevated(
         child,
         Err(crate::error::Error::Io(std::io::Error::other("no password"))),
     )
-    .expect_err("the password write failed");
+    .expect_err("the password write failed")
+    .expect_may_have_started_with();
 
     assert!(matches!(err, crate::error::Error::Elevation { .. }), "{err:?}");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the group's kill and the root's reap"
+    );
     recorder.assert_killed_only(pid as i32);
     assert_skipped_at_debug(mark);
 }

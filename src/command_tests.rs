@@ -375,3 +375,167 @@ fn executable_path_is_variant_agnostic() {
     b.raw_executable("/bin/busybox");
     assert_eq!(b.executable_path(), Some(Path::new("/bin/busybox")));
 }
+
+// A failure after the spawn reports what became of the child =====
+
+/// A live blocker whose stdin this test holds, and that writer.
+#[cfg(unix)]
+fn held_blocker(kill_on_drop: bool) -> (crate::Child, std::io::PipeWriter) {
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.kill_on_drop(kill_on_drop);
+    (cmd.spawn().expect("spawn"), writer)
+}
+
+/// A run-to-completion helper that fails after its spawn kills and reaps the child, as its drop
+/// would, and says so.
+///
+/// Mutant: the failure reports `Unknown` without tearing the child down.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
+    let (mut child, _writer) = held_blocker(true);
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
+    assert_eq!(child.id().is_alive(), crate::identity::Liveness::Dead, "{error}");
+}
+
+/// A child `kill_on_drop(false)` keeps is left alone, and the failure names it.
+///
+/// Mutant: the failure tears down a child that opted out of it.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
+    let (mut child, writer) = held_blocker(false);
+    let id = child.id();
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    assert_eq!(
+        error.fate(),
+        Some(crate::error::ChildFate::Running { id: Some(id) }),
+        "{error}"
+    );
+    drop(writer);
+    child.wait().expect("the child exits once its stdin closes");
+}
+
+/// A child that opted out of the teardown and had its exit collected is reaped, not running.
+///
+/// Mutant: an opted-out child is always reported `Running`.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failure_after_the_spawn_does_not_call_a_collected_child_running() {
+    let (mut child, writer) = held_blocker(false);
+    drop(writer);
+    child.wait().expect("the child exits once its stdin closes");
+    let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut child);
+    assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
+}
+
+/// A failure after the spawn of an elevation backend says an elevated program behind it may still
+/// run; one of a plain child does not.
+///
+/// Mutants: the note on a plain child; no note on a backend.
+#[cfg(unix)]
+#[skuld::test]
+fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_backend() {
+    use crate::elevation::{Backend, ElevatedVia};
+    let note = "an elevated program behind it may still run";
+    let (mut plain, _w1) = held_blocker(true);
+    let plain = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut plain);
+    assert!(!plain.to_string().contains(note), "{plain}");
+
+    let (mut wrapped, _w2) = held_blocker(true);
+    wrapped.set_elevation(crate::child::front_kill_tests::report(ElevatedVia::Wrapped(
+        Backend::Sudo,
+    )));
+    let wrapped = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), &mut wrapped);
+    assert_eq!(wrapped.fate(), Some(crate::error::ChildFate::Reaped), "{wrapped}");
+    assert!(wrapped.to_string().contains(note), "{wrapped}");
+}
+
+// A run-to-completion helper that fails after its spawn =====
+
+/// The answer of a run-to-completion helper that failed after its spawn: the program may have
+/// started, the fate is `fate`, the wrapper flag is `wrapper`, and the cause is the seam's.
+#[track_caller]
+fn assert_failed_after_the_spawn(error: crate::error::Error, fate: crate::error::ChildFate, wrapper: bool) {
+    let crate::error::Error::MayHaveStarted {
+        fate: got,
+        wrapper_elevated,
+        source,
+    } = &error
+    else {
+        panic!("expected MayHaveStarted, got {error:?}");
+    };
+    assert_eq!(*got, fate, "{error}");
+    assert_eq!(*wrapper_elevated, wrapper, "{error}");
+    assert!(
+        matches!(**source, crate::error::Error::Io(ref e) if e.to_string() == crate::child::spawn::failure::seams::FAILURE),
+        "{source:?}"
+    );
+}
+
+/// `output`, `status` and `read` each say the program may have started when their pump or wait
+/// fails after the spawn, with the fate their teardown gave the child and the wrapper flag of the
+/// child.
+///
+/// Mutants: a helper returns the cause bare; drops the fate; drops the wrapper flag.
+#[skuld::test]
+fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
+    use crate::child::spawn::failure::seams;
+    use crate::error::ChildFate;
+    for wrapper in [false, true] {
+        let _wrapper = wrapper.then(seams::pretend_wrapper);
+        let mut cmd = Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        let _pump = seams::fail_the_next_pump();
+        assert_failed_after_the_spawn(
+            cmd.output().expect_err("a failed pump fails `output`"),
+            ChildFate::Reaped,
+            wrapper,
+        );
+        let _pump = seams::fail_the_next_pump();
+        assert_failed_after_the_spawn(
+            cmd.read().expect_err("a failed pump fails `read`"),
+            ChildFate::Reaped,
+            wrapper,
+        );
+        let _wait = seams::fail_the_next_wait();
+        assert_failed_after_the_spawn(
+            cmd.status().expect_err("a failed wait fails `status`"),
+            ChildFate::Reaped,
+            wrapper,
+        );
+    }
+}
+
+/// `read`'s invalid UTF-8 of a wrapper-elevated child keeps the wrapper flag, as the pump's and
+/// wait's failures do.
+///
+/// Mutant: `read` builds the invalid-UTF-8 error without the child's wrapper flag.
+#[cfg(unix)]
+#[skuld::test]
+fn read_of_invalid_utf8_behind_a_wrapper_keeps_the_wrapper_flag() {
+    for wrapper in [false, true] {
+        let _wrapper = wrapper.then(crate::child::spawn::failure::seams::pretend_wrapper);
+        let mut cmd = Command::new();
+        cmd.args(["printf", "\\377"]);
+        let error = cmd.read().expect_err("invalid UTF-8 fails `read`");
+        let crate::error::Error::MayHaveStarted {
+            fate,
+            wrapper_elevated,
+            source,
+        } = &error
+        else {
+            panic!("expected MayHaveStarted, got {error:?}");
+        };
+        assert_eq!(*fate, crate::error::ChildFate::Reaped, "`read` collected the exit");
+        assert_eq!(*wrapper_elevated, wrapper, "{error}");
+        assert!(
+            matches!(**source, crate::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{source:?}"
+        );
+    }
+}

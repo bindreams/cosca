@@ -19,8 +19,10 @@
 //!   ([#341](https://github.com/bindreams/cosca/issues/341)).
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
 //!   checked `/proc` view uses it to read a process's identity. A refusal is
-//!   [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`, from a spawn or from a
-//!   by-pid identity read, wait or kill. [`ProcessId::current`](identity::ProcessId::current)
+//!   [`Error::Unsupported`](error::Error::Unsupported) naming `openat2`, from a by-pid identity
+//!   read, wait or kill, and from a spawn inside
+//!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
+//!   child runs. [`ProcessId::current`](identity::ProcessId::current)
 //!   needs only a readable `/proc/self/stat`.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`

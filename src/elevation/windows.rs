@@ -227,16 +227,38 @@ use windows::Win32::UI::Shell::{
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
 use crate::child::spawn::windows_raw::RawChild;
+use crate::child::spawn::{Classify, SpawnFailure};
 use crate::command::ExecutableSpec;
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::shell_file;
 use crate::elevation::{ElevatedStdio, ElevatedVia, ElevationReport, Privilege};
+use crate::error::ChildFate;
 use crate::error::ElevationErrorKind;
 use crate::identity::ProcessId;
 
-/// `ERROR_CANCELLED` (1223) as an HRESULT (0x800704C7) — the UAC-declined code.
-const ERROR_CANCELLED_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x800704C7_u32 as i32);
+/// The failure of `ShellExecuteExW(runas)` with error `code` and `hInstApp` `inst_app`: see
+/// [`super::runas_failure::classify`]. A launch that may have happened left no process handle, so
+/// what became of it is unknown.
+pub(crate) fn shell_execute_failure(code: windows::core::HRESULT, inst_app: isize) -> SpawnFailure {
+    use super::runas_failure::{classify, RunasFailure};
+
+    let failed = || Error::Elevation {
+        kind: ElevationErrorKind::AuthFailed,
+        detail: format!(
+            "ShellExecuteEx(runas) failed: {}",
+            windows::core::Error::from_hresult(code)
+        ),
+    };
+    match classify(code.0, inst_app) {
+        RunasFailure::Declined => SpawnFailure::NotStarted(Error::Elevation {
+            kind: ElevationErrorKind::AuthDeclined,
+            detail: "the UAC elevation prompt was declined".into(),
+        }),
+        RunasFailure::BeforeLaunch => SpawnFailure::NotStarted(failed()),
+        RunasFailure::MayHaveLaunched => SpawnFailure::started(failed(), ChildFate::Unknown),
+    }
+}
 
 /// A NUL-terminated wide string for a `SHELLEXECUTEINFOW` field, REFUSING an interior NUL.
 ///
@@ -373,7 +395,7 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 }
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
-pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, Error> {
+pub(crate) fn launch_runas(cmd: &Command) -> Result<RunasOutcome, SpawnFailure> {
     let request = cmd.elevation_request();
     launch_runas_with_host(cmd, &Host::detect(request.backend, &request.auth))
 }
@@ -487,8 +509,10 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
 
 /// The effect: `ShellExecuteEx(runas)` on an already-validated payload, plus the identity read of
 /// the child it launched. Everything that could refuse the request happened in [`plan_runas`].
-pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<RunasOutcome, Error> {
-    let launch = match plan_runas(cmd, host)? {
+///
+/// A failure once `ShellExecuteEx` succeeded may come after the program started.
+pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<RunasOutcome, SpawnFailure> {
+    let launch = match plan_runas(cmd, host).not_started()? {
         RunasStep::AlreadyElevated => return Ok(RunasOutcome::AlreadyElevated),
         RunasStep::Launch(launch) => launch,
     };
@@ -501,7 +525,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         show,
     } = *launch;
 
-    let com = ComInit::init()?;
+    let com = ComInit::init().not_started()?;
     // SAFETY: `info` is fully initialized with the correct cbSize; the wide buffers
     // outlive the call; SEE_MASK_NOCLOSEPROCESS yields an owned hProcess.
     let proc: OwnedHandle = unsafe {
@@ -516,24 +540,18 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
             lpClass: PCWSTR(class_w.as_ptr()),
             ..Default::default()
         };
-        ShellExecuteExW(&mut info).map_err(|e| {
-            if e.code() == ERROR_CANCELLED_HRESULT {
-                Error::Elevation {
-                    kind: ElevationErrorKind::AuthDeclined,
-                    detail: "the UAC elevation prompt was declined".into(),
-                }
-            } else {
+        if let Err(e) = ShellExecuteExW(&mut info) {
+            return Err(shell_execute_failure(e.code(), info.hInstApp.0 as isize));
+        }
+        // `ShellExecuteEx` succeeded, and a handle that names no process does not show none started.
+        if info.hProcess.is_invalid() {
+            return Err(SpawnFailure::started(
                 Error::Elevation {
                     kind: ElevationErrorKind::AuthFailed,
-                    detail: format!("ShellExecuteEx(runas) failed: {e}"),
-                }
-            }
-        })?;
-        if info.hProcess.is_invalid() {
-            return Err(Error::Elevation {
-                kind: ElevationErrorKind::AuthFailed,
-                detail: "ShellExecuteEx(runas) returned no process handle".into(),
-            });
+                    detail: "ShellExecuteEx(runas) returned no process handle".into(),
+                },
+                ChildFate::Unknown,
+            ));
         }
         OwnedHandle::from_raw_handle(info.hProcess.0 as std::os::windows::io::RawHandle)
     };
@@ -553,15 +571,25 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
         // ACTUAL outcome (terminated vs still-running) in the detail — the kind stays neutral.
         // SAFETY: `handle` is live; terminating our own launched child.
         let terminated = unsafe { TerminateProcess(handle, 1) }.is_ok();
-        let detail = if terminated {
-            "the elevated child launched but its identity could not be resolved; it was terminated".into()
+        let (detail, fate) = if terminated {
+            (
+                "the elevated child launched but its identity could not be resolved; it was terminated".into(),
+                ChildFate::Killed,
+            )
         } else {
-            format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running")
+            (
+                format!("the elevated child (pid {pid}) launched but its identity could not be resolved and could not be terminated; it may still be running"),
+                // Its identity is what could not be resolved.
+                ChildFate::Running { id: None },
+            )
         };
-        return Err(Error::Elevation {
-            kind: ElevationErrorKind::Untracked,
-            detail,
-        });
+        return Err(SpawnFailure::started(
+            Error::Elevation {
+                kind: ElevationErrorKind::Untracked,
+                detail,
+            },
+            fate,
+        ));
     };
 
     let report = ElevationReport {
@@ -572,7 +600,7 @@ pub(crate) fn launch_runas_with_host(cmd: &Command, host: &Host) -> Result<Runas
     Ok(RunasOutcome::Launched { proc, pid, id, report })
 }
 
-pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, Error> {
+pub(crate) fn spawn_elevated(cmd: &mut Command, kill_on_drop: bool) -> Result<crate::child::Child, SpawnFailure> {
     match launch_runas(&*cmd)? {
         RunasOutcome::AlreadyElevated => {
             let mut child = crate::child::spawn::spawn_unelevated(cmd, kill_on_drop)?;

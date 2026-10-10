@@ -234,10 +234,11 @@ fn teardown_levels_when_the_reap_fails(errno: i32) -> Vec<log::Level> {
     use crate::child::shared::seams::{self, ForcedWait};
     crate::log_capture::install();
     let (handle, _stdin) = std_handle();
+    let id = crate::identity::ProcessId::of(handle.id()).found().expect("identity");
     let marker = format!("teardown of child {}", handle.id());
     let mark = crate::log_capture::mark();
     let forced = seams::force_unlocked_wait(ForcedWait::Errno(errno));
-    handle.teardown_on_drop();
+    handle.teardown_on_drop(id);
     drop(forced);
     // The forced failure left the killed child unreaped: reap it for real.
     handle.wait().expect("reap the killed child");

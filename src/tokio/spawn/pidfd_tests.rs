@@ -7,6 +7,7 @@ use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
 
+use crate::child::spawn::failure::{expect_may_have_started_with, expect_not_started};
 use crate::child::spawn::pidfd_handshake::fault::{self, ChildFault};
 use crate::error::Error;
 use crate::stdio::Stdio;
@@ -38,8 +39,9 @@ async fn a_refused_probe_fails_unsupported_and_forks_nothing() {
         let err = cmd.spawn().err();
         drop(forced);
 
+        let err = expect_not_started(err.expect("a refused probe fails the spawn"));
         assert!(
-            matches!(err, Some(Error::Unsupported { platform: "linux", .. })),
+            matches!(err, Error::Unsupported { platform: "linux", .. }),
             "{name}: {err:?}"
         );
         assert_eq!(fault::spawns(), 0, "{name}: the fork must not be reached");
@@ -57,7 +59,7 @@ async fn emfile_in_the_child_fails_io_and_the_program_never_runs() {
     let err = cmd.spawn().err();
     drop(forced);
 
-    match err.expect("a failed pidfd_open must fail the spawn") {
+    match expect_not_started(err.expect("a failed pidfd_open must fail the spawn")) {
         Error::Io(e) => assert_eq!(e.to_string(), "pidfd_open: Too many open files (os error 24)"),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -93,7 +95,7 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
     drop(held);
     drop(armed);
 
-    let err = err.expect("a child that never ran the program must fail the spawn");
+    let err = expect_not_started(err.expect("a child that never ran the program must fail the spawn"));
     assert!(
         err.to_string().ends_with("died before exec: the program never ran"),
         "{err}"
@@ -102,6 +104,54 @@ async fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
         "tokio reaped the child",
     );
     assert!(!program_ran(cmd, reader));
+}
+
+/// tokio can fail a spawn after std's succeeded, so after the child's `exec`, and its error does not
+/// say which failed: the spawn says the program may have started. The child, which tokio dropped, is
+/// killed and reaped through its pidfd.
+///
+/// Mutant: a failed tokio spawn after the child was told to go answers that it did not start.
+#[skuld::test]
+async fn a_tokio_failure_after_the_fork_may_have_started() {
+    let (mut cmd, _reader) = marker_command();
+    let err = {
+        let _failing = crate::child::spawn::fault::fail_tokio_spawns_after_fork();
+        cmd.spawn().expect_err("the forced failure fails the spawn")
+    };
+    crate::child::spawn::fault::take_forgotten_pid().expect("the seam forked a child");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "killed and reaped through its pidfd"
+    );
+    assert!(
+        matches!(err, Error::Io(ref e) if e.raw_os_error() == Some(libc::ENOSPC)),
+        "{err:?}"
+    );
+    crate::child::spawn::pidfd_handshake::pidfd_handshake_tests::assert_no_child_of_this_thread(
+        "the teardown reaped the child",
+    );
+}
+
+/// A tokio exec failure is one the spawn cannot tell from tokio's own failure after `exec`: it may
+/// have started.
+///
+/// Mutant: a failed tokio exec answers that the program did not start.
+#[skuld::test]
+async fn a_tokio_exec_failure_may_have_started() {
+    let mut cmd = Command::new();
+    cmd.args(["cosca-no-such-program-142"]);
+    let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Gone,
+        "std had collected the child whose exec failed"
+    );
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+        "{err:?}"
+    );
 }
 
 /// A tokio runtime built without IO makes tokio panic inside the spawn, after std's fork. With a

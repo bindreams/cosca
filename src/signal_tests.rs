@@ -164,13 +164,16 @@ mod macos {
         child.wait().expect("reap");
     }
 
-    /// Mutant: a process that was gone at adoption is signalled anyway.
+    /// A child that holds no unique id has nothing to verify its pid against: nothing is sent, and it is
+    /// `Unverified`, not `Gone`, since it may be running.
+    ///
+    /// Mutants: a process with no id is signalled anyway; it is read as gone.
     #[skuld::test]
-    fn a_child_gone_at_adoption_is_gone_and_sends_nothing() {
+    fn a_child_with_no_unique_id_is_unverified_and_sends_nothing() {
         let log = Capture::start();
         assert_eq!(
-            via_verified_pid(NEVER_A_PID, None, Sig::Kill).expect("gone is Ok"),
-            Sent::Gone
+            via_verified_pid(NEVER_A_PID, None, Sig::Kill).expect("unverified is Ok"),
+            Sent::Unverified
         );
         assert_eq!(log.entries(), []);
     }

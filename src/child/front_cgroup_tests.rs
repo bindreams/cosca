@@ -495,6 +495,12 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
         }),
     )
     .expect_err("a failed write fails the spawn");
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the cgroup kill ended the front and the teardown reaped it"
+    );
     let rendered = err.to_string();
     assert!(rendered.contains("the elevated child was terminated"), "{rendered}");
     let (_, status) = reaps
@@ -515,7 +521,8 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
 #[skuld::test]
 fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#[fixture(cgroup)] _group: &Group) {
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let pid = child.id().pid();
+    let id = child.id();
+    let pid = id.pid();
     let leaf = leaf_of(&child).path().to_path_buf();
     let err = {
         let _failing = crate::containment::cgroup::fault::fail_kill_writes();
@@ -528,6 +535,12 @@ fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_does(#
         )
         .expect_err("a failed write fails the spawn")
     };
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Running { id: Some(id) },
+        "a front its cgroup kill did not end may be running"
+    );
     assert_front_refused_by_its_cgroup_kill(&err, pid);
     drop(stdin);
     assert_reaped_unsignalled(pid);
@@ -642,6 +655,12 @@ fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: 
         }),
     )
     .expect_err("a failed write fails the spawn");
+    let (err, fate) = err.expect_may_have_started_with();
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the cgroup kill ended the front and the teardown reaped it"
+    );
     assert!(err.to_string().contains("the elevated child was terminated"), "{err}");
     assert_eq!(gates.count(), 1);
 }
@@ -673,6 +692,8 @@ pub(crate) enum LeafKill {
 pub(crate) struct HeldFailure {
     pub(crate) err: crate::error::Error,
     pub(crate) pid: u32,
+    /// The identity the spawn had read when it failed: the attach's, and not the identity check's.
+    pub(crate) read_id: Option<crate::identity::ProcessId>,
     pub(crate) stdin: std::rc::Rc<std::cell::RefCell<Option<PipeWriter>>>,
 }
 
@@ -688,7 +709,9 @@ pub(crate) fn failed_held_front_spawns(
 
     use crate::child::spawn::fault;
     let arms: [fn(bool); 2] = [fault::set_force_attach_failure, fault::set_force_identity_vanished];
+    let mut arm = 0;
     arms.map(|force_arm| {
+        arm += 1;
         let (reader, writer) = std::io::pipe().expect("pipe");
         let stdin = Rc::new(RefCell::new(Some(writer)));
         let mut cmd = in_cgroup(cat());
@@ -753,6 +776,8 @@ pub(crate) fn failed_held_front_spawns(
         HeldFailure {
             err,
             pid: id.pid(),
+            // The attach arm comes first, and fails after the identity was read.
+            read_id: (arm == 1).then_some(id),
             stdin,
         }
     })
@@ -768,6 +793,7 @@ pub(crate) fn assert_killed_by_the_leaf(
     let recorded = reaps.recorded();
     for HeldFailure { err, pid, .. } in failures {
         let text = err.to_string();
+        assert_eq!(err.fate(), Some(crate::error::ChildFate::Reaped), "{text}");
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(text.contains("its cgroup's kill ended it, and it was reaped"), "{text}");
         let status = recorded
@@ -787,8 +813,19 @@ pub(crate) fn assert_killed_by_the_leaf(
 /// the leaf a failed kill left behind with it.
 #[track_caller]
 pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2]) {
-    for HeldFailure { err, pid, stdin } in failures {
+    for HeldFailure {
+        err,
+        pid,
+        read_id,
+        stdin,
+    } in failures
+    {
         let text = err.to_string();
+        assert_eq!(
+            err.fate(),
+            Some(crate::error::ChildFate::Running { id: read_id }),
+            "{text}"
+        );
         assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
         assert!(
             text.contains("the elevated program may be running; it is left unreaped"),
@@ -1379,8 +1416,8 @@ pub(crate) fn front_its_leaf_did_not_take() -> (Command, PipeWriter) {
     (cmd, writer)
 }
 
-/// Spawns `cmd` through `spawn` with its identity check failing (`Gone`), and returns the error with
-/// the child's pid.
+/// Spawns `cmd`, a front, through `spawn` with its identity check failing (`Gone`), and returns the
+/// error with the child's pid. The front is left running, and no identity was read for it.
 pub(crate) fn fail_the_identity_check(
     cmd: &mut Command,
     spawn: impl FnOnce(&mut Command) -> Result<(), crate::error::Error>,
@@ -1389,7 +1426,10 @@ pub(crate) fn fail_the_identity_check(
     fault::set_force_identity_vanished(true);
     let result = spawn(cmd);
     fault::set_force_identity_vanished(false);
-    let err = result.expect_err("the forced identity failure fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        result.expect_err("the forced identity failure fails the spawn"),
+    );
+    assert_eq!(fate, crate::error::ChildFate::Running { id: None }, "{err:?}");
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the seam captured the child") else {
         panic!("the seam must capture a resolved identity");
     };

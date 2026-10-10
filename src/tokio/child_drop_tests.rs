@@ -582,3 +582,29 @@ async fn drop_warns_instead_of_asserting_on_a_real_teardown_mechanism_failure() 
         "a real teardown-mechanism failure during Drop must be logged at warn, got {records:?}"
     );
 }
+
+// The fate of a teardown of a child already reaped =====
+
+/// A child whose exit this handle collected is `Reaped` when its teardown runs, whether or not the
+/// drop is armed, on every platform: nothing is left to signal.
+///
+/// Mutant: a disarmed teardown of a reaped child reports `Running`, as the child is left alone.
+#[skuld::test]
+async fn a_teardown_of_a_reaped_child_is_reaped_armed_or_not() {
+    crate::tokio::test_runtime::assert_current_thread();
+    for kill_on_drop in [true, false] {
+        let mut cmd = crate::tokio::Command::new();
+        cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+        cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+        cmd.stdout(crate::Stdio::null()).expect("set stdout");
+        cmd.kill_on_drop(kill_on_drop);
+        let mut child = cmd.spawn().expect("spawn");
+        drop(child.stdin().expect("piped stdin"));
+        child.wait().await.expect("the child exits once its stdin closes");
+        assert_eq!(
+            child.tear_down_now(),
+            crate::error::ChildFate::Reaped,
+            "kill_on_drop={kill_on_drop}"
+        );
+    }
+}

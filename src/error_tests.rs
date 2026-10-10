@@ -1,4 +1,4 @@
-use crate::error::{Error, QuoteError, QuoteErrorKind};
+use crate::error::{ChildFate, Error, QuoteError, QuoteErrorKind};
 
 #[skuld::test]
 fn containment_error_displays_detail() {
@@ -258,4 +258,29 @@ fn with_note_keeps_each_variant_and_appends() {
         Error::IdentityRecord { kind: RecordErrorKind::ForeignPlatform, detail, .. } if detail == "d; left running"
     ));
     assert_eq!(source_code(&e), Some(libc::EACCES));
+}
+
+/// The elevated-program note belongs to a wrapper-elevated spawn only, and only to a fate that says
+/// the backend is not running.
+///
+/// Mutants: the note on every spawn; the note missing from a wrapper-elevated one; the note on a
+/// `Running` fate.
+#[skuld::test]
+fn the_elevated_program_note_is_for_a_wrapper_elevated_spawn_only() {
+    let note = "an elevated program behind it may still run";
+    let message = |fate: ChildFate, wrapper_elevated: bool| {
+        Error::MayHaveStarted {
+            fate,
+            wrapper_elevated,
+            source: Box::new(Error::Io(std::io::Error::other("cause"))),
+        }
+        .to_string()
+    };
+    for fate in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
+        assert!(!message(fate, false).contains(note), "{fate:?}, not wrapper-elevated");
+        assert!(message(fate, true).contains(note), "{fate:?}, wrapper-elevated");
+    }
+    for fate in [ChildFate::Running { id: None }, ChildFate::Unknown] {
+        assert!(!message(fate, true).contains(note), "{fate:?}");
+    }
 }

@@ -156,6 +156,11 @@ fn runas_kill_of_a_killable_child_returns_and_reaps() {
     assert_eq!(status.code(), Some(1), "a TerminateProcess(1) exit is 1: {status:?}");
 }
 
+/// The identity the spawn would have read for `child`.
+fn identity_of(child: &RawChild) -> crate::identity::ProcessId {
+    crate::identity::ProcessId::of(child.id()).found().expect("identity")
+}
+
 /// Mutants: `TerminateProcess` in `teardown_on_drop` a no-op reporting `Ok` or
 /// `ERROR_ACCESS_DENIED`; the wait after an accepted terminate dropped.
 #[skuld::test]
@@ -163,7 +168,7 @@ fn runas_teardown_on_drop_returns_promptly() {
     let child = spawn_suspended_runas();
     // Keeps a no-op terminate from hanging teardown's wait; see `end_with_code_zero`.
     let observer = end_on_wait(&child);
-    child.teardown_on_drop();
+    child.teardown_on_drop(identity_of(&child));
     assert_eq!(observer.waits(), 1, "teardown must block on the exit it started");
     let status = child.wait().expect("wait after teardown");
     assert_eq!(
@@ -182,7 +187,7 @@ fn runas_teardown_on_drop_reaps_when_terminate_is_denied_but_permitted() {
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
     let observer = end_on_wait(&owner);
-    denied.teardown_on_drop();
+    denied.teardown_on_drop(identity_of(&denied));
     assert_eq!(observer.waits(), 1, "a terminable runas child's denial must be reaped");
     let status = denied.wait().expect("wait after teardown");
     assert_eq!(
@@ -215,7 +220,7 @@ fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
     let denied = runas_without_terminate_right(&owner);
     let observer = end_on_wait(&owner);
     observer.force_unterminable();
-    denied.teardown_on_drop();
+    denied.teardown_on_drop(identity_of(&denied));
     assert_eq!(observer.waits(), 0, "teardown blocked on a child it cannot terminate");
     assert!(
         denied.try_wait().expect("try_wait").is_none(),
@@ -357,4 +362,20 @@ fn wait_deadline_re_arms_past_a_clamped_timeout() {
     let status = result.expect("a genuinely-terminated child must not report a wait failure");
     assert!(status.is_some(), "a clamped WAIT_TIMEOUT was trusted");
     crate::wait::wait_ms_probe::assert_rearmed_with_fresh_remaining(&arms, 5);
+}
+
+/// A failed wait after a delivered kill is `Killed`; after a refused kill nothing was delivered, so
+/// the child's fate is not known. A collected status is `Reaped` either way.
+///
+/// Mutants: the refused kill's failed wait says `Killed`; a failed wait says `Reaped`.
+#[skuld::test]
+fn a_failed_wait_after_a_refused_kill_is_unknown_not_killed() {
+    use crate::error::ChildFate;
+    use std::os::windows::process::ExitStatusExt as _;
+    let failed = || Err(std::io::Error::other("forced wait failure 3a7c"));
+    let exited = || Ok(std::process::ExitStatus::from_raw(1));
+    assert_eq!(super::fate_after_reap(true, failed()), ChildFate::Killed);
+    assert_eq!(super::fate_after_reap(false, failed()), ChildFate::Unknown);
+    assert_eq!(super::fate_after_reap(true, exited()), ChildFate::Reaped);
+    assert_eq!(super::fate_after_reap(false, exited()), ChildFate::Reaped);
 }

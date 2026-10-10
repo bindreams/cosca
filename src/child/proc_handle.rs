@@ -114,13 +114,22 @@ impl ProcHandle {
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
     #[cfg(unix)]
-    pub(crate) fn reap_after_tree_kill(&self) {
+    pub(crate) fn reap_after_tree_kill(&self) -> crate::error::ChildFate {
+        use crate::error::ChildFate;
         match self {
             ProcHandle::Std(s) => {
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                if let Err(e) = s.wait() {
-                    log_teardown_wait_failure(s.id(), &e);
+                match s.wait() {
+                    Ok(_) => ChildFate::Reaped,
+                    Err(e) => {
+                        log_teardown_wait_failure(s.id(), &e);
+                        if e.raw_os_error() == Some(libc::ECHILD) {
+                            ChildFate::Gone
+                        } else {
+                            ChildFate::Killed
+                        }
+                    }
                 }
             }
         }
@@ -142,25 +151,41 @@ impl ProcHandle {
     /// setuid helper, or `sudo` spawned with no `.elevate()`) also returns EPERM, and
     /// keying on a request flag would take the blocking `wait()` and hang Drop forever.
     /// The Windows `Raw` arm handles its own higher-integrity runas case via its flag.
-    pub(crate) fn teardown_on_drop(&self) {
+    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::error::ChildFate {
+        use crate::error::ChildFate;
         #[cfg(all(test, unix))]
         crate::child::fault::note_root_teardown();
         match self {
             ProcHandle::Std(s) => {
+                #[cfg(unix)]
+                let (kill_result, delivered) = {
+                    let sent = s.kill_sent();
+                    let delivered = matches!(sent, Ok(crate::signal::Sent::Delivered));
+                    (sent.map(drop), delivered)
+                };
+                #[cfg(not(unix))]
                 let kill_result = s.kill();
                 match std_teardown_action(&kill_result) {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
-                    StdTeardown::ReapBlocking => {
-                        if let Err(e) = s.wait() {
+                    StdTeardown::ReapBlocking => match s.wait() {
+                        Ok(_) => ChildFate::Reaped,
+                        Err(e) => {
                             log_teardown_wait_failure(s.id(), &e);
+                            #[cfg(unix)]
+                            if e.raw_os_error() == Some(libc::ECHILD) {
+                                // Delivered, the kill is `Killed`; found nothing to signal, `Gone`.
+                                return crate::wait::exit_only::Foreign::Gone.fate(delivered);
+                            }
+                            ChildFate::Killed
                         }
-                    }
+                    },
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
                     // child is still running (an elevated child we cannot signal), warn.
                     StdTeardown::ReapNonBlocking => {
-                        let still_running = !matches!(s.try_wait(), Ok(Some(_)));
+                        let looked = s.try_wait();
+                        let still_running = !matches!(looked, Ok(Some(_)));
                         let permission_denied =
                             matches!(&kill_result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied);
                         if still_running && permission_denied {
@@ -169,11 +194,12 @@ impl ProcHandle {
                                 s.id()
                             );
                         }
+                        crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id))
                     }
                 }
             }
             #[cfg(windows)]
-            ProcHandle::Raw(r) => r.teardown_on_drop(),
+            ProcHandle::Raw(r) => r.teardown_on_drop(id),
         }
     }
 }

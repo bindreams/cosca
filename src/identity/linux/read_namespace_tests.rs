@@ -90,13 +90,20 @@ fn fixture_outer_procfs_inner() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::test_child::leaked_writer_stdin())
         .expect("set stdin pipe");
-    match cmd.spawn() {
-        Err(crate::error::Error::Unassessable { detail, .. }) => assert!(
+    let (error, fate) =
+        crate::child::spawn::failure::expect_may_have_started_with(cmd.spawn().expect_err("the spawn fails"));
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the pidfd pins the child, so it is killed and reaped"
+    );
+    match error {
+        crate::error::Error::Unassessable { detail, .. } => assert!(
             detail.contains(
                 "the spawned child identity could not be read: this process's /proc is an outer pid namespace's"
             ),
             "{detail}"
         ),
-        other => panic!("expected Unassessable naming the view, got {:?}", other.map(|_| ())),
+        other => panic!("expected Unassessable naming the view, got {other:?}"),
     }
 }

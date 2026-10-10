@@ -3,6 +3,7 @@
 
 use std::future::Future;
 
+use super::proc_source::Ownership;
 use crate::send_log::{Capture, Via};
 use crate::tokio::Command;
 
@@ -75,31 +76,31 @@ fn exited_unreaped_with(identity: impl FnOnce(u64) -> Option<u64>) -> (super::pr
 
 /// Mutant: `reaped_elsewhere` answers `true` for the child's own unreaped zombie.
 #[skuld::test]
-async fn macos_a_child_with_its_own_unique_id_is_not_reaped_elsewhere() {
+async fn macos_a_child_with_its_own_unique_id_is_ours() {
     let (proc, _pid) = exited_unreaped_with(Some);
-    assert!(!proc.reaped_elsewhere());
+    assert_eq!(proc.not_ours(), None);
 }
 
 /// Mutant: the unique id is not compared.
 #[skuld::test]
-async fn macos_a_pid_with_another_unique_id_is_reaped_elsewhere() {
+async fn macos_a_pid_with_another_unique_id_is_not_ours() {
     let (proc, _pid) = exited_unreaped_with(|real| Some(real ^ 1));
-    assert!(proc.reaped_elsewhere());
+    assert_eq!(proc.not_ours(), Some(Ownership::Foreign));
 }
 
 /// Mutant: a child with no unique id is taken for one that can be verified.
 #[skuld::test]
-async fn macos_a_child_with_no_unique_id_is_reaped_elsewhere() {
+async fn macos_a_child_with_no_unique_id_is_not_ours() {
     let (proc, _pid) = exited_unreaped_with(|_| None);
-    assert!(proc.reaped_elsewhere());
+    assert_eq!(proc.not_ours(), Some(Ownership::Unknown));
 }
 
-/// A failed peek cannot show the child is ours: it counts as reaped elsewhere, and the warning
-/// carries the error.
+/// A failed peek cannot show the child is ours, but shows no reap either: its ownership is unknown,
+/// and the warning carries the error.
 ///
 /// Mutant: a failed peek is no evidence.
 #[skuld::test]
-async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
+async fn macos_a_failed_peek_is_not_ours_and_warns_with_the_error() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::wait::exit_only::seams::force_peek_once;
     crate::log_capture::install();
@@ -107,7 +108,7 @@ async fn macos_a_failed_peek_is_reaped_elsewhere_and_warns_with_the_error() {
     let (proc, _pid) = exited_unreaped_with(Some);
     let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure 7c3e")));
 
-    assert!(proc.reaped_elsewhere());
+    assert_eq!(proc.not_ours(), Some(Ownership::Unknown));
     assert!(crate::log_capture::contains_since(mark, "forced peek failure 7c3e"));
 }
 
@@ -140,20 +141,24 @@ fn running_backend_with(held: impl FnOnce(u64) -> u64) -> (super::proc_source::P
 /// Mutants: `reaped_elsewhere` takes a `Running` peek with an unreadable id, or with a gone one, as
 /// "ours".
 #[skuld::test]
-async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_reaped_elsewhere() {
+async fn macos_a_running_child_whose_unique_id_cannot_be_read_is_not_ours() {
     crate::tokio::test_runtime::assert_current_thread();
     use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
-    for read in [UniqRead::Refused(libc::EPERM), UniqRead::Gone] {
+    for (read, expected) in [
+        (UniqRead::Refused(libc::EPERM), Ownership::Unknown),
+        (UniqRead::Gone, Ownership::Foreign),
+    ] {
         let (proc, pid) = running_backend();
         let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, read);
 
-        let reaped_elsewhere = proc.reaped_elsewhere();
+        let not_ours = proc.not_ours();
 
         // The child is ours and unreaped: end it before asserting.
         proc.signal(crate::signal::Sig::Kill).expect("kill our own child");
         proc.release(); // tokio's orphan queue reaps the killed child
-        assert!(
-            reaped_elsewhere,
+        assert_eq!(
+            not_ours,
+            Some(expected),
             "{read:?}: the pid is not shown to be ours (pid {pid})"
         );
     }
@@ -264,7 +269,10 @@ async fn macos_finish_elevated_after_a_foreign_reap_does_not_claim_a_termination
             detail: "forced password-write failure".into(),
         }),
     )
-    .expect_err("the spawn fails");
+    .expect_err("the spawn fails")
+    .expect_may_have_started_with();
+    let (err, fate) = err;
+    assert_eq!(fate, crate::error::ChildFate::Gone, "reaped by someone else");
 
     let crate::error::Error::Elevation { detail, .. } = err else {
         panic!("expected an Elevation error, got {err:?}");

@@ -41,7 +41,7 @@ fn a_front_whose_place_cannot_be_read_is_left_naming_the_cause() {
     let received = received(&front, pidfd);
     let mark = crate::log_capture::mark();
     let fate = end_front(&received, |_, _| Err(std::io::Error::other("subtree gone")));
-    assert_eq!(fate, Abandoned::Front(FrontFate::LeftUnreaped));
+    assert_eq!(fate, Abandoned::Front(FrontFate::Unplaced));
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("(subtree gone)"), "{warns:?}");

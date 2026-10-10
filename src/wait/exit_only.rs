@@ -16,6 +16,8 @@
 use std::io;
 use std::process::ExitStatus;
 
+use crate::error::ChildFate;
+
 #[cfg(target_os = "linux")]
 #[path = "exit_only/linux.rs"]
 mod linux;
@@ -73,11 +75,34 @@ pub(crate) enum Foreign {
     #[cfg(target_os = "macos")]
     Other,
     /// `ECHILD` for a pid that still names the child, held by launchd: its tracer died and XNU
-    /// reparented it. It is not this process's to reap, and the caller cannot tell it from a reap, so
-    /// it stays unverifiable rather than "reaped by another party". Nothing is signalled or reaped
-    /// by pid.
+    /// reparented it. It has exited and is not this process's to reap, so its fate is `Gone` as for
+    /// any foreign verdict ([`Foreign::fate`]); the variant stays apart so that a log can say why.
+    /// Nothing is signalled or reaped by pid.
     #[cfg(target_os = "macos")]
     Orphaned,
+}
+
+impl Foreign {
+    /// What became of a child this evidence shows is not this process's to reap: it has exited, and
+    /// someone else holds or has collected its exit. That includes a zombie launchd holds. Every path
+    /// that maps this evidence to a fate uses this, so one situation has one fate:
+    ///
+    /// - `kill_delivered`: cosca's kill was delivered, so the child is [`Killed`](ChildFate::Killed):
+    ///   dead or dying, its exit not collected by cosca.
+    /// - Otherwise cosca delivered nothing, and the child is [`Gone`](ChildFate::Gone).
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
+    )]
+    pub(crate) fn fate(self, kill_delivered: bool) -> ChildFate {
+        // Every foreign verdict is the same situation for the fate: only the kill tells them apart.
+        let _ = self;
+        if kill_delivered {
+            ChildFate::Killed
+        } else {
+            ChildFate::Gone
+        }
+    }
 }
 
 /// What [`peek`] saw.

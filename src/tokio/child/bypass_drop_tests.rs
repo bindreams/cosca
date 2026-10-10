@@ -304,8 +304,12 @@ async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing()
         child,
         Err(crate::error::Error::Io(std::io::Error::other("no password"))),
     )
-    .expect_err("the password write failed");
+    .expect_err("the password write failed")
+    .expect_may_have_started_with();
+    let (err, fate) = err;
     assert!(matches!(err, crate::error::Error::Elevation { .. }), "{err:?}");
+    // The look found it reaped elsewhere: it is not running, and not reaped by cosca.
+    assert_eq!(fate, crate::error::ChildFate::Gone);
     witness
         .reap()
         .expect("finish_elevated's refused-kill arm must not reap the child by pid");
@@ -461,7 +465,14 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
     let err = cmd.spawn().err();
 
     drop(armed);
-    let err = err.expect("a failed identity peek fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        err.expect("a failed identity peek fails the spawn"),
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the pidfd pins the child, so it is killed and reaped"
+    );
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a failed peek is Unassessable, not a vanish: {err:?}"

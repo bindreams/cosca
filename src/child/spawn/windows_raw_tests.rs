@@ -476,7 +476,9 @@ fn a_high_fd_spawn_without_an_executable_is_gated_on_its_program_token() {
     let mut by_line = high_fd_command();
     by_line.commandline("x.bat --flag");
     for (via, mut c) in [("argv", by_argv), ("commandline", by_line)] {
-        let err = c.spawn().expect_err("a batch program token must be refused");
+        let err = crate::child::spawn::failure::expect_not_started(
+            c.spawn().expect_err("a batch program token must be refused"),
+        );
         assert!(matches!(err, Error::Unsupported { .. }), "{via}: got {err:?}");
     }
 }
@@ -603,10 +605,17 @@ fn a_raw_spawn_reads_the_identity_before_it_attaches() {
     let result = c.spawn();
     fault::set_force_attach_failure(false);
     fault::set_force_identity_vanished(false);
-    let err = result.expect_err("a forced failure fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        result.expect_err("a forced failure fails the spawn"),
+    );
     assert!(
         matches!(&err, Error::Io(e) if e.to_string().contains("reaped by another party")),
         "the identity check comes first: {err:?}"
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the raw teardown kills and reaps the child"
     );
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
@@ -621,7 +630,66 @@ fn a_raw_spawn_whose_attach_fails_tears_its_child_down() {
     fault::set_force_attach_failure(true);
     let result = c.spawn();
     fault::set_force_attach_failure(false);
-    let err = result.expect_err("the forced attach failure fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        result.expect_err("the forced attach failure fails the spawn"),
+    );
     assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "terminated and waited for");
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}
+
+/// A raw spawn whose `CreateProcessW` fails, here on an image that is not a program (Windows
+/// answers `ERROR_BAD_EXE_FORMAT` or `ERROR_EXE_MACHINE_TYPE_MISMATCH`), did not start one.
+///
+/// Mutant: the raw backend's `CreateProcessW` failure answers that the program may have started.
+#[skuld::test]
+fn a_raw_spawn_whose_create_process_fails_did_not_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image = dir.path().join("not-a-program.exe");
+    std::fs::write(&image, b"not a PE image").expect("write the image");
+    let mut c = Command::new();
+    c.executable(&image).args(["not-a-program"]);
+    let err = crate::child::spawn::failure::expect_not_started(c.spawn().expect_err("a non-PE image fails"));
+    assert!(matches!(err, Error::Io(ref e) if e.raw_os_error().is_some()), "{err:?}");
+}
+
+// The refusals before `CreateProcessW` =====
+
+/// Every refusal the raw backend makes before `CreateProcessW` says the program did not start, and
+/// is the refusal's own error: a batch program, a NUL in the working directory or the command line,
+/// an fd table over its limit, and `inherit` on fd 3.
+///
+/// Mutant: any one of those arms answers that the program may have started, or another error.
+#[skuld::test]
+fn raw_refusals_before_create_process_did_not_start() {
+    use crate::child::spawn::failure::{invalid_input, unsupported};
+    use crate::stdio::Stdio;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bat = dir.path().join("x.bat");
+    std::fs::write(&bat, b"@echo off\n").expect("write the batch file");
+    let mut batch = Command::new();
+    batch.executable(&bat).args(["x.bat"]);
+    let mut cwd_nul = Command::new();
+    cwd_nul
+        .executable("findstr")
+        .args(["findstr", "x"])
+        .current_dir(std::path::PathBuf::from("a\u{0}b"));
+    let mut line_nul = Command::new();
+    line_nul.executable("findstr").args(["findstr", "a\u{0}b"]);
+    let mut oversized = Command::new();
+    oversized.executable("findstr").args(["findstr", "x"]);
+    oversized.fd(70_000, Stdio::null()).expect("fd 70000");
+    let mut inherit_fd3 = Command::new();
+    inherit_fd3.executable("findstr").args(["findstr", "x"]);
+    inherit_fd3.fd(3, Stdio::inherit()).expect("fd 3");
+    for (what, mut cmd, variant) in [
+        ("batch", batch, unsupported as fn(&Error) -> bool),
+        ("cwd NUL", cwd_nul, invalid_input),
+        ("command-line NUL", line_nul, invalid_input),
+        ("oversized fd table", oversized, unsupported),
+        ("inherit on fd 3", inherit_fd3, unsupported),
+    ] {
+        let err = crate::child::spawn::failure::expect_not_started(cmd.spawn().expect_err(what));
+        assert!(variant(&err), "{what}: not the refusal's own error: {err:?}");
+    }
 }

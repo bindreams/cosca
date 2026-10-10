@@ -707,8 +707,12 @@ fn read_errors_on_invalid_utf8() {
     // 0xff is not valid UTF-8.
     cmd.executable(testbin()).args(["cosca_testbin", "emit-raw", "ff"]);
     let err = cmd.read().expect_err("should fail on invalid UTF-8");
+    let cosca::error::Error::MayHaveStarted { source, fate, .. } = &err else {
+        panic!("expected MayHaveStarted, got {err:?}");
+    };
+    assert_eq!(*fate, cosca::error::ChildFate::Reaped, "`read` collected the exit");
     assert!(
-        matches!(err, cosca::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+        matches!(**source, cosca::error::Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
         "expected Io(InvalidData), got {err:?}"
     );
 }

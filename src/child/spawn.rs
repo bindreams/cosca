@@ -6,9 +6,10 @@ use std::process::Stdio as StdStdio;
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::shared::SharedChild;
+pub(crate) use crate::child::spawn::failure::{after_the_spawn, Classify, SpawnFailure};
 use crate::child::{Child, ParentEnd};
 use crate::command::{Command, CommandInput, EnvOp};
-use crate::error::Error;
+use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::stdio::{Direction, Fd, ResolvedStdio};
 
@@ -18,7 +19,7 @@ pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
 #[cfg(windows)]
 pub(crate) type ChildEnd = std::os::windows::io::OwnedHandle;
 
-pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
+pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let child = spawn_uncommitted(cmd)?;
     child.commit_kill_on_drop();
     Ok(child)
@@ -26,7 +27,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, Error> {
 
 /// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
 /// on drop whatever `kill_on_drop` says.
-pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
+pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let kill_on_drop = cmd.kill_on_drop_flag();
     // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
     // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
@@ -43,37 +44,42 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 report,
                 password_write,
                 backend_path,
-            } = crate::elevation::posix::rewrite(cmd)?;
-            let mut child = match derived {
-                // The derived program IS the backend; remap an exec failure to
-                // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
-                // yields the same kind and stays a plain Io). An already-elevated derived
-                // (sanitized original) has no backend path, so it is never remapped.
-                Some(mut derived) => {
-                    let r = spawn_unelevated(&mut derived, kill_on_drop);
-                    match backend_path.as_deref() {
-                        Some(bp) => r.map_err(|e| crate::elevation::remap_derived_spawn_error(e, bp))?,
-                        None => r?,
+            } = crate::elevation::posix::rewrite(cmd).not_started()?;
+            // From here the child is the backend: its elevated program may outlive what happens to it.
+            let wrapper = report.as_ref().is_some_and(|r| r.via.program_outlives_child());
+            let spawned = (|| {
+                let mut child = match derived {
+                    // The derived program IS the backend; remap an exec failure to
+                    // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
+                    // yields the same kind and stays a plain Io). An already-elevated derived
+                    // (sanitized original) has no backend path, so it is never remapped.
+                    Some(mut derived) => {
+                        let r = spawn_unelevated(&mut derived, kill_on_drop);
+                        match backend_path.as_deref() {
+                            Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
+                            None => r?,
+                        }
                     }
-                }
-                // No derived command: the current POSIX `rewrite` always returns `Some` (it
-                // sanitizes even the already-elevated case into a derived), so this is defensive.
-                None => spawn_unelevated(cmd, kill_on_drop)?,
-            };
-            // Set the elevation report BEFORE handling the deferred password: a cleanup
-            // kill() in the write-failure path must see the elevated state so an EPERM maps
-            // to the typed Unkillable rather than leaking a raw Io.
-            child.set_elevation(report);
-            let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
-            return finish_elevated(child, written);
+                    // No derived command: the current POSIX `rewrite` always returns `Some` (it
+                    // sanitizes even the already-elevated case into a derived), so this is defensive.
+                    None => spawn_unelevated(cmd, kill_on_drop)?,
+                };
+                // Set the elevation report BEFORE handling the deferred password: a cleanup
+                // kill() in the write-failure path must see the elevated state so an EPERM maps
+                // to the typed Unkillable rather than leaking a raw Io.
+                child.set_elevation(report);
+                let written = password_write.map_or(Ok(()), |pw| pw.write_after_spawn());
+                finish_elevated(child, written)
+            })();
+            return spawned.map_err(|failure| if wrapper { failure.behind_wrapper() } else { failure });
         }
         #[cfg(not(any(unix, windows)))]
         {
-            return Err(Error::Unsupported {
+            return Err(SpawnFailure::NotStarted(Error::Unsupported {
                 op: "elevation".into(),
                 platform: std::env::consts::OS,
                 detail: "no elevation backend on this platform".into(),
-            });
+            }));
         }
     }
     spawn_unelevated(cmd, kill_on_drop)
@@ -99,8 +105,11 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
 /// and the note says it had exited. A front in a cgroup is ended by the tree's cgroup kill alone,
 /// read after it. The front's gate is decided once, before both kills.
+///
+/// The backend has run by now, so the program may have started: a backend that needed no password
+/// runs it without reading one.
 #[cfg(unix)]
-pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     let Err(write_err) = written else {
         return Ok(child);
     };
@@ -143,12 +152,26 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
         gate => child.kill_sent_gated(gate),
     };
-    let root_note = match root {
-        Ok(crate::signal::Sent::Gone) if exited_front => {
-            "the elevated child had already exited, and was reaped by someone else".to_string()
-        }
-        Ok(crate::signal::Sent::Gone) => {
-            "the elevated child could not be terminated (it was already reaped)".to_string()
+    let pid = child.id().pid();
+    let (root_note, fate) = match root {
+        Ok(crate::signal::Sent::Gone) if exited_front => (
+            "the elevated child had already exited, and was reaped by someone else".to_string(),
+            ChildFate::Gone,
+        ),
+        Ok(crate::signal::Sent::Gone) => (
+            "the elevated child could not be terminated (it was already reaped)".to_string(),
+            ChildFate::Gone,
+        ),
+        // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
+        // unique id every production spawn adopts is held (`SharedChild::adopt` is test-only there).
+        // Were it ever not, the child may still be running.
+        Ok(crate::signal::Sent::Unverified) => {
+            debug_assert!(false, "a sync child's kill always verifies its target");
+            (
+                "the elevated child could not be terminated (it could not be verified, and may still be running)"
+                    .to_string(),
+                ChildFate::Running { id: Some(child.id()) },
+            )
         }
         Ok(crate::signal::Sent::Delivered) => {
             #[cfg(test)]
@@ -156,32 +179,63 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
             match wait_killed_elevated(&child) {
                 Ok(_status) => {
                     #[cfg(test)]
-                    fault::record_teardown_reap(child.id().pid(), _status);
-                    if exited_front {
-                        "the elevated child had already exited, and was reaped".to_string()
+                    fault::record_teardown_reap(pid, _status);
+                    let note = if exited_front {
+                        "the elevated child had already exited, and was reaped"
                     } else {
-                        "the elevated child was terminated".to_string()
-                    }
+                        "the elevated child was terminated"
+                    };
+                    (note.to_string(), ChildFate::Reaped)
                 }
                 Err(e) if exited_front => {
-                    log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child had already exited, but could not be reaped ({e})")
+                    log::warn!("could not reap the exited elevated child pid {pid}: {e}");
+                    (
+                        format!("the elevated child had already exited, but could not be reaped ({e})"),
+                        ChildFate::Killed,
+                    )
                 }
                 Err(e) => {
-                    log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child was killed but could not be reaped ({e})")
+                    log::warn!("could not reap the killed elevated child pid {pid}: {e}");
+                    (
+                        format!("the elevated child was killed but could not be reaped ({e})"),
+                        ChildFate::Killed,
+                    )
                 }
             }
         }
         Err(e) => {
-            _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
+            #[cfg(test)]
+            fault::run_between_kill_and_wait();
+            // The non-blocking look reaps a child that has exited by now.
+            let fate = fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), Some(child.id()));
+            (format!("the elevated child could not be terminated ({e})"), fate)
         }
     };
-    Err(Error::Elevation {
-        kind: crate::error::ElevationErrorKind::AuthFailed,
-        detail: format!("{write_err}; {root_note}{tree_note}"),
-    })
+    Err(SpawnFailure::started(
+        Error::Elevation {
+            kind: crate::error::ElevationErrorKind::AuthFailed,
+            detail: format!("{write_err}; {root_note}{tree_note}"),
+        },
+        fate,
+    ))
+}
+
+/// The fate of a child cosca did not kill (its kill was refused, or never sent), from one
+/// non-blocking look that collects it if it has exited: `Reaped` then, `Running` if it has not
+/// exited, `Gone` if the look found it reaped by someone else (`ECHILD`), and `Unknown` if the look
+/// failed otherwise. `looked` carries the failed look's OS error, and `id` is the child's identity,
+/// if the spawn had read one.
+pub(crate) fn fate_of_a_look(
+    looked: Result<Option<std::process::ExitStatus>, Option<i32>>,
+    id: Option<ProcessId>,
+) -> ChildFate {
+    match looked {
+        Ok(Some(_)) => ChildFate::Reaped,
+        Ok(None) => ChildFate::Running { id },
+        #[cfg(unix)]
+        Err(Some(libc::ECHILD)) => ChildFate::Gone,
+        Err(_) => ChildFate::Unknown,
+    }
 }
 
 /// `child.wait()` after the root's kill, which a test can force to fail. The forced failure still
@@ -241,10 +295,12 @@ pub(crate) fn routes_to_raw_backend(cmd: &Command) -> bool {
 /// read identity, adopt. Shared by the ordinary path and the elevation paths'
 /// already-elevated / derived-command continuations (which must spawn without
 /// re-entering the elevation branch).
-pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, Error> {
+///
+/// Every failure says whether the program could have started; see [`SpawnFailure`].
+pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<Child, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
-    crate::wait::backend::probe_pidfd_support()?;
+    crate::wait::backend::probe_pidfd_support().not_started()?;
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
     // command would take the std path — whose fd >= 3 collection is unix-only, so the
@@ -262,11 +318,11 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         return windows_raw::spawn_raw(cmd, fds, kill_on_drop);
     }
     #[cfg(target_os = "linux")]
-    let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register)?;
+    let (mut std_cmd, handshake) = build_std_command_with(cmd, pidfd_handshake::register).not_started()?;
     #[cfg(target_os = "macos")]
-    let (mut std_cmd, report) = build_std_command_with(cmd, unique_report::register)?;
+    let (mut std_cmd, report) = build_std_command_with(cmd, unique_report::register).not_started()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let mut std_cmd = build_std_command(cmd)?;
+    let mut std_cmd = build_std_command(cmd).not_started()?;
 
     // Resolve every configured slot to a child end via the shared core. Slots: 0/1/2
     // (defaulting to inherit) plus, on Unix, any configured n>=3. We own our pipes
@@ -287,7 +343,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
         }
         v
     };
-    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Owned)?;
+    let (mut child_ends, parent_ends) = resolve_stdio(&fds, &all_slots, PipeOwnership::Owned).not_started()?;
 
     // Hand 0/1/2 child ends to std (consumes them; std closes its copies on spawn).
     for slot in std_slots {
@@ -344,8 +400,9 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
-        )?;
-        let report = report.open(&_guard)?;
+        )
+        .not_started()?;
+        let report = report.open(&_guard).not_started()?;
 
         // On Unix, hand n>=3 child ends to fd_map. This installs a pre_exec hook
         // that dup2's each OwnedFd to its target number post-fork. It is registered
@@ -361,14 +418,17 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 child_fd: fd.raw(),
             })
             .collect();
-        fd_map::install(&mut std_cmd, mappings).map_err(Error::Io)?;
+        fd_map::install(&mut std_cmd, mappings).not_started()?;
 
         #[allow(
             clippy::disallowed_methods,
             reason = "spawn_lock is held by `_guard`, taken at the top of this block"
         )]
         let (spawned, unique) = report.run(|| std_cmd.spawn().map_err(Error::Io));
-        let c = spawned.map_err(|e| unique_report::failed_spawn_error(e, &unique))?;
+        // std collected the child of a spawn it failed, which never ran the program.
+        let c = spawned
+            .map_err(|e| unique_report::failed_spawn_error(e, &unique))
+            .not_started()?;
         drop(std_cmd);
         (prepared, c, unique)
     };
@@ -383,20 +443,21 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
-        )?;
+        )
+        .not_started()?;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         if let Some(leaf) = prepared
             .cgroup_leaf
             .as_ref()
             .filter(|_| cmd.elevation_front().is_some())
         {
-            crate::containment::cgroup::front_placement(|| leaf.id())?;
+            crate::containment::cgroup::front_placement(|| leaf.id()).not_started()?;
         }
 
         let _guard = spawn_lock();
         // The hook was registered first of all (see `build_std_command_with`), so `fd_map`'s, which
         // may `dup2` a mapping onto any number, including the channel's, runs after it is done.
-        let handshake = handshake.open(&_guard)?;
+        let handshake = handshake.open(&_guard).not_started()?;
         let mappings: Vec<fd_map::FdMapping> = child_ends
             .into_iter()
             .map(|(fd, owned)| fd_map::FdMapping {
@@ -404,7 +465,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 child_fd: fd.raw(),
             })
             .collect();
-        fd_map::install(&mut std_cmd, mappings).map_err(Error::Io)?;
+        fd_map::install(&mut std_cmd, mappings).not_started()?;
 
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
@@ -421,7 +482,8 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             &reserved,
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
-        )?;
+        )
+        .not_started()?;
 
         // The std Child is owned here so containment can job-assign + resume it. Serialize the
         // spawn against the raw backend's inheritable-handle window via the shared spawn lock: std's
@@ -434,7 +496,7 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             let spawned = std_cmd.spawn().map_err(Error::Io);
             let spawned =
                 spawned.map_err(|e| crate::command::flags::classify_spawn_syscall_error(e, *cmd.flags_request()));
-            spawned?
+            spawned.not_started()?
         };
         (prepared, c)
     };
@@ -507,23 +569,28 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
                 drop(prepared);
             }
             #[cfg(target_os = "macos")]
-            let fate = {
+            let (fate, child_fate) = {
                 let identity = if matches!(other, crate::identity::Resolved::Gone) {
                     crate::containment::RootIdentity::Gone
                 } else {
                     crate::containment::RootIdentity::Unknown
                 };
-                leave_unverified_child(child, identity);
-                FrontFate::of_unverified(identity)
+                // The read failed, so no identity is known.
+                let child_fate = leave_unverified_child(child, identity, None);
+                (FrontFate::of_unverified(identity), child_fate)
             };
+            // The read failed, so no identity is known.
             #[cfg(target_os = "linux")]
-            let fate = teardown_unadopted_or_front(child, front, subtree.as_ref());
+            let (fate, child_fate) = teardown_unadopted_or_front(child, front, None, subtree.as_ref());
             #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-            let fate = teardown_unadopted_or_front(child, front);
+            let (fate, child_fate) = teardown_unadopted_or_front(child, front, None);
             // The distinction must survive as a VARIANT, not as prose: a supervisor matching
             // on `Unassessable` to retry elevated would otherwise see an I/O failure and
             // treat a live, merely-unreadable child as a startup failure. A front's fate is a note.
-            return Err(fate.note(spawn_identity_error(other), front, Some(pid)));
+            return Err(SpawnFailure::started(
+                fate.note(spawn_identity_error(other), front, Some(pid)),
+                child_fate,
+            ));
         }
     };
     #[cfg(test)]
@@ -542,13 +609,15 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // macOS: a front is left running and unreaped, sent nothing; any other child is killed
             // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
-            let fate = {
+            let (fate, child_fate) = {
                 assert_attach_cannot_fail(&error);
                 if front.is_some() {
-                    leave_front_after_attach_failure(child)
+                    (
+                        leave_front_after_attach_failure(child),
+                        ChildFate::Running { id: Some(id) },
+                    )
                 } else {
-                    teardown_after_attach_failure(child, unique);
-                    FrontFate::NotAFront
+                    (FrontFate::NotAFront, teardown_after_attach_failure(child, unique, id))
                 }
             };
             // Off macOS: kill + reap so a failed attach never leaks the child (std `Child::drop`
@@ -556,10 +625,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
             // containment already: a cgroup leaf's drop kills it, so a front in it is dying, and is
             // waited for.
             #[cfg(target_os = "linux")]
-            let fate = teardown_unadopted_or_front(child, front, subtree.as_ref());
+            let (fate, child_fate) = teardown_unadopted_or_front(child, front, Some(id), subtree.as_ref());
             #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-            let fate = teardown_unadopted_or_front(child, front);
-            return Err(fate.note(error, front, Some(pid)));
+            let (fate, child_fate) = teardown_unadopted_or_front(child, front, Some(id));
+            return Err(SpawnFailure::started(fate.note(error, front, Some(pid)), child_fate));
         }
     };
     // The pidfd is already held, so adopting cannot fail.
@@ -570,7 +639,10 @@ pub(crate) fn spawn_unelevated(cmd: &mut Command, kill_on_drop: bool) -> Result<
     #[cfg(windows)]
     let shared = match SharedChild::adopt(child, id) {
         Ok(shared) => shared,
-        Err((error, child)) => return Err(teardown_after_failed_adoption(child, error)),
+        Err((error, child)) => {
+            let (error, fate) = teardown_after_failed_adoption(child, error, Some(id));
+            return Err(SpawnFailure::started(error, fate));
+        }
     };
 
     let mut child = Child::from_parts(ProcHandle::std(shared), id, parent_ends, kill_on_drop, attachment);
@@ -610,38 +682,60 @@ fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
 ///
 /// The checks are not pins: macOS has no handle, so the kill has `via_verified_pid`'s window
 /// between its id check and `kill(2)`, and the reap has `try_reap`'s between its id check and the
-/// consuming `waitid`. A child that cannot be shown ours (a refused id read, or a zombie launchd
-/// holds) is left with a `warn`.
+/// consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
+/// a zombie launchd holds is not ours to reap, and is `Gone` (see [`Foreign::fate`]).
 ///
 /// Dropping the `std` `Child` closes our pipe ends only.
 #[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
-    kill_and_reap_verified(child.id(), unique);
+fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: ProcessId) -> ChildFate {
+    let fate = kill_and_reap_verified(child.id(), unique, Some(id));
     drop(child);
+    fate
 }
 
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
-/// handle.
+/// handle. `id` is its identity, if one was read.
 #[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64) {
+pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>) -> ChildFate {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
+    use crate::wait::exit_only::Foreign;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target),
-            Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-            Ok(Waited::Orphaned) => log::warn!(
-                "spawn teardown: pid {pid} cannot be shown to be ours or reaped (launchd holds it, because its tracer died)"
-            ),
-            Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
-            Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
+            Ok(Waited::Reapable) => reap_verified(pid, &target, id, true),
+            Ok(Waited::Gone) => {
+                log::debug!("spawn teardown: pid {pid} was reaped by someone else");
+                Foreign::Gone.fate(true)
+            }
+            Ok(Waited::Orphaned) => {
+                log::warn!(
+                    "spawn teardown: pid {pid} is not ours to reap (launchd holds its zombie, because its tracer died)"
+                );
+                Foreign::Orphaned.fate(true)
+            }
+            Ok(Waited::DeadlinePassed) => {
+                log::warn!("spawn teardown: pid {pid} is still running after its kill");
+                ChildFate::Running { id }
+            }
+            Err(e) => {
+                log::warn!("spawn teardown could not wait for pid {pid}: {e}");
+                ChildFate::Killed
+            }
         },
-        Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
+        Ok(Sent::Gone) => {
+            log::debug!("spawn teardown: pid {pid} is already gone");
+            Foreign::Gone.fate(false)
+        }
+        Ok(Sent::Unverified) => {
+            debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
+            log::warn!("spawn teardown: pid {pid} could not be verified, so it was not signalled");
+            ChildFate::Running { id }
+        }
         Err(kill) => {
             log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
-            reap_verified(pid, &target);
+            reap_verified(pid, &target, id, false)
         }
     }
 }
@@ -650,54 +744,102 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64) {
 /// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
 /// shown ours or reaped is a `warn`.
 #[cfg(target_os = "macos")]
-fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
+///
+/// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict (see
+/// [`Foreign::fate`]).
+fn reap_verified(
+    pid: u32,
+    target: &crate::wait::exit_only::Target<'_>,
+    id: Option<ProcessId>,
+    killed: bool,
+) -> ChildFate {
     use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
 
     let unverifiable = |why: &dyn std::fmt::Display| {
         log::warn!("spawn teardown: pid {pid} cannot be shown to be ours or reaped ({why})");
+        ChildFate::Unknown
     };
-    let orphaned = "launchd holds it, because its tracer died";
+    let foreign = |why: Foreign| {
+        match why {
+            Foreign::Orphaned => log::warn!(
+                "spawn teardown: pid {pid} is not ours to reap (launchd holds its zombie, because its tracer died)"
+            ),
+            Foreign::Gone | Foreign::Other => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
+        }
+        why.fate(killed)
+    };
+    let running = || {
+        log::warn!("spawn teardown: pid {pid} is still running");
+        ChildFate::Running { id }
+    };
     match peek_verified(target) {
         Err(e) => return unverifiable(&e),
-        Ok(Peek::Foreign(Foreign::Orphaned)) => return unverifiable(&orphaned),
-        Ok(Peek::Foreign(_)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Ok(Peek::Running) => return log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Peek::Foreign(why)) => return foreign(why),
+        Ok(Peek::Running) => return running(),
         Ok(Peek::Exit(_)) => {}
     }
     match try_reap(target) {
-        Ok(Reap::Reaped(Reaped::Status(_))) => {}
+        Ok(Reap::Reaped(Reaped::Status(_))) => ChildFate::Reaped,
+        // The consuming `waitid` collected the zombie, whatever it reported.
         Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
             log::warn!("spawn teardown: pid {pid}: a consuming waitid returned si_code {si_code}, not an exit record");
             debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
+            ChildFate::Reaped
         }
-        Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
-        Ok(Reap::Foreign(Foreign::Orphaned)) => unverifiable(&orphaned),
-        Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Err(e) => log::warn!("spawn teardown failed to reap pid {pid}: {e}"),
+        Ok(Reap::Running) => running(),
+        Ok(Reap::Foreign(why)) => foreign(why),
+        Err(e) => {
+            log::warn!("spawn teardown failed to reap pid {pid}: {e}");
+            ChildFate::Unknown
+        }
     }
 }
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
 /// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects; any other is left as `leave_unverified_child` leaves it, and the error
-/// notes that a `front` is left unreaped.
+/// corpse nothing collects, and the program did not start. A child that had not reported is left
+/// running and unreaped. Any other is left as `leave_unverified_child` leaves it. Either of those may
+/// have started the program, and the error notes that a `front` is left unreaped.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
     not_adopted: unique_report::NotAdopted,
     front: Option<crate::elevation::front::Front>,
-) -> Error {
-    if not_adopted.died_before_exec {
-        log::warn!(
-            "child {} died before exec; nothing is signalled or waited on by pid, so its status is not collected",
-            child.id()
-        );
-        drop(child);
-        not_adopted.error
-    } else {
-        let pid = child.id();
-        let error = teardown_after_failed_adoption(child, not_adopted.error);
-        FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid))
+) -> SpawnFailure {
+    use unique_report::Unadoptable;
+
+    let pid = child.id();
+    let error = not_adopted.error;
+    match not_adopted.why {
+        Unadoptable::DiedBeforeExec => {
+            log::warn!(
+                "child {pid} died before exec; nothing is signalled or waited on by pid, so its status is not collected"
+            );
+            drop(child);
+            SpawnFailure::NotStarted(error)
+        }
+        Unadoptable::Unreported => {
+            #[cfg(test)]
+            fault::capture(ProcessId::of(pid));
+            log::warn!(
+                "child {pid} had not reported its unique id when its spawn returned; it is not adopted, nothing is \
+                 signalled or waited on by pid, and it may be running"
+            );
+            drop(child);
+            SpawnFailure::started(
+                FrontFate::LeftUnreaped.note(error, front, Some(pid)),
+                // No unique id was read, so there is no identity to give.
+                ChildFate::Running { id: None },
+            )
+        }
+        Unadoptable::Unverified => {
+            // No unique id was read, so there is no identity to give.
+            let (error, fate) = teardown_after_failed_adoption(child, error, None);
+            SpawnFailure::started(
+                FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).note(error, front, Some(pid)),
+                fate,
+            )
+        }
     }
 }
 
@@ -707,20 +849,26 @@ fn abandon_unadopted(
 /// a warning names the pid, and the spawn still fails: the caller must not assume the program did
 /// not start.
 #[cfg(target_os = "macos")]
-fn leave_unverified_child(child: std::process::Child, identity: crate::containment::RootIdentity) {
-    if identity == crate::containment::RootIdentity::Gone {
+fn leave_unverified_child(
+    child: std::process::Child,
+    identity: crate::containment::RootIdentity,
+    id: Option<ProcessId>,
+) -> ChildFate {
+    let pid = child.id();
+    let fate = if identity == crate::containment::RootIdentity::Gone {
         log::warn!(
-            "child {} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid",
-            child.id()
+            "child {pid} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid"
         );
+        ChildFate::Gone
     } else {
         log::warn!(
-            "child {} cannot be shown to be ours (its identity could not be read); leaving it unreaped, with \
-             nothing signalled or waited on by pid, and it may still be running",
-            child.id()
+            "child {pid} cannot be shown to be ours (its identity could not be read); leaving it unreaped, with \
+             nothing signalled or waited on by pid, and it may still be running"
         );
-    }
+        ChildFate::Running { id }
+    };
     drop(child);
+    fate
 }
 
 /// The spawned `child` could not be adopted. Answers `error`.
@@ -733,14 +881,18 @@ fn leave_unverified_child(child: std::process::Child, identity: crate::containme
 /// Not on Linux, where the pidfd is opened before `exec` (see `pidfd_handshake`) and adoption
 /// cannot fail.
 #[cfg(not(target_os = "linux"))]
-fn teardown_after_failed_adoption(child: std::process::Child, error: Error) -> Error {
+fn teardown_after_failed_adoption(
+    child: std::process::Child,
+    error: Error,
+    id: Option<ProcessId>,
+) -> (Error, ChildFate) {
     #[cfg(test)]
     fault::capture(ProcessId::of(child.id()));
     #[cfg(target_os = "macos")]
-    leave_unverified_child(child, crate::containment::RootIdentity::Unknown);
+    let fate = leave_unverified_child(child, crate::containment::RootIdentity::Unknown, id);
     #[cfg(not(target_os = "macos"))]
-    teardown_unadopted(child);
-    error
+    let fate = teardown_unadopted(child, id);
+    (error, fate)
 }
 
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
@@ -1271,7 +1423,8 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
                 source: None,
             }),
         _ => Error::Io(std::io::Error::other(
-            "the spawned child exited and was reaped by another party before its identity could be read",
+            "the spawned child exited and was reaped by another party, or its zombie is held by one, before its \
+             identity could be read",
         )),
     }
 }
@@ -1284,7 +1437,7 @@ pub(crate) fn spawn_identity_error(outcome: crate::identity::Resolved<ProcessId>
 ///   peek is `Unknown`, warned.
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
-///   (held by launchd after its tracer died) is `Unknown` too.
+///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
 /// - **Windows:** the process handle pins the pid, so the read stands.
 ///
 /// On macOS the `through` id is the one the child reported before `exec`.
@@ -1309,14 +1462,12 @@ pub(crate) fn resolve_identity(
         let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
             Ok(Peek::Running | Peek::Exit(_)) => read,
-            // macOS: held by launchd after its tracer died. It is neither shown reaped nor shown
-            // ours, so it is unverifiable, not "reaped by another party".
+            // macOS: held by launchd after its tracer died. It has exited and is not ours to reap, so it
+            // is `Gone`, with a warning that its zombie is not collected.
             #[cfg(target_os = "macos")]
             Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => {
-                log::warn!(
-                    "child {pid}: launchd holds it, so its tracer died; it cannot be shown to be ours or reaped"
-                );
-                Resolved::Unknown
+                log::warn!("child {pid}: launchd holds its zombie, so its tracer died; it is not ours to reap");
+                Resolved::Gone
             }
             Ok(Peek::Foreign(_)) => Resolved::Gone,
             Err(e) => {
@@ -1409,6 +1560,11 @@ trait Unadopted: Send + 'static {
     fn pid(&self) -> Option<u32>;
     /// `Ok` for a child that has already exited.
     fn kill(&mut self) -> std::io::Result<()>;
+    /// Whether the last `kill` delivered a signal, rather than finding the child already gone.
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        true
+    }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     /// Blocks until the child exits, and reaps it.
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
@@ -1451,6 +1607,8 @@ struct PidfdChild {
     pidfd: std::os::fd::OwnedFd,
     /// Kept once reaped, as std keeps it: a later `try_wait` or `wait` answers it, not `ECHILD`.
     reaped: Option<std::process::ExitStatus>,
+    /// Whether its kill delivered a signal (see [`Unadopted::kill_delivered`]).
+    delivered: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1460,6 +1618,7 @@ impl PidfdChild {
             pid,
             pidfd,
             reaped: None,
+            delivered: false,
         }
     }
 
@@ -1482,12 +1641,17 @@ impl Unadopted for PidfdChild {
         use std::os::fd::AsFd;
         // A zombie takes the signal too, so an exited child is `Ok`, and so is one reaped elsewhere.
         // An unknown pid (a child tokio dropped) is named 0 in the helper's log.
-        crate::signal::via_pidfd(
+        let sent = crate::signal::via_pidfd(
             Some(self.pidfd.as_fd()),
             self.pid.unwrap_or(0),
             crate::signal::Sig::Kill,
-        )
-        .map(drop)
+        )?;
+        self.delivered = matches!(sent, crate::signal::Sent::Delivered);
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        self.delivered
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         use crate::wait::exit_only::{try_reap, Reap, Reaped};
@@ -1551,6 +1715,10 @@ impl Unadopted for HeldStdChild {
     fn kill(&mut self) -> std::io::Result<()> {
         self.through.kill()
     }
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        self.through.kill_delivered()
+    }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.through.try_wait()
     }
@@ -1578,6 +1746,13 @@ pub(crate) enum FrontFate {
     LeftUnreaped,
     /// It could not be waited on: reaped by someone else, or unreadable.
     Unaccounted,
+    /// Where it is could not be read, so it is not known whether its cgroup's kill ended it. It is
+    /// left unreaped.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only a Linux cgroup leaf places a front")
+    )]
+    Unplaced,
 }
 
 impl FrontFate {
@@ -1614,6 +1789,10 @@ impl FrontFate {
             }
             FrontFate::Unaccounted => {
                 "it was sent nothing and could not be waited on, so the elevated program may be running"
+            }
+            FrontFate::Unplaced => {
+                "it was sent nothing, and where it is cannot be read, so the elevated program may be running; it \
+                 is left unreaped"
             }
         };
         error.with_note(&format!("{what}; {fate}"))
@@ -1661,11 +1840,11 @@ pub(crate) fn front_subtree(
 fn teardown_unadopted_or_front(
     mut child: impl Unadopted,
     front: Option<crate::elevation::front::Front>,
+    id: Option<ProcessId>,
     #[cfg(target_os = "linux")] subtree: Option<&crate::containment::cgroup::Subtree>,
-) -> FrontFate {
+) -> (FrontFate, ChildFate) {
     if front.is_none() {
-        teardown_unadopted(child);
-        return FrontFate::NotAFront;
+        return (FrontFate::NotAFront, teardown_unadopted(child, id));
     }
     // Dropping the handle afterwards closes it; it neither signals nor reaps the child.
     #[cfg(all(test, target_os = "linux"))]
@@ -1691,9 +1870,12 @@ fn teardown_unadopted_or_front(
     };
     #[cfg(not(test))]
     let tried = child.try_wait();
+    let fate = fate_of_a_look(tried.as_ref().map(|s| *s).map_err(std::io::Error::raw_os_error), id);
     match tried {
-        Ok(Some(_)) => FrontFate::Reaped,
+        Ok(Some(_)) => (FrontFate::Reaped, fate),
         Ok(None) => {
+            #[cfg(target_os = "linux")]
+            let mut unplaced = false;
             #[cfg(target_os = "linux")]
             if let (Some(subtree), Some(pid)) = (subtree, child.pid()) {
                 match subtree.reached(pid, child.pidfd()) {
@@ -1704,22 +1886,26 @@ fn teardown_unadopted_or_front(
                             Ok(_status) => {
                                 #[cfg(test)]
                                 fault::record_teardown_reap(pid, _status);
-                                FrontFate::Reaped
+                                (FrontFate::Reaped, ChildFate::Reaped)
                             }
                             Err(e) => {
                                 log::warn!(
                                     "spawn teardown: elevation front {} could not be reaped ({e})",
                                     named(Some(pid))
                                 );
-                                FrontFate::Unaccounted
+                                (FrontFate::Unaccounted, ChildFate::Killed)
                             }
                         };
                     }
                     Ok(false) => {}
-                    Err(e) => log::debug!(
-                        "spawn teardown: elevation front {}'s cgroup cannot be read ({e})",
-                        named(Some(pid))
-                    ),
+                    // Where it is cannot be read, so it is not known whether the kill ended it.
+                    Err(e) => {
+                        log::debug!(
+                            "spawn teardown: elevation front {}'s cgroup cannot be read ({e})",
+                            named(Some(pid))
+                        );
+                        unplaced = true;
+                    }
                 }
             }
             log::warn!(
@@ -1727,7 +1913,11 @@ fn teardown_unadopted_or_front(
                  elevated program",
                 named(child.pid())
             );
-            FrontFate::LeftUnreaped
+            #[cfg(target_os = "linux")]
+            if unplaced {
+                return (FrontFate::Unplaced, ChildFate::Unknown);
+            }
+            (FrontFate::LeftUnreaped, fate)
         }
         // Reaped by someone else, or unreadable: nothing is signalled or waited on.
         Err(e) => {
@@ -1735,7 +1925,7 @@ fn teardown_unadopted_or_front(
                 "spawn teardown: elevation front {} cannot be waited on ({e})",
                 named(child.pid())
             );
-            FrontFate::Unaccounted
+            (FrontFate::Unaccounted, fate)
         }
     }
 }
@@ -1747,23 +1937,29 @@ pub(crate) fn leave_front_through_pidfd(
     pid: Option<u32>,
     pidfd: std::os::fd::OwnedFd,
     front: crate::elevation::front::Front,
+    id: Option<ProcessId>,
     subtree: Option<&crate::containment::cgroup::Subtree>,
-) -> FrontFate {
-    teardown_unadopted_or_front(PidfdChild::new(pid, pidfd), Some(front), subtree)
+) -> (FrontFate, ChildFate) {
+    teardown_unadopted_or_front(PidfdChild::new(pid, pidfd), Some(front), id, subtree)
 }
 
 /// Kill and reap, through `pidfd`, the child of a spawn that failed after its fork, unless it is
 /// already collected: std reaps the child of a spawn it fails; tokio can fail a spawn after std's
 /// succeeded, and drops the child neither killed nor reaped.
+/// `id` is the child's identity, if the spawn had read one.
 #[cfg(target_os = "linux")]
-pub(crate) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) {
+pub(crate) fn teardown_through_pidfd(
+    pid: Option<u32>,
+    pidfd: std::os::fd::OwnedFd,
+    id: Option<ProcessId>,
+) -> ChildFate {
     use crate::wait::exit_only::{peek, Peek};
 
     let child = PidfdChild::new(pid, pidfd);
     match peek(&child.target()) {
-        Ok(Peek::Foreign(_)) => {
+        Ok(Peek::Foreign(why)) => {
             log::debug!("{}: already collected when its spawn failed", named(pid));
-            return;
+            return why.fate(false);
         }
         Ok(Peek::Exit(_) | Peek::Running) => {}
         // `waitid` on a pidfd of this process's own child answers or says `ECHILD`.
@@ -1773,10 +1969,10 @@ pub(crate) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::Owned
                 named(pid)
             );
             debug_assert!(false, "waitid on a spawned child's pidfd failed: {e}");
-            return;
+            return ChildFate::Unknown;
         }
     }
-    teardown_unadopted(child);
+    teardown_unadopted(child, id)
 }
 
 /// Kill and reap a spawned child that an error path is abandoning before adoption, logging a
@@ -1787,8 +1983,10 @@ pub(crate) fn teardown_through_pidfd(pid: Option<u32>, pidfd: std::os::fd::Owned
 /// spawn for as long as it runs. If it has not exited, it is handed to [`reap_in_background`],
 /// which reaps it whenever it does, so it never lingers as a zombie. EPERM is the one kill failure
 /// that is not asserted, because it is reachable without any bug.
+///
+/// `id` is the child's identity, if the spawn had read one.
 #[cfg(not(target_os = "macos"))]
-fn teardown_unadopted(mut child: impl Unadopted) {
+fn teardown_unadopted(mut child: impl Unadopted, id: Option<ProcessId>) -> ChildFate {
     // warn before any assert: `debug_assert` is compiled out in release, and a swallowed failure
     // would otherwise leave no trace at all there.
     if let Err(kill) = kill_unadopted(&mut child) {
@@ -1796,7 +1994,9 @@ fn teardown_unadopted(mut child: impl Unadopted) {
             "spawn teardown failed to kill {}: {kill}; reaping it in the background once it exits",
             named(child.pid())
         );
-        if !matches!(child.try_wait(), Ok(Some(_))) {
+        let looked = child.try_wait();
+        let fate = fate_of_a_look(looked.as_ref().map(|s| *s).map_err(std::io::Error::raw_os_error), id);
+        if !matches!(looked, Ok(Some(_))) {
             reap_in_background(child);
         }
         // After the handoff, so a debug build's panic cannot strand the child.
@@ -1804,20 +2004,23 @@ fn teardown_unadopted(mut child: impl Unadopted) {
             kill.kind() == std::io::ErrorKind::PermissionDenied,
             "sync spawn teardown failed to kill child: {kill}"
         );
-        return;
+        return fate;
     }
     #[cfg(test)]
     fault::run_between_kill_and_wait();
     match reap_unadopted(&mut child) {
-        Ok(_) => {}
+        Ok(_) => ChildFate::Reaped,
         // Reaped by someone else: a handled case, not a contract violation.
         #[cfg(unix)]
         Err(reap) if reap.raw_os_error() == Some(libc::ECHILD) => {
             log::debug!("spawn teardown: {} was reaped by someone else", named(child.pid()));
+            // The kill went first: delivered, it is `Killed`; found nothing to signal, `Gone`.
+            crate::wait::exit_only::Foreign::Gone.fate(child.kill_delivered())
         }
         Err(reap) => {
             log::warn!("spawn teardown failed to reap {}: {reap}", named(child.pid()));
             debug_assert!(false, "sync spawn teardown failed to reap child: {reap}");
+            ChildFate::Killed
         }
     }
 }
@@ -1996,11 +2199,11 @@ pub(crate) mod fault {
             const { std::cell::RefCell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORCE_POST_FORK_FAIL: Cell<bool> = const { Cell::new(false) };
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        #[cfg(feature = "tokio")]
         static FAIL_TOKIO_SPAWN: Cell<bool> = const { Cell::new(false) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static AFTER_FAILED_TOKIO_FORK: std::cell::RefCell<Option<PidHook>> = const { std::cell::RefCell::new(None) };
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        #[cfg(feature = "tokio")]
         static FORGOTTEN_PID: Cell<Option<u32>> = const { Cell::new(None) };
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         static FORGOTTEN_LEAF: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -2018,7 +2221,7 @@ pub(crate) mod fault {
 
     /// The pid of the child the last forced post-fork failure dropped. It is still this
     /// process's unreaped child, so the caller may wait on it.
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn take_forgotten_pid() -> Option<u32> {
         FORGOTTEN_PID.with(|f| f.take())
     }
@@ -2038,7 +2241,7 @@ pub(crate) mod fault {
     /// While the guard lives, tokio's own `spawn()` on this thread fails after its fork, dropping the
     /// child neither killed nor reaped, as a failed reaper registration (`epoll_ctl`'s `ENOSPC` or
     /// `ENOMEM`) does. The child's pid is kept for [`take_forgotten_pid`].
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     pub(crate) fn fail_tokio_spawns_after_fork() -> FailTokioSpawns {
         FAIL_TOKIO_SPAWN.with(|f| f.set(true));
         FailTokioSpawns(())
@@ -2052,19 +2255,44 @@ pub(crate) mod fault {
         fail_tokio_spawns_after_fork()
     }
 
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     #[must_use = "spawns succeed again as soon as the guard is dropped"]
     pub(crate) struct FailTokioSpawns(());
 
-    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    #[cfg(feature = "tokio")]
     impl Drop for FailTokioSpawns {
         fn drop(&mut self) {
             FAIL_TOKIO_SPAWN.with(|f| f.set(false));
+            #[cfg(target_os = "linux")]
             AFTER_FAILED_TOKIO_FORK.with(|h| h.borrow_mut().take());
         }
     }
 
+    /// While [`fail_tokio_spawns_after_fork`]'s guard lives, makes tokio's `spawn()` fail after its
+    /// fork: the child is forgotten, and its pid, a pidfd on it and `leaf`, the cgroup leaf of the
+    /// spawn, are kept for the `take_forgotten_*` readers. The spawn's own answer is what production
+    /// gives a child tokio dropped.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn fail_tokio_spawn_after_fork(
+        spawned: std::io::Result<::tokio::process::Child>,
+        leaf: Option<&std::path::Path>,
+    ) -> std::io::Result<::tokio::process::Child> {
+        if !FAIL_TOKIO_SPAWN.with(Cell::get) {
+            return spawned;
+        }
+        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
+        let child = spawned?;
+        if let (Some(hook), Some(pid)) = (AFTER_FAILED_TOKIO_FORK.with(|h| h.borrow_mut().take()), child.id()) {
+            hook(pid);
+        }
+        forget_child(child);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    /// [`fail_tokio_spawns_after_fork`] for a platform without the pidfd handshake: tokio's `spawn()`
+    /// fails after its fork, and the child is forgotten, neither killed nor reaped. Its pid is kept
+    /// for [`take_forgotten_pid`].
+    #[cfg(all(not(target_os = "linux"), feature = "tokio"))]
     pub(crate) fn fail_tokio_spawn_after_fork(
         spawned: std::io::Result<::tokio::process::Child>,
     ) -> std::io::Result<::tokio::process::Child> {
@@ -2073,23 +2301,15 @@ pub(crate) mod fault {
         }
         let child = spawned?;
         FORGOTTEN_PID.with(|f| f.set(child.id()));
-        if let (Some(hook), Some(pid)) = (AFTER_FAILED_TOKIO_FORK.with(|h| h.borrow_mut().take()), child.id()) {
-            hook(pid);
-        }
         std::mem::forget(child);
-        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        Err(std::io::Error::other(
+            "forced tokio spawn failure after the fork (test seam)",
+        ))
     }
 
+    /// Forgets `child`, neither killed nor reaped, keeping its pid and a pidfd on it.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
-    pub(crate) fn post_fork_failure(
-        spawned: Result<::tokio::process::Child, crate::error::Error>,
-        leaf: Option<&std::path::Path>,
-    ) -> Result<::tokio::process::Child, crate::error::Error> {
-        if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
-            return spawned;
-        }
-        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
-        let child = spawned?;
+    fn forget_child(child: ::tokio::process::Child) -> u32 {
         FORGOTTEN_PID.with(|f| f.set(child.id()));
         // A handle on the child that cannot come to name another process, taken while tokio still
         // pins its pid, so a test can prove the child reaped without probing a freed pid.
@@ -2102,10 +2322,32 @@ pub(crate) mod fault {
         FORGOTTEN_PIDFD.with(|f| *f.borrow_mut() = pidfd);
         let pid = child.id().expect("an unreaped child has its pid");
         std::mem::forget(child);
+        pid
+    }
+
+    /// Fails the NEXT tokio spawn on this thread after the handshake concluded, forgetting its child
+    /// as [`fail_tokio_spawn_after_fork`] does. That answer is the seam's own, not production's: a
+    /// test through it checks the leaf and the warnings, never the answer (use
+    /// [`fail_tokio_spawns_after_fork`] for that).
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn post_fork_failure(
+        spawned: Result<::tokio::process::Child, super::SpawnFailure>,
+        leaf: Option<&std::path::Path>,
+    ) -> Result<::tokio::process::Child, super::SpawnFailure> {
+        if !FORCE_POST_FORK_FAIL.with(|f| f.replace(false)) {
+            return spawned;
+        }
+        FORGOTTEN_LEAF.with(|f| *f.borrow_mut() = leaf.map(std::path::Path::to_path_buf));
+        let child = spawned?;
+        let pid = forget_child(child);
         // Its pid names this spawn's failure, so a test can tell its log records from any other's.
-        Err(crate::error::Error::Io(std::io::Error::other(format!(
-            "forced post-fork spawn failure (test seam) for child {pid}"
-        ))))
+        // It models tokio failing after std's spawn succeeded: after `exec`.
+        Err(super::SpawnFailure::started(
+            crate::error::Error::Io(std::io::Error::other(format!(
+                "forced post-fork spawn failure (test seam) for child {pid}"
+            ))),
+            crate::error::ChildFate::Unknown,
+        ))
     }
 
     pub(crate) fn set_force_identity_vanished(on: bool) {
@@ -2445,6 +2687,10 @@ pub(crate) mod fd_map;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "spawn/fd_channel.rs"]
 pub(crate) mod fd_channel;
+
+// A failed spawn's answer to whether the program could have started.
+#[path = "spawn/failure.rs"]
+pub(crate) mod failure;
 
 // Linux: holds a forked child before `exec` until the parent has its pidfd.
 #[cfg(target_os = "linux")]

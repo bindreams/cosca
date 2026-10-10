@@ -17,6 +17,11 @@
 //! `spawn()` returning `Ok` does not mean the child execed: std reads EOF on its own close-on-exec
 //! pipe both after a successful `exec` and after a child killed by a signal before it. So the
 //! report may be missing on `Ok`, and [`Report::Missing`] says so.
+//!
+//! Nor does it mean the child has reported yet. With two of this process's fds 0 to 2 closed, std's
+//! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
+//! hooks run (see `crate::containment::cgroup::channel::ReportChannel`). The pipe is then empty but
+//! open, [`Report::Unwritten`], and the child may report and `exec` afterwards.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -41,8 +46,12 @@ pub(crate) enum Report {
     Id(u64),
     /// The child's own read was refused with this errno; its hook then failed before `exec`.
     ChildRefused(i32),
-    /// No report, or a short one: the child died before it could write it (before `exec`).
+    /// No report, or a short one, and every copy of the write end closed: the child died before it
+    /// could write it (before `exec`).
     Missing,
+    /// No report, and the pipe still open: the child has not written it yet, or a copy of the write
+    /// end outlives it in another forked process. Nothing shows the child did not go on to `exec`.
+    Unwritten,
     /// This process's own read of the pipe failed.
     ReadFailed(io::Error),
     /// A tag no hook writes.
@@ -130,6 +139,10 @@ fn read_report(read_end: &OwnedFd) -> Report {
     if let Some(errno) = seams::parent_read_fails() {
         return Report::ReadFailed(io::Error::from_raw_os_error(errno));
     }
+    #[cfg(test)]
+    if seams::parent_read_finds_nothing() {
+        return Report::Unwritten;
+    }
     let mut buf = [0u8; REPORT_LEN];
     let mut got = 0;
     while got < REPORT_LEN {
@@ -143,7 +156,7 @@ fn read_report(read_end: &OwnedFd) -> Report {
             let e = io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::EINTR) => {}
-                Some(libc::EAGAIN) => return Report::Missing,
+                Some(libc::EAGAIN) => return Report::Unwritten,
                 _ => return Report::ReadFailed(e),
             }
         }
@@ -161,41 +174,75 @@ fn read_report(read_end: &OwnedFd) -> Report {
 #[derive(Debug)]
 pub(crate) struct NotAdopted {
     pub(crate) error: Error,
-    /// The child died before `exec`: only a corpse is left. Otherwise nothing shows what it is
-    /// doing, and it may be running.
-    pub(crate) died_before_exec: bool,
+    pub(crate) why: Unadoptable,
+}
+
+/// Why a child cannot be adopted, which decides what the spawn does with it and what it answers.
+/// The caller signals and waits on none of them by pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unadoptable {
+    /// It died before `exec`, so only a corpse is left, and the program did not start.
+    DiedBeforeExec,
+    /// It had not reported when its spawn returned ([`Report::Unwritten`]): it may yet report, `exec`
+    /// and run the program, so it is left running, and the program may have started.
+    Unreported,
+    /// Its report could not be read or is malformed: nothing shows what it is doing, and the program
+    /// may have started.
+    Unverified,
 }
 
 /// The spawn's unique id, or why the child cannot be adopted, for a spawn that returned `Ok`.
 /// Either way the caller does not signal or wait on the child by pid.
 pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
-    let dead = |error| NotAdopted {
-        error,
-        died_before_exec: true,
-    };
-    let unknown = |error| NotAdopted {
-        error,
-        died_before_exec: false,
-    };
+    let not = |why, error| Err(NotAdopted { error, why });
     match report {
         Report::Id(id) => Ok(id),
         // The hook fails its spawn after reporting a refusal, so `Ok` is a child killed between its
         // report and std's own errno write: the same refusal, with the program not started.
-        Report::ChildRefused(errno) => Err(dead(refused_error(errno))),
-        Report::Missing => Err(dead(Error::Io(io::Error::other(format!(
-            "the spawned child {pid} died before exec; the program did not start"
-        ))))),
-        Report::ReadFailed(e) => Err(unknown(Error::Unassessable {
-            detail: format!("pid {pid}: its unique-id report could not be read ({e}); the child was not adopted"),
-            source: Some(e),
-        })),
+        Report::ChildRefused(errno) => not(Unadoptable::DiedBeforeExec, refused_error(errno)),
+        Report::Missing => not(
+            Unadoptable::DiedBeforeExec,
+            Error::Io(io::Error::other(format!(
+                "the spawned child {pid} died before exec; the program did not start"
+            ))),
+        ),
+        Report::Unwritten => not(
+            Unadoptable::Unreported,
+            Error::Io(io::Error::other(format!(
+                "the spawned child {pid} had not reported its unique id when its spawn returned; the child was \
+                 not adopted"
+            ))),
+        ),
+        Report::ReadFailed(e) => not(
+            Unadoptable::Unverified,
+            Error::Unassessable {
+                detail: format!("pid {pid}: its unique-id report could not be read ({e}); the child was not adopted"),
+                source: Some(e),
+            },
+        ),
         Report::BadTag(tag) => {
             debug_assert!(false, "a unique-id report with tag {tag}");
-            Err(unknown(Error::Unassessable {
-                detail: format!("pid {pid}: its unique-id report is malformed (tag {tag}); the child was not adopted"),
-                source: None,
-            }))
+            not(
+                Unadoptable::Unverified,
+                Error::Unassessable {
+                    detail: format!(
+                        "pid {pid}: its unique-id report is malformed (tag {tag}); the child was not adopted"
+                    ),
+                    source: None,
+                },
+            )
         }
+    }
+}
+
+/// Whether `report` proves that the child of a spawn did not run the program: it refused its own
+/// id (its hook then fails before `exec`), or it died before it could report. Any other report
+/// leaves the program possibly started. Only the tokio spawn asks: std's own failed spawn proves it.
+#[cfg(any(test, feature = "tokio"))]
+pub(crate) fn proves_no_exec(report: &Report) -> bool {
+    match report {
+        Report::ChildRefused(_) | Report::Missing => true,
+        Report::Id(_) | Report::Unwritten | Report::ReadFailed(_) | Report::BadTag(_) => false,
     }
 }
 
@@ -233,7 +280,7 @@ fn report(shared: &Shared, #[cfg(test)] seam: seams::Armed) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(errno));
     }
     #[cfg(test)]
-    let read = seam.read();
+    let read = seam.read(shared.child_end());
     #[cfg(not(test))]
     let read = crate::identity::own_unique_id();
     let (tag, value) = match read {
@@ -283,6 +330,7 @@ pub(crate) mod seams {
     thread_local! {
         static FORCE: Cell<Force> = const { Cell::new(Force::None) };
         static PARENT_READ_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        static PARENT_READ_UNWRITTEN: Cell<bool> = const { Cell::new(false) };
     }
 
     /// What a hook registered on this thread was armed with.
@@ -298,13 +346,21 @@ pub(crate) mod seams {
             }
         }
 
-        pub(super) fn read(self) -> Result<u64, i32> {
+        /// `child_end` is the report pipe's write end.
+        pub(super) fn read(self, child_end: std::os::fd::RawFd) -> Result<u64, i32> {
             match self.0 {
                 Force::None | Force::FailBeforeReport(_) => crate::identity::own_unique_id(),
                 Force::Errno(errno) => Err(errno),
                 Force::KillSelf => {
-                    // SAFETY: `kill` and `getpid` are async-signal-safe; the child dies here.
-                    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                    // The write end is closed first: the kernel closes a dying process's descriptors
+                    // one by one, so std's own pipe could read EOF, and the spawn read the report,
+                    // while this one is still open. The parent then sees `Unwritten`, a child that
+                    // may yet run, where a test of this seam asks for one that died.
+                    // SAFETY: `close`, `kill` and `getpid` are async-signal-safe; the child dies here.
+                    unsafe {
+                        libc::close(child_end);
+                        libc::kill(libc::getpid(), libc::SIGKILL);
+                    }
                     Err(libc::EINTR)
                 }
             }
@@ -356,6 +412,26 @@ pub(crate) mod seams {
 
     pub(super) fn parent_read_fails() -> Option<i32> {
         PARENT_READ_ERRNO.with(Cell::get)
+    }
+
+    /// While the guard lives, this thread's own read of a spawn's report finds it not yet written,
+    /// as when std's spawn returned before the child's hooks ran: the child runs on as it would.
+    pub(crate) fn find_the_report_unwritten() -> UnwrittenRead {
+        PARENT_READ_UNWRITTEN.with(|f| f.set(true));
+        UnwrittenRead(())
+    }
+
+    #[must_use = "the read finds the report again as soon as the guard is dropped"]
+    pub(crate) struct UnwrittenRead(());
+
+    impl Drop for UnwrittenRead {
+        fn drop(&mut self) {
+            PARENT_READ_UNWRITTEN.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn parent_read_finds_nothing() -> bool {
+        PARENT_READ_UNWRITTEN.with(Cell::get)
     }
 
     /// The next spawns on this thread have their child killed by `SIGKILL` before it reports, as

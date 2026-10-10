@@ -940,3 +940,43 @@ fn a_failed_token_close_is_logged() {
         "a failed token close must be logged"
     );
 }
+
+/// The launch maps each classification of a failed `ShellExecuteEx(runas)` (see
+/// `runas_failure_tests`) to its answer: a declined prompt and an error before the launch did not
+/// start the program, and anything else may have, with no handle to say what became of it.
+///
+/// Mutant: the launch drops the classification's answer.
+#[skuld::test]
+fn a_shell_execute_failure_takes_its_answer_from_the_classification() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{ERROR_CANCELLED, ERROR_DDE_FAIL, ERROR_FILE_NOT_FOUND};
+
+    use crate::child::spawn::SpawnFailure;
+    use crate::error::{ChildFate, ElevationErrorKind, Error};
+
+    assert!(matches!(
+        super::shell_execute_failure(HRESULT::from_win32(ERROR_CANCELLED.0), 0),
+        SpawnFailure::NotStarted(Error::Elevation {
+            kind: ElevationErrorKind::AuthDeclined,
+            ..
+        })
+    ));
+    assert!(matches!(
+        super::shell_execute_failure(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0), 2),
+        SpawnFailure::NotStarted(Error::Elevation {
+            kind: ElevationErrorKind::AuthFailed,
+            ..
+        })
+    ));
+    assert!(matches!(
+        super::shell_execute_failure(HRESULT::from_win32(ERROR_DDE_FAIL.0), 0),
+        SpawnFailure::MayHaveStarted {
+            cause: Error::Elevation {
+                kind: ElevationErrorKind::AuthFailed,
+                ..
+            },
+            fate: ChildFate::Unknown,
+            wrapper_elevated: false,
+        }
+    ));
+}

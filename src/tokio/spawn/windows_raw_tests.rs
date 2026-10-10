@@ -78,7 +78,8 @@ async fn an_async_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         .contain()
         .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
     observe::take_inheritance_cleared();
-    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    let err =
+        crate::child::spawn::failure::expect_not_started(refused.spawn().expect_err("a reserved bit must be refused"));
     assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
     assert!(
         !observe::take_inheritance_cleared(),
@@ -112,7 +113,8 @@ async fn an_async_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheri
         .contain()
         .env("A\0B", "x");
     observe::take_inheritance_cleared();
-    let err = refused.spawn().expect_err("an embedded NUL must be refused");
+    let err =
+        crate::child::spawn::failure::expect_not_started(refused.spawn().expect_err("an embedded NUL must be refused"));
     assert!(
         matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
         "got {err:?}"
@@ -148,10 +150,17 @@ async fn an_async_raw_spawn_reads_the_identity_before_it_attaches() {
     let result = c.spawn();
     fault::set_force_attach_failure(false);
     fault::set_force_identity_vanished(false);
-    let err = result.expect_err("a forced failure fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        result.expect_err("a forced failure fails the spawn"),
+    );
     assert!(
         matches!(&err, Error::Io(e) if e.to_string().contains("reaped by another party")),
         "the identity check comes first: {err:?}"
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the raw teardown kills and reaps the child"
     );
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
 }
@@ -167,7 +176,65 @@ async fn an_async_raw_spawn_whose_attach_fails_tears_its_child_down() {
     fault::set_force_attach_failure(true);
     let result = c.spawn();
     fault::set_force_attach_failure(false);
-    let err = result.expect_err("the forced attach failure fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        result.expect_err("the forced attach failure fails the spawn"),
+    );
     assert!(matches!(err, Error::Containment { .. }), "{err:?}");
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "terminated and waited for");
     fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
+}
+
+/// The async twin of `a_raw_spawn_whose_create_process_fails_did_not_start`.
+#[cfg(windows)]
+#[skuld::test]
+async fn an_async_raw_spawn_whose_create_process_fails_did_not_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image = dir.path().join("not-a-program.exe");
+    std::fs::write(&image, b"not a PE image").expect("write the image");
+    let mut c = Command::new();
+    c.executable(&image).args(["not-a-program"]);
+    let err = crate::child::spawn::failure::expect_not_started(c.spawn().expect_err("a non-PE image fails"));
+    assert!(
+        matches!(err, crate::error::Error::Io(ref e) if e.raw_os_error().is_some()),
+        "{err:?}"
+    );
+}
+
+/// Every refusal the async raw backend makes before `CreateProcessW` says the program did not start:
+/// a batch program, a NUL in the working directory or the command line, an fd table over its limit,
+/// and `inherit` on fd 3.
+///
+/// Mutant: any one of those arms answers that the program may have started.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_raw_refusals_before_create_process_did_not_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bat = dir.path().join("x.bat");
+    std::fs::write(&bat, b"@echo off\n").expect("write the batch file");
+    let mut batch = Command::new();
+    batch.executable(&bat).args(["x.bat"]);
+    let mut cwd_nul = Command::new();
+    cwd_nul
+        .executable("findstr")
+        .args(["findstr", "x"])
+        .current_dir(std::path::PathBuf::from("a\u{0}b"));
+    let mut line_nul = Command::new();
+    line_nul.executable("findstr").args(["findstr", "a\u{0}b"]);
+    let mut oversized = Command::new();
+    oversized.executable("findstr").args(["findstr", "x"]);
+    oversized.fd(70_000, Stdio::null()).expect("fd 70000");
+    let mut inherit_fd3 = Command::new();
+    inherit_fd3.executable("findstr").args(["findstr", "x"]);
+    inherit_fd3.fd(3, Stdio::inherit()).expect("fd 3");
+    use crate::child::spawn::failure::{invalid_input, unsupported};
+    for (what, mut cmd, variant) in [
+        ("batch", batch, unsupported as fn(&crate::error::Error) -> bool),
+        ("cwd NUL", cwd_nul, invalid_input),
+        ("command-line NUL", line_nul, invalid_input),
+        ("oversized fd table", oversized, unsupported),
+        ("inherit on fd 3", inherit_fd3, unsupported),
+    ] {
+        let err = crate::child::spawn::failure::expect_not_started(cmd.spawn().expect_err(what));
+        assert!(variant(&err), "{what}: not the refusal's own error: {err:?}");
+    }
 }
