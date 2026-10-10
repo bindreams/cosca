@@ -1,4 +1,4 @@
-//! The shim's exit codes (plan F, D8). cosca does not interpret them: the frame decides. The
+//! The shim's exit codes. cosca does not interpret them: the frame decides. The
 //! refusals after hello (122-125) are [`Refusal`](super::protocol::Refusal).
 
 /// The possibly-started program's status was reaped by someone else (frame `U`).

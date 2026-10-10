@@ -17,5 +17,5 @@ pub(crate) mod program_path;
 pub(crate) mod protocol;
 pub(crate) mod step;
 
-#[allow(unused_imports, reason = "no caller yet")]
+#[allow(unused_imports, reason = "nothing outside the tests of this module uses it")]
 pub(crate) use choice::ShimChoice;
