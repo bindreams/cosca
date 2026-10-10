@@ -80,8 +80,6 @@ impl Child {
     /// [`Child::kill`](crate::Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
         #[cfg(unix)]
-        self.refuse_unpinned("terminate")?;
-        #[cfg(unix)]
         if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
             return Err(unkillable);
         }
@@ -273,8 +271,6 @@ impl Child {
         // Before the grace is waited: a root this process does not pin is neither signalled nor
         // watched.
         self.require_contained()?;
-        #[cfg(unix)]
-        self.refuse_unpinned("graceful_shutdown_tree")?;
         // terminate_tree's own require_contained guard fires before any signal, so an
         // uncontained child errors up front.
         #[cfg(test)]
