@@ -483,12 +483,12 @@ jobs:
         shell: bash
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py cgroup sudo -E "$(command -v python3)" .github/scripts/forward.py bash -uxc '
+          exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
-            # The profile is passed explicitly: Ubuntu 26.04's sudo-rs ignores `-E`, so no variable survives.
+            # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
