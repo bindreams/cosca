@@ -20,13 +20,7 @@ use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
 
-// The integration tests' cgroup helpers, compiled from their real source.
-#[path = "../../../tests/common/cgroup.rs"]
-#[allow(
-    dead_code,
-    reason = "this file needs `LeafGuard` alone; the integration binaries use the rest"
-)]
-mod cgroup_common;
+use super::child_drop_reaped_tests::cgroup_common;
 
 /// Removes the child's leaf when the test ends, a failing one too: a tokio drop does not wait for the leaf to drain.
 fn clean_up_leaf_of(child: &Child) -> cgroup_common::LeafGuard {

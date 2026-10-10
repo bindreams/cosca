@@ -419,7 +419,7 @@ async fn drop_after_an_incomplete_tree_walk_kill_and_wait_still_warns() {
     dead_code,
     reason = "this file needs `drain_and_remove_leaf` alone; the integration binaries use the rest"
 )]
-mod cgroup_common;
+pub(super) mod cgroup_common;
 
 /// A cgroup names its tree without the root's number, so the reaped root does not stop the drop's
 /// kill. The cgroup lane's counterpart of the sync test of the same name. Mutant: the skip applied to every mechanism, which logs the warn here.
