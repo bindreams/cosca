@@ -642,12 +642,14 @@ impl ProcSource {
     /// - **Windows:** waits on tokio's process handle, which pins the child.
     ///
     /// On [`Waited::Foreign`] the caller calls [`forget_foreign`](ProcSource::forget_foreign).
+    #[cfg(any(windows, test))]
     pub(crate) fn wait_and_reap(&mut self, pid: u32) -> Waited {
         self.wait_and_reap_at(pid, log::Level::Warn)
     }
 
     /// [`wait_and_reap`](ProcSource::wait_and_reap), logging what it finds that is not an exit at
     /// `level`: for a caller that reports a [`Waited::Foreign`] itself, in its one warn.
+    #[cfg(any(windows, test))]
     pub(crate) fn wait_and_reap_at(&mut self, pid: u32, level: log::Level) -> Waited {
         self.wait_and_reap_caused(pid, level).0
     }
