@@ -64,6 +64,10 @@ mod root_state_tests;
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/unpinned_public_tests.rs"]
+mod unpinned_public_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
 pub(crate) mod front_kill_tests;
@@ -292,6 +296,15 @@ impl Child {
     /// An elevated program that moves its front out of the cgroup and back again around the kill
     /// can make an `Ok` false, as [`Command::contain`](crate::Command::contain) says; `wait` stays
     /// truthful.
+    ///
+    /// **macOS, a root launchd holds.** If a tracer reparented the root and died, launchd holds its
+    /// zombie and reaps it on its own schedule, so this process no longer pins its pid. Nothing is
+    /// sent to it, by pid or to its group, and nothing is waited on: the call returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) naming launchd, and the root is
+    /// left as it was. The state is read before anything is sent, so a tracer that dies after the
+    /// read passes still leaves a window in which the signal lands on a pid launchd has since
+    /// reused; only the audit-token signal of [#55](https://github.com/bindreams/cosca/issues/55)
+    /// closes it.
     pub fn kill(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
@@ -311,7 +324,15 @@ impl Child {
     /// [`kill`](Child::kill), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self) -> Result<crate::signal::Sent, Error> {
+        self.refuse_unpinned("kill")?;
         self.kill_sent_gated(self.kill_gate())
+    }
+
+    /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
+    /// See [`crate::signal::refuse_unpinned`].
+    #[cfg(unix)]
+    pub(crate) fn refuse_unpinned(&self, op: &str) -> Result<(), Error> {
+        crate::signal::refuse_unpinned(self.id.pid(), op, || self.proc.state())
     }
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's [`kill_gate`](Child::kill_gate)
@@ -542,8 +563,12 @@ impl Child {
     /// cgroup that holds it, and nothing is signalled after its kill. Under any other mechanism, or
     /// once it has left the cgroup, this sends nothing and returns
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        #[cfg(unix)]
+        self.refuse_unpinned("kill_tree")?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
         // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
         // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
@@ -689,8 +714,12 @@ impl Child {
     /// See [`kill_tree`](Child::kill_tree)'s doc for two things that also apply here: the
     /// `ProcessGroup`/`Session`-only scope of this guarantee (a separate, unfixed gap for
     /// `TreeWalk`), and the residual `hidepid` gap on Linux.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        #[cfg(unix)]
+        self.refuse_unpinned("terminate_tree")?;
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]

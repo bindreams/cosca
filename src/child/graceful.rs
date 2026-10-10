@@ -64,7 +64,11 @@ impl Child {
     /// is past the window and gets a real cooperative signal; a caller that wants the child gone
     /// before it has run at all should use [`kill`](Child::kill), which is honest about being
     /// forced.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        self.refuse_unpinned("terminate")?;
         #[cfg(unix)]
         if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
             return Err(unkillable);
@@ -109,6 +113,8 @@ impl Child {
     /// An elevated child behind a front (see [`kill`](Child::kill)) that outlives the grace is killed
     /// only through a cgroup that holds it. Outside one it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
 
@@ -124,6 +130,9 @@ impl Child {
         }
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
+        // A root orphaned during the grace is no longer ours to kill.
+        #[cfg(unix)]
+        self.refuse_unpinned("kill")?;
         // Escalate; an Err returns HERE, subsuming any watch Err (deliberate — mirrors kill_tree's
         // both-fail disposition). A live front outside a cgroup is not signalled; any other child's
         // refused kill stays the raw `Io`.
@@ -231,10 +240,16 @@ impl Child {
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for [`kill`](Child::kill).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
         // Fail fast before sending any signal. terminate_tree/kill_tree re-check this guard
         // internally; the redundancy is intentional so an uncontained child errors up front.
         self.require_contained()?;
+        // Before the grace is waited: a root this process does not pin is neither signalled nor
+        // watched.
+        #[cfg(unix)]
+        self.refuse_unpinned("graceful_shutdown_tree")?;
 
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {

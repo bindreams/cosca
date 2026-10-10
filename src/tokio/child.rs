@@ -629,6 +629,9 @@ impl Child {
     /// otherwise it sends nothing. An elevated program that moves its front out of the cgroup and
     /// back again around the kill can make an `Ok` false; `wait` stays truthful. See the sync
     /// [`Child::kill`](crate::Child::kill).
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill), which says why and what window remains.
     pub fn kill(&mut self) -> Result<(), Error> {
         self.kill_sent().map(|_| ())
     }
@@ -637,6 +640,8 @@ impl Child {
     /// child was already gone ([`Sent::Gone`]: nothing was sent, and the caller must not wait for
     /// a termination that did not happen).
     pub(crate) fn kill_sent(&mut self) -> Result<Sent, Error> {
+        #[cfg(unix)]
+        self.refuse_unpinned("kill")?;
         #[cfg(unix)]
         let gate = self.kill_gate();
         self.kill_sent_gated(
@@ -730,8 +735,13 @@ impl Child {
     ///
     /// **An elevated child behind a front** is reached only through a cgroup, as for the sync
     /// [`Child::kill_tree`](crate::Child::kill_tree).
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
+        #[cfg(unix)]
+        self.refuse_unpinned("kill_tree")?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
         // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
         // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
@@ -848,8 +858,13 @@ impl Child {
     /// ([`Error::Unassessable`](crate::error::Error::Unassessable)) rather than fired at a bare
     /// pid; [`kill_tree`](Child::kill_tree) addresses no pid and still reaches the survivors.
     /// The sync [`Child`](crate::Child) pins for its whole life and is unaffected.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
+        #[cfg(unix)]
+        self.refuse_unpinned("terminate_tree")?;
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
@@ -895,6 +910,18 @@ impl Child {
             ),
             source: None,
         }
+    }
+
+    /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
+    /// See [`crate::signal::refuse_unpinned`].
+    #[cfg(unix)]
+    pub(super) fn refuse_unpinned(&self, op: &str) -> Result<(), Error> {
+        crate::signal::refuse_unpinned(self.id.pid(), op, || {
+            self.os
+                .proc
+                .as_ref()
+                .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+        })
     }
 
     /// Guard for the `_tree` operations (single-sourced with the sync `Child`).
@@ -1021,6 +1048,10 @@ mod root_state_tests;
 #[cfg(all(test, unix))]
 #[path = "child/drop_report_tests.rs"]
 mod drop_report_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/unpinned_public_tests.rs"]
+mod unpinned_public_tests;
 
 #[cfg(all(test, windows))]
 #[path = "child/windows_signal_tests.rs"]
