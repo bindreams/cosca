@@ -488,10 +488,11 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
+            # The profile is passed explicitly: the `sudo` of Ubuntu 26.04 does not keep NEXTEST_PROFILE under `-E`.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
-            SKULD_LABELS="cgroup | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
+            SKULD_LABELS="cgroup | namespaces" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
             # Hand the target dir back so later steps can write to it.
             chown -R "$2" "$PWD/target"
             exit "$status"
@@ -564,7 +565,7 @@ jobs:
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
           exec python3 .github/scripts/run-nextest.py setuid-root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
-            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "binary(group_teardown_setuid)"
+            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci-setuid-root --no-tests=fail -E "binary(group_teardown_setuid)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
 
@@ -960,6 +961,8 @@ jobs:
       - name: Elevation (Linux) - remove the sudo rules
         if: ${{ always() && steps.lin_elev_sudo.outcome != 'skipped' && steps.lin_elev_sudo.outcome != '' }}
         shell: bash
+        env:
+          COSCA_TEST_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
         run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
 
       - name: Elevation (Linux) - upload JUnit
