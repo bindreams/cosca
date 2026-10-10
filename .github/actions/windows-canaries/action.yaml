@@ -1,0 +1,110 @@
+name: Windows canaries
+description: >
+  Runs the Windows path-resolution canaries (`windows_path_resolution`, the `PATH_PROBES` group) and the elevating
+  ShellExecuteEx probes (`windows_shell_execute`, the `SHELL_EXECUTE` group), each through run-nextest.ps1 under a
+  profile of its own, then uploads their JUnit files. `--no-capture`: the surveys report only through stdout, and every
+  canary prints what it measured before asserting on it. Without a filter, each JUnit file must hold exactly the
+  tests the file has (`check-junit.py`); with one, at least one canary must have left its marker.
+inputs:
+  target:
+    description: "Rust target triple"
+    required: true
+  artifact:
+    description: "JUnit artifact name: <job>-<os>-<arch>"
+    required: true
+  filter:
+    description: "Test-name filter (blank runs every test of the two files)"
+    required: false
+    default: ""
+  path_resolution:
+    description: "Run the path-resolution canaries ('true' or 'false')"
+    required: false
+    default: "true"
+  shell_execute:
+    description: "Run the elevating probes ('true' or 'false'). They ELEVATE and write one volatile App Paths key in HKLM and one in HKCU"
+    required: false
+    default: "true"
+  path_profile:
+    required: false
+    default: ci-canary
+  shell_execute_profile:
+    required: false
+    default: ci-shell-execute
+runs:
+  using: composite
+  steps:
+    # Each canary that passes leaves a marker named after itself (`mark_canary_passed`).
+    - name: Windows canaries - path resolution
+      id: path
+      if: ${{ !cancelled() && inputs.path_resolution == 'true' }}
+      shell: pwsh
+      env:
+        FILTER: ${{ inputs.filter }}
+        TARGET: ${{ inputs.target }}
+        NEXTEST_PROFILE: ${{ inputs.path_profile }}
+        COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
+        COSCA_TEST_PATH_PROBES: "1"
+        COSCA_TEST_PATH_PROBES_CONSENT: "1"
+        SKULD_LABELS: path_probes
+      run: |
+        New-Item -ItemType Directory $env:COSCA_CANARY_MARKERS | Out-Null
+        $filter = @(if ($env:FILTER) { $env:FILTER })
+        ./.github/scripts/run-nextest.ps1 canary-path cargo nextest run --locked --target $env:TARGET --test windows_path_resolution --no-capture --no-tests=fail @filter
+
+    - name: Windows canaries - check the path-resolution result
+      if: ${{ !cancelled() && steps.path.outcome == 'success' && inputs.filter == '' }}
+      shell: bash
+      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-path.xml" --tests 13
+
+    # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without a prompt, and
+    # register one volatile App Paths key in HKLM and one in HKCU, deleting each again; a volatile parent key they had
+    # to create can stay behind until the next logon session. They measure an ELEVATED caller's launch, not the
+    # consent route cosca takes from an unelevated one, so the elevated path's rules do not rest on them. They share
+    # machine-wide state (the App Paths keys) and must not run concurrently; `--no-capture` and the
+    # `windows-shell-execute` test group (one thread, `.config/nextest.toml`) both guarantee that.
+    - name: Windows canaries - elevating ShellExecuteEx probes
+      id: execute
+      if: ${{ !cancelled() && inputs.shell_execute == 'true' }}
+      shell: pwsh
+      env:
+        FILTER: ${{ inputs.filter }}
+        TARGET: ${{ inputs.target }}
+        NEXTEST_PROFILE: ${{ inputs.shell_execute_profile }}
+        COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
+        COSCA_TEST_SHELL_EXECUTE: "1"
+        COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
+        SKULD_LABELS: shell_execute
+      run: |
+        New-Item -ItemType Directory $env:COSCA_CANARY_MARKERS | Out-Null
+        $filter = @(if ($env:FILTER) { $env:FILTER })
+        ./.github/scripts/run-nextest.ps1 canary-shell-execute cargo nextest run --locked --target $env:TARGET --test windows_shell_execute --no-capture --no-tests=fail @filter
+
+    - name: Windows canaries - check the elevating-probe result
+      if: ${{ !cancelled() && steps.execute.outcome == 'success' && inputs.filter == '' }}
+      shell: bash
+      run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/canary-shell-execute.xml" --tests 3
+
+    # A filter matching only surveys would otherwise pass having asserted nothing.
+    - name: Windows canaries - require that a filtered canary ran
+      if: ${{ !cancelled() && inputs.filter != '' }}
+      shell: bash
+      env:
+        PATH_MARKERS: ${{ runner.temp }}/canary-markers
+        EXECUTE_MARKERS: ${{ runner.temp }}/elevating-markers
+      run: |
+        shopt -s nullglob
+        passed=("$PATH_MARKERS"/* "$EXECUTE_MARKERS"/*)
+        if ((${#passed[@]} == 0)); then
+          echo "::error::no canary ran: the run asserted nothing about the platform"
+          exit 1
+        fi
+        printf 'canary passed: %s\n' "${passed[@]##*/}"
+
+    - name: Windows canaries - upload JUnit
+      if: ${{ !cancelled() && (steps.path.outcome != 'skipped' || steps.execute.outcome != 'skipped') }}
+      uses: ./.github/actions/upload-junit
+      with:
+        name: ${{ inputs.artifact }}
+        path: |
+          ${{ runner.temp }}/junit/canary-path.xml
+          ${{ runner.temp }}/junit/canary-shell-execute.xml

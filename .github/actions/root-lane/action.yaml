@@ -1,0 +1,115 @@
+name: Root lane (Linux)
+description: >
+  Runs the privilege tests (`PRIVILEGE_TESTS`) from a nextest archive in a container with the privilege state of
+  one lane, then uploads the lane's JUnit file. `root-lane-check.sh` fails the lane unless its EXPECT_* state holds.
+  The caller archived the tests to `$RUNNER_TEMP/root-lane.tar.zst`; `PRIVILEGE_TESTS` comes from the workflow's env.
+inputs:
+  slug:
+    description: "Lane identifier: names the lane's scratch directories"
+    required: true
+  image:
+    description: "Container image. Its glibc must be at least the runner's, which built the test binaries"
+    required: true
+  docker_flags:
+    description: "Extra `docker run` flags (capabilities)"
+    required: false
+    default: ""
+  uid_switch:
+    description: "COSCA_TEST_UID_SWITCH value"
+    required: true
+  prefix:
+    description: "Words that change identity before the lane's commands"
+    required: false
+    default: ""
+  expect_uid:
+    required: true
+  expect_capeff_has:
+    required: true
+  expect_capeff_lacks:
+    required: true
+  expect_capamb:
+    required: true
+  expect_userns:
+    required: false
+    default: ""
+  foreign_tmpdir:
+    required: false
+    default: ""
+  artifact:
+    description: "JUnit artifact name: <job>-<os>-<arch>-<lane>"
+    required: true
+runs:
+  using: composite
+  steps:
+    # The checkout is mounted read-only below, and nextest writes its store under the remapped
+    # workspace's `target/nextest`. A scratch directory of the lane's own is mounted writable on top
+    # of it, so the container never writes into the job's `target`. root-lane.sh copies the JUnit
+    # file out to the lane's `junit` directory. Both are mode 0777 because the `uid 1000` lane is
+    # not the runner's user.
+    #
+    # `target/nextest` is the mountpoint; docker cannot create it inside the read-only checkout.
+    - name: Make the lane's nextest store and JUnit directory writable inside the container
+      shell: bash
+      env:
+        SLUG: ${{ inputs.slug }}
+      run: |
+        set -euxo pipefail
+        lane="$RUNNER_TEMP/root-lane/${SLUG:?}"
+        mkdir -p "$GITHUB_WORKSPACE/target/nextest" "$lane/nextest" "$lane/junit"
+        chmod 0777 "$lane/nextest" "$lane/junit"
+
+    # The container is the sandbox, so consent is given here.
+    # `exec` and `--init`: the runner signals only this shell, `docker run` forwards the signal to
+    # the container's pid 1, and an init process passes it on to the lane's script.
+    - name: Run the container
+      shell: bash
+      env:
+        SLUG: ${{ inputs.slug }}
+        IMAGE: ${{ inputs.image }}
+        DOCKER_FLAGS: ${{ inputs.docker_flags }}
+        COSCA_TEST_UID_SWITCH: ${{ inputs.uid_switch }}
+        PREFIX: ${{ inputs.prefix }}
+        EXPECT_UID: ${{ inputs.expect_uid }}
+        EXPECT_CAPEFF_HAS: ${{ inputs.expect_capeff_has }}
+        EXPECT_CAPEFF_LACKS: ${{ inputs.expect_capeff_lacks }}
+        EXPECT_CAPAMB: ${{ inputs.expect_capamb }}
+        EXPECT_USERNS: ${{ inputs.expect_userns }}
+        FOREIGN_TMPDIR: ${{ inputs.foreign_tmpdir }}
+      run: |
+        set -euxo pipefail
+        lane="$RUNNER_TEMP/root-lane/${SLUG:?}"
+        # `DOCKER_FLAGS` must word-split into separate arguments.
+        # shellcheck disable=SC2086
+        exec docker run --rm --init --network none $DOCKER_FLAGS \
+          -v "$PWD":/repo:ro \
+          -v "$lane/nextest":/repo/target/nextest \
+          -v "$RUNNER_TEMP/root-lane.tar.zst":/artifacts/root-lane.tar.zst:ro \
+          -v "$lane/junit":/junit-out \
+          -v "$(command -v cargo-nextest)":/usr/local/bin/cargo-nextest:ro \
+          -e COSCA_TEST_ROOT=1 \
+          -e COSCA_TEST_ROOT_CONSENT=1 \
+          -e PRIVILEGE_TESTS \
+          -e COSCA_TEST_UID_SWITCH \
+          -e COSCA_TEST_UID_SWITCH_CONSENT=1 \
+          -e FOREIGN_TMPDIR \
+          -e PREFIX \
+          -e EXPECT_UID \
+          -e EXPECT_CAPEFF_HAS \
+          -e EXPECT_CAPEFF_LACKS \
+          -e EXPECT_CAPAMB \
+          -e EXPECT_USERNS \
+          "$IMAGE" \
+          bash /repo/.github/scripts/root-lane.sh
+
+    - name: Upload JUnit
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/upload-junit
+      with:
+        name: ${{ inputs.artifact }}
+        path: ${{ runner.temp }}/root-lane/${{ inputs.slug }}/junit
+
+    # Names the stuck process after a hang or failure.
+    - name: Print the process table
+      if: ${{ failure() || cancelled() }}
+      shell: bash
+      run: ps -eo pid,ppid,pgid,stat,etime,args

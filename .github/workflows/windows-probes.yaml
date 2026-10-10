@@ -1,4 +1,7 @@
-# Windows path-resolution and ShellExecuteEx canaries.
+# Windows path-resolution and ShellExecuteEx canaries, on a schedule and by hand.
+#
+# Pull requests run the same canaries in the required `Test (windows/...)` jobs of ci.yaml; this workflow re-measures
+# weekly and on dispatch.
 #
 # Runs the platform canaries in tests/windows_path_resolution.rs and the elevating ones in
 # tests/windows_shell_execute.rs on real Windows runners; see those files for what is asserted and
@@ -19,35 +22,6 @@
 name: windows-probes
 
 on:
-  # Every change to code whose correctness depends on these facts.
-  pull_request:
-    paths:
-      - "src/child/spawn.rs"
-      - "src/child/spawn/batch_gate.rs"
-      - "src/child/spawn/batch_gate/**"
-      - "src/resolve.rs"
-      - "src/child/spawn/windows_raw.rs"
-      - "src/child/spawn/windows_raw/resolve.rs"
-      - "src/tokio/spawn/windows_raw.rs"
-      - "src/elevation/windows.rs"
-      - "src/elevation/shell_file.rs"
-      - "tests/windows_path_resolution.rs"
-      - "tests/windows_path_resolution/**"
-      - "tests/windows_shell_execute.rs"
-      - "tests/common/windows_probe.rs"
-      # The probes' group declarations and labels.
-      - "src/test_groups.rs"
-      - "src/test_harness.rs"
-      # The canary's payload is built from here.
-      - "testbin/**"
-      # Which `windows` crate features are enabled decides what the probes can call.
-      - "Cargo.toml"
-      - "Cargo.lock"
-      # `terminate-after` and other nextest profile settings the probes' own bounds are chosen against.
-      - ".config/nextest.toml"
-      - ".github/actions/setup-rust/**"
-      - ".github/ci-toolchain"
-      - ".github/workflows/windows-probes.yaml"
   # `windows-latest` floats: a new Windows build can change the answer with no commit here.
   schedule:
     - cron: "17 5 * * 1"
@@ -80,13 +54,6 @@ on:
 permissions:
   contents: read
 
-# A concurrency group holds one pending run, and a newly queued run cancels the pending one
-# whatever `cancel-in-progress` says. Only PR runs may supersede each other; a schedule or dispatch
-# run gets a group of its own so none is ever dropped.
-concurrency:
-  group: windows-probes-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
   # The probe groups (principle 9) are off unless a step below opts in; each runner is the sandbox
   # that consent requires.
@@ -101,8 +68,8 @@ env:
 jobs:
   path-resolution:
     name: Path canary (${{ matrix.runner }})
-    # Only a dispatch can opt out, and only by refusing both steps this job can run; pull requests
-    # and the schedule always run it.
+    # Only a dispatch can opt out, and only by refusing both steps this job can run; the schedule
+    # always runs it.
     if: github.event_name != 'workflow_dispatch' || inputs.run_canary || inputs.elevating
     strategy:
       fail-fast: false
@@ -123,79 +90,15 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # `--no-capture`: the surveys report only through stdout, and every canary prints what it
-      # measured before asserting on it.
-      # Each canary that passes leaves a marker named after itself (`mark_canary_passed`).
-      - name: Run path-resolution probes
-        if: github.event_name != 'workflow_dispatch' || inputs.run_canary
-        shell: bash
-        env:
-          FILTER: ${{ inputs.filter }}
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-          COSCA_TEST_PATH_PROBES: "1"
-          COSCA_TEST_PATH_PROBES_CONSENT: "1"
-          SKULD_LABELS: path_probes
-        run: |
-          mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_path_resolution --no-capture --no-tests=fail)
-          if [[ -n "${FILTER}" ]]; then
-            args+=("${FILTER}")
-          fi
-          cargo "${args[@]}"
-      # These elevate through ShellExecuteEx(runas), which a runner already elevated grants without
-      # a prompt, and register one volatile App Paths key in HKLM and one in HKCU, deleting each
-      # again; a volatile parent key they had to create can stay behind until the runner is gone.
-      # They run on every schedule and pull-request run too, so a change to that code, or a new
-      # Windows build, re-measures it. They measure an ELEVATED caller's launch, not the consent
-      # route cosca takes from an unelevated one, so the elevated path's rules do not rest on them.
-      # These tests share machine-wide state (the App Paths keys) and must not run concurrently
-      # with each other. `--no-capture` already forces nextest to run every test in this
-      # invocation serially; the `windows-shell-execute` test group capped at one thread in
-      # `.config/nextest.toml` gives the same guarantee independent of that flag.
-      - name: Run elevating probes
-        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.elevating) }}
-        shell: bash
-        env:
-          FILTER: ${{ inputs.filter }}
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-          COSCA_TEST_SHELL_EXECUTE: "1"
-          COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
-          SKULD_LABELS: shell_execute
-        run: |
-          mkdir "$COSCA_CANARY_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_execute --no-capture --no-tests=fail)
-          if [[ -n "${FILTER}" ]]; then
-            args+=("${FILTER}")
-          fi
-          cargo "${args[@]}"
-      # A filter matching no test, or only surveys, would otherwise pass having asserted nothing.
-      # Runs after a failure too, so the log shows which canaries passed.
-      - name: Require that a canary ran
-        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.run_canary) }}
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-        run: |
-          shopt -s nullglob
-          passed=("$COSCA_CANARY_MARKERS"/*)
-          if ((${#passed[@]} == 0)); then
-            echo "::error::no canary ran: the run asserted nothing about the platform"
-            exit 1
-          fi
-          printf 'canary passed: %s\n' "${passed[@]##*/}"
-      - name: Require that an elevating probe ran
-        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.elevating) }}
-        shell: bash
-        env:
-          COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-        run: |
-          shopt -s nullglob
-          passed=("$COSCA_CANARY_MARKERS"/*)
-          if ((${#passed[@]} == 0)); then
-            echo "::error::no elevating probe ran: the run asserted nothing about ShellExecuteEx"
-            exit 1
-          fi
-          printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
+      # Skipped by a dispatch that refuses it: `run_canary` for the path-resolution canaries, `elevating` for the probes.
+      - name: Windows canaries
+        uses: ./.github/actions/windows-canaries
+        with:
+          target: ${{ matrix.target }}
+          artifact: canary-${{ matrix.runner }}
+          filter: ${{ inputs.filter }}
+          path_resolution: ${{ github.event_name != 'workflow_dispatch' || inputs.run_canary }}
+          shell_execute: ${{ github.event_name != 'workflow_dispatch' || inputs.elevating }}
 
   # These plant a `.bat` and hand it to `ShellExecuteEx`, so unlike the canary they EXECUTE code
   # chosen by the path rules they measure, and the elevation probes create a throwaway local

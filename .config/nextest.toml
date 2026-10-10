@@ -52,8 +52,10 @@ path = "junit.xml"
 # One profile per Unix step in ci.yaml (`.github/scripts/run-nextest.py` selects it through
 # `NEXTEST_PROFILE`), so a straggler from one step can only ever write that step's own JUnit file.
 # Settings and `[[...overrides]]` are inherited (nextest 0.9.146). Windows runs its steps under the
-# shared `ci` profile (run-nextest.ps1), and the elevation step under `ci-elevation`: after a failed or timed-out step
-# every later step is skipped, so nothing a surviving process writes can reach a published file.
+# shared `ci` profile (run-nextest.ps1), the canaries and the elevation step under profiles of their own. A
+# Windows step leaves no process in the job behind: run-nextest.ps1 ends the step's Job Object, and waits for it to
+# be empty, before the next step starts. Processes started under another logon (the elevation lane's administrator,
+# which runs last) are outside it.
 [profile.ci-tests]
 inherits = "ci"
 
@@ -103,6 +105,14 @@ inherits = "ci"
 inherits = "ci"
 
 [profile.ci-root]
+inherits = "ci"
+
+# The Windows canaries of the test job (`windows_path_resolution`, `windows_shell_execute`), each under a profile of its
+# own so each publishes its own JUnit file.
+[profile.ci-canary]
+inherits = "ci"
+
+[profile.ci-shell-execute]
 inherits = "ci"
 
 [[profile.ci.overrides]]

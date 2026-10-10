@@ -1,13 +1,20 @@
 name: Upload the nextest JUnit files
 description: >
   Uploads every JUnit file the job's nextest steps collected in `$RUNNER_TEMP/junit`
-  (.github/scripts/run-nextest.py, run-nextest.ps1 and root-lane.sh), as one artifact per job.
+  (.github/scripts/run-nextest.py and run-nextest.ps1), as one artifact. A job that runs several lanes
+  uploads the main lanes' directory once, then each later lane's own files under a name of their own.
 inputs:
   name:
     description: >
       Artifact name: <job>-<os>-<arch>. The action appends -<run attempt>, so a re-run does not
       upload into a name the first attempt already used.
     required: true
+  path:
+    description: >
+      What to upload (a multi-line list is fine): files or directories. Defaults to the whole
+      `$RUNNER_TEMP/junit` directory.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -15,5 +22,5 @@ runs:
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: ${{ inputs.name }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/junit
+        path: ${{ inputs.path || format('{0}/junit', runner.temp) }}
         if-no-files-found: error
