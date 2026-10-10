@@ -412,6 +412,21 @@ class MacOS(unittest.TestCase):
         self.assertEqual(fake.calls[0][2], "read")
         self.assertEqual(fake.calls[1][2], "write")
 
+    def test_the_databases_own_modified_timestamp_is_not_compared(self):
+        # Measured on a hosted macOS runner: restoring the right sets `modified` to the time of the write.
+        fake = FakeSecurity({**self.PRIOR, "modified": 1.0})
+        prior = self.enable(fake)
+        original_write = fake.__call__
+
+        def restamping(command, **kwargs):
+            result = original_write(command, **kwargs)
+            if command[2] == "write" and "input" in kwargs:
+                fake.right = {**fake.right, "modified": 2.0}
+            return result
+
+        self.revert(restamping, prior)
+        self.assertEqual(fake.right["rule"], self.PRIOR["rule"])
+
     def test_a_restore_that_did_not_stick_is_a_failure(self):
         # Mutant: the read-back after restoring is dropped.
         fake = FakeSecurity(self.PRIOR)

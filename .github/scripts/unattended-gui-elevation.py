@@ -277,7 +277,9 @@ def revert_macos(prior):
         env=env,
     )
     right = read_macos_right(env)
-    if right != saved:
+    # `modified` is the database's own timestamp of the write, so it can't match.
+    without_timestamp = lambda right: {key: value for key, value in right.items() if key != "modified"}  # noqa: E731
+    if without_timestamp(right) != without_timestamp(saved):
         sys.exit(f"the authorization right reads back {right!r} after restoring {saved!r}")
 
 
