@@ -238,6 +238,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 /// debug build asserts it.
 ///
 /// Mutant: the `Trusted` arm answers "already reaped".
+#[cfg(debug_assertions)] // the contract is a debug assertion: release has none to trigger
 #[skuld::test]
 fn asking_why_a_trusted_root_is_untrusted_is_a_contract_breach() {
     let view = crate::containment::DropView {

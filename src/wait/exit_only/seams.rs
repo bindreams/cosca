@@ -139,8 +139,8 @@ pub(crate) fn take_forced_visible_none() -> bool {
 /// The next blocking `waitid` in `wait_visible_exit` on this thread fails with `errno`.
 #[cfg(target_os = "linux")]
 #[cfg_attr(
-    not(feature = "tokio"),
-    allow(dead_code, reason = "only the async child's tests force a failed wait")
+    not(all(feature = "tokio", debug_assertions)),
+    allow(dead_code, reason = "only the async child's debug-build tests force a failed wait")
 )]
 pub(crate) fn force_visible_errno_once(errno: i32) -> Forced {
     FORCED_VISIBLE_ERRNO.with(|f| f.set(Some(errno)));

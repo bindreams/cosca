@@ -232,6 +232,7 @@ mod linux {
     /// breach, asserted in debug builds, after the log.
     ///
     /// Mutant: the pidfd wait logs at `warn` whatever the level.
+    #[cfg(debug_assertions)] // the failure is a debug assertion: release has none to catch
     #[skuld::test]
     async fn a_failed_pidfd_wait_is_logged_at_the_level_the_caller_gave() {
         use crate::signal::Sig;
