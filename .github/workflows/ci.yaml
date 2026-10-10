@@ -497,7 +497,13 @@ jobs:
             PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
             mkdir "$CG"
             # Back out of the lane cgroup and remove it on every exit; it fails if a test left a cgroup in it.
-            trap '\''echo $$ > "$PRIOR/cgroup.procs" && rmdir "$CG" || { echo "could not remove $CG; left in it:" >&2; find "$CG" -mindepth 1 -type d -exec sh -c '\''for d; do echo "$d: $(tr "\n" " " < "$d/cgroup.procs")"; done'\'' sh {} + >&2; exit 1; }'\'' EXIT
+            leave() {
+              echo $$ > "$PRIOR/cgroup.procs" && rmdir "$CG" && return
+              echo "could not remove $CG; left in it:" >&2
+              find "$CG" -mindepth 1 -type d | while read -r d; do echo "$d: $(tr "\n" " " < "$d/cgroup.procs")"; done >&2
+              exit 1
+            }
+            trap leave EXIT
             echo $$ > "$CG/cgroup.procs"
             # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
             # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
