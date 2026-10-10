@@ -768,16 +768,65 @@ fn macos_treewalk_attach_reads_nothing_by_pid() {
 // A report not yet written =====
 
 /// A child whose unique-id report was not yet written when its spawn returned is not taken for a
-/// corpse: the spawn says the program may have started, the child is left running and unreaped,
-/// and the warning says it may be running. A front gets its note, as for an unreadable report.
+/// corpse: it may have exec'd, and this process is its parent with the child unreaped, so its pid is
+/// pinned. The spawn kills it, reaps it, and says so in one `warn`: the fate is `Reaped`, nothing is
+/// left to `waitpid`, and the program may have started.
 ///
-/// Mutants: the unreported child is logged as having died before `exec`; its fate is not
-/// `Running` with its pid; the front's note is dropped.
+/// Mutants: the `Unwritten` arm leaves the child (fate `Running`, a zombie nothing owns); the child
+/// is logged as having died before `exec`; the arm warns twice or not at all.
 #[skuld::test]
-fn macos_sync_spawn_of_an_unreported_child_leaves_it_running_and_says_so() {
+fn macos_sync_spawn_of_an_unreported_child_kills_and_reaps_it() {
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = unique_report::seams::find_the_report_unwritten();
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let pid = id.pid();
+    assert_eq!(fate, crate::error::ChildFate::Reaped, "an unreported child is killed and reaped");
+    assert_reaped_and_warned_once(pid, mark);
+    drop(writer);
+}
+
+/// Asserts `pid` is no child of this process any more (`waitpid` answers `ECHILD`), and that the
+/// teardown's one event produced exactly one `warn` naming it.
+pub(crate) fn assert_reaped_and_warned_once(pid: u32, mark: usize) {
+    // SAFETY: `pid` was this test's own child; `WNOHANG` blocks on nothing.
+    let rc = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+    assert_eq!(rc, -1, "the child must be reaped already, waitpid gave {rc}");
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    let warns: Vec<String> = crate::log_capture::records_since(mark, &format!("child {pid} "))
+        .into_iter()
+        .zip(crate::log_capture::levels_since(mark, &format!("child {pid} ")))
+        .filter(|(_, level)| *level == log::Level::Warn)
+        .map(|(text, _)| text)
+        .collect();
+    assert_eq!(warns.len(), 1, "one event, one warn: {warns:?}");
+    assert!(
+        warns[0].contains(&format!("child {pid} had not reported its unique id")),
+        "{warns:?}"
+    );
+    assert!(
+        !crate::log_capture::contains_since(mark, &format!("child {pid} died before exec")),
+        "an unreported child is not reported dead"
+    );
+}
+
+/// An elevation front whose report was not yet written is left as every front is: sent nothing and
+/// left unreaped, running, with its note and a warning that says it may be running.
+///
+/// Mutants: the unreported front is logged as having died before `exec`; its fate is not `Running`
+/// with its pid; the front's note is dropped.
+#[skuld::test]
+fn macos_sync_spawn_of_an_unreported_front_leaves_it_running_and_says_so() {
     use crate::elevation::{front::front, ElevatedVia};
     crate::log_capture::install();
-    for front in [None, front(Some(&ElevatedVia::MacosOsascript))] {
+    for front in [front(Some(&ElevatedVia::MacosOsascript))] {
         let (mut cmd, writer) = sync_blocker();
         cmd.set_elevation_front(front);
         let mark = crate::log_capture::mark();
