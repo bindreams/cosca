@@ -6,11 +6,16 @@
 //! `!pam_session`, or doas without PAM) the tracked process is the root program itself, whose
 //! signal is refused. Which of the two cosca holds is not known at spawn.
 //!
-//! So a forced kill of a live front sends nothing, and the answer is `Unkillable`. Left alone, a
-//! wrapper front exits only after its program, so `wait()` returns once the program is gone.
+//! So a forced kill never signals a live front. It goes through a cgroup whose `cgroup.kill`
+//! reaches the tracked process whatever its credentials, and nothing is signalled after it. Whether
+//! the kill reached the tracked process is read after the write ([`cgroup_kill_reached`]): a front
+//! that left the cgroup in between was not killed. Without a cgroup, nothing is sent and the answer
+//! is `Unkillable`.
 //!
-//! A child contained in a Linux cgroup is not gated: its forced kills signal the tracked process
-//! as any child's do.
+//! Left alone, a wrapper front exits only after its program, so `wait()` returns once the program
+//! is gone. A cgroup kill is asynchronous, though: `wait()` then returns once the front is reaped,
+//! and a program stuck in uninterruptible sleep can outlive it. Only `wait_tree()` observes the
+//! program's own end.
 //!
 //! A `SIGTERM` is gated only for osascript, which would end and leave the program running, so
 //! `terminate()` on it is refused like a kill. A sudo or doas front relays it to the program; with
@@ -27,13 +32,15 @@ use crate::error::{ElevationErrorKind, Error};
 /// How a signal to a child may go.
 #[derive(Debug)]
 pub(crate) enum Gate {
-    /// Not a front, or a child contained in a cgroup: signal it like any child.
+    /// Not a front: signal it like any child.
     Open,
     /// A front that has exited. A kill answers `Ok`, as for any exited child, even where the
     /// signal to it would be refused (a root zombie keeps its credentials). `Ok` then means only
     /// that the front has exited: a front something else killed (the OOM killer, or this user) may
     /// have left its program running.
     Exited,
+    /// A live front in a cgroup: kill the cgroup, and signal nothing after it.
+    CgroupOnly,
     /// A live front that nothing reaches past: send nothing, and answer this `Unkillable`.
     Closed(Error),
 }
@@ -78,30 +85,138 @@ pub(crate) fn front(via: Option<&ElevatedVia>) -> Option<Front> {
 }
 
 /// The gate for a forced kill of the child `pid`, the `front` its spawn launched (if any).
-/// `in_cgroup`: the child is contained in a Linux cgroup, whose children are not gated. `running`
-/// reads, without reaping, whether the tracked process still runs, and is asked only about a front
-/// outside a cgroup; one that cannot be read is taken to run.
+/// `running` reads, without reaping, whether the tracked process still runs; `in_cgroup` whether it
+/// is in a cgroup whose kill reaches it. Both are asked only about a front, and `in_cgroup` only
+/// about one that may run: one that cannot be read is taken to run. A front `in_cgroup` cannot
+/// place is asked `running` again: one that exited meanwhile, and that another thread's `wait`
+/// reaped, has no cgroup left to read.
 pub(crate) fn kill_gate(
     front: Option<Front>,
     pid: u32,
-    in_cgroup: bool,
-    running: impl FnOnce() -> io::Result<bool>,
+    running: impl Fn() -> io::Result<bool>,
+    in_cgroup: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
     #[cfg(test)]
     seams::note_kill_gate();
-    let Some(front) = front.filter(|_| !in_cgroup) else {
+    let Some(front) = front else {
         return Gate::Open;
     };
-    match running() {
-        Ok(false) => Gate::Exited,
-        Ok(true) => Gate::Closed(refused(front, pid, Signal::Kill, None)),
-        Err(e) => Gate::Closed(refused(
-            front,
-            pid,
-            Signal::Kill,
-            Some(format!("whether it had exited could not be read: {e}")),
-        )),
+    let unread = match running() {
+        Ok(false) => return Gate::Exited,
+        Ok(true) => None,
+        Err(e) => Some(format!("whether it had exited could not be read: {e}")),
+    };
+    #[cfg(test)]
+    seams::run_between_gate_reads();
+    let placed = in_cgroup();
+    if !matches!(placed, Ok(true)) && matches!(running(), Ok(false)) {
+        return Gate::Exited;
     }
+    match placed {
+        Ok(true) => Gate::CgroupOnly,
+        Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, unread)),
+        Err(e) => {
+            let why = format!("whether its cgroup kill reaches it could not be read: {e}");
+            let why = unread.map_or(why.clone(), |r| format!("{r}; {why}"));
+            Gate::Closed(refused(front, pid, Signal::Kill, Some(why)))
+        }
+    }
+}
+
+/// Whether a cgroup kill, just written, reached the tracked process `pid`, the `front` its spawn
+/// launched. The kill and a move out of the cgroup are serialised by the kernel (both writes take
+/// `cgroup_mutex`), so what holds after the write says which came first:
+///
+/// - `exited`: it has exited, so nothing of it is left to kill.
+/// - `under_leaf`: its cgroup is the leaf or one under it (see `containment::cgroup::Subtree::holds`).
+///
+/// A front `under_leaf` does not place is asked `exited` again: one the kill ended meanwhile, and
+/// that another thread's `wait` reaped, has no cgroup left to read, and has exited.
+///
+/// A front none of these places in the leaf left it before the kill, as pam_systemd moves sudo into
+/// a session scope: it was not killed, and the answer is `Unkillable`, so nothing waits for it. So
+/// is one whose place cannot be read: nothing shows the kill reached it. A front killed and then
+/// moved before it exited reads the same (see [`Command::contain`](crate::Command::contain)).
+pub(crate) fn cgroup_kill_reached(
+    front: Option<Front>,
+    pid: u32,
+    exited: impl Fn() -> io::Result<bool>,
+    under_leaf: impl FnOnce() -> io::Result<bool>,
+) -> Result<(), Error> {
+    let Some(front) = front else {
+        debug_assert!(false, "only a front's cgroup kill is checked");
+        return Err(Error::Containment {
+            detail: format!("pid {pid}'s cgroup kill is not shown to have reached it: it is no front"),
+        });
+    };
+    let exited = || {
+        #[cfg(test)]
+        if seams::reach_reads_running() {
+            return Ok(false);
+        }
+        exited()
+    };
+    let mut unread = Vec::new();
+    match exited() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => unread.push(format!("whether it had exited could not be read: {e}")),
+    }
+    #[cfg(test)]
+    seams::run_between_reach_reads();
+    let placed = under_leaf();
+    if !matches!(placed, Ok(true)) && matches!(exited(), Ok(true)) {
+        return Ok(());
+    }
+    let why = match placed {
+        Ok(true) => return Ok(()),
+        Ok(false) => "it reads as having left the cgroup before its kill, which did not reach it".to_owned(),
+        Err(e) => {
+            unread.push(format!("its cgroup could not be read: {e}"));
+            "nothing shows the cgroup kill reached it".to_owned()
+        }
+    };
+    let why = if unread.is_empty() {
+        why
+    } else {
+        format!("{why} ({})", unread.join("; "))
+    };
+    Err(refused(front, pid, Signal::Kill, Some(why)))
+}
+
+/// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
+/// sent, since a kill of the front itself would orphan its elevated program.
+pub(crate) fn cgroup_kill_failed(front: Option<Front>, pid: u32, error: Error) -> Error {
+    let Some(front) = front else {
+        debug_assert!(false, "only a front's cgroup kill is refused so");
+        return error;
+    };
+    cgroup_not_killed(front, pid, Some(&error.to_string()))
+}
+
+/// [`cgroup_not_killed`] for the child `pid`, whose gate found it a front in a cgroup.
+pub(crate) fn cgroup_not_killed_of(front: Option<Front>, pid: u32, failure: Option<&str>) -> Error {
+    let Some(front) = front else {
+        debug_assert!(false, "only a front's gate is CgroupOnly");
+        return Error::Containment {
+            detail: format!(
+                "pid {pid}'s cgroup was not killed{}",
+                failure.map_or(String::new(), |f| format!(": {f}"))
+            ),
+        };
+    };
+    cgroup_not_killed(front, pid, failure)
+}
+
+/// The refusal of a kill of the front `pid` whose cgroup no kill reached: its kill failed with
+/// `failure`, or (`None`) none was made. Nothing else was sent, since a kill of the front itself
+/// would orphan its elevated program.
+pub(crate) fn cgroup_not_killed(front: Front, pid: u32, failure: Option<&str>) -> Error {
+    let why = match failure {
+        Some(failure) => format!("its cgroup kill failed: {failure}"),
+        None => "its cgroup was not killed".to_owned(),
+    };
+    refused(front, pid, Signal::Kill, Some(why))
 }
 
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
@@ -155,6 +270,10 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
         Signal::Term => "no SIGTERM",
     };
     let mut detail = format!("{}; {what} was sent.", describe(front, pid));
+    // Only Linux has a cgroup to reach the program through; osascript runs on macOS.
+    if matches!(signal, Signal::Kill) && !matches!(front, Front::Osascript) {
+        detail.push_str(" Only a cgroup (Linux containment) that holds it reaches the program.");
+    }
     if let Some(why) = unread {
         detail.push_str(&format!(" ({why})"));
     }
@@ -164,13 +283,75 @@ fn refused(front: Front, pid: u32, signal: Signal, unread: Option<String>) -> Er
     }
 }
 
-/// Test seams.
+/// Test seam counting kill-gate evaluations on this thread, so a test can show a kill path decides
+/// once and does not re-ask the gate after its cgroup kill. Thread-local, with an RAII reset.
 #[cfg(test)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux cgroup lane's tests count gates")
+)]
 pub(crate) mod seams {
     use std::cell::Cell;
 
     thread_local! {
         static GATES: Cell<Option<u32>> = const { Cell::new(None) };
+        static BETWEEN_GATE_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static BETWEEN_REACH_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        static REACH_READS_RUNNING: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// While the guard lives, the check of a cgroup kill on this thread reads the front as still
+    /// running at its first read of whether it exited, whatever the kill did to it: a front just
+    /// killed may or may not have exited by then, and a test of what the check does between its
+    /// reads needs one that has not.
+    pub(crate) fn read_front_running_at_the_first_reach_read() -> ReachReadsRunning {
+        REACH_READS_RUNNING.with(|f| f.set(1));
+        ReachReadsRunning(())
+    }
+
+    /// As [`read_front_running_at_the_first_reach_read`], at every read of the check: for a test of
+    /// what it does with a front it cannot place.
+    pub(crate) fn read_front_running_at_every_reach_read() -> ReachReadsRunning {
+        REACH_READS_RUNNING.with(|f| f.set(u32::MAX));
+        ReachReadsRunning(())
+    }
+
+    #[must_use = "fronts are read as they are again as soon as the guard is dropped"]
+    pub(crate) struct ReachReadsRunning(());
+
+    impl Drop for ReachReadsRunning {
+        fn drop(&mut self) {
+            REACH_READS_RUNNING.with(|f| f.set(0));
+        }
+    }
+
+    /// Whether the read now being made reads the front as running.
+    pub(super) fn reach_reads_running() -> bool {
+        REACH_READS_RUNNING.with(|f| {
+            let remaining = f.get();
+            if remaining != u32::MAX {
+                f.set(remaining.saturating_sub(1));
+            }
+            remaining > 0
+        })
+    }
+
+    /// Run `hook` once in the next kill gate on this thread, between its read of whether the front
+    /// runs and its read of the front's cgroup.
+    pub(crate) fn set_between_gate_reads(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&BETWEEN_GATE_READS, hook)
+    }
+    pub(super) fn run_between_gate_reads() {
+        crate::oneshot_hook::fire(&BETWEEN_GATE_READS);
+    }
+
+    /// Run `hook` once in the next check of a cgroup kill on this thread, after the kill's write
+    /// and its read of whether the front exited, before its read of the front's cgroup.
+    pub(crate) fn set_between_reach_reads(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+        crate::oneshot_hook::arm(&BETWEEN_REACH_READS, hook)
+    }
+    pub(super) fn run_between_reach_reads() {
+        crate::oneshot_hook::fire(&BETWEEN_REACH_READS);
     }
 
     /// From now on kill-gate evaluations on THIS thread are counted.

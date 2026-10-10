@@ -225,6 +225,9 @@ pub(crate) struct CgroupLeaf {
     pub(super) report: Option<ReportChannel>,
     /// Whether the child reported entering the leaf, recorded when `report` is released.
     pub(super) entered: bool,
+    /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
+    /// created outside the cgroup filesystem.
+    cgroup_path: Option<String>,
     /// Whether the leaf is already dealt with, so `Drop` has nothing left to do: the spawn was
     /// abandoned before its verdict, or an async `Drop` released it
     /// ([`release_without_waiting`](Self::release_without_waiting)).
@@ -235,7 +238,13 @@ pub(crate) struct CgroupLeaf {
     /// Whether [`hard_kill`](Self::hard_kill) wrote `cgroup.kill`. A disarmed `Drop` reads it to
     /// tell a tree the caller killed, whose leaf has not drained yet, from one left running.
     /// [`terminate`](Self::terminate) does not set it: a SIGTERM can be caught.
-    killed: AtomicBool,
+    killed: std::sync::Arc<AtomicBool>,
+    /// The elevation front this leaf's child is, by pid, whose place is recorded in `placed` before
+    /// each `rmdir` (see [`watch_front`](Self::watch_front)).
+    watched: Option<u32>,
+    /// Where the watched front was when the leaf was last about to be removed, shared with the
+    /// leaf's [`Subtree`]s.
+    placed: super::PlacedAtRemoval,
     /// Whether a [`hard_kill`](Self::hard_kill) call failed for a real mechanism reason (not
     /// "leaf already gone", which sets `killed` above instead). A disarmed `Drop` reads it to
     /// `warn` that the caller's own `kill_tree()` never actually reached this leaf, rather than
@@ -370,7 +379,95 @@ impl CgroupLeaf {
         })
     }
 
+    /// Whether `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup under it,
+    /// for a kill through it.
+    pub(crate) fn holds_member(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
+        self.names(pid, pidfd)
+    }
+
+    /// Whether the task `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup
+    /// under it (see [`Subtree::holds`]).
+    pub(crate) fn names(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
+        self.subtree()?.holds(pid, pidfd)
+    }
+
+    /// The leaf's cgroup id (see [`cgroup_id`](super::cgroup_id)).
+    pub(crate) fn id(&self) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(errno) = fault::cgroup_id_fails() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        self.dir.id()
+    }
+
+    /// The leaf as a place to read a task's membership in, once the leaf may be gone: its own
+    /// cgroup id, its directory, its path, what its sweep removed, and whether a kill through it
+    /// has landed.
+    pub(crate) fn subtree(&self) -> io::Result<Subtree> {
+        #[cfg(test)]
+        if let Some(errno) = fault::subtree_fails() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(Subtree::new(
+            self.id()?,
+            Some(self.dir.shared()),
+            self.cgroup_path.clone(),
+            self.dir.swept(),
+            self.placed.clone(),
+            std::sync::Arc::clone(&self.killed),
+        ))
+    }
+
+    /// Watch the elevation front `pid`, this leaf's child: its place is recorded before each
+    /// `rmdir` of the leaf, while the leaf's own path still reads without ` (deleted)` (see
+    /// [`Subtree::holds`]).
+    pub(crate) fn watch_front(&mut self, pid: u32) {
+        debug_assert!(
+            self.watched.is_none_or(|watched| watched == pid),
+            "a leaf watches one front: {:?}, then {pid}",
+            self.watched
+        );
+        self.watched = Some(pid);
+    }
+
+    /// Record where the watched front is, by `/proc/<pid>/cgroup`, before the leaf may be removed.
+    /// At an `rmdir` that succeeds, the leaf holds no live task, so a front recorded in it is past
+    /// leaving its cgroup and can no longer be moved, and a front recorded outside it can no
+    /// longer enter it: the record stays true once the leaf is gone.
+    ///
+    /// While the leaf is live its own path reads plainly: a front that reads it with ` (deleted)`
+    /// after it is in a live cgroup of that name beside it, and recorded outside. If the leaf is
+    /// already gone (removed by someone else), or whether it is live cannot be read, that path is
+    /// undecidable, and nothing is recorded.
+    fn record_watched_place(&self) {
+        let (Some(pid), Some(path)) = (self.watched, &self.cgroup_path) else {
+            return;
+        };
+        // Outside only when the leaf's own file opens: the leaf is live. Any error, its removal or
+        // any other, leaves the path undecided.
+        let outside_if_live = || {
+            #[cfg(test)]
+            let opened = match fault::liveness_read_fails() {
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                None => self.dir.open("cgroup.events", rustix::fs::OFlags::PATH),
+            };
+            #[cfg(not(test))]
+            let opened = self.dir.open("cgroup.events", rustix::fs::OFlags::PATH);
+            opened.ok().map(|_| false)
+        };
+        match super::proc_names(path, pid, outside_if_live, false) {
+            Ok(inside) => self.placed.record(pid, inside),
+            Err(e) => {
+                log::debug!(
+                    "cgroup v2: elevation front pid {pid}'s place before its leaf's removal cannot be read ({e})"
+                );
+                self.placed.clear();
+            }
+        }
+    }
+
     fn rmdir_leaf(&self) -> io::Result<()> {
+        self.record_watched_place();
         #[cfg(test)]
         fault::record_leaf_step(|| {
             let events = self.dir.read("cgroup.events").unwrap_or_default();
@@ -399,7 +496,17 @@ impl CgroupLeaf {
     /// see [`Command::kill_on_drop`](crate::Command::kill_on_drop).
     pub(crate) fn hard_kill(&self) -> Result<(), crate::error::Error> {
         let path = self.leaf_path.join("cgroup.kill");
-        match self.dir.write("cgroup.kill", KILL_PAYLOAD) {
+        #[cfg(test)]
+        fault::run_before_kill_write();
+        #[cfg(test)]
+        let written = if fault::kill_writes_fail() || fault::take_next_kill_write_failure() {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            self.dir.write("cgroup.kill", KILL_PAYLOAD)
+        };
+        #[cfg(not(test))]
+        let written = self.dir.write("cgroup.kill", KILL_PAYLOAD);
+        match written {
             Ok(()) => {
                 #[cfg(test)]
                 fault::record_leaf_step(|| "kill".to_string());
@@ -636,11 +743,24 @@ impl CgroupLeaf {
             procs_fd: None,
             report: Some(ReportChannel::new().expect("open a placement-report channel")),
             entered: false,
+            cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
-            killed: AtomicBool::new(false),
+            killed: std::sync::Arc::new(AtomicBool::new(false)),
+            watched: None,
+            placed: super::PlacedAtRemoval::default(),
             kill_attempt_failed: AtomicBool::new(false),
         }
+    }
+
+    /// Give a test leaf the unified-hierarchy path `/proc/<pid>/cgroup` prints for it.
+    pub(crate) fn set_cgroup_path_for_test(&mut self, path: String) {
+        self.cgroup_path = Some(path);
+    }
+
+    /// The record of the watched front's place, as the leaf's subtrees read it.
+    pub(crate) fn placed_for_test(&self) -> super::PlacedAtRemoval {
+        self.placed.clone()
     }
 
     /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.
@@ -658,7 +778,7 @@ impl Drop for CgroupLeaf {
         self.procs_fd = None;
         // Before the verdict — a spawn that failed, maybe after its fork — end the exchange.
         if self.report.is_some() {
-            self.abandon_before_verdict();
+            self.abandon_before_verdict(false, None);
         }
         if self.abandoned {
             return;
@@ -766,6 +886,9 @@ pub(crate) enum Abandoned {
     /// The child may be running, and cosca could not kill it: it has no pidfd or refused the
     /// signal, and its leaf does not hold it.
     OutOfReach,
+    /// The child is an elevation front, which was sent no signal of its own (see
+    /// [`CgroupLeaf::abandon_before_verdict`]), and this is what became of it.
+    Front(crate::child::spawn::FrontFate),
 }
 
 /// What became of the child itself when its spawn was abandoned.
@@ -796,14 +919,39 @@ impl CgroupLeaf {
     /// a child it forked and then failed to set up, neither killed nor reaped. A spawn path that
     /// still holds its child takes the verdict first, and one whose child `std` reaped leaves
     /// nothing to reap here.
-    pub(crate) fn abandon_before_verdict(&mut self) -> Abandoned {
+    ///
+    /// A child that is an elevation `front` (see [`crate::elevation::front`]) is sent no signal of
+    /// its own, which would orphan its elevated program: it is killed through the leaf alone (see
+    /// [`end_front`]).
+    pub(crate) fn abandon_before_verdict(&mut self, front: bool, handshake: Option<OwnedFd>) -> Abandoned {
         let Some(channel) = self.report.take() else {
             return Abandoned::Ended;
         };
         self.procs_fd = None;
         self.abandoned = true;
-        let received = channel.shut();
+        let mut received = channel.shut();
         self.entered = received.placement() == PlacementReport::Placed;
+        // The handshake's pidfd names the child where its intent named it by no handle.
+        if received.pidfd.is_none() && received.proc_dir.is_none() {
+            received.pidfd = handshake;
+        }
+        // A child that never named itself never reached the point where it could run the program:
+        // it is no front, and the handshake's pidfd alone can reap it.
+        if received.pid.is_none() {
+            if let Some(pidfd) = received.pidfd.take() {
+                self.remove_holding_nothing();
+                crate::child::spawn::teardown_through_pidfd(None, pidfd);
+                return Abandoned::Ended;
+            }
+        }
+        // Only a child that reported goes on to `exec`: one that named itself and sent no report
+        // never runs the program, and is answered as any child.
+        if front && received.report.is_some() {
+            if let Some(pid) = received.pid {
+                self.watch_front(pid);
+            }
+            return self.abandon_front(&received);
+        }
         // The child first, by its pidfd and as its group, whatever the leaf's own kill does: it
         // may have left the leaf, or never entered it.
         let fate = end_child(&received);
@@ -823,6 +971,30 @@ impl CgroupLeaf {
             (ChildFate::Unkillable, Some(Ok(()))) => Abandoned::Ended,
             (ChildFate::Unkillable, _) => Abandoned::OutOfReach,
         }
+    }
+
+    /// [`abandon_before_verdict`](Self::abandon_before_verdict) for an elevation front: the leaf
+    /// is killed through and removed as for any child, and the front itself is sent nothing. Its
+    /// subtree is read first, so the front can still be placed in it once the leaf is gone.
+    fn abandon_front(&mut self, received: &Received) -> Abandoned {
+        let subtree = self.subtree();
+        if let Err(e) = &subtree {
+            log::debug!("cgroup v2: an abandoned front's leaf subtree cannot be read ({e})");
+        }
+        if self.entered {
+            let killed = self.hard_kill().is_ok();
+            self.remove_killing_through(killed, "after its spawn was abandoned");
+        } else {
+            self.remove_holding_nothing();
+        }
+        // Any kill through the leaf, this one or the removal's own, ends what it held.
+        end_front(received, |pid, pidfd| match &subtree {
+            Ok(subtree) => subtree.reached(pid, pidfd),
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("its leaf's subtree cannot be read: {e}"),
+            )),
+        })
     }
 
     /// Remove a leaf its child entered: killed through, drained, its empty child cgroups removed,
@@ -937,9 +1109,7 @@ impl CgroupLeaf {
 /// exits, however that comes.
 #[cfg(target_os = "linux")]
 fn end_child(received: &Received) -> ChildFate {
-    use std::os::fd::{AsFd, AsRawFd};
-
-    use rustix::process::{pidfd_send_signal, waitid, WaitId, WaitIdOptions};
+    use rustix::process::{pidfd_send_signal, waitid, WaitIdOptions};
 
     #[cfg(feature = "tokio")]
     crate::bounded::assert_may_block("end_child");
@@ -955,36 +1125,8 @@ fn end_child(received: &Received) -> ChildFate {
         log::warn!("cgroup v2: an abandoned spawn's child sent no handle on itself ({pid:?}); it is not signalled");
         return ChildFate::Unkillable;
     };
-    // The reap names the child by its pidfd, or — with its `/proc` directory proving the number is
-    // still its own, and it unreaped — by its pid.
-    let id = || match &received.pidfd {
-        Some(pidfd) => WaitId::PidFd(pidfd.as_fd()),
-        None => WaitId::Pid(pid),
-    };
-    // Still unreaped? A process `std` reaped is gone: its pidfd waits on nothing, its `/proc`
-    // directory opens nothing.
-    let unreaped = match &received.pidfd {
-        Some(_) => loop {
-            match waitid(
-                id(),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            ) {
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::CHILD) => break false,
-                _ => break true,
-            }
-        },
-        None => {
-            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
-            let stat = unsafe { libc::openat(handle.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if stat >= 0 {
-                // Safety: the descriptor just opened, closed once.
-                unsafe { libc::close(stat) };
-            }
-            stat >= 0
-        }
-    };
-    if !unreaped {
+    let id = || wait_id(received, pid);
+    if !still_unreaped(received, pid) {
         return ChildFate::Gone;
     }
     #[cfg(test)]
@@ -1045,6 +1187,137 @@ fn end_child(received: &Received) -> ChildFate {
         }
     }
     ChildFate::Killed
+}
+
+/// What names the child `received` names, `pid`, to its reaper: its pidfd, or — with its `/proc`
+/// directory proving the number is still its own, and it unreaped — its pid.
+#[cfg(target_os = "linux")]
+fn wait_id(received: &Received, pid: rustix::process::Pid) -> rustix::process::WaitId<'_> {
+    use std::os::fd::AsFd;
+    match &received.pidfd {
+        Some(pidfd) => rustix::process::WaitId::PidFd(pidfd.as_fd()),
+        None => rustix::process::WaitId::Pid(pid),
+    }
+}
+
+/// Whether the child `received` names, `pid`, is still unreaped. A process `std` reaped is gone:
+/// its pidfd waits on nothing, its `/proc` directory opens nothing. A child that sent no handle on
+/// itself is not.
+#[cfg(target_os = "linux")]
+fn still_unreaped(received: &Received, pid: rustix::process::Pid) -> bool {
+    use rustix::process::{waitid, WaitIdOptions};
+    match (&received.pidfd, &received.proc_dir) {
+        (Some(_), _) => loop {
+            match waitid(
+                wait_id(received, pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::CHILD) => break false,
+                _ => break true,
+            }
+        },
+        (None, Some(proc_dir)) => {
+            // Safety: a NUL-terminated name relative to an open directory; the result is closed.
+            let stat =
+                unsafe { libc::openat(proc_dir.as_raw_fd(), c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if stat >= 0 {
+                // Safety: the descriptor just opened, closed once.
+                unsafe { libc::close(stat) };
+            }
+            stat >= 0
+        }
+        (None, None) => false,
+    }
+}
+
+/// Answer for an abandoned spawn's elevation front, sent nothing: one that has exited is reaped,
+/// one its leaf's kill `reached` (given its pid and pidfd) is waited for, through its pidfd, and
+/// reaped; any other is left running and unreaped, with nothing that waits for it.
+///
+/// A child that never named itself, or that `std` collected, never ran the elevated program, so it
+/// is no front: it is answered as any child.
+#[cfg(target_os = "linux")]
+fn end_front(
+    received: &Received,
+    reached: impl FnOnce(u32, Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool>,
+) -> Abandoned {
+    use std::os::fd::AsFd;
+
+    use crate::child::spawn::FrontFate;
+    use rustix::process::{waitid, WaitIdOptions};
+
+    #[cfg(feature = "tokio")]
+    crate::bounded::assert_may_block("end_front");
+
+    let Some((raw, pid)) = received
+        .pid
+        .and_then(|raw| Some((raw, rustix::process::Pid::from_raw(i32::try_from(raw).ok()?)?)))
+    else {
+        return Abandoned::MaybeUnreaped;
+    };
+    if received.pidfd.is_none() && received.proc_dir.is_none() {
+        log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) sent no handle on itself; it is left");
+        return Abandoned::Front(FrontFate::Unaccounted);
+    }
+    if !still_unreaped(received, pid) {
+        return Abandoned::Ended;
+    }
+    #[cfg(test)]
+    let seen_running = crate::child::spawn::fault::fronts_seen_running();
+    #[cfg(not(test))]
+    let seen_running = false;
+    let exited = if seen_running {
+        Ok(None)
+    } else {
+        loop {
+            match waitid(wait_id(received, pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
+                Err(rustix::io::Errno::INTR) => continue,
+                other => break other,
+            }
+        }
+    };
+    match exited {
+        Ok(Some(_)) => return Abandoned::Front(FrontFate::Reaped),
+        Ok(None) => {}
+        Err(e) => {
+            log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be waited on ({e})");
+            return Abandoned::Front(FrontFate::Unaccounted);
+        }
+    }
+    match reached(raw, received.pidfd.as_ref().map(AsFd::as_fd)) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!(
+                "cgroup v2: an abandoned spawn's elevation front (pid {raw}) is outside its leaf's reach; it is left \
+                 running, unsignalled and unreaped: a kill would orphan the elevated program"
+            );
+            return Abandoned::Front(FrontFate::LeftUnreaped);
+        }
+        Err(e) => {
+            log::warn!(
+                "cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be placed ({e}); it is left \
+                 unsignalled and unreaped, and its leaf's kill may have ended it"
+            );
+            return Abandoned::Front(FrontFate::LeftUnreaped);
+        }
+    }
+    // The leaf's kill reached it, so this wait ends with its exit.
+    #[cfg(test)]
+    fault::run_before_exit_wait();
+    let status = loop {
+        match waitid(wait_id(received, pid), WaitIdOptions::EXITED) {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => break other,
+        }
+    };
+    match status {
+        Ok(_) => Abandoned::Front(FrontFate::Reaped),
+        Err(e) => {
+            log::warn!("cgroup v2: an abandoned spawn's elevation front (pid {raw}) could not be reaped ({e})");
+            Abandoned::Front(FrontFate::Unaccounted)
+        }
+    }
 }
 
 /// What names a child to its reaper: its own pidfd, or its pid once its `/proc` directory proved
@@ -1138,7 +1411,10 @@ pub(crate) fn try_create_leaf() -> Result<CgroupLeaf, LeafError> {
         }
     })?;
 
-    create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))
+    let mut leaf = create_leaf_under(&Path::new("/sys/fs/cgroup").join(rel_path.trim_start_matches('/')))?;
+    let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
+    leaf.cgroup_path = Some(format!("{}/{name}", rel_path.trim_end_matches('/')));
+    Ok(leaf)
 }
 
 /// A new leaf's name: `cosca-<pid>-<seq>-<random>`. The pid and sequence number name the spawn for
@@ -1295,9 +1571,12 @@ pub(crate) fn create_leaf_under(current: &Path) -> Result<CgroupLeaf, LeafError>
         procs_fd: Some(procs_fd),
         report: Some(report),
         entered: false,
+        cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
-        killed: AtomicBool::new(false),
+        killed: std::sync::Arc::new(AtomicBool::new(false)),
+        watched: None,
+        placed: super::PlacedAtRemoval::default(),
         kill_attempt_failed: AtomicBool::new(false),
     })
 }
@@ -1329,6 +1608,8 @@ pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Re
     }
     // Safety: the caller's guarantee: this is the forked child.
     unsafe { slot.close_parents_end() };
+    #[cfg(test)]
+    fault::die_if_at(fault::ChildDeath::BeforeIntent);
     // Safety: the caller's guarantee.
     match unsafe { place_self_in_cgroup_pre_exec(procs_fd, slot) } {
         // Safety: `_exit` is async-signal-safe, and runs nothing of this process's.
@@ -1371,6 +1652,8 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
             _ => Ok(()),
         };
     }
+    #[cfg(test)]
+    fault::die_if_at(fault::ChildDeath::BeforeReport);
     // Test-only fault seam: a write that returns this instead of writing (take semantics — see
     // `fault`), so a failed placement leaves the child out of the leaf, as a real one does.
     #[cfg(test)]
@@ -1410,6 +1693,10 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 #[path = "leaf/release.rs"]
 mod release;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf/end_front_tests.rs"]
+mod end_front_tests;
 
 #[cfg(test)]
 #[path = "leaf_tests.rs"]

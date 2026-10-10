@@ -1098,7 +1098,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let said = std::rc::Rc::new(RefCell::new(None));
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, None).err();
+    let err = super::conclude(Ok(Recorder(Rc::clone(&said))), failed, super::LeftFront::NotAFront).err();
     assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("the report was cut short"));
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(
@@ -1106,7 +1106,12 @@ fn an_abandoned_child_is_worded_by_its_cause() {
         "{why}"
     );
 
-    super::conclude(Ok(Recorder(Rc::clone(&said))), Outcome::NoReport, None).err();
+    super::conclude(
+        Ok(Recorder(Rc::clone(&said))),
+        Outcome::NoReport,
+        super::LeftFront::NotAFront,
+    )
+    .err();
     let why = said.borrow_mut().take().expect("the child was abandoned");
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
@@ -1236,11 +1241,14 @@ impl super::Spawned for NoChild {
     }
 }
 
-/// The front `sudo` leaves.
-fn sudo_front() -> Option<crate::elevation::front::Front> {
-    crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
-        crate::elevation::Backend::Sudo,
-    )))
+/// The front `sudo` leaves, left to the handshake.
+fn sudo_front() -> super::LeftFront {
+    super::LeftFront::Here(
+        crate::elevation::front::front(Some(&crate::elevation::ElevatedVia::Wrapped(
+            crate::elevation::Backend::Sudo,
+        )))
+        .expect("sudo leaves a front"),
+    )
 }
 
 /// A `cat` whose stdin this test holds, and a pidfd naming it.
@@ -1317,6 +1325,36 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
     .err()
     .expect("the spawn fails");
     assert!(err.to_string().contains("the spawned child is what sudo left"), "{err}");
+    drop(cat.stdin.take());
+    assert!(cat.wait().expect("wait").success(), "the front was signalled");
+}
+
+/// A front spawned for a cgroup leaf and dropped by tokio after its fork is the leaf's to answer
+/// for: the handshake stashes its pidfd for the leaf, signals and waits on nothing, and returns the
+/// error as it came, with no note of the front's fate. Mutants: "the arm tears the child down",
+/// "the arm notes the front", "the arm drops the pidfd".
+#[skuld::test]
+fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let raw = pidfd.as_raw_fd();
+    let left: super::LeftPidfd = Rc::new(Cell::new(None));
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::ToLeaf(Rc::clone(&left)),
+    )
+    .err()
+    .expect("the spawn fails");
+    assert_eq!(
+        err.to_string(),
+        Error::Io(std::io::Error::other("tokio failed")).to_string()
+    );
+    let stashed = left.take().expect("the pidfd is left for the leaf");
+    assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
+    // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
+    // reaped before this wait.
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }

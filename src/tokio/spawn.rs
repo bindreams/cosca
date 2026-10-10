@@ -8,7 +8,7 @@ use std::process::Stdio as StdStdio;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::child::spawn::build_std_command;
-use crate::child::spawn::{dup, front_after_verdict, resolve_identity, resolve_stdio, PipeOwnership};
+use crate::child::spawn::{dup, resolve_identity, resolve_stdio, PipeOwnership};
 use crate::command::Command;
 use crate::error::Error;
 use crate::identity::Resolved;
@@ -326,12 +326,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 // after std returned `Ok`: a std `Err` has already collected the child.
                 use crate::child::spawn::unique_report::Report;
                 use crate::containment::AbandonedChild;
+                let front = cmd.elevation_front();
                 let abandoned = match unique {
                     Report::ChildRefused(_) | Report::Missing => AbandonedChild::MaybeUnreaped,
-                    _ => prepared.abandon_before_verdict(),
+                    _ => prepared.abandon_before_verdict(front.is_some()),
                 };
-                warn_for_abandoned_child(abandoned, &e);
-                return Err(e);
+                return Err(abandoned_error(abandoned, e, front));
             }
         };
         drop(tcmd);
@@ -347,6 +347,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
         )?;
+        // A front this host could not place after a cgroup kill is refused before it is spawned.
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = prepared
+            .cgroup_leaf
+            .as_ref()
+            .filter(|_| cmd.elevation_front().is_some())
+        {
+            crate::containment::cgroup::front_placement(|| leaf.id())?;
+        }
 
         // fd >= 3 merge SOURCES: their dup'd ends join the resolved fd >= 3 collection below
         // (the pre-pass removed those slots from `fds`, so the numbers cannot collide).
@@ -365,11 +374,16 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // Linux: the child is held before `exec` until the parent holds the pidfd it sent, which
         // the child then keeps. Its hook was registered first of all, so `fd_map`'s, which may
         // `dup2` a mapping onto the channel's descriptor number, runs after it is done.
-        // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
+        // A front spawned for a cgroup leaf is left to the leaf, which alone knows whether it holds
+        // the front, with the handshake's pidfd for a child the leaf cannot name (see
+        // `Handshake::leaving_front`).
         #[cfg(target_os = "linux")]
-        let handshake = handshake
-            .open(&_guard)?
-            .leaving_front(cmd.elevation_front().filter(|_| prepared.cgroup_leaf.is_none()));
+        let left_pidfd = crate::child::spawn::pidfd_handshake::LeftPidfd::default();
+        #[cfg(target_os = "linux")]
+        let handshake = handshake.open(&_guard)?.leaving_front(
+            cmd.elevation_front(),
+            prepared.cgroup_leaf.is_some().then(|| std::rc::Rc::clone(&left_pidfd)),
+        );
 
         // On Unix, hand n>=3 child ends to fd_map — registered AFTER `prepare` so its dup2
         // pre_exec runs LAST in the child (see the ordering rationale in child/spawn.rs).
@@ -430,8 +444,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 Err(e) => {
                     // Whatever tokio did with the child, the leaf's exchange says what became of
                     // it; without a leaf, nothing can tell.
-                    warn_for_abandoned_child(prepared.abandon_before_verdict(), &e);
-                    return Err(e);
+                    let front = cmd.elevation_front();
+                    #[cfg(target_os = "linux")]
+                    let abandoned = prepared.abandon_before_verdict(front.is_some(), left_pidfd.take());
+                    #[cfg(not(target_os = "linux"))]
+                    let abandoned = prepared.abandon_before_verdict(front.is_some());
+                    return Err(abandoned_error(abandoned, e, front));
                 }
             }
         };
@@ -496,6 +514,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
     };
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, pid);
+    #[cfg(unix)]
+    let front = cmd.elevation_front();
+    // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
+    #[cfg(target_os = "linux")]
+    let subtree = crate::child::spawn::front_subtree(front.and(prepared.cgroup_leaf.as_ref()));
+    #[cfg(unix)]
+    if front.is_some() {
+        prepared.watch_front(pid);
+    }
     // The handle checks the read: a pid alone does not say whom it names once something else has
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
@@ -514,20 +541,20 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
         // CREATE_SUSPENDED) process.
         other => {
             // Settle the leaf's verdict before any kill, so the kill never races its reads.
-            #[cfg(unix)]
-            let left_front = front_after_verdict(
+            crate::child::spawn::settle_before_teardown(
                 &mut prepared,
                 #[cfg(target_os = "linux")]
                 handle,
                 #[cfg(not(target_os = "linux"))]
                 pid,
-                cmd.elevation_front(),
             );
-            #[cfg(not(unix))]
-            let left_front = front_after_verdict(&mut prepared, pid, None);
-            // An elevation front is sent nothing (see `ProcSource::leave_front`).
+            // An elevation front is sent nothing (see `ProcSource::leave_front`). Its containment
+            // goes first: a cgroup leaf's drop kills it, so the teardown waits for a contained front
+            // that kill reached, and says what became of it.
             #[cfg(unix)]
-            if let Some(front) = left_front {
+            if let Some(front) = front {
+                #[cfg(target_os = "linux")]
+                drop(prepared);
                 // macOS: a front whose identity was refused or found gone is left unverified, as the
                 // sync spawn leaves it.
                 #[cfg(target_os = "macos")]
@@ -540,17 +567,15 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                     },
                 );
                 #[cfg(not(target_os = "macos"))]
-                let fate = proc.leave_front(pid, front);
-                let _ = front;
-                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
+                let fate = proc.leave_front(pid, front, subtree.as_ref());
+                return Err(fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)));
             }
-            let not_a_front = crate::child::spawn::FrontFate::NotAFront;
             // Linux: a failed check says nothing about the child, and its pidfd pins it whatever
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
             if matches!(other, Resolved::Unknown) {
                 proc.teardown_through_pidfd(pid);
-                return Err(not_a_front.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
+                return Err(crate::child::spawn::spawn_identity_error(other));
             }
             // macOS: nothing pins the pid, so a child the handle still cannot show ours is
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
@@ -559,20 +584,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
                 proc.forget_foreign();
             }
             proc.reap_now(pid);
-            return Err(not_a_front.note(crate::child::spawn::spawn_identity_error(other), left_front, Some(pid)));
+            return Err(crate::child::spawn::spawn_identity_error(other));
         }
     };
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
-    // A front in a cgroup leaf is torn down as any child (see `crate::elevation::front`).
-    #[cfg(target_os = "linux")]
-    let in_cgroup = prepared.cgroup_leaf.is_some();
-    #[cfg(not(target_os = "linux"))]
-    let in_cgroup = false;
-    #[cfg(unix)]
-    let front_before_attach = cmd.elevation_front().filter(|_| !in_cgroup);
-    #[cfg(not(unix))]
-    let _ = in_cgroup;
     let attach = crate::child::spawn::attach_or_fault(
         id,
         #[cfg(target_os = "linux")]
@@ -587,17 +603,18 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
             #[cfg(target_os = "macos")]
             crate::child::spawn::assert_attach_cannot_fail(&error);
             #[cfg(unix)]
-            if let Some(front) = front_before_attach {
+            if let Some(front) = front {
                 // macOS: a front is sent nothing and left unreaped, as the sync spawn leaves it.
                 #[cfg(target_os = "macos")]
                 let fate = {
                     proc.forget_because("is an elevation front whose attach failed, sent nothing, and left unreaped");
                     crate::child::spawn::FrontFate::LeftUnreaped
                 };
+                // Elsewhere the failed attach has dropped the containment: a cgroup leaf's drop kills
+                // and drains it, so a front in it is dying, and is waited for.
                 #[cfg(not(target_os = "macos"))]
-                let fate = proc.leave_front(pid, front);
-                let _ = front;
-                return Err(fate.note(error, front_before_attach, Some(pid)));
+                let fate = proc.leave_front(pid, front, subtree.as_ref());
+                return Err(fate.note(error, Some(front), Some(pid)));
             }
             // macOS: killed and reaped through its verified unique id, as the sync spawn does, and
             // tokio's `Child` forgotten: its drop reaps by pid.
@@ -656,7 +673,8 @@ fn leave_unverified_front(
 }
 
 /// Async twin of the sync `finish_elevated` (see there). The root's reap is blocking (`try_wait`
-/// cannot reap a just-killed child, so it would leak a zombie), and waits only on this kill.
+/// cannot reap a just-killed child, so it would leak a zombie), and waits only on this kill. The
+/// front's gate is decided once, before the tree's kill.
 #[cfg(unix)]
 pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
@@ -668,7 +686,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let gate = child.kill_gate();
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
+    let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {
         skipped = child.kill_tree_members_unless_reaped()?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
@@ -678,6 +696,10 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         })?;
         Ok(())
     });
+    let tree_failure = match &tree {
+        Some(Err(e)) => Some(e.to_string()),
+        _ => None,
+    };
     let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
     if let Some(action) = skipped {
         tree_note.push_str(&format!(
@@ -686,8 +708,17 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         ));
     }
     let root = match gate {
+        // Not asked again after the kill: a killed front can read as neither exited nor in its
+        // cgroup, between leaving the cgroup's member list and becoming a zombie.
+        crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
+            child.cgroup_kill_reached().map(|()| Sent::Delivered)
+        }
+        // No kill reached the cgroup: refused as `kill` refuses, naming why.
+        crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
         crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate => child.kill_sent_gated(gate),
+        gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
+            child.kill_sent_gated(gate)
+        }
     };
     let root_note = match root {
         Ok(Sent::Delivered) => {
@@ -775,12 +806,18 @@ mod pidfd_tests;
 /// tokio can fail a spawn after its fork, dropping the child neither killed nor reaped and
 /// returning no pid. Only a cgroup leaf still reaches such a child, and only once the child has
 /// told it who it is. The error cannot tell a failure before the fork from one after it, hence
-/// "may". Reported at `warn` every time.
-fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &Error) {
+/// "may". Reported at `warn` every time. The fate of an elevation `front` the leaf found is noted
+/// on the error instead, as the spawn's other failures note it.
+fn abandoned_error(
+    child: crate::containment::AbandonedChild,
+    error: Error,
+    front: Option<crate::elevation::front::Front>,
+) -> Error {
     use crate::containment::AbandonedChild;
 
     let consequence = match child {
-        AbandonedChild::Ended => return,
+        AbandonedChild::Front(fate) => return fate.note(error, front, None),
+        AbandonedChild::Ended => return error,
         AbandonedChild::MaybeUnreaped => {
             "the child exits before `exec`; if its spawn did not collect it, it is left unreaped, since it \
              never reached the point where it names itself and nothing holds its pid"
@@ -791,4 +828,5 @@ fn warn_for_abandoned_child(child: crate::containment::AbandonedChild, error: &E
         }
     };
     log::warn!("tokio spawn failed ({error}); if it failed after forking, {consequence}");
+    error
 }

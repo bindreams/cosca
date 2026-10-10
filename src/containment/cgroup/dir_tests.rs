@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 
-use super::{fd_path, LeafDir};
+use super::{fd_path, id_of_handle, LeafDir};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
@@ -218,4 +218,37 @@ fn rmdir_spares_a_symlink_that_took_a_live_leafs_name() {
         moved.exists(),
         "the leaf behind the link must not be removed through it"
     );
+}
+
+/// A cgroup id is all 64 bits of a kernfs file handle, read in this machine's byte order; any
+/// other handle is no cgroup's.
+#[skuld::test]
+fn a_cgroup_id_is_decoded_from_its_kernfs_handle() {
+    const HIGH: u64 = 0x1_0000_0007;
+    assert_eq!(
+        id_of_handle(0xfe, 8, HIGH.to_ne_bytes()).expect("a kernfs handle"),
+        HIGH
+    );
+    // `FILEID_INO32_GEN`, as tmpfs gives: an inode and a generation, not a cgroup id.
+    id_of_handle(1, 8, HIGH.to_ne_bytes()).expect_err("not a kernfs handle");
+    id_of_handle(0xfe, 4, HIGH.to_ne_bytes()).expect_err("too short for a kernfs id");
+}
+
+/// A sweep that cannot read the id of a child cgroup removes it all the same, unrecorded, and says
+/// so at `debug` with the cause: a leaf left behind for it would leak a cgroup. The stand-in's
+/// directories are no cgroups, so their ids cannot be read. Mutant: "an unreadable id is silent".
+#[skuld::test]
+fn a_sweep_that_cannot_read_a_childs_id_removes_it_unrecorded_and_says_why() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sub = dir.path().join("unrecorded-sub-9f3a");
+    std::fs::create_dir(&sub).expect("make the child");
+    let leaf = LeafDir::open_for_test(dir.path());
+    let mark = crate::log_capture::mark();
+    assert_eq!(leaf.remove_children().expect("the sweep"), 1);
+    assert!(!sub.exists(), "the child is removed");
+    let logs = crate::log_capture::records_since_on_current_thread(mark, "unrecorded-sub-9f3a");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].0, log::Level::Debug);
+    assert!(logs[0].1.contains("removed unrecorded"), "{logs:?}");
 }

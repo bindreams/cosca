@@ -115,6 +115,12 @@ mod watcher;
 pub(crate) use watcher::*;
 
 #[cfg(target_os = "linux")]
+#[path = "cgroup/reach.rs"]
+mod reach;
+#[cfg(target_os = "linux")]
+pub(crate) use reach::*;
+
+#[cfg(target_os = "linux")]
 #[path = "cgroup/leaf.rs"]
 mod leaf;
 #[cfg(target_os = "linux")]

@@ -1,0 +1,506 @@
+//! Whether a task is in a leaf's cgroup subtree, by reads that each end: none waits on the task.
+//!
+//! - **Linux 6.13+:** `PIDFD_GET_INFO`'s cgroup id, through the task's pidfd, compared with the
+//!   leaf's own id. Another id is looked for among the cgroups under the leaf: those its sweep
+//!   removed, then those a walk of the leaf's descendants finds.
+//! - **Otherwise:** `/proc/<pid>/cgroup`'s path, compared with the leaf's. A `hidepid` `/proc`
+//!   hides it for a task of another user (a root front), so an elevated spawn that would need it
+//!   is refused (see [`front_placement`]).
+//!
+//! What a read says of a task killed through the leaf and then moved by someone else is on
+//! [`Command::contain`](crate::Command::contain).
+
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use super::parse::{is_at_or_under, parse_v2_relative_path};
+
+/// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
+/// The request is the same 32 bits under glibc's `unsigned long` and musl's `int`.
+const PIDFD_GET_INFO: libc::Ioctl = 0xC040_FF0B_u32 as libc::Ioctl;
+const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
+
+/// The first version of `struct pidfd_info`, whose size is in [`PIDFD_GET_INFO`].
+#[repr(C)]
+#[derive(Default)]
+struct PidfdInfo {
+    mask: u64,
+    cgroupid: u64,
+    rest: [u32; 12],
+}
+
+/// The cgroup id of the task `pidfd` names, or `None` on a kernel with no `PIDFD_GET_INFO` (before
+/// 6.13). An error is a refusal of a kernel that has it, such as `ESRCH` for a task already reaped.
+pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> {
+    #[cfg(test)]
+    if super::fault::pidfd_info_missing() {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    if super::fault::pidfd_info_fails() {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    #[cfg(test)]
+    if let Some(id) = super::fault::forced_pidfd_cgroup_id() {
+        return Ok(Some(id));
+    }
+    let mut info = PidfdInfo {
+        mask: PIDFD_INFO_CGROUPID,
+        ..PidfdInfo::default()
+    };
+    // SAFETY: `info` is a valid, writable `struct pidfd_info` of the size the request encodes.
+    let rc = unsafe { libc::ioctl(pidfd.as_raw_fd(), PIDFD_GET_INFO, &mut info as *mut PidfdInfo) };
+    if rc == 0 {
+        if info.mask & PIDFD_INFO_CGROUPID == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(info.cgroupid));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // Not a pidfs ioctl this kernel knows.
+        Some(libc::ENOTTY) | Some(libc::EINVAL) => Ok(None),
+        _ => Err(e),
+    }
+}
+
+/// Whether `/proc/<pid>/cgroup` names `leaf_path` (a unified-hierarchy path) or a cgroup under it
+/// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
+/// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
+pub(crate) fn proc_names(
+    leaf_path: &str,
+    pid: u32,
+    recorded: impl FnOnce() -> Option<bool>,
+    other_id: bool,
+) -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(errno) = super::fault::proc_hidden_as() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    let proc_dir = match crate::identity::proc_view() {
+        crate::identity::ProcView::Same(dir) => dir,
+        crate::identity::ProcView::Diverged => {
+            return Err(io::Error::other(format!(
+                "this process's /proc is an outer pid namespace's, so pid {pid}'s cgroup cannot be read"
+            )));
+        }
+        crate::identity::ProcView::Unassessable(why) => {
+            let kind = why.source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
+            return Err(io::Error::new(
+                kind,
+                format!(
+                    "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
+                    why.reason
+                ),
+            ));
+        }
+    };
+    let text = proc_dir.read_to_string(&format!("{pid}/cgroup"))?;
+    let path = parse_v2_relative_path(&text)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
+    names_leaf(path, leaf_path, other_id, recorded)
+}
+
+/// What `/proc/<pid>/cgroup` prints after the path of a removed cgroup.
+const DELETED: &str = " (deleted)";
+
+/// Whether the cgroup `path` (from `/proc/<pid>/cgroup`) is the leaf at `leaf_path` or under it.
+///
+/// A removed cgroup's path is printed with [`DELETED`] after it, which a live cgroup may also have
+/// in its name. A path under the leaf is under it either way. The leaf's own path with the suffix
+/// is the removed leaf or a live cgroup of that name beside it, which no read of `/proc` can tell
+/// apart: it is answered by `recorded`, the task's place recorded just before the leaf's removal,
+/// while the leaf's own path still read without the suffix (see [`PlacedAtRemoval`]). With no
+/// record it is undecidable. It is never the leaf when `other_id` says the task's pidfd gave a
+/// cgroup id other than the leaf's.
+pub(crate) fn names_leaf(
+    path: &str,
+    leaf_path: &str,
+    other_id: bool,
+    recorded: impl FnOnce() -> Option<bool>,
+) -> io::Result<bool> {
+    if is_at_or_under(path, leaf_path) {
+        return Ok(true);
+    }
+    if path.strip_suffix(DELETED) != Some(leaf_path) || other_id {
+        return Ok(false);
+    }
+    recorded().ok_or_else(|| {
+        io::Error::other(format!(
+            "{path} is either the removed leaf or a live cgroup of that name, and the task's place was not \
+             recorded before the leaf's removal"
+        ))
+    })
+}
+
+/// Where a leaf's watched elevation front was just before the leaf's last `rmdir`, by pid (see
+/// `CgroupLeaf::watch_front`), shared by the leaf and its subtrees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlacedAtRemoval(Arc<std::sync::Mutex<Option<(u32, bool)>>>);
+
+impl PlacedAtRemoval {
+    pub(crate) fn record(&self, pid: u32, inside: bool) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((pid, inside));
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Whether `pid` was recorded inside the leaf; `None` without a record for it.
+    pub(crate) fn of(&self, pid: u32) -> Option<bool> {
+        match *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            Some((recorded, inside)) if recorded == pid => Some(inside),
+            _ => None,
+        }
+    }
+}
+
+/// A leaf's subtree, captured while the leaf exists, so a task can be placed in it even once the
+/// leaf is removed: the leaf's own cgroup id, its directory, its unified-hierarchy path, the ids of
+/// the cgroups its sweep removed, its front's place before its removal, and whether a kill through
+/// it has landed (the leaf's own record).
+#[derive(Debug)]
+pub(crate) struct Subtree {
+    leaf_id: u64,
+    dir: Option<Arc<OwnedFd>>,
+    path: Option<String>,
+    swept: super::Swept,
+    placed: PlacedAtRemoval,
+    killed: Arc<AtomicBool>,
+}
+
+impl Subtree {
+    pub(crate) fn new(
+        leaf_id: u64,
+        dir: Option<Arc<OwnedFd>>,
+        path: Option<String>,
+        swept: super::Swept,
+        placed: PlacedAtRemoval,
+        killed: Arc<AtomicBool>,
+    ) -> Subtree {
+        Subtree {
+            leaf_id,
+            dir,
+            path,
+            swept,
+            placed,
+            killed,
+        }
+    }
+
+    /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. A task
+    /// keeps its cgroup until it is freed, so a killed task on its way out, or a zombie, still has
+    /// the leaf's id, and a task moved out has its new cgroup's. Where the kernel gives a pidfd's
+    /// cgroup id (6.13+), the task is in the subtree if that id is the leaf's, or one the leaf's
+    /// sweep removed, or one a walk of the leaf's descendants finds; outside if the walk finds it
+    /// nowhere (see [`walk_places`](Self::walk_places)). Otherwise, before 6.13 or when the walk
+    /// cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no unified-hierarchy path (a
+    /// test leaf) holds nothing that read would place.
+    pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        let mut elsewhere = false;
+        if let Some(pidfd) = pidfd {
+            if let Some(id) = pidfd_cgroup_id(pidfd)? {
+                if id == self.leaf_id || self.swept.holds(id) {
+                    return Ok(true);
+                }
+                if let Some(under) = self.walk_places(id) {
+                    return Ok(under);
+                }
+                elsewhere = true;
+            }
+        }
+        let Some(path) = &self.path else {
+            return Ok(false);
+        };
+        proc_names(path, pid, || self.placed.of(pid), elsewhere).map_err(|e| {
+            if elsewhere {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
+                         cannot be read ({e})"
+                    ),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Whether the cgroup `id`, not the leaf's own, is under the leaf, by a walk of the leaf's
+    /// descendants (see [`find_descendant`](super::find_descendant)). `None` when the walk cannot
+    /// tell: the leaf cannot be read or is removed, a cgroup under it cannot be listed, or one is
+    /// removed but not yet freed, which no walk lists. The last is read after the walk: a cgroup
+    /// the task is in stays, live or dying, until the task is freed, so one under the leaf that the
+    /// walk missed is dying by then.
+    fn walk_places(&self, id: u64) -> Option<bool> {
+        let dir = self.dir.as_ref()?;
+        match super::find_descendant(dir.as_fd(), id) {
+            super::Walked::Found => Some(true),
+            super::Walked::Absent => match self.dying() {
+                Ok(Some(0)) => Some(false),
+                Ok(dying) => {
+                    log::debug!(
+                        "the cgroups under a leaf were all walked without finding cgroup {id}, but {} are removed \
+                         and not yet freed, so it is not shown to be outside",
+                        dying.map_or("an unknown number".to_owned(), |n| n.to_string())
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::debug!(
+                        "the cgroups under a leaf were all walked without finding cgroup {id}, but its cgroup.stat \
+                         cannot be read ({e}), so it is not shown to be outside"
+                    );
+                    None
+                }
+            },
+            super::Walked::Unknown(e) => {
+                log::debug!("the cgroups under a leaf could not all be walked ({e})");
+                None
+            }
+        }
+    }
+
+    /// How many cgroups under the leaf are removed but not yet freed, by its `cgroup.stat`; `None`
+    /// if that holds no such count. An error if the file cannot be read, as once the leaf is
+    /// removed.
+    fn dying(&self) -> io::Result<Option<u64>> {
+        let dir = self
+            .dir
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the subtree holds no leaf directory"))?;
+        let file = rustix::fs::openat(
+            dir.as_fd(),
+            "cgroup.stat",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let text = io::read_to_string(std::fs::File::from(file))?;
+        Ok(dying_in(&text))
+    }
+
+    /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
+    /// only then does the task's exit follow, so only then may it be waited for.
+    pub(crate) fn reached(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+        if !self.killed.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.holds(pid, pidfd)
+    }
+}
+
+/// `nr_dying_descendants` in a `cgroup.stat`'s `text`.
+fn dying_in(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("nr_dying_descendants ")?.trim().parse::<u64>().ok())
+}
+
+/// Whether this host can place an elevation front after a cgroup kill, decided before any front is
+/// spawned. Placement is by a pidfd's cgroup id on Linux 6.13 and later, else by `/proc/<pid>/cgroup`
+/// of a non-dumpable child, since `hidepid` hides such a process as it hides a root `sudo` front.
+/// The leaf's id must be readable: `ENOSYS`, `EOPNOTSUPP` or `EPERM` is `Unsupported` naming the
+/// errno, and any other error is `Io`.
+///
+/// `Err` is the spawn's refusal.
+pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Result<(), crate::error::Error> {
+    use std::os::fd::AsFd;
+
+    if let Err(e) = leaf_id() {
+        return Err(match e.raw_os_error() {
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM) => unplaceable(format!(
+                "this host gives no cgroup's id by name_to_handle_at ({e}), as a kernel without CONFIG_FHANDLE, a \
+                 filesystem without export operations or a seccomp filter refuses it"
+            )),
+            _ => crate::error::Error::Io(crate::error::io_context(
+                "the cgroup id of the elevated front's leaf",
+                e,
+            )),
+        });
+    }
+    let own = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
+        .map_err(|e| crate::error::Error::Io(crate::error::io_context("pidfd_open of this process", e.into())))?;
+    match pidfd_cgroup_id(own.as_fd()) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(unplaceable(format!(
+                "PIDFD_GET_INFO failed on this process's own pidfd ({e})"
+            )))
+        }
+    }
+    untraceable_cgroup_readable().map_err(refusal)
+}
+
+/// The spawn's refusal for `why` the cgroup of a process this one may not trace is unreadable,
+/// on a kernel with no `PIDFD_GET_INFO`.
+fn refusal(why: Unreadable) -> crate::error::Error {
+    match why {
+        Unreadable::Hidden(e) => unplaceable(format!(
+            "this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and /proc hides the cgroup of a process \
+             this one may not trace ({e}), as a hidepid /proc does: it would hide the elevated front's too"
+        )),
+        Unreadable::View(why) => unplaceable(format!(
+            "this kernel has no PIDFD_GET_INFO (Linux 6.13 or later), and {why}"
+        )),
+        Unreadable::Probe(e) => crate::error::Error::Io(crate::error::io_context(
+            "probing whether /proc shows the cgroup of a process this one may not trace",
+            e,
+        )),
+    }
+}
+
+fn unplaceable(why: String) -> crate::error::Error {
+    crate::error::Error::Unsupported {
+        op: "contain() on an elevated command".into(),
+        platform: "linux",
+        detail: format!(
+            "{why}. cosca could not tell whether a cgroup kill reached the elevated front, so the spawn is \
+             refused before anything is spawned"
+        ),
+    }
+}
+
+/// Why [`untraceable_cgroup_readable`] could not read.
+#[derive(Debug)]
+enum Unreadable {
+    /// `/proc` hid it.
+    Hidden(io::Error),
+    /// This process's `/proc` view is not its own pid namespace's, or could not be told.
+    View(String),
+    /// The probe itself failed: its pipe, fork or reap.
+    Probe(io::Error),
+}
+
+/// A forked probe child (see [`fork_probe`]).
+struct Probe {
+    pid: libc::pid_t,
+    /// Where the child reports whether it is dumpable and its parent-death signal, a byte each. Its
+    /// end closes when it exits.
+    ready_read: std::io::PipeReader,
+}
+
+/// Forks the probe child of `parent`, this process's pid as recorded before the fork. The child is
+/// made non-dumpable (`dumpable`: left so, for a test), reports `PR_GET_DUMPABLE` and
+/// `PR_GET_PDEATHSIG` on `ready_read`, and waits to be killed. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and
+/// a parent that died before that took effect is no longer `parent`, so the child exits instead.
+fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
+    use std::os::fd::AsRawFd;
+
+    let (ready_read, ready_write) = std::io::pipe()?;
+    let (ready_r, ready_w) = (ready_read.as_raw_fd(), ready_write.as_raw_fd());
+    // The fork is under the spawn lock, as every fork of cosca's is, so no other spawn's descriptor
+    // is copied into the child mid-handshake.
+    let _guard = crate::child::spawn::spawn_lock();
+    // SAFETY: the child makes only async-signal-safe syscalls, then waits for the parent's kill; it
+    // never returns into Rust.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: async-signal-safe syscalls in the forked child.
+        unsafe {
+            libc::close(ready_r);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            if libc::getppid() != parent {
+                libc::_exit(0);
+            }
+            if !dumpable {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+            }
+            // What the parent checks: this child is not dumpable, as a front is not, and dies with
+            // its parent.
+            let mut pdeathsig: libc::c_int = 0;
+            libc::prctl(libc::PR_GET_PDEATHSIG, (&raw mut pdeathsig) as libc::c_ulong, 0, 0, 0);
+            let report = [libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as u8, pdeathsig as u8];
+            libc::write(ready_w, report.as_ptr().cast(), report.len());
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(ready_write);
+    Ok(Probe { pid, ready_read })
+}
+
+/// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
+fn untraceable_cgroup_readable() -> Result<(), Unreadable> {
+    let proc_dir = match crate::identity::proc_view() {
+        crate::identity::ProcView::Same(dir) => dir,
+        crate::identity::ProcView::Diverged => {
+            return Err(Unreadable::View(
+                "this process's /proc is an outer pid namespace's, so no process's cgroup can be read by its pid"
+                    .into(),
+            ))
+        }
+        crate::identity::ProcView::Unassessable(why) => {
+            return Err(Unreadable::View(format!(
+                "this process's /proc view could not be established ({})",
+                why.reason
+            )))
+        }
+    };
+    #[cfg(test)]
+    let dumpable = super::fault::probe_kept_dumpable();
+    #[cfg(not(test))]
+    let dumpable = false;
+    let Probe { pid, ready_read } =
+        fork_probe(rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
+    let mut ready = [0u8; 2];
+    let readied = loop {
+        match std::io::Read::read(&mut &ready_read, &mut ready) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            other => break other,
+        }
+    };
+    // A `/proc` that hides the child answers `ENOENT` under `hidepid=2`, `EPERM` under `hidepid=1`
+    // (measured on Linux 7.0); a test forces one.
+    #[cfg(test)]
+    let hidden = super::fault::proc_hidden_as();
+    #[cfg(not(test))]
+    let hidden: Option<i32> = None;
+    let read = match readied {
+        Ok(2) if ready[0] != 0 => Err(Unreadable::Probe(io::Error::other(
+            "the probe's child could not make itself non-dumpable",
+        ))),
+        Ok(2) if i32::from(ready[1]) != libc::SIGKILL => Err(Unreadable::Probe(io::Error::other(
+            "the probe's child could not ask to die with its parent",
+        ))),
+        // The child is this process's own and unreaped, so its `/proc` entry exists: an error that
+        // says otherwise, or refuses, is `/proc` hiding it.
+        Ok(2) => match hidden {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => proc_dir.read_to_string(&format!("{pid}/cgroup")).map(drop),
+        }
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOENT | libc::EPERM | libc::EACCES) => Unreadable::Hidden(e),
+            _ => Unreadable::Probe(e),
+        }),
+        Ok(_) => Err(Unreadable::Probe(io::Error::other(
+            "the probe's child died before it was ready",
+        ))),
+        Err(e) => Err(Unreadable::Probe(e)),
+    };
+    // SAFETY: `pid` is this function's own unreaped child, so the number names it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let mut status = 0;
+    loop {
+        // SAFETY: `pid` is this function's own unreaped child.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(Unreadable::Probe(e));
+        }
+    }
+    read
+}
+
+#[cfg(test)]
+#[path = "reach_tests.rs"]
+mod reach_tests;

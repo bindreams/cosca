@@ -93,11 +93,36 @@ impl ProcHandle {
         }
     }
 
+    /// The pidfd naming the process, if it holds one (Linux).
+    #[cfg(unix)]
+    pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            ProcHandle::Std(s) => s.pidfd(),
+            #[cfg(not(target_os = "linux"))]
+            ProcHandle::Std(_) => None,
+        }
+    }
+
     /// Whether the process is still running, read without reaping it.
     #[cfg(unix)]
     pub(crate) fn is_running(&self) -> io::Result<bool> {
         match self {
             ProcHandle::Std(s) => s.is_running(),
+        }
+    }
+
+    /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
+    #[cfg(unix)]
+    pub(crate) fn reap_after_tree_kill(&self) {
+        match self {
+            ProcHandle::Std(s) => {
+                #[cfg(test)]
+                crate::child::spawn::fault::run_between_kill_and_wait();
+                if let Err(e) = s.wait() {
+                    log_teardown_wait_failure(s.id(), &e);
+                }
+            }
         }
     }
 

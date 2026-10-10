@@ -1,5 +1,7 @@
 use std::cell::Cell;
 
+use super::dir::WalkStep;
+
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
@@ -30,6 +32,22 @@ thread_local! {
     static FORCE_INOTIFY_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_KILL_CHECK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
     static FORCE_LEAF_OPEN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_KILL_WRITES: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
+    static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
+    static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
+    static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
+    static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
+    static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
+    static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
+    static PIDFD_INFO_FAILS: Cell<bool> = const { Cell::new(false) };
+    static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
+    static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
+    static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static RMDIR_HOOK: std::cell::RefCell<Option<RmdirHook>> = std::cell::RefCell::new(None);
     static FORCE_FORK_RUNNING_PIDFD_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORK_RUNNING_PIDFD_FAILURE_PROBE: std::cell::RefCell<Option<std::os::fd::OwnedFd>> =
@@ -45,6 +63,155 @@ thread_local! {
 
 /// Replaces a leaf's `rmdir`, given the leaf's path.
 type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// While the guard lives, every `cgroup.kill` write on this thread fails with `EIO`, and kills
+/// nothing: a failed kill whose members may all still run.
+pub(crate) fn fail_kill_writes() -> FailKillWrites {
+    FAIL_KILL_WRITES.with(|f| f.set(true));
+    FailKillWrites(())
+}
+
+#[must_use = "the writes succeed again as soon as the guard is dropped"]
+pub(crate) struct FailKillWrites(());
+
+impl Drop for FailKillWrites {
+    fn drop(&mut self) {
+        FAIL_KILL_WRITES.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn kill_writes_fail() -> bool {
+    FAIL_KILL_WRITES.with(Cell::get)
+}
+
+/// The next `cgroup.kill` write on this thread fails with `EIO` and kills nothing; the writes after
+/// it succeed. A drop's own kill failing while the leaf's teardown, which writes after it, works.
+pub(crate) fn fail_next_kill_write() -> FailNextKillWrite {
+    FAIL_NEXT_KILL_WRITE.with(|f| f.set(true));
+    FailNextKillWrite(())
+}
+
+#[must_use = "the failure is cleared as soon as the guard is dropped"]
+pub(crate) struct FailNextKillWrite(());
+
+impl Drop for FailNextKillWrite {
+    fn drop(&mut self) {
+        FAIL_NEXT_KILL_WRITE.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn take_next_kill_write_failure() -> bool {
+    FAIL_NEXT_KILL_WRITE.with(|f| f.replace(false))
+}
+
+/// While the guard lives, this thread reads `PIDFD_GET_INFO` as missing, as on a kernel before
+/// 6.13: a task's cgroup is read through `/proc` instead.
+pub(crate) fn miss_pidfd_info() -> MissPidfdInfo {
+    PIDFD_INFO_MISSING.with(|f| f.set(true));
+    MissPidfdInfo(())
+}
+
+#[must_use = "PIDFD_GET_INFO is back as soon as the guard is dropped"]
+pub(crate) struct MissPidfdInfo(());
+
+impl Drop for MissPidfdInfo {
+    fn drop(&mut self) {
+        PIDFD_INFO_MISSING.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn pidfd_info_missing() -> bool {
+    PIDFD_INFO_MISSING.with(Cell::get)
+}
+
+/// While the guard lives, this thread finds no `/proc/<pid>/cgroup` for another task, as a
+/// `hidepid` `/proc` hides a task of another user.
+pub(crate) fn hide_proc() -> HideProc {
+    PROC_HIDDEN.with(|f| f.set(true));
+    HideProc(())
+}
+
+#[must_use = "/proc is visible again as soon as the guard is dropped"]
+pub(crate) struct HideProc(());
+
+impl Drop for HideProc {
+    fn drop(&mut self) {
+        PROC_HIDDEN.with(|f| f.set(false));
+    }
+}
+
+/// While the guard lives, this thread's reads of another task's `/proc/<pid>/cgroup` that
+/// fail with `errno`, as `hidepid` answers: `EPERM` under `hidepid=1`.
+pub(crate) fn hide_proc_as(errno: i32) -> HideProcAs {
+    PROC_HIDDEN_AS.with(|f| f.set(Some(errno)));
+    HideProcAs(())
+}
+
+#[must_use = "/proc is visible again as soon as the guard is dropped"]
+pub(crate) struct HideProcAs(());
+
+impl Drop for HideProcAs {
+    fn drop(&mut self) {
+        PROC_HIDDEN_AS.with(|f| f.set(None));
+    }
+}
+
+/// The errno a hidden `/proc` answers on this thread: [`hide_proc_as`]'s, `ENOENT` under
+/// [`hide_proc`], or `None` while nothing hides it.
+pub(crate) fn proc_hidden_as() -> Option<i32> {
+    PROC_HIDDEN_AS
+        .with(Cell::get)
+        .or_else(|| PROC_HIDDEN.with(Cell::get).then_some(libc::ENOENT))
+}
+
+/// While the guard lives, `PIDFD_GET_INFO` fails on this thread with `EIO`, as a kernel that has
+/// it refusing it.
+pub(crate) fn fail_pidfd_info() -> FailPidfdInfo {
+    PIDFD_INFO_FAILS.with(|f| f.set(true));
+    FailPidfdInfo(())
+}
+
+#[must_use = "PIDFD_GET_INFO answers again as soon as the guard is dropped"]
+pub(crate) struct FailPidfdInfo(());
+
+impl Drop for FailPidfdInfo {
+    fn drop(&mut self) {
+        PIDFD_INFO_FAILS.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn pidfd_info_fails() -> bool {
+    PIDFD_INFO_FAILS.with(Cell::get)
+}
+
+/// While the guard lives, the placement probe's child forked from this thread stays dumpable, as
+/// one whose `PR_SET_DUMPABLE` failed.
+pub(crate) fn keep_probe_dumpable() -> KeepProbeDumpable {
+    PROBE_DUMPABLE.with(|f| f.set(true));
+    KeepProbeDumpable(())
+}
+
+#[must_use = "the probe's child is made non-dumpable again as soon as the guard is dropped"]
+pub(crate) struct KeepProbeDumpable(());
+
+impl Drop for KeepProbeDumpable {
+    fn drop(&mut self) {
+        PROBE_DUMPABLE.with(|f| f.set(false));
+    }
+}
+
+pub(crate) fn probe_kept_dumpable() -> bool {
+    PROBE_DUMPABLE.with(Cell::get)
+}
+
+/// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.
+pub(crate) fn set_before_kill_write(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_KILL_WRITE, hook)
+}
+
+pub(crate) fn run_before_kill_write() {
+    crate::oneshot_hook::fire(&BEFORE_KILL_WRITE);
+}
 
 /// Make the NEXT leaf directory made on this thread fail to be held after its `mkdir`, with
 /// `EMFILE`, as at `RLIMIT_NOFILE`. Take semantics.
@@ -99,7 +266,16 @@ pub(crate) fn set_drain_blocking_notifier(notify: std::sync::mpsc::Sender<()>) {
 pub(crate) fn take_drain_blocking_notifier() {
     DRAIN_BLOCKING.with(|d| d.borrow_mut().take());
 }
+/// Run `hook` once when the next drain wait on this thread is about to block, before it does: a
+/// fixture that only the thing awaited would release can be checked, or released, here, so a
+/// mutant that never made it happen fails an assertion instead of hanging the wait.
+#[cfg(feature = "tokio")]
+pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
+    crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
+}
+
 pub(crate) fn notify_drain_blocking() {
+    crate::oneshot_hook::fire(&BEFORE_DRAIN_BLOCK);
     DRAIN_BLOCKING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
             // The send must always run — `debug_assert!` does not evaluate its condition in a
@@ -192,6 +368,11 @@ pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
 /// latter with its `cgroup.events` as read at that moment, until [`take_leaf_steps`].
 pub(crate) fn record_leaf_steps() {
     LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+/// The steps recorded so far, left in place.
+#[cfg(feature = "tokio")]
+pub(crate) fn leaf_steps_so_far() -> Vec<String> {
+    LEAF_STEPS.with(|s| s.borrow().clone()).unwrap_or_default()
 }
 pub(crate) fn take_leaf_steps() -> Vec<String> {
     LEAF_STEPS.with(|s| s.borrow_mut().take()).unwrap_or_default()
@@ -354,8 +535,9 @@ pub(crate) fn run_between_check_and_kill() {
     }
 }
 
-/// Run `hook` in the NEXT abandonment on this thread, after the child has been
-/// signalled and right before the wait for its exit. A test whose child blocks on a stdin it
+/// Run `hook` in the NEXT abandonment on this thread, after the child has been signalled (an
+/// elevation front: after its leaf's kill reached it) and right before the wait for its exit. A
+/// test whose child blocks on a stdin it
 /// holds releases it here: a real kill has already landed, so the release changes nothing, while
 /// a skipped kill lets the child exit on its own EOF and the test's `SIGKILL` assertion fails
 /// at once instead of waiting out the child.
@@ -604,4 +786,178 @@ pub(crate) fn set_before_state_read(hook: impl FnOnce() + 'static) -> crate::one
 }
 pub(crate) fn run_before_state_read() {
     crate::oneshot_hook::fire(&BEFORE_STATE_READ);
+}
+
+/// Where the next child forked from this thread kills itself (`SIGKILL`) in its placement hook,
+/// before it can run the program: `std`'s spawn then returns `Ok`, as for any child a signal ends
+/// before `exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildDeath {
+    /// Before it sends its intent: nothing names it to the leaf.
+    BeforeIntent,
+    /// After its intent, before its report.
+    BeforeReport,
+}
+
+/// While the guard lives, the next child forked from this thread — which inherits the flag — dies
+/// at `at` (see [`ChildDeath`]).
+#[cfg(feature = "tokio")]
+pub(crate) fn kill_child_at(at: ChildDeath) -> ChildDies {
+    CHILD_DIES.with(|c| c.set(Some(at)));
+    ChildDies(())
+}
+
+#[cfg(feature = "tokio")]
+#[must_use = "children live again as soon as the guard is dropped"]
+pub(crate) struct ChildDies(());
+
+#[cfg(feature = "tokio")]
+impl Drop for ChildDies {
+    fn drop(&mut self) {
+        CHILD_DIES.with(|c| c.set(None));
+    }
+}
+
+/// In a forked child: dies here if this is where it was told to (see [`kill_child_at`]).
+/// Async-signal-safe: a thread-local read, `getpid` and `kill`.
+pub(crate) fn die_if_at(at: ChildDeath) {
+    if CHILD_DIES.with(Cell::get) == Some(at) {
+        // SAFETY: `kill` and `getpid` are async-signal-safe; the child dies here.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
+}
+
+/// While the guard lives, this thread reads every pidfd's cgroup id as `id`.
+pub(crate) fn force_pidfd_cgroup_id(id: u64) -> ForcedPidfdCgroupId {
+    FORCED_PIDFD_CGROUP_ID.with(|f| f.set(Some(id)));
+    ForcedPidfdCgroupId(())
+}
+
+#[must_use = "the id is read again as soon as the guard is dropped"]
+pub(crate) struct ForcedPidfdCgroupId(());
+
+impl Drop for ForcedPidfdCgroupId {
+    fn drop(&mut self) {
+        FORCED_PIDFD_CGROUP_ID.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn forced_pidfd_cgroup_id() -> Option<u64> {
+    FORCED_PIDFD_CGROUP_ID.with(Cell::get)
+}
+
+/// While the guard lives, capturing a leaf's subtree on this thread fails with `errno`, as its
+/// cgroup id read does once the leaf's filesystem stops giving ids.
+pub(crate) fn fail_subtree(errno: i32) -> FailSubtree {
+    SUBTREE_FAILS.with(|f| f.set(Some(errno)));
+    FailSubtree(())
+}
+
+#[must_use = "the subtree is captured again as soon as the guard is dropped"]
+pub(crate) struct FailSubtree(());
+
+impl Drop for FailSubtree {
+    fn drop(&mut self) {
+        SUBTREE_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn subtree_fails() -> Option<i32> {
+    SUBTREE_FAILS.with(Cell::get)
+}
+
+/// A hook given the path, relative to the leaf, of each cgroup a descendant walk is about to open.
+type WalkHook = Box<dyn FnMut(&std::path::Path)>;
+
+/// While the guard lives, run `hook` with the path, relative to the leaf, of each cgroup a
+/// descendant walk on this thread is about to open (`dir::find_descendant`), so a test can remove
+/// one mid-walk.
+pub(crate) fn set_before_walk_open(hook: impl FnMut(&std::path::Path) + 'static) -> BeforeWalkOpen {
+    BEFORE_WALK_OPEN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    BeforeWalkOpen(())
+}
+
+#[must_use = "the hook is cleared as soon as the guard is dropped"]
+pub(crate) struct BeforeWalkOpen(());
+
+impl Drop for BeforeWalkOpen {
+    fn drop(&mut self) {
+        BEFORE_WALK_OPEN.with(|h| h.borrow_mut().take());
+    }
+}
+
+pub(crate) fn run_before_walk_open(path: &std::path::Path) {
+    let hook = BEFORE_WALK_OPEN.with(|h| h.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(path);
+        BEFORE_WALK_OPEN.with(|h| {
+            h.borrow_mut().get_or_insert(hook);
+        });
+    }
+}
+
+type WalkFailure = (std::path::PathBuf, WalkStep, i32);
+
+/// While the guard lives, `step` of the walk on this thread at the cgroup `path`, relative to the
+/// leaf (`.` is the leaf itself), fails with `errno`, as the OS answers a refusal that cannot be
+/// provoked on a real cgroup, such as a path past `PATH_MAX`.
+pub(crate) fn fail_walk_step(path: &str, step: WalkStep, errno: i32) -> FailWalkStep {
+    WALK_FAILURE.with(|f| *f.borrow_mut() = Some((path.into(), step, errno)));
+    FailWalkStep(())
+}
+
+#[must_use = "the step succeeds again as soon as the guard is dropped"]
+pub(crate) struct FailWalkStep(());
+
+impl Drop for FailWalkStep {
+    fn drop(&mut self) {
+        WALK_FAILURE.with(|f| f.borrow_mut().take());
+    }
+}
+
+pub(crate) fn walk_step_failure(path: &std::path::Path, step: WalkStep) -> Option<i32> {
+    WALK_FAILURE.with(|f| match &*f.borrow() {
+        Some((at, failing, errno)) if at == path && *failing == step => Some(*errno),
+        _ => None,
+    })
+}
+
+/// While the guard lives, a leaf's cgroup id on this thread fails with `errno`, as
+/// `name_to_handle_at` does on a kernel without `CONFIG_FHANDLE` (`ENOSYS`).
+pub(crate) fn fail_cgroup_id(errno: i32) -> FailCgroupId {
+    CGROUP_ID_FAILS.with(|f| f.set(Some(errno)));
+    FailCgroupId(())
+}
+
+#[must_use = "the id reads again as soon as the guard is dropped"]
+pub(crate) struct FailCgroupId(());
+
+impl Drop for FailCgroupId {
+    fn drop(&mut self) {
+        CGROUP_ID_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn cgroup_id_fails() -> Option<i32> {
+    CGROUP_ID_FAILS.with(Cell::get)
+}
+
+/// While the guard lives, a leaf's read of whether it is live, before its removal on this thread,
+/// fails with `errno`, as an `openat` refused `EMFILE` does.
+pub(crate) fn fail_liveness_read(errno: i32) -> FailLivenessRead {
+    LIVENESS_READ_FAILS.with(|f| f.set(Some(errno)));
+    FailLivenessRead(())
+}
+
+#[must_use = "the liveness reads again as soon as the guard is dropped"]
+pub(crate) struct FailLivenessRead(());
+
+impl Drop for FailLivenessRead {
+    fn drop(&mut self) {
+        LIVENESS_READ_FAILS.with(|f| f.set(None));
+    }
+}
+
+pub(crate) fn liveness_read_fails() -> Option<i32> {
+    LIVENESS_READ_FAILS.with(Cell::get)
 }

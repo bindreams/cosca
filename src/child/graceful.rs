@@ -106,8 +106,8 @@ impl Child {
     /// kill/reap error takes precedence (the child then stays owned — `Drop`'s teardown
     /// applies).
     ///
-    /// An elevated child behind a front outside a cgroup (see [`kill`](Child::kill)) that outlives
-    /// the grace is not killed: it is left running, and this answers
+    /// An elevated child behind a front (see [`kill`](Child::kill)) that outlives the grace is killed
+    /// only through a cgroup that holds it. Outside one it is left running, and this answers
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
@@ -138,6 +138,13 @@ impl Child {
                 other => other.map_err(Error::Io)?,
             },
             crate::elevation::front::Gate::Open => self.proc.kill().map_err(Error::Io)?,
+            // A live front in its cgroup: killed through it, and nothing signalled after it.
+            crate::elevation::front::Gate::CgroupOnly => {
+                self.attached
+                    .hard_kill_marking(&self.tree_killed)
+                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(self.front, self.id.pid(), e))?;
+                self.cgroup_kill_reached()?;
+            }
         }
         #[cfg(not(unix))]
         self.proc.kill().map_err(Error::Io)?;

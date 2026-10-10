@@ -139,8 +139,10 @@ fn kill_reads_the_front_its_spawn_found_not_its_report() {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let mut child = cmd.spawn().expect("spawn");
     child.set_elevation(report(ElevatedVia::Wrapped(Backend::Sudo)));
-    let _stdin = child.stdin().expect("stdin pipe");
+    let stdin = child.stdin().expect("stdin pipe");
     child.kill().expect("a child with no front is killed as any child");
+    // Closed first: a child nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -290,8 +292,10 @@ fn a_failed_password_write_to_a_front_someone_else_reaped_says_it_had_exited() {
 /// pkexec execs the program, so the tracked process is the program: it is signalled.
 #[skuld::test]
 fn kill_of_a_pkexec_child_signals_it() {
-    let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Pkexec));
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Pkexec));
     child.kill().expect("kill");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGKILL));
 }
 
@@ -489,8 +493,10 @@ fn graceful_shutdown_of_a_live_osascript_is_unkillable_and_sends_nothing() {
 /// sudo relays `SIGTERM` to the program, so it is sent.
 #[skuld::test]
 fn terminate_of_a_live_sudo_front_is_sent() {
-    let (child, _stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
+    let (child, stdin) = spawn_as(cat(), ElevatedVia::Wrapped(Backend::Sudo));
     child.terminate().expect("sudo relays SIGTERM");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
     assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGTERM));
 }
 

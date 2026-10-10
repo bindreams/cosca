@@ -35,20 +35,6 @@ pub(crate) struct ChildHandle<'a> {
     pub(crate) pidfd: std::os::fd::BorrowedFd<'a>,
 }
 
-/// What [`Prepared::settle_verdict`] found of the child's placement in its cgroup leaf.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only a Linux cgroup leaf is settled")
-)]
-#[derive(Debug)]
-pub(crate) enum Settled {
-    /// The child is in its leaf, which contains it.
-    InLeaf,
-    /// No leaf holds the child: there is none, the child did not enter it, or the verdict was
-    /// already taken.
-    NotPlaced,
-}
-
 impl Prepared {
     /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
     /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
@@ -62,28 +48,31 @@ impl Prepared {
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child:
     /// take the verdict, as `attach` would, so the leaf answers only for the tree and
-    /// never for the child the caller will reap. [`Settled::NotPlaced`] without a leaf, or once
-    /// the verdict is taken.
+    /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
+    /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
+    /// tree either way.
     pub(crate) fn settle_verdict(
         &mut self,
         #[cfg(target_os = "linux")] child: ChildHandle<'_>,
         #[cfg(not(target_os = "linux"))] pid: u32,
-    ) -> Settled {
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut().filter(|leaf| leaf.holds_verdict_to_take()) {
-            return match leaf.take_placement(child) {
-                Ok(()) => Settled::InLeaf,
-                Err(_) => Settled::NotPlaced,
-            };
+            if let Err(e) = leaf.take_placement(child) {
+                log::debug!("cgroup v2: a failed spawn's child is not placed in its leaf: {e}");
+            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
-        Settled::NotPlaced
     }
 
     /// End the placement exchange of a spawn that failed with no handle left on its child — tokio
     /// can drop one it forked — and say what became of that child. Without a leaf nothing can
-    /// tell, so [`AbandonedChild::MaybeUnreachable`].
+    /// tell, so [`AbandonedChild::MaybeUnreachable`]. A child that is an elevation `front` is sent
+    /// no signal of its own (see [`CgroupLeaf::abandon_before_verdict`]); `handshake` is the
+    /// pidfd its handshake left for a child the leaf cannot name.
+    ///
+    /// [`CgroupLeaf::abandon_before_verdict`]: crate::containment::cgroup::CgroupLeaf::abandon_before_verdict
     #[cfg_attr(
         not(feature = "tokio"),
         allow(
@@ -91,17 +80,35 @@ impl Prepared {
             reason = "only the tokio spawn path can lose a handle before a verdict is settled"
         )
     )]
-    pub(crate) fn abandon_before_verdict(&mut self) -> AbandonedChild {
+    pub(crate) fn abandon_before_verdict(
+        &mut self,
+        front: bool,
+        #[cfg(target_os = "linux")] handshake: Option<std::os::fd::OwnedFd>,
+    ) -> AbandonedChild {
         #[cfg(target_os = "linux")]
         if let Some(leaf) = self.cgroup_leaf.as_mut() {
             use crate::containment::cgroup::Abandoned;
-            return match leaf.abandon_before_verdict() {
+            return match leaf.abandon_before_verdict(front, handshake) {
                 Abandoned::Ended => AbandonedChild::Ended,
                 Abandoned::MaybeUnreaped => AbandonedChild::MaybeUnreaped,
                 Abandoned::OutOfReach => AbandonedChild::MaybeUnreachable,
+                Abandoned::Front(fate) => AbandonedChild::Front(fate),
             };
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = front;
         AbandonedChild::MaybeUnreachable
+    }
+
+    /// Watch the elevation front `pid` this spawn forked: its cgroup leaf, if it has one, records
+    /// the front's place before its removal (see `CgroupLeaf::watch_front`).
+    pub(crate) fn watch_front(&mut self, pid: u32) {
+        #[cfg(target_os = "linux")]
+        if let Some(leaf) = self.cgroup_leaf.as_mut() {
+            leaf.watch_front(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
     }
 }
 
@@ -122,6 +129,9 @@ pub(crate) enum AbandonedChild {
     MaybeUnreaped,
     /// If it was forked, it may be running where nothing can reach it.
     MaybeUnreachable,
+    /// It is an elevation front, which was sent no signal of its own, and this is what became of
+    /// it.
+    Front(crate::child::spawn::FrontFate),
 }
 
 /// What a spawn achieved, beyond the child handle itself: the tree-teardown mechanism and the
@@ -253,14 +263,40 @@ impl Attached {
         format!("{self:?}")
     }
 
-    /// Whether this is a Linux cgroup leaf.
+    /// Whether this mechanism's kill reaches `pid` whatever its credentials: only a cgroup's
+    /// `cgroup.kill` does, and only while `pid` is in it. A signal to a group or to walked members is
+    /// subject to the kernel's permission check, so it is `false` for every other mechanism.
+    /// `pid` must be this process's unreaped child, so its number is not reused.
     #[cfg(unix)]
-    pub(crate) fn is_cgroup(&self) -> bool {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    pub(crate) fn kill_reaches_across_credentials(
+        &self,
+        pid: u32,
+        pidfd: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> std::io::Result<bool> {
         #[cfg(target_os = "linux")]
-        if matches!(self, Attached::Cgroup(_)) {
-            return true;
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.holds_member(pid, pidfd);
         }
-        false
+        Ok(false)
+    }
+
+    /// Whether `pid` (which `pidfd` names, when there is one) is in a cgroup's leaf or a cgroup
+    /// under it (see `CgroupLeaf::names`). `false` for every other mechanism.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused_variables, reason = "only a Linux cgroup reads it")
+    )]
+    pub(crate) fn cgroup_names(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Attached::Cgroup(leaf) = self {
+            return leaf.names(pid, pidfd);
+        }
+        Ok(false)
     }
 
     /// Hard-kill the contained tree (best-effort; already-gone is success).
