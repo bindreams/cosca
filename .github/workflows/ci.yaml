@@ -488,7 +488,7 @@ jobs:
             mkdir -p "$CG"
             echo $$ > "$CG/cgroup.procs"
             # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
-            # The profile is passed explicitly: the `sudo` of Ubuntu 26.04 does not keep NEXTEST_PROFILE under `-E`.
+            # The profile is passed explicitly: Ubuntu 26.04's sudo-rs ignores `-E`, so no variable survives.
             export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
             export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
             status=0
@@ -541,8 +541,8 @@ jobs:
       # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
       # helper must all be reachable by that uid: every directory above the checkout and the
       # extraction directory is made traversable and `target` readable. `--extract-to` is what lets
-      # nextest run an archive there: its default extraction directory is root-only. `sudo -E` keeps
-      # COSCA_TEST_SETUID_HELPER and the group's variables.
+      # nextest run an archive there: its default extraction directory is root-only. `sudo --preserve-env` keeps
+      # COSCA_TEST_SETUID_HELPER and the group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
       - name: Archive the setuid-root process-group teardown test (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -564,7 +564,7 @@ jobs:
           SKULD_LABELS: setuid_root
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py setuid-root sudo -E "$(command -v python3)" .github/scripts/forward.py bash -euxc '
+          exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TEST_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci-setuid-root --no-tests=fail -E "binary(group_teardown_setuid)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
