@@ -208,6 +208,14 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
         crate::log_capture::contains_since(mark, "reap_now refused); it is not waited on"),
         "a forgotten child was handed nowhere, and the warning must say so"
     );
+    // The refused kill and the forget are one event: one warn about the teardown, which carries the
+    // leak. (The identity check's own warn, if any, came before the teardown.)
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, text)| *level <= log::Level::Warn && !text.contains("could not be checked against"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
     assert!(
         !crate::log_capture::contains_since(mark, "handed to the pidfd teardown"),
         "nothing was handed to the pidfd teardown"
@@ -503,7 +511,7 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 ///
 /// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
 /// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
-/// warns with the foreign-reap text.
+/// warns with the foreign-reap text; the refused kill and the forget warn separately.
 #[cfg(target_os = "linux")]
 fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box<dyn std::any::Any>>) {
     use std::cell::RefCell;
@@ -539,12 +547,17 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            "had its teardown kill refused and is handed to the pidfd teardown"
-        ),
-        "the forget must say the kill was refused and the child handed on"
+        crate::log_capture::contains_since(mark, "teardown refused); it is handed to the pidfd teardown"),
+        "the warn must say the kill was refused and the child handed on"
     );
+    // The refused kill and the forget are one event: one warn about the teardown, which carries the
+    // leak. (The identity check's own warn, if any, came before the teardown.)
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, text)| *level <= log::Level::Warn && !text.contains("could not be checked against"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
     assert!(
         !crate::log_capture::contains_since(mark, "was reaped by someone else"),
         "the child was not reaped by someone else"

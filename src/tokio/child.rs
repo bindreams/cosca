@@ -1136,7 +1136,7 @@ impl Drop for Child {
                     let cgroup_front = matches!(gate, crate::elevation::front::Gate::CgroupOnly)
                         .then_some(self.front)
                         .flatten();
-                    signals = signal_on_drop(self.id, &view, cgroup_front, &mut os, self.reported);
+                    signals = signal_on_drop(self.id, &view, cgroup_front, &mut os);
                 }
             }
             #[cfg(not(unix))]
@@ -1224,15 +1224,14 @@ struct DropSignals {
     left: Vec<String>,
 }
 
-/// The signals of a kill-on-drop drop: the tree, then the root. `reported`: an earlier step of this
-/// same event already warned, so a failed tree kill is logged at `debug`.
+/// The signals of a kill-on-drop drop: the tree, then the root. A failed tree kill is returned for
+/// the drop's one warn.
 fn signal_on_drop(
     id: ProcessId,
     #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(unix)] cgroup_front: Option<crate::elevation::front::Front>,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
-    #[cfg(unix)] reported: bool,
 ) -> DropSignals {
     #[allow(unused_mut, reason = "only the Unix signals collect anything")]
     let mut signals = DropSignals::default();
@@ -1261,18 +1260,22 @@ fn signal_on_drop(
         os.attached.hard_kill()
     };
     if let Err(e) = &tree {
-        // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
+        // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on.
+        let failed = format!("contained-tree teardown did not fully succeed: {e}");
+        // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+        let orphaned = "the root is killed regardless, so its descendants may be orphaned";
         #[cfg(unix)]
-        let level = if reported { log::Level::Debug } else { log::Level::Warn };
+        {
+            signals.left.push(failed);
+            if os.attached.hard_kill_refused_to_walk(&tree) {
+                signals.left.push(orphaned.to_owned());
+            }
+        }
         #[cfg(not(unix))]
-        let level = log::Level::Warn;
-        log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
         if os.attached.hard_kill_refused_to_walk(&tree) {
-            // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-            log::log!(
-                level,
-                "Child::drop: the root is killed regardless, so its descendants may be orphaned"
-            );
+            log::warn!("Child::drop: {failed}; {orphaned}");
+        } else {
+            log::warn!("Child::drop: {failed}");
         }
     }
     // Already reaped, or not pinned by this process: no signal to issue.

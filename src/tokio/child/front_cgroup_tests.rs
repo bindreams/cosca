@@ -144,10 +144,22 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
     };
     let leaf = leaf.path().to_path_buf();
     let pidfd = pidfd_of(child.id().pid());
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     {
         let _failing = crate::containment::cgroup::fault::fail_kill_writes();
         drop(child);
     }
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "Child::drop")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn for the one event: {warns:?}");
+    assert!(
+        warns[0].1.contains("contained-tree teardown did not fully succeed")
+            && warns[0].1.contains("elevation front pid"),
+        "the failed kill and the front are in it: {warns:?}"
+    );
     assert_eq!(roots.kills(), 0, "the drop must not kill the front");
     drop(stdin);
     assert_eq!(ended(&pidfd), Some((Some(0), None)), "the drop signalled the front");

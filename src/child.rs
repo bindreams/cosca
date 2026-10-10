@@ -980,10 +980,12 @@ impl Drop for Child {
         {
             let tree = self.attached.hard_kill();
             if let Err(e) = &tree {
-                log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
-                if self.attached.hard_kill_refused_to_walk(&tree) {
-                    log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
-                }
+                let orphaned = if self.attached.hard_kill_refused_to_walk(&tree) {
+                    "; the root is killed regardless, so its descendants may be orphaned"
+                } else {
+                    ""
+                };
+                log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}{orphaned}");
             }
             self.proc.teardown_on_drop();
         }
@@ -1021,19 +1023,15 @@ impl Child {
             // A live member refused, or couldn't be confirmed — visible, not silently
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
-            // logged, never asserted on.
-            let level = if self.reported {
-                log::Level::Debug
-            } else {
-                log::Level::Warn
-            };
-            log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
+            // reported, never asserted on.
+            report
+                .left
+                .push(format!("contained-tree teardown did not fully succeed: {e}"));
             if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-                log::log!(
-                    level,
-                    "Child::drop: the root is killed regardless, so its descendants may be orphaned"
-                );
+                report
+                    .left
+                    .push("the root is killed regardless, so its descendants may be orphaned".to_owned());
             }
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns

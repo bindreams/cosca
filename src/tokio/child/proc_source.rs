@@ -116,6 +116,43 @@ impl std::os::fd::AsFd for PinnedPidfd {
     }
 }
 
+/// Why a child its handle shows gone, not pinned, or unanswerable is forgotten, completing "child N ...".
+#[cfg(unix)]
+fn foreign_why(state: &RootState) -> String {
+    match state {
+        RootState::Unknown(e) => format!("cannot be shown to be ours (RootState::Unknown: {e})"),
+        RootState::Unpinned => format!(
+            "is not pinned by this process (RootState::Unpinned: {})",
+            crate::signal::UNPINNED_WHY
+        ),
+        RootState::Unreaped | RootState::Reaped => {
+            "was reaped by someone else, or cannot be shown to be ours".to_owned()
+        }
+    }
+}
+
+/// What the one warning for a refused teardown kill says: the kill's error, what became of the
+/// child, why the handle forgot it if it did, and what that leaked.
+fn refused_kill_warning(
+    pid: u32,
+    e: &Error,
+    handed: bool,
+    foreign: Option<&str>,
+    leak: Option<&'static str>,
+) -> String {
+    let mut text = format!(
+        "teardown kill of child {pid} failed ({e}); {}",
+        refused_kill_fate(handed)
+    );
+    if let Some(why) = foreign {
+        text.push_str(&format!("; the child {why}"));
+    }
+    if let Some(leak) = leak {
+        text.push_str(&format!("; forgetting tokio's handle for it leaks {leak}"));
+    }
+    text
+}
+
 /// What the warning for a refused teardown kill says became of the child: `handed` only when the
 /// pidfd teardown really took it.
 fn refused_kill_fate(handed: bool) -> &'static str {
@@ -819,17 +856,16 @@ impl ProcSource {
     #[cfg(unix)]
     pub(crate) fn forget_if_foreign(&mut self) -> Option<&'static str> {
         let (_, state) = self.elsewhere()?;
-        let why = match &state {
-            RootState::Unknown(e) => format!("cannot be shown to be ours (RootState::Unknown: {e})"),
-            RootState::Unpinned => format!(
-                "is not pinned by this process (RootState::Unpinned: {})",
-                crate::signal::UNPINNED_WHY
-            ),
-            RootState::Unreaped | RootState::Reaped => {
-                "was reaped by someone else, or cannot be shown to be ours".to_owned()
-            }
-        };
-        self.forget_because(&why)
+        self.forget_because(&foreign_why(&state))
+    }
+
+    /// [`forget_if_foreign`](ProcSource::forget_if_foreign) without the warn, for a caller whose
+    /// one warn carries it: what the forget leaks, and why the child was forgotten.
+    #[cfg(unix)]
+    fn forget_if_foreign_quietly(&mut self) -> Option<(&'static str, String)> {
+        let (_, state) = self.elsewhere()?;
+        let (_, leak) = self.forget_quietly()?;
+        Some((leak, foreign_why(&state)))
     }
 
     /// Guaranteed synchronous teardown for a spawn that failed after the fork: kill the child
@@ -853,20 +889,28 @@ impl ProcSource {
         if let Err(e) = &killed {
             // Tokio's drop reaps by pid: a child the handle shows reaped elsewhere is forgotten.
             #[cfg(unix)]
-            self.forget_if_foreign();
+            let foreign = self.forget_if_foreign_quietly();
+            #[cfg(not(unix))]
+            let foreign: Option<(&'static str, String)> = None;
             // Handed off before the log and the assertion: a panic from either must not strand a
             // child that is ours. Linux: through its pidfd, never to tokio's orphan queue, whose
             // `waitpid(pid)` could one day reap a reused pid.
             #[cfg(target_os = "linux")]
-            let handed = self.hand_to_pidfd_reaper(pid);
+            let (handed, hand_leak) = self.hand_to_pidfd_reaper(pid);
             #[cfg(not(target_os = "linux"))]
-            let handed = {
+            let (handed, hand_leak) = {
                 self.release();
-                false
+                (false, None)
             };
             log::warn!(
-                "teardown kill of child {pid} failed ({e}); {}",
-                refused_kill_fate(handed)
+                "{}",
+                refused_kill_warning(
+                    pid,
+                    e,
+                    handed,
+                    foreign.as_ref().map(|f| f.1.as_str()),
+                    foreign.as_ref().map(|f| f.0).or(hand_leak)
+                )
             );
             // `EPERM` is a setuid child refusing the kill, reachable without a bug: it alone is not
             // asserted.
@@ -936,18 +980,19 @@ impl ProcSource {
     /// tokio would reap it later with `waitpid(pid)` from its orphan queue, when the number may
     /// name another process. The child goes to the same teardown the sync spawn uses, through its own
     /// pidfd, moved out of the backend: another kill, then a reap through the pidfd, or one non-blocking
-    /// look and a background reap through the pidfd once it exits. Answers whether it was handed on:
-    /// `false` when the backend was already forgotten, so nothing is left to hand.
+    /// look and a background reap through the pidfd once it exits. Answers whether it was handed on
+    /// (`false` when the backend was already forgotten, so nothing is left to hand) and what the
+    /// forget leaked, quietly: the caller's one warn carries it.
     #[cfg(target_os = "linux")]
-    fn hand_to_pidfd_reaper(mut self, pid: u32) -> bool {
+    fn hand_to_pidfd_reaper(mut self, pid: u32) -> (bool, Option<&'static str>) {
         let ProcSource::Tokio { pidfd, .. } = &mut self else {
-            return false;
+            return (false, None);
         };
         // The original, moved out: a duplicate could fail at the fd limit and strand the child.
         let pidfd = pidfd.take();
-        self.forget_because("had its teardown kill refused and is handed to the pidfd teardown");
+        let leak = self.forget_quietly().map(|(_, leak)| leak);
         crate::child::spawn::teardown_through_pidfd(Some(pid), pidfd);
-        true
+        (true, leak)
     }
 
     /// Linux teardown of a spawn whose identity check could not answer: kill the child through its
@@ -961,11 +1006,17 @@ impl ProcSource {
 
         crate::bounded::assert_may_block("teardown_through_pidfd");
         if let Err(e) = self.teardown_kill() {
-            self.forget_if_foreign();
-            let handed = self.hand_to_pidfd_reaper(pid);
+            let foreign = self.forget_if_foreign_quietly();
+            let (handed, hand_leak) = self.hand_to_pidfd_reaper(pid);
             log::warn!(
-                "teardown kill of child {pid} failed ({e}); {}",
-                refused_kill_fate(handed)
+                "{}",
+                refused_kill_warning(
+                    pid,
+                    &e,
+                    handed,
+                    foreign.as_ref().map(|f| f.1.as_str()),
+                    foreign.as_ref().map(|f| f.0).or(hand_leak)
+                )
             );
             debug_assert!(
                 matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
@@ -976,6 +1027,7 @@ impl ProcSource {
         let ProcSource::Tokio { pidfd, .. } = &self else {
             unreachable!("a freshly spawned backend is a tokio child");
         };
+        let mut failed = None;
         match exit_only::reap_blocking(&Target::PidFd(std::os::fd::AsFd::as_fd(pidfd))) {
             Ok(Ok(_reaped)) =>
             {
@@ -985,12 +1037,14 @@ impl ProcSource {
                 }
             }
             Ok(Err(_foreign)) => log::debug!("child {pid} was reaped by someone else during its teardown"),
-            Err(e) => {
-                log::warn!("teardown of child {pid}: reaping through its pidfd failed: {e}");
-                debug_assert!(false, "waitid on a child's own pidfd failed: {e}");
-            }
+            Err(e) => failed = Some(e),
         }
-        self.forget_foreign();
+        // One warn: the failed reap, if there was one, and the leak of the forget.
+        match &failed {
+            Some(e) => self.forget_because(&format!("could not be reaped through its pidfd ({e})")),
+            None => self.forget_foreign(),
+        };
+        debug_assert!(failed.is_none(), "waitid on a child's own pidfd failed: {failed:?}");
     }
 
     /// Install the per-instance test wait observer (raw backend only). Panics on a Tokio child —
@@ -1092,7 +1146,10 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
         }
         // Unbounded, so the deadline cannot pass: a contract breach.
         Ok(Awaited::DeadlinePassed) => {
-            log::warn!("wait_and_reap: the unbounded wait on child {pid} reported a passed deadline");
+            log::log!(
+                level,
+                "wait_and_reap: the unbounded wait on child {pid} reported a passed deadline"
+            );
             debug_assert!(false, "an unbounded wait reported a passed deadline");
             (
                 Waited::Foreign,
