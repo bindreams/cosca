@@ -56,6 +56,10 @@ mod drop_reaped_tests;
 mod root_state_tests;
 
 #[cfg(all(test, unix))]
+#[path = "child/drop_report_tests.rs"]
+mod drop_report_tests;
+
+#[cfg(all(test, unix))]
 #[path = "child/front_kill_tests.rs"]
 pub(crate) mod front_kill_tests;
 

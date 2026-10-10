@@ -940,6 +940,10 @@ mod pid_reuse_tests;
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/drop_report_tests.rs"]
+mod drop_report_tests;
+
 #[cfg(all(test, windows))]
 #[path = "child/windows_signal_tests.rs"]
 mod windows_signal_tests;

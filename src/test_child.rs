@@ -295,6 +295,28 @@ pub(crate) fn wait_until_zombie(pid: u32) {
     assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
 }
 
+/// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):
+/// `waitid` with `WNOHANG | WNOWAIT` consumes nothing. `false` once something reaped it.
+#[cfg(unix)]
+pub(crate) fn is_unreaped_child(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable, WNOHANG never blocks.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+    let e = std::io::Error::last_os_error();
+    assert_eq!(e.raw_os_error(), Some(libc::ECHILD), "waitid: {e}");
+    false
+}
+
 /// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and
 /// `BrokenPipe` (the kill under test already landed, so the write goes nowhere) are both
 /// expected; any other error is a fixture fault and panics.

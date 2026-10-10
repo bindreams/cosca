@@ -84,7 +84,13 @@ pub(super) fn wait_visible_exit(target: &Target<'_>) -> io::Result<Peek> {
     let forced_none = super::seams::take_forced_visible_none();
     #[cfg(not(test))]
     let forced_none = false;
-    let record = if forced_none {
+    #[cfg(test)]
+    let forced_errno = super::seams::take_forced_visible_errno();
+    #[cfg(not(test))]
+    let forced_errno: Option<i32> = None;
+    let record = if let Some(errno) = forced_errno {
+        Err(Errno::from_raw_os_error(errno))
+    } else if forced_none {
         Ok(None)
     } else {
         waitid_record(pidfd(target), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT)

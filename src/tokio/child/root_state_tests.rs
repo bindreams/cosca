@@ -5,7 +5,7 @@ use crate::signal::RootState;
 use crate::tokio::Command;
 
 /// Every record at `warn` or above that this thread logged since `mark`.
-fn warns_since(mark: usize) -> Vec<String> {
+pub(super) fn warns_since(mark: usize) -> Vec<String> {
     crate::log_capture::records_since_on_current_thread(mark, "")
         .into_iter()
         .filter(|(level, _)| *level <= log::Level::Warn)
@@ -51,7 +51,7 @@ async fn tokio_kill_after_a_completed_wait_keeps_the_cached_status() {
 }
 
 #[cfg(target_os = "linux")]
-fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
+pub(super) fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWriter) {
     let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
@@ -62,7 +62,7 @@ fn session_blocker(kill_on_drop: bool) -> (crate::tokio::Child, std::io::PipeWri
 }
 
 #[cfg(target_os = "linux")]
-fn failed_peek(what: &str) -> std::io::Result<crate::wait::exit_only::Peek> {
+pub(super) fn failed_peek(what: &str) -> std::io::Result<crate::wait::exit_only::Peek> {
     Err(std::io::Error::other(what.to_owned()))
 }
 
