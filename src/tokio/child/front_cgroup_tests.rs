@@ -622,10 +622,14 @@ fn fail_a_contained_front_spawn(
 
 /// `err` keeps its `Io` variant and notes, once, the front's `fate`.
 #[track_caller]
-fn assert_front_noted(err: &crate::error::Error, fate: &str) {
-    let crate::error::Error::Io(io) = err else {
+fn assert_front_noted(err: &crate::error::Error, fate: &str, expected: ChildFate) {
+    let crate::error::Error::MayHaveStarted { source, fate: got, .. } = err else {
+        panic!("the spawn may have started: {err:?}");
+    };
+    let crate::error::Error::Io(io) = &**source else {
         panic!("the spawn's error keeps its variant: {err:?}");
     };
+    assert_eq!(*got, expected, "what the failed spawn did with the front: {err:?}");
     assert_eq!(io.raw_os_error(), None, "noted, with the original as its source: {io}");
     let text = err.to_string();
     assert_eq!(text.matches("the spawned child is what sudo left").count(), 1, "{text}");
@@ -641,7 +645,7 @@ async fn cgroup_a_contained_front_tokio_drops_is_killed_through_its_leaf_and_rea
     let _running = crate::child::spawn::fault::see_fronts_running();
     let (reader, writer) = std::io::pipe().expect("pipe");
     let (err, pid) = fail_a_contained_front_spawn(reader, |_| {});
-    assert_front_noted(&err, "its cgroup's kill ended it, and it was reaped");
+    assert_front_noted(&err, "its cgroup's kill ended it, and it was reaped", ChildFate::Reaped);
     drop(writer);
     assert_eq!(reap(pid), None, "the abandonment reaps the front");
 }
@@ -663,7 +667,11 @@ async fn cgroup_a_contained_front_moved_out_of_its_leaf_is_left_running(#[fixtur
         move || drop(writer.borrow_mut().take())
     });
     let (err, pid) = fail_a_contained_front_spawn(reader, move_out_of_its_leaf);
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Running { id: None },
+    );
     assert!(
         writer.borrow().is_some(),
         "the abandonment waited on a front outside its leaf"
@@ -684,7 +692,11 @@ async fn cgroup_a_contained_front_that_exited_outside_its_leaf_is_reaped(#[fixtu
         drop(writer);
         crate::test_child::wait_until_zombie(pid);
     });
-    assert_front_noted(&err, "it had exited, or its cgroup's kill ended it, and it was reaped");
+    assert_front_noted(
+        &err,
+        "it had exited, or its cgroup's kill ended it, and it was reaped",
+        ChildFate::Reaped,
+    );
     assert_eq!(reap(pid), None, "the abandonment reaps the exited front");
 }
 
@@ -719,7 +731,11 @@ async fn cgroup_a_contained_front_its_leaf_could_not_kill_is_left_running(#[fixt
             }
         })
     };
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Running { id: None },
+    );
     assert!(
         writer.borrow().is_some(),
         "the abandonment waited on a front no kill reached"
@@ -943,7 +959,11 @@ async fn cgroup_a_contained_front_whose_leaf_subtree_cannot_be_read_is_left_nami
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cannot be placed");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].1.contains("its leaf's subtree cannot be read: "), "{warns:?}");
-    assert_front_noted(&err, "the elevated program may be running; it is left unreaped");
+    assert_front_noted(
+        &err,
+        "the elevated program may be running; it is left unreaped",
+        ChildFate::Unknown,
+    );
     // Its leaf's kill, which does not need the subtree, ended it; the abandonment left it unreaped.
     drop(writer);
     let status = reap(pid).expect("the front was left unreaped");

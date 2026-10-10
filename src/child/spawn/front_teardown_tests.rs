@@ -177,7 +177,7 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
         let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
         teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree))
     };
-    assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(fate, FrontFate::Unplaced);
     assert_eq!(child_fate, ChildFate::Unknown);
     assert!(!waited.load(Ordering::SeqCst), "an unplaced front is not waited for");
     let notes = crate::log_capture::records_since_on_current_thread(mark, "cgroup cannot be read");

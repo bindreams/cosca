@@ -1721,6 +1721,13 @@ pub(crate) enum FrontFate {
     LeftUnreaped,
     /// It could not be waited on: reaped by someone else, or unreadable.
     Unaccounted,
+    /// Where it is could not be read, so it is not known whether its cgroup's kill ended it. It is
+    /// left unreaped.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only a Linux cgroup leaf places a front")
+    )]
+    Unplaced,
 }
 
 impl FrontFate {
@@ -1757,6 +1764,10 @@ impl FrontFate {
             }
             FrontFate::Unaccounted => {
                 "it was sent nothing and could not be waited on, so the elevated program may be running"
+            }
+            FrontFate::Unplaced => {
+                "it was sent nothing, and where it is cannot be read, so the elevated program may be running; it \
+                 is left unreaped"
             }
         };
         error.with_note(&format!("{what}; {fate}"))
@@ -1879,7 +1890,7 @@ fn teardown_unadopted_or_front(
             );
             #[cfg(target_os = "linux")]
             if unplaced {
-                return (FrontFate::LeftUnreaped, ChildFate::Unknown);
+                return (FrontFate::Unplaced, ChildFate::Unknown);
             }
             (FrontFate::LeftUnreaped, fate)
         }

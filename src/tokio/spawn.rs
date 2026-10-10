@@ -957,7 +957,7 @@ fn front_child_fate(fate: crate::child::spawn::FrontFate) -> ChildFate {
     match fate {
         FrontFate::Reaped => ChildFate::Reaped,
         FrontFate::LeftUnreaped => ChildFate::Running { id: None },
-        FrontFate::Unaccounted => ChildFate::Unknown,
+        FrontFate::Unaccounted | FrontFate::Unplaced => ChildFate::Unknown,
         FrontFate::NotAFront => {
             debug_assert!(false, "an abandoned front is a front");
             ChildFate::Unknown

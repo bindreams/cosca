@@ -943,24 +943,6 @@ async fn finish_elevated_after_a_foreign_reap_sends_no_killpg_to_a_process_group
     assert!(detail.contains("already reaped"), "{detail}");
 }
 
-/// What a failed tokio spawn says of a child it abandoned with no handle on it: ended, a zombie
-/// nothing reaps, or a process nothing can reach.
-///
-/// Mutant: any two of the three abandoned children share a fate, or the unreachable one is `Killed`.
-#[cfg(not(target_os = "linux"))]
-#[skuld::test]
-fn an_abandoned_childs_fate_follows_what_is_left_of_it() {
-    use crate::containment::AbandonedChild;
-    use crate::error::ChildFate;
-    assert_eq!(super::abandoned_fate(AbandonedChild::Ended), ChildFate::Killed);
-    assert_eq!(super::abandoned_fate(AbandonedChild::MaybeUnreaped), ChildFate::Unknown);
-    assert_eq!(
-        super::abandoned_fate(AbandonedChild::MaybeUnreachable),
-        ChildFate::Running { id: None },
-        "no handle names it"
-    );
-}
-
 // Whether the program could have started =====
 
 /// A refusal before the fork, here of a merge into a merge, did not start the program.
@@ -987,7 +969,14 @@ async fn a_failed_exec_may_have_started_the_program() {
     let mut cmd = Command::new();
     cmd.args(["cosca-no-such-program-142"]);
     let (err, fate) = expect_may_have_started_with(cmd.spawn().expect_err("a missing program fails the spawn"));
-    assert_eq!(fate, ChildFate::Gone, "std had collected the child whose exec failed");
+    // Linux's handshake finds std had collected the child whose exec failed. Elsewhere nothing holds
+    // it, so it may be running.
+    let expected = if cfg!(target_os = "linux") {
+        ChildFate::Gone
+    } else {
+        ChildFate::Running { id: None }
+    };
+    assert_eq!(fate, expected);
     assert!(
         matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
         "{err:?}"
@@ -1146,4 +1135,21 @@ async fn a_tokio_spawn_failing_after_the_fork_leaves_the_child_running_and_says_
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+/// What a leaf's abandonment found of an elevation front is what the spawn answers: reaped through
+/// the leaf is `Reaped`, left running is `Running`, and a place that cannot be read or a front that
+/// cannot be waited on is `Unknown`, never `Running` or `Killed`.
+///
+/// Mutant: an arm answers another fate.
+#[skuld::test]
+fn a_front_the_leaf_found_is_answered_by_what_became_of_it() {
+    use crate::child::spawn::FrontFate;
+    assert_eq!(super::front_child_fate(FrontFate::Reaped), ChildFate::Reaped);
+    assert_eq!(
+        super::front_child_fate(FrontFate::LeftUnreaped),
+        ChildFate::Running { id: None }
+    );
+    assert_eq!(super::front_child_fate(FrontFate::Unplaced), ChildFate::Unknown);
+    assert_eq!(super::front_child_fate(FrontFate::Unaccounted), ChildFate::Unknown);
 }

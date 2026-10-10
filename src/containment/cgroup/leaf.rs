@@ -1299,7 +1299,7 @@ fn end_front(
                 "cgroup v2: an abandoned spawn's elevation front (pid {raw}) cannot be placed ({e}); it is left \
                  unsignalled and unreaped, and its leaf's kill may have ended it"
             );
-            return Abandoned::Front(FrontFate::LeftUnreaped);
+            return Abandoned::Front(FrontFate::Unplaced);
         }
     }
     // The leaf's kill reached it, so this wait ends with its exit.
