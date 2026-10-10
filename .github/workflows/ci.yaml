@@ -157,6 +157,7 @@ jobs:
             # `Type=notify-reload` there. The root lanes' containers run `ubuntu:26.04`, the runner's own glibc.
             runner: ubuntu-26.04
             root_image: ubuntu:26.04
+            timeout: 26
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -164,12 +165,14 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
             root_image: ubuntu:24.04
+            timeout: 29
             target: aarch64-unknown-linux-gnu
             other: x86_64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: darwin
             arch: arm64
             runner: macos-latest
+            timeout: 35
             target: aarch64-apple-darwin
             other: x86_64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
@@ -179,12 +182,14 @@ jobs:
           - os: darwin
             arch: amd64
             runner: macos-15
+            timeout: 53
             target: x86_64-apple-darwin
             other: aarch64-apple-darwin
             nextest: exec python3 .github/scripts/run-nextest.py
           - os: windows
             arch: amd64
             runner: windows-latest
+            timeout: 50
             target: x86_64-pc-windows-msvc
             other: aarch64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
@@ -194,13 +199,17 @@ jobs:
           - os: windows
             arch: arm64
             runner: windows-11-arm
+            timeout: 45
             target: aarch64-pc-windows-msvc
             other: x86_64-pc-windows-msvc
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # PLACEHOLDER while the consolidated jobs are measured.
-    timeout-minutes: 120
+    # Per-job failure bound, 1.5x the slowest measured wall time (minutes), lanes included; the PR that folded
+    # the lanes in (#626) has the numbers. Measured max: linux/amd64 17 (13 + the root and elevation lanes
+    # that ran as their own jobs before), linux/arm64 19, darwin/arm64 23, darwin/amd64 35, windows/amd64 34,
+    # windows/arm64 29. The clippy powerset release step dominates the Windows jobs.
+    timeout-minutes: ${{ matrix.timeout }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
