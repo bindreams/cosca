@@ -78,10 +78,14 @@ fn sigint_before_exec_is_not_started() {
 #[skuld::test]
 fn unknown_control_byte_kills_and_reports_the_status() {
     let rig = ShimRig::new();
-    let mut run = blocked(&rig);
+    let mut run = rig.spawn(Spec::new("cat", &[]).stdin_held().gate(Gate::BeforeLoop));
+    run.wait_for("gate: waiting at before-loop");
+    // Both bytes are queued before the loop reads either: the `X` ends the program, and a shim that
+    // finished before the `P` was sent would make that send fail.
     rig.link.link.send_control(b'X').unwrap();
     // The ping comes after the `X` on one stream: its answer orders the check.
     rig.link.link.send_control(b'P').unwrap();
+    run.release(Gate::BeforeLoop);
     run.wait_for("pong");
     assert!(
         run.lines().iter().any(|l| l.contains("protocol violation: byte 0x58")),
