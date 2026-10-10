@@ -1088,31 +1088,27 @@ fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -
 #[skuld::test]
 fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     let _serialize = test_spawn_lock();
-    crate::log_capture::install();
     let view = crate::containment::DropView {
         root_pid: 4242,
         root: crate::containment::dispatch::RootView::Reaped,
         tree_killed: false,
     };
-    let text = |marker| {
-        let attached = crate::containment::Attached::FdMarker(marker);
-        let mark = crate::log_capture::mark();
-        attached.hard_kill_for_drop(&view).expect("the holders-only sweep");
-        crate::log_capture::records_since_on_current_thread(mark, "Child::drop: the root is already reaped")
+    let skipped = |marker| {
+        let kill = crate::containment::Attached::FdMarker(marker).hard_kill_for_drop(&view);
+        kill.result.expect("the holders-only sweep");
+        kill.skipped.expect("the reaped root's kill by its number is skipped")
     };
 
     let root = crate::identity::ProcessId::from_parts_for_test(4242, 1);
-    let rooted = text(marker_without_holders(root, None));
-    assert_eq!(rooted.len(), 1, "{rooted:?}");
+    let rooted = skipped(marker_without_holders(root, None));
     assert!(
-        rooted[0].1.contains("root pid 4242") && !rooted[0].1.contains("pgid"),
+        rooted.contains("root pid 4242") && !rooted.contains("pgid"),
         "{rooted:?}"
     );
 
-    let grouped = text(marker_without_holders(root, Some(4243)));
-    assert_eq!(grouped.len(), 1, "{grouped:?}");
+    let grouped = skipped(marker_without_holders(root, Some(4243)));
     assert!(
-        grouped[0].1.contains("pgid 4243") && grouped[0].1.contains("root pid 4242"),
+        grouped.contains("pgid 4243") && grouped.contains("root pid 4242"),
         "{grouped:?}"
     );
 }

@@ -5,9 +5,9 @@
 
 use std::process::ExitStatus;
 
-use crate::error::Error;
 #[cfg(unix)]
 use crate::child::drop_report::Forgot;
+use crate::error::Error;
 #[cfg(unix)]
 use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
@@ -657,7 +657,10 @@ impl ProcSource {
     pub(crate) fn wait_and_reap_caused(
         &mut self,
         pid: u32,
-        #[cfg_attr(windows, allow(unused_variables, reason = "a process handle pins its process: nothing to log"))]
+        #[cfg_attr(
+            windows,
+            allow(unused_variables, reason = "a process handle pins its process: nothing to log")
+        )]
         level: log::Level,
     ) -> (Waited, Option<String>) {
         crate::bounded::assert_may_block("wait_and_reap");
@@ -1018,7 +1021,10 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd, level: log::Level) -> (
         // A blocking wait that returns without an exit is a contract breach, like an errno that
         // is not `ECHILD`. Without proof the child is ours, tokio's by-pid reap must not run.
         Ok(Peek::Running) => {
-            log::log!(level, "wait_and_reap: waitid on child {pid}'s pidfd returned without an exit");
+            log::log!(
+                level,
+                "wait_and_reap: waitid on child {pid}'s pidfd returned without an exit"
+            );
             debug_assert!(false, "a blocking waitid on a pidfd returned without an exit");
             (
                 Waited::Foreign,

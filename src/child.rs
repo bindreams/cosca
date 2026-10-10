@@ -15,11 +15,11 @@ pub(crate) mod pump;
 #[path = "child/spawn.rs"]
 pub(crate) mod spawn;
 
-#[path = "child/proc_handle.rs"]
-pub(crate) mod proc_handle;
 #[cfg(unix)]
 #[path = "child/drop_report.rs"]
 pub(crate) mod drop_report;
+#[path = "child/proc_handle.rs"]
+pub(crate) mod proc_handle;
 #[path = "child/shared.rs"]
 pub(crate) mod shared;
 use proc_handle::ProcHandle;
@@ -822,7 +822,11 @@ impl Child {
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
             // logged, never asserted on.
-            let level = if self.reported { log::Level::Debug } else { log::Level::Warn };
+            let level = if self.reported {
+                log::Level::Debug
+            } else {
+                log::Level::Warn
+            };
             log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
             if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.

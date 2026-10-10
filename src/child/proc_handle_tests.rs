@@ -270,7 +270,8 @@ fn teardown_when_the_reap_fails(errno: i32) -> (Option<String>, Vec<log::Level>)
 fn a_failed_teardown_reap_is_returned_and_not_logged() {
     let (left, levels) = teardown_when_the_reap_fails(libc::EIO);
     assert!(
-        left.as_deref().is_some_and(|text| text.contains("the reap after the kill failed")),
+        left.as_deref()
+            .is_some_and(|text| text.contains("the reap after the kill failed")),
         "{left:?}"
     );
     assert_eq!(levels, Vec::<log::Level>::new());

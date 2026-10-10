@@ -568,8 +568,8 @@ impl Command {
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`
     /// instead: the pid is not this process's, and a signal or reap by it could hit whoever
     /// reuses it. An fd marker's drop still sweeps the descendants that hold the marker, by
-    /// identity, but leaves that root out of the sweep. The public kill paths are tracked in
-    /// [#619](https://github.com/bindreams/cosca/issues/619).
+    /// identity, but leaves that root out of the sweep. The public kill paths do not yet handle this
+    /// case.
     ///
     /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
     /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable

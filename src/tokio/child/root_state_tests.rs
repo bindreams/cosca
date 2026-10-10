@@ -74,7 +74,7 @@ pub(super) fn failed_peek(what: &str) -> std::io::Result<crate::wait::exit_only:
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_tokio_drop_with_an_unknown_root_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -85,6 +85,7 @@ async fn a_tokio_drop_with_an_unknown_root_warns_once() {
 
     drop(child);
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
     assert!(
@@ -102,7 +103,7 @@ async fn a_tokio_drop_with_an_unknown_root_warns_once() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
     use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
@@ -115,6 +116,7 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
 
     drop(child);
 
+    assert_peeks_exhausted();
     assert_eq!(recorder.killed(), Vec::<i32>::new());
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
@@ -129,7 +131,7 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
 /// root still shown ours, or already forgotten, is not forgotten, and nothing is logged.
 ///
 /// Mutants: `forget_for` logs; forgets a trusted root without a second look; drops the second
-/// look's answer; forgets a backend that was already forgotten.
+/// look's answer; reports a leak for a backend that was already forgotten.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
@@ -157,6 +159,12 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
     assert_eq!(warns_since(mark), Vec::<String>::new());
     // The backend is forgotten now: a second forget has nothing to forget, and leaks nothing.
     assert!(child.proc_mut().forget_for(&view(RootView::Reaped)).is_none());
+    assert_eq!(
+        child.proc_mut().forget_foreign(),
+        None,
+        "a forget that never happened leaks nothing"
+    );
+    assert_eq!(warns_since(mark), Vec::<String>::new());
 
     let (mut child, _writer) = session_blocker(false);
     let mark = crate::log_capture::mark();
@@ -193,7 +201,7 @@ async fn forget_for_forgets_quietly_on_evidence_and_carries_the_second_look() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_tokio_drop_whose_kill_fails_on_an_unknown_root_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -204,6 +212,7 @@ async fn a_tokio_drop_whose_kill_fails_on_an_unknown_root_warns_once() {
 
     drop(child);
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
@@ -218,7 +227,7 @@ async fn a_tokio_drop_whose_kill_fails_on_an_unknown_root_warns_once() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn an_unknown_seen_only_on_the_second_look_names_its_error() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
     use crate::wait::exit_only::Peek;
 
     crate::log_capture::install();
@@ -229,6 +238,7 @@ async fn an_unknown_seen_only_on_the_second_look_names_its_error() {
 
     drop(child);
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("second look failure 91"), "{warns:?}");
@@ -240,7 +250,7 @@ async fn an_unknown_seen_only_on_the_second_look_names_its_error() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_disarmed_drop_with_an_unknown_root_does_not_claim_a_skipped_kill() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -250,6 +260,7 @@ async fn a_disarmed_drop_with_an_unknown_root_does_not_claim_a_skipped_kill() {
 
     drop(child);
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(!warns[0].contains("does not"), "{warns:?}");
@@ -262,7 +273,7 @@ async fn a_disarmed_drop_with_an_unknown_root_does_not_claim_a_skipped_kill() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -274,6 +285,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
         .expect_err("the spawn fails");
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
@@ -291,7 +303,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_refused_kill_warns_once() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -306,6 +318,7 @@ async fn finish_elevated_with_an_unknown_root_and_a_foreign_reap_during_the_wait
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
         .expect_err("the spawn fails");
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
@@ -353,7 +366,7 @@ async fn finish_elevated_with_a_trusted_root_and_a_foreign_reap_during_the_wait_
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
 
     crate::log_capture::install();
     let _recorder = crate::containment::unix::fault::record_kill_group();
@@ -368,6 +381,7 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
     let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
         .expect_err("the spawn fails");
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
     assert!(
@@ -383,7 +397,7 @@ async fn finish_elevated_with_an_unknown_root_that_is_already_gone_warns_once() 
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn a_second_look_that_shows_a_foreign_reap_is_named() {
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
     use crate::wait::exit_only::{Foreign, Peek};
 
     crate::log_capture::install();
@@ -394,6 +408,7 @@ async fn a_second_look_that_shows_a_foreign_reap_is_named() {
 
     drop(child);
 
+    assert_peeks_exhausted();
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains("reaped by someone else"), "{warns:?}");
@@ -404,7 +419,7 @@ mod macos {
     use super::*;
     use crate::send_log::{Capture, Via};
     use crate::signal::Sig;
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
     use crate::wait::exit_only::{Foreign, Peek};
 
     fn walked_blocker() -> (crate::tokio::Child, std::io::PipeWriter) {
@@ -423,18 +438,85 @@ mod macos {
     #[skuld::test]
     async fn an_orphaned_root_is_not_signalled_and_warns_once() {
         crate::log_capture::install();
-        let (child, _writer) = walked_blocker();
+        let (child, writer) = walked_blocker();
+        let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         drop(child);
+        assert_peeks_exhausted();
+        assert!(
+            crate::test_child::is_unreaped_child(pid),
+            "the root was waited on: this process does not pin it"
+        );
+        // The test's own child ended and collected, since the drop left it alone.
+        drop(writer);
+        crate::test_child::wait_until_zombie(pid);
+        // SAFETY: `pid` is this test's own zombie child.
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+
+        assert_peeks_exhausted();
 
         assert_eq!(sends.entries(), vec![], "nothing may be sent to a root we do not pin");
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd") && warns[0].contains("leaks"), "{warns:?}");
+    }
+
+    /// An unpinned root cannot be waited on, and the error does not pretend a failed call caused it:
+    /// it names launchd and carries no source.
+    ///
+    /// Mutant: the gate answers `Unassessable` with a synthetic `io::Error` as its source.
+    #[skuld::test]
+    async fn waiting_on_an_orphaned_root_is_unassessable_without_a_source() {
+        crate::log_capture::install();
+        let (mut child, _writer) = walked_blocker();
+        let _orphaned = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+        let err = child
+            .try_wait()
+            .expect_err("a root this process does not pin cannot be waited on");
+
+        assert_peeks_exhausted();
+        assert!(
+            matches!(&err, crate::error::Error::Unassessable { detail, source: None } if detail.contains("launchd")),
+            "{err:?}"
+        );
+    }
+
+    /// A root launchd holds, behind a live elevation front: the front is left running and the root
+    /// is not pinned, which is one event, so one warn that names both.
+    ///
+    /// Mutants: the drop warns of the front apart from the unpinned root; the one warn omits the
+    /// front.
+    #[skuld::test]
+    async fn an_orphaned_root_behind_a_closed_front_gate_warns_once() {
+        crate::log_capture::install();
+        let (mut child, writer) = walked_blocker();
+        let pid = child.id().pid();
+        child.set_front(Some(crate::elevation::front::Front::Sudo));
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        // The read, the gate's look at the front (it runs), then the second look.
+        let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
+        let _looks = force_peeks([orphaned(), Ok(Peek::Running), orphaned()]);
+
+        drop(child);
+
+        assert_peeks_exhausted();
+        assert_eq!(sends.entries(), vec![]);
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("launchd") && warns[0].contains("left running") && warns[0].contains("leaks"),
+            "{warns:?}"
+        );
+        drop(writer);
+        crate::test_child::wait_until_zombie(pid);
+        // SAFETY: `pid` is this test's own zombie child.
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
     }
 
     /// Any other root we cannot get an answer for is still our unreaped child: still killed through
@@ -450,6 +532,8 @@ mod macos {
         let _failed = force_peeks([Err(std::io::Error::other("forced peek failure"))]);
 
         drop(child);
+
+        assert_peeks_exhausted();
 
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
     }
@@ -487,6 +571,8 @@ mod macos {
 
         drop(child);
 
+        assert_peeks_exhausted();
+
         assert_eq!(sends.entries(), vec![]);
         assert!(
             !holders.killed().contains(&pid),
@@ -503,12 +589,14 @@ mod macos {
         let (child, _writer) = walked_blocker();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
-        // The cleanup's first look, then the second look of its own `forget_unsettled`.
+        // The cleanup's first look, then the second look of its own `forget_for`.
         let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
         let _orphaned = force_peeks([orphaned(), orphaned()]);
 
         let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
+
+        assert_peeks_exhausted();
 
         assert_eq!(sends.entries(), vec![]);
         assert!(err.to_string().contains("left alone"), "{err}");

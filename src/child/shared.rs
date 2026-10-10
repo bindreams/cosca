@@ -276,11 +276,8 @@ impl SharedChild {
     /// Whether the root is still this handle's child to act on, from the handle's own evidence,
     /// read under the lock so none of our reaps lands between the state and the peek.
     ///
-    /// - this handle's recorded reap is `Reaped`;
-    /// - a handle that was gone at adoption (no pidfd, no unique id) is `Reaped` too, with a
-    ///   `debug` record;
-    /// - otherwise a peek through the handle decides (Linux: the pidfd; macOS: the pid, checked
-    ///   against its unique id, with an unreadable id on a running child an error).
+    /// A peek through the handle decides (Linux: the pidfd; macOS: the pid, checked against its
+    /// unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
         use crate::signal::RootState;
@@ -289,7 +286,6 @@ impl SharedChild {
             return RootState::Reaped;
         }
         let Some(target) = self.target() else {
-            // Only a test adopts a child that was already gone.
             #[cfg(not(test))]
             debug_assert!(false, "a production child always holds its handle");
             log::debug!(

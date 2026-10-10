@@ -114,6 +114,36 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     drop(writer);
 }
 
+/// A cleanup that warned and then left its handle armed (the root kill was refused): the handle's
+/// drop retries, and the retry does not warn of the same event again.
+///
+/// Mutant: the drop's report ignores that the cleanup already warned.
+#[skuld::test]
+fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
+    crate::log_capture::install();
+    let _recorder = crate::containment::unix::fault::record_kill_group();
+    let (child, writer) = session_blocker();
+    let teardowns = crate::child::fault::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    let err_peek = || Err(std::io::Error::other("forced peek failure"));
+    // The cleanup's read, then the drop's.
+    let _looks = crate::wait::exit_only::seams::force_peeks([err_peek(), err_peek()]);
+    let refused = crate::signal::seams::refuse_kills();
+
+    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+
+    assert_peeks_exhausted();
+    assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].starts_with("finish_elevated:") && warns[0].contains("RootState::Unknown"),
+        "{warns:?}"
+    );
+    drop(refused);
+    drop(writer);
+}
+
 /// A tree kill that fails once, in a cleanup that then kills the root: the tree is not settled, so
 /// the handle stays armed and its drop writes the kill again, now that it can succeed. The failed
 /// kill is the one warn.
@@ -166,4 +196,50 @@ fn a_transient_tree_kill_failure_is_retried_by_the_drop() {
         [log::Level::Warn],
         "the failed kill is reported once, and the retry adds nothing"
     );
+}
+
+/// A handle that could not say, when the root's number shows it reaped: the doubt is not dropped
+/// silently. The `debug` record names the caller and the handle's error.
+///
+/// Mutant: `DropView::read` discards the handle's `Unknown` once the number shows the reap.
+#[skuld::test]
+fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
+    crate::log_capture::install();
+    let (child, _writer) = session_blocker();
+    let mark = crate::log_capture::mark();
+    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
+    let _failed = force_peek_once(Err(std::io::Error::other("handle doubt 6e2")));
+
+    let view =
+        crate::containment::DropView::read("labelled-reader", child.id, || child.proc.state(), &child.tree_killed);
+
+    assert_peeks_exhausted();
+    assert!(
+        matches!(view.root, crate::containment::dispatch::RootView::Reaped),
+        "{:?}",
+        view.root
+    );
+    let records = crate::log_capture::records_since_on_current_thread(mark, "handle doubt 6e2");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(
+        records[0].0 == log::Level::Debug && records[0].1.starts_with("labelled-reader:"),
+        "{records:?}"
+    );
+}
+
+/// A trusted root's number is never untrusted, so nothing asks why: the answer would be a lie. A
+/// debug build asserts it.
+///
+/// Mutant: the `Trusted` arm answers "already reaped".
+#[skuld::test]
+fn asking_why_a_trusted_root_is_untrusted_is_a_contract_breach() {
+    let view = crate::containment::DropView {
+        root_pid: 1,
+        root: crate::containment::dispatch::RootView::Trusted,
+        tree_killed: false,
+    };
+
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| view.why_number_untrusted()));
+
+    assert!(asked.is_err(), "a trusted root has no untrusted number to explain");
 }

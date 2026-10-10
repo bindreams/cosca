@@ -81,8 +81,6 @@ impl RootState {
         use crate::wait::exit_only::Peek;
         match peeked {
             Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
-            // launchd holds the zombie, so the root is neither ours to reap nor gone, and this
-            // process does not pin its pid.
             #[cfg(target_os = "macos")]
             Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unpinned,
             Ok(Peek::Foreign(_)) => RootState::Reaped,

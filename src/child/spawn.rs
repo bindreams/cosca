@@ -130,9 +130,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     });
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
-    let tree_settled = tree.is_none()
-        || child.tree_killed.is_set()
-        || (skipped.is_some() && view.leaves_root_alone());
+    let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
     let tree_warned = matches!(tree, Some(Err(_)));
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
     if let Some(note) = skipped {
@@ -175,16 +173,18 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     }
                     Err(e) if exited_front => {
                         root_settled = false;
-                        report
-                            .left
-                            .push(format!("could not reap the exited elevated child pid {}: {e}", child.id().pid()));
+                        report.left.push(format!(
+                            "could not reap the exited elevated child pid {}: {e}",
+                            child.id().pid()
+                        ));
                         format!("the elevated child had already exited, but could not be reaped ({e})")
                     }
                     Err(e) => {
                         root_settled = false;
-                        report
-                            .left
-                            .push(format!("could not reap the killed elevated child pid {}: {e}", child.id().pid()));
+                        report.left.push(format!(
+                            "could not reap the killed elevated child pid {}: {e}",
+                            child.id().pid()
+                        ));
                         format!("the elevated child was killed but could not be reaped ({e})")
                     }
                 }

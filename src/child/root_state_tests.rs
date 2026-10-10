@@ -44,7 +44,7 @@ mod linux {
     use crate::signal::Sig;
     use crate::test_child::pid_reuse::{in_fresh_pid_ns, reap_behind_and_reuse, sigusr1_and_wait};
     use crate::test_groups::namespaces;
-    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once};
     use crate::ContainMode;
 
     fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
@@ -112,6 +112,7 @@ mod linux {
         drop(child);
         drop(writer);
 
+        assert_peeks_exhausted();
         assert!(
             crate::log_capture::contains_since(mark, "RootState::Unknown"),
             "the drop must name the unknown root state"
@@ -134,26 +135,34 @@ mod linux {
         );
     }
 
-    /// The warn is labelled by the caller: a failed spawn's cleanup does not call itself a drop.
+    /// The records are labelled by the caller: a failed spawn's cleanup does not call itself a drop,
+    /// in the warn or in the read's `debug` line.
     ///
-    /// Mutants: `DropView::read` hardcodes "Child::drop"; the cleanup leaves the handle armed, so its
-    /// drop warns "already reaped" about a `Child` the caller never received.
+    /// Mutants: the report hardcodes "Child::drop"; `DropView::read` hardcodes "Child::drop"; the
+    /// cleanup leaves the handle armed, so its drop warns "already reaped" about a `Child` the
+    /// caller never received.
     #[skuld::test]
     fn the_unknown_warn_names_its_caller() {
         crate::log_capture::install();
         let _recorder = record_kill_group();
         let (child, _writer) = session_blocker();
         let mark = crate::log_capture::mark();
+        // The number is unreadable too, so the read says so in a `debug` line of its own.
+        let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
 
         let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
 
+        assert_peeks_exhausted();
         // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
         // disarmed and says nothing more.
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?} ({err:?})");
         assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
+        let read = crate::log_capture::records_since_on_current_thread(mark, "could not be read either");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert!(read[0].1.starts_with("finish_elevated:"), "{read:?}");
     }
 
     /// An unknown root behind a live elevation front the drop leaves running is one event, so one
@@ -175,6 +184,7 @@ mod linux {
         drop(child);
         drop(writer);
 
+        assert_peeks_exhausted();
         assert_eq!(recorder.killed(), Vec::<i32>::new());
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         let warns = warns_since(mark);
@@ -200,6 +210,7 @@ mod linux {
 
         drop(child);
 
+        assert_peeks_exhausted();
         assert!(
             !crate::log_capture::contains_since(mark, "treating the root as not reaped"),
             "{:?}",
@@ -223,6 +234,7 @@ mod linux {
         let killed = crate::containment::TreeKilled::default();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
         let view = crate::containment::DropView::read("test", child.id, || child.proc.state(), &child.tree_killed);
+        assert_peeks_exhausted();
         assert!(
             matches!(view.root, crate::containment::dispatch::RootView::Unknown(_)),
             "{:?}",
@@ -245,7 +257,7 @@ mod macos {
     use super::*;
     use crate::send_log::{Capture, Via};
     use crate::signal::Sig;
-    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peek_once, force_peeks};
     use crate::wait::exit_only::{Foreign, Peek};
     use crate::ContainMode;
 
@@ -267,17 +279,59 @@ mod macos {
     fn an_orphaned_root_is_neither_signalled_nor_waited_on_and_warns_once() {
         crate::log_capture::install();
         let (child, writer) = walked_blocker();
+        let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
         let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
 
         drop(child);
-        drop(writer);
 
+        assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![], "nothing may be sent to a root we do not pin");
+        assert!(
+            crate::test_child::is_unreaped_child(pid),
+            "the root was waited on: this process does not pin it"
+        );
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("launchd"), "{warns:?}");
+        // The test's own child ended and collected, since the drop left it alone.
+        drop(writer);
+        crate::test_child::wait_until_zombie(pid);
+        // SAFETY: `pid` is this test's own zombie child.
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+    }
+
+    /// A root launchd holds, behind a live elevation front: the front is left running and the root
+    /// is not pinned, which is one event, so one warn that names both.
+    ///
+    /// Mutants: the drop warns of the front apart from the unpinned root; the one warn omits the
+    /// front.
+    #[skuld::test]
+    fn an_orphaned_root_behind_a_closed_front_gate_warns_once() {
+        crate::log_capture::install();
+        let (mut child, writer) = walked_blocker();
+        let pid = child.id().pid();
+        child.set_front(Some(crate::elevation::front::Front::Sudo));
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        // The read, then the gate's look at the front, which sees it run.
+        let _looks = force_peeks([Ok(Peek::Foreign(Foreign::Orphaned)), Ok(Peek::Running)]);
+
+        drop(child);
+
+        assert_peeks_exhausted();
+        assert_eq!(sends.entries(), vec![]);
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("launchd") && warns[0].contains("left running"),
+            "{warns:?}"
+        );
+        drop(writer);
+        crate::test_child::wait_until_zombie(pid);
+        // SAFETY: `pid` is this test's own zombie child.
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
     }
 
     /// Any other root we cannot get an answer for is still our unreaped child, pinned by us: the
@@ -295,6 +349,7 @@ mod macos {
         drop(child);
         drop(writer);
 
+        assert_peeks_exhausted();
         assert_eq!(sends.entries(), vec![(pid, Sig::Kill, Via::Pid)]);
     }
 
@@ -327,6 +382,7 @@ mod macos {
         let control_pid = control.id().pid();
         let gone = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
         drop(control);
+        assert_peeks_exhausted();
         drop(gone);
         drop(control_writer);
         assert!(holders.killed().contains(&control_pid), "{:?}", holders.killed());
@@ -339,6 +395,7 @@ mod macos {
         drop(child);
         drop(writer);
 
+        assert_peeks_exhausted();
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(
             !holders.killed().contains(&pid),
@@ -362,6 +419,7 @@ mod macos {
             .expect_err("the spawn fails");
         drop(writer);
 
+        assert_peeks_exhausted();
         assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(err.to_string().contains("left alone"), "{err}");
         let warns = warns_since(mark);

@@ -132,7 +132,10 @@ impl Child {
 
     /// See [`ProcSource::forget_for`].
     #[cfg(unix)]
-    pub(super) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<crate::child::drop_report::Forgot> {
+    pub(super) fn forget_for(
+        &mut self,
+        view: &crate::containment::DropView,
+    ) -> Option<crate::child::drop_report::Forgot> {
         self.os.proc.as_mut()?.forget_for(view)
     }
 
@@ -1075,10 +1078,8 @@ impl Drop for Child {
             },
             &self.tree_killed,
         );
-        // What the drop's steps found, for its one report.
         #[cfg(unix)]
         let mut signals = DropSignals::default();
-        // The elevation front this drop left running instead of signalling, if any.
         #[cfg(unix)]
         let mut front_left = None;
         if self.kill_on_drop {

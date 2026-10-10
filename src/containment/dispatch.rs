@@ -187,8 +187,8 @@ impl DropView {
     /// where the number is not: a foreign reap followed by a same-tick reuse still reads as this
     /// root by its start token.
     ///
-    /// Reading emits no `warn`: for an unsettled root (`Unknown`, `Unpinned`) the caller reports
-    /// once with [`warn_unsettled`](Self::warn_unsettled). `label` names the caller in log lines.
+    /// Reading emits no `warn`: the caller reports once, with a
+    /// [`DropReport`](crate::child::drop_report::DropReport). `label` names the caller in log lines.
     pub(crate) fn read(
         label: &str,
         id: crate::identity::ProcessId,
@@ -566,7 +566,10 @@ impl Attached {
             );
             None
         } else {
-            log::debug!("Child::drop: {why}, so this drop does not {skipped}");
+            // A reaped root's skip is the drop's warn; an unsettled root's is part of its state's.
+            if !matches!(view.root, RootView::Reaped) {
+                log::debug!("Child::drop: {why}, so this drop does not {skipped}");
+            }
             Some(skipped)
         };
         let result = match self {

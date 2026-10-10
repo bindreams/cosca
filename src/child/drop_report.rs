@@ -70,7 +70,10 @@ impl<'a> DropReport<'a> {
 
     fn compose(&self) -> Option<String> {
         let pid = self.view.root_pid;
-        let reaped_now = matches!(self.forgot.as_ref().and_then(|f| f.now.as_ref()), Some(RootState::Reaped));
+        let reaped_now = matches!(
+            self.forgot.as_ref().and_then(|f| f.now.as_ref()),
+            Some(RootState::Reaped)
+        );
         let reaped = reaped_now || matches!(self.view.root, RootView::Reaped);
         let mut parts: Vec<String> = Vec::new();
 
@@ -130,7 +133,9 @@ impl<'a> DropReport<'a> {
                 "RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({e})"
             )),
             (RootView::Reaped | RootView::Trusted, Some(forgot)) => Some(match &forgot.now {
-                Some(RootState::Unknown(e)) => format!("child {pid} cannot be shown to be ours (RootState::Unknown: {e})"),
+                Some(RootState::Unknown(e)) => {
+                    format!("child {pid} cannot be shown to be ours (RootState::Unknown: {e})")
+                }
                 Some(RootState::Unpinned) => format!(
                     "child {pid} is not pinned by this process (RootState::Unpinned: {})",
                     crate::signal::UNPINNED_WHY
