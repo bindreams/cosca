@@ -269,6 +269,7 @@ pub(crate) fn take_drain_blocking_notifier() {
 /// Run `hook` once when the next drain wait on this thread is about to block, before it does: a
 /// fixture that only the thing awaited would release can be checked, or released, here, so a
 /// mutant that never made it happen fails an assertion instead of hanging the wait.
+#[cfg(feature = "tokio")]
 pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
     crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
 }
@@ -369,6 +370,7 @@ pub(crate) fn record_leaf_steps() {
     LEAF_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
 }
 /// The steps recorded so far, left in place.
+#[cfg(feature = "tokio")]
 pub(crate) fn leaf_steps_so_far() -> Vec<String> {
     LEAF_STEPS.with(|s| s.borrow().clone()).unwrap_or_default()
 }
