@@ -704,16 +704,16 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target, id),
+            Ok(Waited::Reapable) => reap_verified(pid, &target, id, true),
             Ok(Waited::Gone) => {
                 log::debug!("spawn teardown: pid {pid} was reaped by someone else");
-                Foreign::Gone.fate()
+                Foreign::Gone.fate(true)
             }
             Ok(Waited::Orphaned) => {
                 log::warn!(
                     "spawn teardown: pid {pid} is not ours to reap (launchd holds its zombie, because its tracer died)"
                 );
-                Foreign::Orphaned.fate()
+                Foreign::Orphaned.fate(true)
             }
             Ok(Waited::DeadlinePassed) => {
                 log::warn!("spawn teardown: pid {pid} is still running after its kill");
@@ -726,7 +726,7 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
         },
         Ok(Sent::Gone) => {
             log::debug!("spawn teardown: pid {pid} is already gone");
-            Foreign::Gone.fate()
+            Foreign::Gone.fate(false)
         }
         Ok(Sent::Unverified) => {
             debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
@@ -735,7 +735,7 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
         }
         Err(kill) => {
             log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
-            reap_verified(pid, &target, id)
+            reap_verified(pid, &target, id, false)
         }
     }
 }
@@ -744,7 +744,15 @@ pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId
 /// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
 /// shown ours or reaped is a `warn`.
 #[cfg(target_os = "macos")]
-fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>, id: Option<ProcessId>) -> ChildFate {
+///
+/// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict (see
+/// [`Foreign::fate`]).
+fn reap_verified(
+    pid: u32,
+    target: &crate::wait::exit_only::Target<'_>,
+    id: Option<ProcessId>,
+    killed: bool,
+) -> ChildFate {
     use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
 
     let unverifiable = |why: &dyn std::fmt::Display| {
@@ -758,7 +766,7 @@ fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>, id: Opti
             ),
             Foreign::Gone | Foreign::Other => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
         }
-        why.fate()
+        why.fate(killed)
     };
     let running = || {
         log::warn!("spawn teardown: pid {pid} is still running");
@@ -1552,6 +1560,11 @@ trait Unadopted: Send + 'static {
     fn pid(&self) -> Option<u32>;
     /// `Ok` for a child that has already exited.
     fn kill(&mut self) -> std::io::Result<()>;
+    /// Whether the last `kill` delivered a signal, rather than finding the child already gone.
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        true
+    }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     /// Blocks until the child exits, and reaps it.
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
@@ -1594,6 +1607,8 @@ struct PidfdChild {
     pidfd: std::os::fd::OwnedFd,
     /// Kept once reaped, as std keeps it: a later `try_wait` or `wait` answers it, not `ECHILD`.
     reaped: Option<std::process::ExitStatus>,
+    /// Whether its kill delivered a signal (see [`Unadopted::kill_delivered`]).
+    delivered: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1603,6 +1618,7 @@ impl PidfdChild {
             pid,
             pidfd,
             reaped: None,
+            delivered: false,
         }
     }
 
@@ -1625,12 +1641,17 @@ impl Unadopted for PidfdChild {
         use std::os::fd::AsFd;
         // A zombie takes the signal too, so an exited child is `Ok`, and so is one reaped elsewhere.
         // An unknown pid (a child tokio dropped) is named 0 in the helper's log.
-        crate::signal::via_pidfd(
+        let sent = crate::signal::via_pidfd(
             Some(self.pidfd.as_fd()),
             self.pid.unwrap_or(0),
             crate::signal::Sig::Kill,
-        )
-        .map(drop)
+        )?;
+        self.delivered = matches!(sent, crate::signal::Sent::Delivered);
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        self.delivered
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         use crate::wait::exit_only::{try_reap, Reap, Reaped};
@@ -1693,6 +1714,10 @@ impl Unadopted for HeldStdChild {
     }
     fn kill(&mut self) -> std::io::Result<()> {
         self.through.kill()
+    }
+    #[cfg(unix)]
+    fn kill_delivered(&self) -> bool {
+        self.through.kill_delivered()
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.through.try_wait()
@@ -1934,7 +1959,7 @@ pub(crate) fn teardown_through_pidfd(
     match peek(&child.target()) {
         Ok(Peek::Foreign(why)) => {
             log::debug!("{}: already collected when its spawn failed", named(pid));
-            return why.fate();
+            return why.fate(false);
         }
         Ok(Peek::Exit(_) | Peek::Running) => {}
         // `waitid` on a pidfd of this process's own child answers or says `ECHILD`.
@@ -1989,7 +2014,8 @@ fn teardown_unadopted(mut child: impl Unadopted, id: Option<ProcessId>) -> Child
         #[cfg(unix)]
         Err(reap) if reap.raw_os_error() == Some(libc::ECHILD) => {
             log::debug!("spawn teardown: {} was reaped by someone else", named(child.pid()));
-            ChildFate::Gone
+            // The kill went first: delivered, it is `Killed`; found nothing to signal, `Gone`.
+            crate::wait::exit_only::Foreign::Gone.fate(child.kill_delivered())
         }
         Err(reap) => {
             log::warn!("spawn teardown failed to reap {}: {reap}", named(child.pid()));

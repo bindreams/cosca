@@ -266,8 +266,9 @@ pub enum ChildFate {
     /// The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the
     /// type's doc).
     Reaped,
-    /// The child is dead or dying, but cosca did not collect its exit: cosca's kill was delivered
-    /// (or the child had exited) and the wait for it failed, a Windows child was terminated and not
+    /// The child is dead or dying, but cosca did not collect its exit, and cosca's kill was delivered
+    /// (or the child had exited by itself): the wait for it failed, someone else collected its exit
+    /// or holds its zombie after the kill, a Windows child was terminated and not
     /// waited for, a dropped async child was signalled and left to tokio to collect, or a
     /// containment teardown ended it. On a wrapper-elevated spawn, the elevated program may still
     /// run.
@@ -284,8 +285,9 @@ pub enum ChildFate {
     /// [`ProcessId::is_alive`]: crate::identity::ProcessId::is_alive
     Running { id: Option<crate::identity::ProcessId> },
     /// Someone else reaped the child, or its zombie is held by another process (on macOS, launchd
-    /// holds a tracer-orphaned child's zombie), so cosca could not collect it. The child is not
-    /// running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    /// holds a tracer-orphaned child's zombie), so cosca could not collect it, and cosca delivered
+    /// no kill: a child that was gone already, or not ours, when cosca came to it. (One cosca killed
+    /// and found collected is [`Killed`](ChildFate::Killed).) The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
     Gone,
     /// cosca cannot say what became of the child.
     Unknown,

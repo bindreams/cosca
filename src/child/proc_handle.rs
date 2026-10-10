@@ -157,6 +157,13 @@ impl ProcHandle {
         crate::child::fault::note_root_teardown();
         match self {
             ProcHandle::Std(s) => {
+                #[cfg(unix)]
+                let (kill_result, delivered) = {
+                    let sent = s.kill_sent();
+                    let delivered = matches!(sent, Ok(crate::signal::Sent::Delivered));
+                    (sent.map(drop), delivered)
+                };
+                #[cfg(not(unix))]
                 let kill_result = s.kill();
                 match std_teardown_action(&kill_result) {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
@@ -168,7 +175,8 @@ impl ProcHandle {
                             log_teardown_wait_failure(s.id(), &e);
                             #[cfg(unix)]
                             if e.raw_os_error() == Some(libc::ECHILD) {
-                                return ChildFate::Gone;
+                                // Delivered, the kill is `Killed`; found nothing to signal, `Gone`.
+                                return crate::wait::exit_only::Foreign::Gone.fate(delivered);
                             }
                             ChildFate::Killed
                         }

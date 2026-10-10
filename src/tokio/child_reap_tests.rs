@@ -681,13 +681,14 @@ async fn macos_reap_now_with_another_unique_id_is_gone() {
     reap_behind_the_owner(pid);
 }
 
-/// A teardown of a zombie launchd holds (its tracer died) says it is gone: it has exited, and is not
-/// ours to reap.
+/// A teardown of a zombie launchd holds (its tracer died) says it was killed: its exit is not ours to
+/// reap, and cosca's kill was delivered.
 ///
-/// Mutant: `Awaited::Orphaned` is `Unverified`, so the teardown says it may be running.
+/// Mutants: `Awaited::Orphaned` is `Unverified`, so the teardown says it may be running; or the
+/// foreign arm answers `Gone`, the fate of a child cosca delivered nothing to.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_reap_now_of_a_zombie_launchd_holds_is_gone() {
+async fn macos_reap_now_of_a_zombie_launchd_holds_is_killed() {
     use crate::wait::exit_only::seams::force_peek_once;
     use crate::wait::exit_only::{Foreign, Peek};
     let (proc, pid) = exited_unreaped_with(Some);
@@ -695,7 +696,7 @@ async fn macos_reap_now_of_a_zombie_launchd_holds_is_gone() {
 
     let fate = proc.reap_now(pid, None);
 
-    assert_eq!(fate, crate::error::ChildFate::Gone);
+    assert_eq!(fate, crate::error::ChildFate::Killed);
     reap_behind_the_owner(pid);
 }
 
@@ -811,4 +812,33 @@ async fn macos_wait_and_reap_of_a_child_a_tracer_holds_waits_for_the_hand_back(
     drop(helper);
     let status = proc.wait().await.expect("the handed-back zombie is ours to reap");
     assert!(status.success(), "{status:?}");
+}
+
+/// A child reaped behind the owner's back after cosca's kill was delivered is `Killed`, not `Gone`:
+/// the kill went first, and someone else collected the exit. A child already reaped when cosca came
+/// to it (`reap_now_of_a_child_reaped_behind_the_owner_is_gone`) is `Gone`.
+///
+/// Mutant: the foreign arm of `reap_now` answers `Gone` whatever the kill did.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn reap_now_of_a_child_reaped_behind_the_owner_after_the_kill_is_killed() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let child = crate::test_spawn::spawn_tokio(
+        ::tokio::process::Command::new("sleep")
+            .arg("600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn");
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = proc_source(child);
+    // Between the kill and the wait, the application reaps the zombie the kill made.
+    let _foreign_reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+        crate::test_child::wait_until_zombie(pid);
+        reap_behind_the_owner(pid);
+    });
+
+    let fate = proc.reap_now(pid, None);
+
+    assert_eq!(fate, crate::error::ChildFate::Killed);
 }

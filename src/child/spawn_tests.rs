@@ -1414,3 +1414,56 @@ fn a_handshake_that_cannot_open_did_not_start() {
         "{err:?}"
     );
 }
+
+// One OS situation, one fate =====
+
+/// A child reaped behind the spawn's back after the teardown's kill was delivered is `Killed`: the
+/// kill went first, and someone else collected the exit. (A child already reaped when the teardown
+/// came to it is `Gone`: `identity_failure_after_a_foreign_reap_*`.)
+///
+/// Mutant: the teardown's `ECHILD` arm answers `Gone` whatever the kill did.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_child_reaped_elsewhere_after_the_teardowns_kill_is_killed() {
+    let (stdin, _writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    // The hook reaps the zombie the kill made, so the teardown's own reap finds `ECHILD`.
+    let pid = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _noted = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let pid = std::rc::Rc::clone(&pid);
+        move || pid.set(fault::spawn_pid())
+    });
+    let _foreign_reap = fault::set_between_kill_and_wait(move || {
+        let pid = pid.get();
+        assert_ne!(pid, 0, "the spawn noted the child's pid");
+        crate::test_child::wait_until_zombie(pid);
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own zombie child; this plays the application that reaps it.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
+    });
+    fault::set_force_identity_vanished(true);
+    let err = cmd.spawn().err();
+    fault::set_force_identity_vanished(false);
+    let (_err, fate) = expect_may_have_started_with(err.expect("the forced vanish fails the spawn"));
+    assert_eq!(fate, ChildFate::Killed);
+}
+
+/// Every foreign verdict is one fate, decided by whether cosca's kill was delivered: `Killed` if it
+/// was, `Gone` if cosca delivered nothing.
+///
+/// Mutant: either answer is swapped, or a verdict ignores the kill.
+#[skuld::test]
+fn a_foreign_verdict_is_killed_after_a_delivered_kill_and_gone_otherwise() {
+    use crate::wait::exit_only::Foreign;
+    #[cfg(target_os = "macos")]
+    let all = [Foreign::Gone, Foreign::Other, Foreign::Orphaned];
+    #[cfg(not(target_os = "macos"))]
+    let all = [Foreign::Gone];
+    for foreign in all {
+        assert_eq!(foreign.fate(true), ChildFate::Killed, "{foreign:?}");
+        assert_eq!(foreign.fate(false), ChildFate::Gone, "{foreign:?}");
+    }
+}

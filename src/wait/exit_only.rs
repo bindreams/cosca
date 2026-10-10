@@ -84,17 +84,23 @@ pub(crate) enum Foreign {
 
 impl Foreign {
     /// What became of a child this evidence shows is not this process's to reap: it has exited, and
-    /// someone else holds or has collected its exit, so it is [`Gone`](ChildFate::Gone). That includes a
-    /// zombie launchd holds. Every path that maps this evidence to a fate uses this.
+    /// someone else holds or has collected its exit. That includes a zombie launchd holds. Every path
+    /// that maps this evidence to a fate uses this, so one situation has one fate:
+    ///
+    /// - `kill_delivered`: cosca's kill was delivered, so the child is [`Killed`](ChildFate::Killed):
+    ///   dead or dying, its exit not collected by cosca.
+    /// - Otherwise cosca delivered nothing, and the child is [`Gone`](ChildFate::Gone).
     #[cfg_attr(
         windows,
         allow(dead_code, reason = "a process handle pins its process: no foreign reap")
     )]
-    pub(crate) fn fate(self) -> ChildFate {
-        match self {
-            Foreign::Gone => ChildFate::Gone,
-            #[cfg(target_os = "macos")]
-            Foreign::Other | Foreign::Orphaned => ChildFate::Gone,
+    pub(crate) fn fate(self, kill_delivered: bool) -> ChildFate {
+        // Every foreign verdict is the same situation for the fate: only the kill tells them apart.
+        let _ = self;
+        if kill_delivered {
+            ChildFate::Killed
+        } else {
+            ChildFate::Gone
         }
     }
 }

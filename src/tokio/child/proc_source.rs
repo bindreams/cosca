@@ -852,7 +852,7 @@ impl ProcSource {
         let waited = self.wait_and_reap(pid);
         let fate = match waited {
             Waited::Exited => self.collect_exit(id),
-            Waited::Foreign => Foreign::Gone.fate(),
+            Waited::Foreign => Foreign::Gone.fate(matches!(killed, Ok(Sent::Delivered))),
             Waited::Unverified => match killed {
                 Ok(Sent::Delivered) => ChildFate::Killed,
                 _ => ChildFate::Running { id },
@@ -946,7 +946,8 @@ impl ProcSource {
         use crate::wait::exit_only::{self, Target};
 
         crate::bounded::assert_may_block("teardown_through_pidfd");
-        if let Err(e) = self.teardown_kill() {
+        let killed = self.teardown_kill();
+        if let Err(e) = &killed {
             let forgotten = self.forget_unless_ours(id);
             let handed = self.hand_to_pidfd_reaper(pid, id);
             log::warn!(
@@ -972,7 +973,7 @@ impl ProcSource {
             }
             Ok(Err(foreign)) => {
                 log::debug!("child {pid} was reaped by someone else during its teardown");
-                foreign.fate()
+                foreign.fate(matches!(killed, Ok(Sent::Delivered)))
             }
             Err(e) => {
                 log::warn!("teardown of child {pid}: reaping through its pidfd failed: {e}");

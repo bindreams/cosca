@@ -580,7 +580,11 @@ fn macos_attach_failure_teardown_does_not_reap_a_pid_reused_after_the_wait() {
     );
     let _second = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, other);
     let fate = teardown(child, unique);
-    assert_eq!(fate, crate::error::ChildFate::Gone, "another process holds the pid");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Killed,
+        "the kill was delivered, and another process holds the pid"
+    );
     let records = teardown_records(mark);
     assert!(
         records.iter().all(|(level, _)| *level == log::Level::Debug),
@@ -597,11 +601,13 @@ fn macos_attach_failure_teardown_does_not_reap_a_pid_reused_after_the_wait() {
 }
 
 /// A delivered kill, then a wait whose peek finds the zombie held by launchd (its tracer died): not
-/// ours to reap, so `Gone` with a `warn` saying so, never a `debug` claim of a reap.
+/// ours to reap, and cosca's kill was delivered: `Killed`, with a `warn` saying so, never a `debug`
+/// claim of a reap.
 ///
-/// Mutants: `await_reapable` folds `Foreign::Orphaned` into `Waited::Gone`; or the arm is `Unknown`.
+/// Mutants: `await_reapable` folds `Foreign::Orphaned` into `Waited::Gone`; the arm is `Unknown`, or
+/// `Gone` (the fate of a child cosca delivered nothing to).
 #[skuld::test]
-fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_gone_and_warns() {
+fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_warns() {
     use crate::wait::exit_only::{Foreign, Peek};
 
     crate::log_capture::install();
@@ -610,11 +616,33 @@ fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_is_gone_an
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     let fate = teardown(child, unique);
-    assert_eq!(fate, crate::error::ChildFate::Gone, "a launchd-held zombie is gone");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Killed,
+        "the kill was delivered, and launchd holds the zombie"
+    );
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
     assert_eq!(levels, vec![log::Level::Warn], "{records:?}");
     assert!(records[0].1.contains("launchd holds its zombie"), "{records:?}");
+    // The kill was delivered; the zombie is the test's to collect.
+    reap_by_pid(pid);
+}
+
+/// A delivered kill, then a wait whose peek shows someone else reaped the child: `Killed`, as for a
+/// pid reused or a zombie launchd holds. One OS situation, one fate.
+///
+/// Mutant: the `Waited::Gone` arm of `kill_and_reap_verified` answers `Gone`.
+#[skuld::test]
+fn macos_attach_failure_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
+    use crate::wait::exit_only::{Foreign, Peek};
+
+    crate::log_capture::install();
+    let (child, _stdin, unique) = std_blocker_with_unique();
+    let pid = child.id();
+    let _reaped = force_peek_once(Ok(Peek::Foreign(Foreign::Gone)));
+    let fate = teardown(child, unique);
+    assert_eq!(fate, crate::error::ChildFate::Killed);
     // The kill was delivered; the zombie is the test's to collect.
     reap_by_pid(pid);
 }
