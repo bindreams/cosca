@@ -629,77 +629,59 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
 }
 
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
-/// handle. What it cannot do is one event, so one `warn` carries every note (a verified foreign
-/// reap is a `debug`).
+/// handle.
 #[cfg(target_os = "macos")]
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64) {
-    let mut notes = Vec::new();
-    let mut breach = None;
-    kill_and_reap_noting(pid, unique, &mut notes, &mut breach);
-    if !notes.is_empty() {
-        log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
-    }
-    // After the log: an assertion that fires first would take the warn with it.
-    debug_assert!(breach.is_none(), "{}", breach.unwrap_or_default());
-}
-
-#[cfg(target_os = "macos")]
-fn kill_and_reap_noting(pid: u32, unique: u64, notes: &mut Vec<String>, breach: &mut Option<String>) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target, notes, breach),
+            Ok(Waited::Reapable) => reap_verified(pid, &target),
             Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-            Ok(Waited::Orphaned) => notes.push(format!(
-                "cannot be shown to be ours or reaped ({})",
-                crate::signal::UNPINNED_WHY
-            )),
-            Ok(Waited::DeadlinePassed) => notes.push("is still running after its kill".to_owned()),
-            Err(e) => notes.push(format!("could not be waited for: {e}")),
+            Ok(Waited::Orphaned) => log::warn!(
+                "spawn teardown: pid {pid} cannot be shown to be ours or reaped (launchd holds it, because its tracer died)"
+            ),
+            Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
+            Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
         },
         Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
         Err(kill) => {
-            notes.push(format!("could not be killed: {kill}"));
-            reap_verified(pid, &target, notes, breach);
+            log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
+            reap_verified(pid, &target);
         }
     }
 }
 
 /// [`teardown_after_attach_failure`]'s reap: consume `target`'s exit record only when a verified
 /// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
-/// shown ours or reaped is noted for the teardown's one `warn`.
+/// shown ours or reaped is a `warn`.
 #[cfg(target_os = "macos")]
-fn reap_verified(
-    pid: u32,
-    target: &crate::wait::exit_only::Target<'_>,
-    notes: &mut Vec<String>,
-    breach: &mut Option<String>,
-) {
+fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
     use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
 
-    let unverifiable = |why: &dyn std::fmt::Display| format!("cannot be shown to be ours or reaped ({why})");
+    let unverifiable = |why: &dyn std::fmt::Display| {
+        log::warn!("spawn teardown: pid {pid} cannot be shown to be ours or reaped ({why})");
+    };
+    let orphaned = "launchd holds it, because its tracer died";
     match peek_verified(target) {
-        Err(e) => return notes.push(unverifiable(&e)),
-        Ok(Peek::Foreign(Foreign::Orphaned)) => return notes.push(unverifiable(&crate::signal::UNPINNED_WHY)),
+        Err(e) => return unverifiable(&e),
+        Ok(Peek::Foreign(Foreign::Orphaned)) => return unverifiable(&orphaned),
         Ok(Peek::Foreign(_)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Ok(Peek::Running) => return notes.push("is still running".to_owned()),
+        Ok(Peek::Running) => return log::warn!("spawn teardown: pid {pid} is still running"),
         Ok(Peek::Exit(_)) => {}
     }
     match try_reap(target) {
         Ok(Reap::Reaped(Reaped::Status(_))) => {}
         Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
-            notes.push(format!(
-                "a consuming waitid returned si_code {si_code}, not an exit record"
-            ));
-            *breach = Some(format!("a consuming waitid on a zombie returned si_code {si_code}"));
+            log::warn!("spawn teardown: pid {pid}: a consuming waitid returned si_code {si_code}, not an exit record");
+            debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
         }
-        Ok(Reap::Running) => notes.push("is still running".to_owned()),
-        Ok(Reap::Foreign(Foreign::Orphaned)) => notes.push(unverifiable(&crate::signal::UNPINNED_WHY)),
+        Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Reap::Foreign(Foreign::Orphaned)) => unverifiable(&orphaned),
         Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Err(e) => notes.push(format!("could not be reaped: {e}")),
+        Err(e) => log::warn!("spawn teardown failed to reap pid {pid}: {e}"),
     }
 }
 

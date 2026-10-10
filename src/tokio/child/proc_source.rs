@@ -1071,11 +1071,8 @@ fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<
             Some("its pid is gone, or names another process".to_owned()),
         ),
         Ok(Awaited::Orphaned) => {
-            log::log!(
-                level,
-                "wait_and_reap: child {pid} cannot be shown to be ours or reaped (launchd holds it, because its \
-                 tracer died)"
-            );
+            let _ = level;
+            log::warn!("wait_and_reap: child {pid} is held by launchd");
             (Waited::Foreign, Some(crate::signal::UNPINNED_WHY.to_owned()))
         }
         // Unbounded, so the deadline cannot pass: a contract breach.
