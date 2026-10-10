@@ -1009,7 +1009,7 @@ impl Child {
 /// An elevated child behind a front (see [`kill`](Child::kill)) gets no signal of its own while it
 /// runs. In a cgroup that holds it, the tree's kill ends it. Otherwise, or when that kill fails,
 /// the drop signals nothing and warns: the leaf's release still writes `cgroup.kill`, which ends the
-/// front if it is in the leaf, and nothing waits to see, so the front is left unreaped.
+/// front if it is in the leaf. cosca does not wait for the front; tokio reaps it once it exits.
 ///
 /// Once the root is reaped the drop skips kills named by its number and warns; see
 /// [`Command::kill_on_drop`](crate::tokio::Command::kill_on_drop). A root reaped outside this
@@ -1058,7 +1058,7 @@ impl Drop for Child {
                 crate::elevation::front::Gate::Closed(unkillable) => {
                     log::warn!(
                         "Child::drop: elevation front pid {}: {unkillable}; the front is killed through its cgroup if \
-                         it is still in it, and is left unreaped",
+                         it is still in it; cosca does not wait for it, and tokio reaps it once it exits",
                         self.id.pid()
                     );
                 }
@@ -1185,7 +1185,8 @@ fn signal_on_drop(
             // leaf; nothing waits to see.
             log::warn!(
                 "Child::drop: elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the \
-                 front is killed through its cgroup if it is still in it, and is left unreaped"
+                 front is killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it \
+                 exits"
             );
         }
         return;

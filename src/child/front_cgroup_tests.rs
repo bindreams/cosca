@@ -421,6 +421,13 @@ fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(
     let (child, stdin, member) = spawn_front_with_member();
     let pid = child.id().pid();
     move_out_of_its_leaf(pid);
+    // Released at the wait a drop makes for a front it places in its leaf, which this one is not in:
+    // a drop that waited for it would end it and fail the warning below, not hang.
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait({
+        let stdin = std::rc::Rc::clone(&stdin);
+        move || drop(stdin.take())
+    });
     crate::containment::cgroup::fault::record_leaf_steps();
     let mark = crate::log_capture::mark();
     drop(child);
@@ -432,7 +439,7 @@ fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(
     assert!(said[0].1.contains("is left running and unreaped"), "{said:?}");
     assert!(steps.iter().any(|s| s == "kill"), "the leaf was killed: {steps:?}");
     wait_until_exited(&member);
-    drop(stdin);
+    drop(stdin.take().expect("the drop must not wait for the front"));
     assert_reaped_unsignalled(pid);
 }
 
@@ -828,6 +835,7 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
 #[skuld::test]
 fn cgroup_a_failed_spawn_reaps_a_front_its_leaf_made_a_zombie_without_waiting(#[fixture(cgroup)] _group: &Group) {
     let _zombie = crate::child::spawn::fault::exit_fronts_before_teardown();
+    crate::containment::cgroup::fault::record_leaf_steps();
     let reaps = crate::child::spawn::fault::record_teardown_reaps();
     let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
     for HeldFailure { err, pid, .. } in &failures {

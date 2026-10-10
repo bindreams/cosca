@@ -1670,6 +1670,15 @@ fn teardown_unadopted_or_front(
     // Dropping the handle afterwards closes it; it neither signals nor reaps the child.
     #[cfg(all(test, target_os = "linux"))]
     if fault::fronts_exit_before_teardown() {
+        // The wait below ends only with the front, which only the leaf's kill brings about: that the
+        // kill was written is checked first (and the record restarted for the next arm), so a
+        // teardown that skipped it fails here instead of hanging.
+        let steps = crate::containment::cgroup::fault::take_leaf_steps();
+        crate::containment::cgroup::fault::record_leaf_steps();
+        assert!(
+            steps.iter().any(|s| s == "kill"),
+            "the leaf's kill was written before the teardown waits for the front's exit: {steps:?}"
+        );
         if let Some(pid) = child.pid() {
             crate::test_child::wait_until_zombie(pid);
         }

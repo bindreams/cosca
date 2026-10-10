@@ -354,7 +354,7 @@ impl Child {
                 match subtree {
                     Some(Ok(subtree)) => match subtree.reached(pid, self.proc.pidfd()) {
                         // Dying: its kill is pending, so this wait ends.
-                        Ok(true) => match self.proc.wait() {
+                        Ok(true) => match self.wait_for_dying_front() {
                             Ok(status) => reaped(status),
                             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
@@ -386,6 +386,14 @@ impl Child {
                 "Child::drop: elevation front pid {pid} could not be looked at after its cgroup's teardown ({e})"
             ),
         }
+    }
+
+    /// The blocking wait for a front placed in its leaf with a kill landed: dying, so it ends.
+    #[cfg(target_os = "linux")]
+    fn wait_for_dying_front(&self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(test)]
+        crate::child::spawn::fault::run_between_kill_and_wait();
+        self.proc.wait()
     }
 
     #[cfg(unix)]

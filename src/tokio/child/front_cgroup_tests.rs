@@ -200,7 +200,7 @@ async fn assert_tokio_drop_kills_the_leaf(fault: impl FnOnce() -> Box<dyn std::a
     assert!(
         warns[0]
             .1
-            .contains("the front is killed through its cgroup if it is still in it, and is left unreaped"),
+            .contains("the front is killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it exits"),
         "{warns:?}"
     );
     assert!(!warns[0].1.contains("left running"), "{warns:?}");
