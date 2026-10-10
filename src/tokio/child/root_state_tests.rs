@@ -126,7 +126,9 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
     let warns = warns_since(mark);
     assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
     assert!(
-        warns[0].contains("RootState::Unknown") && warns[0].contains("left running") && warns[0].contains("leaks"),
+        warns[0].contains("RootState::Unknown")
+            && warns[0].contains("elevation front pid")
+            && warns[0].contains("leaks"),
         "{warns:?}"
     );
 }
@@ -515,7 +517,7 @@ mod macos {
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains("launchd") && warns[0].contains("left running") && warns[0].contains("leaks"),
+            warns[0].contains("launchd") && warns[0].contains("elevation front pid") && warns[0].contains("leaks"),
             "{warns:?}"
         );
         drop(writer);

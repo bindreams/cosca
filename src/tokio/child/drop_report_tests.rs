@@ -40,7 +40,10 @@ mod linux {
             warns[0].contains("reaped by someone else") && warns[0].contains("leaks"),
             "{warns:?}"
         );
-        assert!(!warns[0].contains("left running"), "the reap was seen: {warns:?}");
+        assert!(
+            !warns[0].contains("elevation front pid"),
+            "the reap was seen: {warns:?}"
+        );
     }
 
     /// The same drop whose second look shows the root still ours: the front is left running, and that is
@@ -64,7 +67,7 @@ mod linux {
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains("left running") && !warns[0].contains("leaks"),
+            warns[0].contains("elevation front pid") && !warns[0].contains("leaks"),
             "{warns:?}"
         );
     }
@@ -92,7 +95,7 @@ mod linux {
             warns[0].contains("reaped by someone else") && warns[0].contains("leaks"),
             "{warns:?}"
         );
-        assert!(!warns[0].contains("left running"), "{warns:?}");
+        assert!(!warns[0].contains("elevation front pid"), "{warns:?}");
     }
 
     /// A reaped root in a process group: the skipped `killpg` and the forget of tokio's `Child` are one
