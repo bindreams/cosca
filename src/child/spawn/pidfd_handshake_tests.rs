@@ -1316,6 +1316,7 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
     )
     .err()
     .expect("the spawn fails");
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert!(err.to_string().contains("the spawned child is what sudo left"), "{err}");
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");

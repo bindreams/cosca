@@ -864,8 +864,15 @@ impl ProcSource {
             return;
         }
         #[cfg(unix)]
-        if self.wait_and_reap(pid) == Waited::Foreign {
-            self.forget_foreign();
+        {
+            // The wait logs at `debug`: the forget's one warn carries its cause.
+            let (waited, cause) = self.wait_and_reap_caused(pid, log::Level::Debug);
+            if waited == Waited::Foreign {
+                let cause = cause.map_or_else(String::new, |c| format!(" ({c})"));
+                self.forget_because(&format!(
+                    "was reaped by someone else, or cannot be shown to be ours{cause}"
+                ));
+            }
         }
         #[cfg(windows)]
         self.wait_and_reap(pid);

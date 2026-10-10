@@ -136,6 +136,7 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
         }
     });
     let outcome = cmd.spawn();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let err = outcome.expect_err("a pid with another unique id is not the child");
@@ -503,6 +504,7 @@ fn macos_attach_failure_teardown_of_an_orphaned_child_warns_it_cannot_be_shown_o
     let _refused = refuse_the_kill();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     super::teardown_after_attach_failure(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
     assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
@@ -577,6 +579,7 @@ fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_warns() {
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     super::teardown_after_attach_failure(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
     assert_eq!(levels, vec![log::Level::Warn], "{records:?}");

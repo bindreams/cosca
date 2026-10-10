@@ -339,4 +339,31 @@ mod linux {
             "{warns:?}"
         );
     }
+
+    /// A failed spawn's teardown whose wait finds the child reaped behind its back forgets tokio's
+    /// `Child` under one warn, which names the cause of the wait and carries the leak.
+    ///
+    /// Mutants: the wait logs a warn of its own besides the forget's; the forget's warn omits the
+    /// wait's cause.
+    #[skuld::test]
+    async fn reap_now_warns_once_for_a_foreign_reap_during_its_wait() {
+        crate::log_capture::install();
+        let _recorder = crate::containment::unix::fault::record_kill_group();
+        let (mut child, _writer) = session_blocker(false);
+        let pid = child.id().pid();
+        let proc = child.os.proc.take().expect("the backend");
+        let mark = crate::log_capture::mark();
+        let _reap = crate::child::spawn::fault::set_between_kill_and_wait(move || {
+            crate::tokio::child::child_reap_tests::reap_behind_the_owner(pid);
+        });
+
+        proc.reap_now(pid);
+
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("waitid") && warns[0].contains("leaks"),
+            "the one warn carries the wait's cause and the leak: {warns:?}"
+        );
+    }
 }
