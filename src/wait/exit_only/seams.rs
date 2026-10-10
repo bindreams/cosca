@@ -61,6 +61,8 @@ thread_local! {
     #[cfg(target_os = "linux")]
     static FORCED_VISIBLE_NONE: Cell<bool> = const { Cell::new(false) };
     #[cfg(target_os = "linux")]
+    static FORCED_VISIBLE_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+    #[cfg(target_os = "linux")]
     static WAITID_OBSERVER: RefCell<Option<WaitidObserver>> = const { RefCell::new(None) };
     static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
     static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
@@ -87,6 +89,14 @@ pub(crate) fn force_peek_once(result: io::Result<Peek>) -> Forced {
 pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<Peek>>) -> Forced {
     FORCED_PEEK.with(|f| *f.borrow_mut() = results.into_iter().collect());
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
+}
+
+/// Panics unless every peek forced on this thread was consumed: a test that counts on a specific
+/// number of looks asserts it, so a look that stopped happening fails by assertion.
+#[track_caller]
+pub(crate) fn assert_peeks_exhausted() {
+    let left = FORCED_PEEK.with(|f| f.borrow().len());
+    assert_eq!(left, 0, "{left} forced peek(s) were never consumed");
 }
 
 pub(crate) fn take_forced_peek() -> Option<io::Result<Peek>> {
@@ -124,6 +134,22 @@ pub(crate) fn force_visible_none_once() -> Forced {
 #[cfg(target_os = "linux")]
 pub(crate) fn take_forced_visible_none() -> bool {
     FORCED_VISIBLE_NONE.with(Cell::take)
+}
+
+/// The next blocking `waitid` in `wait_visible_exit` on this thread fails with `errno`.
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(all(feature = "tokio", debug_assertions)),
+    allow(dead_code, reason = "only the async child's debug-build tests force a failed wait")
+)]
+pub(crate) fn force_visible_errno_once(errno: i32) -> Forced {
+    FORCED_VISIBLE_ERRNO.with(|f| f.set(Some(errno)));
+    Forced(|| FORCED_VISIBLE_ERRNO.with(|f| f.set(None)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn take_forced_visible_errno() -> Option<i32> {
+    FORCED_VISIBLE_ERRNO.with(Cell::take)
 }
 
 /// Every `waitid` this thread makes reports its `options` to `observer`, until the guard drops.

@@ -136,6 +136,7 @@ fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
         }
     });
     let outcome = cmd.spawn();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let err = outcome.expect_err("a pid with another unique id is not the child");
@@ -483,15 +484,19 @@ fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_
     super::teardown_after_attach_failure(child, unique);
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Debug], "{records:?}");
-    assert!(records[1].1.contains("reaped by someone else"), "{records:?}");
+    // The debug lines come as they happen; the one warn comes last, with everything noted.
+    assert_eq!(levels, vec![log::Level::Debug, log::Level::Warn], "{records:?}");
+    assert!(records[0].1.contains("reaped by someone else"), "{records:?}");
+    assert!(records[1].1.contains("could not be killed"), "{records:?}");
     end_unsignalled_and_reap(pid);
 }
 
 /// A zombie launchd holds (its tracer died) is not shown ours or reaped: a `warn` saying so, not a
-/// `debug` claim of a foreign reap.
+/// `debug` claim of a foreign reap. The refused kill and the unverifiable reap are one event, so
+/// they share one warn.
 ///
-/// Mutant: `Foreign::Orphaned` is logged as a reaped-by-someone-else `debug`.
+/// Mutants: `Foreign::Orphaned` is logged as a reaped-by-someone-else `debug`; the kill and the
+/// reap warn separately.
 #[skuld::test]
 fn macos_attach_failure_teardown_of_an_orphaned_child_warns_it_cannot_be_shown_ours() {
     use crate::wait::exit_only::{Foreign, Peek};
@@ -503,16 +508,25 @@ fn macos_attach_failure_teardown_of_an_orphaned_child_warns_it_cannot_be_shown_o
     let _refused = refuse_the_kill();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     super::teardown_after_attach_failure(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
-    assert!(records[1].1.contains("cannot be shown to be ours"), "{records:?}");
+    assert_eq!(
+        levels,
+        vec![log::Level::Warn],
+        "one warn for the one event: {records:?}"
+    );
+    assert!(
+        records[0].1.contains("could not be killed") && records[0].1.contains("cannot be shown to be ours"),
+        "{records:?}"
+    );
     end_unsignalled_and_reap(pid);
 }
 
-/// An id read the OS refuses (a MACF denial) is the same: not shown ours, so a `warn`.
+/// An id read the OS refuses (a MACF denial) is the same: not shown ours, so a `warn`, shared with
+/// the refused kill.
 ///
-/// Mutant: the reap is unverified, so a refusal reads as `Running` or as a reap by another party.
+/// Mutants: the kill and the reap warn separately; the reap is unverified, so a refusal reads as `Running` or as a reap by another party.
 #[skuld::test]
 fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown_ours() {
     crate::log_capture::install();
@@ -524,8 +538,15 @@ fn macos_attach_failure_teardown_with_a_refused_id_read_warns_it_cannot_be_shown
     super::teardown_after_attach_failure(child, unique);
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
-    assert_eq!(levels, vec![log::Level::Warn, log::Level::Warn], "{records:?}");
-    assert!(records[1].1.contains("cannot be shown to be ours"), "{records:?}");
+    assert_eq!(
+        levels,
+        vec![log::Level::Warn],
+        "one warn for the one event: {records:?}"
+    );
+    assert!(
+        records[0].1.contains("could not be killed") && records[0].1.contains("cannot be shown to be ours"),
+        "{records:?}"
+    );
     end_unsignalled_and_reap(pid);
 }
 
@@ -577,6 +598,7 @@ fn macos_attach_failure_teardown_of_an_orphaned_zombie_after_the_kill_warns() {
     let mark = crate::log_capture::mark();
     let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
     super::teardown_after_attach_failure(child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     let records = teardown_records(mark);
     let levels: Vec<_> = records.iter().map(|r| r.0).collect();
     assert_eq!(levels, vec![log::Level::Warn], "{records:?}");

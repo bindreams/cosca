@@ -192,7 +192,11 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
         "the number may belong to another child by now: no kill, and tokio's `Child` is forgotten so \
          its own drop cannot reap by pid"
     );
-    assert_eq!(drop_warns_since(mark).len(), 1);
+    // The drop also forgot tokio's `Child`, so the one warn leads with that and carries the skip.
+    let warns =
+        crate::log_capture::records_since_on_current_thread(mark, "the root is already reaped, so this drop does not");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
 }
 
 /// A spawned `sleep` whose root something else (the application's own `waitpid`) has reaped,

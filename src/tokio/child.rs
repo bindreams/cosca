@@ -63,13 +63,6 @@ impl OsResources {
         self.proc.as_mut().expect(PROC_TAKEN)
     }
 
-    /// Whether the child's own handle shows its root reaped by someone else, which the start token
-    /// cannot tell for a reuse in the same tick. `false` when this handle reaped it itself.
-    #[cfg(unix)]
-    pub(crate) fn root_reaped_elsewhere(&self, own_reap: bool) -> bool {
-        !own_reap && self.proc.as_ref().is_some_and(ProcSource::reaped_elsewhere)
-    }
-
     /// Give up every resource, in declaration order, without waiting for anything.
     ///
     /// The backend goes first, through [`ProcSource::release`]. tokio's `Child` drops: it tries a
@@ -102,6 +95,10 @@ pub struct Child {
     elevation: Option<crate::elevation::ElevationReport>,
     /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
     front: Option<crate::elevation::front::Front>,
+    /// A failed-spawn cleanup that left this handle armed already warned about its event, so the
+    /// drop that retries reports at `debug`.
+    #[cfg(unix)]
+    reported: bool,
 }
 
 impl Child {
@@ -128,6 +125,36 @@ impl Child {
             graceful: attachment.graceful,
             elevation: None,
             front: None,
+            #[cfg(unix)]
+            reported: false,
+        }
+    }
+
+    /// See [`ProcSource::forget_for`].
+    #[cfg(unix)]
+    pub(super) fn forget_for(
+        &mut self,
+        view: &crate::containment::DropView,
+    ) -> Option<crate::child::drop_report::Forgot> {
+        self.os.proc.as_mut()?.forget_for(view)
+    }
+
+    /// Whether this handle already killed its tree completely.
+    #[cfg(unix)]
+    pub(super) fn tree_killed(&self) -> bool {
+        self.tree_killed.is_set()
+    }
+
+    /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
+    /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
+    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is whether the
+    /// cleanup already warned of the event, so the drop does not warn of it twice.
+    #[cfg(unix)]
+    pub(super) fn end_cleanup(&mut self, settled: bool, warned: bool) {
+        if settled {
+            self.kill_on_drop = false;
+        } else {
+            self.reported = warned;
         }
     }
 
@@ -157,16 +184,33 @@ impl Child {
     /// [`kill_tree`](Self::kill_tree) adds, for a failed spawn, which kills and reaps the root
     /// separately. The root may already be reaped: when it is (this handle's own reap, the number
     /// no longer reading as the root, or the child's own handle showing it reaped), nothing that
-    /// names the tree by the root's number runs, and the skipped action is returned as
-    /// `Ok(Some(action))`.
+    /// names the tree by the root's number runs, and why and what was skipped is returned as
+    /// `Ok(Some(note))`. The same when the handle could not say (`RootState::Unknown`).
     #[cfg(unix)]
-    pub(super) fn kill_tree_members_unless_reaped(&self) -> Result<Option<String>, Error> {
-        let own_reap = self.os.proc.as_ref().is_none_or(ProcSource::is_reaped);
-        let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-        view.root_reaped |= self.os.root_reaped_elsewhere(own_reap);
+    pub(super) fn kill_tree_members_unless_reaped(
+        &self,
+        view: &crate::containment::DropView,
+    ) -> Result<Option<String>, Error> {
         self.os
             .attached
             .hard_kill_marking_unless_reaped(view, &self.tree_killed)
+    }
+
+    /// What this child's own handle and the root's number say about the root, for a cleanup that
+    /// decides on both. Logs nothing about an unsettled root: the caller does, once.
+    #[cfg(unix)]
+    pub(super) fn read_root_view(&self, label: &str) -> crate::containment::DropView {
+        crate::containment::DropView::read(
+            label,
+            self.id,
+            || {
+                self.os
+                    .proc
+                    .as_ref()
+                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+            },
+            &self.tree_killed,
+        )
     }
 
     /// Block until a cgroup-contained tree has drained, so the leaf's drop can remove it on its
@@ -250,13 +294,19 @@ impl Child {
     /// mid-teardown, and a zombie keeps the credentials it died with), so the reap would be
     /// skipped on the ordinary success path.
     ///
+    /// A child something else reaped, or that cannot be shown to be ours, is forgotten instead,
+    /// quietly (nothing above `debug`): what the forget leaked, and why the wait found the child
+    /// foreign, are returned for the caller's one warn. `None`: the child was waited for.
+    ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn wait_and_reap_blocking(&mut self) {
+    pub(super) fn wait_and_reap_blocking(&mut self) -> Option<crate::child::drop_report::Forgot> {
         let pid = self.id.pid();
-        if self.proc_mut().wait_and_reap(pid) == Waited::Foreign {
-            self.proc_mut().forget_foreign();
+        let (waited, cause) = self.proc_mut().wait_and_reap_caused(pid, log::Level::Debug);
+        if waited != Waited::Foreign {
+            return None;
         }
+        self.proc_mut().forget_for_wait(cause)
     }
 
     /// The child's stable identity — valid after `wait`.
@@ -572,6 +622,21 @@ impl Child {
 
     /// [`kill_sent`](Child::kill_sent) under `gate`, this child's kill gate read by the caller.
     pub(crate) fn kill_sent_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
+        let sent = self.signal_gated(
+            #[cfg(unix)]
+            gate,
+        );
+        if matches!(sent, Ok(Sent::Gone)) {
+            // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
+            #[cfg(unix)]
+            self.proc_mut().forget_if_foreign();
+        }
+        sent
+    }
+
+    /// [`kill_sent_gated`](Child::kill_sent_gated) without forgetting a child that is gone: for a
+    /// caller that decides what to do with it, and what to log.
+    pub(crate) fn signal_gated(&mut self, #[cfg(unix)] gate: crate::elevation::front::Gate) -> Result<Sent, Error> {
         #[cfg(test)]
         if fault::take_force_kill_failure() {
             return Err(fault::forced_kill_failure());
@@ -604,13 +669,7 @@ impl Child {
             }
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             Err(other) => Err(other),
-            Ok(Sent::Gone) => {
-                // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
-                #[cfg(unix)]
-                self.proc_mut().forget_if_foreign();
-                Ok(Sent::Gone)
-            }
-            Ok(delivered) => Ok(delivered),
+            Ok(sent) => Ok(sent),
         }
     }
 
@@ -930,6 +989,14 @@ mod child_drop_reaped_tests;
 #[path = "child/pid_reuse_tests.rs"]
 mod pid_reuse_tests;
 
+#[cfg(all(test, unix))]
+#[path = "child/root_state_tests.rs"]
+mod root_state_tests;
+
+#[cfg(all(test, unix))]
+#[path = "child/drop_report_tests.rs"]
+mod drop_report_tests;
+
 #[cfg(all(test, windows))]
 #[path = "child/windows_signal_tests.rs"]
 mod windows_signal_tests;
@@ -1045,47 +1112,61 @@ impl Drop for Child {
         #[cfg(unix)]
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
         #[cfg(unix)]
-        let view = {
-            let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-            view.root_reaped |= os.root_reaped_elsewhere(own_reap);
-            view
-        };
+        let view = crate::containment::DropView::read(
+            "Child::drop",
+            self.id,
+            || {
+                os.proc
+                    .as_ref()
+                    .map_or(crate::signal::RootState::Reaped, ProcSource::state)
+            },
+            &self.tree_killed,
+        );
+        #[cfg(unix)]
+        let mut signals = DropSignals::default();
+        #[cfg(unix)]
+        let mut front_left = None;
         if self.kill_on_drop {
             // A live elevation front gets no signal of its own: outside a cgroup it is left running,
-            // and named.
+            // and named in the drop's one warn.
             #[cfg(unix)]
             match kill_gate(self.front, &os, self.id.pid()) {
-                crate::elevation::front::Gate::Closed(unkillable) => {
-                    log::warn!(
-                        "Child::drop: elevation front pid {}: {unkillable}; the front is killed through its cgroup if \
-                         it is still in it; cosca does not wait for it, and tokio reaps it once it exits",
-                        self.id.pid()
-                    );
-                }
-                gate => signal_on_drop(
-                    self.id,
-                    view,
-                    matches!(gate, crate::elevation::front::Gate::CgroupOnly)
+                crate::elevation::front::Gate::Closed(unkillable) => front_left = Some(unkillable),
+                gate => {
+                    let cgroup_front = matches!(gate, crate::elevation::front::Gate::CgroupOnly)
                         .then_some(self.front)
-                        .flatten(),
-                    &mut os,
-                ),
+                        .flatten();
+                    signals = signal_on_drop(self.id, &view, cgroup_front, &mut os, self.reported);
+                }
             }
             #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
         }
-        // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
-        // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
+        // A root that was reaped outside this handle (tokio's state cannot see it), or that the
+        // handle cannot show is ours (unknown, unpinned), leaves the number possibly naming another
+        // child, so tokio's `Child` must not run its own drop, which reaps by pid. Asked again: a
+        // reap can land after the read above (and before or during the root kill).
         #[cfg(unix)]
-        // Asked again: a reap can land after the read above (and before or during the root kill).
-        if !own_reap && (view.root_reaped || os.root_reaped_elsewhere(own_reap)) {
+        if !own_reap && signals.forgot.is_none() {
             if let Some(proc) = os.proc.as_mut() {
-                proc.forget_foreign();
-                log::debug!(
-                    "async child {} was reaped outside its handle; dropping it would reap by that number, so it was forgotten",
-                    self.id.pid()
-                );
+                signals.forgot = proc.forget_for(&view);
+                if signals.forgot.is_some() {
+                    log::debug!(
+                        "async child {} cannot be shown to be ours (reaped outside its handle, unknown, or unpinned); \
+                         dropping it would reap by that number, so it was forgotten",
+                        self.id.pid()
+                    );
+                }
             }
+        }
+        #[cfg(unix)]
+        {
+            let mut report = crate::child::drop_report::DropReport::new("Child::drop", &view);
+            report.front = front_left.as_ref();
+            report.skipped = signals.skipped;
+            report.forgot = signals.forgot;
+            report.left = signals.left;
+            report.emit(self.reported);
         }
         os.release_without_waiting();
     }
@@ -1129,16 +1210,32 @@ fn cgroup_kill_reached(front: Option<crate::elevation::front::Front>, os: &OsRes
     )
 }
 
-/// The signals of a kill-on-drop drop: the tree, then the root. `cgroup_front`: the root is an
-/// elevation front in the cgroup, this one, whose kill is the only signal it
-/// gets.
+/// What the signals of a kill-on-drop drop found, for the drop's one report.
+#[derive(Default)]
+struct DropSignals {
+    /// What the tree kill skipped ([`DropKill::skipped`](crate::containment::dispatch::DropKill)).
+    #[cfg(unix)]
+    skipped: Option<String>,
+    /// What forgetting tokio's `Child` leaked, if the failed root kill forgot it.
+    #[cfg(unix)]
+    forgot: Option<crate::child::drop_report::Forgot>,
+    /// What the root kill could not do.
+    #[cfg(unix)]
+    left: Vec<String>,
+}
+
+/// The signals of a kill-on-drop drop: the tree, then the root. `reported`: an earlier step of this
+/// same event already warned, so a failed tree kill is logged at `debug`.
 fn signal_on_drop(
     id: ProcessId,
-    #[cfg(unix)] view: crate::containment::DropView,
+    #[cfg(unix)] view: &crate::containment::DropView,
     #[cfg(unix)] cgroup_front: Option<crate::elevation::front::Front>,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
-) {
+    #[cfg(unix)] reported: bool,
+) -> DropSignals {
+    #[allow(unused_mut, reason = "only the Unix signals collect anything")]
+    let mut signals = DropSignals::default();
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
@@ -1153,7 +1250,11 @@ fn signal_on_drop(
     // see a foreign reap until it is polled). Accepted gaps: a foreign reap landing after `view`
     // was read, and tokio's orphan queue reaping by number afterwards.
     #[cfg(unix)]
-    let tree = os.attached.hard_kill_for_drop(view);
+    let tree = {
+        let kill = os.attached.hard_kill_for_drop(view);
+        signals.skipped = kill.skipped;
+        kill.result
+    };
     #[cfg(not(unix))]
     let tree = {
         _ = tree_killed;
@@ -1161,20 +1262,27 @@ fn signal_on_drop(
     };
     if let Err(e) = &tree {
         // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): logged, never asserted on.
-        log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
+        #[cfg(unix)]
+        let level = if reported { log::Level::Debug } else { log::Level::Warn };
+        #[cfg(not(unix))]
+        let level = log::Level::Warn;
+        log::log!(level, "Child::drop: contained-tree teardown did not fully succeed: {e}");
         if os.attached.hard_kill_refused_to_walk(&tree) {
             // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-            log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
+            log::log!(
+                level,
+                "Child::drop: the root is killed regardless, so its descendants may be orphaned"
+            );
         }
     }
-    // Already reaped: no signal to issue.
+    // Already reaped, or not pinned by this process: no signal to issue.
     #[cfg(unix)]
-    if view.root_reaped {
-        return;
+    if view.leaves_root_alone() {
+        return signals;
     }
     #[cfg(not(unix))]
     if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
-        return;
+        return signals;
     }
     // The cgroup kill ended the front, and tokio reaps it. One the kill did not end may still have
     // its program running, and a kill of the front would orphan it.
@@ -1183,16 +1291,16 @@ fn signal_on_drop(
         if let Err(e) = tree.and_then(|()| cgroup_kill_reached(Some(front), os, pid)) {
             // The leaf's release still writes `cgroup.kill`, which ends the front if it is in the
             // leaf; nothing waits to see.
-            log::warn!(
-                "Child::drop: elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the \
-                 front is killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it \
-                 exits"
-            );
+            signals.left.push(format!(
+                "elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the front is \
+                 killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it \
+                 once it exits"
+            ));
         }
-        return;
+        return signals;
     }
     let Some(proc) = os.proc.as_mut() else {
-        return;
+        return signals;
     };
     #[cfg(all(test, unix))]
     drop_fault::note_root_kill();
@@ -1213,16 +1321,23 @@ fn signal_on_drop(
     // possibly reused): the pid names nothing of ours to wait for.
     // Nothing is logged here: the drop forgets the child next, and logs that.
     if matches!(killed, Ok(Sent::Gone)) {
-        return;
+        return signals;
     }
     if killed.is_err() {
         // The `try_wait` below reaps by pid: forget a foreign reap first.
         #[cfg(unix)]
-        proc.forget_if_foreign();
+        {
+            signals.forgot = proc.forget_for(view);
+        }
         if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {
-            log::warn!("async child {pid} could not be terminated on drop; leaving it running");
+            let left = format!("async child {pid} could not be terminated on drop; leaving it running");
+            #[cfg(unix)]
+            signals.left.push(left);
+            #[cfg(not(unix))]
+            log::warn!("{left}");
         }
     }
+    signals
 }
 
 /// Re-encodes a `waitid` result as a raw `wait` status.

@@ -680,6 +680,9 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    let view = child.read_root_view("finish_elevated");
+    // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
+    let mut forgot: Option<crate::child::drop_report::Forgot> = None;
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -687,7 +690,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {
-        skipped = child.kill_tree_members_unless_reaped()?;
+        skipped = child.kill_tree_members_unless_reaped(&view)?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
         // naming a `wait_tree` the caller never gets.
@@ -700,50 +703,72 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         Some(Err(e)) => Some(e.to_string()),
         _ => None,
     };
+    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
+    // deliberately left alone because the root is reaped or unpinned.
+    let tree_settled = tree.is_none() || child.tree_killed() || (skipped.is_some() && view.leaves_root_alone());
+    let tree_warned = matches!(tree, Some(Err(_)));
     let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
-    if let Some(action) = skipped {
-        tree_note.push_str(&format!(
-            "; its contained tree was not killed: the root was already reaped, so its number may name another \
-             process, and the kill would {action}"
-        ));
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
-    let root = match gate {
-        // Not asked again after the kill: a killed front can read as neither exited nor in its
-        // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
-            child.cgroup_kill_reached().map(|()| Sent::Delivered)
+    // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
+    // deliberately not signalled (an unpinned root, a live front). A refused kill leaves it to the
+    // handle's drop to try again.
+    let mut root_settled = true;
+    let root_note = if view.unpinned_root() {
+        forgot = child.forget_for(&view);
+        format!(
+            "the elevated child was left alone, neither signalled nor waited on: {}",
+            view.why_number_untrusted()
+        )
+    } else {
+        let root = match gate {
+            // Not asked again after the kill: a killed front can read as neither exited nor in its
+            // cgroup, between leaving the cgroup's member list and becoming a zombie.
+            crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
+                child.cgroup_kill_reached().map(|()| Sent::Delivered)
+            }
+            // No kill reached the cgroup: refused as `kill` refuses, naming why.
+            crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
+            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+            gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
+                child.signal_gated(gate)
+            }
+        };
+        // A child that is gone is forgotten here, not by the kill: tokio's wait and drop reap by pid.
+        if matches!(root, Ok(Sent::Gone)) {
+            forgot = child.forget_for(&view);
         }
-        // No kill reached the cgroup: refused as `kill` refuses, naming why.
-        crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
-        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
-            child.kill_sent_gated(gate)
-        }
-    };
-    let root_note = match root {
-        Ok(Sent::Delivered) => {
-            child.wait_and_reap_blocking();
-            if exited_front {
-                "the elevated child had already exited, and was reaped".to_string()
-            } else {
-                "the elevated child was terminated".to_string()
+        match root {
+            Ok(Sent::Delivered) => {
+                forgot = child.wait_and_reap_blocking();
+                if exited_front {
+                    "the elevated child had already exited, and was reaped".to_string()
+                } else {
+                    "the elevated child was terminated".to_string()
+                }
+            }
+            // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
+            // which may name another process by now.
+            Ok(Sent::Gone) if exited_front => {
+                "the elevated child had already exited, and was reaped by someone else".to_string()
+            }
+            Ok(Sent::Gone) => {
+                "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
+            }
+            Err(e) => {
+                root_settled = front_closed;
+                // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
+                forgot = child.forget_for(&view);
+                _ = child.try_wait();
+                format!("the elevated child could not be terminated ({e})")
             }
         }
-        // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
-        // which may name another process by now.
-        Ok(Sent::Gone) if exited_front => {
-            "the elevated child had already exited, and was reaped by someone else".to_string()
-        }
-        Ok(Sent::Gone) => {
-            "the elevated child could not be terminated (it was already reaped by someone else)".to_string()
-        }
-        Err(e) => {
-            // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
-            child.proc_mut().forget_if_foreign();
-            _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
-        }
     };
+    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
+    report.forgot = forgot;
+    let warned = report.emit(false);
+    child.end_cleanup(tree_settled && root_settled, warned || tree_warned);
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),

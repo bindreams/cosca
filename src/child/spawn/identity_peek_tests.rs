@@ -36,6 +36,7 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
 
     let outcome = cmd.spawn();
 
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     let err = outcome.expect_err("a failed identity peek fails the spawn");
     assert!(

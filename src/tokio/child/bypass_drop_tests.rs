@@ -295,10 +295,12 @@ async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
 
 /// `finish_elevated`'s refused-kill arm forgets a child shown reaped elsewhere (`forget_if_foreign`,
 /// as `Drop`'s and `reap_now`'s refused-kill arms do) before its `try_wait`, a `waitpid` by pid.
+/// The looks are forced in sequence: `finish_elevated`'s first look sees `Running`, the look inside
+/// the refused-kill arm sees `Foreign`.
 #[skuld::test]
 async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let (child, witness) = exited_unreaped(true);
-    let _evidence = force_evidence();
+    let _evidence = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
     let _refused = super::fault::force_kill_failure();
     let err = crate::tokio::spawn::finish_elevated(
         child,

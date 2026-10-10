@@ -10,7 +10,6 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -33,11 +32,6 @@ pub(crate) struct RawChild {
     /// A `runas`-elevated (higher-integrity) child a lower-integrity parent may be
     /// unable to `PROCESS_TERMINATE`. Its kill/teardown must never block on it.
     runas: bool,
-    /// The status this handle's own `wait`, `try_wait` or `wait_deadline` returned: set once, and
-    /// only by them, so [`is_reaped`](Self::is_reaped) means "this handle recorded the exit".
-    /// A reader that sees the record a moment late is harmless on Windows: the open process
-    /// handle pins the pid, so it cannot be reused meanwhile.
-    reaped: OnceLock<ExitStatus>,
 }
 
 impl RawChild {
@@ -46,19 +40,13 @@ impl RawChild {
             proc,
             pid,
             runas: false,
-            reaped: OnceLock::new(),
         }
     }
 
     /// A `runas`-elevated child: a higher-integrity process a lower-integrity parent
     /// may be unable to `PROCESS_TERMINATE`. Its kill/teardown never block on it.
     pub(crate) fn new_runas(proc: OwnedHandle, pid: u32) -> RawChild {
-        RawChild {
-            proc,
-            pid,
-            runas: true,
-            reaped: OnceLock::new(),
-        }
+        RawChild { proc, pid, runas: true }
     }
 
     fn handle(&self) -> HANDLE {
@@ -92,20 +80,6 @@ impl RawChild {
         self.pid
     }
 
-    /// Whether this handle's own wait has recorded the exit. Nothing is consumed on Windows, so
-    /// an exit nobody waited on yet is not recorded: this is the same meaning as on the other
-    /// backends.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
-    pub(crate) fn is_reaped(&self) -> bool {
-        self.reaped.get().is_some()
-    }
-
-    /// Record `status` as this handle's reap, and pass it on.
-    fn record(&self, status: ExitStatus) -> ExitStatus {
-        _ = self.reaped.set(status);
-        status
-    }
-
     /// A `WaitForSingleObject` result that is neither signalled nor timed out: a contract breach
     /// on our own live handle, reported as the OS error.
     fn unexpected_wait_result(&self, r: WAIT_EVENT) -> io::Error {
@@ -121,7 +95,7 @@ impl RawChild {
     /// Block until the child exits, returning its status.
     pub(crate) fn wait(&self) -> io::Result<ExitStatus> {
         match wait_handle_or_cancel(self.handle(), None)? {
-            WaitOutcome::Exited => exit_status(self.handle()).map(|s| self.record(s)),
+            WaitOutcome::Exited => exit_status(self.handle()),
             WaitOutcome::Cancelled => unreachable!("wait with no cancel handle cannot be cancelled"),
         }
     }
@@ -131,7 +105,7 @@ impl RawChild {
         // SAFETY: `handle` is our live, owned process handle; a zero timeout polls without blocking.
         let r = unsafe { WaitForSingleObject(self.handle(), 0) };
         if r == WAIT_OBJECT_0 {
-            Ok(Some(self.record(exit_status(self.handle())?)))
+            Ok(Some(exit_status(self.handle())?))
         } else if r == WAIT_TIMEOUT {
             Ok(None)
         } else {
@@ -150,7 +124,7 @@ impl RawChild {
             WaitForSingleObject(self.handle(), ms)
         });
         if r == WAIT_OBJECT_0 {
-            Ok(Some(self.record(exit_status(self.handle())?)))
+            Ok(Some(exit_status(self.handle())?))
         } else if r == WAIT_TIMEOUT {
             Ok(None)
         } else {

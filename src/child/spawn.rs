@@ -99,12 +99,25 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, Error> {
 /// kill is the typed `Unkillable`, and the note says so. A front that had already exited is reaped,
 /// and the note says it had exited. A front in a cgroup is ended by the tree's cgroup kill alone,
 /// read after it. The front's gate is decided once, before both kills.
+///
+/// A root whose handle could not say whether it is reaped (`RootState::Unknown`) is killed through
+/// its handle like any other, and the tree kills named by its number are skipped, as for a reaped
+/// root. A root this process does not pin (`RootState::Unpinned`, macOS) is left alone: neither
+/// signalled nor waited on, and the error says so. The event warns once: the unsettled root, a
+/// failed reap and any other leftover share one record, labelled `finish_elevated`.
+///
+/// The handle is disarmed only once the cleanup has settled both the tree and the root: each was
+/// killed, is gone, or was deliberately left alone (a reaped or unpinned root, a live front).
+/// Otherwise (a refused kill, a failed tree kill, a failed reap) the handle stays armed, so its drop
+/// tries again; that drop does not warn of the event a second time.
 #[cfg(unix)]
-pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Result<Child, Error> {
+pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, Error> {
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let view = crate::containment::DropView::read(child.id, child.proc.is_reaped(), &child.tree_killed);
+    let view =
+        crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
+    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -113,71 +126,99 @@ pub(crate) fn finish_elevated(child: Child, written: Result<(), Error>) -> Resul
     let tree = (child.containment().can_teardown() && !front_closed).then(|| {
         child
             .attached
-            .hard_kill_marking_unless_reaped(view, &child.tree_killed)
+            .hard_kill_marking_unless_reaped(&view, &child.tree_killed)
             .map(|s| skipped = s)
     });
     let tree_failure = match &tree {
         Some(Err(e)) => Some(e.to_string()),
         _ => None,
     };
+    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
+    // deliberately left alone because the root is reaped or unpinned.
+    let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
+    let tree_warned = matches!(tree, Some(Err(_)));
     let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
-    if let Some(action) = skipped {
-        tree_note.push_str(&format!(
-            "; its contained tree was not killed: the root was already reaped, so its number may name another \
-             process, and the kill would {action}"
-        ));
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
-    let root = match gate {
-        // Not asked again after the kill: a killed front can read as neither exited nor in its
-        // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if child.tree_killed.is_set() => {
-            child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
-        }
-        // No kill reached the cgroup: refused as `kill` refuses, naming why.
-        crate::elevation::front::Gate::CgroupOnly => Err(crate::elevation::front::cgroup_not_killed_of(
-            child.front,
-            child.id().pid(),
-            tree_failure.as_deref(),
-        )),
-        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate => child.kill_sent_gated(gate),
-    };
-    let root_note = match root {
-        Ok(crate::signal::Sent::Gone) if exited_front => {
-            "the elevated child had already exited, and was reaped by someone else".to_string()
-        }
-        Ok(crate::signal::Sent::Gone) => {
-            "the elevated child could not be terminated (it was already reaped)".to_string()
-        }
-        Ok(crate::signal::Sent::Delivered) => {
-            #[cfg(test)]
-            fault::run_between_kill_and_wait();
-            match wait_killed_elevated(&child) {
-                Ok(_status) => {
-                    #[cfg(test)]
-                    fault::record_teardown_reap(child.id().pid(), _status);
-                    if exited_front {
-                        "the elevated child had already exited, and was reaped".to_string()
-                    } else {
-                        "the elevated child was terminated".to_string()
+    // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
+    // deliberately not signalled (an unpinned root, a live front). A refused kill, or a reap that
+    // failed, leaves it to the handle's drop to try again.
+    let mut root_settled = true;
+    let root_note = if view.unpinned_root() {
+        format!(
+            "the elevated child was left alone, neither signalled nor waited on: {}",
+            view.why_number_untrusted()
+        )
+    } else {
+        let root = match gate {
+            // Not asked again after the kill: a killed front can read as neither exited nor in its
+            // cgroup, between leaving the cgroup's member list and becoming a zombie.
+            crate::elevation::front::Gate::CgroupOnly if child.tree_killed.is_set() => {
+                child.cgroup_kill_reached().map(|()| crate::signal::Sent::Delivered)
+            }
+            // No kill reached the cgroup: refused as `kill` refuses, naming why.
+            crate::elevation::front::Gate::CgroupOnly => Err(crate::elevation::front::cgroup_not_killed_of(
+                child.front,
+                child.id().pid(),
+                tree_failure.as_deref(),
+            )),
+            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+            gate => child.kill_sent_gated(gate),
+        };
+        match root {
+            Ok(crate::signal::Sent::Gone) if exited_front => {
+                "the elevated child had already exited, and was reaped by someone else".to_string()
+            }
+            Ok(crate::signal::Sent::Gone) => {
+                "the elevated child could not be terminated (it was already reaped)".to_string()
+            }
+            Ok(crate::signal::Sent::Delivered) => {
+                #[cfg(test)]
+                fault::run_between_kill_and_wait();
+                match wait_killed_elevated(&child) {
+                    Ok(_status) => {
+                        #[cfg(test)]
+                        fault::record_teardown_reap(child.id().pid(), _status);
+                        if exited_front {
+                            "the elevated child had already exited, and was reaped".to_string()
+                        } else {
+                            "the elevated child was terminated".to_string()
+                        }
+                    }
+                    Err(e) if exited_front => {
+                        root_settled = false;
+                        report.left.push(format!(
+                            "could not reap the exited elevated child pid {}: {e}",
+                            child.id().pid()
+                        ));
+                        format!("the elevated child had already exited, but could not be reaped ({e})")
+                    }
+                    Err(e) => {
+                        root_settled = false;
+                        report.left.push(format!(
+                            "could not reap the killed elevated child pid {}: {e}",
+                            child.id().pid()
+                        ));
+                        format!("the elevated child was killed but could not be reaped ({e})")
                     }
                 }
-                Err(e) if exited_front => {
-                    log::warn!("could not reap the exited elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child had already exited, but could not be reaped ({e})")
-                }
-                Err(e) => {
-                    log::warn!("could not reap the killed elevated child pid {}: {e}", child.id().pid());
-                    format!("the elevated child was killed but could not be reaped ({e})")
-                }
+            }
+            Err(e) => {
+                root_settled = front_closed;
+                _ = child.try_wait();
+                format!("the elevated child could not be terminated ({e})")
             }
         }
-        Err(e) => {
-            _ = child.try_wait();
-            format!("the elevated child could not be terminated ({e})")
-        }
     };
+    let warned = report.emit(false);
+    if tree_settled && root_settled {
+        child.kill_on_drop = false;
+    } else {
+        // The drop tries again; it need not warn of the same event twice.
+        child.reported = warned || tree_warned;
+    }
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,
         detail: format!("{write_err}; {root_note}{tree_note}"),
@@ -621,59 +662,77 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64) {
 }
 
 /// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
-/// handle.
+/// handle. What it cannot do is one event, so one `warn` carries every note (a verified foreign
+/// reap is a `debug`).
 #[cfg(target_os = "macos")]
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64) {
+    let mut notes = Vec::new();
+    let mut breach = None;
+    kill_and_reap_noting(pid, unique, &mut notes, &mut breach);
+    if !notes.is_empty() {
+        log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
+    }
+    // After the log: an assertion that fires first would take the warn with it.
+    debug_assert!(breach.is_none(), "{}", breach.unwrap_or_default());
+}
+
+#[cfg(target_os = "macos")]
+fn kill_and_reap_noting(pid: u32, unique: u64, notes: &mut Vec<String>, breach: &mut Option<String>) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target),
+            Ok(Waited::Reapable) => reap_verified(pid, &target, notes, breach),
             Ok(Waited::Gone) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-            Ok(Waited::Orphaned) => log::warn!(
-                "spawn teardown: pid {pid} cannot be shown to be ours or reaped (launchd holds it, because its tracer died)"
-            ),
-            Ok(Waited::DeadlinePassed) => log::warn!("spawn teardown: pid {pid} is still running after its kill"),
-            Err(e) => log::warn!("spawn teardown could not wait for pid {pid}: {e}"),
+            Ok(Waited::Orphaned) => notes.push(format!(
+                "cannot be shown to be ours or reaped ({})",
+                crate::signal::UNPINNED_WHY
+            )),
+            Ok(Waited::DeadlinePassed) => notes.push("is still running after its kill".to_owned()),
+            Err(e) => notes.push(format!("could not be waited for: {e}")),
         },
         Ok(Sent::Gone) => log::debug!("spawn teardown: pid {pid} is already gone"),
         Err(kill) => {
-            log::warn!("spawn teardown failed to kill pid {pid}: {kill}");
-            reap_verified(pid, &target);
+            notes.push(format!("could not be killed: {kill}"));
+            reap_verified(pid, &target, notes, breach);
         }
     }
 }
 
 /// [`teardown_after_attach_failure`]'s reap: consume `target`'s exit record only when a verified
 /// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
-/// shown ours or reaped is a `warn`.
+/// shown ours or reaped is noted for the teardown's one `warn`.
 #[cfg(target_os = "macos")]
-fn reap_verified(pid: u32, target: &crate::wait::exit_only::Target<'_>) {
+fn reap_verified(
+    pid: u32,
+    target: &crate::wait::exit_only::Target<'_>,
+    notes: &mut Vec<String>,
+    breach: &mut Option<String>,
+) {
     use crate::wait::exit_only::{peek_verified, try_reap, Foreign, Peek, Reap, Reaped};
 
-    let unverifiable = |why: &dyn std::fmt::Display| {
-        log::warn!("spawn teardown: pid {pid} cannot be shown to be ours or reaped ({why})");
-    };
-    let orphaned = "launchd holds it, because its tracer died";
+    let unverifiable = |why: &dyn std::fmt::Display| format!("cannot be shown to be ours or reaped ({why})");
     match peek_verified(target) {
-        Err(e) => return unverifiable(&e),
-        Ok(Peek::Foreign(Foreign::Orphaned)) => return unverifiable(&orphaned),
+        Err(e) => return notes.push(unverifiable(&e)),
+        Ok(Peek::Foreign(Foreign::Orphaned)) => return notes.push(unverifiable(&crate::signal::UNPINNED_WHY)),
         Ok(Peek::Foreign(_)) => return log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Ok(Peek::Running) => return log::warn!("spawn teardown: pid {pid} is still running"),
+        Ok(Peek::Running) => return notes.push("is still running".to_owned()),
         Ok(Peek::Exit(_)) => {}
     }
     match try_reap(target) {
         Ok(Reap::Reaped(Reaped::Status(_))) => {}
         Ok(Reap::Reaped(Reaped::Unreadable { si_code })) => {
-            log::warn!("spawn teardown: pid {pid}: a consuming waitid returned si_code {si_code}, not an exit record");
-            debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
+            notes.push(format!(
+                "a consuming waitid returned si_code {si_code}, not an exit record"
+            ));
+            *breach = Some(format!("a consuming waitid on a zombie returned si_code {si_code}"));
         }
-        Ok(Reap::Running) => log::warn!("spawn teardown: pid {pid} is still running"),
-        Ok(Reap::Foreign(Foreign::Orphaned)) => unverifiable(&orphaned),
+        Ok(Reap::Running) => notes.push("is still running".to_owned()),
+        Ok(Reap::Foreign(Foreign::Orphaned)) => notes.push(unverifiable(&crate::signal::UNPINNED_WHY)),
         Ok(Reap::Foreign(_)) => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        Err(e) => log::warn!("spawn teardown failed to reap pid {pid}: {e}"),
+        Err(e) => notes.push(format!("could not be reaped: {e}")),
     }
 }
 

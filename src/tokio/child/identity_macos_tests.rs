@@ -59,6 +59,7 @@ async fn macos_tokio_spawn_identity_with_a_different_unique_id_is_gone() {
         }
     });
     let outcome = cmd.spawn();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(armed);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let err = outcome.expect_err("a pid with another unique id is not the child");

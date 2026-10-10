@@ -35,17 +35,12 @@ impl ProcHandle {
         shared.adopted_unique()
     }
 
-    /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
-    /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
-    /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
-    /// `Raw` (Windows) reads the process handle's signalled state: nothing is consumed there.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
-    pub(crate) fn is_reaped(&self) -> bool {
-        match self {
-            ProcHandle::Std(s) => s.is_reaped(),
-            #[cfg(windows)]
-            ProcHandle::Raw(r) => r.is_reaped(),
-        }
+    /// Whether the root is still this handle's child to act on; see
+    /// [`RootState`](crate::signal::RootState).
+    #[cfg(unix)]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        let ProcHandle::Std(s) = self;
+        s.state()
     }
 
     /// Block until the child exits.
@@ -113,15 +108,15 @@ impl ProcHandle {
     }
 
     /// Reap a child a tree kill has just ended, sending it nothing: the kill bounds the wait.
+    /// Returns a failed reap for the caller's one warn, as [`teardown_on_drop`](Self::teardown_on_drop)
+    /// does.
     #[cfg(unix)]
-    pub(crate) fn reap_after_tree_kill(&self) {
+    pub(crate) fn reap_after_tree_kill(&self) -> Option<String> {
         match self {
             ProcHandle::Std(s) => {
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                if let Err(e) = s.wait() {
-                    log_teardown_wait_failure(s.id(), &e);
-                }
+                s.wait().err().and_then(|e| teardown_wait_failure(s.id(), &e))
             }
         }
     }
@@ -142,7 +137,11 @@ impl ProcHandle {
     /// setuid helper, or `sudo` spawned with no `.elevate()`) also returns EPERM, and
     /// keying on a request flag would take the blocking `wait()` and hang Drop forever.
     /// The Windows `Raw` arm handles its own higher-integrity runas case via its flag.
-    pub(crate) fn teardown_on_drop(&self) {
+    ///
+    /// Returns what it could not do, for the caller's one warn: a child it could not signal and
+    /// left running, or a reap that failed after the kill. It logs neither above `debug`. (The
+    /// Windows `Raw` arm still logs its own refusal.)
+    pub(crate) fn teardown_on_drop(&self) -> Option<String> {
         #[cfg(all(test, unix))]
         crate::child::fault::note_root_teardown();
         match self {
@@ -152,43 +151,44 @@ impl ProcHandle {
                     // Kill succeeded: reap the zombie with a bounded blocking wait (SIGKILL
                     // cannot be caught, so the child's exit is guaranteed — this is the
                     // sanctioned real-child-exit wait).
-                    StdTeardown::ReapBlocking => {
-                        if let Err(e) = s.wait() {
-                            log_teardown_wait_failure(s.id(), &e);
-                        }
-                    }
+                    StdTeardown::ReapBlocking => s.wait().err().and_then(|e| teardown_wait_failure(s.id(), &e)),
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
-                    // child is still running (an elevated child we cannot signal), warn.
+                    // child is still running (an elevated child we cannot signal), report it.
                     StdTeardown::ReapNonBlocking => {
                         let still_running = !matches!(s.try_wait(), Ok(Some(_)));
                         let permission_denied =
                             matches!(&kill_result, Err(e) if e.kind() == io::ErrorKind::PermissionDenied);
-                        if still_running && permission_denied {
-                            log::warn!(
+                        (still_running && permission_denied).then(|| {
+                            format!(
                                 "elevated child {} could not be terminated on drop (permission denied); leaving it running",
                                 s.id()
-                            );
-                        }
+                            )
+                        })
                     }
                 }
             }
             #[cfg(windows)]
-            ProcHandle::Raw(r) => r.teardown_on_drop(),
+            ProcHandle::Raw(r) => {
+                r.teardown_on_drop();
+                None
+            }
         }
     }
 }
 
 /// A failed reap after a successful kill: `ECHILD` (someone else reaped the child) is expected
-/// and quiet; anything else leaves a zombie or an unread exit, and is a `warn`.
-fn log_teardown_wait_failure(pid: u32, e: &io::Error) {
+/// and logged at `debug`; anything else leaves a zombie or an unread exit, and is returned for the
+/// caller's warn.
+fn teardown_wait_failure(pid: u32, e: &io::Error) -> Option<String> {
     #[cfg(unix)]
     let gone = e.raw_os_error() == Some(libc::ECHILD);
     #[cfg(windows)]
     let gone = false;
     if gone {
         log::debug!("teardown of child {pid}: it was reaped elsewhere before the reap after the kill");
+        None
     } else {
-        log::warn!("teardown of child {pid}: the reap after the kill failed: {e}");
+        Some(format!("teardown of child {pid}: the reap after the kill failed: {e}"))
     }
 }
 

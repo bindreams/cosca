@@ -5,7 +5,11 @@
 
 use std::process::ExitStatus;
 
+#[cfg(unix)]
+use crate::child::drop_report::Forgot;
 use crate::error::Error;
+#[cfg(unix)]
+use crate::signal::RootState;
 use crate::signal::{Sent, Sig};
 
 /// How [`ProcSource::wait_and_reap`] ended.
@@ -178,7 +182,7 @@ fn counted(child: ::tokio::process::Child) -> ::tokio::process::Child {
 
 /// Dropping a backend that nothing released or forgot (an unwind out of a caller does this) does
 /// the one safe thing: the untaken streams close with the fields, and tokio's `Child` goes to its
-/// own drop only if [`ProcSource::classify`] shows it ours, else it is forgotten. It is quiet where
+/// own drop only if [`ProcSource::state`] shows it ours, else it is forgotten. It is quiet where
 /// it matters: no `log` call while unwinding, since a logger that panics there aborts.
 ///
 /// Nothing is killed: the backend does not know whether the handle was armed.
@@ -191,7 +195,8 @@ impl Drop for ProcSource {
         let Some(child) = child.take() else {
             return;
         };
-        if self.classify(&child).0 == Ownership::Ours {
+        // A child tokio already reaped has nothing left to drop wrongly.
+        if child.id().is_none() || matches!(self.state_of(&child), RootState::Unreaped) {
             drop(counted(child));
         } else {
             std::mem::forget(child);
@@ -202,18 +207,6 @@ impl Drop for ProcSource {
             }
         }
     }
-}
-
-/// What a backend's own handle shows of its child.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ownership {
-    /// Running, or exited and unreaped, and named by the handle: tokio may reap it.
-    Ours,
-    /// Reaped by someone else: the pid may name another process by now.
-    Foreign,
-    /// The handle could not say (a failed peek, or no unique id to check): not tokio's to reap.
-    Unknown,
 }
 
 /// What waiting on a forgotten child answers: nothing of ours is left to wait for.
@@ -386,15 +379,22 @@ impl ProcSource {
         let Some(pid) = child.id() else {
             return Ok(());
         };
-        match self.classify(child) {
-            (Ownership::Ours, _) => Ok(()),
-            (Ownership::Foreign, _) => {
+        match self.state_of(child) {
+            RootState::Unreaped => Ok(()),
+            RootState::Reaped => {
                 self.forget_foreign();
                 Err(gone())
             }
-            (Ownership::Unknown, failed) => Err(Error::Unassessable {
+            RootState::Unknown(failed) => Err(Error::Unassessable {
                 detail: format!("pid {pid}: the child cannot be shown to be ours; it was not waited on"),
-                source: failed,
+                source: Some(failed),
+            }),
+            RootState::Unpinned => Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid}: the child cannot be shown to be ours ({}); it was not waited on",
+                    crate::signal::UNPINNED_WHY
+                ),
+                source: None,
             }),
         }
     }
@@ -502,50 +502,39 @@ impl ProcSource {
         }
     }
 
-    /// Whether the child's own handle shows it was reaped by someone else, or cannot show it is
-    /// ours, so tokio's `Child` must not be dropped (its drop reaps by pid, and the pid may name
-    /// another process by now): [`ownership`](Ownership) is not `Ours`. A child that cannot be
-    /// shown to be ours is logged, naming the failed peek if there was one.
-    ///
-    /// `false` for a child tokio itself already reaped, and for one already forgotten.
-    #[cfg(unix)]
-    pub(crate) fn reaped_elsewhere(&self) -> bool {
-        let ProcSource::Tokio { child, .. } = self else {
-            return false;
-        };
-        match self.classify(child) {
-            (Ownership::Ours, _) => false,
-            (Ownership::Foreign, _) => true,
-            (Ownership::Unknown, failed) => {
-                let pid = child.id().unwrap_or(0);
-                match failed {
-                    Some(e) => log::warn!("child {pid} cannot be shown to be ours: its peek failed: {e}"),
-                    None => log::warn!("child {pid} cannot be shown to be ours"),
-                }
-                true
-            }
-        }
-    }
-
-    /// Whether `child` (this backend's tokio `Child`, which may already be taken out of it) is ours,
-    /// reaped elsewhere, or neither can be shown, with the failed peek if there was one. Quiet: it
-    /// may run during an unwind.
+    /// Whether the root is still this backend's child to act on, from its own handle; see
+    /// [`RootState`]. Nothing is logged: it may run during an unwind.
     ///
     /// - **Linux:** a peek through the pidfd. Exact, with no start token to collide.
     /// - **macOS:** a peek that checks the pid's unique id, including that a running child's id can
     ///   be read ([`exit_only::peek_verified`](crate::wait::exit_only)). A child with no unique id
-    ///   (a spawn whose unique id was not adopted, see `adopted_id`): unknown.
+    ///   (a spawn whose unique id was not adopted, see `adopted_id`) is `Unknown`: its unique-id
+    ///   read was refused, and nothing shows the pid still names it.
     ///
-    /// A child tokio already reaped is `Ours`: nothing is left to drop wrongly.
+    /// A child tokio reaped (`id()` is `None`) and a forgotten backend are `Reaped`.
     #[cfg(unix)]
-    fn classify(&self, child: &::tokio::process::Child) -> (Ownership, Option<std::io::Error>) {
-        use crate::wait::exit_only::Peek;
-        let ProcSource::Tokio { .. } = self else {
-            return (Ownership::Foreign, None);
-        };
-        if child.id().is_none() {
-            return (Ownership::Ours, None);
+    pub(crate) fn state(&self) -> RootState {
+        match self {
+            ProcSource::Foreign { .. } => RootState::Reaped,
+            ProcSource::Tokio { child, .. } if child.id().is_none() => RootState::Reaped,
+            ProcSource::Tokio { child, .. } => self.state_of(child),
         }
+    }
+
+    /// [`state`](ProcSource::state) of a `Tokio` backend whose `child` may already be taken out of
+    /// it (the drop does that), for a child tokio has not reaped.
+    #[cfg(unix)]
+    fn state_of(
+        &self,
+        #[cfg_attr(
+            target_os = "linux",
+            allow(unused_variables, reason = "Linux peeks the pidfd, not the pid")
+        )]
+        child: &::tokio::process::Child,
+    ) -> RootState {
+        let ProcSource::Tokio { .. } = self else {
+            return RootState::Reaped;
+        };
         #[cfg(target_os = "linux")]
         let peeked = {
             let ProcSource::Tokio { pidfd, .. } = self else {
@@ -559,14 +548,25 @@ impl ProcSource {
                 unreachable!("checked above")
             };
             let (Some(pid), Some(identity)) = (child.id(), *identity) else {
-                return (Ownership::Unknown, None);
+                return RootState::Unknown(std::io::Error::other(
+                    "the child's unique id is unknown, so nothing shows its pid still names it",
+                ));
             };
             crate::wait::exit_only::peek_verified(&crate::wait::exit_only::Target::pid(pid, Some(identity)))
         };
-        match peeked {
-            Ok(Peek::Running | Peek::Exit(_)) => (Ownership::Ours, None),
-            Ok(Peek::Foreign(_)) => (Ownership::Foreign, None),
-            Err(e) => (Ownership::Unknown, Some(e)),
+        RootState::of_peek(peeked)
+    }
+
+    /// The pid and non-`Unreaped` state of a child tokio has not reaped, if its handle shows one.
+    #[cfg(unix)]
+    fn elsewhere(&self) -> Option<(u32, RootState)> {
+        let ProcSource::Tokio { child, .. } = self else {
+            return None;
+        };
+        let pid = child.id()?;
+        match self.state_of(child) {
+            RootState::Unreaped => None,
+            state => Some((pid, state)),
         }
     }
 
@@ -653,43 +653,68 @@ impl ProcSource {
     /// - **Windows:** waits on tokio's process handle, which pins the child.
     ///
     /// On [`Waited::Foreign`] the caller calls [`forget_foreign`](ProcSource::forget_foreign).
+    #[cfg(any(windows, test))]
     pub(crate) fn wait_and_reap(&mut self, pid: u32) -> Waited {
+        self.wait_and_reap_at(pid, log::Level::Warn)
+    }
+
+    /// [`wait_and_reap`](ProcSource::wait_and_reap), logging what it finds that is not an exit at
+    /// `level`: for a caller that reports a [`Waited::Foreign`] itself, in its one warn.
+    #[cfg(any(windows, test))]
+    pub(crate) fn wait_and_reap_at(&mut self, pid: u32, level: log::Level) -> Waited {
+        self.wait_and_reap_caused(pid, level).0
+    }
+
+    /// [`wait_and_reap_at`](ProcSource::wait_and_reap_at), and why a [`Waited::Foreign`] was found:
+    /// the wait's error, or why the child is not ours.
+    pub(crate) fn wait_and_reap_caused(
+        &mut self,
+        pid: u32,
+        #[cfg_attr(
+            windows,
+            allow(unused_variables, reason = "a process handle pins its process: nothing to log")
+        )]
+        level: log::Level,
+    ) -> (Waited, Option<String>) {
         crate::bounded::assert_may_block("wait_and_reap");
         match self {
             #[cfg(unix)]
-            ProcSource::Foreign { .. } => Waited::Foreign,
+            ProcSource::Foreign { .. } => (Waited::Foreign, None),
             #[cfg(target_os = "linux")]
             ProcSource::Tokio { child, pidfd, .. } => {
                 if !still_ours(child) {
-                    return Waited::Exited;
+                    return (Waited::Exited, None);
                 }
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                wait_on_pidfd(pid, pidfd)
+                wait_on_pidfd(pid, pidfd, level)
             }
             #[cfg(target_os = "macos")]
             ProcSource::Tokio { child, identity, .. } => {
                 if !still_ours(child) {
-                    return Waited::Exited;
+                    return (Waited::Exited, None);
                 }
                 // No unique id is held, so nothing shows the pid names this child: it is never waited
                 // on.
                 let Some(identity) = identity else {
-                    return Waited::Foreign;
+                    return (
+                        Waited::Foreign,
+                        Some("no unique id is held, so nothing shows its pid names it".to_owned()),
+                    );
                 };
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
-                wait_reapable(pid, *identity)
+                wait_reapable(pid, *identity, level)
             }
             #[cfg(windows)]
             ProcSource::Tokio { child, .. } => {
                 if !still_ours(child) {
-                    return Waited::Exited;
+                    return (Waited::Exited, None);
                 }
                 #[cfg(test)]
                 crate::child::spawn::fault::run_between_kill_and_wait();
                 wait_on_handle(child, pid);
-                Waited::Exited
+                (Waited::Exited, None)
             }
             #[cfg(windows)]
             ProcSource::Raw(_) => unreachable!("the raw backend tears its own spawn failures down"),
@@ -703,15 +728,31 @@ impl ProcSource {
     ///
     /// Forgetting leaks what tokio's `Child` holds — on Linux its pidfd and its reactor
     /// registration, on macOS its `SIGCHLD` watch — so it is logged at `warn`, naming the pid.
+    /// Returns what the forget leaks, or `None` if the backend was already forgotten.
     #[cfg(unix)]
-    pub(crate) fn forget_foreign(&mut self) {
-        self.forget_because("was reaped by someone else, or cannot be shown to be ours");
+    pub(crate) fn forget_foreign(&mut self) -> Option<&'static str> {
+        self.forget_because("was reaped by someone else, or cannot be shown to be ours")
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign) for any reason: `why` completes "child N ...",
     /// so the warning says what actually happened.
     #[cfg(unix)]
-    pub(crate) fn forget_because(&mut self, why: &str) {
+    pub(crate) fn forget_because(&mut self, why: &str) -> Option<&'static str> {
+        let (pid, leak) = self.forget_quietly()?;
+        log::warn!("child {pid} {why}; forgetting tokio's handle for it leaks {leak}");
+        Some(leak)
+    }
+
+    /// Forget tokio's `Child` without logging, for a caller that reports the forget in its own one
+    /// warn. Returns the child's pid and what the forget leaks, or `None` if the backend was
+    /// already forgotten (or never held a child): nothing was forgotten, so nothing leaked.
+    #[cfg(unix)]
+    fn forget_quietly(&mut self) -> Option<(String, &'static str)> {
+        let leak = if cfg!(target_os = "linux") {
+            "tokio's pidfd and its reactor registration"
+        } else {
+            "tokio's SIGCHLD watch"
+        };
         let ProcSource::Tokio {
             child,
             stdin,
@@ -720,7 +761,7 @@ impl ProcSource {
             ..
         } = self
         else {
-            return;
+            return None;
         };
         let pid = child.id().map_or_else(|| "?".to_owned(), |pid| pid.to_string());
         let foreign = ProcSource::Foreign {
@@ -731,21 +772,64 @@ impl ProcSource {
         std::mem::replace(self, foreign).forget();
         #[cfg(test)]
         super::drop_fault::note_forget();
-        let leak = if cfg!(target_os = "linux") {
-            "tokio's pidfd and its reactor registration"
-        } else {
-            "tokio's SIGCHLD watch"
+        Some((pid, leak))
+    }
+
+    /// Forget tokio's `Child` where `view` shows the drop must not leave it to tokio's own drop,
+    /// which reaps by pid. One policy for every drop and cleanup, and a quiet one: the caller's one
+    /// warn carries what was forgotten.
+    /// - a root the view shows reaped is forgotten on that evidence;
+    /// - any other only if a second look shows it gone, not pinned, or unanswerable.
+    ///
+    /// `None` if nothing was forgotten: tokio already reaped the child, it is already forgotten, or
+    /// the second look shows it ours.
+    #[cfg(unix)]
+    pub(crate) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<Forgot> {
+        use crate::containment::dispatch::RootView;
+        let now = match view.root {
+            RootView::Reaped => {
+                if !self.holds_unreaped_child() {
+                    return None;
+                }
+                None
+            }
+            RootView::Unknown(_) | RootView::Unpinned | RootView::Trusted => Some(self.elsewhere()?.1),
         };
-        log::warn!("child {pid} {why}; forgetting tokio's handle for it leaks {leak}");
+        let (_, leak) = self.forget_quietly()?;
+        Some(Forgot { leak, now, cause: None })
+    }
+
+    /// Forget tokio's `Child` after a wait found it foreign for `cause`, quietly.
+    #[cfg(unix)]
+    pub(crate) fn forget_for_wait(&mut self, cause: Option<String>) -> Option<Forgot> {
+        let (_, leak) = self.forget_quietly()?;
+        Some(Forgot { leak, now: None, cause })
+    }
+
+    /// Whether tokio's `Child` is still held and has not reaped its child.
+    #[cfg(unix)]
+    fn holds_unreaped_child(&self) -> bool {
+        matches!(self, ProcSource::Tokio { child, .. } if child.id().is_some())
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that
-    /// release the backend without waiting: [`reaped_elsewhere`](ProcSource::reaped_elsewhere).
+    /// release the backend without waiting: the handle shows the child reaped elsewhere, not
+    /// pinned, or cannot be asked. One warn, naming the error when the handle could not say.
+    /// Returns what the forget leaks, if it forgot.
     #[cfg(unix)]
-    pub(crate) fn forget_if_foreign(&mut self) {
-        if self.reaped_elsewhere() {
-            self.forget_foreign();
-        }
+    pub(crate) fn forget_if_foreign(&mut self) -> Option<&'static str> {
+        let (_, state) = self.elsewhere()?;
+        let why = match &state {
+            RootState::Unknown(e) => format!("cannot be shown to be ours (RootState::Unknown: {e})"),
+            RootState::Unpinned => format!(
+                "is not pinned by this process (RootState::Unpinned: {})",
+                crate::signal::UNPINNED_WHY
+            ),
+            RootState::Unreaped | RootState::Reaped => {
+                "was reaped by someone else, or cannot be shown to be ours".to_owned()
+            }
+        };
+        self.forget_because(&why)
     }
 
     /// Guaranteed synchronous teardown for a spawn that failed after the fork: kill the child
@@ -793,8 +877,15 @@ impl ProcSource {
             return;
         }
         #[cfg(unix)]
-        if self.wait_and_reap(pid) == Waited::Foreign {
-            self.forget_foreign();
+        {
+            // The wait logs at `debug`: the forget's one warn carries its cause.
+            let (waited, cause) = self.wait_and_reap_caused(pid, log::Level::Debug);
+            if waited == Waited::Foreign {
+                let cause = cause.map_or_else(String::new, |c| format!(" ({c})"));
+                self.forget_because(&format!(
+                    "was reaped by someone else, or cannot be shown to be ours{cause}"
+                ));
+            }
         }
         #[cfg(windows)]
         self.wait_and_reap(pid);
@@ -928,9 +1019,10 @@ fn still_ours(child: &::tokio::process::Child) -> bool {
     ours
 }
 
-/// Linux: waits until the exit is visible to this process, through the child's own pidfd.
+/// Linux: waits until the exit is visible to this process, through the child's own pidfd. What it
+/// finds that is not an exit is logged at `level` and returned as the cause.
 #[cfg(target_os = "linux")]
-fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd) -> Waited {
+fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd, level: log::Level) -> (Waited, Option<String>) {
     use std::os::fd::AsFd;
 
     use crate::wait::exit_only::{self, Peek, Target};
@@ -941,20 +1033,29 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd) -> Waited {
             if let exit_only::Reaped::Status(status) = _reaped {
                 crate::child::spawn::fault::record_teardown_reap(pid, status);
             }
-            Waited::Exited
+            (Waited::Exited, None)
         }
-        Ok(Peek::Foreign(_)) => Waited::Foreign,
+        Ok(Peek::Foreign(_)) => (
+            Waited::Foreign,
+            Some("waitid on its pidfd found it reaped by someone else (ECHILD)".to_owned()),
+        ),
         // A blocking wait that returns without an exit is a contract breach, like an errno that
         // is not `ECHILD`. Without proof the child is ours, tokio's by-pid reap must not run.
         Ok(Peek::Running) => {
-            log::warn!("wait_and_reap: waitid on child {pid}'s pidfd returned without an exit");
+            log::log!(
+                level,
+                "wait_and_reap: waitid on child {pid}'s pidfd returned without an exit"
+            );
             debug_assert!(false, "a blocking waitid on a pidfd returned without an exit");
-            Waited::Foreign
+            (
+                Waited::Foreign,
+                Some("waitid on its pidfd returned without an exit".to_owned()),
+            )
         }
         Err(e) => {
-            log::warn!("wait_and_reap: waitid on child {pid}'s pidfd failed: {e}");
+            log::log!(level, "wait_and_reap: waitid on child {pid}'s pidfd failed: {e}");
             debug_assert!(false, "waitid on a child's own pidfd failed: {e}");
-            Waited::Foreign
+            (Waited::Foreign, Some(format!("waitid on its pidfd failed: {e}")))
         }
     }
 }
@@ -963,9 +1064,9 @@ fn wait_on_pidfd(pid: u32, pidfd: &std::os::fd::OwnedFd) -> Waited {
 /// this process can reap. It never reaps: tokio's field-drop does. A child a tracer holds answers
 /// `ECHILD` to `waitid` and is still running, so the wait goes on until the tracer hands it back.
 /// Anything that cannot be shown to be ours is [`Waited::Foreign`] (see
-/// [`ProcSource::wait_and_reap`]).
+/// [`ProcSource::wait_and_reap`]), logged at `level` and returned as the cause.
 #[cfg(target_os = "macos")]
-fn wait_reapable(pid: u32, identity: u64) -> Waited {
+fn wait_reapable(pid: u32, identity: u64, level: log::Level) -> (Waited, Option<String>) {
     use crate::wait::backend::{await_reapable, Waited as Awaited};
     match await_reapable(pid, Some(identity), None) {
         Ok(Awaited::Reapable) => {
@@ -975,26 +1076,33 @@ fn wait_reapable(pid: u32, identity: u64) -> Waited {
             {
                 crate::child::spawn::fault::record_teardown_reap(pid, status);
             }
-            Waited::Exited
+            (Waited::Exited, None)
         }
-        Ok(Awaited::Gone) => Waited::Foreign,
+        Ok(Awaited::Gone) => (
+            Waited::Foreign,
+            Some("its pid is gone, or names another process".to_owned()),
+        ),
         Ok(Awaited::Orphaned) => {
-            log::warn!(
+            log::log!(
+                level,
                 "wait_and_reap: child {pid} cannot be shown to be ours or reaped (launchd holds it, because its \
                  tracer died)"
             );
-            Waited::Foreign
+            (Waited::Foreign, Some(crate::signal::UNPINNED_WHY.to_owned()))
         }
         // Unbounded, so the deadline cannot pass: a contract breach.
         Ok(Awaited::DeadlinePassed) => {
             log::warn!("wait_and_reap: the unbounded wait on child {pid} reported a passed deadline");
             debug_assert!(false, "an unbounded wait reported a passed deadline");
-            Waited::Foreign
+            (
+                Waited::Foreign,
+                Some("the unbounded wait reported a passed deadline".to_owned()),
+            )
         }
         // Without proof the child is ours, tokio's by-pid reap must not run.
         Err(e) => {
-            log::warn!("wait_and_reap: waiting on child {pid} failed: {e}");
-            Waited::Foreign
+            log::log!(level, "wait_and_reap: waiting on child {pid} failed: {e}");
+            (Waited::Foreign, Some(format!("waiting on it failed: {e}")))
         }
     }
 }

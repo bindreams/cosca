@@ -560,7 +560,16 @@ impl Command {
     /// that outlived the reaped root keeps running: call [`kill_tree`](crate::Child::kill_tree)
     /// **before** `wait()` to end it; once it has killed the tree completely, the skip is logged at
     /// `debug`. A root reaped by someone else is neither killed nor waited for by its number
-    /// either.
+    /// either. The evidence is the child's own handle (on Linux its pidfd), or the number no
+    /// longer reading as the root. If the handle cannot say (a failed peek), the same kills are
+    /// skipped and a warning says so; the root itself is still killed through its handle.
+    ///
+    /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
+    /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`
+    /// instead: the pid is not this process's, and a signal or reap by it could hit whoever
+    /// reuses it. An fd marker's drop still sweeps the descendants that hold the marker, by
+    /// identity, but leaves that root out of the sweep. The public kill paths do not yet handle this
+    /// case.
     ///
     /// **Kernel requirement.** Complete cgroup containment assumes the kernel fix `b69bb476dee9`
     /// ("cgroup: fix race between fork and cgroup.kill"): mainline 6.14 and later, or a stable

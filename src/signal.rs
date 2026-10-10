@@ -40,6 +40,55 @@ pub(crate) enum Sent {
     Gone,
 }
 
+/// Whether an owned child's root is still its own child to act on, as its own handle says.
+///
+/// Unix only: a Windows process handle pins its process, so nothing there asks.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum RootState {
+    /// The root is an unreaped child (a zombie at worst): its pid names it, and a signal through
+    /// its handle reaches it.
+    Unreaped,
+    /// The root was reaped, by this handle or by someone else: its pid may name another process.
+    Reaped,
+    /// The handle could not say: a failed peek, or (macOS) a refused unique-id read. Treated as
+    /// neither reaped nor unreaped; callers skip what a reuse of the pid could redirect, and act
+    /// only through the handle.
+    Unknown(io::Error),
+    /// The root exists, but this process does not pin it (macOS: launchd holds its zombie after
+    /// its tracer died, and reaps it on its own schedule). Its pid is not ours: nothing may be
+    /// signalled or waited on by it. [`UNPINNED_WHY`] says why.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS reports an unpinned root")
+    )]
+    Unpinned,
+}
+
+/// Why a root is [`RootState::Unpinned`], for every message that reports it.
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS reports an unpinned root")
+)]
+pub(crate) const UNPINNED_WHY: &str =
+    "the root's zombie is held by launchd (its tracer died), so it is neither reaped nor ours to reap";
+
+#[cfg(unix)]
+impl RootState {
+    /// What a peek through the root's own handle shows.
+    pub(crate) fn of_peek(peeked: io::Result<crate::wait::exit_only::Peek>) -> RootState {
+        use crate::wait::exit_only::Peek;
+        match peeked {
+            Ok(Peek::Running | Peek::Exit(_)) => RootState::Unreaped,
+            #[cfg(target_os = "macos")]
+            Ok(Peek::Foreign(crate::wait::exit_only::Foreign::Orphaned)) => RootState::Unpinned,
+            Ok(Peek::Foreign(_)) => RootState::Reaped,
+            Err(e) => RootState::Unknown(e),
+        }
+    }
+}
+
 /// Send `sig` through `pidfd`, which names the child for good, so a reused pid cannot be hit.
 /// `None` is a child that was already gone when its handle was made.
 #[cfg(target_os = "linux")]

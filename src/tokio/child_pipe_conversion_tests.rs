@@ -26,6 +26,8 @@ fn a_child_without_a_process() -> Child {
         graceful: crate::graceful::GracefulMechanism::Process,
         elevation: None,
         front: None,
+        #[cfg(unix)]
+        reported: false,
     }
 }
 
