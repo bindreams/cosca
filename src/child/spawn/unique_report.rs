@@ -21,7 +21,8 @@
 //! Nor does it mean the child has reported yet. With two of this process's fds 0 to 2 closed, std's
 //! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
 //! hooks run (see `crate::containment::cgroup::channel::ReportChannel`). The pipe is then empty but
-//! open, [`Report::Unwritten`], and the child may report and `exec` afterwards.
+//! open, [`Report::Unwritten`], and the child may report and `exec` afterwards. The spawn then kills
+//! and reaps it by pid: this process is its parent and has not reaped it, so the number is pinned.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -184,7 +185,8 @@ pub(crate) enum Unadoptable {
     /// It died before `exec`, so only a corpse is left, and the program did not start.
     DiedBeforeExec,
     /// It had not reported when its spawn returned ([`Report::Unwritten`]): it may yet report, `exec`
-    /// and run the program, so it is left running, and the program may have started.
+    /// and run the program, so the program may have started. It is this process's own unreaped child,
+    /// so the spawn kills and reaps it by pid (an elevation front is left unreaped instead).
     Unreported,
     /// Its report could not be read or is malformed: nothing shows what it is doing, and the program
     /// may have started.
