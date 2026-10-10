@@ -110,6 +110,7 @@ pub(crate) mod fault {
     use std::cell::{Cell, RefCell};
 
     thread_local! {
+        static TERMED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static FAIL: Cell<bool> = const { Cell::new(false) };
     }
@@ -119,6 +120,32 @@ pub(crate) mod fault {
     pub(crate) fn record_kill_group() -> KillGroupRecorder {
         KILLED.with(|k| *k.borrow_mut() = Some(Vec::new()));
         KillGroupRecorder(())
+    }
+
+    /// From now on `term_group` on THIS thread records its group and sends nothing.
+    pub(crate) fn record_term_group() -> TermGroupRecorder {
+        TERMED.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        TermGroupRecorder(())
+    }
+
+    #[must_use = "recording stops as soon as the recorder is dropped"]
+    pub(crate) struct TermGroupRecorder(());
+
+    impl TermGroupRecorder {
+        /// The groups `term_group` was asked to signal since the recorder was made.
+        pub(crate) fn termed(&self) -> Vec<i32> {
+            TERMED.with(|t| t.borrow().clone().expect("the recorder is live"))
+        }
+    }
+
+    impl Drop for TermGroupRecorder {
+        fn drop(&mut self) {
+            TERMED.with(|t| *t.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn intercept_term_group(pgid: i32) -> bool {
+        TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some())
     }
 
     #[must_use = "recording stops as soon as the recorder is dropped"]
@@ -175,6 +202,10 @@ pub(crate) mod fault {
 /// Send the graceful signal to the whole process group, then confirm no live
 /// member refused it. See [`signal_group`].
 pub(crate) fn term_group(pgid: i32) -> Result<(), Error> {
+    #[cfg(test)]
+    if fault::intercept_term_group(pgid) {
+        return Ok(());
+    }
     signal_group(pgid, Signal::SIGTERM)
 }
 

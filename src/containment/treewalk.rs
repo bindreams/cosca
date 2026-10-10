@@ -250,6 +250,8 @@ pub(crate) fn kill_by_identity(id: ProcessId, signal: Signal) -> KillOutcome {
         );
         return KillOutcome::NotAttempted;
     };
+    #[cfg(test)]
+    crate::send_log::record_by_identity(id.pid(), signal as i32);
     match kill(Pid::from_raw(target), signal) {
         Ok(()) => KillOutcome::Terminated,
         // Exited between the re-verify and the signal - nothing was left to kill.
