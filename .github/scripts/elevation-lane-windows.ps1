@@ -91,6 +91,8 @@ try {
     $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
         -WorkingDirectory $work -Wait -PassThru
     $exitCode = $process.ExitCode
+    # The handle keeps the logon session, and so its profile hive, alive.
+    $process.Dispose()
 } finally {
     # Print what the run said before its directory goes. Each step below stops on failure: the step fails, and no
     # exit path leaves anything behind unnoticed.
