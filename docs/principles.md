@@ -240,7 +240,7 @@ joined with `#[fixture(elevation)] _group: &Group`, selected by `SKULD_LABELS=el
 Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries and surveys),
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
-are `test_group!` rows like `namespaces`, and which `windows-probes.yaml` selects by label.
+are `test_group!` rows like `namespaces`, and which the canary steps of the `Test (windows/...)` jobs in `ci.yaml` (and `windows-probes.yaml`, weekly and on dispatch) select by label.
 CI turns each off workflow-wide and opts in only in the step or job that runs it.
 
 **Why:** a bug in such a test reaches whatever machine it runs on, so the sandbox, not the test's

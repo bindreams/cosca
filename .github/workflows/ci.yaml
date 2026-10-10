@@ -156,7 +156,8 @@ jobs:
             # 26.04: the elevation lane needs polkit 0.106 or later, and its `polkit.service` is
             # `Type=notify-reload` there. The root lanes' containers run `ubuntu:26.04`, the runner's own glibc.
             runner: ubuntu-26.04
-            root_image: ubuntu:26.04
+            # ubuntu:26.04 (multi-arch index digest)
+            root_image: ubuntu@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
             timeout: 30
             target: x86_64-unknown-linux-gnu
             other: aarch64-unknown-linux-gnu
@@ -164,7 +165,8 @@ jobs:
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            root_image: ubuntu:24.04
+            # ubuntu:24.04 (multi-arch index digest)
+            root_image: ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
             timeout: 29
             target: aarch64-unknown-linux-gnu
             other: x86_64-unknown-linux-gnu
@@ -205,9 +207,10 @@ jobs:
             nextest: ./.github/scripts/run-nextest.ps1
 
     runs-on: ${{ matrix.runner }}
-    # Per-job failure bound, 1.5x the slowest wall time measured over two runs of #626, lanes included
-    # (minutes): linux/amd64 19.6, linux/arm64 18.9, darwin/arm64 26.9, darwin/amd64 34.9, windows/amd64 21.6
-    # (main's last green run, before the lanes joined, took 30.2 and the elevation job 3.9), windows/arm64 33.8. The clippy powerset release step dominates the Windows jobs.
+    # Per-job failure bound (minutes), about 1.5x the slowest wall time measured over the runs of #626, lanes
+    # included: linux/amd64 19.6 (bound 30), linux/arm64 18.9 (29), darwin/arm64 26.9 (41), darwin/amd64 34.9
+    # (53), windows/amd64 32.5 (51), windows/arm64 33.8 (51). The clippy powerset release step dominates the
+    # Windows jobs.
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
@@ -514,6 +517,7 @@ jobs:
       # create a user namespace. The group is selected by its label (`SKULD_LABELS=setuid`), in the
       # two binaries that carry it (see principle 10).
       - name: Set up setuid-root helper (Linux)
+        id: lin_helper
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
@@ -525,10 +529,12 @@ jobs:
           cp "$BIN" "$HELPER"
           sudo chown root:root "$HELPER"
           sudo chmod 4755 "$HELPER"
-          echo "COSCA_TEST_SETUID_HELPER=$HELPER" >> "$GITHUB_ENV"
+          echo "helper=$HELPER" >> "$GITHUB_OUTPUT"
 
       - name: Check the setuid lane (Linux)
         if: matrix.os == 'linux'
+        env:
+          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
         run: bash .github/scripts/setuid-lane-check.sh "$COSCA_TEST_SETUID_HELPER"
 
       - name: Build setuid tests (Linux)
@@ -542,6 +548,7 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
+          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
 
@@ -569,6 +576,7 @@ jobs:
         env:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
+          COSCA_TEST_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid_root
         run: |
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
@@ -633,7 +641,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          cargo nextest run --locked --profile ci --target "$TARGET" --test windows_path_resolution --no-capture --no-tests=fail
+          cargo nextest run --locked --profile ci-canary --target "$TARGET" --test windows_path_resolution --no-capture --no-tests=fail
 
       # A canary filter matching nothing would otherwise pass having asserted nothing. Runs after a failure too,
       # so the log shows which canaries passed.
@@ -669,7 +677,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir "$COSCA_CANARY_MARKERS"
-          cargo nextest run --locked --profile ci --target "$TARGET" --test windows_shell_execute --no-capture --no-tests=fail
+          cargo nextest run --locked --profile ci-shell-execute --target "$TARGET" --test windows_shell_execute --no-capture --no-tests=fail
 
       - name: Windows canaries - require that an elevating probe ran
         if: ${{ !cancelled() && matrix.os == 'windows' }}
@@ -684,6 +692,15 @@ jobs:
             exit 1
           fi
           printf 'elevating probe passed: %s\n' "${passed[@]##*/}"
+
+      - name: Windows canaries - upload JUnit
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        uses: ./.github/actions/upload-junit
+        with:
+          name: canary-windows-${{ matrix.arch }}
+          path: |
+            ${{ github.workspace }}/target/nextest/ci-canary/junit.xml
+            ${{ github.workspace }}/target/nextest/ci-shell-execute/junit.xml
 
       # Root lanes (Linux) =====
       #
@@ -857,8 +874,8 @@ jobs:
             echo "tmpdir=$COSCA_ROOT_TMPDIR"
           } >> "$GITHUB_OUTPUT"
 
-      # `sudo -E` keeps `TMPDIR`. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned. The root
-      # shell hands `target` back to the runner user, so later lanes can write to it.
+      # `sudo -E` keeps `TMPDIR`. The lane fails unless it really is euid 0 and `TMPDIR` is root-owned. The step after it
+      # hands `target` back to the runner user, so later lanes can write to it.
       - name: Root lane (macOS, sudo -E)
         id: mac_root_run
         if: ${{ !cancelled() && steps.mac_root_dirs.outcome == 'success' }}
@@ -878,9 +895,14 @@ jobs:
             test "$(stat -f %u "$TMPDIR")" = 0
             status=0
             SKULD_LABELS=root "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --no-tests=fail -E "$PRIVILEGE_TESTS" || status=1
-            chown -R "$3" "$PWD/target"
             exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR" "$(id -u):$(id -g)"
+          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/root-lane-macos.tar.zst" "$COSCA_EXTRACT_DIR"
+
+      # Root wrote into `target`; hand it back even when the lane was killed, or the elevation archive step fails on it.
+      - name: Root lane (macOS) - hand the target directory back
+        if: ${{ always() && steps.mac_root_run.outcome != 'skipped' && steps.mac_root_run.outcome != '' }}
+        shell: bash
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD/target"
 
       - name: Root lane (macOS) - upload JUnit
         if: ${{ !cancelled() && steps.mac_helper.outcome != 'skipped' }}

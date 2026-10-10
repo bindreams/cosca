@@ -105,6 +105,14 @@ inherits = "ci"
 [profile.ci-root]
 inherits = "ci"
 
+# The Windows canaries of the test job (`windows_path_resolution`, `windows_shell_execute`), each under a profile of its
+# own so each publishes its own JUnit file.
+[profile.ci-canary]
+inherits = "ci"
+
+[profile.ci-shell-execute]
+inherits = "ci"
+
 [[profile.ci.overrides]]
 # `windows_shell_resolution.rs` already bounds its own external waits in-process: every
 # `ShellExecuteExW` call likely to hang is wrapped in `shell_execute_bounded`/`SHELL_EXECUTE_BOUND`
