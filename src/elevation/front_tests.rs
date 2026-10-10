@@ -262,3 +262,24 @@ fn a_front_reaped_before_its_cgroup_is_read_was_reached() {
     let (r, _) = reached_asking_in_turn(vec![Ok(false), Ok(false)], reaped());
     r.expect_err("still running, unplaced");
 }
+
+/// A reach check of a child that is no front is a contract violation. Mutant: "debug_assert
+/// removed".
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "only a front's cgroup kill is checked")]
+fn a_reach_check_with_no_front_asserts() {
+    drop(super::cgroup_kill_reached(None, PID, || Ok(true), || Ok(true)));
+}
+
+/// In release the same check fails closed, like its siblings: nothing shows the kill reached a
+/// front it does not know. Mutant: "`None` answers `Ok(())`".
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn a_reach_check_with_no_front_fails_closed_in_release() {
+    let r = super::cgroup_kill_reached(None, PID, || Ok(true), || Ok(true));
+    let Err(Error::Containment { detail }) = r else {
+        panic!("expected a refusal, got {r:?}");
+    };
+    assert!(detail.contains(&format!("pid {PID}")), "{detail}");
+}

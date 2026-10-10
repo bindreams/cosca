@@ -148,7 +148,9 @@ pub(crate) fn cgroup_kill_reached(
 ) -> Result<(), Error> {
     let Some(front) = front else {
         debug_assert!(false, "only a front's cgroup kill is checked");
-        return Ok(());
+        return Err(Error::Containment {
+            detail: format!("pid {pid}'s cgroup kill is not shown to have reached it: it is no front"),
+        });
     };
     let mut unread = Vec::new();
     match exited() {
