@@ -6,7 +6,68 @@
 //! (lane selection, `SKULD_LABELS=<label>`).
 
 /// Proof that the group is enabled (and consented to, where asked).
-pub(crate) struct Group;
+///
+/// The `cgroup` group also carries a [`StrayLeaves`] check that runs when the test ends.
+pub(crate) struct Group {
+    #[allow(dead_code, reason = "held only for its Drop")]
+    stray_leaves: Option<StrayLeaves>,
+}
+
+impl Group {
+    pub(crate) fn plain() -> Group {
+        Group { stray_leaves: None }
+    }
+
+    /// This group, plus a check at the end of the test that it left no cosca cgroup leaf behind.
+    #[allow(dead_code, reason = "a root that includes this file may have no test in the group")]
+    pub(crate) fn watching_leaves(self) -> Group {
+        Group {
+            stray_leaves: Some(StrayLeaves::new()),
+        }
+    }
+}
+
+/// Fails the test that created a cosca cgroup leaf and did not remove it. A leaf is named
+/// `cosca-<pid>-<n>-<random>` in this process's own cgroup, and a test process is one test (nextest),
+/// so at the end of the test every leaf of this pid is that test's. A test that is already failing
+/// only reports them: a second panic while unwinding aborts the binary.
+pub(crate) struct StrayLeaves {
+    pub(crate) own_cgroup: Option<std::path::PathBuf>,
+}
+
+impl StrayLeaves {
+    fn new() -> StrayLeaves {
+        let own_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("0::/"))
+                .map(|rel| std::path::Path::new("/sys/fs/cgroup").join(rel))
+        });
+        StrayLeaves { own_cgroup }
+    }
+}
+
+impl Drop for StrayLeaves {
+    fn drop(&mut self) {
+        let Some(dir) = &self.own_cgroup else { return };
+        let prefix = format!("cosca-{}-", std::process::id());
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let left: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        if left.is_empty() {
+            return;
+        }
+        let test = std::thread::current().name().unwrap_or("?").to_owned();
+        let message = format!("{test} left cgroup leaves behind in {}: {left:?}", dir.display());
+        if std::thread::panicking() {
+            eprintln!("{message}");
+        } else {
+            panic!("{message}");
+        }
+    }
+}
 
 /// The rule behind every group: `Ok(false)` for `enabled_var=0`; `Err` naming the consent
 /// variable for an enabled group without exactly `<enabled_var>_CONSENT=1`.
@@ -39,7 +100,7 @@ pub(crate) fn require_consent(
     var: impl Fn(&str) -> Option<String>,
 ) -> Result<Group, String> {
     match check_group(enabled_var, var) {
-        Ok(true) => Ok(Group),
+        Ok(true) => Ok(Group::plain()),
         // skuld runs the body of a test whose `requires` failed when ignored tests are included
         // (`--run-ignored only`), so a group that is off refuses here as well.
         Ok(false) => Err(format!("{enabled_var}=0")),
@@ -53,11 +114,15 @@ pub(crate) fn require_consent(
 ///
 /// A test file brings the fixture into scope with `use crate::test_groups::{$fixture, Group};`.
 macro_rules! test_group {
+    ($label:ident => $fixture:ident, env = $env:literal, consent = $what:literal, watching_leaves) => {
+        test_group!(@declare $label, $fixture, $env,
+            require_consent($env, $what, |name| std::env::var(name).ok()).map(Group::watching_leaves));
+    };
     ($label:ident => $fixture:ident, env = $env:literal, consent = $what:literal) => {
         test_group!(@declare $label, $fixture, $env, require_consent($env, $what, |name| std::env::var(name).ok()));
     };
     ($label:ident => $fixture:ident, env = $env:literal) => {
-        test_group!(@declare $label, $fixture, $env, require_enabled($env, |name| std::env::var(name).ok()).map(|()| Group));
+        test_group!(@declare $label, $fixture, $env, require_enabled($env, |name| std::env::var(name).ok()).map(|()| Group::plain()));
     };
     (@declare $label:ident, $fixture:ident, $env:literal, $setup:expr) => {
         mod $fixture {
@@ -83,7 +148,7 @@ test_group!(PATH_PROBES => path_probes, env = "COSCA_TEST_PATH_PROBES", consent 
 test_group!(SHELL_EXECUTE => shell_execute, env = "COSCA_TEST_SHELL_EXECUTE", consent = "elevates through ShellExecuteEx and registers volatile App Paths keys");
 test_group!(SHELL_PROBES => shell_probes, env = "COSCA_TEST_SHELL_PROBES", consent = "plants and executes batch files through ShellExecuteEx and launches copies of cosca_testbin_image");
 test_group!(ELEVATION_ROUTES => elevation_routes, env = "COSCA_TEST_ELEVATION_ROUTES", consent = "derives tokens, creates accounts and a scheduled task, launches copies of this test binary under derived tokens and scratch accounts, and plants a batch file that CreateProcessW may run");
-test_group!(CGROUP => cgroup, env = "COSCA_TEST_CGROUP", consent = "creates, kills and removes cgroup v2 leaves, runs process trees in them, and unshares file tables and mount namespaces to mount over them");
+test_group!(CGROUP => cgroup, env = "COSCA_TEST_CGROUP", consent = "creates, kills and removes cgroup v2 leaves, runs process trees in them, and unshares file tables and mount namespaces to mount over them", watching_leaves);
 test_group!(TRACER => tracer_group, env = "COSCA_TEST_TRACER", consent = "attaches a tracer with ptrace to its own children as a debugger would, re-executes the test binary as that tracer (on macOS an ad-hoc signed copy with the debugger entitlement), and on Linux allows any process to trace its tracee");
 test_group!(UID_SWITCH => uid_switch, env = "COSCA_TEST_UID_SWITCH", consent = "runs as real root and switches to other real uids, spawning and signalling processes under them");
 test_group!(ELEVATION => elevation, env = "COSCA_TEST_ELEVATION", consent = "runs commands with real administrator or root privileges");

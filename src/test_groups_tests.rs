@@ -1,6 +1,6 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test, one real `ROOT` test, one real `CGROUP` test and one real `TRACER` test under chosen environments. None of the bodies runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
-use crate::test_groups::{check_group, require_consent, require_enabled, Group};
+use crate::test_groups::{check_group, require_consent, require_enabled, Group, StrayLeaves};
 use crate::test_harness::{
     CGROUP, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
     TRACER, UID_SWITCH,
@@ -92,7 +92,7 @@ fn require_enabled_fails_only_for_0() {
 fn require_consent_grants_only_on_exactly_1() {
     assert!(matches!(
         require_consent("COSCA_TEST_X", "does a thing", env(&[("COSCA_TEST_X_CONSENT", "1")])),
-        Ok(Group)
+        Ok(_)
     ));
     let off = [("COSCA_TEST_X", "0"), ("COSCA_TEST_X_CONSENT", "1")];
     let why = require_consent("COSCA_TEST_X", "does a thing", env(&off))
@@ -411,4 +411,27 @@ mod reexec {
     fn the_tracer_label_selects_its_tests() {
         assert_label_selects(&TRACER);
     }
+}
+
+/// A leaf of this pid left in the cgroup fails the test that ended with it. Mutant: the check is deleted.
+#[skuld::test]
+fn a_leaf_left_behind_fails_the_test_that_made_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(format!("cosca-{}-0-abc", std::process::id()))).unwrap();
+    let stray = StrayLeaves {
+        own_cgroup: Some(dir.path().to_path_buf()),
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(stray)));
+    assert!(outcome.is_err(), "a leaf was left behind and the check passed");
+}
+
+/// Another process's leaf, and an empty cgroup, are not this test's.
+#[skuld::test]
+fn only_this_pids_leaves_are_strays() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(format!("cosca-{}-0-abc", std::process::id() + 1))).unwrap();
+    std::fs::create_dir(dir.path().join("unrelated")).unwrap();
+    drop(StrayLeaves {
+        own_cgroup: Some(dir.path().to_path_buf()),
+    });
 }
