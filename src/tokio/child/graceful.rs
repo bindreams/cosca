@@ -75,7 +75,12 @@ impl Child {
     ///
     /// **A macOS graphically-elevated child** is refused, as for the sync
     /// [`Child::terminate`](crate::Child::terminate).
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        self.refuse_unpinned("terminate")?;
         #[cfg(unix)]
         if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
             return Err(unkillable);
@@ -131,6 +136,9 @@ impl Child {
     /// Needs a runtime with the IO **and** time drivers enabled (the `#[tokio::main]` /
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         self.terminate()?;
         // A watch failure must not strand the child between the soft signal and the escalation —
@@ -145,6 +153,8 @@ impl Child {
                     id = self.id().pid()
                 );
             }
+            #[cfg(test)]
+            fault::run_hook(fault::HookPoint::BeforeEscalation);
             self.kill()?; // escalate; an Err returns HERE, subsuming any watch Err
         }
         #[cfg(test)]
@@ -256,7 +266,15 @@ impl Child {
     /// than returning a typed error. On Windows the grace-wait runs on the blocking pool:
     /// each in-flight call occupies one blocking-pool thread for up to `grace` — size the
     /// pool accordingly for many long concurrent shutdowns.
+    ///
+    /// **macOS, a root launchd holds** is refused with nothing sent, as for the sync
+    /// [`Child::kill`](crate::Child::kill).
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
+        // Before the grace is waited: a root this process does not pin is neither signalled nor
+        // watched.
+        self.require_contained()?;
+        #[cfg(unix)]
+        self.refuse_unpinned("graceful_shutdown_tree")?;
         // terminate_tree's own require_contained guard fires before any signal, so an
         // uncontained child errors up front.
         #[cfg(test)]
