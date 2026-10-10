@@ -23,10 +23,10 @@ use crate::{ContainMode, Containment, Stdio};
 use super::child_drop_reaped_tests::cgroup_common;
 
 /// Removes the child's leaf when the test ends, a failing one too: a tokio drop does not wait for the leaf to drain.
-fn clean_up_leaf_of(child: &Child) -> cgroup_common::LeafGuard {
+fn clean_up_leaf_of(child: &Child) -> Option<cgroup_common::LeafGuard> {
     match &child.os.attached {
-        crate::containment::Attached::Cgroup(leaf) => cgroup_common::LeafGuard::new(leaf.path().to_path_buf()),
-        other => panic!("a cgroup child holds its leaf, got {other:?}"),
+        crate::containment::Attached::Cgroup(leaf) => Some(cgroup_common::LeafGuard::new(leaf.path().to_path_buf())),
+        _ => None,
     }
 }
 
@@ -125,6 +125,7 @@ async fn cgroup_drop_of_a_front_kills_it_through_the_cgroup(#[fixture(cgroup)] _
     crate::log_capture::install();
     let roots = drop_fault::record();
     let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pidfd = pidfd_of(child.id().pid());
     let mark = crate::log_capture::mark();
     drop(child);
@@ -150,6 +151,7 @@ async fn cgroup_a_failed_drop_kill_of_a_front_leaves_the_front_alone(#[fixture(c
     crate::tokio::test_runtime::assert_current_thread();
     let roots = drop_fault::record();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let crate::containment::Attached::Cgroup(leaf) = &child.os.attached else {
         panic!("expected a cgroup leaf, got {:?}", child.os.attached);
     };
@@ -307,6 +309,7 @@ async fn cgroup_drop_of_a_front_that_refuses_signals_kills_it(#[fixture(cgroup)]
     crate::log_capture::install();
     let roots = drop_fault::record();
     let (child, _stdin) = spawn_nobody_front().await;
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pidfd = pidfd_of(child.id().pid());
     let mark = crate::log_capture::mark();
     {
@@ -323,6 +326,7 @@ async fn cgroup_drop_of_a_front_that_refuses_signals_kills_it(#[fixture(cgroup)]
 async fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixture(cgroup)] _group: &Group) {
     crate::tokio::test_runtime::assert_current_thread();
     let (child, stdin) = spawn_nobody_front().await;
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pidfd = pidfd_of(child.id().pid());
     let _refusing = WithoutKillCap::refusing(child.id().pid());
     // The teardown awaits its leaf's drain, which only the cgroup kill brings about: that the kill
@@ -364,6 +368,7 @@ async fn cgroup_a_front_that_left_its_leaf_is_unkillable_and_sent_nothing(#[fixt
     crate::tokio::test_runtime::assert_current_thread();
     let roots = drop_fault::record();
     let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pid = child.id().pid();
     let pidfd = pidfd_of(pid);
     move_out_of_its_leaf(pid);
@@ -412,6 +417,7 @@ async fn cgroup_drop_of_a_front_moved_out_during_its_kill_warns(#[fixture(cgroup
     crate::log_capture::install();
     let roots = drop_fault::record();
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pid = child.id().pid();
     let pidfd = pidfd_of(pid);
     let _moving = crate::containment::cgroup::fault::set_before_kill_write(move || move_out_of_its_leaf(pid));
@@ -431,6 +437,7 @@ async fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _g
     let mut cmd = in_cgroup(cat());
     cmd.kill_on_drop(false);
     let (child, _stdin) = spawn_as(cmd, SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let gates = crate::elevation::front::seams::count_kill_gates();
     let err = crate::tokio::spawn::finish_elevated(
         child,
@@ -572,6 +579,7 @@ async fn cgroup_a_failed_password_write_whose_cgroup_kill_fails_refuses_as_kill_
 ) {
     use crate::child::front_cgroup_tests::assert_front_refused_by_its_cgroup_kill;
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let id = child.id();
     let pid = id.pid();
     let pidfd = pidfd_of(pid);
