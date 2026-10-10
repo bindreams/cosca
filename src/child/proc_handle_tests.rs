@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::ProcHandle;
 use super::{std_teardown_action, StdTeardown};
 

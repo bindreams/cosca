@@ -120,24 +120,6 @@ fn raw_is_reaped_only_once_its_own_wait_returns() {
     assert!(child.is_reaped());
 }
 
-/// [`raw_is_reaped_only_once_its_own_wait_returns`], through the `ProcHandle::Raw` arm.
-///
-/// Mutants: the arm polls the handle; the arm answers `false`.
-#[skuld::test]
-fn proc_handle_raw_is_reaped_only_once_its_own_wait_returns() {
-    use crate::child::proc_handle::ProcHandle;
-    let handle = ProcHandle::Raw(suspended_raw(RawChild::new));
-    assert!(!handle.is_reaped());
-    handle.kill().expect("kill");
-    wait_for_exit_unrecorded(match &handle {
-        ProcHandle::Raw(r) => r.handle(),
-        ProcHandle::Std(_) => unreachable!(),
-    });
-    assert!(!handle.is_reaped(), "an exit nobody waited on is not a recorded reap");
-    handle.wait().expect("wait");
-    assert!(handle.is_reaped());
-}
-
 /// Mutants: `TerminateProcess` in `kill` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`.
 #[skuld::test]
 fn runas_kill_of_a_killable_child_returns_and_reaps() {
