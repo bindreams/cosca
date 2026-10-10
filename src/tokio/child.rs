@@ -621,7 +621,8 @@ impl Child {
     /// still has the unique id read at spawn, and a reap by someone else between that check and the
     /// send is an accepted gap.
     /// `Ok(())` if the child already exited, was reaped by a prior `wait`, or was reaped by someone
-    /// else.
+    /// else; except a root launchd holds on macOS, whose zombie is an exit this process does not
+    /// pin, and which is refused (see below).
     /// Signal-only: does not reap — `wait().await` (or `Drop`) collects the exit status.
     ///
     /// **An elevated child behind a front** gets no signal of its own while it runs: in a Linux
@@ -865,6 +866,13 @@ impl Child {
         self.require_contained()?;
         #[cfg(unix)]
         self.refuse_unpinned("terminate_tree")?;
+        self.terminate_tree_signalling()
+    }
+
+    /// [`terminate_tree`](Self::terminate_tree) after its guards: the signal itself. The graceful
+    /// shutdown calls it after reading the root's state once, so the refusal of an unpinned root
+    /// is never mistaken for an ordinary refusal that the shutdown holds and goes on from.
+    fn terminate_tree_signalling(&self) -> Result<(), Error> {
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]

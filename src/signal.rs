@@ -90,7 +90,7 @@ pub(crate) const UNPINNED_WHY: &str = "launchd holds its zombie (its tracer died
 #[cfg(target_os = "macos")]
 pub(crate) fn unpinned_refusal(pid: u32, op: &str) -> crate::error::Error {
     crate::error::Error::Unassessable {
-        detail: format!("pid {pid}: the child cannot be shown to be ours ({UNPINNED_WHY}); {op} sent nothing"),
+        detail: format!("pid {pid}: the child cannot be shown to be ours: {UNPINNED_WHY}; {op} sent nothing"),
         source: None,
     }
 }

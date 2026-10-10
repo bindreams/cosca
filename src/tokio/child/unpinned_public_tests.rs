@@ -56,7 +56,9 @@ fn orphaned() -> Forced {
 fn assert_refused(err: &Error, op: &str) {
     match err {
         Error::Unassessable { detail, source: None } => assert!(
-            detail.contains("launchd") && detail.contains(&format!("{op} sent nothing")),
+            detail.contains("launchd")
+                && detail.contains(&format!("{op} sent nothing"))
+                && !detail.contains("(launchd"),
             "{detail}"
         ),
         other => panic!("expected Unassessable without a source, got {other:?}"),
@@ -296,7 +298,11 @@ async fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace
     drop(writer);
 }
 
-/// Mutant: `graceful_shutdown_tree` goes on to wait out the grace and sweep an orphaned root.
+/// A root orphaned when the shutdown begins is refused before the grace is waited: the hook at the
+/// first point after `terminate_tree` fails the test if the shutdown gets that far, so a long grace
+/// cannot hang it.
+///
+/// Mutants: the check is dropped, or moved after the terminate or the grace wait.
 #[skuld::test]
 async fn graceful_shutdown_tree_of_an_orphaned_root_sends_nothing_and_waits_for_nothing() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -305,10 +311,13 @@ async fn graceful_shutdown_tree_of_an_orphaned_root_sends_nothing_and_waits_for_
     let (mut child, writer) = session_blocker();
     let sends = Capture::start();
     let mark = crate::log_capture::mark();
+    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, || {
+        panic!("the grace wait began on a root this process does not pin")
+    });
     let _looks = orphaned();
 
     let err = child
-        .graceful_shutdown_tree(Duration::ZERO)
+        .graceful_shutdown_tree(Duration::from_secs(3600))
         .await
         .expect_err("a root this process does not pin is not shut down");
 
@@ -317,5 +326,66 @@ async fn graceful_shutdown_tree_of_an_orphaned_root_sends_nothing_and_waits_for_
     assert_nothing_sent(&sends);
     assert_eq!(groups.termed(), Vec::<i32>::new());
     assert_eq!(warns_since(mark), Vec::<String>::new());
+    drop(writer);
+}
+
+/// A root orphaned during the grace is refused by the sweep, which sends it nothing. The hook flips
+/// the next peek between the terminate and the sweep.
+///
+/// Mutant: the sweep (`kill_tree`) does not read the root's state.
+#[skuld::test]
+async fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = walked_blocker();
+    let sends = Capture::start();
+    let mark = crate::log_capture::mark();
+    let forced: std::sync::Arc<std::sync::Mutex<Option<Forced>>> = std::sync::Arc::default();
+    let _hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
+        let forced = std::sync::Arc::clone(&forced);
+        move || *forced.lock().expect("the hook's slot") = Some(orphaned())
+    });
+
+    let err = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect_err("a root this process does not pin is not swept");
+
+    assert_peeks_exhausted();
+    assert_refused(&err, "kill_tree");
+    assert_eq!(sends.entries(), vec![]);
+    assert!(
+        !sends.by_identity().iter().any(|(_, signo)| *signo == libc::SIGKILL),
+        "{:?}",
+        sends.by_identity()
+    );
+    assert_eq!(warns_since(mark), Vec::<String>::new());
+    drop(writer);
+}
+
+/// The tree kill reads the root's state again before its handle backstop, so a root orphaned during
+/// the sweep is not killed by pid. The first read sees it running, the second sees it orphaned.
+///
+/// Mutant: the backstop does not read the state again.
+#[skuld::test]
+async fn kill_tree_reads_the_root_again_before_its_backstop() {
+    crate::tokio::test_runtime::assert_current_thread();
+    crate::log_capture::install();
+    let (mut child, writer) = walked_blocker();
+    let pid = child.id().pid();
+    let sends = Capture::start();
+    let _looks = crate::wait::exit_only::seams::force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]);
+
+    let err = child
+        .kill_tree()
+        .expect_err("a root orphaned during the sweep is not killed by pid");
+
+    assert_peeks_exhausted();
+    assert_refused(&err, "kill_tree");
+    assert_eq!(sends.entries(), vec![], "the backstop must send nothing");
+    assert!(
+        sends.by_identity().contains(&(pid, libc::SIGKILL)),
+        "the sweep ran first"
+    );
     drop(writer);
 }

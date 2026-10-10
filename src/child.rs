@@ -273,7 +273,8 @@ impl Child {
         )
     }
 
-    /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike [`Process::kill`](crate::Process::kill), this
+    /// Hard-kill the process. Returns `Ok(())` if already dead, except a root launchd holds on macOS (see
+    /// below), which is refused. Unlike [`Process::kill`](crate::Process::kill), this
     /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
     ///
     /// **An elevated child behind a front** ([`Backend::Sudo`](crate::elevation::Backend::Sudo),
@@ -650,10 +651,16 @@ impl Child {
         // Backstop for the TreeWalk mechanism: its hard_kill kills the root by identity,
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
-        let backstop = self
-            .proc
-            .kill()
-            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()));
+        // Read again: the sweep above can be long, and a root orphaned meanwhile is no longer ours.
+        #[cfg(unix)]
+        let backstop = self.refuse_unpinned("kill_tree");
+        #[cfg(not(unix))]
+        let backstop = Ok(());
+        let backstop = backstop.and_then(|()| {
+            self.proc
+                .kill()
+                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper()))
+        });
         if let (Err(group), Err(bs)) = (&group_result, &backstop) {
             log::debug!("kill_tree handle backstop also failed ({bs}); surfacing the group error: {group}");
         }
@@ -720,6 +727,13 @@ impl Child {
         self.require_contained()?;
         #[cfg(unix)]
         self.refuse_unpinned("terminate_tree")?;
+        self.terminate_tree_signalling()
+    }
+
+    /// [`terminate_tree`](Self::terminate_tree) after its guards: the signal itself. The graceful
+    /// shutdown calls it after reading the root's state once, so the refusal of an unpinned root
+    /// is never mistaken for an ordinary refusal that the shutdown holds and goes on from.
+    fn terminate_tree_signalling(&self) -> Result<(), Error> {
         // See kill_tree's identical precondition assert for the full rationale, including the
         // `#[cfg(unix)]` gate (`carries_recyclable_pgid` does not exist on Windows).
         #[cfg(unix)]
