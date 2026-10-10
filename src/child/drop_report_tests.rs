@@ -23,6 +23,16 @@ fn session_blocker() -> (crate::Child, std::io::PipeWriter) {
     (cmd.spawn().expect("spawn"), writer)
 }
 
+/// A child with no containment: nothing sweeps it before the root kill under test, on any platform
+/// (a macOS fd marker's sweep kills the root, which holds the marker).
+fn bare_blocker() -> (crate::Child, std::io::PipeWriter) {
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    (cmd.spawn().expect("spawn"), writer)
+}
+
 fn failed_write() -> Result<(), crate::error::Error> {
     Err(crate::error::Error::Io(std::io::Error::other("w")))
 }
@@ -35,8 +45,7 @@ fn failed_write() -> Result<(), crate::error::Error> {
 #[skuld::test]
 fn an_unknown_root_with_a_refused_kill_warns_once() {
     crate::log_capture::install();
-    let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = session_blocker();
+    let (child, writer) = bare_blocker();
     let mark = crate::log_capture::mark();
     let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
     let _refused = crate::signal::seams::refuse_kills();
@@ -94,8 +103,7 @@ fn finish_elevated_with_an_unknown_root_and_a_failed_reap_warns_once() {
 #[skuld::test]
 fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     crate::log_capture::install();
-    let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = session_blocker();
+    let (child, writer) = bare_blocker();
     let teardowns = crate::child::fault::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let refused = crate::signal::seams::refuse_kills();
@@ -121,8 +129,7 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
 #[skuld::test]
 fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
     crate::log_capture::install();
-    let _recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = session_blocker();
+    let (child, writer) = bare_blocker();
     let teardowns = crate::child::fault::record_root_teardowns();
     let mark = crate::log_capture::mark();
     let err_peek = || Err(std::io::Error::other("forced peek failure"));
