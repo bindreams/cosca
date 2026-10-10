@@ -33,7 +33,7 @@ impl Drop for LeafGuard {
         let leaf = &self.0;
         let removed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // The leaf is gone on the success path, and `cgroup.kill` then does not exist.
-            let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
+            drop(std::fs::write(leaf.join("cgroup.kill"), "1"));
             drain_and_remove_leaf(leaf);
         }));
         if removed.is_err() {

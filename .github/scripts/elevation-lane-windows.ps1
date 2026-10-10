@@ -100,7 +100,22 @@ try {
             Set-Acl-Native $junitDir /remove "${account}"
             Remove-LocalUser $account -ErrorAction Stop
             # The profile directory and registry hive that logging on created. A profile that is still loaded fails here.
-            Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+            # Nothing of the account may be running when its profile goes: stop what is left of its processes.
+            foreach ($candidate in Get-CimInstance Win32_Process) {
+                $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
+                if ($owner -and $owner.User -eq $account) { Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue }
+            }
+            # The profile service unloads the registry hive after the last process of the logon has gone, and the
+            # removal fails with a sharing violation until it has: retry that one error, nothing else.
+            while ($true) {
+                try {
+                    Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+                    break
+                } catch {
+                    if ($_.Exception.Message -notmatch 'being used by another process') { throw }
+                    Start-Sleep -Seconds 1
+                }
+            }
             if (Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'") { throw "the profile of $account is still there after its removal" }
         }
         if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }

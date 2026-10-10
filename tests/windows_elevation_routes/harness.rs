@@ -974,10 +974,13 @@ impl Drop for ScratchAccount {
     fn drop(&mut self) {
         let mut failures = Vec::new();
         // The profile directory and registry hive outlive `net user /delete`. `self.user` is one of two fixed
-        // alphanumeric names, so it needs no quoting. A profile that is still loaded fails to go and is reported.
+        // alphanumeric names, so it needs no quoting. The profile service unloads the hive some time after the last process of the logon exits; the removal is retried on that sharing violation alone.
         let script = format!(
             "$left = {{ Get-CimInstance Win32_UserProfile | Where-Object {{ $_.LocalPath -like '*\\{user}' }} }}; \
-             & $left | Remove-CimInstance -ErrorAction Stop; \
+             while ($true) {{ \
+               try {{ & $left | Remove-CimInstance -ErrorAction Stop; break }} \
+               catch {{ if ($_.Exception.Message -notmatch 'being used by another process') {{ throw }}; Start-Sleep -Seconds 1 }} \
+             }}; \
              if (& $left) {{ exit 1 }}",
             user = self.user
         );
