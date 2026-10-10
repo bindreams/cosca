@@ -28,15 +28,15 @@
 //!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
-//! Linux 5.6 on its own oopses under systemd 254 or newer: `systemd-udevd` writes a cgroup's
-//! `memory.pressure`, and that write dereferences NULL in the 5.6 kernel. cosca does not touch
-//! pressure-stall information; the CI guest boots 5.6 with `psi=0` for that reason.
-//!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
 //! is not used and containment falls back as documented on [`Containment`]. It also assumes kernel
 //! commit `b69bb476dee9` ("cgroup: fix race between fork and cgroup.kill"), in mainline from 6.14
 //! or in a stable kernel that carries it. cosca does not probe for it; the cost of its absence is
 //! described under [`Command::kill_on_drop`].
+//!
+//! Linux 5.6 on its own oopses under systemd 254 or newer: `systemd-udevd` writes a cgroup's
+//! `memory.pressure`, and that write dereferences NULL in the 5.6 kernel. cosca does not touch
+//! pressure-stall information; the CI guest boots 5.6 with `psi=0` for that reason.
 //!
 //! # A child under a debugger
 //!
