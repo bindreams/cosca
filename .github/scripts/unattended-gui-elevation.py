@@ -5,6 +5,7 @@
     sudo python3 unattended-gui-elevation.py --this-machine-is-disposable               # macOS
     python3 unattended-gui-elevation.py --this-machine-is-disposable                    # Windows, elevated, CI only
     python3 unattended-gui-elevation.py --this-machine-is-disposable --check-only       # only the guard, no change
+    ... --this-machine-is-disposable [--user USER] --revert                              # puts the saved state back
 
 What it changes, system-wide:
 
@@ -23,8 +24,21 @@ What it changes, system-wide:
   `HKLM\\...\\Policies\\System` (the 64-bit view). Hosted runner images already have it; it is set here so the
   setup does not depend on the image, and read back (it must be `0`, a `REG_DWORD`) so a lost write fails.
 
-These weaken the machine's security for good, so the script refuses unless the machine is disposable, which takes
-both the flag `--this-machine-is-disposable` and a fact about the machine:
+These weaken the machine's security until reverted. Before it changes anything, the script writes the prior state to a
+state file (`/etc/cosca-unattended-gui-elevation-state.json`; Windows: `%ProgramData%\\cosca-unattended-gui-elevation-state.json`),
+and refuses to run when that file exists (a second run would save the changed state as the prior one). `--revert`
+restores exactly the saved state and removes the file; the CI jobs run it on success and on failure. It does
+nothing when there is no state file, and refuses a state file written for another OS or another `--user` (Linux
+needs `--user` to revert, too). Reverting:
+
+- Linux: the rule file goes back to what it was (absent: removed; present: its content restored), `polkit.service`
+  restarts, and the user's `pkexec` result must be what it was before.
+- macOS: the saved `system.privilege.admin` right is written back and read back.
+- Windows: `ConsentPromptBehaviorAdmin` gets its saved value and type back, or is deleted if it was absent, and is
+  read back.
+
+`--revert` and enabling take the same guard, because a developer can run this in a devvm guest and has to undo it
+there: the machine must be disposable, which takes both the flag `--this-machine-is-disposable` and a fact about the machine:
 
 - a GitHub-hosted runner (`GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`), or
 - a devvm guest (the marker file `/etc/cosca-devvm-guest`, written by the devvm driver).
@@ -40,6 +54,7 @@ environment (classic sudo and sudo-rs alike) and so drops the CI variables: pass
 """
 
 import argparse
+import json
 import os
 import platform
 import plistlib
@@ -117,7 +132,60 @@ def require_ordinary_user(user, getpwnam=None):
         sys.exit(f"--user {user!r} is root, which polkit always authorizes: the check below would prove nothing")
 
 
-def enable_linux(user, isdir=os.path.isdir, init_comm=comm_of, getpwnam=None, environ=os.environ):
+STATE_FILE_NAME = "cosca-unattended-gui-elevation-state.json"
+
+
+def default_state_path(system, environ=os.environ):
+    if system == "Windows":
+        return os.path.join(environ.get("ProgramData", r"C:\ProgramData"), STATE_FILE_NAME)
+    return "/etc/" + STATE_FILE_NAME
+
+
+def write_state(path, system, user, prior):
+    """Records the prior state. Atomic, and fails if a state file exists (a second enable would save the changed state)."""
+    temporary = f"{path}.{os.getpid()}.new"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"system": system, "user": user, "prior": prior}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.link(temporary, path)  # fails if `path` exists
+    except FileExistsError:
+        sys.exit(f"refusing: {path} exists, so an enable already ran here; run --revert first")
+    finally:
+        os.unlink(temporary)
+
+
+def read_state(path, system, user):
+    """The saved prior state, or None when there is no state file. Exits on a state file for another OS or user."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except FileNotFoundError:
+        return None
+    if state.get("system") != system or state.get("user") != user:
+        sys.exit(
+            f"refusing: {path} was written for {state.get('system')!r} with --user {state.get('user')!r}, "
+            f"not for {system!r} with --user {user!r}"
+        )
+    return state["prior"]
+
+
+def pkexec_grants(user, env):
+    """Whether USER can run `pkexec` with no agent and no prompt."""
+    check = subprocess.run(
+        ["runuser", "-u", user, "--", "pkexec", "--disable-internal-agent", "/usr/bin/id", "-u"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    return check, check.returncode == 0 and check.stdout.strip() == "0"
+
+
+def enable_linux(
+    user, save, isdir=os.path.isdir, init_comm=comm_of, getpwnam=None, environ=os.environ, rule_path=POLKIT_RULE_PATH
+):
     require_ordinary_user(user, getpwnam)
     if not isdir("/run/systemd/system") or init_comm(1) != "systemd":
         sys.exit("refusing: this needs systemd as PID 1; run it on a CI runner or a devvm guest with systemd")
@@ -133,63 +201,150 @@ def enable_linux(user, isdir=os.path.isdir, init_comm=comm_of, getpwnam=None, en
     if not supported:
         sys.exit(f"polkit is too old for rules.d JavaScript rules (needs 0.106 or later): {version.strip()}")
 
+    # The prior state: the rule file (absent, or its content) and whether USER already had a grant.
+    try:
+        with open(rule_path, encoding="ascii") as rule:
+            prior_rule = rule.read()
+    except FileNotFoundError:
+        prior_rule = None
+    save({"rule": prior_rule, "granted": pkexec_grants(user, env)[1]})
+
     # Atomic: polkitd never reads a half-written rule.
-    temporary = POLKIT_RULE_PATH + ".new"
+    temporary = rule_path + ".new"
     with open(temporary, "w", encoding="ascii") as rule:
         rule.write(POLKIT_RULE.format(user=user))
     os.chmod(temporary, 0o644)
-    os.replace(temporary, POLKIT_RULE_PATH)
+    os.replace(temporary, rule_path)
 
     # `systemctl restart` returns once polkit.service is up: it notifies readiness (Type=notify-reload on Ubuntu 26.04).
     subprocess.run(["systemctl", "restart", "polkit"], check=True, env=env)
 
     # The change took effect only if the user can run pkexec with no agent and no prompt.
-    check = subprocess.run(
-        ["runuser", "-u", user, "--", "pkexec", "--disable-internal-agent", "/usr/bin/id", "-u"],
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        env=env,
-    )
-    if check.returncode != 0 or check.stdout.strip() != "0":
+    check, granted = pkexec_grants(user, env)
+    if not granted:
         sys.exit(
             f"the polkit rule did not take effect: pkexec as {user} exited {check.returncode} "
             f"with stdout {check.stdout.strip()!r}, stderr {check.stderr.strip()!r}"
         )
 
 
-def enable_macos():
-    subprocess.run(
-        ["security", "authorizationdb", "write", "system.privilege.admin", "allow"], check=True, env=scrubbed_environment()
-    )
-    right = plistlib.loads(
+def revert_linux(user, prior, environ=os.environ, rule_path=POLKIT_RULE_PATH):
+    env = scrubbed_environment(environ)
+    if prior["rule"] is None:
+        try:
+            os.unlink(rule_path)
+        except FileNotFoundError:
+            pass
+    else:
+        temporary = rule_path + ".new"
+        with open(temporary, "w", encoding="ascii") as rule:
+            rule.write(prior["rule"])
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, rule_path)
+    subprocess.run(["systemctl", "restart", "polkit"], check=True, env=env)
+    check, granted = pkexec_grants(user, env)
+    if granted != prior["granted"]:
+        sys.exit(
+            f"polkit still differs from before the enable: pkexec as {user} grants={granted}, before it was "
+            f"{prior['granted']} (exit {check.returncode}, stdout {check.stdout.strip()!r}, stderr {check.stderr.strip()!r})"
+        )
+
+
+def read_macos_right(env):
+    return plistlib.loads(
         subprocess.run(
-            ["security", "authorizationdb", "read", "system.privilege.admin"],
-            check=True,
-            capture_output=True,
-            env=scrubbed_environment(),
+            ["security", "authorizationdb", "read", "system.privilege.admin"], check=True, capture_output=True, env=env
         ).stdout
     )
+
+
+def enable_macos(save):
+    env = scrubbed_environment()
+    save({"right": plistlib.dumps(read_macos_right(env)).decode("utf-8")})
+    subprocess.run(["security", "authorizationdb", "write", "system.privilege.admin", "allow"], check=True, env=env)
+    right = read_macos_right(env)
     if right.get("rule") != ["allow"]:
         sys.exit(f"the authorization right did not take effect: {right!r}")
 
 
-def enable_windows():
+def revert_macos(prior):
+    env = scrubbed_environment()
+    saved = plistlib.loads(prior["right"].encode("utf-8"))
+    subprocess.run(
+        ["security", "authorizationdb", "write", "system.privilege.admin"],
+        input=prior["right"].encode("utf-8"),
+        check=True,
+        env=env,
+    )
+    right = read_macos_right(env)
+    if right != saved:
+        sys.exit(f"the authorization right reads back {right!r} after restoring {saved!r}")
+
+
+WINDOWS_POLICY_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+WINDOWS_VALUE = "ConsentPromptBehaviorAdmin"
+
+
+def enable_windows(save):
     import winreg
 
-    key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
     access = winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, access) as handle:
-        winreg.SetValueEx(handle, "ConsentPromptBehaviorAdmin", 0, winreg.REG_DWORD, 0)
-        stored = winreg.QueryValueEx(handle, "ConsentPromptBehaviorAdmin")
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WINDOWS_POLICY_KEY, 0, access) as handle:
+        try:
+            value, kind = winreg.QueryValueEx(handle, WINDOWS_VALUE)
+            save({"present": True, "value": value, "type": kind})
+        except FileNotFoundError:
+            save({"present": False})
+        winreg.SetValueEx(handle, WINDOWS_VALUE, 0, winreg.REG_DWORD, 0)
+        stored = winreg.QueryValueEx(handle, WINDOWS_VALUE)
     if stored != (0, winreg.REG_DWORD):
-        sys.exit(f"ConsentPromptBehaviorAdmin reads back {stored!r} after setting it to (0, REG_DWORD)")
+        sys.exit(f"{WINDOWS_VALUE} reads back {stored!r} after setting it to (0, REG_DWORD)")
 
 
-ENABLERS = {"Linux": enable_linux, "Darwin": lambda user: enable_macos(), "Windows": lambda user: enable_windows()}
+def revert_windows(prior):
+    import winreg
+
+    access = winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WINDOWS_POLICY_KEY, 0, access) as handle:
+        if prior["present"]:
+            winreg.SetValueEx(handle, WINDOWS_VALUE, 0, prior["type"], prior["value"])
+            stored = winreg.QueryValueEx(handle, WINDOWS_VALUE)
+            if stored != (prior["value"], prior["type"]):
+                sys.exit(f"{WINDOWS_VALUE} reads back {stored!r} after restoring {(prior['value'], prior['type'])!r}")
+        else:
+            try:
+                winreg.DeleteValue(handle, WINDOWS_VALUE)
+            except FileNotFoundError:
+                pass
+            try:
+                stored = winreg.QueryValueEx(handle, WINDOWS_VALUE)
+            except FileNotFoundError:
+                return
+            sys.exit(f"{WINDOWS_VALUE} reads back {stored!r} after deleting it")
 
 
-def main(argv, system=None, environ=os.environ, exists=os.path.exists, enablers=None, geteuid=getattr(os, "geteuid", None)):
+ENABLERS = {
+    "Linux": enable_linux,
+    "Darwin": lambda user, save: enable_macos(save),
+    "Windows": lambda user, save: enable_windows(save),
+}
+REVERTERS = {
+    "Linux": revert_linux,
+    "Darwin": lambda user, prior: revert_macos(prior),
+    "Windows": lambda user, prior: revert_windows(prior),
+}
+
+
+def main(
+    argv,
+    system=None,
+    environ=os.environ,
+    exists=os.path.exists,
+    enablers=None,
+    reverters=None,
+    geteuid=getattr(os, "geteuid", None),
+    state_path=None,
+):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--this-machine-is-disposable",
@@ -197,10 +352,12 @@ def main(argv, system=None, environ=os.environ, exists=os.path.exists, enablers=
         help="required: states that this machine is a throwaway CI runner or devvm guest",
     )
     parser.add_argument("--user", help="Linux only: the account to authorize")
-    parser.add_argument("--check-only", action="store_true", help="only check that the machine is disposable")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check-only", action="store_true", help="only check that the machine is disposable")
+    mode.add_argument("--revert", action="store_true", help="put back the state the enable saved")
     args = parser.parse_args(argv)
     if not args.this_machine_is_disposable:
-        refuse("this weakens the machine's security for good; pass --this-machine-is-disposable on a throwaway machine")
+        refuse("this weakens the machine's security; pass --this-machine-is-disposable on a throwaway machine")
 
     system = system or platform.system()
     if args.user is not None and system != "Linux":
@@ -209,13 +366,28 @@ def main(argv, system=None, environ=os.environ, exists=os.path.exists, enablers=
     if args.check_only:
         print(f"{system}: this machine is disposable")
         return
-    enable = (enablers or ENABLERS).get(system)
-    if enable is None:
+    table = (reverters or REVERTERS) if args.revert else (enablers or ENABLERS)
+    action = table.get(system)
+    if action is None:
         sys.exit(f"unsupported platform: {system}")
     # `security` may prompt for a password, which hangs a headless guest: refuse before any change.
     if system in ("Linux", "Darwin") and geteuid is not None and geteuid() != 0:
         sys.exit("refusing: this needs root; run it with sudo")
-    enable(args.user)
+    state_path = state_path or default_state_path(system)
+    if args.revert:
+        if system == "Linux" and args.user is None:
+            sys.exit("--user is required to revert on Linux: the state file names the account it was written for")
+        prior = read_state(state_path, system, args.user)
+        if prior is None:
+            print(f"no state file at {state_path}: nothing to revert")
+            return
+        action(args.user, prior)
+        os.unlink(state_path)
+        print(f"unattended GUI elevation reverted on {system}")
+        return
+    if os.path.exists(state_path):
+        sys.exit(f"refusing: {state_path} exists, so an enable already ran here; run --revert first")
+    action(args.user, lambda prior: write_state(state_path, system, args.user, prior))
     print(f"unattended GUI elevation enabled on {system}")
 
 

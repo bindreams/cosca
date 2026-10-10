@@ -12,6 +12,10 @@
 # The account cannot read the runner's profile, so it runs a copy of cargo-nextest and an extraction of the
 # archive under C:\cosca-elevation-lane, and it writes its JUnit file into the workspace's `target\nextest\<profile>`.
 # The script exits with nextest's exit code. It creates an account, so it refuses outside a hosted runner.
+#
+# Everything it creates it removes, on failure too: the account (which must not exist beforehand, and is recorded in
+# `$root\account` before it is created, so only that account is deleted), its profile, the ACE it was given on the
+# JUnit directory, and `$root`.
 $ErrorActionPreference = 'Stop'
 
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
@@ -34,6 +38,7 @@ $work = Join-Path $root 'work'
 $bin = Join-Path $root 'bin'
 $extract = Join-Path $work 'extract'
 $out = Join-Path $work 'out.txt'
+$accountRecord = Join-Path $root 'account'
 $nextestProfile = $env:NEXTEST_PROFILE
 if (-not $nextestProfile) { throw 'NEXTEST_PROFILE must name the profile whose JUnit file the caller publishes' }
 $junitDir = Join-Path $workspace "target\nextest\$nextestProfile"
@@ -57,6 +62,10 @@ Set-Acl-Native $marker /inheritance:r
 Set-Acl-Native $marker /grant '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
 Set-Acl-Native $bin /grant '*S-1-5-32-545:(OI)(CI)RX'
 
+# The record first, then the account: a record without an account is fine for the cleanup, an account without one
+# would be left behind. An account that exists already is not ours to adopt or delete.
+if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account already exists; refusing to adopt it" }
+Set-Content -LiteralPath $accountRecord -Value $account -Encoding ascii
 New-LocalUser $account -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires | Out-Null
 try {
     Add-LocalGroupMember -Group 'Administrators' -Member $account
@@ -80,11 +89,24 @@ try {
         -LoadUserProfile -WorkingDirectory $work -Wait -PassThru
     $exitCode = $process.ExitCode
 } finally {
-    # Stop on a failed removal: the step fails, and no exit path leaves the account behind unnoticed.
-    Remove-LocalUser $account -ErrorAction Stop
-    if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }
+    # Print what the run said before its directory goes. Each step below stops on failure: the step fails, and no
+    # exit path leaves anything behind unnoticed.
+    if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out }
+    if ((Test-Path -LiteralPath $accountRecord) -and ((Get-Content -LiteralPath $accountRecord -Raw).Trim() -eq $account)) {
+        $existing = Get-LocalUser -Name $account -ErrorAction SilentlyContinue
+        if ($existing) {
+            $sid = $existing.SID.Value
+            # The ACE on the published JUnit directory names the account; without it the SID would dangle there.
+            Set-Acl-Native $junitDir /remove "${account}"
+            Remove-LocalUser $account -ErrorAction Stop
+            # The profile directory and registry hive that logging on created. A profile that is still loaded fails here.
+            Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+            if (Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'") { throw "the profile of $account is still there after its removal" }
+        }
+        if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }
+    }
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
 }
 
-Get-Content -LiteralPath $out
 Write-Host "nextest exit code: $exitCode"
 exit $exitCode

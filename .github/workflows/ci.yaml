@@ -494,7 +494,10 @@ jobs:
           # shellcheck disable=SC2016 # the root shell expands its own positional arguments
           exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -uxc '
             CG=/sys/fs/cgroup/cosca-ci
-            mkdir -p "$CG"
+            PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
+            mkdir "$CG"
+            # Back out of the lane cgroup and remove it on every exit; it fails if a test left a cgroup in it.
+            trap '\''echo $$ > "$PRIOR/cgroup.procs" && rmdir "$CG" || { echo "could not remove $CG" >&2; exit 1; }'\'' EXIT
             echo $$ > "$CG/cgroup.procs"
             # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
             # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
@@ -581,6 +584,11 @@ jobs:
           exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TEST_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -euxc '
             "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci-setuid-root --no-tests=fail -E "binary(group_teardown_setuid)"
           ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
+
+      - name: Remove the setuid-root helper (Linux)
+        if: ${{ always() && matrix.os == 'linux' }}
+        run: |
+          if [ -n "${COSCA_TEST_SETUID_HELPER:-}" ]; then sudo rm -f -- "$COSCA_TEST_SETUID_HELPER"; fi
 
 
       # The libtest guard (.github/scripts/libtest_guard.py) checks that the test suite is complete: no
