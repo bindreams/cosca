@@ -213,14 +213,31 @@ fn runas_kill_reaps_when_terminate_is_denied_but_permitted() {
 
 /// The runas `ERROR_ACCESS_DENIED` arm with a child we cannot terminate: never block.
 ///
-/// Mutant: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`.
+/// What it could not do comes back for the caller's one warn, and it logs nothing itself.
+///
+/// Mutants: reap in the `runas && !can_terminate()` arm of `teardown_on_drop`; the arm logs its own
+/// warn instead of returning it.
 #[skuld::test]
 fn runas_teardown_on_drop_never_blocks_on_an_unterminable_child() {
+    crate::log_capture::install();
     let owner = spawn_suspended();
     let denied = runas_without_terminate_right(&owner);
     let observer = end_on_wait(&owner);
     observer.force_unterminable();
-    denied.teardown_on_drop(identity_of(&denied));
+    let mark = crate::log_capture::mark();
+    let torn = denied.teardown_on_drop(identity_of(&denied));
+    assert!(
+        torn.left
+            .as_deref()
+            .is_some_and(|text| text.contains("higher integrity")),
+        "{torn:?}"
+    );
+    assert!(
+        crate::log_capture::records_since_on_current_thread(mark, "")
+            .iter()
+            .all(|(level, _)| *level > log::Level::Warn),
+        "the warn is the caller's"
+    );
     assert_eq!(observer.waits(), 0, "teardown blocked on a child it cannot terminate");
     assert!(
         denied.try_wait().expect("try_wait").is_none(),

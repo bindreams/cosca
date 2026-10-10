@@ -404,10 +404,25 @@ async fn terminate_of_a_live_sudo_front_is_sent() {
 #[skuld::test]
 async fn a_failed_spawn_leaves_an_elevation_front_running_and_says_so() {
     use crate::child::front_kill_tests::{assert_noted, failed_front_spawns, reap};
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
     let failures = failed_front_spawns(None, |cmd| {
         crate::tokio::spawn::spawn(cmd).map(drop).map_err(Into::into)
     });
     assert_noted(&failures, "the elevated program may be running; it is left unreaped");
+    // Each failed spawn is one event: the forget of tokio's `Child` and the front left running share
+    // one warn, which carries the leak. (Mutant: the forget warns on its own.)
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), failures.len(), "{warns:?}");
+    assert!(
+        warns
+            .iter()
+            .all(|(_, text)| text.contains("leaks") && text.contains("left elevation front")),
+        "{warns:?}"
+    );
     for (_, pid) in &failures {
         let status = reap(*pid).expect("the front must be left unreaped");
         assert!(status.success(), "the teardown signalled the front: {status:?}");

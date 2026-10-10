@@ -830,6 +830,17 @@ impl ProcSource {
         self.forget_noting(why, reaped_elsewhere, &mut Diagnosis::default())
     }
 
+    /// [`forget_noting`](ProcSource::forget_noting) that logs nothing: the forget is owed to `owed`,
+    /// for a caller whose teardown warns next and carries it.
+    #[cfg(target_os = "linux")]
+    fn forget_deferring(&mut self, why: &str, reaped_elsewhere: bool, owed: &mut Diagnosis) -> Option<&'static str> {
+        let (pid, leak) = self.forget_quietly(reaped_elsewhere)?;
+        owed.add(format!(
+            "child {pid} {why}; forgetting tokio's handle for it leaks {leak}"
+        ));
+        Some(leak)
+    }
+
     /// [`forget_as`](ProcSource::forget_as) for a spawn whose identity check found `diagnosis`: the
     /// forget's one warn carries it.
     #[cfg(unix)]
@@ -1083,7 +1094,10 @@ impl ProcSource {
         subtree: Option<&crate::containment::cgroup::Subtree>,
         why: &mut Diagnosis,
     ) -> (crate::child::spawn::FrontFate, ChildFate) {
-        self.forget_if_foreign_noting(why);
+        // The forgets are owed to the one warn of the teardown below, not logged on their own.
+        if let Some((_, state)) = self.elsewhere() {
+            self.forget_deferring(&foreign_why(&state), shown_reaped_elsewhere(&state), why);
+        }
         let ProcSource::Tokio { pidfd, .. } = &mut self else {
             // Only something that broke the reaping precondition (see `Command::contain`) leaves a
             // spawn's backend foreign this early.
@@ -1100,12 +1114,12 @@ impl ProcSource {
             return (crate::child::spawn::FrontFate::Unaccounted, ChildFate::Unknown);
         };
         let pidfd = pidfd.take();
-        self.forget_noting(
+        self.forget_deferring(
             "is an elevation front, sent nothing, and handed to the pidfd teardown",
             false,
             why,
         );
-        crate::child::spawn::leave_front_through_pidfd(Some(pid), pidfd, front, id, subtree)
+        crate::child::spawn::leave_front_through_pidfd_noting(Some(pid), pidfd, front, id, subtree, why)
     }
 
     /// The teardown's kill: [`Sig::Kill`] through the handle, or (tests) the forced refusal of the

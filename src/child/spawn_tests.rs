@@ -882,8 +882,9 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     );
 }
 
-/// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown
-/// at `warn` and in the returned note, and nothing when the teardown worked or was not tried.
+/// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in
+/// the returned note and in the text the cleanup's one warn carries, logs nothing itself, and
+/// reports nothing when the teardown worked or was not tried.
 #[cfg(unix)]
 #[skuld::test]
 fn report_tree_teardown_reports_only_a_failed_teardown() {
@@ -895,7 +896,13 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
         ("cosca-report-not-tried", None, false),
     ] {
         let mark = crate::log_capture::mark();
-        let note = super::report_tree_teardown(tree, &name);
+        let (note, warn) = super::report_tree_teardown(tree, &name);
+        assert_eq!(
+            warn.as_deref()
+                .is_some_and(|text| text.contains(super::TREE_TEARDOWN_WARN) && text.contains(name)),
+            reported,
+            "{name}: the carried warn text, got {warn:?}"
+        );
         assert_eq!(
             note.contains("its contained tree could not be killed"),
             reported,
@@ -908,8 +915,8 @@ fn report_tree_teardown_reports_only_a_failed_teardown() {
         );
         assert_eq!(
             crate::log_capture::levels_since(mark, name),
-            if reported { vec![log::Level::Warn] } else { vec![] },
-            "{name}"
+            Vec::<log::Level>::new(),
+            "{name}: it logs nothing itself"
         );
     }
 }
@@ -995,6 +1002,56 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     assert!(
         detail.contains("its contained tree could not be killed"),
         "the tree's failure is reported, got {detail}"
+    );
+}
+
+/// A tree kill that fails and a root whose handle cannot say whether it was reaped (`Unknown`) are
+/// one event: the cleanup warns once, naming both.
+///
+/// Mutant: the tree's failure is logged on its own, beside the cleanup's warn.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unkillable-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would.
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let (mut cmd, teardown) = teardown_blocker();
+    cmd.kill_on_drop(false);
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let pid = child.id().pid();
+    let mark = crate::log_capture::mark();
+    let _unsure =
+        crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other("forced peek failure 7a2e")));
+
+    let (err, _fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    teardown.assert_killed();
+    assert!(reaped(pid), "the root was killed through its handle, got {err:?}");
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        // (The leaf's own removal failure is another resource's event.)
+        .filter(|(level, text)| *level <= log::Level::Warn && !text.contains("was not removed"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0]
+            .1
+            .contains("tree teardown after a failed password write failed")
+            && warns[0].1.contains("RootState::Unknown"),
+        "the one warn names the tree's failure and the unknown root: {warns:?}"
     );
 }
 
@@ -1466,4 +1523,31 @@ fn a_foreign_verdict_is_killed_after_a_delivered_kill_and_gone_otherwise() {
         assert_eq!(foreign.fate(true), ChildFate::Killed, "{foreign:?}");
         assert_eq!(foreign.fate(false), ChildFate::Gone, "{foreign:?}");
     }
+}
+
+/// A diagnosis that no teardown step carried is logged when it is dropped, but not while the thread
+/// unwinds: a logger that panics there would abort.
+///
+/// Mutants: it is never logged; it is logged while unwinding.
+#[cfg(unix)]
+#[skuld::test]
+fn an_unfolded_diagnosis_is_logged_on_drop_but_not_while_unwinding() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    drop(super::Diagnosis::of("diagnosis 4e1c, dropped quietly".to_owned()));
+    assert!(crate::log_capture::contains_since(
+        mark,
+        "diagnosis 4e1c, dropped quietly"
+    ));
+
+    let mark = crate::log_capture::mark();
+    let unwound = std::panic::catch_unwind(|| {
+        let _owed = super::Diagnosis::of("diagnosis 9b7a, dropped unwinding".to_owned());
+        panic!("unwinding with a diagnosis owed");
+    });
+    assert!(unwound.is_err());
+    assert!(!crate::log_capture::contains_since(
+        mark,
+        "diagnosis 9b7a, dropped unwinding"
+    ));
 }

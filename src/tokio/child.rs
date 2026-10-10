@@ -95,10 +95,10 @@ pub struct Child {
     elevation: Option<crate::elevation::ElevationReport>,
     /// The elevation front this child is, if any, as its spawn found it (see the sync `Child`).
     front: Option<crate::elevation::front::Front>,
-    /// A failed-spawn cleanup that left this handle armed already warned about its event, so the
-    /// drop that retries reports at `debug`.
+    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
+    /// retries reports a repeat of it at `debug` and anything new at `warn`.
     #[cfg(unix)]
-    reported: bool,
+    reported: Vec<crate::child::drop_report::PartKey>,
 }
 
 impl Child {
@@ -126,7 +126,7 @@ impl Child {
             elevation: None,
             front: None,
             #[cfg(unix)]
-            reported: false,
+            reported: Vec::new(),
         }
     }
 
@@ -147,10 +147,10 @@ impl Child {
 
     /// End a failed spawn's cleanup: `settled` (the tree and the root were each killed, are gone, or
     /// were deliberately left alone) disarms the drop, whose error reports what the cleanup did and
-    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is whether the
-    /// cleanup already warned of the event, so the drop does not warn of it twice.
+    /// left. Otherwise the handle stays armed so its drop tries again; `warned` is what the cleanup
+    /// already warned of, so the drop does not warn of the same twice.
     #[cfg(unix)]
-    pub(super) fn end_cleanup(&mut self, settled: bool, warned: bool) {
+    pub(super) fn end_cleanup(&mut self, settled: bool, warned: Vec<crate::child::drop_report::PartKey>) {
         if settled {
             self.kill_on_drop = false;
         } else {
@@ -1235,8 +1235,14 @@ impl Child {
             report.front = front_left.as_ref();
             report.skipped = signals.skipped;
             report.forgot = signals.forgot;
+            report.tree = signals.tree;
             report.left = signals.left;
-            report.emit(self.reported);
+            report.emit(&self.reported);
+        }
+        // Off Unix there is no root state to report: what the signals could not do is the event.
+        #[cfg(not(unix))]
+        if !signals.left.is_empty() {
+            log::warn!("Child::drop: {}", signals.left.join("; "));
         }
         os.release_without_waiting();
         signals.fate
@@ -1292,8 +1298,10 @@ struct DropSignals {
     /// What forgetting tokio's `Child` leaked, if the failed root kill forgot it.
     #[cfg(unix)]
     forgot: Option<crate::child::drop_report::Forgot>,
-    /// What the root kill could not do.
+    /// The contained tree's teardown failure, if it failed.
     #[cfg(unix)]
+    tree: Option<String>,
+    /// What the root kill could not do.
     left: Vec<String>,
 }
 
@@ -1306,6 +1314,7 @@ impl DropSignals {
             #[cfg(unix)]
             forgot: None,
             #[cfg(unix)]
+            tree: None,
             left: Vec::new(),
         }
     }
@@ -1349,22 +1358,17 @@ fn signal_on_drop(
     };
     if let Err(e) = &tree {
         // A real OS outcome (e.g. `EACCES`/`EIO` on `cgroup.kill`): reported, never asserted on.
-        let failed = format!("contained-tree teardown did not fully succeed: {e}");
-        // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-        let orphaned = "the root is killed regardless, so its descendants may be orphaned";
+        let mut failed = format!("contained-tree teardown did not fully succeed: {e}");
+        if os.attached.hard_kill_refused_to_walk(&tree) {
+            // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
+            failed.push_str("; the root is killed regardless, so its descendants may be orphaned");
+        }
         #[cfg(unix)]
         {
-            signals.left.push(failed);
-            if os.attached.hard_kill_refused_to_walk(&tree) {
-                signals.left.push(orphaned.to_owned());
-            }
+            signals.tree = Some(failed);
         }
         #[cfg(not(unix))]
-        if os.attached.hard_kill_refused_to_walk(&tree) {
-            log::warn!("Child::drop: {failed}; {orphaned}");
-        } else {
-            log::warn!("Child::drop: {failed}");
-        }
+        signals.left.push(failed);
     }
     // Already reaped, or not pinned by this process: no signal to issue. The caller tells its own
     // reap from a foreign one; a root someone else reaped, or launchd holds, is `Gone`.
@@ -1453,11 +1457,9 @@ fn signal_on_drop(
         }
         let looked = proc.try_wait();
         if !matches!(looked, Ok(Some(_))) {
-            let left = format!("async child {pid} could not be terminated on drop; leaving it running");
-            #[cfg(unix)]
-            signals.left.push(left);
-            #[cfg(not(unix))]
-            log::warn!("{left}");
+            signals.left.push(format!(
+                "async child {pid} could not be terminated on drop; leaving it running"
+            ));
         }
         signals.fate = crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id));
         return signals;

@@ -147,8 +147,8 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree.is_none() || child.tree_killed.is_set() || (skipped.is_some() && view.leaves_root_alone());
-    let tree_warned = matches!(tree, Some(Err(_)));
-    let mut tree_note = report_tree_teardown(tree, &child.attached.teardown_subject());
+    let (mut tree_note, tree_warn) = report_tree_teardown(tree, &child.attached.teardown_subject());
+    report.tree = tree_warn;
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
@@ -253,12 +253,12 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
         }
     };
-    let warned = report.emit(false);
+    let warned = report.emit(&[]);
     if tree_settled && root_settled {
         child.kill_on_drop = false;
     } else {
-        // The drop tries again; it need not warn of the same event twice.
-        child.reported = warned || tree_warned;
+        // The drop tries again; it need not warn of what the cleanup warned of again.
+        child.reported = warned;
     }
     Err(SpawnFailure::started(
         Error::Elevation {
@@ -310,19 +310,25 @@ pub(crate) fn teardown_warn_marker(leaf_path: &std::path::Path) -> String {
     format!("{TREE_TEARDOWN_WARN} (cgroup leaf {})", leaf_path.display())
 }
 
-/// Report a failed password write's tree teardown, for both `finish_elevated` variants: log it at
-/// `warn` and return the note for the error's `detail`. `subject` names the tree, because the
-/// teardown error itself may not (see `Attached::teardown_subject`).
+/// Report a failed password write's tree teardown, for both `finish_elevated` variants: the note
+/// for the error's `detail`, and the text the cleanup's one `warn` carries (the tree and the root
+/// are one event). `subject` names the tree, because the teardown error itself may not (see
+/// `Attached::teardown_subject`).
 ///
 /// `None`: no tree kill was tried, as the containment cannot tear one down. `Some(Ok)`: it worked.
 /// Neither is reported.
 #[cfg(unix)]
-pub(crate) fn report_tree_teardown(tree: Option<Result<(), Error>>, subject: &dyn std::fmt::Display) -> String {
+pub(crate) fn report_tree_teardown(
+    tree: Option<Result<(), Error>>,
+    subject: &dyn std::fmt::Display,
+) -> (String, Option<String>) {
     let Some(Err(e)) = tree else {
-        return String::new();
+        return (String::new(), None);
     };
-    log::warn!("{TREE_TEARDOWN_WARN} ({subject}): {e}");
-    format!("; its contained tree could not be killed ({subject}: {e})")
+    (
+        format!("; its contained tree could not be killed ({subject}: {e})"),
+        Some(format!("{TREE_TEARDOWN_WARN} ({subject}): {e}")),
+    )
 }
 
 /// The one authority for Windows backend routing: does `cmd` go to the raw `CreateProcessW`
@@ -1595,6 +1601,15 @@ impl Diagnosis {
         Diagnosis(Some(text))
     }
 
+    /// Owe `text` too: the next [`fold`](Diagnosis::fold) leads with it, after what was owed.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    pub(crate) fn add(&mut self, text: impl std::fmt::Display) {
+        match &mut self.0 {
+            Some(owed) => owed.push_str(&format!("; {text}")),
+            None => self.0 = Some(text.to_string()),
+        }
+    }
+
     /// `text`, led by the diagnosis if it is still owed, which it then no longer is.
     pub(crate) fn fold(&mut self, text: impl std::fmt::Display) -> String {
         match self.0.take() {
@@ -1606,8 +1621,11 @@ impl Diagnosis {
 
 impl Drop for Diagnosis {
     fn drop(&mut self) {
+        // Not while unwinding: a logger that panics there would abort.
         if let Some(diagnosis) = self.0.take() {
-            log::warn!("{diagnosis}");
+            if !std::thread::panicking() {
+                log::warn!("{diagnosis}");
+            }
         }
     }
 }

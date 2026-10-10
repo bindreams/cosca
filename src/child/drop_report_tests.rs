@@ -122,12 +122,13 @@ fn finish_elevated_leaves_the_handle_armed_when_the_root_kill_was_refused() {
     drop(writer);
 }
 
-/// A cleanup that warned and then left its handle armed (the root kill was refused): the handle's
-/// drop retries, and the retry does not warn of the same event again.
+/// A cleanup that warned of its unknown root and then left its handle armed (the root kill was
+/// refused): the handle's drop retries and is refused again. The refusal is new, which the cleanup
+/// did not report, so the drop warns of it; the unknown root it repeats rides along.
 ///
-/// Mutant: the drop's report ignores that the cleanup already warned.
+/// Mutant: the drop's report is a `debug` record whenever the cleanup warned of anything.
 #[skuld::test]
-fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
+fn a_retry_that_fails_anew_warns_of_the_new_failure() {
     crate::log_capture::install();
     let (child, writer) = bare_blocker();
     let teardowns = crate::child::fault::record_root_teardowns();
@@ -142,12 +143,56 @@ fn a_retried_cleanup_does_not_warn_of_its_event_twice() {
     assert_peeks_exhausted();
     assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
     let warns = warns_since(mark);
-    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_eq!(warns.len(), 2, "{warns:?}");
     assert!(
         warns[0].starts_with("finish_elevated:") && warns[0].contains("RootState::Unknown"),
         "{warns:?}"
     );
+    assert!(
+        warns[1].starts_with("Child::drop:") && warns[1].contains("could not be terminated on drop"),
+        "the retry's own refusal is warned of: {warns:?}"
+    );
     drop(refused);
+    drop(writer);
+}
+
+/// A cleanup that warned of its unknown root and left its handle armed (the root kill was refused,
+/// once): the handle's drop retries, the kill lands, and all the drop has to say is the unknown root
+/// again, which is a `debug` record.
+///
+/// Mutant: the drop's report ignores that the cleanup already warned.
+#[skuld::test]
+fn a_retry_that_only_repeats_the_cleanups_warn_is_debug() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    crate::log_capture::install();
+    let (child, writer) = bare_blocker();
+    let teardowns = crate::child::fault::record_root_teardowns();
+    let mark = crate::log_capture::mark();
+    let err_peek = || Err(std::io::Error::other("forced peek failure"));
+    // The cleanup's read, then the drop's.
+    let _looks = crate::wait::exit_only::seams::force_peeks([err_peek(), err_peek()]);
+    // The refusal ends as the cleanup's own refused kill is looked at, so the drop's retry lands.
+    let refused = Rc::new(RefCell::new(Some(crate::signal::seams::refuse_kills())));
+    let _heals = crate::child::spawn::fault::set_between_kill_and_wait({
+        let refused = Rc::clone(&refused);
+        move || drop(refused.borrow_mut().take())
+    });
+
+    let err = crate::child::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+
+    assert_peeks_exhausted();
+    assert_eq!(teardowns.count(), 1, "the handle's drop retries ({err:?})");
+    let warns = warns_since(mark);
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
+    assert!(
+        crate::log_capture::records_since_on_current_thread(mark, "Child::drop:")
+            .iter()
+            .any(|(level, text)| *level == log::Level::Debug && text.contains("RootState::Unknown")),
+        "the drop's repeat is a debug record"
+    );
     drop(writer);
 }
 

@@ -39,6 +39,19 @@ impl Forgot {
     }
 }
 
+/// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
+/// event reported from something new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PartKey {
+    /// The root's condition and what was therefore skipped, left or forgotten: the same event
+    /// described again, whatever its wording.
+    Described,
+    /// The contained tree's teardown failure.
+    Tree,
+    /// A failure of the signals, by its text: a different one is new.
+    Left(String),
+}
+
 /// What one drop or cleanup found, for its single `warn`.
 pub(crate) struct DropReport<'a> {
     /// The caller, which prefixes the warn.
@@ -51,6 +64,8 @@ pub(crate) struct DropReport<'a> {
     pub(crate) skipped: Option<String>,
     /// What forgetting tokio's `Child` leaked, if the event forgot it.
     pub(crate) forgot: Option<Forgot>,
+    /// The contained tree's teardown failure, if it failed.
+    pub(crate) tree: Option<String>,
     /// What the signals could not do: a refused kill, a failed reap.
     pub(crate) left: Vec<String>,
 }
@@ -63,33 +78,45 @@ impl<'a> DropReport<'a> {
             front: None,
             skipped: None,
             forgot: None,
+            tree: None,
             left: Vec::new(),
         }
     }
 
-    /// Log the report: one `warn`, or nothing when there is nothing to report. `already_said`: an
-    /// earlier step of this same event warned (a cleanup that left its handle armed, whose drop
-    /// retries), so this one is a `debug` record. Returns whether it warned.
-    pub(crate) fn emit(self, already_said: bool) -> bool {
-        let Some(text) = self.compose() else {
-            return false;
-        };
-        if already_said {
+    /// Log the report: one `warn`, or nothing when there is nothing to report. `reported`: what an
+    /// earlier step of this same event warned of (a cleanup that left its handle armed, whose drop
+    /// retries). A report that only repeats it is a `debug` record; one with anything new warns.
+    /// Returns the kinds of part it warned of, none when it did not warn.
+    pub(crate) fn emit(self, reported: &[PartKey]) -> Vec<PartKey> {
+        let parts = self.parts();
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        let text = format!(
+            "{}: {}",
+            self.label,
+            parts
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        if parts.iter().all(|(key, _)| reported.contains(key)) {
             log::debug!("{text}");
-            return false;
+            return Vec::new();
         }
         log::warn!("{text}");
-        true
+        parts.into_iter().map(|(key, _)| key).collect()
     }
 
-    fn compose(&self) -> Option<String> {
+    fn parts(&self) -> Vec<(PartKey, String)> {
         let pid = self.view.root_pid;
         let reaped_now = matches!(
             self.forgot.as_ref().and_then(|f| f.now.as_ref()),
             Some(RootState::Reaped)
         );
         let reaped = reaped_now || matches!(self.view.root, RootView::Reaped);
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: Vec<(PartKey, String)> = Vec::new();
 
         if let Some(mut state) = self.state_text(pid, reaped_now) {
             if self.view.unsettled() && !reaped_now {
@@ -102,30 +129,40 @@ impl<'a> DropReport<'a> {
             if matches!(self.view.root, RootView::Unpinned) && !reaped_now {
                 state.push_str("; the root itself is neither signalled nor waited on");
             }
-            parts.push(state);
+            parts.push((PartKey::Described, state));
         }
         if let (RootView::Reaped, Some(action)) = (&self.view.root, &self.skipped) {
-            parts.push(format!(
-                "the root is already reaped, so this drop does not {action}, whose number may now belong to an \
+            parts.push((
+                PartKey::Described,
+                format!(
+                    "the root is already reaped, so this drop does not {action}, whose number may now belong to an \
                  unrelated process. Descendants that outlived the reaped root are not torn down by this drop; \
                  call kill_tree() before wait() to end them (https://github.com/bindreams/cosca/issues/382)"
+                ),
             ));
         }
         if let Some(why) = self.front.filter(|_| !reaped) {
-            parts.push(format!(
-                "elevation front pid {pid}: {why}; the front is killed through its cgroup if it is still in it; \
-                 cosca does not wait for it, and tokio reaps it once it exits"
+            parts.push((
+                PartKey::Described,
+                format!(
+                    "elevation front pid {pid}: {why}; the front is killed through its cgroup if it is still in it; \
+                     cosca does not wait for it, and tokio reaps it once it exits"
+                ),
             ));
         }
-        parts.extend(self.left.iter().cloned());
+        parts.extend(self.tree.iter().map(|tree| (PartKey::Tree, tree.clone())));
+        parts.extend(self.left.iter().map(|left| (PartKey::Left(left.clone()), left.clone())));
         if let Some(forgot) = &self.forgot {
             if let Some(cause) = &forgot.cause {
-                parts.push(format!("the wait found it foreign: {cause}"));
+                parts.push((PartKey::Described, format!("the wait found it foreign: {cause}")));
             }
-            parts.push(format!("forgetting tokio's handle for it leaks {}", forgot.leak));
+            parts.push((
+                PartKey::Described,
+                format!("forgetting tokio's handle for it leaks {}", forgot.leak),
+            ));
         }
 
-        (!parts.is_empty()).then(|| format!("{}: {}", self.label, parts.join("; ")))
+        parts
     }
 
     /// The root's state, when it is worth a warn: unsettled, or forgotten. A second look that

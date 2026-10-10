@@ -28,10 +28,12 @@ fn collect(id: crate::identity::ProcessId, writer: std::io::PipeWriter) {
     );
 }
 
-/// A failed peek cannot show the child ours, but proves nothing about a reap either: the child runs.
+/// A failed peek cannot show the child ours, but proves nothing about a reap either. Armed, the drop
+/// signals through the handle and the child is `Killed`; disarmed, nothing is signalled and the child
+/// may be running. Neither is `Gone`.
 ///
 /// Mutants: the unshown-ownership case is read as a foreign reap (`Gone`), armed or disarmed.
-fn a_failed_peek_leaves_the_child_running(kill_on_drop: bool) {
+fn a_failed_peek_answers_what_the_drop_did(kill_on_drop: bool) {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, writer) = live(kill_on_drop);
     let id = child.id();
@@ -87,13 +89,13 @@ async fn a_disarmed_teardown_with_a_failed_peek_looks_and_warns_once() {
 }
 
 #[skuld::test]
-async fn an_armed_teardown_with_a_failed_peek_says_running_not_gone() {
-    a_failed_peek_leaves_the_child_running(true);
+async fn an_armed_teardown_with_a_failed_peek_says_killed_not_gone() {
+    a_failed_peek_answers_what_the_drop_did(true);
 }
 
 #[skuld::test]
 async fn a_disarmed_teardown_with_a_failed_peek_says_running_not_gone() {
-    a_failed_peek_leaves_the_child_running(false);
+    a_failed_peek_answers_what_the_drop_did(false);
 }
 
 /// A live child whose backend was forgotten, shown reaped elsewhere (`true`) or not shown to be

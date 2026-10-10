@@ -27,7 +27,7 @@ fn a_child_without_a_process() -> Child {
         elevation: None,
         front: None,
         #[cfg(unix)]
-        reported: false,
+        reported: Vec::new(),
     }
 }
 

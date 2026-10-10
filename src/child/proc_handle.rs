@@ -54,8 +54,8 @@ impl ProcHandle {
     /// Whether this handle itself has reaped the root: [`wait`](Self::wait),
     /// [`try_wait`](Self::try_wait) or [`wait_deadline`](Self::wait_deadline) recorded the exit.
     /// True from the moment the reap is recorded, even before the recording waiter returns. A reap by someone else is not seen here.
-    /// `Raw` (Windows) reads the process handle's signalled state: nothing is consumed there.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
+    /// `Raw` (Windows) reads the reap its own wait recorded: nothing is consumed there, so an exit
+    /// nobody waited on yet is not a reap.
     pub(crate) fn is_reaped(&self) -> bool {
         match self {
             ProcHandle::Std(s) => s.is_reaped(),
@@ -148,9 +148,11 @@ impl ProcHandle {
                 crate::child::spawn::fault::run_between_kill_and_wait();
                 match s.wait() {
                     Ok(_) => Torn::new(ChildFate::Reaped),
+                    // The tree kill was delivered: a wait that finds the exit collected elsewhere, or
+                    // fails, is `Killed` (see `Foreign::fate`).
                     Err(e) => Torn {
                         fate: if e.raw_os_error() == Some(libc::ECHILD) {
-                            ChildFate::Gone
+                            crate::wait::exit_only::Foreign::Gone.fate(true)
                         } else {
                             ChildFate::Killed
                         },
@@ -211,10 +213,16 @@ impl ProcHandle {
                                     left,
                                 };
                             }
-                            Torn {
-                                fate: ChildFate::Killed,
-                                left,
-                            }
+                            // A failed wait shows what became of the child only if the kill was delivered.
+                            #[cfg(unix)]
+                            let fate = if delivered {
+                                ChildFate::Killed
+                            } else {
+                                ChildFate::Unknown
+                            };
+                            #[cfg(not(unix))]
+                            let fate = ChildFate::Killed;
+                            Torn { fate, left }
                         }
                     },
                     // Kill failed: NEVER block. Reap non-blockingly; if it was EPERM and the
@@ -238,7 +246,7 @@ impl ProcHandle {
                 }
             }
             #[cfg(windows)]
-            ProcHandle::Raw(r) => Torn::new(r.teardown_on_drop(id)),
+            ProcHandle::Raw(r) => r.teardown_on_drop(id),
         }
     }
 }

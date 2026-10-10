@@ -131,10 +131,11 @@ pub struct Child {
     /// The elevation front this child is, if any, as its spawn found it (see
     /// [`crate::elevation::front`]). The one source the kill and `SIGTERM` gates read.
     front: Option<crate::elevation::front::Front>,
-    /// A failed-spawn cleanup that left this handle armed already warned about its event, so the
-    /// drop that retries reports at `debug` ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
+    /// What a failed-spawn cleanup that left this handle armed already warned of, so the drop that
+    /// retries reports a repeat of it at `debug` and anything new at `warn`
+    /// ([`DropReport::emit`](crate::child::drop_report::DropReport::emit)).
     #[cfg(unix)]
-    reported: bool,
+    reported: Vec<crate::child::drop_report::PartKey>,
 }
 
 impl Child {
@@ -157,7 +158,7 @@ impl Child {
             elevation: None,
             front: None,
             #[cfg(unix)]
-            reported: false,
+            reported: Vec::new(),
         }
     }
 
@@ -395,7 +396,8 @@ impl Child {
                             Ok(status) => reaped(status),
                             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                                 log::debug!("Child::drop: elevation front pid {pid} was reaped by someone else");
-                                Torn::new(ChildFate::Gone)
+                                // The cgroup kill landed first: delivered, so `Killed`.
+                                Torn::new(crate::wait::exit_only::Foreign::Gone.fate(true))
                             }
                             Err(e) => Torn {
                                 fate: ChildFate::Killed,
@@ -1087,7 +1089,7 @@ impl Child {
                 // in it. Run now, not at field drop, so the look at the front comes after it.
                 let torn = self.tear_down_leaf_and_look_at_front(&unkillable);
                 report.left.extend(torn.left);
-                report.emit(self.reported);
+                report.emit(&self.reported);
                 return torn.fate;
             }
             gate => matches!(gate, crate::elevation::front::Gate::CgroupOnly),
@@ -1099,15 +1101,12 @@ impl Child {
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
             // reported, never asserted on.
-            report
-                .left
-                .push(format!("contained-tree teardown did not fully succeed: {e}"));
+            let mut tree = format!("contained-tree teardown did not fully succeed: {e}");
             if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
-                report
-                    .left
-                    .push("the root is killed regardless, so its descendants may be orphaned".to_owned());
+                tree.push_str("; the root is killed regardless, so its descendants may be orphaned");
             }
+            report.tree = Some(tree);
         }
         // Kill, block until the child has exited, and collect its status here — this handle owns
         // the child outright, and a sync caller owns the thread it is blocking. The async twin
@@ -1139,7 +1138,7 @@ impl Child {
             report.left.extend(torn.left);
             torn.fate
         };
-        report.emit(self.reported);
+        report.emit(&self.reported);
         fate
     }
 }

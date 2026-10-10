@@ -891,6 +891,54 @@ async fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     );
 }
 
+/// A tree kill that fails and a root whose handle cannot say whether it was reaped (`Unknown`) are
+/// one event: the cleanup warns once, naming both.
+///
+/// Mutant: the tree's failure is logged on its own, beside the cleanup's warn.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
+    crate::log_capture::install();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-unkillable-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    // A directory: writing `cgroup.kill` fails with EISDIR, as a refused kill would.
+    std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
+    fault::set_attachment_override(crate::containment::Attachment {
+        containment: crate::containment::Containment::CgroupV2,
+        attached: crate::containment::Attached::Cgroup(crate::containment::cgroup::test_support::entered_leaf_at(
+            leaf_path.clone(),
+        )),
+        graceful: crate::graceful::GracefulMechanism::Process,
+    });
+    let (mut cmd, teardown) = opted_out_teardown_blocker();
+    let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
+    let mark = crate::log_capture::mark();
+    let _unsure = crate::wait::exit_only::seams::force_peeks([
+        Err(std::io::Error::other("forced peek failure 7a2e")),
+        Err(std::io::Error::other("forced peek failure 7a2e")),
+    ]);
+
+    let (_err, _fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+
+    teardown.assert_killed();
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        // (The leaf's own removal failure is another resource's event.)
+        .filter(|(level, text)| *level <= log::Level::Warn && !text.contains("was not removed"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0]
+            .1
+            .contains("tree teardown after a failed password write failed")
+            && warns[0].1.contains("RootState::Unknown"),
+        "the one warn names the tree's failure and the unknown root: {warns:?}"
+    );
+}
+
 /// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
 /// group number may name another group by now, and the error says the tree kill was skipped. The
 /// async twin of the sync `finish_elevated`'s test.

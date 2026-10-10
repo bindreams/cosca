@@ -796,8 +796,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
     // deliberately left alone because the root is reaped or unpinned.
     let tree_settled = tree.is_none() || child.tree_killed() || (skipped.is_some() && view.leaves_root_alone());
-    let tree_warned = matches!(tree, Some(Err(_)));
-    let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
+    let (mut tree_note, tree_warn) = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
     if let Some(note) = skipped {
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
@@ -884,8 +883,9 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     };
     let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
     report.forgot = forgot;
-    let warned = report.emit(false);
-    child.end_cleanup(tree_settled && root_settled, warned || tree_warned);
+    report.tree = tree_warn;
+    let warned = report.emit(&[]);
+    child.end_cleanup(tree_settled && root_settled, warned);
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,

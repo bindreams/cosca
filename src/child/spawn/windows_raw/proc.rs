@@ -95,7 +95,6 @@ impl RawChild {
     /// Whether this handle's own wait has recorded the exit. Nothing is consumed on Windows, so
     /// an exit nobody waited on yet is not recorded: this is the same meaning as on the other
     /// backends.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "read only on unix and in tests"))]
     pub(crate) fn is_reaped(&self) -> bool {
         self.reaped.get().is_some()
     }
@@ -189,28 +188,32 @@ impl RawChild {
     /// Best-effort `kill_on_drop` teardown that NEVER blocks on an unkillable runas child.
     /// Non-runas (or a runas child we can terminate): kill, then reap via a blocking wait on
     /// the real exit event. A genuinely higher-integrity runas child (static `can_terminate`
-    /// probe is false on the `ACCESS_DENIED` path): LOG and move on — never block.
-    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::error::ChildFate {
+    /// probe is false on the `ACCESS_DENIED` path): say so and move on — never block. What it could
+    /// not do comes back in [`Torn::left`] for the caller's one warn; nothing is logged here.
+    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::child::proc_handle::Torn {
+        use crate::child::proc_handle::Torn;
         use crate::error::ChildFate;
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => fate_after_reap(true, self.reap()),
+            Ok(()) => Torn::new(fate_after_reap(true, self.reap())),
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
-                    log::warn!(
-                        "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
-                        self.pid
-                    );
-                    ChildFate::Running { id: Some(id) }
+                    Torn {
+                        fate: ChildFate::Running { id: Some(id) },
+                        left: Some(format!(
+                            "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
+                            self.pid
+                        )),
+                    }
                 } else {
                     // The kill was refused: only the wait's result says what became of the child.
-                    fate_after_reap(false, self.reap())
+                    Torn::new(fate_after_reap(false, self.reap()))
                 }
             }
-            Err(e) => {
-                log::warn!("terminating child {} on drop failed: {e:?}", self.pid);
-                ChildFate::Unknown
-            }
+            Err(e) => Torn {
+                fate: ChildFate::Unknown,
+                left: Some(format!("terminating child {} on drop failed: {e:?}", self.pid)),
+            },
         }
     }
 }
