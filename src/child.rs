@@ -250,14 +250,9 @@ impl Child {
     /// [`ElevationErrorKind::Unkillable`](crate::error::ElevationErrorKind::Unkillable), and
     /// [`wait`](Child::wait) still returns only once the program has exited.
     ///
-    /// Whether the cgroup kill reached the front is read after it: by the cgroup id of its pidfd
-    /// (`PIDFD_GET_INFO`) on Linux 6.13 and later, looked for in the cgroup and the cgroups under
-    /// it, and by `/proc/<pid>/cgroup` otherwise. A killed process keeps its cgroup until it is
-    /// reaped, so a front the kill reached reads as in the cgroup. One that someone else moves out
-    /// after the kill, before it exits, reads as moved, and this returns `Unkillable` though the
-    /// front is dying. So does a failed `cgroup.kill`, naming the failure; the other cases are
-    /// listed on [`Command::contain`](crate::Command::contain). Before 6.13, a host whose `/proc`
-    /// would hide the front's cgroup refuses the spawn instead.
+    /// Whether the cgroup kill reached the front is read after it; a front someone else moves out of
+    /// the cgroup before it exits reads as moved, and this returns `Unkillable` though it is dying.
+    /// The other `Unkillable` cases are listed on [`Command::contain`](crate::Command::contain).
     ///
     /// An elevated program that moves its front out of the cgroup and back again around the kill
     /// can make an `Ok` false, as [`Command::contain`](crate::Command::contain) says; `wait` stays
@@ -301,8 +296,7 @@ impl Child {
                     other => other.map_err(Error::Io),
                 }
             }
-            // A signal after the cgroup kill could only be refused; whether the kill reached the
-            // tracked process is read after it.
+            // Nothing is signalled after the cgroup kill: it could only be refused.
             Gate::CgroupOnly => {
                 self.attached
                     .hard_kill_marking(&self.tree_killed)
@@ -445,8 +439,7 @@ impl Child {
             self.id.pid()
         );
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
-        // neither exited nor in its cgroup. `None` for a child the backstop may signal; for a front
-        // it must not, `Some(true)` when the front is in the cgroup, `Some(false)` when it exited.
+        // neither exited nor in its cgroup.
         #[cfg(unix)]
         let front = match self.kill_gate() {
             crate::elevation::front::Gate::Closed(unkillable) => return Err(unkillable),

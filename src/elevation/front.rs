@@ -128,9 +128,7 @@ pub(crate) fn kill_gate(
 /// `cgroup_mutex`), so what holds after the write says which came first:
 ///
 /// - `exited`: it has exited, so nothing of it is left to kill.
-/// - `under_leaf`: its cgroup is the leaf or one under it: by its pidfd's cgroup id on Linux 6.13
-///   and later, then by `/proc/<pid>/cgroup` (see `containment::cgroup::Subtree::holds`). A killed
-///   task keeps its cgroup until it is freed.
+/// - `under_leaf`: its cgroup is the leaf or one under it (see `containment::cgroup::Subtree::holds`).
 ///
 /// A front `under_leaf` does not place is asked `exited` again: one the kill ended meanwhile, and
 /// that another thread's `wait` reaped, has no cgroup left to read, and has exited.
@@ -138,8 +136,7 @@ pub(crate) fn kill_gate(
 /// A front none of these places in the leaf left it before the kill, as pam_systemd moves sudo into
 /// a session scope: it was not killed, and the answer is `Unkillable`, so nothing waits for it. So
 /// is one whose place cannot be read: nothing shows the kill reached it. A front killed and then
-/// moved before it exited reads as moved before its kill (measured on Linux 7.0): that answer is a
-/// refusal of a kill that did land, never an `Ok` for one that did not.
+/// moved before it exited reads the same (see [`Command::contain`](crate::Command::contain)).
 pub(crate) fn cgroup_kill_reached(
     front: Option<Front>,
     pid: u32,
@@ -300,15 +297,22 @@ pub(crate) mod seams {
         static GATES: Cell<Option<u32>> = const { Cell::new(None) };
         static BETWEEN_GATE_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static BETWEEN_REACH_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        static REACH_READS_RUNNING: Cell<bool> = const { Cell::new(false) };
+        static REACH_READS_RUNNING: Cell<u32> = const { Cell::new(0) };
     }
 
-    /// While the guard lives, the checks of a cgroup kill on this thread read the front as still
-    /// running, whatever its cgroup kill did to it: a front just killed may or may not have exited
-    /// by the check's first read, and a test of what the check does with a front it cannot place
-    /// needs one that has not.
-    pub(crate) fn read_fronts_running_after_a_kill() -> ReachReadsRunning {
-        REACH_READS_RUNNING.with(|f| f.set(true));
+    /// While the guard lives, the check of a cgroup kill on this thread reads the front as still
+    /// running at its first read of whether it exited, whatever the kill did to it: a front just
+    /// killed may or may not have exited by then, and a test of what the check does between its
+    /// reads needs one that has not.
+    pub(crate) fn read_front_running_at_the_first_reach_read() -> ReachReadsRunning {
+        REACH_READS_RUNNING.with(|f| f.set(1));
+        ReachReadsRunning(())
+    }
+
+    /// As [`read_front_running_at_the_first_reach_read`], at every read of the check: for a test of
+    /// what it does with a front it cannot place.
+    pub(crate) fn read_front_running_at_every_reach_read() -> ReachReadsRunning {
+        REACH_READS_RUNNING.with(|f| f.set(u32::MAX));
         ReachReadsRunning(())
     }
 
@@ -317,12 +321,19 @@ pub(crate) mod seams {
 
     impl Drop for ReachReadsRunning {
         fn drop(&mut self) {
-            REACH_READS_RUNNING.with(|f| f.set(false));
+            REACH_READS_RUNNING.with(|f| f.set(0));
         }
     }
 
+    /// Whether the read now being made reads the front as running.
     pub(super) fn reach_reads_running() -> bool {
-        REACH_READS_RUNNING.with(Cell::get)
+        REACH_READS_RUNNING.with(|f| {
+            let remaining = f.get();
+            if remaining != u32::MAX {
+                f.set(remaining.saturating_sub(1));
+            }
+            remaining > 0
+        })
     }
 
     /// Run `hook` once in the next kill gate on this thread, between its read of whether the front

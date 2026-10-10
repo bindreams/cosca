@@ -594,7 +594,8 @@ impl Command {
     /// block on: the teardown gives up rather than wait forever, and the child is left running.
     /// So is an elevated child behind a front outside a cgroup (see
     /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
-    /// `warn` naming it.
+    /// `warn` naming it. A front so left takes its tree with it: the drop disarms its cgroup leaf,
+    /// whose own `cgroup.kill` would end the front.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup
     /// leaf behind.** Dropping the handle still removes the leaf if the whole tree has exited,
@@ -634,7 +635,8 @@ impl Command {
     ///
     /// The cgroup kill reaches every process still in the cgroup or under it. A process root moved
     /// out of it (as `sudo systemd-run --scope` does) is not killed, and cosca cannot see it: an
-    /// `Ok` says only that the front and everything still in the cgroup were killed.
+    /// `Ok` says only that the front and everything still in the cgroup were killed. A killed
+    /// process keeps its cgroup until it is freed, so a front the kill reached reads as in it.
     ///
     /// An elevated program that moves its front out of the cgroup and back again around the kill
     /// can make that `Ok` false: the kill and a move are serialised, but nothing records which side
@@ -643,8 +645,9 @@ impl Command {
     /// a hostile root program, which could as well trace cosca or rewrite its memory.
     ///
     /// A front no kill is shown to have reached is sent nothing and left unreaped, and the call
-    /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns, and a
-    /// failed spawn's error carries a note. That is the case when:
+    /// says so: [`kill`](crate::Child::kill) returns `Unkillable`, never `Ok`, a drop warns and its
+    /// leaf kills nothing either (a `cgroup.kill` there would end the front), and a failed spawn's
+    /// error carries a note. That is the case when:
     ///
     /// - the `cgroup.kill` write fails (`kill` names the failure);
     /// - someone else moves the front out of the cgroup before its kill, which then does not reach

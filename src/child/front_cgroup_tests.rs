@@ -310,7 +310,7 @@ fn cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed(#[fixture(cgrou
         let unreadable = std::rc::Rc::clone(&unreadable);
         move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
     });
-    let _running = crate::elevation::front::seams::read_fronts_running_after_a_kill();
+    let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
     let mark = crate::log_capture::mark();
     drop(child);
     drop(unreadable.take());
@@ -369,8 +369,16 @@ fn cgroup_drop_of_a_front_that_refuses_signals_reaps_it(#[fixture(cgroup)] _grou
 /// A failed password write's teardown of such a front says it was terminated.
 #[skuld::test]
 fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_nobody_front();
-    let _refusing = WithoutKillCap::refusing(child.id().pid());
+    let (child, stdin) = spawn_nobody_front();
+    let pid = child.id().pid();
+    let _refusing = WithoutKillCap::refusing(pid);
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    // Closed at the teardown's wait: a front nothing killed then exits 0, and the status below fails.
+    let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(stdin)));
+    let _released = crate::child::spawn::fault::set_between_kill_and_wait({
+        let stdin = std::rc::Rc::clone(&stdin);
+        move || drop(stdin.take())
+    });
     let err = crate::child::spawn::finish_elevated(
         child,
         Err(crate::error::Error::Elevation {
@@ -381,6 +389,16 @@ fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixt
     .expect_err("a failed write fails the spawn");
     let rendered = err.to_string();
     assert!(rendered.contains("the elevated child was terminated"), "{rendered}");
+    let (_, status) = reaps
+        .recorded()
+        .into_iter()
+        .find(|(reaped, _)| *reaped == pid)
+        .expect("the teardown reaped the front");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the front ended by the cgroup kill"
+    );
 }
 
 /// A failed password write whose cgroup kill fails refuses the front's kill as `kill` does,
@@ -702,6 +720,28 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
     assert_killed_by_the_leaf(&failures, &reaps);
 }
 
+/// A failed spawn's teardown reads a front its leaf's kill has made a zombie, with its own wait,
+/// not the seam that has it see the front running: the real read finds the zombie and reaps it,
+/// waiting for nothing. The teardown first waits (without reaping) until the front is a zombie, so
+/// the read is not a race with the kill. Mutant: "a zombie front is left unreaped".
+#[skuld::test]
+fn cgroup_a_failed_spawn_reaps_a_front_its_leaf_made_a_zombie_without_waiting(#[fixture(cgroup)] _group: &Group) {
+    let _zombie = crate::child::spawn::fault::exit_fronts_before_teardown();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
+    for HeldFailure { err, pid, .. } in &failures {
+        let text = err.to_string();
+        assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
+        assert!(text.contains("and it was reaped"), "{text}");
+        assert_eq!(
+            crate::child::front_kill_tests::reap(*pid),
+            None,
+            "the teardown's read reaped front {pid}"
+        );
+    }
+    assert_eq!(reaps.recorded(), [], "the zombie was reaped by the read, not by a wait");
+}
+
 /// A failed spawn's front, its place read through `/proc` alone, is killed by its leaf and reaped:
 /// once the leaf is removed `/proc` names it with ` (deleted)`, which the place recorded before the
 /// removal answers.
@@ -775,6 +815,9 @@ fn cgroup_a_failed_escalation_of_a_front_is_unkillable(#[fixture(cgroup)] _group
         .expect("stdout pipe")
         .read_exact(&mut ready)
         .expect("read `ready`");
+    // Released at the wait that follows the escalation, which a swallowed failure would reach: the
+    // front then ends by itself, and the refusal below fails, instead of the wait hanging.
+    let release = crate::graceful_hooks::release_at(crate::graceful_hooks::HookPoint::BeforeReap, stdin);
     {
         let _failing = crate::containment::cgroup::fault::fail_kill_writes();
         assert_refused_by(
@@ -782,7 +825,10 @@ fn cgroup_a_failed_escalation_of_a_front_is_unkillable(#[fixture(cgroup)] _group
             "its cgroup kill failed",
         );
     }
-    assert_ends_unsignalled(&child, stdin);
+    // Closes the front's stdin: it ends unsignalled.
+    drop(release);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "the front was signalled: {status:?}");
 }
 
 /// A front that exits, and that another thread's `wait` reaps, between the kill gate's read of
@@ -793,6 +839,7 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     std::thread::scope(|scope| {
         let child = &child;
         scope.spawn(move || {
@@ -802,11 +849,15 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
                     .expect("report the reap");
             }
         });
-        let _between = crate::elevation::front::seams::set_between_gate_reads(move || {
-            drop(stdin);
-            go_tx.send(()).expect("start the waiter");
-            let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
-            assert!(status.success(), "the front ended on its stdin: {status:?}");
+        let _between = crate::elevation::front::seams::set_between_gate_reads({
+            let fired = std::rc::Rc::clone(&fired);
+            move || {
+                fired.set(true);
+                drop(stdin);
+                go_tx.send(()).expect("start the waiter");
+                let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
+                assert!(status.success(), "the front ended on its stdin: {status:?}");
+            }
         });
         crate::wait::exit_only::seams::signals_sent();
         child.kill().expect("a front that exited is not refused");
@@ -816,6 +867,7 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
             "nothing is signalled to a reaped front"
         );
     });
+    assert!(fired.get(), "the hook between the gate's reads ran");
 }
 
 /// A front its cgroup kill ended, and that another thread's `wait` reaped before its cgroup is
@@ -825,6 +877,7 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixtu
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
     std::thread::scope(|scope| {
         let child = &child;
         scope.spawn(move || {
@@ -834,17 +887,25 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixtu
                     .expect("report the reap");
             }
         });
-        let _between = crate::elevation::front::seams::set_between_reach_reads(move || {
-            // The kill was written, so the front dies of it; one the kill missed exits 0 here.
-            drop(stdin);
-            go_tx.send(()).expect("start the waiter");
-            let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
-            assert_eq!(status.signal(), Some(libc::SIGKILL), "the cgroup kill ended the front");
+        // The check's first read finds the front running, whether or not the kill has ended it by
+        // then, so the hook below always runs between the check's reads.
+        let _running = crate::elevation::front::seams::read_front_running_at_the_first_reach_read();
+        let _between = crate::elevation::front::seams::set_between_reach_reads({
+            let fired = std::rc::Rc::clone(&fired);
+            move || {
+                fired.set(true);
+                // The kill was written, so the front dies of it; one the kill missed exits 0 here.
+                drop(stdin);
+                go_tx.send(()).expect("start the waiter");
+                let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
+                assert_eq!(status.signal(), Some(libc::SIGKILL), "the cgroup kill ended the front");
+            }
         });
         child
             .kill()
             .expect("a front its kill ended is reached, whoever reaped it");
     });
+    assert!(fired.get(), "the hook between the check's reads ran");
 }
 
 /// The leaf `child` is contained in.
@@ -1184,7 +1245,9 @@ fn cgroup_an_unplaceable_front_is_refused_before_its_fork_with_fds_0_and_1_close
 }
 
 /// A host whose `/proc` shows a process this one may not trace can place a front without
-/// `PIDFD_GET_INFO`: the spawn goes on.
+/// `PIDFD_GET_INFO`: the spawn goes on. The cgroup group declares the precondition: the lane runs
+/// as root, whose `CAP_SYS_PTRACE` reads a non-dumpable child's cgroup through any `/proc`, even a
+/// `hidepid` one.
 #[skuld::test]
 fn cgroup_a_front_placeable_through_proc_is_not_refused(#[fixture(cgroup)] _group: &Group) {
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();

@@ -583,8 +583,7 @@ impl Child {
         #[cfg(unix)]
         match gate {
             crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited => {}
-            // A signal after the cgroup kill could only be refused; whether the kill reached the
-            // tracked process is read after it.
+            // Nothing is signalled after the cgroup kill: it could only be refused.
             crate::elevation::front::Gate::CgroupOnly => {
                 self.os
                     .attached

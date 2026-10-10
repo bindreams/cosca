@@ -118,10 +118,14 @@ fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that shows a process this one may not trace makes fronts
 /// placeable. The probe is real: a non-dumpable child of this process, read and reaped.
+///
+/// A precondition, declared by the cgroup group: the lane runs as root, whose `CAP_SYS_PTRACE` reads
+/// a non-dumpable child's cgroup through `/proc` whatever its mount options (`hidepid` hides it from
+/// anyone else). The refusal where `/proc` hides it is tested by forcing it.
 #[skuld::test]
-fn without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts() {
+fn cgroup_without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts(#[fixture(cgroup)] _group: &Group) {
     let _missing = fault::miss_pidfd_info();
-    front_placement(|| Ok(HIGH)).expect("this test's /proc hides nothing");
+    front_placement(|| Ok(HIGH)).expect("the lane's /proc shows its root every process");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that hides a process this one may not trace refuses an
@@ -175,14 +179,17 @@ fn without_pidfd_info_an_unassessable_proc_view_refuses_naming_the_view() {
 
 /// The probe's pipe lands on whatever descriptors are free, std's own included: with fds 0 and 1
 /// closed it still reads, and still refuses where `/proc` hides. Runs in a process of its own:
-/// closing 0 and 1 is process-wide.
+/// closing 0 and 1 is process-wide. Its precondition is the cgroup group's root, as above.
 #[skuld::test]
-fn the_placement_probe_answers_with_fds_0_and_1_closed() {
+fn cgroup_the_placement_probe_answers_with_fds_0_and_1_closed(#[fixture(cgroup)] _group: &Group) {
     use crate::test_own_process::{own_process, test_path};
     use crate::test_spawn::spawn;
     use crate::test_stdio::RestoreStdio;
 
-    let Some(done) = own_process(test_path!(the_placement_probe_answers_with_fds_0_and_1_closed), spawn) else {
+    let Some(done) = own_process(
+        test_path!(cgroup_the_placement_probe_answers_with_fds_0_and_1_closed),
+        spawn,
+    ) else {
         return;
     };
     let _missing = fault::miss_pidfd_info();
@@ -410,10 +417,10 @@ impl Drop for ProbeGuard {
     fn drop(&mut self) {
         // Already reaped by the test: nothing to signal.
         if rustix::process::pidfd_send_signal(self.0.as_fd(), rustix::process::Signal::KILL).is_ok() {
-            drop(rustix::process::waitid(
+            _ = rustix::process::waitid(
                 rustix::process::WaitId::PidFd(self.0.as_fd()),
                 rustix::process::WaitIdOptions::EXITED,
-            ));
+            );
         }
     }
 }
@@ -438,7 +445,7 @@ fn the_probe_child_dies_with_the_thread_that_forked_it() {
             probe.ready_read.read_exact(&mut report).expect("the probe reports");
             ready_tx.send((probe.pid, report)).expect("report the probe");
             // The thread ends when the test lets it go, or when the test fails and drops `go_tx`.
-            drop(go_rx.recv());
+            _ = go_rx.recv();
         });
         let (pid, report) = ready_rx.recv().expect("the probe's pid");
         let pidfd = ProbeGuard(

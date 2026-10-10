@@ -1621,9 +1621,7 @@ impl FrontFate {
 }
 
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn
-/// down, so the teardown never races the verdict's reads. An elevation front stays one whatever the
-/// verdict: one its leaf holds is reached through the leaf alone, and one outside it is never
-/// signalled (see [`teardown_unadopted_or_front`]).
+/// down, so the teardown never races the verdict's reads.
 pub(crate) fn settle_before_teardown(
     prepared: &mut crate::containment::Prepared,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
@@ -1670,6 +1668,12 @@ fn teardown_unadopted_or_front(
         return FrontFate::NotAFront;
     }
     // Dropping the handle afterwards closes it; it neither signals nor reaps the child.
+    #[cfg(all(test, target_os = "linux"))]
+    if fault::fronts_exit_before_teardown() {
+        if let Some(pid) = child.pid() {
+            crate::test_child::wait_until_zombie(pid);
+        }
+    }
     #[cfg(test)]
     let tried = if fault::fronts_seen_running() {
         Ok(None)
@@ -1903,6 +1907,7 @@ pub(crate) mod fault {
     thread_local! {
         #[cfg(not(target_os = "macos"))]
         static FRONTS_SEEN_RUNNING: Cell<bool> = const { Cell::new(false) };
+        static FRONTS_EXIT_FIRST: Cell<bool> = const { Cell::new(false) };
     }
 
     /// While the guard lives, a failed spawn's teardown on this thread, and a leaf's abandonment,
@@ -1929,6 +1934,32 @@ pub(crate) mod fault {
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn fronts_seen_running() -> bool {
         FRONTS_SEEN_RUNNING.with(Cell::get)
+    }
+
+    /// While the guard lives, a failed spawn's teardown on this thread waits, before it reads an
+    /// elevation front, until the front has exited (a `WNOWAIT` wait: it stays a zombie), so the
+    /// teardown's own read finds the zombie its leaf's kill made. For a test whose kill is known to
+    /// land: one that does not blocks.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exit_fronts_before_teardown() -> ExitFrontsFirst {
+        FRONTS_EXIT_FIRST.with(|f| f.set(true));
+        ExitFrontsFirst(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "fronts are read as they are again as soon as the guard is dropped"]
+    pub(crate) struct ExitFrontsFirst(());
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ExitFrontsFirst {
+        fn drop(&mut self) {
+            FRONTS_EXIT_FIRST.with(|f| f.set(false));
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn fronts_exit_before_teardown() -> bool {
+        FRONTS_EXIT_FIRST.with(Cell::get)
     }
 
     /// A seam's hook, run with the child's pid.

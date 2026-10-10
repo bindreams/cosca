@@ -210,7 +210,7 @@ async fn cgroup_a_drop_whose_post_kill_read_fails_says_the_kill_landed(#[fixture
         let unreadable = std::rc::Rc::clone(&unreadable);
         move || *unreadable.borrow_mut() = Some(crate::containment::cgroup::fault::fail_pidfd_info())
     });
-    let _running = crate::elevation::front::seams::read_fronts_running_after_a_kill();
+    let _running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
     let mark = crate::log_capture::mark();
     drop(child);
     drop(unreadable.take());
@@ -263,7 +263,9 @@ async fn cgroup_drop_of_a_front_that_refuses_signals_kills_it(#[fixture(cgroup)]
 
 #[skuld::test]
 async fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_nobody_front().await;
+    crate::tokio::test_runtime::assert_current_thread();
+    let (child, stdin) = spawn_nobody_front().await;
+    let pidfd = pidfd_of(child.id().pid());
     let _refusing = WithoutKillCap::refusing(child.id().pid());
     let err = crate::tokio::spawn::finish_elevated(
         child,
@@ -275,6 +277,9 @@ async fn cgroup_a_failed_password_write_terminates_a_front_that_refuses_signals(
     .expect_err("a failed write fails the spawn");
     let rendered = err.to_string();
     assert!(rendered.contains("the elevated child was terminated"), "{rendered}");
+    // Closed first: a front nothing killed then exits 0, and the assertion fails.
+    drop(stdin);
+    assert_killed(&pidfd);
 }
 
 #[skuld::test]
@@ -764,6 +769,57 @@ async fn cgroup_a_child_dead_before_its_report_is_no_front(#[fixture(cgroup)] _g
     let text = err.to_string();
     assert!(!text.contains("what sudo left"), "no front, no note: {text}");
     assert_eq!(reap(pid), None, "the abandonment reaps the child");
+}
+
+/// A `sh` front that ignores `SIGTERM` and then execs `cat`, contained and reported as launched by
+/// `sudo`, once it says `ready`: the escalation of a graceful shutdown runs against it.
+async fn spawn_term_ignoring_front() -> (Child, ChildStdin) {
+    use ::tokio::io::AsyncReadExt as _;
+    let mut cmd = Command::new();
+    cmd.args(["sh", "-c", "trap '' TERM; echo ready; exec cat"]);
+    cmd.stdout(Stdio::pipe()).expect("stdout pipe");
+    let (mut child, stdin) = spawn_as(in_cgroup(cmd), SUDO);
+    let mut ready = [0u8; 6];
+    child
+        .stdout()
+        .expect("stdout pipe")
+        .read_exact(&mut ready)
+        .await
+        .expect("read `ready`");
+    (child, stdin)
+}
+
+/// Async twin of the sync `cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup`.
+#[skuld::test]
+async fn cgroup_graceful_shutdown_of_a_front_escalates_through_the_cgroup(#[fixture(cgroup)] _group: &Group) {
+    let (mut child, _stdin) = spawn_term_ignoring_front().await;
+    let status = child
+        .graceful_shutdown(std::time::Duration::ZERO)
+        .await
+        .expect("the cgroup kill ends the front");
+    assert!(child.tree_killed.is_set(), "the escalation must go through the cgroup");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+}
+
+/// Async twin of the sync `cgroup_a_failed_escalation_of_a_front_is_unkillable`.
+#[skuld::test]
+async fn cgroup_a_failed_escalation_of_a_front_is_unkillable(#[fixture(cgroup)] _group: &Group) {
+    use crate::graceful_hooks::{release_at, HookPoint};
+    let (mut child, stdin) = spawn_term_ignoring_front().await;
+    // Released at the wait that follows the escalation, which a swallowed failure would reach: the
+    // front then ends by itself, and the refusal below fails, instead of the wait hanging.
+    let release = release_at(HookPoint::BeforeReap, stdin);
+    {
+        let _failing = crate::containment::cgroup::fault::fail_kill_writes();
+        crate::child::front_kill_tests::assert_refused_by(
+            child.graceful_shutdown(std::time::Duration::ZERO).await,
+            "its cgroup kill failed",
+        );
+    }
+    // Closes the front's stdin: it ends unsignalled.
+    drop(release);
+    let status = child.wait().await.expect("wait");
+    assert!(status.success(), "the front was signalled: {status:?}");
 }
 
 /// Async twin of the sync `cgroup_a_front_spawn_that_cannot_read_its_leaf_subtree_says_why`.

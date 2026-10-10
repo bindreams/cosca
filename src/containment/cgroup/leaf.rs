@@ -386,7 +386,7 @@ impl CgroupLeaf {
     }
 
     /// Whether the task `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup
-    /// under it (see [`Subtree::holds`]). A killed task stays in its cgroup until it is freed.
+    /// under it (see [`Subtree::holds`]).
     pub(crate) fn names(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
         self.subtree()?.holds(pid, pidfd)
     }

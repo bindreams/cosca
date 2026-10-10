@@ -298,11 +298,9 @@ pub(crate) enum Walked {
 /// may not read (`EACCES`), or one whose path from the leaf is longer than `PATH_MAX`
 /// (`ENAMETOOLONG`).
 ///
-/// Its cost is one `openat2`, one `name_to_handle_at`, one `openat` and its `getdents` per cgroup:
-/// about 3 µs per cgroup, measured on Linux 7.0 (arm64, release build): 2.6 ms for 1000 cgroups
-/// side by side, 2.9 ms for 1110 nested three deep. It is bounded: the tree is finite, and the walk
-/// visits each cgroup at most once, since cgroup v2 refuses to rename or move a cgroup. It is sized
-/// by the cgroups the contained program made.
+/// One `openat2`, `name_to_handle_at`, `openat` and `getdents` per cgroup. Bounded: the tree is
+/// finite and each cgroup is visited once, since cgroup v2 refuses to rename or move one; it is
+/// sized by the cgroups the contained program made.
 pub(crate) fn find_descendant(dir: BorrowedFd<'_>, id: u64) -> Walked {
     match walk(dir, id) {
         Ok(Some(())) => Walked::Found,
@@ -371,7 +369,7 @@ fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
         let mut first = true;
         for entry in entries {
             let entry = if std::mem::take(&mut first) {
-                step_fault(&path, WalkStep::Entries).and_then(|()| entry)
+                step_fault(&path, WalkStep::Entries).and(entry)
             } else {
                 entry
             };

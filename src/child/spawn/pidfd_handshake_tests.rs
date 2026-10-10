@@ -1328,3 +1328,33 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
     drop(cat.stdin.take());
     assert!(cat.wait().expect("wait").success(), "the front was signalled");
 }
+
+/// A front spawned for a cgroup leaf and dropped by tokio after its fork is the leaf's to answer
+/// for: the handshake stashes its pidfd for the leaf, signals and waits on nothing, and returns the
+/// error as it came, with no note of the front's fate. Mutants: "the arm tears the child down",
+/// "the arm notes the front", "the arm drops the pidfd".
+#[skuld::test]
+fn a_front_left_to_its_leaf_keeps_its_pidfd_and_is_sent_nothing() {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut cat, pidfd) = cat_with_pidfd();
+    let raw = pidfd.as_raw_fd();
+    let left: super::LeftPidfd = Rc::new(Cell::new(None));
+    let err = super::conclude(
+        Err::<NoChild, _>(std::io::Error::other("tokio failed")),
+        Outcome::Opened(pidfd),
+        super::LeftFront::ToLeaf(Rc::clone(&left)),
+    )
+    .err()
+    .expect("the spawn fails");
+    assert_eq!(
+        err.to_string(),
+        Error::Io(std::io::Error::other("tokio failed")).to_string()
+    );
+    let stashed = left.take().expect("the pidfd is left for the leaf");
+    assert_eq!(stashed.as_raw_fd(), raw, "the pidfd it was given");
+    // Not signalled and not waited on: closing its stdin ends it with status 0, and it was not
+    // reaped before this wait.
+    drop(cat.stdin.take());
+    assert!(cat.wait().expect("wait").success(), "the front was signalled");
+}

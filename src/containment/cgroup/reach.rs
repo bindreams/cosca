@@ -1,16 +1,14 @@
 //! Whether a task is in a leaf's cgroup subtree, by reads that each end: none waits on the task.
 //!
 //! - **Linux 6.13+:** `PIDFD_GET_INFO`'s cgroup id, through the task's pidfd, compared with the
-//!   leaf's own id. A task keeps its cgroup until it is freed, so a killed task on its way out, or
-//!   a zombie, still has the leaf's id; a task moved out has its new cgroup's. Measured on Linux
-//!   7.0. Another id is looked for among the cgroups under the leaf: those its sweep removed, then
-//!   those a walk of the leaf's descendants finds.
+//!   leaf's own id. Another id is looked for among the cgroups under the leaf: those its sweep
+//!   removed, then those a walk of the leaf's descendants finds.
 //! - **Otherwise:** `/proc/<pid>/cgroup`'s path, compared with the leaf's. A `hidepid` `/proc`
 //!   hides it for a task of another user (a root front), so an elevated spawn that would need it
 //!   is refused (see [`front_placement`]).
 //!
-//! A task killed through the leaf and then moved by someone else before it exits reads as moved
-//! before its kill, by either read.
+//! What a read says of a task killed through the leaf and then moved by someone else is on
+//! [`Command::contain`](crate::Command::contain).
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -22,7 +20,6 @@ use super::parse::{is_at_or_under, parse_v2_relative_path};
 /// `_IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info)`, with the 64-byte first version of the struct.
 /// The request is the same 32 bits under glibc's `unsigned long` and musl's `int`.
 const PIDFD_GET_INFO: libc::Ioctl = 0xC040_FF0B_u32 as libc::Ioctl;
-/// `PIDFD_INFO_CGROUPID`.
 const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
 
 /// The first version of `struct pidfd_info`, whose size is in [`PIDFD_GET_INFO`].
@@ -194,13 +191,14 @@ impl Subtree {
         }
     }
 
-    /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. Where the
-    /// kernel gives a pidfd's cgroup id (6.13+), it is in the subtree if that id is the leaf's, or
+    /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. A task
+    /// keeps its cgroup until it is freed, so a killed task on its way out, or a zombie, still has
+    /// the leaf's id, and a task moved out has its new cgroup's. Where the kernel gives a pidfd's
+    /// cgroup id (6.13+), it is in the subtree if that id is the leaf's, or
     /// one the leaf's sweep removed, or one a walk of the leaf's descendants finds; outside if the
     /// walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise, before 6.13 or
     /// when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
-    /// unified-hierarchy path (a test leaf) holds nothing that read would place. Every read is
-    /// bounded: the walk by the cgroups under the leaf, which are finite.
+    /// unified-hierarchy path (a test leaf) holds nothing that read would place.
     pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
         let mut elsewhere = false;
         if let Some(pidfd) = pidfd {
@@ -302,21 +300,12 @@ fn dying_in(text: &str) -> Option<u64> {
 }
 
 /// Whether this host can place an elevation front after a cgroup kill, decided before any front is
-/// spawned: on Linux 6.13 and later by a pidfd's cgroup id, which no `/proc` mount option hides;
-/// before, by `/proc/<pid>/cgroup` of a process this one may not trace, as it may not trace a
-/// front: sudo runs as root, and a setuid program is not dumpable. `hidepid` hides exactly such a
-/// process, whatever its user, from a caller without `CAP_SYS_PTRACE` (measured on Linux 7.0: a
-/// non-dumpable child of this process and a sudo front alike, `ENOENT` under `hidepid=2`, `EPERM`
-/// under `hidepid=1`, and readable without it or by root). The process read is a child forked for
-/// it, made non-dumpable (which it reports), then killed and reaped. Neither read depends on when the
-/// front would run: no front exists yet.
+/// spawned. Placement is by a pidfd's cgroup id on Linux 6.13 and later, else by `/proc/<pid>/cgroup`
+/// of a non-dumpable child, since `hidepid` hides such a process as it hides a root `sudo` front.
+/// The leaf's id must be readable: `ENOSYS`, `EOPNOTSUPP` or `EPERM` is `Unsupported` naming the
+/// errno, and any other error is `Io`.
 ///
-/// First of all, the front's leaf must give its cgroup id (`leaf_id`, by `name_to_handle_at`):
-/// every placement compares with it. A kernel without `CONFIG_FHANDLE` answers `ENOSYS`, a
-/// filesystem with no export operations `EOPNOTSUPP`, and a seccomp filter may answer `EPERM`:
-/// each refuses the spawn as unsupported, naming the errno. Any other error is the spawn's `Io`.
-///
-/// `Err` is the spawn's refusal: `Unsupported`, naming the cause, or `Io`.
+/// `Err` is the spawn's refusal.
 pub(crate) fn front_placement(leaf_id: impl FnOnce() -> io::Result<u64>) -> Result<(), crate::error::Error> {
     use std::os::fd::AsFd;
 
