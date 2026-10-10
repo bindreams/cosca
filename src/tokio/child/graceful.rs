@@ -274,7 +274,6 @@ impl Child {
         // watched.
         self.require_contained()?;
         #[cfg(unix)]
-        self.refuse_unpinned("graceful_shutdown_tree")?;
         // `require_contained` above errors an uncontained child before any signal.
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {

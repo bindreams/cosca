@@ -249,7 +249,6 @@ impl Child {
         // Before the grace is waited: a root this process does not pin is neither signalled nor
         // watched.
         #[cfg(unix)]
-        self.refuse_unpinned("graceful_shutdown_tree")?;
 
         #[cfg(test)]
         let term_result = match fault::take_force_terminate() {

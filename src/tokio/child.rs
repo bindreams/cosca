@@ -799,7 +799,7 @@ impl Child {
         // covers that, so its failure is contract-relevant.
         // Read again: the sweep above can be long, and a root orphaned meanwhile is no longer ours.
         #[cfg(unix)]
-        let backstop = self.refuse_unpinned("kill_tree").and_then(|()| self.kill());
+        let backstop = { let gate = self.kill_gate(); self.kill_sent_gated(gate).map(|_| ()) };
         #[cfg(not(unix))]
         let backstop = self.kill();
         // Both-fail: the group error is surfaced; subsuming the backstop's is deliberate.

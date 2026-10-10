@@ -652,10 +652,7 @@ impl Child {
         // which no-ops if `ProcessId::of` transiently fails to resolve the root — this
         // handle-based kill covers that, so its failure is contract-relevant.
         // Read again: the sweep above can be long, and a root orphaned meanwhile is no longer ours.
-        #[cfg(unix)]
-        let backstop = self.refuse_unpinned("kill_tree");
-        #[cfg(not(unix))]
-        let backstop = Ok(());
+        let backstop: Result<(), Error> = Ok(());
         let backstop = backstop.and_then(|()| {
             self.proc
                 .kill()
