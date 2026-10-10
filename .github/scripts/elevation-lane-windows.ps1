@@ -38,6 +38,7 @@ $work = Join-Path $root 'work'
 $bin = Join-Path $root 'bin'
 $extract = Join-Path $work 'extract'
 $out = Join-Path $work 'out.txt'
+$tmp = Join-Path $work 'tmp'
 $accountRecord = Join-Path $root 'account'
 $nextestProfile = $env:NEXTEST_PROFILE
 if (-not $nextestProfile) { throw 'NEXTEST_PROFILE must name the profile whose JUnit file the caller publishes' }
@@ -53,7 +54,7 @@ function Set-Acl-Native {
     if ($LASTEXITCODE -ne 0) { throw "icacls $args failed with exit code $LASTEXITCODE" }
 }
 
-New-Item -ItemType Directory -Force $marker, $work, $bin, $extract, $junitDir | Out-Null
+New-Item -ItemType Directory -Force $marker, $work, $tmp, $bin, $extract, $junitDir | Out-Null
 Copy-Item -LiteralPath $archive -Destination (Join-Path $bin 'elevation.tar.zst')
 Copy-Item -LiteralPath $nextestExe -Destination (Join-Path $bin 'cargo-nextest.exe')
 # The marker directory is what the elevated child writes to and the unelevated test reads: only
@@ -74,6 +75,8 @@ try {
 
     $script = Join-Path $work 'run.cmd'
     @(
+        "set TEMP=$tmp",
+        "set TMP=$tmp",
         'set COSCA_TEST_ELEVATION=1',
         'set COSCA_TEST_ELEVATION_CONSENT=1',
         'set COSCA_TEST_ELEVATION_EXPECT_KILL=ok',
@@ -86,7 +89,7 @@ try {
     $credential = New-Object System.Management.Automation.PSCredential(
         "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $password -AsPlainText -Force))
     $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
-        -LoadUserProfile -WorkingDirectory $work -Wait -PassThru
+        -WorkingDirectory $work -Wait -PassThru
     $exitCode = $process.ExitCode
 } finally {
     # Print what the run said before its directory goes. Each step below stops on failure: the step fails, and no
