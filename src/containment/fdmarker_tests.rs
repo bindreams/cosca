@@ -1091,10 +1091,8 @@ fn the_drops_skip_names_the_walk_and_the_group_only_when_there_is_one() {
     crate::log_capture::install();
     let view = crate::containment::DropView {
         root_pid: 4242,
-        root: crate::signal::RootState::Reaped,
-        root_reaped: true,
+        root: crate::containment::dispatch::RootView::Reaped,
         tree_killed: false,
-        left_alone: None,
     };
     let text = |marker| {
         let attached = crate::containment::Attached::FdMarker(marker);

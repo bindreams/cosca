@@ -767,20 +767,20 @@ impl Drop for Child {
         // longer reading as this root. A foreign reap landing after this read is the accepted
         // gap. An unreaped root stays a zombie, pinning its number, until `teardown_on_drop`.
         #[cfg(unix)]
-        let view = crate::containment::DropView::read(
-            "Child::drop",
-            self.id,
-            &self.attached,
-            || self.proc.state(),
-            &self.tree_killed,
-        );
+        let view = crate::containment::DropView::read("Child::drop", self.id, || self.proc.state(), &self.tree_killed);
+        // A live elevation front outside a cgroup is not signalled: it is left running and
+        // unreaped. The drop's one warn names that and an unsettled root together.
         #[cfg(unix)]
-        view.warn_unsettled("Child::drop", true, None);
-        // A live elevation front outside a cgroup is not signalled: it is left running, unreaped,
-        // and named.
+        let gate = self.kill_gate();
         #[cfg(unix)]
-        if let crate::elevation::front::Gate::Closed(unkillable) = self.kill_gate() {
-            log::warn!("Child::drop: the elevated child is left running and unreaped: {unkillable}");
+        let front = match &gate {
+            crate::elevation::front::Gate::Closed(unkillable) => Some(unkillable),
+            _ => None,
+        };
+        #[cfg(unix)]
+        view.warn_unsettled("Child::drop", &self.attached, true, front, None);
+        #[cfg(unix)]
+        if front.is_some() {
             return;
         }
         #[cfg(unix)]

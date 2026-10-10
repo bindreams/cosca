@@ -124,12 +124,16 @@ impl Child {
         }
     }
 
-    /// Forget tokio's `Child` for a root its handle cannot show is ours (`Unknown`, `Unpinned`),
-    /// without logging: the caller reports the forget in its one warn, with the leak this returns.
-    /// `None` if a second look shows the child ours after all, or it is already forgotten.
+    /// The containment this child owns.
     #[cfg(unix)]
-    pub(super) fn forget_unsettled(&mut self) -> Option<crate::containment::Forgot> {
-        self.os.proc.as_mut()?.forget_unsettled()
+    pub(super) fn attached(&self) -> &crate::containment::Attached {
+        &self.os.attached
+    }
+
+    /// See [`ProcSource::forget_for`].
+    #[cfg(unix)]
+    pub(super) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<crate::containment::Forgot> {
+        self.os.proc.as_mut()?.forget_for(view)
     }
 
     /// Disarm the drop: for a failed spawn's cleanup, whose error reports what it did and left, so
@@ -184,7 +188,6 @@ impl Child {
         crate::containment::DropView::read(
             label,
             self.id,
-            &self.os.attached,
             || {
                 self.os
                     .proc
@@ -269,7 +272,11 @@ impl Child {
         let pid = self.id.pid();
         if self.proc_mut().wait_and_reap_at(pid, log::Level::Debug) == Waited::Foreign {
             let leak = self.proc_mut().forget_foreign_quietly();
-            return Some(crate::containment::Forgot { leak, now: None });
+            return Some(crate::containment::Forgot {
+                leak,
+                now: None,
+                quiet: true,
+            });
         }
         None
     }
@@ -1049,7 +1056,6 @@ impl Drop for Child {
         let view = crate::containment::DropView::read(
             "Child::drop",
             self.id,
-            &os.attached,
             || {
                 os.proc
                     .as_ref()
@@ -1060,49 +1066,45 @@ impl Drop for Child {
         // What forgetting tokio's `Child` leaked, if this drop forgot it.
         #[cfg(unix)]
         let mut forgot: Option<crate::containment::Forgot> = None;
+        // The elevation front this drop left running instead of signalling, if any.
+        #[cfg(unix)]
+        let mut front_left = None;
         if self.kill_on_drop {
             // A live elevation front outside a cgroup is not signalled: it is left running, and
-            // named.
+            // named in the drop's one warn.
             #[cfg(unix)]
             match kill_gate(self.front, &os, self.id.pid()) {
-                crate::elevation::front::Gate::Closed(unkillable) => {
-                    log::warn!("Child::drop: the elevated child is left running: {unkillable}");
-                }
+                crate::elevation::front::Gate::Closed(unkillable) => front_left = Some(unkillable),
                 _ => signal_on_drop(self.id, &view, &mut os, &mut forgot),
             }
             #[cfg(not(unix))]
             signal_on_drop(self.id, &self.tree_killed, &mut os);
         }
-        // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
-        // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
-        // Asked again: a reap can land after the read above (and before or during the root kill).
+        // A root that was reaped outside this handle (tokio's state cannot see it), or that the
+        // handle cannot show is ours (unknown, unpinned), leaves the number possibly naming another
+        // child, so tokio's `Child` must not run its own drop, which reaps by pid. Asked again: a
+        // reap can land after the read above (and before or during the root kill).
         #[cfg(unix)]
         if !own_reap && forgot.is_none() {
             if let Some(proc) = os.proc.as_mut() {
-                forgot = if view.root_reaped {
-                    Some(crate::containment::Forgot {
-                        leak: proc.forget_foreign(),
-                        now: Some(crate::signal::RootState::Reaped),
-                    })
-                } else if view.unsettled() {
-                    // The one warn below carries the error and the leak.
-                    proc.forget_unsettled()
-                } else {
-                    proc.forget_if_foreign()
-                        .map(|leak| crate::containment::Forgot { leak, now: None })
-                };
+                forgot = proc.forget_for(&view);
                 if forgot.is_some() {
                     log::debug!(
-                        "async child {} was reaped outside its handle; dropping it would reap by that number, so it was forgotten",
+                        "async child {} cannot be shown to be ours (reaped outside its handle, unknown, or unpinned); \
+                         dropping it would reap by that number, so it was forgotten",
                         self.id.pid()
                     );
                 }
             }
         }
         #[cfg(unix)]
-        if !own_reap {
-            view.warn_unsettled("Child::drop", self.kill_on_drop, forgot.as_ref());
-        }
+        view.warn_unsettled(
+            "Child::drop",
+            &os.attached,
+            self.kill_on_drop,
+            front_left.as_ref(),
+            forgot.as_ref(),
+        );
         os.release_without_waiting();
     }
 }
@@ -1192,13 +1194,7 @@ fn signal_on_drop(
         // The `try_wait` below reaps by pid: forget a foreign reap first.
         #[cfg(unix)]
         {
-            *forgot = if view.unsettled() {
-                // The drop's one warn carries the error and the leak.
-                proc.forget_unsettled()
-            } else {
-                proc.forget_if_foreign()
-                    .map(|leak| crate::containment::Forgot { leak, now: None })
-            };
+            *forgot = proc.forget_for(view);
         }
         if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {
             log::warn!("async child {pid} could not be terminated on drop; leaving it running");

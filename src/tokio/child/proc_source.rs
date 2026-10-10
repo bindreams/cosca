@@ -548,24 +548,6 @@ impl ProcSource {
         RootState::of_peek(peeked)
     }
 
-    /// Whether the child's own handle shows it was reaped by someone else, or cannot show it is
-    /// ours, so tokio's `Child` must not be dropped (its drop reaps by pid, and the pid may name
-    /// another process by now): its [`state`](ProcSource::state) is not `Unreaped`. A child that
-    /// cannot be shown to be ours is logged, naming `RootState::Unknown` and the failed peek.
-    ///
-    /// `false` for a child tokio itself already reaped (`id()` is `None`), and for one already
-    /// forgotten.
-    #[cfg(all(test, unix))]
-    pub(crate) fn reaped_elsewhere(&self) -> bool {
-        let Some((pid, state)) = self.elsewhere() else {
-            return false;
-        };
-        if let RootState::Unknown(e) = &state {
-            log::warn!("child {pid} cannot be shown to be ours: RootState::Unknown, its peek failed: {e}");
-        }
-        true
-    }
-
     /// The pid and non-`Unreaped` state of a child tokio has not reaped, if its handle shows one.
     #[cfg(unix)]
     fn elsewhere(&self) -> Option<(u32, RootState)> {
@@ -770,14 +752,51 @@ impl ProcSource {
         leak
     }
 
-    /// Forget tokio's `Child` for a root its handle cannot show is ours (`Unknown`, `Unpinned`) or
-    /// shows reaped, without logging: the caller reports the forget in its one warn. `None` if a
-    /// second look shows the child ours after all, or it is already forgotten.
+    /// Forget tokio's `Child` where `view` shows the drop must not leave it to tokio's own drop,
+    /// which reaps by pid. One policy for every drop and cleanup:
+    /// - a root the view shows reaped is forgotten on that evidence
+    ///   ([`forget_foreign`](ProcSource::forget_foreign), with a warn of its own);
+    /// - an unsettled root is forgotten quietly after a second look
+    ///   ([`forget_unsettled`](ProcSource::forget_unsettled)): the caller's one warn carries the
+    ///   leak;
+    /// - any other only if a second look shows it gone
+    ///   ([`forget_if_foreign`](ProcSource::forget_if_foreign), with a warn of its own).
+    ///
+    /// `None` if nothing was forgotten: tokio already reaped the child, it is already forgotten, or
+    /// the second look shows it ours.
     #[cfg(unix)]
-    pub(crate) fn forget_unsettled(&mut self) -> Option<crate::containment::Forgot> {
+    pub(crate) fn forget_for(&mut self, view: &crate::containment::DropView) -> Option<crate::containment::Forgot> {
+        use crate::containment::dispatch::RootView;
+        let forgot = |leak| crate::containment::Forgot {
+            leak,
+            now: None,
+            quiet: false,
+        };
+        match view.root {
+            RootView::Reaped => self.holds_unreaped_child().then(|| forgot(self.forget_foreign())),
+            RootView::Unknown(_) | RootView::Unpinned(_) => self.forget_unsettled(),
+            RootView::Trusted => self.forget_if_foreign().map(forgot),
+        }
+    }
+
+    /// Whether tokio's `Child` is still held and has not reaped its child.
+    #[cfg(unix)]
+    fn holds_unreaped_child(&self) -> bool {
+        matches!(self, ProcSource::Tokio { child, .. } if child.id().is_some())
+    }
+
+    /// Forget tokio's `Child` for a root its handle cannot show is ours (`Unknown`, `Unpinned`) or
+    /// shows reaped, without logging. `None` if a second look shows the child ours after all, or
+    /// it is already forgotten.
+    #[cfg(unix)]
+    fn forget_unsettled(&mut self) -> Option<crate::containment::Forgot> {
         let (_, now) = self.elsewhere()?;
         let leak = self.forget_foreign_quietly();
-        Some(crate::containment::Forgot { leak, now: Some(now) })
+        Some(crate::containment::Forgot {
+            leak,
+            now: Some(now),
+            quiet: true,
+        })
     }
 
     /// [`forget_foreign`](ProcSource::forget_foreign), but only on evidence, for the places that

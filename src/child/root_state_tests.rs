@@ -156,6 +156,35 @@ mod linux {
         assert!(warns[0].starts_with("finish_elevated:"), "{warns:?}");
     }
 
+    /// An unknown root behind a live elevation front the drop leaves running is one event, so one
+    /// warn: it names the unknown state and the front.
+    ///
+    /// Mutants: the drop warns of the unknown root before it checks the front's gate, then again
+    /// of the front; the one warn omits the front.
+    #[skuld::test]
+    fn an_unknown_root_behind_a_closed_front_gate_warns_once() {
+        crate::log_capture::install();
+        let recorder = record_kill_group();
+        let (mut child, writer) = session_blocker();
+        child.set_front(Some(crate::elevation::front::Front::Sudo));
+        let sends = Capture::start();
+        let mark = crate::log_capture::mark();
+        // The read sees the failed peek; the gate's own look at the front is real and sees it run.
+        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
+
+        drop(child);
+        drop(writer);
+
+        assert_eq!(recorder.killed(), Vec::<i32>::new());
+        assert!(sends.entries().is_empty(), "{:?}", sends.entries());
+        let warns = warns_since(mark);
+        assert_eq!(warns.len(), 1, "one warn for the event: {warns:?}");
+        assert!(
+            warns[0].contains("RootState::Unknown") && warns[0].contains("left running"),
+            "{warns:?}"
+        );
+    }
+
     /// With the root's number unreadable too, the debug line does not claim the root is treated as
     /// not reaped: its handle could not say, and the number-named kills are skipped.
     ///
@@ -176,6 +205,11 @@ mod linux {
             "{:?}",
             crate::log_capture::records_since(mark, "number")
         );
+        assert!(
+            crate::log_capture::contains_since(mark, "could not be read either; kills by that number are skipped"),
+            "the line must say what happens instead: {:?}",
+            crate::log_capture::records_since(mark, "number")
+        );
     }
 
     /// The same read, for a failed spawn's cleanup: the tree kill is skipped and the tree is not
@@ -188,14 +222,12 @@ mod linux {
         let (child, _writer) = session_blocker();
         let killed = crate::containment::TreeKilled::default();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-        let view = crate::containment::DropView::read(
-            "test",
-            child.id,
-            &child.attached,
-            || child.proc.state(),
-            &child.tree_killed,
+        let view = crate::containment::DropView::read("test", child.id, || child.proc.state(), &child.tree_killed);
+        assert!(
+            matches!(view.root, crate::containment::dispatch::RootView::Unknown(_)),
+            "{:?}",
+            view.root
         );
-        assert!(matches!(view.root, RootState::Unknown(_)), "{:?}", view.root);
 
         let skipped = child
             .attached
@@ -307,7 +339,7 @@ mod macos {
         drop(child);
         drop(writer);
 
-        assert_eq!(sends.entries(), vec![]);
+        assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(
             !holders.killed().contains(&pid),
             "swept the root: {:?}",
@@ -330,7 +362,7 @@ mod macos {
             .expect_err("the spawn fails");
         drop(writer);
 
-        assert_eq!(sends.entries(), vec![]);
+        assert!(sends.entries().is_empty(), "{:?}", sends.entries());
         assert!(err.to_string().contains("left alone"), "{err}");
         let warns = warns_since(mark);
         assert_eq!(warns.len(), 1, "{warns:?}");

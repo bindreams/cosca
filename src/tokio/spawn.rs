@@ -686,7 +686,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
     let root_note = if view.unpinned_root() {
-        forgot = child.forget_unsettled();
+        forgot = child.forget_for(&view);
         format!(
             "the elevated child was left alone, neither signalled nor waited on: {}",
             view.why_number_untrusted()
@@ -697,28 +697,12 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             gate => child.signal_gated(gate),
         };
         // A child that is gone is forgotten here, not by the kill: tokio's wait and drop reap by pid.
-        // An unsettled root is forgotten quietly, and the one warn below carries the leak.
         if matches!(root, Ok(Sent::Gone)) {
-            if view.unsettled() {
-                forgot = child.forget_unsettled();
-            } else {
-                child.proc_mut().forget_if_foreign();
-            }
+            forgot = child.forget_for(&view);
         }
         match root {
             Ok(Sent::Delivered) => {
-                if let Some(f) = child.wait_and_reap_blocking() {
-                    if view.unsettled() {
-                        forgot = Some(f);
-                    } else {
-                        log::warn!(
-                            "finish_elevated: child {} was reaped by someone else, or cannot be shown to be ours, \
-                             while waiting for its kill; forgetting tokio's handle for it leaks {}",
-                            child.id().pid(),
-                            f.leak
-                        );
-                    }
-                }
+                forgot = child.wait_and_reap_blocking();
                 if exited_front {
                     "the elevated child had already exited, and was reaped".to_string()
                 } else {
@@ -735,18 +719,13 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
             Err(e) => {
                 // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
-                if view.unsettled() {
-                    forgot = child.forget_unsettled();
-                } else {
-                    child.proc_mut().forget_if_foreign();
-                }
+                forgot = child.forget_for(&view);
                 _ = child.try_wait();
                 format!("the elevated child could not be terminated ({e})")
             }
         }
     };
-    view.warn_unsettled("finish_elevated", true, forgot.as_ref());
-    // The error reports what the cleanup did and left; the handle it drops now is not the caller's.
+    view.warn_unsettled("finish_elevated", child.attached(), true, None, forgot.as_ref());
     child.disarm_drop();
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,

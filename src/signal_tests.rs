@@ -238,8 +238,38 @@ mod root_state {
         assert!(matches!(state, RootState::Reaped), "{state:?}");
     }
 
-    /// A zombie held by launchd is not reaped, and this process does not pin it: it is neither ours
-    /// to reap nor gone, and nothing here bounds how long its pid stays pinned.
+    /// A running child is ours to act on.
+    ///
+    /// Mutant: `Running` is `Unknown`, or `Reaped`.
+    #[skuld::test]
+    fn a_running_peek_is_unreaped() {
+        let state = RootState::of_peek(Ok(Peek::Running));
+        assert!(matches!(state, RootState::Unreaped), "{state:?}");
+    }
+
+    /// An exit record that was peeked, not consumed, is still an unreaped zombie of ours.
+    ///
+    /// Mutant: `Exit` is `Reaped`.
+    #[skuld::test]
+    fn an_exit_record_peek_is_unreaped() {
+        let exit = crate::wait::exit_only::Reaped::Status(std::os::unix::process::ExitStatusExt::from_raw(0));
+        let state = RootState::of_peek(Ok(Peek::Exit(exit)));
+        assert!(matches!(state, RootState::Unreaped), "{state:?}");
+    }
+
+    /// A failed peek is `Unknown`, and carries the error.
+    ///
+    /// Mutant: `Err` is `Reaped` or `Unreaped`, or drops the error.
+    #[skuld::test]
+    fn a_failed_peek_is_unknown_carrying_the_error() {
+        let state = RootState::of_peek(Err(std::io::Error::other("peek failure 5d1")));
+        assert!(
+            matches!(&state, RootState::Unknown(e) if e.to_string().contains("peek failure 5d1")),
+            "{state:?}"
+        );
+    }
+
+    /// An orphaned zombie (held by launchd) is `Unpinned`, and the error names launchd.
     ///
     /// Mutants: `Orphaned` is `Reaped`; `Orphaned` is `Unknown` (a root we still pin).
     #[cfg(target_os = "macos")]

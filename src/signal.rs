@@ -42,9 +42,6 @@ pub(crate) enum Sent {
 
 /// Whether an owned child's root is still its own child to act on, as its own handle says.
 ///
-/// One answer for every "is the root still ours?" question, so a drop, a walk and a failed-spawn
-/// cleanup cannot disagree about a root they all asked about.
-///
 /// Unix only: a Windows process handle pins its process, so nothing there asks.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -60,7 +57,7 @@ pub(crate) enum RootState {
     Unknown(io::Error),
     /// The root exists, but this process does not pin it (macOS: launchd holds its zombie after
     /// its tracer died, and reaps it on its own schedule). Its pid is not ours: nothing may be
-    /// signalled or waited on by it, and nothing bounds how long it stays the root's.
+    /// signalled or waited on by it.
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only macOS reports an unpinned root")

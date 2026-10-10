@@ -103,14 +103,9 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
-    let view = crate::containment::DropView::read(
-        "finish_elevated",
-        child.id,
-        &child.attached,
-        || child.proc.state(),
-        &child.tree_killed,
-    );
-    view.warn_unsettled("finish_elevated", true, None);
+    let view =
+        crate::containment::DropView::read("finish_elevated", child.id, || child.proc.state(), &child.tree_killed);
+    view.warn_unsettled("finish_elevated", &child.attached, true, None, None);
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -173,7 +168,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
             }
         }
     };
-    // The error reports what the cleanup did and left; the handle it drops now is not the caller's.
     child.kill_on_drop = false;
     Err(Error::Elevation {
         kind: crate::error::ElevationErrorKind::AuthFailed,

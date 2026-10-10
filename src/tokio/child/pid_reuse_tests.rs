@@ -546,8 +546,8 @@ in_fresh_pid_ns!(
 
 // A failed peek through the child's own pidfd =====
 
-/// A peek that fails on the child's own pidfd cannot show the child is ours, so it counts as reaped
-/// elsewhere: the child is forgotten, never released to tokio's by-pid reap.
+/// A peek that fails on the child's own pidfd cannot show the child is ours: the child is
+/// forgotten, never released to tokio's by-pid reap.
 ///
 /// Mutant: a failed peek counts as ours.
 #[skuld::test]
@@ -556,8 +556,15 @@ fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
     runtime().block_on(async {
         let (mut child, _writer) = spawn_blocker();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-        let reaped = child.proc_mut().reaped_elsewhere();
-        assert!(reaped, "a child nothing can answer for is not tokio's to reap by pid");
+        let forgot = child.proc_mut().forget_if_foreign();
+        assert!(
+            forgot.is_some(),
+            "a child nothing can answer for is not tokio's to reap by pid"
+        );
+        assert!(
+            child.proc_mut().is_reaped(),
+            "the forgotten child is not tokio's any more"
+        );
     });
 }
 

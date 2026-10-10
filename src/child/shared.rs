@@ -273,13 +273,6 @@ impl SharedChild {
         child.as_handle().try_clone_to_owned()
     }
 
-    /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
-    /// someone else is not seen here.
-    #[cfg(test)]
-    pub(crate) fn is_reaped(&self) -> bool {
-        matches!(self.lock().state, State::E(_))
-    }
-
     /// Whether the root is still this handle's child to act on, from the handle's own evidence,
     /// read under the lock so none of our reaps lands between the state and the peek.
     ///
