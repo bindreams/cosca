@@ -1266,7 +1266,7 @@ fn signal_on_drop(
         let orphaned = "the root is killed regardless, so its descendants may be orphaned";
         #[cfg(unix)]
         {
-            signals.left.push(failed);
+            log::warn!("Child::drop: {failed}");
             if os.attached.hard_kill_refused_to_walk(&tree) {
                 signals.left.push(orphaned.to_owned());
             }

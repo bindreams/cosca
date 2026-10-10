@@ -1024,9 +1024,7 @@ impl Child {
             // discarded, on the RAII teardown path most callers actually hit. A mechanism
             // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
             // reported, never asserted on.
-            report
-                .left
-                .push(format!("contained-tree teardown did not fully succeed: {e}"));
+            log::warn!("Child::drop: contained-tree teardown did not fully succeed: {e}");
             if self.attached.hard_kill_refused_to_walk(&kill.result) {
                 // Unlike `kill_tree`, a drop cannot be retried: the root dies below either way.
                 report
