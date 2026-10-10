@@ -1,0 +1,18 @@
+{
+  "name": "cloud-image/ubuntu-24.04-20260926.0.0",
+  "versions": [
+    {
+      "version": "20260926.0.0",
+      "providers": [
+        {
+          "name": "libvirt",
+          "architecture": "amd64",
+          "default_architecture": true,
+          "url": "https://vagrantcloud.com/cloud-image/boxes/ubuntu-24.04/versions/20260926.0.0/providers/libvirt/amd64/vagrant.box",
+          "checksum_type": "sha512",
+          "checksum": "1c4dd733e670141c9843bcc447b9715aa4526d524ad6511da9cceb24b108c57d6e871a23e2f53817aa3c9a436515ee342aad6029b2af98a7f77dc25d8682cc1d"
+        }
+      ]
+    }
+  ]
+}

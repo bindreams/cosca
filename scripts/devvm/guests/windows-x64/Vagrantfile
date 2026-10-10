@@ -63,8 +63,11 @@ require_relative "../_shared/fix_qemu_loopback_only"
 STAGE_DIR = ENV.fetch("DEVVM_STAGE_DIR")
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "stromweld/windows-10"
-  config.vm.box_version = "202503.09.0"
+  config.vm.box = "stromweld/windows-10-202503.09.0"
+  # Pinned in box.json, the one place Vagrant checks a downloaded box against a checksum: a box named
+  # from the catalog is checked only against the catalog's. sha512 of the box file, computed locally by
+  # `curl -X GET` + `shasum -a 512` (TOFU).
+  config.vm.box_url = "file://#{File.expand_path("box.json", __dir__)}"
   # Amd64-only box: without this, Vagrant's architecture auto-detection on an Apple Silicon
   # host silently excludes it from "usable providers" and `up` fails with a misleading "box
   # doesn't support requested provider" error, even though the box does publish a qemu
