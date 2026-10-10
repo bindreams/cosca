@@ -127,9 +127,10 @@ try {
     $existing = if ($recorded) { Get-LocalUser -Name $account -ErrorAction SilentlyContinue }
     if ($existing) {
         $sid = $existing.SID.Value
+        # The ACE on the published JUnit directory names the account; remove it while the name still resolves. A failure
+        # here does not stop the account's deletion.
+        Invoke-CleanupStep 'remove the account from the JUnit directory ACL' { Set-Acl-Native $junitDir /remove "${account}" }
         Invoke-CleanupStep 'delete the account' { Remove-LocalUser $account -ErrorAction Stop }
-        # The ACE on the published JUnit directory names the account, which is gone by now: remove it by its SID, or it dangles.
-        Invoke-CleanupStep 'remove the account from the JUnit directory ACL' { Set-Acl-Native $junitDir /remove "*$sid" }
         # Nothing of the account may be running when its profile goes: stop what is left of its processes.
         Invoke-CleanupStep 'stop the account processes' {
             foreach ($candidate in Get-CimInstance Win32_Process) {
