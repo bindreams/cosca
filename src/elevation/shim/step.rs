@@ -54,6 +54,8 @@ pub(crate) struct Events {
     pub(crate) owner_exited: bool,
     pub(crate) child_exited: bool,
     pub(crate) exec: ExecEvent,
+    /// A signal reached the shim: any signal stops the program.
+    pub(crate) signaled: bool,
     /// Test hook: supervision is forced to fail.
     pub(crate) forced_failure: bool,
 }
@@ -64,6 +66,7 @@ impl Events {
         owner_exited: false,
         child_exited: false,
         exec: ExecEvent::Nothing,
+        signaled: false,
         forced_failure: false,
     };
 }
@@ -89,6 +92,9 @@ pub(crate) struct Actions {
 }
 
 /// One supervision step. Control is served whether or not the child has reached `exec`.
+///
+/// At most one signal goes out per step, and a kill wins: the owner's exit and a signal to the shim
+/// each set `Kill` after the control byte is served, so they replace a `Term` from `T`.
 pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
     let mut actions = Actions::default();
     if events.forced_failure {
@@ -97,12 +103,6 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
     }
     if events.exec != ExecEvent::Nothing {
         state.exec_pending = false;
-    }
-    if events.owner_exited && state.owner_watched {
-        state.owner_watched = false;
-        if state.armed {
-            actions.signal = Some(ToChild::Kill);
-        }
     }
     match events.control {
         Control::Nothing => {}
@@ -114,11 +114,7 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
         }
         Control::Byte(byte) => match Command::decode(byte) {
             Ok(Command::Kill) => actions.signal = Some(ToChild::Kill),
-            Ok(Command::Terminate) => {
-                if actions.signal != Some(ToChild::Kill) {
-                    actions.signal = Some(ToChild::Term);
-                }
-            }
+            Ok(Command::Terminate) => actions.signal = Some(ToChild::Term),
             Ok(Command::Disarm) => state.armed = false,
             Ok(Command::Ping) if state.test_hooks => actions.pong = true,
             // `A` and `N` are valid only once, as the first byte; `P` only with hooks.
@@ -127,6 +123,17 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
                 actions.violation = true;
             }
         },
+    }
+    // The owner's exit counts as EOF, so the bytes cosca sent before it come first: a `D` and the
+    // exit in one round leave the program.
+    if events.owner_exited && state.owner_watched {
+        state.owner_watched = false;
+        if state.armed {
+            actions.signal = Some(ToChild::Kill);
+        }
+    }
+    if events.signaled {
+        actions.signal = Some(ToChild::Kill);
     }
     actions.reap = events.child_exited;
     actions

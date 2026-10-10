@@ -23,7 +23,7 @@ mod sys;
 use acceptor::Wake;
 use probe::{LinkEvent, Probe};
 use state::Shared;
-#[allow(unused_imports, reason = "no caller outside the link yet")]
+#[allow(unused_imports, reason = "nothing outside the link and its tests uses these")]
 pub(crate) use {
     outcome::{AcceptorFailure, KillError, KillOutcome, LinkOutcome, NotOwner, NotStarted, NotStartedCause, WaitError},
     state::{Observed, StartState},
@@ -191,6 +191,19 @@ impl ShimLink {
         self.shared.kill()
     }
 
+    /// A raw control byte to the shim (tests only).
+    #[cfg(test)]
+    pub(crate) fn send_control(&self, byte: u8) -> Result<(), Errno> {
+        self.check_owner().expect("the owner sends");
+        self.shared.send_control(byte)
+    }
+
+    /// The descriptor of the shim's connection, once there is one (tests only).
+    #[cfg(test)]
+    pub(crate) fn connection_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.shared.connection_fd()
+    }
+
     /// Blocks for the outcome. Call only after reaping the front: a still-pending start is refused
     /// here, so a late shim is answered `N`. A failure to wait leaves the outcome unset.
     pub(crate) fn wait(&self) -> Result<LinkOutcome, WaitError> {
@@ -213,7 +226,7 @@ impl ShimLink {
     /// `Drop`'s body. Only the process that bound the link tears it down; a fork copy has no
     /// acceptor thread to join. A copy keeps the descriptors the acceptor thread holds (listener,
     /// connection, both pipes) open until it execs or exits, since the thread that would drop them
-    /// does not exist there: the accepted idle-root-shim residual.
+    /// does not exist there.
     ///
     /// An origin that cannot be told is a contract violation, and the process may be either, so it
     /// does only what is safe in both and never uses `log`, which a copy must not touch: refuse a

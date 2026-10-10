@@ -37,6 +37,25 @@ fn t_with_exec_pending_signals_the_child_with_term() {
 }
 
 #[skuld::test]
+fn a_kill_in_the_same_step_wins_over_t() {
+    // `T` asks politely; the owner's exit and a signal to the shim each stop the program for good.
+    let owner_exit = Events {
+        owner_exited: true,
+        ..control(b'T')
+    };
+    assert_eq!(decide(&mut state(), &owner_exit), signal(ToChild::Kill));
+    let shim_signal = Events {
+        signaled: true,
+        ..control(b'T')
+    };
+    assert_eq!(decide(&mut state(), &shim_signal), signal(ToChild::Kill));
+    // Disarmed, the owner's exit leaves the program, so `T` stands.
+    let mut disarmed = state();
+    disarmed.armed = false;
+    assert_eq!(decide(&mut disarmed, &owner_exit), signal(ToChild::Term));
+}
+
+#[skuld::test]
 fn owner_exit_kills_an_armed_program_once() {
     let mut st = state();
     let owner = Events {
@@ -62,6 +81,42 @@ fn owner_exit_after_disarm_leaves_the_program() {
         ..Events::NONE
     };
     assert_eq!(decide(&mut st, &owner), Actions::default());
+}
+
+#[skuld::test]
+fn detach_and_owner_exit_in_one_round_leave_the_program() {
+    // Bytes already sent come first: the owner's exit counts as EOF only after them.
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'D'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), Actions::default());
+    assert!(!st.armed);
+    assert!(!st.owner_watched, "the watch has fired");
+}
+
+#[skuld::test]
+fn kill_and_owner_exit_in_one_round_kill_once() {
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'K'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), signal(ToChild::Kill));
+}
+
+#[skuld::test]
+fn terminate_and_owner_exit_in_one_round_kill() {
+    let mut st = state();
+    let both = Events {
+        control: Control::Byte(b'T'),
+        owner_exited: true,
+        ..Events::NONE
+    };
+    assert_eq!(decide(&mut st, &both), signal(ToChild::Kill));
 }
 
 #[skuld::test]
@@ -136,6 +191,19 @@ fn ping_with_test_hooks_pongs_only() {
         ..Actions::default()
     };
     assert_eq!(decide(&mut st, &control(b'P')), expected);
+}
+
+#[skuld::test]
+fn a_signal_to_the_shim_kills_the_child_even_when_disarmed() {
+    let signaled = Events {
+        signaled: true,
+        ..Events::NONE
+    };
+    let mut armed = state();
+    assert_eq!(decide(&mut armed, &signaled), signal(ToChild::Kill));
+    let mut disarmed = state();
+    decide(&mut disarmed, &control(b'D'));
+    assert_eq!(decide(&mut disarmed, &signaled), signal(ToChild::Kill));
 }
 
 #[skuld::test]

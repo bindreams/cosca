@@ -122,7 +122,7 @@ windows = { version = "0.62", features = [
 libc = "0.2.189"
 nix = { version = "0.31", features = ["signal", "process", "event", "term", "fs", "user"] }
 # Typed `fcntl` wrappers: the raw call is variadic, and the right argument width differs per libc.
-rustix = { version = "1", features = ["fs", "net", "event"] }
+rustix = { version = "1", features = ["fs", "net", "event", "stdio"] }
 # The random part of a cgroup leaf's name and of the elevation shim's private directory's.
 getrandom = "0.4"
 

@@ -277,7 +277,7 @@ pub(crate) enum Refusal {
 }
 
 impl Refusal {
-    fn from_code(code: u8) -> Option<Refusal> {
+    pub(crate) fn from_code(code: i32) -> Option<Refusal> {
         [
             Refusal::NotCosca,
             Refusal::CoscaGone,
@@ -285,7 +285,7 @@ impl Refusal {
             Refusal::Denied,
         ]
         .into_iter()
-        .find(|r| *r as u8 == code)
+        .find(|r| *r as i32 == code)
     }
 }
 
@@ -356,7 +356,7 @@ impl Frame {
 fn payload_byte_ok(tag: u8, p: &[u8], i: usize) -> bool {
     match (tag, i) {
         (b'U', _) | (b'R', 1..) => p[i] == 0,
-        (b'R', 0) => Refusal::from_code(p[0]).is_some(),
+        (b'R', 0) => Refusal::from_code(i32::from(p[0])).is_some(),
         // The 16-bit value, nonzero, then the 16-bit kind, 1 to 4.
         (b'F', 1) => p[0] != 0 || p[1] != 0,
         (b'F', 2) => (1..=4).contains(&p[2]),
@@ -393,7 +393,7 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Frame, FrameError> {
         b'S' => Frame::Status(value),
         b'L' => Frame::Lost(value),
         b'U' => Frame::StatusLost,
-        b'R' => Frame::Refused(Refusal::from_code(payload[0]).expect("checked per byte")),
+        b'R' => Frame::Refused(Refusal::from_code(i32::from(payload[0])).expect("checked per byte")),
         b'F' => Frame::NotExecuted(match kind {
             KIND_FORK => NotExecuted::ForkFailed(Errno(low)),
             KIND_EXEC => NotExecuted::ExecFailed(Errno(low)),
