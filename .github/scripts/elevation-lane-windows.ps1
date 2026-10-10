@@ -86,13 +86,23 @@ try {
         "`"$(Join-Path $bin 'cargo-nextest.exe')`" nextest run --archive-file `"$(Join-Path $bin 'elevation.tar.zst')`" --extract-to `"$extract`" --workspace-remap `"$workspace`" --no-tests=fail -E `"binary(=elevation)`" > `"$out`" 2>&1"
     ) | Set-Content -Path $script -Encoding ascii
 
-    $credential = New-Object System.Management.Automation.PSCredential(
-        "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $password -AsPlainText -Force))
-    $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
-        -WorkingDirectory $work -Wait -PassThru
-    $exitCode = $process.ExitCode
-    # The handle keeps the logon session, and so its profile hive, alive.
-    $process.Dispose()
+    # The logon happens in a pwsh of its own, which is gone when the run is over: nothing of this script then holds
+    # the logon session, and the account's profile hive can unload.
+    $launcher = {
+        param($account, $script, $work)
+        $credential = New-Object System.Management.Automation.PSCredential(
+            "$env:COMPUTERNAME\$account", (ConvertTo-SecureString $env:COSCA_LANE_PASSWORD -AsPlainText -Force))
+        $process = Start-Process cmd.exe -ArgumentList '/c', $script -Credential $credential `
+            -WorkingDirectory $work -Wait -PassThru
+        exit $process.ExitCode
+    }
+    $env:COSCA_LANE_PASSWORD = $password
+    try {
+        & pwsh -NoProfile -NonInteractive -Command $launcher -args $account, $script, $work
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:COSCA_LANE_PASSWORD
+    }
 } finally {
     # Print what the run said before its directory goes. Each step below stops on failure: the step fails, and no
     # exit path leaves anything behind unnoticed.
