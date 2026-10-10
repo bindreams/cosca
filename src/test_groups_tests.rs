@@ -1,6 +1,6 @@
 //! Unit tests for the group rules, and re-exec tests that drive one real `NAMESPACES` test, one real `ROOT` test, one real `CGROUP` test and one real `TRACER` test under chosen environments. None of the bodies runs, so they are safe on any host. The re-exec tests, which exercise the macro's expansion, run on Linux only.
 
-use crate::test_groups::{check_group, require_consent, require_enabled, Group, StrayLeaves};
+use crate::test_groups::{check_group, require_consent, require_enabled, StrayLeaves};
 use crate::test_harness::{
     CGROUP, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE, SHELL_PROBES,
     TRACER, UID_SWITCH,
