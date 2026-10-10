@@ -49,12 +49,11 @@ fn a_failed_peek_leaves_the_child_running(kill_on_drop: bool) {
 }
 
 /// What the drop of a child whose peeks all fail answers. A root whose handle cannot say is killed
-/// through that handle like any other where the handle can still be signalled (Linux: the pidfd
-/// names it whatever any peek said), and then the child is dead but not collected: `Killed`. Where
-/// the signal needs the same evidence (macOS: the pid, checked against its unique id), or when
-/// nothing is armed, nothing is signalled and the child may be running.
+/// through that handle like any other (Linux: the pidfd names it whatever any peek said; macOS: the
+/// signal's own id read is not a peek), and then the child is dead but not collected: `Killed`.
+/// Nothing armed, nothing signalled: the child may be running.
 fn expected_fate_of_a_failed_peek(kill_on_drop: bool, id: crate::identity::ProcessId) -> ChildFate {
-    if kill_on_drop && cfg!(target_os = "linux") {
+    if kill_on_drop {
         ChildFate::Killed
     } else {
         ChildFate::Running { id: Some(id) }
