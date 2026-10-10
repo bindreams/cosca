@@ -26,6 +26,10 @@ pub(crate) struct Forgot {
 }
 
 impl Forgot {
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(dead_code, reason = "only the async child forgets tokio's `Child`")
+    )]
     /// Whether the child was shown reaped by someone else (or held by launchd), rather than merely
     /// not shown to be ours, in which case it may still be running.
     pub(crate) fn reaped_elsewhere(&self) -> bool {
