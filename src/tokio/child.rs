@@ -641,8 +641,6 @@ impl Child {
     /// a termination that did not happen).
     pub(crate) fn kill_sent(&mut self) -> Result<Sent, Error> {
         #[cfg(unix)]
-        self.refuse_unpinned("kill")?;
-        #[cfg(unix)]
         let gate = self.kill_gate();
         self.kill_sent_gated(
             #[cfg(unix)]
@@ -740,8 +738,6 @@ impl Child {
     /// [`Child::kill`](crate::Child::kill).
     pub fn kill_tree(&mut self) -> Result<(), Error> {
         self.require_contained()?;
-        #[cfg(unix)]
-        self.refuse_unpinned("kill_tree")?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
         // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
         // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
@@ -863,8 +859,6 @@ impl Child {
     /// [`Child::kill`](crate::Child::kill).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        #[cfg(unix)]
-        self.refuse_unpinned("terminate_tree")?;
         // After the mechanism guard, which is permanent and pid-independent: an uncontained
         // child must keep hearing why it has no tree to signal, not why a pid is unpinned.
         #[cfg(windows)]
