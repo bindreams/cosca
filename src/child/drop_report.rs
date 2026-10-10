@@ -99,7 +99,7 @@ impl<'a> DropReport<'a> {
         }
         if let Some(why) = self.front.filter(|_| !reaped) {
             parts.push(format!(
-                "elevation front pid {pid}: {why}; the front is killed through its cgroup if it is still in it; \
+                "elevation front pid {pid} is left running: {why}; the front is killed through its cgroup if it is still in it; \
                  cosca does not wait for it, and tokio reaps it once it exits"
             ));
         }

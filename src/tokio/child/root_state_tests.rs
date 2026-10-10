@@ -112,7 +112,12 @@ async fn a_tokio_drop_with_an_unknown_root_behind_a_closed_front_gate_warns_once
     child.set_front(Some(crate::elevation::front::Front::Sudo));
     let mark = crate::log_capture::mark();
     // The read, then the gate's look at the front (it runs), then the second look.
-    let _failed = force_peeks([failed_peek("forced"), Ok(Peek::Running), failed_peek("forced")]);
+    let _failed = force_peeks([
+        failed_peek("forced"),
+        Ok(Peek::Running),
+        Ok(Peek::Running),
+        failed_peek("forced"),
+    ]);
 
     drop(child);
 
@@ -501,7 +506,7 @@ mod macos {
         let mark = crate::log_capture::mark();
         // The read, the gate's look at the front (it runs), then the second look.
         let orphaned = || Ok(Peek::Foreign(Foreign::Orphaned));
-        let _looks = force_peeks([orphaned(), Ok(Peek::Running), orphaned()]);
+        let _looks = force_peeks([orphaned(), Ok(Peek::Running), Ok(Peek::Running), orphaned()]);
 
         drop(child);
 

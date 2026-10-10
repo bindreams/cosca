@@ -28,8 +28,8 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        // The read, then the gate's look at the front, then the second look.
-        let _looks = force_peeks([running(), running(), gone()]);
+        // The read, the gate's two looks at the front, then the second look.
+        let _looks = force_peeks([running(), running(), running(), gone()]);
 
         drop(child);
 
@@ -55,7 +55,7 @@ mod linux {
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let forgets = crate::tokio::child::drop_fault::record();
         let mark = crate::log_capture::mark();
-        let _looks = force_peeks([running(), running(), running()]);
+        let _looks = force_peeks([running(), running(), running(), running()]);
 
         drop(child);
 
@@ -186,7 +186,7 @@ mod linux {
         let (mut child, _writer) = session_blocker(true);
         child.set_front(Some(crate::elevation::front::Front::Sudo));
         let mark = crate::log_capture::mark();
-        let _looks = force_peeks([running(), running(), gone()]);
+        let _looks = force_peeks([running(), running(), running(), gone()]);
 
         let err = crate::tokio::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
