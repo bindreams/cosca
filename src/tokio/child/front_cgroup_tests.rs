@@ -20,6 +20,22 @@ use crate::tokio::child::{drop_fault, Child};
 use crate::tokio::{ChildStdin, Command};
 use crate::{ContainMode, Containment, Stdio};
 
+// The integration tests' cgroup helpers, compiled from their real source.
+#[path = "../../../tests/common/cgroup.rs"]
+#[allow(
+    dead_code,
+    reason = "this file needs `LeafGuard` alone; the integration binaries use the rest"
+)]
+mod cgroup_common;
+
+/// Removes the child's leaf when the test ends, a failing one too: a tokio drop does not wait for the leaf to drain.
+fn clean_up_leaf_of(child: &Child) -> cgroup_common::LeafGuard {
+    match &child.os.attached {
+        crate::containment::Attached::Cgroup(leaf) => cgroup_common::LeafGuard::new(leaf.path().to_path_buf()),
+        other => panic!("a cgroup child holds its leaf, got {other:?}"),
+    }
+}
+
 const SUDO: ElevatedVia = ElevatedVia::Wrapped(Backend::Sudo);
 
 /// A forced kill of a child: `kill` or `kill_tree`.
@@ -197,6 +213,7 @@ async fn assert_tokio_drop_kills_the_leaf(fault: impl FnOnce() -> Box<dyn std::a
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     let (child, _stdin, member) = spawn_front_with_member().await;
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pid = child.id().pid();
     let pidfd = pidfd_of(pid);
     crate::containment::cgroup::fault::record_leaf_steps();
@@ -263,6 +280,7 @@ async fn cgroup_drop_of_a_front_outside_its_leaf_kills_the_rest_of_it(#[fixture(
     use crate::child::front_cgroup_tests::wait_until_exited;
     crate::tokio::test_runtime::assert_current_thread();
     let (child, stdin, member) = spawn_front_with_member().await;
+    let _leaf_cleanup = clean_up_leaf_of(&child);
     let pid = child.id().pid();
     let pidfd = pidfd_of(pid);
     move_out_of_its_leaf(pid);
