@@ -86,6 +86,10 @@ impl Foreign {
     /// What became of a child this evidence shows is not this process's to reap: it has exited, and
     /// someone else holds or has collected its exit, so it is [`Gone`](ChildFate::Gone). That includes a
     /// zombie launchd holds. Every path that maps this evidence to a fate uses this.
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
+    )]
     pub(crate) fn fate(self) -> ChildFate {
         match self {
             Foreign::Gone => ChildFate::Gone,
