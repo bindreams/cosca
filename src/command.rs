@@ -596,7 +596,8 @@ impl Command {
     /// [`Child::kill`](crate::Child::kill)), which the sync drop also leaves unreaped. Each logs a
     /// `warn` naming it. The rest of the tree is still killed: the drop's cgroup leaf stays armed, and
     /// its `cgroup.kill` ends what it holds, a front among it. The sync drop waits for that and
-    /// reaps a front that has exited, and warns of one still running; the async drop waits for
+    /// reaps a front that has exited or that the leaf held, and warns of one still running outside
+    /// it; the async drop waits for
     /// nothing, and leaves the front unreaped.
     ///
     /// **Under [`CgroupV2`](crate::Containment::CgroupV2), opting out can leave the tree's cgroup

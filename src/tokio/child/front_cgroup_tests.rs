@@ -193,7 +193,8 @@ async fn assert_tokio_drop_kills_the_leaf(fault: impl FnOnce() -> Box<dyn std::a
         drop(child);
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
-    let warns = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let warns =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert_eq!(warns[0].0, log::Level::Warn);
     assert!(

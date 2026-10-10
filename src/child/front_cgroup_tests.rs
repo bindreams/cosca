@@ -313,7 +313,8 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(fault: impl FnOnce() -> Box<dy
         drop(child);
     }
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
-    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
     assert!(
@@ -358,6 +359,59 @@ fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fix
     });
 }
 
+/// What a drop does with a front its leaf's kill ended, when the look at its exit still reads it as
+/// running, as on a kernel before 6.19, where a killed task leaves its cgroup (ending the leaf's
+/// drain) before it can be collected: its place says it is dying, so it is waited for and reaped,
+/// and never called running. Neither the drain nor the look's hook waits for it. Mutant: "the look
+/// trusts the exit alone" (the warning then says it is left running, and nothing reaps it).
+#[skuld::test]
+fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, _stdin, member) = spawn_front_with_member();
+    let pid = child.id().pid();
+    let front = pidfd_of(pid);
+    let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
+    let mark = crate::log_capture::mark();
+    {
+        let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
+        drop(child);
+    }
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Debug, "{said:?}");
+    assert!(
+        said[0].1.contains("killed through its cgroup and reaped (signal: 9"),
+        "{said:?}"
+    );
+    assert!(reaped(&front), "the drop reaps the front");
+    wait_until_exited(&member);
+}
+
+/// The same front whose place cannot be read (its pidfd's cgroup id fails) is not called running,
+/// nor waited for: one warning says where it is cannot be read. Mutant: "an unreadable place is
+/// taken for running".
+#[skuld::test]
+fn cgroup_a_drop_that_cannot_place_a_front_does_not_call_it_running(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
+    let (child, _stdin, _member) = spawn_front_with_member();
+    let pid = child.id().pid();
+    let _old_kernel = crate::child::fault::read_front_as_running_at_the_look();
+    let mark = crate::log_capture::mark();
+    {
+        let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
+        drop(child);
+    }
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, log::Level::Warn, "{said:?}");
+    assert!(said[0].1.contains("cannot be read"), "{said:?}");
+    assert!(!said[0].1.contains("left running"), "{said:?}");
+    // The leaf's kill ended it, and the drop left it unreaped.
+    crate::child::front_kill_tests::reap(pid);
+}
+
 /// A front outside its leaf (moved out) is left running, with the warning true: the look finds it
 /// running. The rest of the leaf is killed all the same, since the leaf stays armed. Mutants: "the
 /// drop disarms the leaf" (the member survives), "the drop never looks" (no warning).
@@ -371,7 +425,8 @@ fn cgroup_drop_of_a_front_outside_its_leaf_leaves_it_running_and_kills_the_rest(
     let mark = crate::log_capture::mark();
     drop(child);
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
-    let said = crate::log_capture::records_since_on_current_thread(mark, &format!("elevation front pid {pid}"));
+    let said =
+        crate::log_capture::records_since_on_current_thread(mark, &format!("Child::drop: elevation front pid {pid}"));
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0].0, log::Level::Warn);
     assert!(said[0].1.contains("is left running and unreaped"), "{said:?}");
