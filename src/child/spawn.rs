@@ -1907,6 +1907,7 @@ pub(crate) mod fault {
     thread_local! {
         #[cfg(not(target_os = "macos"))]
         static FRONTS_SEEN_RUNNING: Cell<bool> = const { Cell::new(false) };
+        #[cfg(not(target_os = "macos"))]
         static FRONTS_EXIT_FIRST: Cell<bool> = const { Cell::new(false) };
     }
 

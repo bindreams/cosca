@@ -283,7 +283,7 @@ pub(crate) enum Walked {
     /// behind a mount. A cgroup removed during the walk is not listed, and is not one the walk
     /// could list.
     Absent,
-    /// The walk could not list every cgroup: why.
+    /// The walk could not list every cgroup, or its root is gone: why.
     Unknown(io::Error),
 }
 
@@ -293,10 +293,10 @@ pub(crate) enum Walked {
 /// (`RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS`), read, and closed before the next:
 /// the walk holds two descriptors at most, however large the tree. A cgroup removed during the walk
 /// (`ENOENT`, or `ENODEV` from a removed directory's files) has nothing under it to find, and is
-/// skipped. A cgroup behind a mount (`EXDEV`) cannot be listed, so a walk that meets one answers
-/// [`Walked::Unknown`] if it finds nothing, as it does for any other failure: a cgroup this process
-/// may not read (`EACCES`), or one whose path from the leaf is longer than `PATH_MAX`
-/// (`ENAMETOOLONG`).
+/// skipped; `dir` itself removed lists nothing, and answers [`Walked::Unknown`]. A cgroup behind a
+/// mount (`EXDEV`) cannot be listed, so a walk that meets one answers [`Walked::Unknown`] if it
+/// finds nothing, as it does for any other failure: a cgroup this process may not read (`EACCES`),
+/// or one whose path from the leaf is longer than `PATH_MAX` (`ENAMETOOLONG`).
 ///
 /// One `openat2`, `name_to_handle_at`, `openat` and `getdents` per cgroup. Bounded: the tree is
 /// finite and each cgroup is visited once, since cgroup v2 refuses to rename or move one; it is
@@ -543,18 +543,26 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
             Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
             Err(e) => return Err(e.into()),
         };
-        // The id is what the sweep records of a cgroup it removes, so a cgroup whose id cannot be
-        // read is not removed: the leaf's own id read already showed this filesystem gives ids, so
-        // a failure here is a real one. A cgroup gone since it was opened has nothing to record.
+        // The id is what the sweep records of a cgroup it removes. One that cannot be read leaves no
+        // record, and the cgroup is removed all the same: a leaf left behind for it would leak a
+        // cgroup (on a kernel without `CONFIG_FHANDLE`, every leaf), while a task in a cgroup
+        // removed unrecorded is still placed by its `/proc` path, or not at all, never wrongly.
+        // A cgroup gone since it was opened has nothing to record.
         let child_id = match cgroup_id(child.as_fd()) {
-            Ok(id) => id,
+            Ok(id) => Some(id),
             Err(e)
                 if e.raw_os_error()
                     .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno))) =>
             {
                 continue
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::debug!(
+                    "cgroup v2: the id of child cgroup {} cannot be read ({e}); it is removed unrecorded",
+                    name.to_string_lossy()
+                );
+                None
+            }
         };
         removed += remove_children(child.as_fd(), swept)?;
         // `dir` was reached without crossing a mount, so this removes a directory entry of the
@@ -564,7 +572,9 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
                 removed += 1;
                 // The name may lead to another cgroup since `child` was opened, if someone removed
                 // that one and made this; both were under the leaf, so the id is of one that was.
-                swept.record(child_id);
+                if let Some(child_id) = child_id {
+                    swept.record(child_id);
+                }
             }
             Err(e) if gone(e) || e == rustix::io::Errno::BUSY => {}
             Err(e) => return Err(e.into()),

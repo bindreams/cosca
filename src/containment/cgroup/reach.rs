@@ -194,11 +194,11 @@ impl Subtree {
     /// Whether the task `pid`, which `pidfd` names when there is one, is in this subtree. A task
     /// keeps its cgroup until it is freed, so a killed task on its way out, or a zombie, still has
     /// the leaf's id, and a task moved out has its new cgroup's. Where the kernel gives a pidfd's
-    /// cgroup id (6.13+), it is in the subtree if that id is the leaf's, or
-    /// one the leaf's sweep removed, or one a walk of the leaf's descendants finds; outside if the
-    /// walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise, before 6.13 or
-    /// when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
-    /// unified-hierarchy path (a test leaf) holds nothing that read would place.
+    /// cgroup id (6.13+), the task is in the subtree if that id is the leaf's, or one the leaf's
+    /// sweep removed, or one a walk of the leaf's descendants finds; outside if the walk finds it
+    /// nowhere (see [`walk_places`](Self::walk_places)). Otherwise, before 6.13 or when the walk
+    /// cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no unified-hierarchy path (a
+    /// test leaf) holds nothing that read would place.
     pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
         let mut elsewhere = false;
         if let Some(pidfd) = pidfd {
@@ -384,8 +384,8 @@ struct Probe {
 }
 
 /// Forks the probe child of `parent`, this process's pid as recorded before the fork. The child is
-/// made non-dumpable (`dumpable`: left so, for a test), reports `PR_GET_DUMPABLE` on `ready_read`,
-/// and waits to be killed. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and
+/// made non-dumpable (`dumpable`: left so, for a test), reports `PR_GET_DUMPABLE` and
+/// `PR_GET_PDEATHSIG` on `ready_read`, and waits to be killed. It dies with its parent: `PR_SET_PDEATHSIG` is set before it reports, and
 /// a parent that died before that took effect is no longer `parent`, so the child exits instead.
 fn fork_probe(parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
     use std::os::fd::AsRawFd;

@@ -234,17 +234,21 @@ fn a_cgroup_id_is_decoded_from_its_kernfs_handle() {
     id_of_handle(0xfe, 4, HIGH.to_ne_bytes()).expect_err("too short for a kernfs id");
 }
 
-/// A sweep that cannot read the id of a child cgroup returns the error and removes nothing: the id
-/// is what it records of a cgroup it removes, and a record it cannot make would let a front in the
-/// removed cgroup read as outside. The stand-in's directories are no cgroups, so their ids cannot
-/// be read. Mutant: "an unreadable id is ignored and the cgroup removed anyway".
+/// A sweep that cannot read the id of a child cgroup removes it all the same, unrecorded, and says
+/// so at `debug` with the cause: a leaf left behind for it would leak a cgroup. The stand-in's
+/// directories are no cgroups, so their ids cannot be read. Mutant: "an unreadable id is silent".
 #[skuld::test]
-fn a_sweep_that_cannot_read_a_childs_id_returns_the_error_and_removes_nothing() {
+fn a_sweep_that_cannot_read_a_childs_id_removes_it_unrecorded_and_says_why() {
+    crate::log_capture::install();
     let dir = tempfile::tempdir().expect("tempdir");
-    let sub = dir.path().join("sub");
+    let sub = dir.path().join("unrecorded-sub-9f3a");
     std::fs::create_dir(&sub).expect("make the child");
     let leaf = LeafDir::open_for_test(dir.path());
-    let err = leaf.remove_children().expect_err("an unreadable id fails the sweep");
-    drop(err);
-    assert!(sub.exists(), "a cgroup whose id cannot be recorded is not removed");
+    let mark = crate::log_capture::mark();
+    assert_eq!(leaf.remove_children().expect("the sweep"), 1);
+    assert!(!sub.exists(), "the child is removed");
+    let logs = crate::log_capture::records_since_on_current_thread(mark, "unrecorded-sub-9f3a");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].0, log::Level::Debug);
+    assert!(logs[0].1.contains("removed unrecorded"), "{logs:?}");
 }
