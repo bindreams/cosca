@@ -91,6 +91,7 @@ pub(super) fn park_if_armed() {
 
 /// This thread's next `wait`, `wait_deadline` or `try_wait` that reaps parks on `gate` once the
 /// `E` write is done and the lock is released, before it returns.
+#[cfg(unix)]
 pub(crate) fn park_after_reap_recorded_on(gate: ParkGate) -> Forced {
     PARK_AFTER_REAP.with(|p| *p.borrow_mut() = Some(gate));
     Forced(|| PARK_AFTER_REAP.with(|p| *p.borrow_mut() = None))

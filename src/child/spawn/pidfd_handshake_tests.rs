@@ -1347,6 +1347,7 @@ fn an_unpeekable_dropped_front_is_left_and_noted() {
     .err()
     .expect("the spawn fails")
     .expect_may_have_started_with();
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     assert_eq!(
         fate,
         ChildFate::Running { id: None },

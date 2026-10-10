@@ -38,15 +38,34 @@ fn a_failed_peek_leaves_the_child_running(kill_on_drop: bool) {
     let looks = force_peeks((0..4).map(|_| Err(std::io::Error::other("forced peek failure 5d1b"))));
     let fate = child.tear_down_now();
     drop(looks);
-    // The child was forgotten, not signalled: end it and collect it here.
+    // The child was forgotten: end it and collect it here (an armed drop on Linux has killed it
+    // through its pidfd, which a failed peek does not stop; the zombie is ours to collect).
     collect(id, writer);
-    assert_eq!(fate, ChildFate::Running { id: Some(id) }, "kill_on_drop={kill_on_drop}");
+    assert_eq!(
+        fate,
+        expected_fate_of_a_failed_peek(kill_on_drop, id),
+        "kill_on_drop={kill_on_drop}"
+    );
 }
 
-/// A disarmed drop of a child whose ownership cannot be shown looks once and warns once: the second
-/// look after the kill is for a child the first look did not already give up on.
+/// What the drop of a child whose peeks all fail answers. A root whose handle cannot say is killed
+/// through that handle like any other where the handle can still be signalled (Linux: the pidfd
+/// names it whatever any peek said), and then the child is dead but not collected: `Killed`. Where
+/// the signal needs the same evidence (macOS: the pid, checked against its unique id), or when
+/// nothing is armed, nothing is signalled and the child may be running.
+fn expected_fate_of_a_failed_peek(kill_on_drop: bool, id: crate::identity::ProcessId) -> ChildFate {
+    if kill_on_drop && cfg!(target_os = "linux") {
+        ChildFate::Killed
+    } else {
+        ChildFate::Running { id: Some(id) }
+    }
+}
+
+/// A disarmed drop of a child whose ownership cannot be shown warns once. It looks twice: the read
+/// that finds the handle cannot say, and the forget's own look, which a reap landing after the read
+/// needs. The forget is one warn.
 ///
-/// Mutant: the second look runs unconditionally (two peeks, two warnings).
+/// Mutants: a third look; the forget warns more than once.
 #[skuld::test]
 async fn a_disarmed_teardown_with_a_failed_peek_looks_and_warns_once() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -60,7 +79,7 @@ async fn a_disarmed_teardown_with_a_failed_peek_looks_and_warns_once() {
     drop(looks);
     collect(id, writer);
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
-    assert_eq!(left, 3, "exactly one peek was taken");
+    assert_eq!(left, 2, "two peeks were taken: the read and the forget's own look");
     assert_eq!(
         crate::log_capture::records_since(mark, "forced peek failure 8e2a").len(),
         1,
@@ -212,7 +231,7 @@ async fn reaped_is_reported_only_for_a_status_that_was_collected() {
     let (mut child, _writer) = live(true);
     let id = child.id();
     child.kill().expect("kill");
-    let fate = child.wait_and_reap_blocking();
+    let (fate, _) = child.wait_and_reap_blocking();
     let waiting = record_waits(id);
     assert_eq!(fate, ChildFate::Reaped);
     assert!(

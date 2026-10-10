@@ -208,6 +208,13 @@ fn reap_now_after_a_refused_kill(evidence: fn() -> Box<dyn std::any::Any>) {
         crate::log_capture::contains_since(mark, "reap_now refused); it is not waited on"),
         "a forgotten child was handed nowhere, and the warning must say so"
     );
+    // The refused kill and the forget are one event: one warn, which carries the leak.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
     assert!(
         !crate::log_capture::contains_since(mark, "handed to the pidfd teardown"),
         "nothing was handed to the pidfd teardown"
@@ -295,10 +302,12 @@ async fn try_wait_and_wait_on_a_child_that_cannot_be_verified_say_so() {
 
 /// `finish_elevated`'s refused-kill arm forgets a child shown reaped elsewhere (`forget_if_foreign`,
 /// as `Drop`'s and `reap_now`'s refused-kill arms do) before its `try_wait`, a `waitpid` by pid.
+/// The looks are forced in sequence: `finish_elevated`'s first look sees `Running`, the look inside
+/// the refused-kill arm sees `Foreign`.
 #[skuld::test]
 async fn finish_elevated_after_a_refused_kill_and_a_foreign_reap_reaps_nothing() {
     let (child, witness) = exited_unreaped(true);
-    let _evidence = force_evidence();
+    let _evidence = force_peeks([Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Gone))]);
     let _refused = super::fault::force_kill_failure();
     let err = crate::tokio::spawn::finish_elevated(
         child,
@@ -423,10 +432,10 @@ async fn an_unwind_out_of_drop_closes_the_untaken_stdin_pipe() {
 
 /// The spawn's identity check peeks through the child's pidfd. A peek that fails cannot show the
 /// child ours, but the pidfd pins it whatever the peek said: the spawn fails `Unassessable`, warns
-/// at the call, kills and reaps the child through the pidfd, and forgets tokio's `Child` (its drop
+/// once (with the forget's leak), kills and reaps the child through the pidfd, and forgets tokio's `Child` (its drop
 /// would reap a collected pid).
 ///
-/// Mutants: the call-site warn drops the error; the identity read moves before `ProcSource::new`
+/// Mutants: the warn drops the error, or is a second one beside the forget's; the identity read moves before `ProcSource::new`
 /// (tokio's `Child` is dropped by value on the error path, so `forgets()` is 0); the failed check
 /// goes to `reap_now` (`backend_drops` is 1); the teardown only forgets the child (no teardown
 /// reap is recorded, and the child is left running).
@@ -477,12 +486,19 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
         matches!(err, Error::Unassessable { .. }),
         "a failed peek is Unassessable, not a vanish: {err:?}"
     );
+    // The failed check and the forget its teardown ends in are one event: one warn, which names the
+    // error and carries the leak.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            "could not be checked against its handle (forced identity-check failure 91c4)"
-        ),
-        "the failed peek is warned at the call, naming its own error"
+        warns[0]
+            .1
+            .contains("could not be checked against its handle (forced identity-check failure 91c4)")
+            && warns[0].1.contains("leaks"),
+        "the failed peek is warned once, naming its own error and the leak: {warns:?}"
     );
     assert_eq!(forgets.forgets(), 1, "tokio's Child must have been forgotten");
     assert_eq!(backend_drops.get(), 0, "tokio's Child must not have been dropped");
@@ -512,7 +528,7 @@ async fn a_failed_identity_peek_is_unknown_kills_the_child_and_forgets_the_tokio
 ///
 /// Mutants: the refused arm releases tokio's `Child` (`backend_drops` is 1, no teardown reap is
 /// recorded); the arm forgets it and does nothing else (no teardown reap is recorded); the forget
-/// warns with the foreign-reap text.
+/// warns with the foreign-reap text; the refused kill and the forget warn separately.
 #[cfg(target_os = "linux")]
 fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box<dyn std::any::Any>>) {
     use std::cell::RefCell;
@@ -548,11 +564,21 @@ fn refused_kill_teardown(attach_failure: bool, armed_in_hook: Option<fn() -> Box
     drop(armed);
     assert!(err.is_some(), "the forced failure fails the spawn");
     assert!(
-        crate::log_capture::contains_since(
-            mark,
-            "had its teardown kill refused and is handed to the pidfd teardown"
-        ),
-        "the forget must say the kill was refused and the child handed on"
+        crate::log_capture::contains_since(mark, "teardown refused); it is handed to the pidfd teardown"),
+        "the warn must say the kill was refused and the child handed on"
+    );
+    // The identity check that failed (when one did), the refused kill and the forget are one event:
+    // one warn, which carries the diagnosis and the leak.
+    let warns: Vec<_> = crate::log_capture::records_since_on_current_thread(mark, "")
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Warn)
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
+    assert_eq!(
+        warns[0].1.contains("could not be checked against its handle"),
+        armed_in_hook.is_some(),
+        "the identity diagnosis is in the one warn, and only when the check failed: {warns:?}"
     );
     assert!(
         !crate::log_capture::contains_since(mark, "was reaped by someone else"),

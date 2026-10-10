@@ -143,7 +143,7 @@ fn confirm_exit_of(child: &std::process::Child) {
 }
 
 /// Adopt a child under the force `arm` installs, and expect the gone path: every wait answers
-/// `ECHILD`, and `kill` succeeds without sending. The child has already exited (and is not yet reaped) when it is adopted, so a force
+/// `ECHILD`, `kill` succeeds without sending, and the root's state is `Reaped`. The child has already exited (and is not yet reaped) when it is adopted, so a force
 /// that is not applied leaves a handle whose methods answer at once with a status, and the
 /// assertions fail instead of blocking on a live child.
 #[cfg(target_os = "linux")]
@@ -160,6 +160,10 @@ pub(super) fn assert_adoption_is_gone<G>(arm: impl FnOnce() -> G) {
     assert!(is_echild(&shared.wait().expect_err("wait")));
     assert!(is_echild(&shared.try_wait().expect_err("try_wait")));
     assert!(is_echild(&shared.wait_deadline(far).expect_err("wait_deadline")));
+    assert!(
+        matches!(shared.state(), crate::signal::RootState::Reaped),
+        "a child that was gone at adoption holds no handle: its root is reaped"
+    );
     let log = crate::send_log::Capture::start();
     shared
         .kill()

@@ -497,7 +497,7 @@ async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
     let mut child = spawn_cosca_child_that_exits();
     reap_behind_the_owner(child.id().pid());
 
-    let fate = child.wait_and_reap_blocking();
+    let (fate, _) = child.wait_and_reap_blocking();
 
     assert!(child.proc_mut().is_reaped(), "a foreign-reaped child must be forgotten");
     assert_eq!(

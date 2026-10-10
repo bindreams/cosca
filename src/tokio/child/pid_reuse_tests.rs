@@ -558,20 +558,29 @@ in_fresh_pid_ns!(
 
 // A failed peek through the child's own pidfd =====
 
-/// A peek that fails on the child's own pidfd cannot show the child is ours, so its ownership is
+/// A peek that fails on the child's own pidfd cannot show the child is ours, so its state is
 /// unknown: the child is forgotten, never released to tokio's by-pid reap.
 ///
 /// Mutant: a failed peek counts as ours.
 #[skuld::test]
 fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
-    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::seams::force_peeks;
     runtime().block_on(async {
         let (mut child, _writer) = spawn_blocker();
-        let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-        assert_eq!(
-            child.proc_mut().not_ours(),
-            Some(crate::tokio::child::proc_source::Ownership::Unknown),
+        // One failed peek for the state read, one for the forget's own look.
+        let _failed = force_peeks((0..2).map(|_| Err(std::io::Error::other("forced peek failure"))));
+        assert!(
+            matches!(child.proc_mut().state(), crate::signal::RootState::Unknown(_)),
+            "a child nothing can answer for is not shown to be ours"
+        );
+        let forgot = child.proc_mut().forget_if_foreign();
+        assert!(
+            forgot.is_some(),
             "a child nothing can answer for is not tokio's to reap by pid"
+        );
+        assert!(
+            child.proc_mut().is_reaped(),
+            "the forgotten child is not tokio's any more"
         );
     });
 }

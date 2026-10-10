@@ -192,7 +192,11 @@ async fn dropping_a_foreign_reaped_process_group_child_sends_no_killpg() {
         "the number may belong to another child by now: no kill, and tokio's `Child` is forgotten so \
          its own drop cannot reap by pid"
     );
-    assert_eq!(drop_warns_since(mark).len(), 1);
+    // The drop also forgot tokio's `Child`, so the one warn leads with that and carries the skip.
+    let warns =
+        crate::log_capture::records_since_on_current_thread(mark, "the root is already reaped, so this drop does not");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].1.contains("leaks"), "{warns:?}");
 }
 
 /// A spawned `sleep` whose root something else (the application's own `waitpid`) has reaped,
@@ -310,7 +314,9 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
         "the group's kill and the root's reap"
     );
     recorder.assert_killed_only(pid as i32);
-    assert_skipped_at_debug(mark);
+    // The cleanup disarmed the handle (tree and root settled), so its drop reads nothing and logs
+    // nothing: not a warn, and not a skip record either.
+    assert_eq!(drop_warns_since(mark), []);
 }
 
 /// A `sleep` root, killed and then waited for, so that only `wait()` marks tokio's state.

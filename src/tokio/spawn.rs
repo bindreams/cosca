@@ -585,12 +585,12 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     // reaped the child. The backend exists already, so a failure here tears the child down through
     // it, and a panic unwinds through `ProcSource`'s `Drop`. The attach below takes this identity
     // and does not re-read the root's.
-    let resolved = match proc.target() {
+    let (resolved, mut why) = match proc.target() {
         Some(through) => resolve_identity(pid, &through),
         // Contract: a freshly spawned child holds its handle on every platform.
         None => {
             debug_assert!(false, "a freshly spawned tokio child holds its handle");
-            Resolved::Unknown
+            (Resolved::Unknown, crate::child::spawn::Diagnosis::default())
         }
     };
     let id = match resolved {
@@ -623,10 +623,11 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     } else {
                         crate::containment::RootIdentity::Unknown
                     },
+                    &mut why,
                 );
                 // The read failed, so no identity is known.
                 #[cfg(not(target_os = "macos"))]
-                let (fate, child_fate) = proc.leave_front(pid, front, None, subtree.as_ref());
+                let (fate, child_fate) = proc.leave_front_noting(pid, front, None, subtree.as_ref(), &mut why);
                 return Err(SpawnFailure::started(
                     fate.note(crate::child::spawn::spawn_identity_error(other), Some(front), Some(pid)),
                     child_fate,
@@ -636,7 +637,7 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // the peek said, so it is killed and reaped through the pidfd, as the sync spawn does.
             #[cfg(target_os = "linux")]
             if matches!(other, Resolved::Unknown) {
-                let child_fate = proc.teardown_through_pidfd(pid, None);
+                let child_fate = proc.teardown_through_pidfd(pid, None, &mut why);
                 return Err(SpawnFailure::started(
                     crate::child::spawn::spawn_identity_error(other),
                     child_fate,
@@ -646,10 +647,10 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
             // forgotten, not signalled; tokio's `Child` is not dropped, as its drop reaps by pid.
             #[cfg(target_os = "macos")]
             let forgotten = matches!(other, Resolved::Unknown).then(|| {
-                proc.forget_foreign();
+                proc.forget_foreign_noting(&mut why);
                 ChildFate::Running { id: None }
             });
-            let child_fate = proc.reap_now(pid, None);
+            let child_fate = proc.reap_now_noting(pid, None, &mut why);
             #[cfg(target_os = "macos")]
             let child_fate = forgotten.unwrap_or(child_fate);
             return Err(SpawnFailure::started(
@@ -741,13 +742,18 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
 fn leave_unverified_front(
     proc: &mut ProcSource,
     identity: crate::containment::RootIdentity,
+    why: &mut crate::child::spawn::Diagnosis,
 ) -> (crate::child::spawn::FrontFate, ChildFate) {
-    proc.forget_because(match identity {
-        crate::containment::RootIdentity::Gone => "was reaped by someone else",
-        crate::containment::RootIdentity::Unknown => {
-            "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
-        }
-    });
+    proc.forget_noting(
+        match identity {
+            crate::containment::RootIdentity::Gone => "was reaped by someone else",
+            crate::containment::RootIdentity::Unknown => {
+                "is an elevation front whose identity could not be read, sent nothing, and left unreaped"
+            }
+        },
+        false,
+        why,
+    );
     let fate = match identity {
         crate::containment::RootIdentity::Gone => ChildFate::Gone,
         crate::containment::RootIdentity::Unknown => ChildFate::Running { id: None },
@@ -764,6 +770,9 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let Err(write_err) = written else {
         return Ok(child);
     };
+    let view = child.read_root_view("finish_elevated");
+    // What forgetting tokio's `Child` leaked, if the cleanup forgot it: the one warn below says so.
+    let mut forgot: Option<crate::child::drop_report::Forgot> = None;
     let mut skipped = None;
     // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
     // below then says why.
@@ -771,7 +780,7 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let tree: Option<Result<(), Error>> = (child.containment().can_teardown() && !front_closed).then(|| {
-        skipped = child.kill_tree_members_unless_reaped()?;
+        skipped = child.kill_tree_members_unless_reaped(&view)?;
         // Unlike `Drop`, this path may block. Waiting for the drain here lets the handle's drop
         // remove the leaf on its first `rmdir` instead of leaving it behind with a warning
         // naming a `wait_tree` the caller never gets.
@@ -784,62 +793,99 @@ pub(super) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         Some(Err(e)) => Some(e.to_string()),
         _ => None,
     };
+    // The tree is settled when it was killed completely, was not for the cleanup to kill, or was
+    // deliberately left alone because the root is reaped or unpinned.
+    let tree_settled = tree.is_none() || child.tree_killed() || (skipped.is_some() && view.leaves_root_alone());
+    let tree_warned = matches!(tree, Some(Err(_)));
     let mut tree_note = crate::child::spawn::report_tree_teardown(tree, &child.teardown_subject());
-    if let Some(action) = skipped {
-        tree_note.push_str(&format!(
-            "; its contained tree was not killed: the root was already reaped, so its number may name another \
-             process, and the kill would {action}"
-        ));
+    if let Some(note) = skipped {
+        tree_note.push_str(&format!("; its contained tree was not killed: {note}"));
     }
-    let root = match gate {
-        // Not asked again after the kill: a killed front can read as neither exited nor in its
-        // cgroup, between leaving the cgroup's member list and becoming a zombie.
-        crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
-            child.cgroup_kill_reached().map(|()| Sent::Delivered)
+    // The root is settled when it is gone (killed and reaped, or reaped by someone else) or was
+    // deliberately not signalled (an unpinned root, a live front). A refused kill leaves it to the
+    // handle's drop to try again.
+    let mut root_settled = true;
+    let (root_note, fate) = if view.unpinned_root() {
+        forgot = child.forget_for(&view);
+        // Nothing was signalled, so a launchd-held zombie is `Gone`, as the classifier has it.
+        #[cfg(target_os = "macos")]
+        let fate = crate::wait::exit_only::Foreign::Orphaned.fate(false);
+        #[cfg(not(target_os = "macos"))]
+        let fate = crate::wait::exit_only::Foreign::Gone.fate(false);
+        (
+            format!(
+                "the elevated child was left alone, neither signalled nor waited on: {}",
+                view.why_number_untrusted()
+            ),
+            fate,
+        )
+    } else {
+        let root = match gate {
+            // Not asked again after the kill: a killed front can read as neither exited nor in its
+            // cgroup, between leaving the cgroup's member list and becoming a zombie.
+            crate::elevation::front::Gate::CgroupOnly if child.cgroup_was_killed() => {
+                child.cgroup_kill_reached().map(|()| Sent::Delivered)
+            }
+            // No kill reached the cgroup: refused as `kill` refuses, naming why.
+            crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
+            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
+            gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
+                child.signal_gated(gate)
+            }
+        };
+        // A child that is gone, or not verified to be ours, is forgotten here, not by the kill: tokio's
+        // wait and drop reap by pid.
+        if matches!(root, Ok(Sent::Gone | Sent::Unverified)) {
+            forgot = child.forget_for(&view);
         }
-        // No kill reached the cgroup: refused as `kill` refuses, naming why.
-        crate::elevation::front::Gate::CgroupOnly => Err(child.cgroup_not_killed(tree_failure.as_deref())),
-        crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-        gate @ (crate::elevation::front::Gate::Open | crate::elevation::front::Gate::Exited) => {
-            child.kill_sent_gated(gate)
+        match root {
+            Ok(Sent::Delivered) => {
+                let (fate, forgotten) = child.wait_and_reap_blocking();
+                forgot = forgotten;
+                let note = if exited_front {
+                    "the elevated child had already exited, and was reaped"
+                } else {
+                    "the elevated child was terminated"
+                };
+                (note.to_string(), fate)
+            }
+            // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
+            // which may name another process by now.
+            Ok(Sent::Gone) if exited_front => (
+                "the elevated child had already exited, and was reaped by someone else".to_string(),
+                ChildFate::Gone,
+            ),
+            Ok(Sent::Gone) => (
+                "the elevated child could not be terminated (it was already reaped by someone else)".to_string(),
+                ChildFate::Gone,
+            ),
+            // Nothing could be verified to signal: the child may still be running.
+            Ok(Sent::Unverified) => {
+                root_settled = false;
+                (
+                    "the elevated child could not be terminated (it could not be verified, and may still be running)"
+                        .to_string(),
+                    ChildFate::Running { id: Some(child.id()) },
+                )
+            }
+            Err(e) => {
+                root_settled = front_closed;
+                // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
+                forgot = child.forget_for(&view);
+                let id = Some(child.id());
+                let fate = match &forgot {
+                    Some(forgot) if forgot.reaped_elsewhere() => ChildFate::Gone,
+                    Some(_) => ChildFate::Running { id },
+                    None => crate::child::spawn::fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), id),
+                };
+                (format!("the elevated child could not be terminated ({e})"), fate)
+            }
         }
     };
-    let (root_note, fate) = match root {
-        Ok(Sent::Delivered) => {
-            let fate = child.wait_and_reap_blocking();
-            let note = if exited_front {
-                "the elevated child had already exited, and was reaped"
-            } else {
-                "the elevated child was terminated"
-            };
-            (note.to_string(), fate)
-        }
-        // Reaped by someone else: nothing was terminated, and nothing is waited on by its number,
-        // which may name another process by now.
-        Ok(Sent::Gone) if exited_front => (
-            "the elevated child had already exited, and was reaped by someone else".to_string(),
-            ChildFate::Gone,
-        ),
-        Ok(Sent::Gone) => (
-            "the elevated child could not be terminated (it was already reaped by someone else)".to_string(),
-            ChildFate::Gone,
-        ),
-        // Nothing could be verified to signal: the child may still be running.
-        Ok(Sent::Unverified) => (
-            "the elevated child could not be terminated (it could not be verified, and may still be running)"
-                .to_string(),
-            ChildFate::Running { id: Some(child.id()) },
-        ),
-        Err(e) => {
-            // The `try_wait` reaps by pid: a child the handle shows reaped elsewhere is forgotten.
-            let id = Some(child.id());
-            let fate = match child.proc_mut().forget_unless_ours(id) {
-                Some(fate) => fate,
-                None => crate::child::spawn::fate_of_a_look(child.try_wait().map_err(|e| e.raw_os_error()), id),
-            };
-            (format!("the elevated child could not be terminated ({e})"), fate)
-        }
-    };
+    let mut report = crate::child::drop_report::DropReport::new("finish_elevated", &view);
+    report.forgot = forgot;
+    let warned = report.emit(false);
+    child.end_cleanup(tree_settled && root_settled, warned || tree_warned);
     Err(SpawnFailure::started(
         Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,

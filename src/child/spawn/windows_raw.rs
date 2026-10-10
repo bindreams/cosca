@@ -183,7 +183,9 @@ pub(crate) fn spawn_raw(
     let id = match resolve_identity(
         pid,
         &crate::wait::exit_only::Target::Handle(std::os::windows::io::AsHandle::as_handle(&proc)),
-    ) {
+    )
+    .0
+    {
         crate::identity::Resolved::Found(id) => id,
         other => {
             // The read failed, so no identity is known.
