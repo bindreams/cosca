@@ -29,30 +29,6 @@ fn not_executed(cause: NotExecuted) -> LinkOutcome {
 }
 
 #[skuld::test]
-fn exec_failure_is_f_not_127() {
-    let rig = ShimRig::new();
-    let run = started(&rig, Spec::new("/nonexistent/tool", &[]));
-    assert_eq!(
-        rig.link.link.wait().unwrap(),
-        not_executed(NotExecuted::ExecFailed(Errno(libc::ENOENT)))
-    );
-    let done = run.finish();
-    assert_eq!(done.code, Some(117), "{}", done.stderr);
-    assert!(done.stderr.is_empty(), "{}", done.stderr);
-}
-
-#[skuld::test]
-fn fork_failure_is_f() {
-    let rig = ShimRig::new();
-    let run = started(&rig, Spec::sh("true").inject(Inject::ForkFails));
-    assert_eq!(
-        rig.link.link.wait().unwrap(),
-        not_executed(NotExecuted::ForkFailed(Errno(libc::EAGAIN)))
-    );
-    assert_eq!(run.finish().code, Some(117));
-}
-
-#[skuld::test]
 fn fork_pipe_and_exec_failures_are_distinct_causes() {
     let cases = [
         (

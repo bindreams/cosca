@@ -1,5 +1,6 @@
 //! The shim process against a real [`ShimLink`](super::link::ShimLink), as the same uid. The
-//! lib's test binary is the shim: its `main` calls `init_with_test_hooks`.
+//! lib's test binary is the shim: its `main` starts it, with the test seams, through
+//! `testbin/shim_hooks.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,10 @@ mod owner_tests;
 mod program_tests;
 #[path = "run_tests/rig.rs"]
 mod rig;
+#[path = "run_tests/seam_tests.rs"]
+mod seam_tests;
+#[path = "run_tests/shipped_tests.rs"]
+mod shipped_tests;
 #[path = "run_tests/signal_tests.rs"]
 mod signal_tests;
 

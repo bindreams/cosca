@@ -1,11 +1,13 @@
 //! A process that owns a [`ShimLink`](super::link::ShimLink) and can be ended on demand: cosca, for
-//! the tests that end it while a real shim runs (`owner_exit_*`, `foreign_writer_of_a_is_refused`).
+//! the tests that end it while a real shim runs.
 //!
 //! The lib's test binary is also this helper: its `main` calls [`run_if_requested`] first. It binds
 //! a link in the directory it is given, prints `dir=<link dir>` and `pid=<its pid>`, and then lives
 //! until its stdin ends or it is killed. Its stdout carries what it observes, one event per line. The
 //! line `fork` on its stdin makes a fork copy of it, as `hold-copy` does at the start; the line
-//! `send-exit <bytes>` sends each byte as a control byte to the shim and exits at once.
+//! `send-exit <bytes>` sends each byte as a control byte to the shim and exits at once; the line
+//! `read-frames` makes a copy that reads the shim's connection until the shim ends it and then prints
+//! `frames <hex>`, so that a test can see what the shim said to a cosca that has been killed.
 //!
 //! Modes:
 //! - `plain`: the acceptor answers as usual.
@@ -27,6 +29,8 @@ use super::link::ShimLink;
 const FLAG: &str = "--cosca-shim-test-owner";
 /// The stdin command that sends control bytes and exits, followed by the bytes.
 pub(crate) const SEND_EXIT: &str = "send-exit ";
+/// The stdin command that forks a copy holding the shim's connection and reading what the shim sends.
+pub(crate) const READ_FRAMES: &str = "read-frames";
 
 /// Runs the helper and exits, if this process was started as one.
 pub(crate) fn run_if_requested() {
@@ -79,6 +83,11 @@ fn run(mode: &str, work: &Path) -> i32 {
                 fork_copy(|| {});
                 say("forked");
             }
+            READ_FRAMES => {
+                let conn = link.connection_fd().expect("the shim is connected");
+                fork_copy(|| read_frames(conn));
+                say("forked");
+            }
             command if command.starts_with(SEND_EXIT) => {
                 for byte in command[SEND_EXIT.len()..].bytes() {
                     link.send_control(byte).expect("the byte reaches the shim");
@@ -112,6 +121,60 @@ fn fork_copy(body: impl FnOnce()) {
     }
 }
 
+/// The exit code of a copy whose `poll` failed.
+pub(crate) const POLL_FAILED: i32 = 92;
+
+/// In a copy: blocks until `fd` is readable or hung up. A failed `poll` ends the copy with
+/// [`POLL_FAILED`], so that a test that waits for it does not mistake the silence for an answer. Raw
+/// system calls only.
+unsafe fn wait_readable(fd: libc::c_int) {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` is valid for the call.
+    unsafe {
+        while libc::poll(&mut poll, 1, -1) < 0 {
+            if *libc::__errno_location() != libc::EINTR {
+                libc::_exit(POLL_FAILED);
+            }
+        }
+    }
+}
+
+/// In the copy: reads `conn` until the other end closes it, prints the bytes as `frames <hex>` and
+/// ends. Raw system calls only. The connection is non-blocking, and shared with the owner.
+fn read_frames(conn: std::os::fd::RawFd) {
+    // SAFETY: raw system calls on a descriptor and stack buffers only.
+    unsafe {
+        let mut bytes = [0u8; 64];
+        let mut len = 0;
+        while len < bytes.len() {
+            wait_readable(conn);
+            let n = libc::read(conn, bytes.as_mut_ptr().add(len).cast(), bytes.len() - len);
+            if n == 0 {
+                break;
+            }
+            if n > 0 {
+                len += n as usize;
+            } else if *libc::__errno_location() != libc::EAGAIN && *libc::__errno_location() != libc::EINTR {
+                break;
+            }
+        }
+        let mut line = [0u8; 8 + 2 * 64 + 1];
+        line[..7].copy_from_slice(b"frames ");
+        let digits = b"0123456789abcdef";
+        for i in 0..len {
+            line[7 + 2 * i] = digits[(bytes[i] >> 4) as usize];
+            line[7 + 2 * i + 1] = digits[(bytes[i] & 15) as usize];
+        }
+        line[7 + 2 * len] = b'\n';
+        libc::write(1, line.as_ptr().cast(), 7 + 2 * len + 1);
+        libc::_exit(0)
+    }
+}
+
 /// In the copy: accepts on the copied listener and writes `A`, after reading the hello if `after_hello`.
 fn leak(after_hello: bool) {
     // SAFETY: raw system calls on descriptors and stack buffers only.
@@ -131,12 +194,7 @@ fn leak(after_hello: bool) {
             })
             .unwrap_or_else(|| libc::_exit(90));
         // The listener is non-blocking: the connection may not be queued yet.
-        let mut poll = libc::pollfd {
-            fd: listener,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        libc::poll(&mut poll, 1, -1);
+        wait_readable(listener);
         let conn = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
         if conn < 0 {
             libc::_exit(91);
@@ -148,3 +206,7 @@ fn leak(after_hello: bool) {
         libc::write(conn, b"A".as_ptr().cast(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "owner_helper_tests.rs"]
+mod owner_helper_tests;

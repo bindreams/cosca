@@ -1,19 +1,24 @@
-//! Everything before the program starts (plan F, D2, D22): the connection, who cosca is, the owner
-//! watch, hello, and the answer.
+//! Everything before the program starts: the connection, who cosca is, the owner watch, hello, and
+//! the answer.
 //!
 //! Nothing is written until the listener is verified and the owner watch is open. A refusal before
 //! hello writes nothing, so cosca, which answers a connection only after hello, never sees it, and
 //! the outcome there is always "not started, shim not connected".
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{open, stat, Mode, OFlags};
+use rustix::io::Errno;
 use rustix::net::{connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::process::{pidfd_open, Pid, PidfdFlags};
 
+use super::child::Spawned;
+use super::fds::{readable_now, wait_readable};
 use super::{Exit, Shim};
 use crate::elevation::shim::codes;
 use crate::elevation::shim::creds::{peer_credentials, recv_with_credentials, set_passcred, Received};
+use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::SOCKET_NAME;
 use crate::elevation::shim::owner_watch::OwnerPidfdFailure;
 use crate::elevation::shim::protocol::{Frame, Refusal, ShimArgs};
@@ -30,38 +35,18 @@ pub(super) fn send_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Blocks until `fd` is readable or hung up, retrying `EINTR`. One of the shim's deliberate
-/// blocking calls: the wait for cosca's answer.
-fn wait_any(fds: &[RawFd]) -> io::Result<Vec<bool>> {
-    let mut polled: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|&fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect();
-    loop {
-        // SAFETY: `polled` is valid for its length.
-        if unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as _, -1) } >= 0 {
-            return Ok(polled.iter().map(|p| p.revents != 0).collect());
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
+/// Why the start must not go on.
+enum Stop {
+    OwnerExited,
+    Signaled,
 }
 
-/// Whether `fd` is readable right now.
-fn readable_now(fd: RawFd) -> bool {
-    let mut p = [libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    // SAFETY: `p` is valid for its length.
-    unsafe { libc::poll(p.as_mut_ptr(), 1, 0) > 0 }
+/// What a failed `stat` of `fd_path`, a path under `/proc`, says: only `ENOENT` means `/proc` is not there.
+fn proc_probe_failure(fd_path: &str, errno: Errno) -> String {
+    match errno {
+        Errno::NOENT => format!("/proc must be mounted: {fd_path}: {errno}"),
+        _ => format!("cannot reach {fd_path}: {errno}"),
+    }
 }
 
 impl Shim {
@@ -80,7 +65,7 @@ impl Shim {
         set_passcred(socket.as_fd()).map_err(|e| unreachable(self, format!("SO_PASSCRED: {e}")))?;
         // The probe comes first: without `/proc`, the connect below fails with a bare `ENOENT`.
         let fd_path = format!("/proc/thread-self/fd/{}", dir.as_raw_fd());
-        stat(&fd_path).map_err(|e| unreachable(self, format!("/proc must be mounted: {fd_path}: {e}")))?;
+        stat(&fd_path).map_err(|e| unreachable(self, proc_probe_failure(&fd_path, e)))?;
         let path = format!("{fd_path}/{SOCKET_NAME}");
         let address = SocketAddrUnix::new(&path).map_err(|e| unreachable(self, format!("{path}: {e}")))?;
         connect(&socket, &address).map_err(|e| unreachable(self, format!("could not reach cosca: {e}")))?;
@@ -104,16 +89,22 @@ impl Shim {
 
     /// Opens the owner watch: a pidfd on cosca's pid, before hello. cosca answers only after it has
     /// read the hello, and the answer's credentials name cosca's pid, so cosca was alive after
-    /// this open and the pidfd names it (D2).
+    /// this open and the pidfd names it.
     pub(super) fn watch_owner(&mut self, args: &ShimArgs) -> Result<OwnedFd, Exit> {
-        let lowered = self.hooks.is_some_and(|h| h.exhaust_fds()).then(lower_nofile);
-        // SAFETY: `pidfd_open(pid, 0)` has no pointer arguments.
-        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, args.cosca_pid as libc::pid_t, 0) };
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let lowered = self
+            .hooks
+            .is_some_and(|h| h.exhaust_fds())
+            .then(|| lower_nofile(lowest_free_fd()));
+        // A pid no process can have is the kernel's `EINVAL`, which reads as "gone".
+        let opened = match i32::try_from(args.cosca_pid).ok().and_then(Pid::from_raw) {
+            Some(pid) => pidfd_open(pid, PidfdFlags::empty()),
+            None => Err(Errno::INVAL),
+        };
         if let Some(previous) = lowered {
             previous.restore();
         }
-        if opened < 0 {
+        let owner = opened.map_err(|e| {
+            let errno = e.raw_os_error();
             let failure = OwnerPidfdFailure::from_errno(errno);
             self.log
                 .line(format_args!("pidfd_open(owner): errno {errno} ({failure:?})"));
@@ -121,11 +112,10 @@ impl Shim {
                 OwnerPidfdFailure::CoscaGone => "cosca's process is gone",
                 OwnerPidfdFailure::Unwatchable => "could not watch cosca's process",
             };
-            return Err(self.refuse(failure.exit_code(), why));
-        }
+            self.refuse(failure.exit_code(), why)
+        })?;
         self.log.line(format_args!("owner verified pid={}", args.cosca_pid));
-        // SAFETY: `pidfd_open` made this descriptor, and nothing else owns it.
-        Ok(unsafe { OwnedFd::from_raw_fd(opened as RawFd) })
+        Ok(owner)
     }
 
     pub(super) fn say_hello(&mut self) -> Result<(), Exit> {
@@ -136,68 +126,123 @@ impl Shim {
         Ok(())
     }
 
-    /// Waits for the first byte: `A` or `N`, written by cosca. cosca's exit ends the wait (123); a
-    /// writer that is not cosca is refused (122).
+    /// Waits for the first byte: `A` or `N`, written by cosca. cosca's exit ends the wait (123), and so
+    /// does a signal to the shim (124); a writer that is not cosca is refused (122).
     pub(super) fn await_answer(&mut self, args: &ShimArgs, owner: &OwnedFd) -> Result<(), Exit> {
-        let ready = wait_any(&[owner.as_raw_fd(), self.conn().as_raw_fd()])
-            .map_err(|e| self.refuse(codes::NO_ANSWER, &format!("poll failed: {e}")))?;
+        let wake = self.wake().rx.as_fd();
+        let ready = wait_readable([Some(owner.as_fd()), Some(wake), Some(self.conn().as_fd())])
+            .map_err(|e| self.refuse_with(Refusal::NoAnswer, &format!("poll failed: {e}")))?;
         if ready[0] {
-            return Err(self.refuse(Refusal::CoscaGone as i32, "cosca exited before the start"));
+            return Err(self.refuse_with(Refusal::CoscaGone, "cosca exited before the start"));
+        }
+        if ready[1] {
+            self.log
+                .line(format_args!("a signal reached the shim before the answer"));
+            return Err(self.refuse_with(Refusal::NoAnswer, "a signal reached the shim before cosca's answer"));
         }
         let received = recv_with_credentials(self.conn().as_fd())
-            .map_err(|e| self.refuse(Refusal::NoAnswer as i32, &format!("no answer from cosca: {e}")))?;
+            .map_err(|e| self.refuse_with(Refusal::NoAnswer, &format!("no answer from cosca: {e}")))?;
         let Received::Byte(byte, creds) = received else {
             self.log.line(format_args!("first byte: EOF"));
-            return Err(self.refuse(Refusal::NoAnswer as i32, "no answer from cosca"));
+            return Err(self.refuse_with(Refusal::NoAnswer, "no answer from cosca"));
         };
         let cosca = creds.is_some_and(|c| c.pid == args.cosca_pid as i32 && c.uid == args.cosca_euid);
         if !cosca {
-            return Err(self.refuse(Refusal::NotCosca as i32, "the answer was not written by cosca"));
+            return Err(self.refuse_with(Refusal::NotCosca, "the answer was not written by cosca"));
         }
         self.log
             .line(format_args!("owner pidfd confirmed by the answer's credentials"));
         self.log.line(format_args!("first byte: {}", byte as char));
         match byte {
             b'A' => Ok(()),
-            b'N' => Err(self.refuse(Refusal::Denied as i32, "cosca refused the start")),
-            _ => Err(self.refuse(Refusal::NoAnswer as i32, "no answer from cosca")),
+            b'N' => Err(self.refuse_with(Refusal::Denied, "cosca refused the start")),
+            _ => Err(self.refuse_with(Refusal::NoAnswer, "no answer from cosca")),
         }
     }
 
-    /// Cosca's exit between the answer and the clone means never start (D22).
-    pub(super) fn recheck_owner(&mut self, owner: &OwnedFd) -> Result<(), Exit> {
-        if readable_now(owner.as_raw_fd()) {
-            return Err(self.refuse(Refusal::CoscaGone as i32, "cosca exited before the start"));
+    /// Whether the start must not go on: cosca has exited, or a signal has reached the shim. A failed
+    /// poll is an error, so it is never taken for "nothing".
+    fn why_stop(&self, owner: &OwnedFd) -> Result<Option<Stop>, Errno> {
+        let polled = if self.injected(Inject::OwnerPollFails) {
+            // `poll` fails with `EINVAL` when it is given more descriptors than `RLIMIT_NOFILE` allows.
+            let previous = lower_nofile(0);
+            let polled = readable_now([owner.as_fd(), self.wake().rx.as_fd()]);
+            previous.restore();
+            polled
+        } else {
+            readable_now([owner.as_fd(), self.wake().rx.as_fd()])
+        };
+        Ok(match polled? {
+            [true, _] => Some(Stop::OwnerExited),
+            [false, true] => Some(Stop::Signaled),
+            [false, false] => None,
+        })
+    }
+
+    /// Cosca's exit, or a signal to the shim, between the answer and the program's start means never
+    /// start. `held` is the program's process when the clone has happened and the process is held
+    /// before `exec`: it is killed and reaped first, so the program never runs.
+    pub(super) fn check_owner(&self, owner: &OwnedFd, held: Option<&Spawned>) -> Result<(), Exit> {
+        let stop = self.why_stop(owner);
+        if !matches!(stop, Ok(None)) {
+            if let Some(child) = held {
+                self.gate(Gate::BeforeAbandon);
+                self.abandon(child);
+            }
         }
-        Ok(())
+        match stop {
+            Ok(None) => Ok(()),
+            Ok(Some(Stop::OwnerExited)) => Err(self.refuse_with(Refusal::CoscaGone, "cosca exited before the start")),
+            Ok(Some(Stop::Signaled)) => {
+                self.log
+                    .line(format_args!("a signal reached the shim before the start"));
+                Err(self.refuse_with(Refusal::NoAnswer, "a signal reached the shim before the start"))
+            }
+            Err(e) => Err(self.setup_failed("cannot tell whether cosca is alive", e)),
+        }
+    }
+
+    /// Kills the held process and collects it. It cannot have reached `exec`, so the program never ran.
+    fn abandon(&self, child: &Spawned) {
+        child.kill(&self.log);
+        let status = child.reap(false, &self.log);
+        self.log.line(format_args!("held child reaped status {status:?}"));
+    }
+
+    /// The re-check before the clone.
+    pub(super) fn recheck_owner(&mut self, owner: &OwnedFd) -> Result<(), Exit> {
+        self.check_owner(owner, None)
     }
 }
 
-/// `RLIMIT_NOFILE`'s soft limit before a test hook lowered it.
-struct PreviousLimit(libc::rlimit);
+/// `RLIMIT_NOFILE` before a test hook lowered its soft limit.
+struct PreviousLimit(rustix::process::Rlimit);
 
 impl PreviousLimit {
     fn restore(self) {
-        // SAFETY: `self.0` is a valid `rlimit`.
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) };
+        let restored = rustix::process::setrlimit(rustix::process::Resource::Nofile, self.0);
+        debug_assert!(restored.is_ok(), "setrlimit(NOFILE) back: {restored:?}");
     }
 }
 
-/// Lowers the soft limit to the lowest free descriptor number, so that none can be made.
-fn lower_nofile() -> PreviousLimit {
-    // SAFETY: an all-zero `rlimit` is a valid out-parameter.
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    // SAFETY: `limit` is valid for the call.
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    let previous = PreviousLimit(limit);
-    // SAFETY: `dup` and `close` of a standard descriptor.
-    let lowest_free = unsafe {
-        let fd = libc::dup(0);
-        libc::close(fd);
-        fd
+/// Lowers the soft limit to `soft`.
+fn lower_nofile(soft: u64) -> PreviousLimit {
+    let previous = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let lowered = rustix::process::Rlimit {
+        current: Some(soft),
+        maximum: previous.maximum,
     };
-    limit.rlim_cur = lowest_free as libc::rlim_t;
-    // SAFETY: `limit` is valid for the call.
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
-    previous
+    let set = rustix::process::setrlimit(rustix::process::Resource::Nofile, lowered);
+    debug_assert!(set.is_ok(), "setrlimit(NOFILE) to {soft}: {set:?}");
+    PreviousLimit(previous)
 }
+
+/// The lowest descriptor number that is free: a soft limit of that number lets none be made.
+fn lowest_free_fd() -> u64 {
+    let fd = rustix::io::dup(rustix::stdio::stdin()).expect("a descriptor to measure with");
+    std::os::fd::AsRawFd::as_raw_fd(&fd) as u64
+}
+
+#[cfg(test)]
+#[path = "handshake_tests.rs"]
+mod handshake_tests;

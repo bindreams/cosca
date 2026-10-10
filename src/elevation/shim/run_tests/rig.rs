@@ -2,7 +2,7 @@
 //! test binary re-executed with the shim's arguments (its `main` calls `init_with_test_hooks`).
 //! The seams come from the environment, as `testbin/shim_hooks.rs` reads them.
 //!
-//! Every wait here is on an event a mutant of the code under test cannot suppress (T5): a line the
+//! Every wait here is on an event a mutant of the code under test cannot suppress: a line the
 //! shim's log receives, or the shim's exit. A FIFO is the log, so that the shim's end of it closing
 //! is an event too.
 
@@ -18,8 +18,7 @@ use rustix::fs::{mknodat, open, FileType, Mode, OFlags, CWD};
 
 use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::fake_shim::{my_euid, Rig};
-use crate::elevation::shim::link::probe::LinkEvent;
-use crate::elevation::shim::protocol::{Command as Control, ShimArgs};
+use crate::elevation::shim::protocol::ShimArgs;
 
 /// What a test asks of one shim run.
 pub(super) struct Spec {
@@ -35,12 +34,13 @@ pub(super) struct Spec {
     cosca_euid: Option<u32>,
     search_path: Option<OsString>,
     ignore: Vec<libc::c_int>,
-    env: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
     flag: Option<OsString>,
     dir: Option<PathBuf>,
     stdin_held: bool,
     without_proc: bool,
+    shipped: bool,
+    raw_seams: Vec<(String, OsString)>,
 }
 
 impl Spec {
@@ -58,12 +58,13 @@ impl Spec {
             cosca_euid: None,
             search_path: None,
             ignore: vec![],
-            env: vec![],
             cwd: None,
             flag: None,
             dir: None,
             stdin_held: false,
             without_proc: false,
+            shipped: false,
+            raw_seams: vec![],
         }
     }
 
@@ -124,15 +125,24 @@ impl Spec {
         self
     }
 
-    pub(super) fn env(mut self, k: &str, v: impl Into<OsString>) -> Spec {
-        self.env.push((k.into(), v.into()));
-        self
-    }
-
     /// The program's stdin is a pipe the test holds: a program that reads it blocks until the test lets go
     /// ([`Run::close_stdin`]).
     pub(super) fn stdin_held(mut self) -> Spec {
         self.stdin_held = true;
+        self
+    }
+
+    /// The shim runs as a host ships it: through `cosca::init()`, with no hooks, so none of the
+    /// seams the other settings ask for exists.
+    pub(super) fn shipped(mut self) -> Spec {
+        self.shipped = true;
+        self
+    }
+
+    /// The seam variable `name` set to `value` as written, whatever the settings above made of it: for
+    /// the seams that are wrong on purpose.
+    pub(super) fn raw_seam(mut self, name: &str, value: impl Into<OsString>) -> Spec {
+        self.raw_seams.push((name.to_owned(), value.into()));
         self
     }
 
@@ -164,14 +174,14 @@ impl Spec {
 /// The link, the work directory for the FIFOs, and the shim runs made against them.
 pub(super) struct ShimRig {
     pub(super) link: Rig,
-    work: tempfile::TempDir,
+    work: std::sync::Arc<tempfile::TempDir>,
 }
 
 impl ShimRig {
     pub(super) fn new() -> ShimRig {
         ShimRig {
             link: Rig::new(),
-            work: tempfile::tempdir().expect("a work directory"),
+            work: std::sync::Arc::new(tempfile::tempdir().expect("a work directory")),
         }
     }
 
@@ -222,7 +232,7 @@ impl ShimRig {
                 format!("COSCA_SEAM_GATE_{}", gate.name().to_uppercase().replace('-', "_")),
                 &fifo,
             );
-            gates.insert(*gate, fifo);
+            gates.insert(*gate, hold_open(&fifo));
         }
         if !spec.injects.is_empty() {
             let names: Vec<&str> = spec.injects.iter().map(|i| i.name()).collect();
@@ -232,6 +242,7 @@ impl ShimRig {
         if let Some(path) = &child_gate {
             command.env("COSCA_SEAM_CHILD_GATE", path);
         }
+        let child_gate = child_gate.map(|path| hold_open(&path));
         if spec.child_fault {
             command.env("COSCA_SEAM_CHILD_FAULT", "1");
         }
@@ -242,8 +253,11 @@ impl ShimRig {
         if spec.exhaust_fds {
             command.env("COSCA_SEAM_EXHAUST_FDS", "1");
         }
-        for (k, v) in &spec.env {
-            command.env(k, v);
+        if spec.shipped {
+            command.env("COSCA_TEST_SHIM_SHIPPED", "1");
+        }
+        for (name, value) in &spec.raw_seams {
+            command.env(name, value);
         }
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
@@ -298,6 +312,7 @@ impl ShimRig {
             },
             gates,
             child_gate,
+            _work: self.work.clone(),
             loop_failure,
         }
     }
@@ -360,8 +375,12 @@ pub(super) struct Run {
     stdin: Option<std::process::ChildStdin>,
     pidfd: rustix::fd::OwnedFd,
     log: LogTail,
-    gates: HashMap<Gate, PathBuf>,
-    child_gate: Option<PathBuf>,
+    /// The write ends of the gates' FIFOs, open from the start: a byte released a gate before the shim
+    /// reaches it, and a shim that is gone leaves nothing to wait for.
+    gates: HashMap<Gate, OwnedFd>,
+    child_gate: Option<OwnedFd>,
+    /// The directory of the FIFOs, kept for as long as the shim may open them.
+    _work: std::sync::Arc<tempfile::TempDir>,
     loop_failure: Option<PathBuf>,
 }
 
@@ -388,9 +407,10 @@ impl Run {
                 return;
             }
             let found = self.wait_line_after(self.log.lines.len(), |l| l.contains(needle));
+            let ended = if found { String::new() } else { self.how_it_ended() };
             assert!(
                 found,
-                "the shim's log ended before {n} lines with {needle:?}: {:#?}",
+                "the shim's log ended before {n} lines with {needle:?}: {:#?}\n{ended}",
                 self.log.lines
             );
         }
@@ -449,6 +469,44 @@ impl Run {
         .expect("the program is unreaped")
     }
 
+    /// Whether the shim still holds the write end of the pipe the program's process waits on to be
+    /// released: a pipe the process holds the read end of and the shim does not, and the shim holds the
+    /// write end of.
+    pub(super) fn holds_the_release_pipe(&mut self) -> bool {
+        let (shim, child) = (self.pid(), self.program_pid() as u32);
+        let ends = |pid: u32| -> Vec<(String, bool)> {
+            let mut ends = vec![];
+            for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("the fd table") {
+                let path = entry.expect("an entry").path();
+                let Ok(target) = std::fs::read_link(&path) else {
+                    continue;
+                };
+                let target = target.to_string_lossy().into_owned();
+                if !target.starts_with("pipe:[") {
+                    continue;
+                }
+                let info = std::fs::read_to_string(format!(
+                    "/proc/{pid}/fdinfo/{}",
+                    path.file_name().expect("a name").to_string_lossy()
+                ))
+                .expect("fdinfo");
+                let flags = info
+                    .lines()
+                    .find_map(|l| l.strip_prefix("flags:"))
+                    .expect("flags")
+                    .trim();
+                let flags = u32::from_str_radix(flags, 8).expect("octal flags");
+                ends.push((target, flags & libc::O_ACCMODE as u32 == libc::O_WRONLY as u32));
+            }
+            ends
+        };
+        let (shim_ends, child_ends) = (ends(shim), ends(child));
+        child_ends
+            .iter()
+            .filter(|(pipe, writable)| !writable && !shim_ends.iter().any(|(p, w)| p == pipe && !w))
+            .any(|(pipe, _)| shim_ends.iter().any(|(p, w)| p == pipe && *w))
+    }
+
     /// The hex mask of `/proc/<shim>/status`'s `field` (`SigCgt`, `SigIgn`).
     pub(super) fn signal_mask(&self, field: &str) -> u64 {
         let status = std::fs::read_to_string(format!("/proc/{}/status", self.pid())).expect("the shim's status");
@@ -457,6 +515,29 @@ impl Run {
             .find_map(|l| l.strip_prefix(field).and_then(|r| r.strip_prefix(':')))
             .expect("the field");
         u64::from_str_radix(value.trim(), 16).expect("a hex mask")
+    }
+
+    /// How the shim ended, if it has, and what it wrote to stderr meanwhile: for a failure message.
+    fn how_it_ended(&mut self) -> String {
+        let mut fds = [PollFd::new(&self.pidfd, PollFlags::IN)];
+        let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+        if !matches!(poll(&mut fds, Some(&zero)), Ok(n) if n > 0) {
+            return "the shim is still running".into();
+        }
+        let Some(child) = self.child.as_mut() else {
+            return "the shim was collected".into();
+        };
+        let status = child
+            .wait()
+            .map_or_else(|e| format!("wait failed: {e}"), |s| format!("{s:?}"));
+        let mut stderr = String::new();
+        if let Some(pipe) = child.stderr.as_mut() {
+            if let Ok(flags) = rustix::fs::fcntl_getfl(&*pipe) {
+                _ = rustix::fs::fcntl_setfl(&*pipe, flags | OFlags::NONBLOCK);
+            }
+            _ = std::io::Read::read_to_string(pipe, &mut stderr);
+        }
+        format!("the shim ended: {status}; its stderr: {stderr:?}")
     }
 
     /// Takes the shim's stdout pipe.
@@ -522,10 +603,13 @@ impl Run {
     pub(super) fn wait_for(&mut self, needle: &str) -> String {
         match self.wait_line(|l| l.contains(needle)) {
             Ok(line) => line,
-            Err(gone) => panic!(
-                "the shim's log ended ({gone:?}) without {needle:?}; it has {:#?}",
-                self.log.lines
-            ),
+            Err(gone) => {
+                let ended = self.how_it_ended();
+                panic!(
+                    "the shim's log ended ({gone:?}) without {needle:?}; it has {:#?}\n{ended}",
+                    self.log.lines
+                )
+            }
         }
     }
 
@@ -539,7 +623,16 @@ impl Run {
             if let Some(line) = self.log.lines.iter().find(|l| l.contains(needle)) {
                 return line.clone();
             }
-            assert!(!self.log.eof, "the log ended without {needle:?}: {:#?}", self.log.lines);
+            let ended = if self.log.eof {
+                self.how_it_ended()
+            } else {
+                String::new()
+            };
+            assert!(
+                !self.log.eof,
+                "the log ended without {needle:?}: {:#?}\n{ended}",
+                self.log.lines
+            );
             let mut fds = [PollFd::new(&self.log.fifo, PollFlags::IN)];
             match poll(&mut fds, None) {
                 Ok(_) | Err(rustix::io::Errno::INTR) => {}
@@ -551,22 +644,20 @@ impl Run {
     /// Releases a gate once the shim is waiting at it.
     pub(super) fn release(&mut self, gate: Gate) {
         self.wait_for(&format!("gate: waiting at {}", gate.name()));
-        let fifo = self.gates.get(&gate).expect("the gate was requested").clone();
-        open_for_release(&fifo);
+        let holder = self.gates.get(&gate).expect("the gate was requested");
+        release_gate(holder);
     }
 
-    /// Releases the child's gate if the child is waiting at it right now; a child that is gone has
+    /// Releases the child's gate, whether or not the child is at it yet; a child that is gone has
     /// nothing to release.
     pub(super) fn release_child_if_waiting(&mut self) {
-        let fifo = self.child_gate.clone().expect("the child gate was requested");
-        release_if_waiting(&fifo);
+        release_gate(self.child_gate.as_ref().expect("the child gate was requested"));
     }
 
     /// Releases the child's gate once the child is waiting at it.
     pub(super) fn release_child(&mut self) {
         self.wait_for_in_log("child: waiting at gate");
-        let fifo = self.child_gate.clone().expect("the child gate was requested");
-        open_for_release(&fifo);
+        release_gate(self.child_gate.as_ref().expect("the child gate was requested"));
     }
 
     /// Makes supervision fail.
@@ -591,8 +682,6 @@ impl Run {
         self.log.drain();
         Finished {
             code: output.status.code(),
-            status: output.status,
-            stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             lines: std::mem::take(&mut self.log.lines),
         }
@@ -622,8 +711,6 @@ impl Drop for Run {
 
 pub(super) struct Finished {
     pub(super) code: Option<i32>,
-    pub(super) status: std::process::ExitStatus,
-    pub(super) stdout: Vec<u8>,
     pub(super) stderr: String,
     pub(super) lines: Vec<String>,
 }
@@ -634,14 +721,15 @@ impl Finished {
     }
 }
 
-/// Opens a FIFO for writing without waiting for a reader, and closes it: releases a reader that is
-/// there right now, and does nothing if there is none.
-pub(super) fn release_if_waiting(fifo: &Path) {
-    match open(fifo, OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty()) {
-        Ok(w) => drop(w),
-        Err(rustix::io::Errno::NXIO) => {}
-        Err(e) => panic!("opening the gate: {e}"),
-    }
+/// Opens a gate's FIFO for reading and writing, which does not wait for anyone. With this end open the
+/// shim's own `open` of the FIFO returns at once, and its `read` waits for a byte.
+fn hold_open(fifo: &Path) -> OwnedFd {
+    open(fifo, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).expect("the gate's FIFO")
+}
+
+/// One byte into a gate's FIFO: the shim's read of it returns, now or when the shim gets there.
+fn release_gate(holder: &OwnedFd) {
+    rustix::io::write(holder, b"g").expect("the gate's FIFO has room");
 }
 
 /// Opens a FIFO for writing and closes it: the reader's blocked `open` or `read` returns.
@@ -650,16 +738,6 @@ fn open_for_release(fifo: &Path) {
     // waits.
     let w = open(fifo, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()).expect("the gate's write end");
     drop(w);
-}
-
-/// The acceptor's events until the answer to a shim is written.
-pub(super) fn wait_answered(rig: &ShimRig) -> Control {
-    loop {
-        match crate::elevation::shim::link::fake_shim::next_acceptor_event(&rig.link.events) {
-            LinkEvent::Answered(answer) => return answer,
-            _ => continue,
-        }
-    }
 }
 
 /// The shim's owner as a process of its own, so that a test can end it: see `owner_helper`.
@@ -727,6 +805,53 @@ impl Owner {
             assert!(n > 0, "the owner ended before it forked");
             if line.trim_end() == "forked" {
                 return;
+            }
+        }
+    }
+
+    /// Waits until the owner has answered its shim `A`, and so holds the connection to it.
+    pub(super) fn wait_answered(&mut self) {
+        use std::io::BufRead;
+        loop {
+            let mut line = String::new();
+            let n = self.out.read_line(&mut line).expect("the owner's output");
+            assert!(n > 0, "the owner ended before it answered a shim");
+            if line.trim_end() == "event Answered(Allow)" {
+                return;
+            }
+        }
+    }
+
+    /// Makes a copy of the owner that keeps its connection to the shim and reads every byte the shim
+    /// sends on it until the shim ends it, and waits until it exists. The copy outlives the owner, so
+    /// that what the shim says to a cosca that is gone can still be seen: [`frames`](Self::frames).
+    pub(super) fn fork_reader(&mut self) {
+        use std::io::{BufRead, Write};
+        let stdin = self.stdin.as_mut().expect("the owner's stdin is open");
+        writeln!(stdin, "{}", crate::elevation::shim::owner_helper::READ_FRAMES).expect("the owner is alive");
+        loop {
+            let mut line = String::new();
+            let n = self.out.read_line(&mut line).expect("the owner's output");
+            assert!(n > 0, "the owner ended before it forked");
+            if line.trim_end() == "forked" {
+                return;
+            }
+        }
+    }
+
+    /// What the shim sent on the connection the [`fork_reader`](Self::fork_reader) copy holds, once the
+    /// shim has closed it, as the frames' bytes.
+    pub(super) fn frames(&mut self) -> Vec<u8> {
+        use std::io::BufRead;
+        loop {
+            let mut line = String::new();
+            let n = self.out.read_line(&mut line).expect("the owner's output");
+            assert!(n > 0, "the reader ended without saying what it read");
+            if let Some(hex) = line.trim_end().strip_prefix("frames ") {
+                return (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                    .collect();
             }
         }
     }

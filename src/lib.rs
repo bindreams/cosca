@@ -24,7 +24,8 @@
 //!   [`Error::MayHaveStarted`](error::Error::MayHaveStarted): a spawn reads the identity once the
 //!   child runs. [`ProcessId::current`](identity::ProcessId::current)
 //!   needs only a readable `/proc/self/stat`.
-//! - The elevation shim (`cosca::init`, Unix) needs `/proc` mounted: it reaches cosca's socket through
+//! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
+//!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! [`Containment::CgroupV2`] additionally needs `cgroup.kill` (Linux 5.14); without it `CgroupV2`
@@ -221,7 +222,7 @@ fn main() {
     // This binary is also the elevation shim in the shim's end-to-end tests: a process started with
     // the shim's arguments runs it here and exits.
     #[cfg(unix)]
-    init_with_test_hooks(&shim_env_hooks::HOOKS);
+    shim_env_hooks::init();
     #[cfg(target_os = "linux")]
     elevation::shim::owner_helper::run_if_requested();
     let mut runner = skuld::TestRunner::new();

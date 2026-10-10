@@ -1,4 +1,4 @@
-//! Test seams of the shim (plan F, D24), injected by the host's `main` through
+//! Test seams of the shim, injected by the host's `main` through
 //! [`init_with_test_hooks`](super::init_with_test_hooks). [`init`](super::init) installs none, and
 //! the library reads no environment for seams, so a shipped shim cannot reach one.
 //!
@@ -20,6 +20,10 @@ pub enum Gate {
     BeforeIdentity,
     /// After the answer `A`, before the owner re-check and the clone.
     AfterAnswer,
+    /// After the owner re-check and everything the clone needs, right before the clone.
+    BeforeClone,
+    /// After the clone, when the start must not go on and the held child is about to be killed.
+    BeforeAbandon,
     /// After the clone, before the shim's stdio is replaced.
     AfterFork,
     /// After the shim's stdio is replaced, before the loop.
@@ -34,6 +38,8 @@ impl Gate {
             Gate::BeforeConnect => "before-connect",
             Gate::BeforeIdentity => "before-identity",
             Gate::AfterAnswer => "after-answer",
+            Gate::BeforeClone => "before-clone",
+            Gate::BeforeAbandon => "before-abandon",
             Gate::AfterFork => "after-fork",
             Gate::BeforeLoop => "before-loop",
         }
@@ -57,9 +63,27 @@ pub enum Inject {
     StealReap,
     /// A host thread of the shim reaps with `waitpid(-1)` once released.
     ReapingHostThread,
+    /// The `poll` of an owner re-check fails: `RLIMIT_NOFILE`'s soft limit is 0 around it, and the
+    /// kernel answers `EINVAL` to a `poll` of more descriptors than that.
+    OwnerPollFails,
+    /// The child asks `PR_SET_PDEATHSIG` for a signal that does not exist, which the kernel refuses
+    /// with `EINVAL`.
+    ChildSetupFails,
 }
 
 impl Inject {
+    /// Every injection, for a host that must tell a known name from a misspelt one.
+    pub const ALL: [Inject; 8] = [
+        Inject::ForkFails,
+        Inject::PipeFails,
+        Inject::Clone3Enosys,
+        Inject::DieAfterFork,
+        Inject::StealReap,
+        Inject::ReapingHostThread,
+        Inject::OwnerPollFails,
+        Inject::ChildSetupFails,
+    ];
+
     #[doc(hidden)]
     pub fn name(self) -> &'static str {
         match self {
@@ -69,6 +93,8 @@ impl Inject {
             Inject::DieAfterFork => "die-after-fork",
             Inject::StealReap => "steal-reap",
             Inject::ReapingHostThread => "reaping-host-thread",
+            Inject::OwnerPollFails => "owner-poll-fails",
+            Inject::ChildSetupFails => "child-setup-fails",
         }
     }
 }

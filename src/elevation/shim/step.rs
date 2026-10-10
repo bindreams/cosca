@@ -54,7 +54,7 @@ pub(crate) struct Events {
     pub(crate) owner_exited: bool,
     pub(crate) child_exited: bool,
     pub(crate) exec: ExecEvent,
-    /// A signal reached the shim (D8d): any signal stops the program.
+    /// A signal reached the shim: any signal stops the program.
     pub(crate) signaled: bool,
     /// Test hook: supervision is forced to fail.
     pub(crate) forced_failure: bool,
@@ -92,6 +92,9 @@ pub(crate) struct Actions {
 }
 
 /// One supervision step. Control is served whether or not the child has reached `exec`.
+///
+/// At most one signal goes out per step, and a kill wins: the owner's exit and a signal to the shim
+/// each set `Kill` after the control byte is served, so they replace a `Term` from `T`.
 pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
     let mut actions = Actions::default();
     if events.forced_failure {
@@ -111,11 +114,7 @@ pub(crate) fn decide(state: &mut LoopState, events: &Events) -> Actions {
         }
         Control::Byte(byte) => match Command::decode(byte) {
             Ok(Command::Kill) => actions.signal = Some(ToChild::Kill),
-            Ok(Command::Terminate) => {
-                if actions.signal != Some(ToChild::Kill) {
-                    actions.signal = Some(ToChild::Term);
-                }
-            }
+            Ok(Command::Terminate) => actions.signal = Some(ToChild::Term),
             Ok(Command::Disarm) => state.armed = false,
             Ok(Command::Ping) if state.test_hooks => actions.pong = true,
             // `A` and `N` are valid only once, as the first byte; `P` only with hooks.

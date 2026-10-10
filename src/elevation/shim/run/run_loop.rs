@@ -1,5 +1,5 @@
-//! The shim's loop (plan F, D3): it polls, gathers what is ready into [`Events`], calls
-//! [`decide`] and performs the returned [`Actions`]. It reviews by inspection.
+//! The shim's loop: it polls, gathers what is ready into [`Events`], calls [`decide`] and performs
+//! the returned [`Actions`].
 //!
 //! The loop's blocking calls are these, each commented where it is made:
 //! - the single `poll` of each round;
@@ -7,12 +7,16 @@
 //! - the wait for a host thread's reap, when a test hook installed one;
 //! - the traced-zombie wait inside [`Spawned::reap`].
 
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use rustix::io::Errno;
+use rustix::net::{recv, RecvFlags};
 
 use super::child::{decode_report, Spawned};
+use super::fds::wait_readable;
 use super::log::Log;
 use crate::elevation::shim::protocol::NotExecuted;
-use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState, ToChild};
+use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState};
 
 /// What the loop ended with: the inputs of [`conclude`](crate::elevation::shim::step::conclude).
 pub(super) struct Finished {
@@ -46,23 +50,66 @@ enum Status {
     Nothing,
 }
 
-fn drain_status(fd: RawFd) -> Status {
+/// Reads the status pipe without blocking. A read that fails for a reason other than `EAGAIN` is
+/// logged, and the loop goes on: the child's exit ends the wait for a report.
+fn drain_status(fd: BorrowedFd<'_>, log: &Log) -> Status {
     let mut value = [0u8; 4];
     loop {
-        // SAFETY: `value` is valid for 4 bytes.
-        let n = unsafe { libc::read(fd, value.as_mut_ptr().cast(), value.len()) };
-        return match n {
-            4 => Status::Report(decode_report(i32::from_le_bytes(value))),
-            0 => Status::Eof,
-            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
-            // `EAGAIN`: the child has not exec'd yet.
-            _ => Status::Nothing,
+        return match rustix::io::read(fd, &mut value) {
+            Ok(4) => Status::Report(decode_report(i32::from_le_bytes(value))),
+            Ok(0) => Status::Eof,
+            Ok(n) => {
+                // The child writes its four bytes in one `write`, which a pipe keeps whole.
+                debug_assert!(false, "a short read of {n} bytes from the status pipe");
+                log.warn(format_args!("a short read of {n} bytes from the status pipe"));
+                Status::Nothing
+            }
+            Err(Errno::INTR) => continue,
+            // The child has not exec'd yet.
+            Err(Errno::AGAIN) => Status::Nothing,
+            Err(e) => {
+                log.warn(format_args!(
+                    "reading the status pipe: errno {} ({e})",
+                    e.raw_os_error()
+                ));
+                Status::Nothing
+            }
         };
     }
 }
 
-fn ready(p: &libc::pollfd) -> bool {
-    p.revents != 0
+/// Reads without blocking what cosca has sent, in order: the bytes, then `Eof` if the connection ended.
+fn drain_control(conn: BorrowedFd<'_>, log: &Log) -> Vec<Control> {
+    let mut controls = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        match recv(conn, &mut byte[..], RecvFlags::DONTWAIT) {
+            Ok((1, _)) => controls.push(Control::Byte(byte[0])),
+            Ok((0, _)) => {
+                controls.push(Control::Eof);
+                return controls;
+            }
+            Ok((n, _)) => unreachable!("a one-byte recv returned {n}"),
+            Err(Errno::INTR) => {}
+            // Nothing more yet.
+            Err(Errno::AGAIN) => return controls,
+            // A reset is the connection ending.
+            Err(Errno::CONNRESET) => {
+                controls.push(Control::Eof);
+                return controls;
+            }
+            // The connection is unusable, which ends it as well, but not silently.
+            Err(e) => {
+                log.warn(format_args!("recv from cosca: errno {} ({e})", e.raw_os_error()));
+                debug_assert!(
+                    !matches!(e, Errno::BADF | Errno::INVAL),
+                    "recv on the shim's own connection: {e}"
+                );
+                controls.push(Control::Eof);
+                return controls;
+            }
+        }
+    }
 }
 
 impl Loop<'_> {
@@ -70,33 +117,29 @@ impl Loop<'_> {
         let mut report = None;
         let (reaped, lost) = loop {
             let mut events = Events::NONE;
-            let failure_fd = self.failure.as_ref().map_or(-1, |f| f.as_raw_fd());
             let st = self.state;
-            let mut polled = [
-                pollfd(self.wake.as_raw_fd()),
-                pollfd(self.child.pidfd.as_raw_fd()),
-                pollfd(if st.conn_open { self.conn.as_raw_fd() } else { -1 }),
-                pollfd(if st.owner_watched { self.owner.as_raw_fd() } else { -1 }),
-                pollfd(failure_fd),
-                pollfd(if st.exec_pending { self.status.as_raw_fd() } else { -1 }),
-            ];
             // The loop's single blocking call.
-            // SAFETY: `polled` is valid for its length.
-            if unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as _, -1) } < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+            let polled = wait_readable([
+                Some(self.wake),
+                Some(self.child.pidfd.as_fd()),
+                st.conn_open.then_some(self.conn),
+                st.owner_watched.then_some(self.owner),
+                self.failure.as_ref().map(|f| f.as_fd()),
+                st.exec_pending.then_some(self.status),
+            ]);
+            let [_, child_ready, _, owner_ready, failure_ready, status_ready] = match polled {
+                Ok(ready) => ready,
+                Err(e) => {
+                    self.log.warn(format_args!("poll failed: {e}"));
+                    break self.kill_and_reap();
                 }
-                self.log
-                    .line(format_args!("poll failed: {}", std::io::Error::last_os_error()));
-                break self.kill_and_reap();
-            }
+            };
             events.signaled = self.drain_wake();
-            events.child_exited = ready(&polled[1]);
-            events.owner_exited = st.owner_watched && ready(&polled[3]);
-            events.forced_failure = failure_fd >= 0 && ready(&polled[4]);
-            let status_ready = st.exec_pending && ready(&polled[5]);
+            events.child_exited = child_ready;
+            events.owner_exited = owner_ready;
+            events.forced_failure = failure_ready;
             if status_ready || (events.child_exited && st.exec_pending) {
-                match drain_status(self.status.as_raw_fd()) {
+                match drain_status(self.status, self.log) {
                     Status::Report(r) => {
                         events.exec = ExecEvent::Report;
                         self.log.line(format_args!("status pipe: report {r:?}"));
@@ -111,7 +154,11 @@ impl Loop<'_> {
             }
             // Every byte cosca has sent, in order, before the owner's exit or the connection's end: the
             // poll's snapshot can have the owner's exit without the bytes that preceded it.
-            let mut controls = if st.conn_open { self.drain_control() } else { Vec::new() };
+            let mut controls = if st.conn_open {
+                drain_control(self.conn, self.log)
+            } else {
+                Vec::new()
+            };
             let last = controls.pop().unwrap_or(Control::Nothing);
             for control in controls {
                 let earlier = Events {
@@ -131,7 +178,9 @@ impl Loop<'_> {
             if actions.reap {
                 if let Some(done) = self.host_reap_done {
                     // Blocks until the host thread's reap is done: the child is exiting, so it ends.
-                    wait_readable(done.as_raw_fd());
+                    if let Err(e) = wait_readable([Some(done)]) {
+                        self.log.warn(format_args!("waiting for the host thread's reap: {e}"));
+                    }
                 }
                 let status = self.child.reap(true, self.log);
                 self.log.line(format_args!("reaped status {status:?}"));
@@ -140,7 +189,7 @@ impl Loop<'_> {
         };
         if report.is_none() {
             // A report already written is positive evidence, whatever the reap gave.
-            if let Status::Report(r) = drain_status(self.status.as_raw_fd()) {
+            if let Status::Report(r) = drain_status(self.status, self.log) {
                 report = Some(r);
             }
         }
@@ -163,7 +212,7 @@ impl Loop<'_> {
 
     /// Supervision failed: kill the child through its handle, reap it, and say so.
     fn kill_and_reap(&self) -> (Option<i32>, bool) {
-        _ = self.child.signal(ToChild::Kill);
+        self.child.kill(self.log);
         // The child dies of the SIGKILL just sent; this blocks until it has.
         (self.child.reap(false, self.log), true)
     }
@@ -173,48 +222,22 @@ impl Loop<'_> {
         let mut any = false;
         let mut buf = [0u8; 32];
         loop {
-            // SAFETY: `buf` is valid for its length.
-            let n = unsafe { libc::read(self.wake.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                return any;
-            }
-            any = true;
-            for signal in &buf[..n as usize] {
-                self.log.line(format_args!("shim received signal {signal}"));
-            }
-        }
-    }
-
-    /// Reads without blocking what cosca has sent, in order: the bytes, then `Eof` if the connection ended.
-    fn drain_control(&self) -> Vec<Control> {
-        let mut controls = Vec::new();
-        loop {
-            let mut byte = 0u8;
-            // SAFETY: `byte` is valid for 1 byte.
-            let n = unsafe {
-                libc::recv(
-                    self.conn.as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            match n {
-                1 => controls.push(Control::Byte(byte)),
-                0 => {
-                    controls.push(Control::Eof);
-                    return controls;
-                }
-                _ => match std::io::Error::last_os_error().kind() {
-                    std::io::ErrorKind::Interrupted => {}
-                    // Nothing more yet.
-                    std::io::ErrorKind::WouldBlock => return controls,
-                    // A reset is the connection ending.
-                    _ => {
-                        controls.push(Control::Eof);
-                        return controls;
+            match rustix::io::read(self.wake, &mut buf) {
+                Ok(0) | Err(Errno::AGAIN) => return any,
+                Ok(n) => {
+                    any = true;
+                    for signal in &buf[..n] {
+                        self.log.line(format_args!("shim received signal {signal}"));
                     }
-                },
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => {
+                    self.log.warn(format_args!(
+                        "reading the signal pipe: errno {} ({e})",
+                        e.raw_os_error()
+                    ));
+                    return any;
+                }
             }
         }
     }
@@ -242,22 +265,6 @@ impl Loop<'_> {
     }
 }
 
-fn pollfd(fd: RawFd) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }
-}
-
-/// Blocks until `fd` is readable. A deliberate blocking call, see the module doc.
-fn wait_readable(fd: RawFd) {
-    let mut p = [pollfd(fd)];
-    loop {
-        // SAFETY: `p` is valid for its length.
-        let r = unsafe { libc::poll(p.as_mut_ptr(), 1, -1) };
-        if r >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
-        }
-    }
-}
+#[cfg(test)]
+#[path = "run_loop_tests.rs"]
+mod run_loop_tests;

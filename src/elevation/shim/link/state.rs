@@ -337,6 +337,13 @@ impl Shared {
         sys::send_byte(self.conn.get().expect("Live has a connection").as_fd(), byte)
     }
 
+    /// The descriptor of the shim's connection, once there is one.
+    #[cfg(test)]
+    pub(super) fn connection_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.conn.get().map(|c| c.as_raw_fd())
+    }
+
     pub(super) fn kill(&self) -> Result<KillOutcome, KillError> {
         let mut inner = self.lock();
         if inner.start != StartState::Live {

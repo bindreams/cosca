@@ -1,17 +1,17 @@
-//! The shim process (plan F): it connects to cosca's socket, proves that the listener and the
-//! writer of the answer are cosca, starts the program, and supervises it until the program is gone.
+//! The shim process: it connects to cosca's socket, proves that the listener and the writer of the
+//! answer are cosca, starts the program, and supervises it until the program is gone.
 //!
 //! [`handshake`] is everything up to the answer, [`child`] makes the program's process,
 //! [`run_loop`] supervises it, and the pure [`step`](super::step) decides what each wake means.
 
-use std::fmt::Arguments;
 use std::os::fd::{AsFd, OwnedFd};
 
 use super::codes;
 use super::hooks::{Gate, Inject, ShimTestHooks};
-use super::protocol::{Frame, Refusal, ShimArgs};
+use super::protocol::{Errno, Frame, NotExecuted, Refusal, ShimArgs};
 
 mod child;
+mod fds;
 mod handshake;
 mod log;
 mod reap;
@@ -20,6 +20,7 @@ mod signals;
 mod start;
 
 use log::Log;
+use signals::{Inherited, Wake};
 
 /// An exit code the shim has already reported.
 struct Exit(i32);
@@ -29,15 +30,23 @@ struct Shim {
     log: Log,
     conn: Option<OwnedFd>,
     hello_sent: bool,
+    /// The dispositions the shim started with, until the program's process takes them.
+    inherited: Option<Inherited>,
+    /// The pipe the shim's signal handlers write to, from before hello on.
+    wake: Option<Wake>,
 }
 
 /// Runs the shim for `args` and returns its exit code.
 pub(crate) fn run(args: &ShimArgs, hooks: Option<&'static dyn ShimTestHooks>) -> i32 {
+    let log = Log::new(hooks.and_then(|h| h.log_fd()));
+    log.say_panics();
     let mut shim = Shim {
         hooks,
-        log: Log::new(hooks.and_then(|h| h.log_fd())),
+        log,
         conn: None,
         hello_sent: false,
+        inherited: None,
+        wake: None,
     };
     match shim.go(args) {
         Ok(code) | Err(Exit(code)) => code,
@@ -49,21 +58,34 @@ impl Shim {
         if is_set_id() {
             return Err(self.refuse(codes::SET_ID, "refusing a set-id context"));
         }
-        // SAFETY: `getpid` and `getppid` have no preconditions.
-        let (pid, ppid) = unsafe { (libc::getpid(), libc::getppid()) };
-        self.log.line(format_args!("shim pid={pid} ppid={ppid}"));
-        self.log
-            .line(format_args!("sigpipe at entry: {}", signals::sigpipe_state()));
+        let (pid, ppid) = (rustix::process::getpid(), rustix::process::getppid());
+        self.log.line(format_args!(
+            "shim pid={} ppid={}",
+            pid.as_raw_nonzero(),
+            ppid.map_or(0, |p| p.as_raw_nonzero().get())
+        ));
         self.gate(Gate::BeforeConnect);
         self.connect(args)?;
         self.gate(Gate::BeforeIdentity);
         self.verify_listener(args)?;
         let owner = self.watch_owner(args)?;
+        self.catch_signals()?;
         self.say_hello()?;
         self.await_answer(args, &owner)?;
         self.gate(Gate::AfterAnswer);
         self.recheck_owner(&owner)?;
         start::start_and_supervise(self, args, &owner)
+    }
+
+    /// Catches the signals that would end the shim, so that none can kill it once cosca has been
+    /// told it is there: a signal then stops the program instead.
+    fn catch_signals(&mut self) -> Result<(), Exit> {
+        let inherited = Inherited::read();
+        let wake = Wake::new().map_err(|e| self.refuse(codes::NO_ANSWER, &format!("cannot create a pipe: {e}")))?;
+        signals::install(&inherited, std::os::fd::AsRawFd::as_raw_fd(&wake.tx));
+        self.inherited = Some(inherited);
+        self.wake = Some(wake);
+        Ok(())
     }
 
     fn gate(&self, gate: Gate) {
@@ -81,6 +103,10 @@ impl Shim {
         on
     }
 
+    fn wake(&self) -> &Wake {
+        self.wake.as_ref().expect("the signals are caught before hello")
+    }
+
     fn conn(&self) -> &OwnedFd {
         self.conn.as_ref().expect("connected before it is used")
     }
@@ -93,34 +119,57 @@ impl Shim {
         }
     }
 
-    /// Reports a refusal: one stderr line naming the code, the seam log, and `R` once hello is out.
+    /// Reports a refusal before hello: one stderr line naming the code and the seam log. Nothing is
+    /// written to cosca, which answers a connection only after hello, so it sees a shim that never
+    /// connected.
     fn refuse(&self, code: i32, why: &str) -> Exit {
-        use std::io::Write;
-        // Whether the front's stderr still exists is not the shim's to decide.
-        _ = writeln!(
-            std::io::stderr(),
-            "cosca-elevation-shim: {why}; the program was not started (exit {code})"
+        debug_assert!(
+            !self.hello_sent,
+            "after hello a refusal is a `Refusal` and goes to cosca: use `refuse_with`"
         );
-        self.log.line(format_args!("refused {code}: {why}"));
-        if self.hello_sent {
-            if let Some(refusal) = Refusal::from_code(code) {
-                self.send(Frame::Refused(refusal));
-            }
-        }
+        self.say_refused(code, why);
         Exit(code)
     }
 
-    /// A stderr line only: the program never ran, and the status pipe's report is the frame.
-    fn stderr_line(&self, args: Arguments<'_>) {
-        use std::io::Write;
-        _ = writeln!(std::io::stderr(), "cosca-elevation-shim: {args}");
+    /// Reports a refusal after hello: the stderr line, the seam log, and `R` to cosca.
+    fn refuse_with(&self, refusal: Refusal, why: &str) -> Exit {
+        debug_assert!(self.hello_sent, "before hello nothing goes to cosca: use `refuse`");
+        self.say_refused(refusal as i32, why);
+        self.send(Frame::Refused(refusal));
+        Exit(refusal as i32)
+    }
+
+    fn say_refused(&self, code: i32, why: &str) {
+        super::stderr::line(format_args!("{why}; the program was not started (exit {code})"));
+        self.log.line(format_args!("refused {code}: {why}"));
+    }
+
+    /// Reports a failure before the program could run: `F` to cosca, the stderr line and the seam log.
+    fn not_executed(&self, report: NotExecuted, what: &str, e: &std::io::Error) -> Exit {
+        self.log
+            .line(format_args!("refused {}: {what}: {e}", codes::NOT_EXECUTED));
+        super::stderr::line(format_args!(
+            "{what}: {e}; the program was not started (exit {})",
+            codes::NOT_EXECUTED
+        ));
+        self.send(Frame::NotExecuted(report));
+        Exit(codes::NOT_EXECUTED)
+    }
+
+    /// [`not_executed`](Self::not_executed) for a failed system call.
+    fn setup_failed(&self, what: &str, errno: rustix::io::Errno) -> Exit {
+        self.not_executed(
+            NotExecuted::SetupFailed(Errno(errno.raw_os_error())),
+            what,
+            &std::io::Error::from_raw_os_error(errno.raw_os_error()),
+        )
     }
 }
 
-/// D1a: set-id contexts are refused.
+/// Set-id contexts are refused.
 fn is_set_id() -> bool {
-    // SAFETY: these calls have no preconditions and cannot fail.
-    unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() }
+    use rustix::process::{getegid, geteuid, getgid, getuid};
+    getuid() != geteuid() || getgid() != getegid()
 }
 
 #[cfg(test)]

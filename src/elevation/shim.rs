@@ -22,6 +22,7 @@ pub(crate) mod program_path;
 pub(crate) mod protocol;
 #[cfg(target_os = "linux")]
 pub(crate) mod run;
+pub(crate) mod stderr;
 pub(crate) mod step;
 
 #[allow(unused_imports, reason = "nothing outside the tests of this module uses it")]
@@ -40,6 +41,9 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 ///
 /// When the process was started as the shim (its arguments say so), `init` runs the shim to its end
 /// and exits the process; it does not return. Otherwise it returns at once and does nothing else.
+///
+/// The shim runs on Linux. Other platforms have no shim; `init` reports that and does not start the
+/// program (exit 120).
 pub fn init() {
     install(None);
 }
@@ -49,7 +53,7 @@ pub fn installed() -> bool {
     INSTALLED.load(Ordering::Relaxed)
 }
 
-/// [`init`] with test seams (plan F, D24). Not public API.
+/// [`init`] with test seams. Not public API.
 #[doc(hidden)]
 pub fn init_with_test_hooks(hooks: &'static dyn ShimTestHooks) {
     install(Some(hooks));
@@ -62,13 +66,10 @@ fn install(hooks: Option<&'static dyn ShimTestHooks>) {
         Ok(None) => {}
         Ok(Some(args)) => std::process::exit(run_shim(&args, hooks)),
         Err(e) => {
-            use std::io::Write;
-            // Whether the front's stderr still exists is not the shim's to decide.
-            _ = writeln!(
-                std::io::stderr(),
-                "cosca-elevation-shim: {e}; the program was not started (exit {})",
+            stderr::line(format_args!(
+                "{e}; the program was not started (exit {})",
                 codes::INVOCATION
-            );
+            ));
             std::process::exit(codes::INVOCATION);
         }
     }
@@ -79,15 +80,13 @@ fn run_shim(args: &ShimArgs, hooks: Option<&'static dyn ShimTestHooks>) -> i32 {
     run::run(args, hooks)
 }
 
-/// The shim runs on Linux only so far.
+/// Other platforms have no shim; it reports that and does not start the program.
 #[cfg(not(target_os = "linux"))]
 fn run_shim(_: &ShimArgs, _: Option<&'static dyn ShimTestHooks>) -> i32 {
-    use std::io::Write;
-    _ = writeln!(
-        std::io::stderr(),
-        "cosca-elevation-shim: this platform has no shim yet; the program was not started (exit {})",
+    stderr::line(format_args!(
+        "this platform has no shim; the program was not started (exit {})",
         codes::INVOCATION
-    );
+    ));
     codes::INVOCATION
 }
 

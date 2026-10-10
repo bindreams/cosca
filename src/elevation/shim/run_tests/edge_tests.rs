@@ -1,4 +1,4 @@
-//! Faults, foreign reaps, descriptors, and the shim dying (plan F, D3, D8c, D12).
+//! Faults, foreign reaps, descriptors, and the shim dying.
 
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -156,4 +156,23 @@ fn shim_death_before_pdeathsig_is_119_and_never_execs() {
     assert_eq!(status.1.exit_status(), Some(119), "{status:?}");
     assert!(!marker.exists(), "the program ran");
     run.finish();
+}
+
+#[skuld::test]
+fn a_setup_the_child_cannot_finish_is_f_and_never_runs_the_program() {
+    // The child asks the kernel for a parent-death signal that does not exist, which `prctl` refuses.
+    let rig = ShimRig::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("ran");
+    let mut run = rig.spawn(marker_program(&marker).inject(Inject::ChildSetupFails));
+    run.wait_for("first byte: A");
+    assert_eq!(
+        rig.link.link.wait().unwrap(),
+        LinkOutcome::NotStarted(NotStarted {
+            shim_connected: true,
+            cause: NotStartedCause::NotExecuted(NotExecuted::SetupFailed(Errno(libc::EINVAL))),
+        })
+    );
+    assert_eq!(run.finish().code, Some(117));
+    assert!(!marker.exists(), "the program ran");
 }

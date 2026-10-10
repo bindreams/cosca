@@ -1,4 +1,4 @@
-//! Creating the program's process (plan F, D3, D11, D12), Linux.
+//! Creating the program's process, Linux.
 //!
 //! The child is made by `clone3(CLONE_PIDFD)`, or `clone(CLONE_PIDFD)` where `clone3` is refused
 //! (Docker's default seccomp profile answers `ENOSYS`). The handle exists from the child's first
@@ -10,6 +10,11 @@
 //! formats nothing, calls no `getenv`, no std I/O and nothing that reads libc's cached thread id
 //! (`raise`, `abort`, `pthread_*`), and it neither panics nor debug-asserts. Everything it uses is
 //! prepared before the clone: [`Prepared`].
+//!
+//! The child is held before it arms anything: after its handlers are set up it blocks reading the
+//! release pipe, and the shim lets it go only once it has checked, with the child already created,
+//! that cosca is still there. A shim that died instead closes the pipe the same way, and the child
+//! finds that out when it arms `PDEATHSIG` and looks at its parent.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -35,24 +40,31 @@ const LOG_NO_PARENT: &[u8] = b"child: the shim is gone before exec; exit 119\n";
 
 /// What the child needs, built before the clone.
 pub(in crate::elevation::shim) struct Prepared {
-    exe: CString,
+    /// Every candidate path, in the order the child tries them.
+    candidates: Vec<*const libc::c_char>,
     argv: Vec<*const libc::c_char>,
     envp: Vec<*const libc::c_char>,
-    /// `/bin/sh <exe> <args…>`, for a program `execve` refuses with `ENOEXEC`.
-    sh_argv: Vec<*const libc::c_char>,
+    /// For each candidate, `/bin/sh <candidate> <args…>`, for a program `execve` refuses with `ENOEXEC`.
+    sh_argvs: Vec<Vec<*const libc::c_char>>,
     /// Keep the strings the pointers above point into alive.
     _strings: Vec<CString>,
     max_signal: libc::c_int,
     ignored: *const bool,
+    handleable: *const bool,
     inherited: Inherited,
     saved_mask: libc::sigset_t,
     all_signals: libc::sigset_t,
     shim_pid: libc::pid_t,
     status_read: RawFd,
     status_write: RawFd,
+    /// The release pipe: the child reads, the shim closes its end to let the child go.
+    release_read: RawFd,
+    release_write: RawFd,
     log_fd: RawFd,
     gate: Option<CString>,
     fault: bool,
+    /// The signal the child asks to receive when the shim dies: `SIGKILL`.
+    parent_death_signal: libc::c_ulong,
 }
 
 const SH: &[u8] = b"/bin/sh\0";
@@ -63,41 +75,50 @@ impl Prepared {
         reason = "the child's whole world, gathered once before the clone"
     )]
     pub(in crate::elevation::shim) fn new(
-        exe: &OsStr,
+        candidates: &[OsString],
         argv: &[&OsStr],
         env: impl Iterator<Item = (OsString, OsString)>,
         inherited: Inherited,
         saved_mask: libc::sigset_t,
         status: (RawFd, RawFd),
+        release: (RawFd, RawFd),
         log_fd: Option<RawFd>,
         gate: Option<&OsStr>,
         fault: bool,
+        setup_fails: bool,
     ) -> Prepared {
         let cstring = |s: &OsStr| CString::new(s.as_bytes()).expect("argv carries no NUL: ShimArgs::parse checked");
-        let mut strings = vec![cstring(exe)];
-        strings.extend(argv.iter().map(|a| cstring(a)));
-        let env: Vec<CString> = env
+        let candidate_c: Vec<CString> = candidates.iter().map(|c| cstring(c)).collect();
+        let argv_c: Vec<CString> = argv.iter().map(|a| cstring(a)).collect();
+        let env_c: Vec<CString> = env
             .map(|(mut k, v)| {
                 k.push("=");
                 k.push(v);
                 cstring(&k)
             })
             .collect();
-        let exe_c = strings[0].clone();
-        let args_c = &strings[1..];
+        let sh = CString::from_vec_with_nul(SH.to_vec()).expect("a literal with its NUL");
         let ptrs = |list: &[&CString]| -> Vec<*const libc::c_char> {
             list.iter()
                 .map(|s| s.as_ptr())
                 .chain(std::iter::once(std::ptr::null()))
                 .collect()
         };
-        let argv_ptrs = ptrs(&args_c.iter().collect::<Vec<_>>());
-        let sh = CString::from_vec_with_nul(SH.to_vec()).expect("a literal with its NUL");
-        let mut sh_list: Vec<&CString> = vec![&sh, &strings[0]];
-        sh_list.extend(args_c.iter().skip(1));
-        let sh_argv = ptrs(&sh_list);
-        let envp = ptrs(&env.iter().collect::<Vec<_>>());
-        strings.extend(env);
+        let argv_ptrs = ptrs(&argv_c.iter().collect::<Vec<_>>());
+        let envp = ptrs(&env_c.iter().collect::<Vec<_>>());
+        // `sh <candidate> <args…>`: the candidate takes the place of `argv[0]`.
+        let sh_argvs = candidate_c
+            .iter()
+            .map(|candidate| {
+                let mut list: Vec<&CString> = vec![&sh, candidate];
+                list.extend(argv_c.iter().skip(1));
+                ptrs(&list)
+            })
+            .collect();
+        let candidate_ptrs = candidate_c.iter().map(|c| c.as_ptr()).collect();
+        let mut strings = candidate_c;
+        strings.extend(argv_c);
+        strings.extend(env_c);
         strings.push(sh);
         // SAFETY: an all-zero set is a valid out-parameter; `sigfillset` initialises it.
         let all_signals = unsafe {
@@ -106,23 +127,31 @@ impl Prepared {
             all
         };
         Prepared {
-            exe: exe_c,
+            candidates: candidate_ptrs,
             argv: argv_ptrs,
             envp,
-            sh_argv,
+            sh_argvs,
             _strings: strings,
             max_signal: inherited.max,
             ignored: inherited.ignored_ptr(),
+            handleable: inherited.handleable_ptr(),
             inherited,
             saved_mask,
             all_signals,
-            // SAFETY: `getpid` has no preconditions.
-            shim_pid: unsafe { libc::getpid() },
+            shim_pid: rustix::process::getpid().as_raw_nonzero().get(),
             status_read: status.0,
             status_write: status.1,
+            release_read: release.0,
+            release_write: release.1,
             log_fd: log_fd.unwrap_or(-1),
             gate: gate.map(cstring),
             fault,
+            // A test seam makes the request fail, as the kernel would refuse a signal it has not got.
+            parent_death_signal: if setup_fails {
+                1000
+            } else {
+                libc::SIGKILL as libc::c_ulong
+            },
         }
     }
 }
@@ -244,6 +273,11 @@ unsafe fn raw_clone(flags: u64, pidfd: &mut libc::c_int) -> libc::c_long {
     }
 }
 
+/// The kinds of `F` frame the child reports, as the protocol numbers them.
+const KIND_EXEC: u16 = 2;
+const KIND_SETUP: u16 = 3;
+const KIND_TERMINATED: u16 = 4;
+
 /// The `F` payload as the status pipe carries it: the frame's little-endian value.
 fn status_value(kind: u16, value: i32) -> i32 {
     i32::from(kind) << 16 | value & 0xffff
@@ -262,6 +296,28 @@ pub(in crate::elevation::shim) fn decode_report(value: i32) -> NotExecuted {
     }
 }
 
+/// Reports that the child could not set itself up, and ends it. The program never runs.
+///
+/// # Safety
+///
+/// Called only in the child of a raw clone.
+unsafe fn fail_setup(p: &Prepared, errno: libc::c_int) -> ! {
+    let value = status_value(KIND_SETUP, errno);
+    // SAFETY: raw system calls on valid arguments.
+    unsafe {
+        libc::write(p.status_write, (&value as *const i32).cast(), 4);
+        libc::_exit(crate::elevation::shim::codes::NOT_EXECUTED)
+    }
+}
+
+/// Whether `errno` from `execve` means the next candidate is worth trying, as glibc's `execvp` reads it.
+fn tries_the_next(errno: libc::c_int) -> bool {
+    matches!(
+        errno,
+        libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT | libc::EACCES
+    )
+}
+
 /// Everything between the clone and `execve`. Raw system calls only.
 ///
 /// # Safety
@@ -272,6 +328,7 @@ unsafe fn child_body(p: &Prepared) -> ! {
     // arguments; nothing allocates.
     unsafe {
         libc::close(p.status_read);
+        libc::close(p.release_write);
         let mut record: libc::sigaction = std::mem::zeroed();
         record.sa_sigaction = record_termination as *const () as usize;
         record.sa_flags = libc::SA_RESTART;
@@ -282,22 +339,42 @@ unsafe fn child_body(p: &Prepared) -> ! {
         let mut default: libc::sigaction = std::mem::zeroed();
         default.sa_sigaction = libc::SIG_DFL;
         for signal in 1..=p.max_signal {
-            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP || !*p.handleable.add(signal as usize) {
                 continue;
             }
             if is_in(&FAULTS, signal) {
                 // A fault before exec kills the child; a no-op would refault for ever.
-                libc::sigaction(signal, &default, std::ptr::null_mut());
+                if libc::sigaction(signal, &default, std::ptr::null_mut()) != 0 {
+                    fail_setup(p, *libc::__errno_location());
+                }
                 continue;
             }
-            // An inherited ignore reaches the program, except SIGPIPE's (D1b).
+            // An inherited ignore reaches the program, except SIGPIPE's.
             if *p.ignored.add(signal as usize) && signal != libc::SIGPIPE {
                 continue;
             }
             let action = if is_in(&TERMINATIONS, signal) { &record } else { &noop };
-            libc::sigaction(signal, action, std::ptr::null_mut());
+            if libc::sigaction(signal, action, std::ptr::null_mut()) != 0 {
+                fail_setup(p, *libc::__errno_location());
+            }
         }
-        libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
+        let unblocked = libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
+        if unblocked != 0 {
+            fail_setup(p, unblocked);
+        }
+        // Held here until the shim has checked that cosca is alive and closes its end of the pipe.
+        let mut byte = 0u8;
+        loop {
+            let n = libc::read(p.release_read, (&mut byte as *mut u8).cast(), 1);
+            if n >= 0 {
+                break;
+            }
+            let errno = *libc::__errno_location();
+            if errno != libc::EINTR {
+                fail_setup(p, errno);
+            }
+        }
+        libc::close(p.release_read);
         if let Some(gate) = &p.gate {
             write_log(p.log_fd, LOG_AT_GATE);
             let fd = libc::open(gate.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
@@ -311,32 +388,55 @@ unsafe fn child_body(p: &Prepared) -> ! {
             // A real fault before exec.
             std::ptr::write_volatile(8 as *mut i32, 0);
         }
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        if libc::prctl(libc::PR_SET_PDEATHSIG, p.parent_death_signal) != 0 {
+            fail_setup(p, *libc::__errno_location());
+        }
         if libc::getppid() != p.shim_pid {
             write_log(p.log_fd, LOG_NO_PARENT);
             libc::_exit(crate::elevation::shim::codes::NO_PARENT);
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &p.all_signals, std::ptr::null_mut());
+        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &p.all_signals, std::ptr::null_mut());
+        if blocked != 0 {
+            fail_setup(p, blocked);
+        }
         let terminated = TERMINATED.load(Ordering::Relaxed);
         if terminated != 0 {
-            let value = status_value(4, terminated);
+            let value = status_value(KIND_TERMINATED, terminated);
             libc::write(p.status_write, (&value as *const i32).cast(), 4);
             libc::_exit(crate::elevation::shim::codes::NOT_EXECUTED);
         }
         // A termination that arrives from here on ends the child by default. It is never swallowed.
         for signal in TERMINATIONS {
-            if !*p.ignored.add(signal as usize) {
-                libc::sigaction(signal, &default, std::ptr::null_mut());
+            if !*p.ignored.add(signal as usize) && libc::sigaction(signal, &default, std::ptr::null_mut()) != 0 {
+                fail_setup(p, *libc::__errno_location());
             }
         }
-        libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
-        libc::execve(p.exe.as_ptr(), p.argv.as_ptr(), p.envp.as_ptr());
-        let mut errno = *libc::__errno_location();
-        if errno == libc::ENOEXEC {
-            libc::execve(SH.as_ptr().cast(), p.sh_argv.as_ptr(), p.envp.as_ptr());
-            errno = *libc::__errno_location();
+        let unblocked = libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
+        if unblocked != 0 {
+            fail_setup(p, unblocked);
         }
-        let value = status_value(2, errno);
+        // `execvp`'s rules, over candidates the shim prepared: the next one on `ENOENT` and its kin,
+        // and on `EACCES`, which is the answer only if nothing else is; anything else ends the search.
+        let mut errno = libc::ENOENT;
+        let mut denied = false;
+        let mut stopped = false;
+        for (&candidate, sh_argv) in p.candidates.iter().zip(&p.sh_argvs) {
+            libc::execve(candidate, p.argv.as_ptr(), p.envp.as_ptr());
+            errno = *libc::__errno_location();
+            if errno == libc::ENOEXEC {
+                libc::execve(SH.as_ptr().cast(), sh_argv.as_ptr(), p.envp.as_ptr());
+                errno = *libc::__errno_location();
+            }
+            if !tries_the_next(errno) {
+                stopped = true;
+                break;
+            }
+            denied |= errno == libc::EACCES;
+        }
+        if denied && !stopped {
+            errno = libc::EACCES;
+        }
+        let value = status_value(KIND_EXEC, errno);
         libc::write(p.status_write, (&value as *const i32).cast(), 4);
         libc::_exit(127)
     }

@@ -37,6 +37,25 @@ fn t_with_exec_pending_signals_the_child_with_term() {
 }
 
 #[skuld::test]
+fn a_kill_in_the_same_step_wins_over_t() {
+    // `T` asks politely; the owner's exit and a signal to the shim each stop the program for good.
+    let owner_exit = Events {
+        owner_exited: true,
+        ..control(b'T')
+    };
+    assert_eq!(decide(&mut state(), &owner_exit), signal(ToChild::Kill));
+    let shim_signal = Events {
+        signaled: true,
+        ..control(b'T')
+    };
+    assert_eq!(decide(&mut state(), &shim_signal), signal(ToChild::Kill));
+    // Disarmed, the owner's exit leaves the program, so `T` stands.
+    let mut disarmed = state();
+    disarmed.armed = false;
+    assert_eq!(decide(&mut disarmed, &owner_exit), signal(ToChild::Term));
+}
+
+#[skuld::test]
 fn owner_exit_kills_an_armed_program_once() {
     let mut st = state();
     let owner = Events {

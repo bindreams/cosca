@@ -1,4 +1,4 @@
-//! The program the shim starts: what it is resolved to, and what it inherits (plan F, D1b, D11).
+//! The program the shim starts: what it is resolved to, and what it inherits.
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -125,11 +125,10 @@ fn bit(signal: i32) -> u64 {
 
 #[skuld::test]
 fn elevated_program_sees_sigpipe_at_sig_dfl() {
-    // The caller ignores SIGPIPE before spawning; the shim confirms it inherited that.
+    // The caller ignores SIGPIPE before spawning, as a Rust runtime does for itself.
     let rig = ShimRig::new();
     let mut run = rig.spawn(Spec::new("cat", &["/proc/self/status"]).ignoring(libc::SIGPIPE));
     let mut stdout = run.take_stdout();
-    run.wait_for("sigpipe at entry: ignored");
     let mut text = String::new();
     stdout.read_to_string(&mut text).unwrap();
     run.finish();
@@ -154,4 +153,107 @@ fn program_keeps_the_callers_other_ignored_signals() {
     assert_ne!(ignored & bit(libc::SIGHUP), 0, "SIGHUP: {ignored:#x}");
     assert_ne!(ignored & bit(libc::SIGUSR1), 0, "SIGUSR1: {ignored:#x}");
     assert_eq!(caught, 0, "exec resets every handler");
+}
+
+// A candidate that changes between the search and the exec -----
+
+/// Two directories, searched in this order, and the `PATH` that names them.
+struct Tools {
+    _tmp: tempfile::TempDir,
+    first: PathBuf,
+    second: PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn two_tool_dirs() -> Tools {
+    let tmp = tempfile::tempdir().unwrap();
+    let (first, second) = (tmp.path().join("first"), tmp.path().join("second"));
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    Tools {
+        _tmp: tmp,
+        first,
+        second,
+        path,
+    }
+}
+
+/// Runs `tool` over `tools.path`, holding the shim just before the clone while `change` alters the
+/// directories, and returns the outcome. Both candidates were executable when the shim searched.
+fn changed_before_the_clone(tools: &Tools, args: &[&str], change: impl FnOnce()) -> LinkOutcome {
+    let rig = ShimRig::new();
+    let mut run = rig.spawn(
+        Spec::new("tool", args)
+            .search_path(tools.path.clone())
+            .gate(crate::elevation::shim::hooks::Gate::BeforeClone),
+    );
+    run.wait_for("gate: waiting at before-clone");
+    change();
+    run.release(crate::elevation::shim::hooks::Gate::BeforeClone);
+    let outcome = rig.link.link.wait().unwrap();
+    run.finish();
+    outcome
+}
+
+#[skuld::test]
+fn a_candidate_that_vanishes_before_the_exec_falls_through_to_the_next() {
+    let tools = two_tool_dirs();
+    let (first_ran, second_ran) = (tools.first.join("ran"), tools.second.join("ran"));
+    script(&tools.first, "tool", &first_ran, 0o755);
+    script(&tools.second, "tool", &second_ran, 0o755);
+    let outcome = changed_before_the_clone(&tools, &[], || std::fs::remove_file(tools.first.join("tool")).unwrap());
+    assert_eq!(outcome, LinkOutcome::Exited(0));
+    assert!(second_ran.exists(), "the next candidate did not run");
+    assert!(!first_ran.exists());
+}
+
+#[skuld::test]
+fn a_denied_candidate_is_the_answer_when_nothing_else_runs() {
+    let tools = two_tool_dirs();
+    let marker = tools.first.join("ran");
+    script(&tools.first, "tool", &marker, 0o755);
+    script(&tools.second, "tool", &marker, 0o755);
+    let outcome = changed_before_the_clone(&tools, &[], || {
+        std::fs::set_permissions(tools.first.join("tool"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::remove_file(tools.second.join("tool")).unwrap();
+    });
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::EACCES))));
+    assert!(!marker.exists());
+}
+
+#[skuld::test]
+fn a_candidate_that_fails_otherwise_ends_the_search() {
+    let tools = two_tool_dirs();
+    let marker = tools.second.join("ran");
+    script(&tools.first, "tool", &marker, 0o755);
+    script(&tools.second, "tool", &marker, 0o755);
+    let outcome = changed_before_the_clone(&tools, &[], || {
+        // A symlink to itself: `execve` answers `ELOOP`, which `execvp` does not step over.
+        let first = tools.first.join("tool");
+        std::fs::remove_file(&first).unwrap();
+        std::os::unix::fs::symlink("tool", &first).unwrap();
+    });
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ELOOP))));
+    assert!(!marker.exists(), "the search went on past a failure");
+}
+
+#[skuld::test]
+fn the_shell_fallback_runs_the_candidate_that_was_refused_for_its_format() {
+    let tools = two_tool_dirs();
+    let out = tools._tmp.path().join("out");
+    std::fs::write(tools.first.join("tool"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(tools.first.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let second = tools.second.join("tool");
+    std::fs::write(&second, format!("echo \"$0|$1\" > '{}'\n", out.display())).unwrap();
+    std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let outcome = changed_before_the_clone(&tools, &["one"], || {
+        std::fs::remove_file(tools.first.join("tool")).unwrap()
+    });
+    assert_eq!(outcome, LinkOutcome::Exited(0));
+    // `/bin/sh <the second candidate> one`, not the first.
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        format!("{}|one\n", second.display())
+    );
 }

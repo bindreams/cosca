@@ -1,4 +1,4 @@
-//! Linux `SCM_CREDENTIALS` on the shim channel (plan F, D2).
+//! Linux `SCM_CREDENTIALS` on the shim channel.
 //!
 //! The shim sets `SO_PASSCRED` on its socket and compares the credentials that arrive with the first
 //! byte against argv's. cosca names them explicitly: the kernel attaches the sender's real uid
@@ -6,8 +6,9 @@
 //! kernel lets a sender name its own real, effective or saved ids, and the pid only if it is the
 //! sender's own tgid (or the sender is privileged over its pid namespace).
 //!
-//! libc directly: rustix's `UCred` holds a non-zero `Pid`, and the kernel reports pid 0 for a sender
-//! outside the receiver's pid namespace.
+//! Sending goes through rustix. Receiving stays on libc: rustix reads the credentials into a `UCred`,
+//! whose `Pid` is non-zero, and the kernel reports pid 0 for a sender outside the receiver's pid
+//! namespace, so rustix's read of it would be undefined behaviour.
 
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -56,45 +57,26 @@ const _: () = assert!(size_of::<CmsgSpace>() >= unsafe { libc::CMSG_SPACE(size_o
 
 /// Sends `byte`, naming `creds` as the sender's. Never raises `SIGPIPE`.
 pub(crate) fn send_with_credentials(fd: BorrowedFd<'_>, byte: u8, creds: Creds) -> io::Result<()> {
-    let mut data = byte;
-    let mut iov = libc::iovec {
-        iov_base: (&mut data as *mut u8).cast(),
-        iov_len: 1,
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, UCred};
+    use rustix::process::{Gid, Pid, Uid};
+    let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+    // A pid of zero is not one rustix can name; no sender has one to name.
+    let ucred = UCred {
+        pid: Pid::from_raw(creds.pid).ok_or_else(invalid)?,
+        uid: Uid::from_raw(creds.uid),
+        gid: Gid::from_raw(creds.gid),
     };
-    // SAFETY: an all-zero `msghdr` and `CmsgSpace` are valid.
-    let (mut msg, mut space): (libc::msghdr, CmsgSpace) = unsafe { (zeroed(), zeroed()) };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = (&mut space as *mut CmsgSpace).cast();
-    // SAFETY: `CMSG_SPACE` is a pure computation.
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) } as _;
-    // SAFETY: `msg_control` has room for one header, so `CMSG_FIRSTHDR` is non-null, and `CMSG_DATA`
-    // has room for one `ucred`.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&msg);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_CREDENTIALS;
-        (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::ucred>() as u32) as _;
-        let ucred = libc::ucred {
-            pid: creds.pid,
-            uid: creds.uid,
-            gid: creds.gid,
-        };
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>(), ucred);
-    }
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmCredentials(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let pushed = control.push(SendAncillaryMessage::ScmCredentials(ucred));
+    debug_assert!(pushed, "the buffer has room for one credentials message");
     loop {
-        // SAFETY: `msg` and what it points to are valid for the call.
-        let sent = unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        match sent {
-            1 => return Ok(()),
+        match sendmsg(fd, &[io::IoSlice::new(&[byte])], &mut control, SendFlags::NOSIGNAL) {
+            Ok(1) => return Ok(()),
             // A one-byte send that sends nothing cannot be told from a full buffer.
-            0.. => return Err(io::ErrorKind::WouldBlock.into()),
-            _ => {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
-                }
-            }
+            Ok(_) => return Err(io::ErrorKind::WouldBlock.into()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -176,21 +158,7 @@ pub(crate) fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<Creds> {
 
 /// Asks the kernel to attach the sender's credentials to what this socket receives.
 pub(crate) fn set_passcred(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: `on` is valid for the call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PASSCRED,
-            (&on as *const libc::c_int).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    rustix::net::sockopt::set_socket_passcred(fd, true).map_err(io::Error::from)
 }
 
 #[cfg(test)]
