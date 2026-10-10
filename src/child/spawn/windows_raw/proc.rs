@@ -190,24 +190,39 @@ impl RawChild {
     /// Non-runas (or a runas child we can terminate): kill, then reap via a blocking wait on
     /// the real exit event. A genuinely higher-integrity runas child (static `can_terminate`
     /// probe is false on the `ACCESS_DENIED` path): LOG and move on — never block.
-    pub(crate) fn teardown_on_drop(&self) {
+    pub(crate) fn teardown_on_drop(&self, id: crate::identity::ProcessId) -> crate::error::ChildFate {
+        use crate::error::ChildFate;
         // SAFETY: `handle` is our live, owned process handle.
         match unsafe { TerminateProcess(self.handle(), 1) } {
-            Ok(()) => {
-                _ = self.reap();
-            }
+            Ok(()) => fate_after_reap(true, self.reap()),
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
                 if self.runas && !self.can_terminate() {
                     log::warn!(
                         "elevated child {} could not be terminated on drop (higher integrity); leaving it running",
                         self.pid
                     );
+                    ChildFate::Running { id: Some(id) }
                 } else {
-                    _ = self.reap();
+                    // The kill was refused: only the wait's result says what became of the child.
+                    fate_after_reap(false, self.reap())
                 }
             }
-            Err(e) => log::warn!("terminating child {} on drop failed: {e:?}", self.pid),
+            Err(e) => {
+                log::warn!("terminating child {} on drop failed: {e:?}", self.pid);
+                ChildFate::Unknown
+            }
         }
+    }
+}
+
+/// The fate after a teardown's blocking wait: `Reaped` for a collected status. A wait that failed
+/// leaves `Killed` only if the kill was delivered, and `Unknown` if it was refused.
+fn fate_after_reap(kill_delivered: bool, reaped: io::Result<ExitStatus>) -> crate::error::ChildFate {
+    use crate::error::ChildFate;
+    match reaped {
+        Ok(_) => ChildFate::Reaped,
+        Err(_) if kill_delivered => ChildFate::Killed,
+        Err(_) => ChildFate::Unknown,
     }
 }
 

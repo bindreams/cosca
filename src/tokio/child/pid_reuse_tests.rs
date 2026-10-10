@@ -228,7 +228,10 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_termination() {
         assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
 
         let reaps = crate::child::spawn::fault::record_teardown_reaps();
-        let err = crate::tokio::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (err, fate) = crate::tokio::spawn::finish_elevated(child, failed_write())
+            .expect_err("the spawn fails")
+            .expect_may_have_started_with();
+        assert_eq!(fate, crate::error::ChildFate::Gone);
 
         let detail = elevation_detail(err);
         assert!(detail.contains("could not be terminated"), "{detail}");
@@ -268,7 +271,10 @@ fn finish_elevated_after_a_foreign_reap_and_reuse_waits_for_nothing_body() {
         });
 
         let reaps = crate::child::spawn::fault::record_teardown_reaps();
-        let err = crate::tokio::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (err, fate) = crate::tokio::spawn::finish_elevated(child, failed_write())
+            .expect_err("the spawn fails")
+            .expect_may_have_started_with();
+        assert_eq!(fate, crate::error::ChildFate::Gone);
 
         let detail = elevation_detail(err);
         assert!(detail.contains("could not be terminated"), "{detail}");
@@ -322,7 +328,10 @@ fn finish_elevated_after_a_delivered_kill_and_a_foreign_reap_and_reuse_waits_for
         });
 
         let reaps = crate::child::spawn::fault::record_teardown_reaps();
-        let err = crate::tokio::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (err, fate) = crate::tokio::spawn::finish_elevated(child, failed_write())
+            .expect_err("the spawn fails")
+            .expect_may_have_started_with();
+        assert_eq!(fate, crate::error::ChildFate::Killed);
 
         let detail = elevation_detail(err);
         assert!(detail.contains("was terminated"), "{detail}");
@@ -527,7 +536,10 @@ fn finish_elevated_of_an_aliased_process_group_sends_no_killpg_body() {
         );
         let (_reuser, _alias) = foreign_reaped_and_reused(&child, writer);
 
-        let err = crate::tokio::spawn::finish_elevated(child, failed_write()).expect_err("the spawn fails");
+        let (err, fate) = crate::tokio::spawn::finish_elevated(child, failed_write())
+            .expect_err("the spawn fails")
+            .expect_may_have_started_with();
+        assert_eq!(fate, crate::error::ChildFate::Gone);
 
         let detail = elevation_detail(err);
         assert_eq!(
@@ -546,8 +558,8 @@ in_fresh_pid_ns!(
 
 // A failed peek through the child's own pidfd =====
 
-/// A peek that fails on the child's own pidfd cannot show the child is ours, so it counts as reaped
-/// elsewhere: the child is forgotten, never released to tokio's by-pid reap.
+/// A peek that fails on the child's own pidfd cannot show the child is ours, so its ownership is
+/// unknown: the child is forgotten, never released to tokio's by-pid reap.
 ///
 /// Mutant: a failed peek counts as ours.
 #[skuld::test]
@@ -556,8 +568,11 @@ fn a_failed_pidfd_peek_is_unknown_so_the_child_is_forgotten() {
     runtime().block_on(async {
         let (mut child, _writer) = spawn_blocker();
         let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
-        let reaped = child.proc_mut().reaped_elsewhere();
-        assert!(reaped, "a child nothing can answer for is not tokio's to reap by pid");
+        assert_eq!(
+            child.proc_mut().not_ours(),
+            Some(crate::tokio::child::proc_source::Ownership::Unknown),
+            "a child nothing can answer for is not tokio's to reap by pid"
+        );
     });
 }
 
@@ -729,7 +744,10 @@ fn spawn_failure_teardown_leaves_the_stranger_alone(attach_arm: bool) {
         let err = cmd.spawn().err();
         fault::set_force_attach_failure(false);
         fault::set_force_identity_vanished(false);
-        let err = err.expect("the forced failure must fail the spawn");
+        let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+            err.expect("the forced failure must fail the spawn"),
+        );
+        assert_eq!(fate, crate::error::ChildFate::Gone, "the child was reaped elsewhere");
         // The arm under test ran: only the forced attach failure is a `Containment` error.
         assert_eq!(
             matches!(err, crate::error::Error::Containment { .. }),
@@ -806,10 +824,11 @@ fn spawn_identity_gone_after_a_reap_at(point: crate::child::spawn::fault::SpawnP
                 *stranger.borrow_mut() = Some(reuser);
             }
         });
-        let err = match cmd.spawn() {
+        let (err, fate) = match cmd.spawn() {
             Ok(child) => panic!("the spawn took the stranger for its child: {:?}", child.id()),
-            Err(e) => e,
+            Err(e) => crate::child::spawn::failure::expect_may_have_started_with(e),
         };
+        assert_eq!(fate, crate::error::ChildFate::Gone, "the child was reaped elsewhere");
         let stranger = stranger.borrow_mut().take().expect("the hook must have run");
         assert!(
             matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("reaped by another party")),

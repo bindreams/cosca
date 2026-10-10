@@ -4,7 +4,7 @@ Unified cross-platform subprocess management: spawning, stdio, process trees, st
 
 `std::process` hands you a child and little else. It cannot tell you whether the process you spawned is still the process you think it is, cannot tear down a process tree, cannot address a process it did not spawn, and cannot run one elevated. This crate covers those, with one API across Linux, macOS, and Windows, a `tokio` mirror behind a feature flag, and identities that can be written to disk and restored after a restart (`serde` feature).
 
-On Linux, cosca needs `openat2` (kernel 5.6 or newer, and not blocked by a seccomp filter): it reads `/proc` only through a checked directory fd. Without it a spawn, or a by-pid identity read, fails with `Error::Unsupported` saying so.
+On Linux, cosca needs `openat2` (kernel 5.6 or newer, and not blocked by a seccomp filter): it reads `/proc` only through a checked directory fd. Without it a by-pid identity read fails with `Error::Unsupported` saying so, and a spawn fails with that error inside `Error::MayHaveStarted`, since the child has already started when the spawn reads its identity.
 
 The API is not stable; expect breaking changes in any 0.x release.
 

@@ -37,7 +37,14 @@ fn a_failed_identity_peek_is_unknown_and_kills_and_reaps_the_child() {
     let outcome = cmd.spawn();
 
     drop(armed);
-    let err = outcome.expect_err("a failed identity peek fails the spawn");
+    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
+        outcome.expect_err("a failed identity peek fails the spawn"),
+    );
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the pidfd pins the child, so it is reaped"
+    );
     assert!(
         matches!(err, Error::Unassessable { .. }),
         "a failed peek is Unassessable, not a vanish: {err:?}"

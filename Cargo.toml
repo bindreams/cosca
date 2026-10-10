@@ -45,6 +45,9 @@ skuld = { version = "0.6.0", features = ["tokio"] }
 # Only tests/block_on_socket.rs: an integration test cannot reach the crate-private `SharedChild`,
 # and needs a deadline-bounded wait on a child it also kills from another handle.
 shared_child = { version = "1", features = ["timeout"] }
+# Pins at compile time that a spawn failure cannot be made from a plain error without its answer
+# (`src/child/spawn/failure_tests.rs`).
+static_assertions = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is

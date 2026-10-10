@@ -940,7 +940,7 @@ impl CgroupLeaf {
         if received.pid.is_none() {
             if let Some(pidfd) = received.pidfd.take() {
                 self.remove_holding_nothing();
-                crate::child::spawn::teardown_through_pidfd(None, pidfd);
+                crate::child::spawn::teardown_through_pidfd(None, pidfd, None);
                 return Abandoned::Ended;
             }
         }

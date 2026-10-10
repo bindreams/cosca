@@ -283,10 +283,10 @@ async fn drop_after_graceful_shutdown_tree_skips_at_debug_and_does_not_warn() {
     assert_skipped_at_debug(mark);
 }
 
-/// A failed elevated spawn's cleanup kills the tree, then kills the root and waits for its exit
-/// without reaping (`WNOWAIT`), so tokio's own drop reaps it. The root is still a zombie when the
-/// handle drops, its number is pinned, and the drop has nothing to skip or to warn about. Mutant:
-/// a skip decided on anything but the reaped root.
+/// A failed elevated spawn's cleanup kills the tree, then kills the root, waits for its exit and
+/// collects it, so that `Reaped` is true of the fate it reports. The handle then drops with its root
+/// reaped and its tree already killed: the drop skips the group kill, at `debug`, and warns of
+/// nothing. Mutant: a skip decided on anything but the reaped root.
 #[skuld::test]
 async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
     crate::tokio::test_runtime::assert_current_thread();
@@ -296,15 +296,21 @@ async fn a_failed_elevated_spawns_cleanup_drops_its_handle_without_a_warn() {
     let pid = child.id().pid();
 
     let mark = crate::log_capture::mark();
-    let err = crate::tokio::spawn::finish_elevated(
+    let (err, fate) = crate::tokio::spawn::finish_elevated(
         child,
         Err(crate::error::Error::Io(std::io::Error::other("no password"))),
     )
-    .expect_err("the password write failed");
+    .expect_err("the password write failed")
+    .expect_may_have_started_with();
 
     assert!(matches!(err, crate::error::Error::Elevation { .. }), "{err:?}");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Reaped,
+        "the group's kill and the root's reap"
+    );
     recorder.assert_killed_only(pid as i32);
-    assert_eq!(drop_warns_since(mark), []);
+    assert_skipped_at_debug(mark);
 }
 
 /// A `sleep` root, killed and then waited for, so that only `wait()` marks tokio's state.

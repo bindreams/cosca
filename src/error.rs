@@ -57,7 +57,8 @@ pub enum ElevationErrorKind {
     #[error("could not signal or stop an elevated child")]
     Unkillable,
     /// The elevated child launched, but the parent could not resolve its identity to
-    /// manage it. Whether it was terminated is reported in the error `detail`.
+    /// manage it. Whether it was terminated is reported in the error `detail`. A spawn returns it
+    /// inside [`Error::MayHaveStarted`].
     #[error("elevated child launched but could not be tracked")]
     Untracked,
     /// The composed elevation command exceeded this host's exec argument budget
@@ -176,11 +177,12 @@ pub enum Error {
     /// operation was not performed. Distinct from a failure of the operation: nothing is
     /// known to have gone wrong with the target — the caller was not allowed to look.
     ///
-    /// **A spawn that fails this way may have started the program.** On macOS an identity that
-    /// becomes unreadable after the program started leaves the child running (a warning names its
-    /// pid), so retrying may start a second instance. Elsewhere the child is torn down, unless its
-    /// kill is refused. The exception is a macOS child that could not read its own unique id: it is
-    /// stopped before `exec`, and the program did not start.
+    /// **From a spawn, this variant comes inside [`Error::MayHaveStarted`] when the program may have
+    /// started.** On macOS an identity that becomes unreadable after the program started leaves the
+    /// child running (a warning names its pid), so retrying may start a second instance. Elsewhere
+    /// the child is torn down, unless its kill is refused. A spawn returns it bare only for a macOS
+    /// child that could not read its own unique id: it is stopped before `exec`, and the program did
+    /// not start.
     ///
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
@@ -214,6 +216,103 @@ pub enum Error {
         #[source]
         source: Option<std::io::Error>,
     },
+    /// A spawn failed, and the program may have started: retrying it may run it twice. `source` is
+    /// what failed, and `fate` is what the failed spawn did with its child.
+    ///
+    /// Every error a spawn returns answers whether the program could have started, meaning the
+    /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded). This
+    /// variant says it may have. Any other variant from a spawn says it did not, and cosca has
+    /// proved it. Where cosca cannot prove it, the answer is this variant:
+    ///
+    /// - every failure after `exec`, such as an identity read, a containment attach, or a password
+    ///   write to the elevation backend;
+    /// - on Unix, a [`tokio::Command`](crate::tokio::Command) whose child failed between its first
+    ///   `pre_exec` hook and `exec` (a failed `exec`, `ENOENT` included, or a failed descriptor
+    ///   mapping), and on Windows, any failed spawn of one through `std`: tokio can fail a spawn after
+    ///   `std`'s succeeded, and the error does not say which of the two failed;
+    /// - on macOS, a child whose unique-id report was not yet written, or could not be read, when
+    ///   the spawn looked.
+    ///
+    /// `Command::output`, `status` and `read`, sync and tokio, return this variant for every
+    /// failure after their spawn succeeded. They tear the child down then, as its drop would (see
+    /// `kill_on_drop`), and the fate says what that did; `read`'s invalid UTF-8 comes after the exit
+    /// was collected (`Reaped`).
+    ///
+    /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
+    #[error("the program may have started, and {fate}{}: {source}", elevated_note(.fate, *.wrapper_elevated))]
+    MayHaveStarted {
+        fate: ChildFate,
+        /// Whether the child is an elevation backend (`sudo`, `doas`, `pkexec`, `osascript`), whose
+        /// elevated program is its own child and may outlive it: `fate` is then about the backend
+        /// only (see [`ChildFate`]), and the message says so.
+        wrapper_elevated: bool,
+        #[source]
+        source: Box<Error>,
+    },
+}
+
+/// What a spawn that failed after its program may have started did with its child: the `fate` of
+/// [`Error::MayHaveStarted`] (see [`Error::fate`]).
+///
+/// It is about the child cosca spawned. On a wrapper-elevated spawn that child is the backend
+/// (`sudo`, `doas`, `pkexec`, `osascript`), and the elevated program is its own child, which cosca
+/// never signals: `Reaped`, `Killed` and `Gone` say the backend is not running, not that the program
+/// is not. A front that had exited by itself is `Reaped` while the program it launched may still
+/// run. Descendants of a contained child are not covered either; the containment's own teardown is.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildFate {
+    /// cosca collected the child's exit: it killed the child, or found it had exited, and reaped it.
+    /// The child is not running; on a wrapper-elevated spawn, the elevated program may be (see the
+    /// type's doc).
+    Reaped,
+    /// The child is dead or dying, but cosca did not collect its exit: cosca's kill was delivered
+    /// (or the child had exited) and the wait for it failed, a Windows child was terminated and not
+    /// waited for, a dropped async child was signalled and left to tokio to collect, or a
+    /// containment teardown ended it. On a wrapper-elevated spawn, the elevated program may still
+    /// run.
+    Killed,
+    /// The child may still be running: cosca left it alone (an elevation front, which it never
+    /// signals, a child it could not show to be its own, or one `kill_on_drop(false)` keeps) or
+    /// could not kill it.
+    ///
+    /// `id` is its identity when the spawn had read one, and `None` when the failure came before
+    /// that read (an identity that could not be read, or a macOS report that never came). It is an
+    /// identity, not a pin: the child may exit and be reaped, and its pid reused. Check it before acting on it ([`ProcessId::is_alive`], or the
+    /// identity-checked kills of [`Process`](crate::Process)); never signal its number by itself.
+    ///
+    /// [`ProcessId::is_alive`]: crate::identity::ProcessId::is_alive
+    Running { id: Option<crate::identity::ProcessId> },
+    /// Someone else reaped the child, or its zombie is held by another process (on macOS, launchd
+    /// holds a tracer-orphaned child's zombie), so cosca could not collect it. The child is not
+    /// running; on a wrapper-elevated spawn, the elevated program may be (see the type's doc).
+    Gone,
+    /// cosca cannot say what became of the child.
+    Unknown,
+}
+
+impl std::fmt::Display for ChildFate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChildFate::Reaped => f.write_str("its child was reaped"),
+            ChildFate::Killed => f.write_str("its child was killed, its exit not collected"),
+            ChildFate::Running { id: Some(id) } => write!(f, "its child, pid {}, may still be running", id.pid()),
+            ChildFate::Running { id: None } => f.write_str("its child may still be running"),
+            ChildFate::Gone => f.write_str("its child had been reaped by someone else"),
+            ChildFate::Unknown => f.write_str("what became of its child is unknown"),
+        }
+    }
+}
+
+/// What [`Error::MayHaveStarted`] appends to the fate of an elevation backend: the elevated program
+/// behind it may still run, whenever the fate says the backend is not running.
+fn elevated_note(fate: &ChildFate, wrapper_elevated: bool) -> &'static str {
+    match fate {
+        ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone if wrapper_elevated => {
+            " (an elevated program behind it may still run)"
+        }
+        _ => "",
+    }
 }
 
 /// `source` with `context` prepended to its message and kept as the new error's
@@ -248,6 +347,47 @@ impl std::error::Error for IoContext {
 }
 
 impl Error {
+    /// What a failed spawn did with its child, for an error that says the program may have started
+    /// ([`Error::MayHaveStarted`]); `None` for any other error, including one that says the program
+    /// did not start.
+    ///
+    /// ```
+    /// use cosca::error::{ChildFate, Error};
+    ///
+    /// fn retry_is_safe(error: &Error) -> bool {
+    ///     match error.fate() {
+    ///         // The program did not start: running it again runs it once.
+    ///         None => true,
+    ///         // It may have run, or still be running.
+    ///         Some(ChildFate::Running { id: Some(id) }) => {
+    ///             eprintln!("pid {} may still be running", id.pid());
+    ///             false
+    ///         }
+    ///         Some(_) => false,
+    ///     }
+    /// }
+    ///
+    /// let mut cmd = cosca::Command::new();
+    /// cmd.args(["cosca-no-such-program"]);
+    /// let error = cmd.spawn().expect_err("no such program");
+    /// assert!(retry_is_safe(&error));
+    /// ```
+    pub fn fate(&self) -> Option<ChildFate> {
+        match self {
+            Error::MayHaveStarted { fate, .. } => Some(*fate),
+            _ => None,
+        }
+    }
+
+    /// The OS error code of an [`Error::Io`], for a look whose failure is told apart by it.
+    #[cfg(any(unix, feature = "tokio"))]
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Error::Io(e) => e.raw_os_error(),
+            _ => None,
+        }
+    }
+
     /// This error with `note` appended to what it says, its variant and kind kept: a caller that
     /// matches on the variant still sees the cause. An [`Error::Io`] keeps its kind, and its
     /// original error as the [`source`](std::error::Error::source), which keeps the OS code.
@@ -286,6 +426,15 @@ impl Error {
                 kind,
                 detail: append(detail),
                 source,
+            },
+            Error::MayHaveStarted {
+                fate,
+                wrapper_elevated,
+                source,
+            } => Error::MayHaveStarted {
+                fate,
+                wrapper_elevated,
+                source: Box::new(source.with_note(note)),
             },
             Error::Quote(e) => {
                 debug_assert!(

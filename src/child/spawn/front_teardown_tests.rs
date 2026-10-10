@@ -12,6 +12,7 @@ use crate::child::front_cgroup_tests::{move_out_of_its_leaf, pidfd_of, reaped};
 use crate::child::front_kill_tests::cat;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
+use crate::error::ChildFate;
 use crate::test_groups::{cgroup, Group};
 use crate::ContainMode;
 
@@ -74,6 +75,7 @@ fn sudo_front() -> Option<crate::elevation::front::Front> {
 #[skuld::test]
 fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgroup)] _group: &Group) {
     let (child, pid, _stdin) = contained_cat();
+    let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     child.attached.hard_kill().expect("cgroup.kill");
@@ -83,8 +85,9 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
         reaps: true,
         waited: Arc::clone(&waited),
     };
-    let fate = teardown_unadopted_or_front(front, sudo_front(), Some(&subtree));
+    let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
     assert_eq!(fate, FrontFate::Reaped);
+    assert_eq!(child_fate, ChildFate::Reaped);
     assert!(waited.load(Ordering::SeqCst));
     assert!(reaped(&observer), "the teardown reaps the front");
 }
@@ -94,6 +97,7 @@ fn cgroup_a_front_the_leaf_kill_reached_is_waited_for_and_reaped(#[fixture(cgrou
 #[skuld::test]
 fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &Group) {
     let (child, pid, _stdin) = contained_cat();
+    let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     move_out_of_its_leaf(pid);
@@ -104,8 +108,9 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
         reaps: false,
         waited: Arc::clone(&waited),
     };
-    let fate = teardown_unadopted_or_front(front, sudo_front(), Some(&subtree));
+    let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
     assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(child_fate, ChildFate::Running { id });
     assert!(
         !waited.load(Ordering::SeqCst),
         "a front outside the leaf is not waited for"
@@ -121,6 +126,7 @@ fn cgroup_a_front_outside_its_leaf_is_left_unwaited(#[fixture(cgroup)] _group: &
 #[skuld::test]
 fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _group: &Group) {
     let (child, pid, stdin) = contained_cat();
+    let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     {
@@ -133,8 +139,9 @@ fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _g
         reaps: false,
         waited: Arc::clone(&waited),
     };
-    let fate = teardown_unadopted_or_front(front, sudo_front(), Some(&subtree));
+    let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
     assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(child_fate, ChildFate::Running { id });
     assert!(
         !waited.load(Ordering::SeqCst),
         "a front no kill reached is not waited for"
@@ -155,6 +162,7 @@ fn cgroup_a_front_its_leaf_could_not_kill_is_left_unwaited(#[fixture(cgroup)] _g
 fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let (child, pid, stdin) = contained_cat();
+    let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     child.attached.hard_kill().expect("cgroup.kill");
@@ -165,11 +173,12 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
         waited: Arc::clone(&waited),
     };
     let mark = crate::log_capture::mark();
-    let fate = {
+    let (fate, child_fate) = {
         let _unreadable = crate::containment::cgroup::fault::fail_pidfd_info();
-        teardown_unadopted_or_front(front, sudo_front(), Some(&subtree))
+        teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree))
     };
     assert_eq!(fate, FrontFate::LeftUnreaped);
+    assert_eq!(child_fate, ChildFate::Unknown);
     assert!(!waited.load(Ordering::SeqCst), "an unplaced front is not waited for");
     let notes = crate::log_capture::records_since_on_current_thread(mark, "cgroup cannot be read");
     assert_eq!(notes.len(), 1, "{notes:?}");
@@ -189,6 +198,7 @@ fn cgroup_a_front_whose_place_cannot_be_read_is_left_unwaited(#[fixture(cgroup)]
 fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
     let (child, pid, stdin) = contained_cat();
+    let id = Some(child.id());
     let observer = pidfd_of(pid);
     let subtree = leaf_of(&child).subtree().expect("the leaf's subtree");
     child.attached.hard_kill().expect("cgroup.kill");
@@ -199,8 +209,9 @@ fn cgroup_a_front_the_leaf_kill_reached_whose_wait_fails_is_unaccounted_for(#[fi
         waited: Arc::clone(&waited),
     };
     let mark = crate::log_capture::mark();
-    let fate = teardown_unadopted_or_front(front, sudo_front(), Some(&subtree));
+    let (fate, child_fate) = teardown_unadopted_or_front(front, sudo_front(), id, Some(&subtree));
     assert_eq!(fate, FrontFate::Unaccounted);
+    assert_eq!(child_fate, ChildFate::Killed);
     assert!(waited.load(Ordering::SeqCst), "a front the kill reached is waited for");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "could not be reaped");
     assert_eq!(warns.len(), 1, "{warns:?}");

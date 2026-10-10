@@ -15,7 +15,14 @@ fn a_spawn_where_openat2_is_unavailable_is_unsupported_naming_it() {
         let err = cmd.spawn().err();
         drop(forced);
 
-        match err.expect("a spawn without openat2 must fail") {
+        let (err, fate) =
+            crate::child::spawn::failure::expect_may_have_started_with(err.expect("a spawn without openat2 must fail"));
+        assert_eq!(
+            fate,
+            crate::error::ChildFate::Reaped,
+            "{errno}: the pidfd pins the child, so it is reaped"
+        );
+        match err {
             Error::Unsupported { detail, platform, .. } => {
                 assert_eq!(platform, "linux");
                 assert_eq!(detail, crate::identity::openat2_refused_message(name), "{errno}");

@@ -4,8 +4,10 @@
 //! inheritance. In the library (not `tests/`) because the seam is `pub(crate)`/`#[cfg(test)]` and
 //! only reachable from within the crate. The batch gate's tests are in `spawn/batch_gate_tests.rs`.
 
+use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
 use crate::command::Command;
+use crate::error::ChildFate;
 use crate::error::Error;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
@@ -83,11 +85,12 @@ fn identity_failure_reaps_the_spawned_child() {
     let err = cmd.spawn().err();
     fault::set_force_identity_vanished(false);
 
-    let err = err.expect("forced identity-vanish must make spawn return Err");
+    let (err, fate) = expect_may_have_started_with(err.expect("forced identity-vanish must make spawn return Err"));
     assert!(
         matches!(err, Error::Io(_)),
         "identity-vanish surfaces as an Io error, got {err:?}"
     );
+    assert_eq!(fate, ChildFate::Reaped, "the teardown killed and reaped the child");
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
     teardown.assert_killed();
 }
@@ -104,8 +107,13 @@ fn identity_refusal_reaps_the_spawned_child() {
     let err = cmd.spawn().err();
     fault::set_force_identity_unknown(false);
 
-    let err = err.expect("a refused identity read must make spawn return Err");
+    let (err, fate) = expect_may_have_started_with(err.expect("a refused identity read must make spawn return Err"));
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the pidfd pins the child, so the teardown reaps it"
+    );
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
     teardown.assert_killed();
 }
@@ -118,7 +126,8 @@ fn attach_failure_reaps_the_spawned_child() {
     let err = cmd.spawn().err();
     fault::set_force_attach_failure(false);
 
-    let err = err.expect("forced attach failure must make spawn return Err");
+    let (err, fate) = expect_may_have_started_with(err.expect("forced attach failure must make spawn return Err"));
+    assert_eq!(fate, ChildFate::Reaped, "the teardown killed and reaped the child");
     assert!(
         matches!(err, Error::Containment { .. }),
         "a real attach failure surfaces as Error::Containment, got {err:?}"
@@ -267,6 +276,39 @@ fn a_child_the_teardown_cannot_kill_is_reaped_once_it_exits() {
     fault::assert_child_reaped(fault::take_captured().expect("seam captured the child's identity"));
 }
 
+/// A child whose teardown kill is refused (as a setuid child refuses it, `EPERM`) may still be
+/// running, and the error says so, naming it; it is reaped in the background once it exits.
+///
+/// Mutant: a refused kill reports the child reaped.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_child_whose_teardown_kill_is_refused_may_still_be_running() {
+    use crate::stdio::Stdio;
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(Stdio::pipe_in()).unwrap().stdout(Stdio::null()).unwrap();
+    let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+    fault::set_force_attach_failure(true);
+    fault::set_force_kill_failure_leaving_child_alive_as(
+        "cosca-kill-refused-142",
+        std::io::ErrorKind::PermissionDenied,
+    );
+    fault::set_background_reap_notifier(reaped_tx);
+    let err = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+    fault::set_force_attach_failure(false);
+    let Some(crate::identity::Resolved::Found(id)) = fault::take_captured() else {
+        panic!("the seam captured the child's identity");
+    };
+    let (_, fate) = expect_may_have_started_with(err);
+    // The attach comes after the identity read, so the child is named by it.
+    assert_eq!(fate, ChildFate::Running { id: Some(id) });
+    // The failed spawn closed the child's stdin, so it exits, and the background reap reports.
+    reaped_rx
+        .recv()
+        .expect("the reaper thread must report")
+        .expect("the background wait must succeed");
+}
+
 /// Force one teardown step to fail with each marker, once per teardown arm, and check the failure
 /// is consumed, logged, `debug_assert`ed in exactly the builds that keep it, and leaks no child.
 #[cfg(not(target_os = "macos"))]
@@ -379,7 +421,7 @@ fn elevated_pipe_is_rejected_deterministically_regardless_of_privilege() {
     c.stdout(crate::stdio::Stdio::pipe()).unwrap();
     assert!(matches!(
         super::spawn(&mut c),
-        Err(crate::error::Error::Unsupported { .. })
+        Err(super::SpawnFailure::NotStarted(crate::error::Error::Unsupported { .. }))
     ));
 }
 
@@ -509,7 +551,7 @@ fn a_refused_raw_spawn_does_not_clear_our_handle_inheritance() {
         .contain()
         .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0);
     observe::take_inheritance_cleared();
-    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    let err = expect_not_started(refused.spawn().expect_err("a reserved bit must be refused"));
     assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
     assert!(
         !observe::take_inheritance_cleared(),
@@ -542,7 +584,7 @@ fn a_raw_spawn_refusing_an_env_nul_does_not_clear_our_handle_inheritance() {
         .contain()
         .env("A\0B", "x");
     observe::take_inheritance_cleared();
-    let err = refused.spawn().expect_err("an embedded NUL must be refused");
+    let err = expect_not_started(refused.spawn().expect_err("an embedded NUL must be refused"));
     assert!(
         matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
         "got {err:?}"
@@ -574,7 +616,7 @@ fn a_refused_std_spawn_does_not_clear_our_handle_inheritance() {
         "this leg is only a std-path proof while the command stays off the raw backend"
     );
     observe::take_inheritance_cleared();
-    let err = refused.spawn().expect_err("a reserved bit must be refused");
+    let err = expect_not_started(refused.spawn().expect_err("a reserved bit must be refused"));
     assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
     assert!(
         !observe::take_inheritance_cleared(),
@@ -667,7 +709,10 @@ fn a_failed_password_write_kills_the_contained_tree() {
         detail: "forced password-write failure".into(),
     });
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, written).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, written)
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     assert!(
@@ -729,7 +774,10 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
 
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
     leaf_fault::take_drain_blocking_notifier();
     exiting.join().expect("the exiting thread");
@@ -767,7 +815,10 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     std::fs::remove_file(leaf_path.join("cgroup.kill")).expect("remove the fixture's cgroup.kill file");
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill a directory");
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
     assert!(
         matches!(
@@ -804,7 +855,10 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
     let pid = child.id().pid();
     fault::set_force_reap_failure("cosca-finish-elevated-reap-4c1e");
     let mark = crate::log_capture::mark();
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Killed, "killed, but not reaped");
 
     let Error::Elevation { detail, .. } = &err else {
         panic!("got {err:?}");
@@ -893,7 +947,10 @@ fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     let reaped = reaped(pid);
@@ -926,7 +983,10 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     let child = super::spawn_uncommitted(&mut cmd).expect("spawn");
     let pid = child.id().pid();
 
-    let err = super::finish_elevated(child, failed_write()).expect_err("a failed write fails the spawn");
+    let (err, fate) = super::finish_elevated(child, failed_write())
+        .expect_err("a failed write fails the spawn")
+        .expect_may_have_started_with();
+    assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
 
     assert!(reaped(pid), "the root was killed, so it must be reaped, got {err:?}");
@@ -952,7 +1012,13 @@ fn adopt_on_a_failed_handle_duplication_tears_the_child_down() {
     let err = cmd.spawn().err();
     drop(forced);
 
-    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    let (err, fate) = expect_may_have_started_with(err.expect("a failed adoption fails the spawn"));
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the handle still pins the process, so the teardown reaps it"
+    );
     fault::assert_child_reaped(fault::take_captured().expect("the failed adoption captured the child"));
     teardown.assert_killed();
 }
@@ -975,7 +1041,7 @@ fn a_refused_own_identity_read_is_unassessable_and_the_program_does_not_run() {
     let err = cmd.spawn().err();
     drop(forced);
 
-    match err.expect("a refused identity read must fail the spawn") {
+    match expect_not_started(err.expect("a refused identity read must fail the spawn")) {
         Error::Unassessable { detail, source } => {
             assert!(detail.contains("did not start"), "{detail}");
             assert_eq!(source.and_then(|e| e.raw_os_error()), Some(libc::EPERM));
@@ -1061,6 +1127,7 @@ fn macos_identity_gone_closes_our_pipe_ends() {
         || fault::set_force_identity_vanished(true),
         || fault::set_force_identity_vanished(false),
         false,
+        ChildFate::Gone,
     );
 }
 
@@ -1071,6 +1138,7 @@ fn macos_identity_unknown_closes_our_pipe_ends() {
         || fault::set_force_identity_unknown(true),
         || fault::set_force_identity_unknown(false),
         false,
+        ChildFate::Running { id: None },
     );
 }
 
@@ -1085,11 +1153,17 @@ fn macos_attach_failure_closes_our_pipe_ends() {
         || fault::set_force_attach_failure(true),
         || fault::set_force_attach_failure(false),
         false,
+        ChildFate::Reaped,
     );
 }
 
 #[cfg(target_os = "macos")]
-fn macos_failed_spawn_closes_our_pipe_ends(arm: impl FnOnce(), disarm: impl FnOnce(), tree_walk: bool) {
+fn macos_failed_spawn_closes_our_pipe_ends(
+    arm: impl FnOnce(),
+    disarm: impl FnOnce(),
+    tree_walk: bool,
+    expected: ChildFate,
+) {
     let mut cmd = Command::new();
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(crate::stdio::Stdio::pipe_in()).expect("piped stdin");
@@ -1103,7 +1177,9 @@ fn macos_failed_spawn_closes_our_pipe_ends(arm: impl FnOnce(), disarm: impl FnOn
     let _left = captured_child();
     drop(cmd);
 
-    assert!(err.is_some(), "the forced failure must fail the spawn");
+    // Each forced arm comes after `exec`.
+    let (_err, fate) = expect_may_have_started_with(err.expect("the forced failure must fail the spawn"));
+    assert_eq!(fate, expected);
     assert_eq!(open_fd_count(), before, "the failed spawn must close our pipe ends");
 }
 
@@ -1118,10 +1194,11 @@ fn finish_elevated_after_a_foreign_reap_does_not_claim_a_kill() {
     let child = cmd.spawn().expect("spawn");
     foreign_reap(&child, writer);
 
-    let detail = finish_elevated_detail(child);
+    let (detail, fate) = finish_elevated_detail_and_fate(child);
     assert!(detail.contains("could not be terminated"), "{detail}");
     assert!(detail.contains("it was already reaped"), "{detail}");
     assert!(!detail.contains("was killed"), "{detail}");
+    assert_eq!(fate, ChildFate::Gone, "reaped by someone else");
 }
 
 /// A process-group child that someone else reaped is never `killpg`ed by the failure teardown: its
@@ -1166,18 +1243,25 @@ fn foreign_reap(child: &crate::Child, writer: std::io::PipeWriter) {
 /// The `detail` of the error `finish_elevated` returns for `child` after a failed password write.
 #[cfg(unix)]
 fn finish_elevated_detail(child: crate::Child) -> String {
-    let err = super::finish_elevated(
+    finish_elevated_detail_and_fate(child).0
+}
+
+/// [`finish_elevated_detail`], and the fate the failure reports.
+#[cfg(unix)]
+fn finish_elevated_detail_and_fate(child: crate::Child) -> (String, ChildFate) {
+    let (err, fate) = super::finish_elevated(
         child,
         Err(Error::Elevation {
             kind: crate::error::ElevationErrorKind::AuthFailed,
             detail: "forced password-write failure".into(),
         }),
     )
-    .expect_err("the spawn fails");
+    .expect_err("the spawn fails")
+    .expect_may_have_started_with();
     let Error::Elevation { detail, .. } = err else {
         panic!("expected an Elevation error, got {err:?}");
     };
-    detail
+    (detail, fate)
 }
 
 /// macOS: an identity that is gone means someone else reaped the child, so its pid may be reused: a
@@ -1197,7 +1281,9 @@ fn macos_identity_gone_forgets_the_child_and_signals_nothing() {
     fault::set_force_identity_vanished(false);
     let left = captured_child();
 
-    assert!(matches!(err, Some(Error::Io(_))), "{err:?}");
+    let (err, fate) = expect_may_have_started_with(err.expect("a vanished identity fails the spawn"));
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(fate, ChildFate::Gone, "the check found it reaped by someone else");
     assert_left_alone(mark, "was reaped by someone else", &left);
 }
 
@@ -1216,7 +1302,10 @@ fn macos_identity_unknown_leaves_the_child_alone() {
     fault::set_force_identity_unknown(false);
     let left = captured_child();
 
-    assert!(matches!(err, Some(Error::Unassessable { .. })), "{err:?}");
+    let (err, fate) = expect_may_have_started_with(err.expect("a refused identity fails the spawn"));
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    // Its identity is what could not be read.
+    assert_eq!(fate, ChildFate::Running { id: None }, "left running, unreaped");
     assert_left_alone(mark, "cannot be shown to be ours", &left);
 }
 
@@ -1227,5 +1316,101 @@ fn spawn_pid_is_cleared_once_the_hook_has_run() {
     assert!(
         std::panic::catch_unwind(fault::spawn_pid).is_err(),
         "spawn_pid must panic outside a hook"
+    );
+}
+
+// Whether the program could have started =====
+
+/// A bare program name no `PATH` holds.
+const MISSING_PROGRAM: &str = "cosca-no-such-program-142";
+
+/// A program that cannot be executed fails the spawn before it could start: std collected the
+/// child whose `exec` failed.
+///
+/// Mutant: a failed `std` spawn answers that the program may have started.
+#[skuld::test]
+fn a_failed_exec_did_not_start_the_program() {
+    let mut cmd = Command::new();
+    cmd.args([MISSING_PROGRAM]);
+    let err = expect_not_started(cmd.spawn().expect_err("a missing program fails the spawn"));
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+        "{err:?}"
+    );
+}
+
+/// A refusal before the fork, here of a merge into a merge, did not start the program.
+///
+/// Mutant: stdio resolution answers that the program may have started.
+#[skuld::test]
+fn a_refused_stdio_setup_did_not_start_the_program() {
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdout(crate::stdio::Stdio::merge(crate::stdio::Fd::STDERR))
+        .expect("stdout");
+    cmd.stderr(crate::stdio::Stdio::merge(crate::stdio::Fd::STDOUT))
+        .expect("stderr");
+    let err = expect_not_started(cmd.spawn().expect_err("a merge into a merge is refused"));
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+/// `output`, `status` and `read` answer like `spawn` for a failed spawn, and say the program may
+/// have started for any failure after it: here `read`'s invalid UTF-8.
+///
+/// Mutant: a failure after the spawn returns its cause bare.
+#[cfg(unix)]
+#[skuld::test]
+fn run_to_completion_failures_after_the_spawn_may_have_started() {
+    let mut missing = Command::new();
+    missing.args([MISSING_PROGRAM]);
+    expect_not_started(missing.read().expect_err("a missing program fails"));
+    expect_not_started(missing.output().expect_err("a missing program fails"));
+    expect_not_started(missing.status().expect_err("a missing program fails"));
+
+    let mut cmd = Command::new();
+    cmd.args(["printf", "\\377"]);
+    let (err, fate) = expect_may_have_started_with(cmd.read().expect_err("invalid UTF-8 fails `read`"));
+    assert_eq!(fate, ChildFate::Reaped, "`read` collected the exit");
+    assert!(
+        matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+        "{err:?}"
+    );
+}
+
+/// A command with no program is refused before anything is made.
+///
+/// Mutant: building the `std` command answers that the program may have started.
+#[skuld::test]
+fn a_command_with_no_program_did_not_start() {
+    let err = expect_not_started(Command::new().spawn().expect_err("no program, no spawn"));
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+}
+
+/// An elevated spawn its backend cannot express is refused before any backend runs.
+///
+/// Mutant: the elevation rewrite answers that the program may have started.
+#[cfg(unix)]
+#[skuld::test]
+fn an_elevation_refused_for_its_shape_did_not_start() {
+    let mut cmd = Command::new();
+    cmd.args(["/bin/sh", "-c", "true"]).elevate();
+    cmd.fd(3, crate::stdio::Stdio::null()).expect("fd 3");
+    let err = expect_not_started(cmd.spawn().expect_err("fd >= 3 is refused under elevation"));
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+/// Linux: a pidfd handshake whose channel cannot be made fails before the fork.
+///
+/// Mutant: the handshake's `open` answers that the program may have started.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_handshake_that_cannot_open_did_not_start() {
+    let _armed = super::pidfd_handshake::fault::fail_done_fd(rustix::io::Errno::MFILE);
+    let mut cmd = Command::new();
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
+    assert!(
+        matches!(err, Error::Io(ref e) if e.to_string() == format!("eventfd: {}", std::io::Error::from_raw_os_error(libc::EMFILE))),
+        "{err:?}"
     );
 }

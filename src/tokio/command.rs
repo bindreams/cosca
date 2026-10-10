@@ -214,8 +214,14 @@ impl Command {
     /// ends.
     ///
     /// [`Containment::CgroupV2`]: crate::Containment::CgroupV2
+    ///
+    /// # Errors
+    ///
+    /// Every error says whether the program could have started, as the sync
+    /// [`Command::spawn`](SyncCommand::spawn)'s does. Unlike it, a failed `exec` is
+    /// [`Error::MayHaveStarted`] here (see its list).
     pub fn spawn(&mut self) -> Result<Child, Error> {
-        super::spawn::spawn(&mut self.inner)
+        Ok(super::spawn::spawn(&mut self.inner)?)
     }
 
     /// The sync [`Command`](SyncCommand)'s `set_elevation_front`, for tests.
@@ -225,33 +231,52 @@ impl Command {
     }
 
     /// Run to completion with inherited stdio, returning the exit status.
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn status(&mut self) -> Result<std::process::ExitStatus, Error> {
         self.inner.stdin(Stdio::inherit())?;
         self.inner.stdout(Stdio::inherit())?;
         self.inner.stderr(Stdio::inherit())?;
         let mut child = self.spawn()?;
-        child.wait().await
+        match child.wait().await {
+            Ok(status) => Ok(status),
+            Err(e) => Err(after_the_spawn(e, &mut child)),
+        }
     }
 
     /// Run to completion, capturing stdout and stderr (stdin is `/dev/null`).
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn output(&mut self) -> Result<crate::Output, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
         self.inner.stderr(Stdio::pipe())?;
         let mut child = self.spawn()?;
-        child.communicate(None).await
+        match child.communicate(None).await {
+            Ok(output) => Ok(output),
+            Err(e) => Err(after_the_spawn(e, &mut child)),
+        }
     }
 
     /// Run to completion, capturing stdout as a UTF-8 string (stdin is `/dev/null`).
-    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does.
+    /// Spawns as [`spawn`](Self::spawn) does, blocking under elevation as it does. Fails as `spawn`
+    /// does, and with [`Error::MayHaveStarted`] after it.
     pub async fn read(&mut self) -> Result<String, Error> {
         self.inner.stdin(Stdio::null())?;
         self.inner.stdout(Stdio::pipe())?;
         let mut child = self.spawn()?;
-        let out = child.communicate(None).await?;
-        String::from_utf8(out.stdout).map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+        let out = match child.communicate(None).await {
+            Ok(out) => out,
+            Err(e) => return Err(after_the_spawn(e, &mut child)),
+        };
+        // `communicate` collected the exit.
+        String::from_utf8(out.stdout).map_err(|e| {
+            crate::child::spawn::after_the_spawn(
+                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                crate::error::ChildFate::Reaped,
+                child.behind_wrapper(),
+            )
+        })
     }
 
     /// Test-only spawn variant that installs a per-instance wait observer on the resulting raw
@@ -268,6 +293,13 @@ impl Command {
         child.install_wait_observer(started, outcome);
         Ok(child)
     }
+}
+
+/// The error of a run-to-completion helper that failed after its spawn: the program may have
+/// started, and `child` is torn down now as its drop would, which says what became of it.
+fn after_the_spawn(error: Error, child: &mut Child) -> Error {
+    let fate = child.tear_down_now();
+    crate::child::spawn::after_the_spawn(error, fate, child.behind_wrapper())
 }
 
 #[cfg(test)]

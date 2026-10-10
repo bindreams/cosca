@@ -19,7 +19,9 @@ use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAI
 use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, STARTF_USESTDHANDLES, STARTUPINFOEXW};
 
 use crate::child::spawn::windows_raw as sync_raw;
-use crate::child::spawn::{attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock};
+use crate::child::spawn::{
+    attach_or_fault, dup, resolve_identity, resolve_non_merge, spawn_lock, Classify, SpawnFailure,
+};
 use crate::command::Command;
 use crate::error::Error;
 use crate::stdio::{Fd, ResolvedStdio};
@@ -227,23 +229,30 @@ struct WaitObserver {
 /// Spawn `cmd` via the async raw backend: an `executable()` loaded independently of argv[0], with
 /// arbitrary descriptors (fd >= 3) and containment — the full sync feature set. Reuses the sync
 /// backend's FFI (fd-table + HANDLE_LIST + containment decision + lock/close + error-teardown).
-pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
+///
+/// Everything up to `CreateProcessW` fails before the program could start; everything after may
+/// come after it started.
+pub(crate) fn spawn_raw(
+    cmd: &Command,
+    fds: BTreeMap<Fd, ResolvedStdio>,
+    kill_on_drop: bool,
+) -> Result<Child, SpawnFailure> {
     // Batch reject on the program token, resolve the executable, NUL-check, build the command line
     // — all shared verbatim with the sync raw backend.
-    sync_raw::reject_batch_program(cmd)?;
-    let spawn_env = sync_raw::spawn_env(cmd)?;
+    sync_raw::reject_batch_program(cmd).not_started()?;
+    let spawn_env = sync_raw::spawn_env(cmd).not_started()?;
     // THE SAME function the sync raw backend uses, not a mirror of it — the `raw_executable()`
     // contract must not depend on which API you spawned through, and a copy here could drift.
-    let sync_raw::Target { image, cwd } = sync_raw::target(cmd, &spawn_env)?;
+    let sync_raw::Target { image, cwd } = sync_raw::target(cmd, &spawn_env).not_started()?;
     if let Some(p) = &image {
         sync_raw::resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
-    let mut cmdline = sync_raw::raw_program_and_line(cmd)?; // each token NUL-checked
+    let mut cmdline = sync_raw::raw_program_and_line(cmd).not_started()?; // each token NUL-checked
     cmdline.push(0);
     // Ordered after `raw_program_and_line` for the same reason as the sync backend — see its
     // comment: that call names which no-program mistake the caller made, this one is the backstop
     // that keeps a NULL `lpApplicationName` unrepresentable.
-    let app_name: Vec<u16> = sync_raw::app_name_wide(image.as_deref())?;
+    let app_name: Vec<u16> = sync_raw::app_name_wide(image.as_deref()).not_started()?;
 
     // Containment: mirror the sync raw backend's pre-spawn decision. Uncontained keeps the defaults
     // (flags 0, `mode: None`/`is_root: false`); a Strongest root spawns CREATE_SUSPENDED and is
@@ -257,7 +266,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         *cmd.flags_request(),
         spawn_env.is_root,
         crate::command::flags::SpawnBackend::Raw,
-    )?;
+    )
+    .not_started()?;
     debug_assert_eq!(plan.marker_env, spawn_env.marker_env, "the marker decision drifted");
     if req.mode.is_some() {
         crate::containment::windows::clear_std_handle_inheritance();
@@ -266,17 +276,17 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let cwd_w = Some(sync_raw::to_wide_nul(cwd.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating any pipes.
-    sync_raw::ensure_fd_table_fits(&fds)?;
+    sync_raw::ensure_fd_table_fits(&fds).not_started()?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3 to child handles: piped slots via the
     // tokio overlapped-pipe machinery (we own the async parent ends — std slots via the
     // stdin/stdout/stderr accessors, fd >= 3 via fd_read_end/fd_write_end), merges as dups, the rest
     // (inherit/file/null) via the shared core (which rejects inherit on fd >= 3).
-    let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds)?;
+    let (child_ends, owned_std, fd_pipes) = resolve_raw_ends(&fds).not_started()?;
 
     // Classify + encode the dense MSVCRT fd-table the child CRT reads back from `lpReserved2` — the
     // SAME layout + single HANDLE_LIST source as the sync backend.
-    let table = sync_raw::build_fd_table(&child_ends)?;
+    let table = sync_raw::build_fd_table(&child_ends).not_started()?;
 
     // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
     // the child CRT recovers fd >= 3; the HANDLE_LIST (`table.handles`) scopes inheritance AND backs
@@ -291,7 +301,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup (its
     // 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
     let all_handles: &[HANDLE] = &table.handles;
-    let attr = AttributeList::build(all_handles)?;
+    let attr = AttributeList::build(all_handles).not_started()?;
     si.lpAttributeList = attr.as_ptr();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
@@ -317,7 +327,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         drop(attr); // DeleteProcThreadAttributeList before the guard releases
         r
     };
-    let (proc, pid) = spawned?;
+    let (proc, pid) = spawned.not_started()?;
 
     // Identity read + attach BEFORE building `Child`, with the REAL mode + is_root (Job Object for a
     // Strongest root, else TreeWalk/Delegated), and the SAME kill+reap error-teardown as the
@@ -339,15 +349,19 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     ) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // The read failed, so no identity is known.
+            let fate = sync_raw::raw_spawn_teardown(proc, pid, None);
+            return Err(SpawnFailure::started(
+                crate::child::spawn::spawn_identity_error(other),
+                fate,
+            ));
         }
     };
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            sync_raw::raw_spawn_teardown(proc, pid);
-            return Err(e);
+            let fate = sync_raw::raw_spawn_teardown(proc, pid, Some(id));
+            return Err(SpawnFailure::started(e, fate));
         }
     };
 

@@ -20,6 +20,8 @@ use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::{Sent, Sig};
 use crate::stdio::Fd;
+#[cfg(unix)]
+use proc_source::Ownership;
 
 /// Parent ends of fd >= 3 pipes, keyed by descriptor. Unix stashes the raw sync `ParentEnd`
 /// (converted to a reactor pipe at take time); Windows stashes the already-registered overlapped
@@ -67,7 +69,17 @@ impl OsResources {
     /// cannot tell for a reuse in the same tick. `false` when this handle reaped it itself.
     #[cfg(unix)]
     pub(crate) fn root_reaped_elsewhere(&self, own_reap: bool) -> bool {
-        !own_reap && self.proc.as_ref().is_some_and(ProcSource::reaped_elsewhere)
+        self.root_not_ours(own_reap).is_some()
+    }
+
+    /// [`root_reaped_elsewhere`](OsResources::root_reaped_elsewhere), answering which: `Foreign`
+    /// (reaped by someone else) or `Unknown` (the handle cannot say). `None` when it is ours.
+    #[cfg(unix)]
+    pub(crate) fn root_not_ours(&self, own_reap: bool) -> Option<Ownership> {
+        if own_reap {
+            return None;
+        }
+        self.proc.as_ref().and_then(ProcSource::not_ours)
     }
 
     /// Give up every resource, in declaration order, without waiting for anything.
@@ -233,6 +245,16 @@ impl Child {
             self.os.proc.as_ref().map_or(Ok(false), ProcSource::is_running)
         })
     }
+    /// Is this child an elevation backend, whose elevated program may outlive it?
+    pub(crate) fn behind_wrapper(&self) -> bool {
+        #[cfg(test)]
+        if crate::child::spawn::failure::seams::wrapper() {
+            return true;
+        }
+        self.elevation
+            .as_ref()
+            .is_some_and(|report| report.via.program_outlives_child())
+    }
     /// Is this a wrapper-elevated child a plain parent may be unable to signal?
     /// (`AlreadyElevated` is an ordinary child of an already-root parent — killable.)
     fn is_elevated_wrapper(&self) -> bool {
@@ -252,10 +274,24 @@ impl Child {
     ///
     /// Unix-only: the Windows elevation arm builds its child in-module with no deferred password.
     #[cfg(unix)]
-    pub(super) fn wait_and_reap_blocking(&mut self) {
+    ///
+    /// Answers what the wait found, for a caller whose kill was delivered: the collected exit
+    /// (`Reaped`), or, for a child it could not show to be ours, which is forgotten, `Killed`.
+    pub(super) fn wait_and_reap_blocking(&mut self) -> crate::error::ChildFate {
         let pid = self.id.pid();
-        if self.proc_mut().wait_and_reap(pid) == Waited::Foreign {
-            self.proc_mut().forget_foreign();
+        match self.proc_mut().wait_and_reap(pid) {
+            Waited::Exited => {
+                let id = Some(self.id);
+                self.proc_mut().collect_exit(id)
+            }
+            Waited::Foreign => {
+                self.proc_mut().forget_as("was reaped by someone else", true);
+                crate::error::ChildFate::Killed
+            }
+            Waited::Unverified => {
+                self.proc_mut().forget_foreign();
+                crate::error::ChildFate::Killed
+            }
         }
     }
 
@@ -533,6 +569,10 @@ impl Child {
     /// instant once (`let deadline = tokio::time::Instant::now() + d;`) and use
     /// `tokio::time::timeout_at(deadline, child.wait())`, not a duration re-derived later.
     pub async fn wait(&mut self) -> Result<ExitStatus, Error> {
+        #[cfg(test)]
+        if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
+            return Err(error);
+        }
         self.proc_mut().wait().await
     }
     /// Exit status if the child has already exited (non-blocking).
@@ -604,11 +644,12 @@ impl Child {
             }
             Err(Error::Io(e)) => Err(crate::elevation::map_elevated_kill_error(e, self.is_elevated_wrapper())),
             Err(other) => Err(other),
-            Ok(Sent::Gone) => {
-                // Gone on evidence of a foreign reap: tokio's wait and drop reap by pid, so forget.
+            Ok(unsent @ (Sent::Gone | Sent::Unverified)) => {
+                // Nothing was sent. A child not shown ours is forgotten: tokio's wait and drop
+                // reap by pid.
                 #[cfg(unix)]
                 self.proc_mut().forget_if_foreign();
-                Ok(Sent::Gone)
+                Ok(unsent)
             }
             Ok(delivered) => Ok(delivered),
         }
@@ -938,6 +979,10 @@ mod windows_signal_tests;
 #[path = "child/bypass_drop_tests.rs"]
 mod bypass_drop_tests;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "child/drop_fate_tests.rs"]
+mod drop_fate_tests;
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/macos_kill_tests.rs"]
 mod macos_kill_tests;
@@ -1036,58 +1081,117 @@ impl Child {
 /// [tokio#4301]: https://github.com/tokio-rs/tokio/issues/4301
 impl Drop for Child {
     fn drop(&mut self) {
+        _ = self.tear_down();
+    }
+}
+
+impl Child {
+    /// What [`Drop`] does, now, and what it did with the child; the drop then does nothing more. For
+    /// the run-to-completion helpers, which fail after the spawn and must say what became of the
+    /// child.
+    pub(crate) fn tear_down_now(&mut self) -> crate::error::ChildFate {
+        let fate = self.tear_down();
+        self.kill_on_drop = false;
+        fate
+    }
+
+    /// The drop's teardown: signal (when armed) and release, never wait. Answers what became of the
+    /// child. A second call finds the resources already taken, and does nothing.
+    fn tear_down(&mut self) -> crate::error::ChildFate {
+        use crate::error::ChildFate;
         // Enforced in debug builds: nothing below may wait for an exit or a drain. Declared before
         // `os`, so a panic in the signals unwinds through the resources while still inside it.
         let _bounded = crate::bounded::Section::enter();
         let mut os = std::mem::take(&mut self.os);
         // Read before the `kill_on_drop` branch: a disarmed drop signals nothing, but releasing
         // tokio's `Child` still `try_wait`s the root's number, so it needs the same evidence.
-        #[cfg(unix)]
         let own_reap = os.proc.as_ref().is_none_or(|proc| proc.is_reaped());
+        // What an earlier forgetting recorded of a backend that no longer holds the child.
         #[cfg(unix)]
-        let view = {
+        let forgotten = os.proc.as_ref().and_then(|proc| proc.forgotten_fate(Some(self.id)));
+        #[cfg(unix)]
+        let (view, proven_reaped, unproven) = {
             let mut view = crate::containment::DropView::read(self.id, own_reap, &self.tree_killed);
-            view.root_reaped |= os.root_reaped_elsewhere(own_reap);
-            view
+            // The number no longer reading as this root is proof of a reap; a handle that merely
+            // cannot say is not.
+            let by_token = view.root_reaped;
+            let not_ours = os.root_not_ours(own_reap);
+            view.root_reaped |= not_ours.is_some();
+            let proven = by_token || not_ours == Some(Ownership::Foreign);
+            (view, proven, !proven && not_ours == Some(Ownership::Unknown))
         };
-        if self.kill_on_drop {
+        let left = ChildFate::Running { id: Some(self.id) };
+        #[cfg_attr(not(unix), allow(unused_mut, reason = "only the Unix reap checks revise it"))]
+        let mut fate = if self.kill_on_drop {
             // A live elevation front gets no signal of its own: outside a cgroup it is left running,
             // and named.
             #[cfg(unix)]
-            match kill_gate(self.front, &os, self.id.pid()) {
+            let fate = match kill_gate(self.front, &os, self.id.pid()) {
                 crate::elevation::front::Gate::Closed(unkillable) => {
                     log::warn!(
                         "Child::drop: elevation front pid {}: {unkillable}; the front is killed through its cgroup if \
                          it is still in it; cosca does not wait for it, and tokio reaps it once it exits",
                         self.id.pid()
                     );
+                    left
                 }
                 gate => signal_on_drop(
                     self.id,
                     view,
+                    unproven,
                     matches!(gate, crate::elevation::front::Gate::CgroupOnly)
                         .then_some(self.front)
                         .flatten(),
                     &mut os,
                 ),
-            }
+            };
             #[cfg(not(unix))]
-            signal_on_drop(self.id, &self.tree_killed, &mut os);
-        }
+            let fate = signal_on_drop(self.id, &self.tree_killed, &mut os);
+            fate
+        } else {
+            left
+        };
         // A reap outside this handle (tokio's state cannot see it) leaves the number possibly
         // naming another child, so tokio's `Child` must not run its own drop, which reaps by pid.
+        // A child the handle cannot show ours is forgotten the same way, and stays possibly running.
         #[cfg(unix)]
-        // Asked again: a reap can land after the read above (and before or during the root kill).
-        if !own_reap && (view.root_reaped || os.root_reaped_elsewhere(own_reap)) {
-            if let Some(proc) = os.proc.as_mut() {
-                proc.forget_foreign();
-                log::debug!(
-                    "async child {} was reaped outside its handle; dropping it would reap by that number, so it was forgotten",
-                    self.id.pid()
-                );
+        if !own_reap {
+            // Asked again: a reap can land after the read above (and before or during the root kill).
+            let again = if view.root_reaped {
+                None
+            } else {
+                os.proc.as_ref().and_then(ProcSource::not_ours)
+            };
+            if view.root_reaped || again.is_some() {
+                let proven = proven_reaped || again == Some(Ownership::Foreign);
+                if let Some(proc) = os.proc.as_mut() {
+                    proc.forget_as("was reaped by someone else, or cannot be shown to be ours", proven);
+                    log::debug!(
+                        "async child {} was reaped outside its handle, or cannot be shown to be ours; dropping it would reap by that number, so it was forgotten",
+                        self.id.pid()
+                    );
+                }
+                // Reaped elsewhere before the kill could reach it; one it reached stays killed. A
+                // child not shown ours is not claimed reaped.
+                if proven && fate != ChildFate::Killed {
+                    fate = ChildFate::Gone;
+                }
+            }
+        }
+        // A backend forgotten earlier says why: a status collected by this handle is `Reaped`, and
+        // nothing else is. This holds whether or not the drop is armed.
+        if own_reap {
+            #[cfg(unix)]
+            {
+                fate = forgotten.unwrap_or(ChildFate::Reaped);
+            }
+            #[cfg(not(unix))]
+            {
+                fate = ChildFate::Reaped;
             }
         }
         os.release_without_waiting();
+        fate
     }
 }
 
@@ -1135,10 +1239,14 @@ fn cgroup_kill_reached(front: Option<crate::elevation::front::Front>, os: &OsRes
 fn signal_on_drop(
     id: ProcessId,
     #[cfg(unix)] view: crate::containment::DropView,
+    // Whether the root's reap is only suspected: the handle could not show the child ours, and
+    // nothing proves someone else reaped it.
+    #[cfg(unix)] unproven: bool,
     #[cfg(unix)] cgroup_front: Option<crate::elevation::front::Front>,
     #[cfg(not(unix))] tree_killed: &crate::containment::TreeKilled,
     os: &mut OsResources,
-) {
+) -> crate::error::ChildFate {
+    use crate::error::ChildFate;
     let pid = id.pid();
     // Tree teardown — the SOLE coverage for descendants (the root's own kill below reaches only
     // the root); a no-op for an uncontained child.
@@ -1167,32 +1275,41 @@ fn signal_on_drop(
             log::warn!("Child::drop: the root is killed regardless, so its descendants may be orphaned");
         }
     }
-    // Already reaped: no signal to issue.
+    // Already reaped: no signal to issue. The caller tells its own reap from a foreign one.
     #[cfg(unix)]
     if view.root_reaped {
-        return;
+        return if unproven {
+            ChildFate::Running { id: Some(id) }
+        } else {
+            ChildFate::Gone
+        };
     }
     #[cfg(not(unix))]
     if os.proc.as_ref().is_none_or(|proc| proc.is_reaped()) {
-        return;
+        return ChildFate::Reaped;
     }
     // The cgroup kill ended the front, and tokio reaps it. One the kill did not end may still have
     // its program running, and a kill of the front would orphan it.
     #[cfg(unix)]
     if let Some(front) = cgroup_front {
-        if let Err(e) = tree.and_then(|()| cgroup_kill_reached(Some(front), os, pid)) {
-            // The leaf's release still writes `cgroup.kill`, which ends the front if it is in the
-            // leaf; nothing waits to see.
-            log::warn!(
+        return match tree.and_then(|()| cgroup_kill_reached(Some(front), os, pid)) {
+            // Ended by the cgroup kill, and left to tokio to collect.
+            Ok(()) => ChildFate::Killed,
+            Err(e) => {
+                // The leaf's release still writes `cgroup.kill`, which ends the front if it is in the
+                // leaf; nothing waits to see.
+                log::warn!(
                 "Child::drop: elevation front pid {pid}: its cgroup kill is not shown to have reached it ({e}); the \
                  front is killed through its cgroup if it is still in it; cosca does not wait for it, and tokio reaps it once it \
                  exits"
             );
-        }
-        return;
+                // Not shown to be dead: it may still be running.
+                ChildFate::Running { id: Some(id) }
+            }
+        };
     }
     let Some(proc) = os.proc.as_mut() else {
-        return;
+        return ChildFate::Unknown;
     };
     #[cfg(all(test, unix))]
     drop_fault::note_root_kill();
@@ -1211,18 +1328,34 @@ fn signal_on_drop(
     let killed = proc.signal(Sig::Kill);
     // Nothing was delivered because the child is gone (reaped by someone else, and its pid
     // possibly reused): the pid names nothing of ours to wait for.
+    // `Unverified`: nothing was sent because the pid cannot be verified (a backend forgotten without
+    // proof of a foreign reap, whose `not_ours` is `None`), so the child may be running.
     // Nothing is logged here: the drop forgets the child next, and logs that.
-    if matches!(killed, Ok(Sent::Gone)) {
-        return;
+    match killed {
+        Ok(Sent::Gone) => return ChildFate::Gone,
+        Ok(Sent::Unverified) => return ChildFate::Running { id: Some(id) },
+        _ => {}
     }
     if killed.is_err() {
         // The `try_wait` below reaps by pid: forget a foreign reap first.
         #[cfg(unix)]
-        proc.forget_if_foreign();
-        if !proc.is_reaped() && !matches!(proc.try_wait(), Ok(Some(_))) {
+        let forgotten = proc.forget_unless_ours(Some(id));
+        #[cfg(not(unix))]
+        let forgotten: Option<ChildFate> = None;
+        if let Some(fate) = forgotten {
+            return fate;
+        }
+        if proc.is_reaped() {
+            return ChildFate::Reaped;
+        }
+        let looked = proc.try_wait();
+        if !matches!(looked, Ok(Some(_))) {
             log::warn!("async child {pid} could not be terminated on drop; leaving it running");
         }
+        return crate::child::spawn::fate_of_a_look(looked.map_err(|e| e.raw_os_error()), Some(id));
     }
+    // Signalled, and left to tokio to collect.
+    ChildFate::Killed
 }
 
 /// Re-encodes a `waitid` result as a raw `wait` status.

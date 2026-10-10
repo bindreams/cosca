@@ -220,6 +220,25 @@ async fn wait_and_reap_of_a_child_reaped_behind_the_owner_is_foreign() {
     proc.forget_foreign();
 }
 
+/// A teardown of a child reaped behind its owner's back says it is gone, and collects nothing.
+///
+/// Mutant: the teardown says `Killed` or `Reaped`, or reaps by the number.
+#[cfg(unix)]
+#[skuld::test]
+async fn reap_now_of_a_child_reaped_behind_the_owner_is_gone() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let reaps = crate::child::spawn::fault::record_teardown_reaps();
+    let child = spawn_a_tokio_child_that_exits();
+    let pid = child.id().expect("tokio owns an un-reaped child");
+    let proc = proc_source(child);
+    reap_behind_the_owner(pid);
+
+    let fate = proc.reap_now(pid, None);
+
+    assert_eq!(fate, crate::error::ChildFate::Gone);
+    assert_eq!(reaps.recorded(), vec![], "no exit was observed, so no reap is recorded");
+}
+
 /// A reaped-behind-its-back child the backend has been told to forget: `Foreign` warns once, naming
 /// the pid and what it leaks, and the backend reports itself reaped.
 #[cfg(unix)]
@@ -391,7 +410,7 @@ async fn wait_closes_the_untaken_stdin_first() {
     };
     let closed = stdin.is_none();
     assert!(!proc.is_reaped(), "the one poll finished the wait");
-    proc.reap_now(pid); // the test's own `cat`: end it whatever happened
+    proc.reap_now(pid, None); // the test's own `cat`: end it whatever happened
     drop(held_writer);
     assert!(closed, "wait must close stdin before it waits");
 }
@@ -478,9 +497,14 @@ async fn wait_and_reap_blocking_forgets_a_foreign_reaped_child() {
     let mut child = spawn_cosca_child_that_exits();
     reap_behind_the_owner(child.id().pid());
 
-    child.wait_and_reap_blocking();
+    let fate = child.wait_and_reap_blocking();
 
     assert!(child.proc_mut().is_reaped(), "a foreign-reaped child must be forgotten");
+    assert_eq!(
+        fate,
+        crate::error::ChildFate::Killed,
+        "the caller's kill was delivered; the exit was collected by someone else"
+    );
 }
 
 /// `kill` that finds the child gone forgets a foreign reap, so a later drop or wait cannot reap
@@ -618,12 +642,60 @@ async fn macos_forget_if_foreign_on_a_failed_peek_forgets() {
 /// Mutant: `wait_and_reap` peeks by pid when there is no id.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_with_no_unique_id_is_foreign() {
+async fn macos_wait_and_reap_with_no_unique_id_is_unverified() {
     let (mut proc, pid) = exited_unreaped_with(|_| None);
 
-    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    assert_eq!(proc.wait_and_reap(pid), Waited::Unverified);
 
     proc.forget_foreign();
+    reap_behind_the_owner(pid);
+}
+
+/// A teardown of a child that cannot be verified (no unique id) neither signals nor waits on it, and
+/// says it may be running, with the identity the spawn had read.
+///
+/// Mutant: the teardown says `Gone` or `Killed` for a child it signalled nothing.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_reap_now_with_no_unique_id_leaves_the_child_running() {
+    let (proc, pid) = exited_unreaped_with(|_| None);
+    let id = crate::identity::ProcessId::current();
+
+    let fate = proc.reap_now(pid, Some(id));
+
+    assert_eq!(fate, crate::error::ChildFate::Running { id: Some(id) });
+    reap_behind_the_owner(pid);
+}
+
+/// A teardown of a pid with another unique id is shown reaped elsewhere: `Gone`.
+///
+/// Mutant: the teardown says `Running` or `Killed` for a pid that is not the child.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_reap_now_with_another_unique_id_is_gone() {
+    let (proc, pid) = exited_unreaped_with(|real| Some(real ^ 1));
+
+    let fate = proc.reap_now(pid, None);
+
+    assert_eq!(fate, crate::error::ChildFate::Gone);
+    reap_behind_the_owner(pid);
+}
+
+/// A teardown of a zombie launchd holds (its tracer died) says it is gone: it has exited, and is not
+/// ours to reap.
+///
+/// Mutant: `Awaited::Orphaned` is `Unverified`, so the teardown says it may be running.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+async fn macos_reap_now_of_a_zombie_launchd_holds_is_gone() {
+    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::wait::exit_only::{Foreign, Peek};
+    let (proc, pid) = exited_unreaped_with(Some);
+    let _orphaned = force_peek_once(Ok(Peek::Foreign(Foreign::Orphaned)));
+
+    let fate = proc.reap_now(pid, None);
+
+    assert_eq!(fate, crate::error::ChildFate::Gone);
     reap_behind_the_owner(pid);
 }
 
@@ -657,7 +729,7 @@ async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_
 
     let err = cmd.spawn().err();
 
-    match err.expect("a refused identity read must fail the spawn") {
+    match crate::child::spawn::failure::expect_not_started(err.expect("a refused identity read must fail the spawn")) {
         crate::error::Error::Unassessable { detail, .. } => assert!(detail.contains("did not start"), "{detail}"),
         other => panic!("expected Unassessable, got {other:?}"),
     }
@@ -670,24 +742,24 @@ async fn macos_a_refused_own_identity_read_fails_the_spawn_and_the_program_does_
 /// Mutant: `wait_reapable` answers `Exited` on an error.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_on_a_failed_peek_is_foreign() {
+async fn macos_wait_and_reap_on_a_failed_peek_is_unverified() {
     use crate::wait::exit_only::seams::force_peek_once;
     let (mut proc, pid) = exited_unreaped_with(Some);
     let _failed = force_peek_once(Err(std::io::Error::other("forced peek failure")));
 
-    assert_eq!(proc.wait_and_reap(pid), Waited::Foreign);
+    assert_eq!(proc.wait_and_reap(pid), Waited::Unverified);
 
     proc.forget_foreign();
     reap_behind_the_owner(pid);
 }
 
-/// A zombie launchd holds (its tracer died) is not shown ours or reaped: `Foreign`, with a `warn`
-/// saying so.
+/// A zombie launchd holds (its tracer died) has exited and is not ours to reap: `Foreign`, with a
+/// `warn` saying so.
 ///
-/// Mutant: `Awaited::Orphaned` is folded into `Gone` without a log.
+/// Mutants: `Awaited::Orphaned` is folded into `Gone` without a log; or it is `Unverified`.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-async fn macos_wait_and_reap_of_a_zombie_launchd_holds_warns_it_cannot_be_shown_ours() {
+async fn macos_wait_and_reap_of_a_zombie_launchd_holds_is_foreign_and_warns() {
     use crate::wait::exit_only::seams::force_peek_once;
     use crate::wait::exit_only::{Foreign, Peek};
     crate::log_capture::install();
@@ -701,7 +773,7 @@ async fn macos_wait_and_reap_of_a_zombie_launchd_holds_warns_it_cannot_be_shown_
     assert!(
         records
             .iter()
-            .any(|(level, text)| *level == log::Level::Warn && text.contains("cannot be shown to be ours or reaped")),
+            .any(|(level, text)| *level == log::Level::Warn && text.contains("launchd holds its zombie")),
         "{records:?}"
     );
     proc.forget_foreign();

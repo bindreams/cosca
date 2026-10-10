@@ -89,6 +89,12 @@ pub(crate) fn force_peeks(results: impl IntoIterator<Item = io::Result<Peek>>) -
     Forced(|| FORCED_PEEK.with(|f| f.borrow_mut().clear()))
 }
 
+#[cfg(feature = "tokio")]
+/// How many forced peeks of [`force_peeks`] this thread has not yet consumed.
+pub(crate) fn forced_peeks_left() -> usize {
+    FORCED_PEEK.with(|f| f.borrow().len())
+}
+
 pub(crate) fn take_forced_peek() -> Option<io::Result<Peek>> {
     FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
 }

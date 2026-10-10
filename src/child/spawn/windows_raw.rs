@@ -49,26 +49,34 @@ use windows::Win32::System::Threading::{
 
 use crate::child::proc_handle::ProcHandle;
 use crate::child::spawn::{
-    attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, PipeOwnership,
+    attach_or_fault, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify, PipeOwnership,
+    SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
-use crate::error::Error;
+use crate::error::{ChildFate, Error};
 use crate::stdio::{Fd, ResolvedStdio};
 
 /// Spawn `cmd` via raw `CreateProcessW`. Handles descriptors 0/1/2 plus arbitrary fd >= 3 (wired
 /// through the MSVCRT `lpReserved2` table), contained (Job Object / TreeWalk) or uncontained.
-pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on_drop: bool) -> Result<Child, Error> {
+///
+/// Everything up to `CreateProcessW` fails before the program could start; everything after may
+/// come after it started.
+pub(crate) fn spawn_raw(
+    cmd: &Command,
+    fds: BTreeMap<Fd, ResolvedStdio>,
+    kill_on_drop: bool,
+) -> Result<Child, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
-    reject_batch_program(cmd)?;
+    reject_batch_program(cmd).not_started()?;
 
-    let spawn_env = spawn_env(cmd)?;
-    let Target { image, cwd } = target(cmd, &spawn_env)?;
+    let spawn_env = spawn_env(cmd).not_started()?;
+    let Target { image, cwd } = target(cmd, &spawn_env).not_started()?;
     if let Some(p) = &image {
         resolve::debug_assert_no_nul_wide("program image", p.as_os_str());
     }
-    let mut cmdline = raw_program_and_line(cmd)?; // each token NUL-checked
+    let mut cmdline = raw_program_and_line(cmd).not_started()?; // each token NUL-checked
     cmdline.push(0);
     // AFTER `raw_program_and_line`, deliberately. Both reject the same three no-program states —
     // `CommandInput::Empty`, an empty argv, and a blank `commandline()` with no `executable()` —
@@ -80,7 +88,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // This stays as the backstop that makes a NULL `lpApplicationName` UNREPRESENTABLE if those
     // two ever drift apart — a NULL would make `CreateProcessW` search for the image itself,
     // including the calling process's current directory.
-    let app_name: Vec<u16> = app_name_wide(image.as_deref())?;
+    let app_name: Vec<u16> = app_name_wide(image.as_deref()).not_started()?;
 
     // Containment: mirror `prepare`'s pre-spawn decision on the raw path. An uncontained spawn keeps
     // the defaults (`contain_flags` 0, a `mode: None`/`is_root: false` `Prepared`); a Strongest root
@@ -94,7 +102,8 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         *cmd.flags_request(),
         spawn_env.is_root,
         crate::command::flags::SpawnBackend::Raw,
-    )?;
+    )
+    .not_started()?;
     debug_assert_eq!(plan.marker_env, spawn_env.marker_env, "the marker decision drifted");
     if req.mode.is_some() {
         crate::containment::windows::clear_std_handle_inheritance();
@@ -103,7 +112,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     let cwd_w = Some(to_wide_nul(cwd.as_os_str()));
 
     // Cap the MSVCRT fd-table to the WORD-sized `cbReserved2` field BEFORE allocating anything.
-    ensure_fd_table_fits(&fds)?;
+    ensure_fd_table_fits(&fds).not_started()?;
 
     // Resolve 0/1/2 (always) plus any configured fd >= 3. `resolve_stdio` rejects inherit on fd >= 3.
     let slots: Vec<Fd> = {
@@ -111,11 +120,11 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         v.extend(fds.keys().copied().filter(|f| f.raw() >= 3));
         v
     };
-    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned)?;
+    let (child_ends, parent_ends) = resolve_stdio(&fds, &slots, PipeOwnership::Owned).not_started()?;
 
     // Classify each resolved child end (0/1/2 + fd >= 3) and encode the dense 0..=maxfd MSVCRT
     // fd-table the child CRT reads back from `lpReserved2`.
-    let table = build_fd_table(&child_ends)?;
+    let table = build_fd_table(&child_ends).not_started()?;
 
     // STARTUPINFOEXW: STARTF_USESTDHANDLES + hStd* for 0/1/2; `lpReserved2` carries the fd-table so
     // the child CRT recovers fd >= 3; the HANDLE_LIST scopes inheritance AND backs
@@ -130,7 +139,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     // SINGLE handle source: `table.handles` is 0/1/2 + fd >= 3, each a distinct fresh dup from
     // `resolve_stdio` (its 0/1/2 entries ARE the hStd* handles), so no duplicate reaches the list.
     let all_handles: &[HANDLE] = &table.handles;
-    let attr = AttributeList::build(all_handles)?;
+    let attr = AttributeList::build(all_handles).not_started()?;
     si.lpAttributeList = attr.as_ptr();
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
@@ -156,7 +165,7 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
         drop(attr); // DeleteProcThreadAttributeList before the guard releases
         r
     };
-    let (proc, pid) = spawned?;
+    let (proc, pid) = spawned.not_started()?;
 
     // Identity read + attach BEFORE building `Child`, with the SAME kill+reap teardown as the std
     // path (dropping the OwnedHandle alone neither kills nor reaps on Windows). The `Prepared`
@@ -177,15 +186,19 @@ pub(crate) fn spawn_raw(cmd: &Command, fds: BTreeMap<Fd, ResolvedStdio>, kill_on
     ) {
         crate::identity::Resolved::Found(id) => id,
         other => {
-            raw_spawn_teardown(proc, pid);
-            return Err(crate::child::spawn::spawn_identity_error(other));
+            // The read failed, so no identity is known.
+            let fate = raw_spawn_teardown(proc, pid, None);
+            return Err(SpawnFailure::started(
+                crate::child::spawn::spawn_identity_error(other),
+                fate,
+            ));
         }
     };
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(e) => {
-            raw_spawn_teardown(proc, pid);
-            return Err(e);
+            let fate = raw_spawn_teardown(proc, pid, Some(id));
+            return Err(SpawnFailure::started(e, fate));
         }
     };
 
@@ -423,7 +436,7 @@ pub(crate) fn app_name_wide(image: Option<&Path>) -> Result<Vec<u16>, Error> {
 /// Kill + reap a just-spawned child whose post-spawn attach/identity read failed, so a failed spawn
 /// never leaks a running/zombie process (mirrors the std path's teardown). `pub(crate)`: the async
 /// raw backend shares the identical error-teardown.
-pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
+pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32, id: Option<crate::identity::ProcessId>) -> ChildFate {
     let rc = RawChild::new(proc, pid);
     // Windows only, so the std path-s invariant does NOT carry: there is no zombie to reap
     // and `rc.wait()` is a bare `WaitForSingleObject(handle, INFINITE)`. If the kill failed,
@@ -431,12 +444,14 @@ pub(crate) fn raw_spawn_teardown(proc: OwnedHandle, pid: u32) {
     // child is strictly better.
     if let Err(e) = rc.kill() {
         log::warn!("raw spawn teardown: kill of pid {pid} failed: {e}; not waiting");
-        return;
+        return ChildFate::Running { id };
     }
     if let Err(e) = rc.wait() {
         log::warn!("raw spawn teardown failed to reap pid {pid}: {e}");
         debug_assert!(false, "raw spawn teardown failed to reap child: {e}");
+        return ChildFate::Killed;
     }
+    ChildFate::Reaped
 }
 
 /// Does the caller hold `PROCESS_TERMINATE` on `pid`? A STATIC permission answer (a second

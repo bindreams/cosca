@@ -89,10 +89,11 @@ fn spawn_identity_after_foreign_reap_and_reuse_is_gone_body() {
             *stranger.borrow_mut() = Some(reuser);
         }
     });
-    let err = match cmd.spawn() {
+    let (err, fate) = match cmd.spawn() {
         Ok(child) => panic!("the spawn took the stranger for its child: {:?}", child.id()),
-        Err(e) => e,
+        Err(e) => crate::child::spawn::failure::expect_may_have_started_with(e),
     };
+    assert_eq!(fate, crate::error::ChildFate::Gone, "the child was reaped elsewhere");
     let stranger = stranger.borrow_mut().take().expect("the hook must have run");
     assert!(
         matches!(&err, crate::error::Error::Io(e) if e.to_string().contains("reaped by another party")),
