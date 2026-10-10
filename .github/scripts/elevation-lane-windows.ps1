@@ -114,26 +114,19 @@ try {
             # The ACE on the published JUnit directory names the account; without it the SID would dangle there.
             Set-Acl-Native $junitDir /remove "${account}"
             Remove-LocalUser $account -ErrorAction Stop
-            # The profile directory and registry hive that logging on created. A profile that is still loaded fails here.
             # Nothing of the account may be running when its profile goes: stop what is left of its processes.
             foreach ($candidate in Get-CimInstance Win32_Process) {
                 $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwner -ErrorAction SilentlyContinue
                 if ($owner -and $owner.User -eq $account) { Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue }
             }
-            # The profile service unloads the registry hive some time after the last handle to the logon has gone, and
-            # the removal fails with a sharing violation until it has: retry that one error, nothing else.
-            $reported = $false
-            while ($true) {
-                try {
-                    Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
-                    break
-                } catch {
-                    if ($_.Exception.Message -notmatch 'being used by another process') { throw }
-                    if (-not $reported) { Write-Host "waiting for the profile of $account to unload"; $reported = $true }
-                    Start-Sleep -Seconds 1
-                }
+            # Best effort: the registry hive of the logon stays loaded for minutes after everything of the run has
+            # exited (measured on both hosted runners; no process of the account is left, and waiting does not
+            # end it within the step's bound), and a loaded profile cannot be removed. The runner is an ephemeral VM.
+            try {
+                Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'" | Remove-CimInstance -ErrorAction Stop
+            } catch {
+                Write-Host "::warning::the profile of $account is still loaded and was left behind: $_"
             }
-            if (Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'") { throw "the profile of $account is still there after its removal" }
         }
         if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "the account $account is still there after its removal" }
     }
