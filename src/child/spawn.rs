@@ -854,6 +854,7 @@ impl Unreported {
             line.push_str(tail);
         }
         log::warn!("{line}");
+        log::warn!("{line}");
         // After the log: an assertion that fires first would take the warn with it.
         debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
         self.fate
