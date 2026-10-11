@@ -414,8 +414,8 @@ async fn terminate_tree_terminates_a_trusted_session_root() {
         .terminate_tree()
         .expect("a trusted root is signalled with its group");
 
-    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
     drop(writer);
+    assert_eq!(child.wait().await.expect("wait").signal(), Some(libc::SIGTERM));
 }
 
 // The backstop =====

@@ -490,7 +490,9 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
     }
 }
 
-/// A real control: a trusted session root is terminated for real, not through the recorder.
+/// A real control: a trusted session root is terminated for real, not through the recorder. The
+/// stdin is released after the signal, so a signal that never came ends the root with status 0
+/// instead of hanging the wait.
 ///
 /// Mutant: `terminate_tree` signals nothing for a trusted session root.
 #[skuld::test]
@@ -502,8 +504,8 @@ fn terminate_tree_terminates_a_trusted_session_root() {
         .terminate_tree()
         .expect("a trusted root is signalled with its group");
 
-    assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGTERM));
     drop(writer);
+    assert_eq!(child.wait().expect("wait").signal(), Some(libc::SIGTERM));
 }
 
 // The backstop =====
