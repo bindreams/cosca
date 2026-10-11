@@ -76,6 +76,9 @@ mod windows_probe;
 #[path = "windows_elevation_routes/harness.rs"]
 mod harness;
 #[cfg(windows)]
+#[path = "windows_elevation_routes/harness_tests.rs"]
+mod harness_tests;
+#[cfg(windows)]
 #[path = "windows_elevation_routes/logon_routes.rs"]
 mod logon_routes;
 #[cfg(windows)]

@@ -18,8 +18,8 @@
 //! Windows runners are), so `runas` raises no prompt. It launches only copies of
 //! `cosca_testbin_image` — never a batch file — and registers one volatile App Paths key in HKLM and
 //! then one in HKCU, each deleted by a guard. Creating a volatile key also creates any missing
-//! parent volatile, and that parent is left behind (seen on arm64, whose HKCU has no `App Paths`
-//! key); it goes at the next reboot, with the ephemeral runner.
+//! parent volatile (seen on arm64, whose HKCU has no `App Paths` key); the guard records which
+//! parents were missing and deletes those too.
 //!
 //! The tests share machine-wide state — the registry keys — so each holds [`serial`] for its
 //! whole body too, a holdover from when `cargo test` ran every test in one shared process and
@@ -56,9 +56,8 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, WAIT_OBJECT
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 #[cfg(windows)]
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATED_NEW_KEY, REG_CREATE_KEY_DISPOSITION, REG_OPEN_CREATE_OPTIONS,
-    REG_OPTION_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_OPEN_CREATE_OPTIONS, REG_OPTION_VOLATILE,
+    RRF_RT_REG_DWORD,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
@@ -122,62 +121,18 @@ fn wide(s: &OsStr) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-/// An App Paths key for [`APP`], deleted on drop. Created only if absent, so a key this probe did
-/// not make is never touched.
-struct AppPathKey(HKEY, Vec<u16>);
+#[path = "windows_shell_execute/app_path_key.rs"]
+mod app_path_key;
+#[cfg(windows)]
+#[path = "windows_shell_execute/app_path_key_tests.rs"]
+mod app_path_key_tests;
+#[cfg(windows)]
+use app_path_key::AppPathKey;
 
 #[cfg(windows)]
-impl AppPathKey {
-    fn register(hive: HKEY, options: REG_OPEN_CREATE_OPTIONS, target: &Path) -> Result<Self, String> {
-        let name = wide(OsStr::new(KEY));
-        let mut hkey = HKEY::default();
-        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
-        // SAFETY: `name` is NUL-terminated and outlives the call; the out-pointers are live locals.
-        let rc = unsafe {
-            RegCreateKeyExW(
-                hive,
-                PCWSTR(name.as_ptr()),
-                None,
-                PCWSTR::null(),
-                options,
-                KEY_WRITE,
-                None,
-                &mut hkey,
-                Some(&mut disposition),
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(format!("RegCreateKeyExW({KEY}) failed: {rc:?}"));
-        }
-        if disposition != REG_CREATED_NEW_KEY {
-            // SAFETY: `hkey` was opened above.
-            let _ = unsafe { RegCloseKey(hkey) };
-            return Err(format!(
-                "{KEY} already existed; refusing to overwrite a key this probe did not make"
-            ));
-        }
-        let guard = AppPathKey(hive, name);
-        let value: Vec<u8> = wide(target.as_os_str()).iter().flat_map(|u| u.to_le_bytes()).collect();
-        // SAFETY: `hkey` is open for writing; `value` is a NUL-terminated UTF-16 string as bytes.
-        let set = unsafe { RegSetValueExW(hkey, PCWSTR::null(), None, REG_SZ, Some(&value)) };
-        // SAFETY: `hkey` was opened above and is closed once.
-        let _ = unsafe { RegCloseKey(hkey) };
-        if set != ERROR_SUCCESS {
-            return Err(format!("RegSetValueExW failed: {set:?}"));
-        }
-        Ok(guard)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for AppPathKey {
-    fn drop(&mut self) {
-        // SAFETY: the name is NUL-terminated and owned by `self`.
-        let rc = unsafe { RegDeleteKeyW(self.0, PCWSTR(self.1.as_ptr())) };
-        if rc != ERROR_SUCCESS {
-            println!("CLEANUP: RegDeleteKeyW({KEY}) failed: {rc:?}");
-        }
-    }
+/// An App Paths key for [`APP`], deleted on drop, with the volatile `App Paths` parent if this probe made it.
+fn register_app_path(hive: HKEY, options: REG_OPEN_CREATE_OPTIONS, target: &Path) -> Result<AppPathKey, String> {
+    AppPathKey::register_at(hive, options, KEY, target)
 }
 
 #[cfg(windows)]
@@ -512,7 +467,7 @@ fn exefile_skips_the_app_paths_lookup(#[fixture(shell_execute)] _group: &Group) 
         ("HKLM", HKEY_LOCAL_MACHINE, REG_OPTION_VOLATILE),
         ("HKCU", HKEY_CURRENT_USER, REG_OPTION_VOLATILE),
     ] {
-        let key = AppPathKey::register(hive, options, &l.b)
+        let key = register_app_path(hive, options, &l.b)
             .unwrap_or_else(|e| panic!("the measurement could not be taken: {label}: {e}"));
         println!("--- {label}: {KEY} -> {}", l.b.display());
         for verb in ["runas", "open"] {

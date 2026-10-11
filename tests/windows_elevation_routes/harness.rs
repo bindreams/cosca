@@ -719,21 +719,125 @@ pub(crate) fn measure(out: &mut String, ancestor_contained: bool) {
     }
 }
 
+/// A scheduled task name, deleted when dropped, whatever the test does in between. A task that is still
+/// registered afterwards fails the test, unless it is already failing (a second panic while unwinding aborts the
+/// binary), where it is only printed. Made before the `/create`, so a `/create` that fails after registering
+/// still gets deleted; a task that was never registered is not a failure.
+pub(crate) struct ScheduledTask {
+    pub(crate) name: String,
+    delete_line: Option<String>,
+}
+
+impl ScheduledTask {
+    pub(crate) fn new(name: String) -> Self {
+        ScheduledTask {
+            name,
+            delete_line: None,
+        }
+    }
+
+    /// Deletes the task now, for the report line; [`Drop`] then finds nothing left to do.
+    pub(crate) fn delete(&mut self) -> String {
+        let line = match crate::common::output_locked(
+            std::process::Command::new("schtasks").args(["/delete", "/tn", &self.name, "/f"]),
+        ) {
+            Ok(out) => format!("{}", out.status),
+            Err(e) => format!("schtasks could not be run: {e}"),
+        };
+        self.delete_line = Some(line.clone());
+        line
+    }
+
+    pub(crate) fn is_registered(&self) -> Result<bool, String> {
+        let name = self.name.clone();
+        // COM is initialised per thread, and this one may already hold an apartment of another kind.
+        std::thread::spawn(move || task_exists(&name))
+            .join()
+            .map_err(|_| format!("the Task Scheduler query for {} panicked", self.name))?
+    }
+}
+
+/// Asks the Task Scheduler whether its root folder holds the task `name`. Only "no such task" means it is gone; any
+/// other failure is an `Err`, since a task that cannot be looked up may still be registered.
+fn task_exists(name: &str) -> Result<bool, String> {
+    use windows::core::BSTR;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{ITaskService, TaskScheduler};
+    use windows::Win32::System::Variant::VARIANT;
+
+    // SAFETY: balanced by the `CoUninitialize` below; every interface is released before it, as `lookup` returns.
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .map_err(|e| format!("CoInitializeEx: {e}"))?;
+        let lookup = || -> Result<bool, String> {
+            let service: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("create the Task Scheduler service: {e}"))?;
+            let none = VARIANT::default();
+            service
+                .Connect(&none, &none, &none, &none)
+                .map_err(|e| format!("connect to the Task Scheduler: {e}"))?;
+            let root = service
+                .GetFolder(&BSTR::from("\\"))
+                .map_err(|e| format!("open the root task folder: {e}"))?;
+            task_lookup_outcome(name, root.GetTask(&BSTR::from(name)).map(drop))
+        };
+        let outcome = lookup();
+        CoUninitialize();
+        outcome
+    }
+}
+
+/// The meaning of a `GetTask` result: found, absent (`ERROR_FILE_NOT_FOUND`), or an error that says nothing about
+/// whether the task exists.
+pub(crate) fn task_lookup_outcome(name: &str, lookup: windows::core::Result<()>) -> Result<bool, String> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+
+    match lookup {
+        Ok(()) => Ok(true),
+        Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => Ok(false),
+        Err(e) => Err(format!("look up the task {name}: {e}")),
+    }
+}
+
+impl Drop for ScheduledTask {
+    fn drop(&mut self) {
+        if self.delete_line.is_none() {
+            self.delete();
+        }
+        let problem = match self.is_registered() {
+            Ok(false) => return,
+            Ok(true) => format!(
+                "the scheduled task {} is still registered after its deletion",
+                self.name
+            ),
+            Err(e) => format!("could not tell whether the scheduled task {} is gone: {e}", self.name),
+        };
+        if std::thread::panicking() {
+            println!("PROBE schtasks: {problem}");
+        } else {
+            panic!("{problem}");
+        }
+    }
+}
+
 /// Try to register a scheduled task at each run level and report what `schtasks` said, plus
 /// whether at least one `/create` call actually exited with a status — a caller for whom `schtasks`
 /// itself could never even be launched measured nothing, no matter how many report lines come back.
-/// Always attempts to delete what it created, on every path, and reports whether each `/delete`
-/// succeeded rather than discarding that result.
+/// Deletes what it created on every path, a panic included, and fails the test if a task is still
+/// registered afterwards.
 pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let mut any_create_exited = false;
     let name = format!("cosca-probe-{}", std::process::id());
     for level in ["HIGHEST", "LIMITED"] {
-        let tn = format!("{name}-{level}");
+        let mut task = ScheduledTask::new(format!("{name}-{level}"));
         match crate::common::output_locked(std::process::Command::new("schtasks").args([
             "/create",
             "/tn",
-            &tn,
+            &task.name,
             "/tr",
             "cmd.exe /c exit 0",
             "/sc",
@@ -755,10 +859,7 @@ pub(crate) fn schtasks_registration_report() -> (Vec<String>, bool) {
             }
             Err(e) => lines.push(format!("/rl {level} -> schtasks could not be run: {e}")),
         }
-        match crate::common::output_locked(std::process::Command::new("schtasks").args(["/delete", "/tn", &tn, "/f"])) {
-            Ok(out) => lines.push(format!("/rl {level} delete -> {}", out.status)),
-            Err(e) => lines.push(format!("/rl {level} delete -> schtasks could not be run: {e}")),
-        }
+        lines.push(format!("/rl {level} delete -> {}", task.delete()));
     }
     (lines, any_create_exited)
 }
@@ -892,26 +993,19 @@ pub(crate) struct ScratchAccount {
 }
 
 impl ScratchAccount {
-    /// Creates the account, first deleting any account of the same name left behind by an earlier
-    /// run on this host: `does_create_process_with_logon_elevate` and
-    /// `which_logon_types_return_a_filtered_token` both create their scratch accounts under the
-    /// same two fixed names (`coscaprobeadm`/`coscaprobestd`; see this crate's module doc), so a
-    /// leftover from a run that crashed before `Drop` ran would otherwise make `/add` fail and
-    /// cascade into every other probe in the `windows-elevation-routes` test group. The pre-create
-    /// `/delete`'s result is printed either way — "account not found" is the expected, silent case
-    /// on a clean host, but a genuine permissions failure here should be visible rather than
-    /// swallowed into `/add`'s own error.
+    /// Creates the account, refusing one that exists already: it is not this test's to adopt or delete (the two
+    /// fixed names, `coscaprobeadm` and `coscaprobestd`, are shared by the probes of this crate, so a leftover from
+    /// a run that crashed before `Drop` ran has to be removed by hand, and says so).
     pub(crate) fn create(user: &str, admin: bool) -> Result<Self, String> {
-        match crate::common::output_locked(std::process::Command::new("net").args(["user", user, "/delete"])) {
+        match crate::common::output_locked(std::process::Command::new("net").args(["user", user])) {
             Ok(out) if out.status.success() => {
-                println!("PROBE scratch-account: deleted a leftover account {user} before creating it fresh");
+                return Err(format!(
+                    "the account {user} exists already; refusing to adopt or delete it (remove it with `net user {user} /delete` \
+                     if an earlier run left it behind)"
+                ));
             }
-            Ok(out) => println!(
-                "PROBE scratch-account: pre-create `net user {user} /delete` -> {} (expected when no \
-                 leftover account exists)",
-                out.status
-            ),
-            Err(e) => println!("PROBE scratch-account: pre-create `net user {user} /delete` could not be run: {e}"),
+            Ok(_) => {}
+            Err(e) => return Err(format!("could not run `net user {user}`: {e}")),
         }
 
         // Satisfies the default complexity policy and stays within 14 characters: `net user` turns
@@ -967,21 +1061,61 @@ impl ScratchAccount {
     }
 }
 
+/// The PowerShell that removes the profile of the local account `user`, picked by the account's SID.
+pub(crate) fn profile_removal_script(user: &str) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $sid = ([System.Security.Principal.NTAccount]'{user}').Translate([System.Security.Principal.SecurityIdentifier]).Value; \
+         Get-CimInstance Win32_UserProfile | Where-Object {{ $_.SID -eq $sid }} | Remove-CimInstance"
+    )
+}
+
 impl Drop for ScratchAccount {
+    /// Removes the account and the profile a logon with `LOGON_WITH_PROFILE` made for it (the profile
+    /// first, while the account exists). A failure to delete the account fails the test, unless the test is already
+    /// failing, where it is only printed.
     fn drop(&mut self) {
+        let mut failures = Vec::new();
+        // The profile directory and registry hive outlive `net user /delete`. The profile is picked by the account's
+        // SID, resolved while the account still exists: a profile path says nothing about whose it is. `self.user` is
+        // one of two fixed alphanumeric names, so it needs no quoting.
+        let script = profile_removal_script(&self.user);
+        match crate::common::output_locked(std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])) {
+            Ok(out) if out.status.success() => {}
+            // Best effort: a logon's registry hive stays loaded for minutes after its processes have exited
+            // (measured on the hosted runners), and a loaded profile cannot be removed. Reported, not failed.
+            Ok(out) => println!(
+                "PROBE scratch-account: the profile of {} was left behind: status={} stderr={}",
+                self.user,
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => println!(
+                "PROBE scratch-account: removing the profile of {} could not be run: {e}",
+                self.user
+            ),
+        }
         match crate::common::output_locked(std::process::Command::new("net").args(["user", &self.user, "/delete"])) {
             Ok(out) if out.status.success() => {}
-            Ok(out) => println!(
-                "PROBE scratch-account: `net user {} /delete` in Drop FAILED: status={} stdout={} stderr={}",
+            Ok(out) => failures.push(format!(
+                "`net user {} /delete` FAILED: status={} stdout={} stderr={}",
                 self.user,
                 out.status,
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
-            ),
-            Err(e) => println!(
-                "PROBE scratch-account: `net user {} /delete` in Drop could not be run: {e}",
-                self.user
-            ),
+            )),
+            Err(e) => failures.push(format!("`net user {} /delete` could not be run: {e}", self.user)),
+        }
+        for failure in &failures {
+            println!("PROBE scratch-account: {failure}");
+        }
+        if !failures.is_empty() && !std::thread::panicking() {
+            panic!("the scratch account {} was not fully removed: {failures:?}", self.user);
         }
     }
 }

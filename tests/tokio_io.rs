@@ -270,6 +270,19 @@ fn cgroup_leaf_of(_: &cosca::tokio::Child) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "tokio")]
+/// Removes the leaf on any exit of the test, a failing one too: see `common::cgroup::LeafGuard`. Hold it in a local.
+#[cfg(target_os = "linux")]
+fn leaf_cleanup(leaf: &Option<std::path::PathBuf>) -> Option<common::cgroup::LeafGuard> {
+    leaf.clone().map(common::cgroup::LeafGuard::new)
+}
+
+#[cfg(feature = "tokio")]
+#[cfg(not(target_os = "linux"))]
+fn leaf_cleanup(_: &Option<std::path::PathBuf>) -> Option<()> {
+    None
+}
+
+#[cfg(feature = "tokio")]
 /// Remove the leaf a test's tree left behind, once the tree drains. Call it only after every
 /// member has been released or killed.
 fn remove_leftover_leaf(leaf: Option<std::path::PathBuf>) {
@@ -287,6 +300,7 @@ async fn async_drop_tears_down_a_contained_tree() {
     use std::io::Read as _;
     let (child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
+    let _leaf_cleanup = leaf_cleanup(&leaf);
     // The containment assert guards the EOFs below from passing for unrelated reasons.
     assert_ne!(
         child.containment(),
@@ -360,6 +374,7 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     common::install_log_capture();
     let (mut child, mut root, mut grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
+    let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
     root.write_all(b"x").expect("release the root so it exits");
     child.wait().await.expect("wait reaps the root");
@@ -442,6 +457,7 @@ async fn async_detach_leaves_the_tree_running() {
     use std::io::{Read as _, Write as _};
     let (mut child, mut root, grand) = common::spawn_grandchild_async(true).await;
     let leaf = cgroup_leaf_of(&child);
+    let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
     child.detach();
     drop(child); // detached → Drop must NOT kill
@@ -505,6 +521,7 @@ async fn async_kill_on_drop_false_leaves_a_contained_tree_running() {
         "contained spawn must engage a mechanism"
     );
     let leaf = cgroup_leaf_of(&child);
+    let _leaf_cleanup = leaf_cleanup(&leaf);
     let root_id = child.id();
     drop(child); // contained + kill_on_drop(false) → nothing may kill the tree
     assert_eq!(
@@ -560,6 +577,7 @@ async fn linux_cgroup_v2_async_kill_tree_then_wait_tree_then_drop_leaves_no_leaf
     } = common::spawn_echo_tree_async(false).await;
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     let mark = common::log_mark();
     child.kill_tree().expect("kill_tree");
@@ -602,6 +620,7 @@ async fn linux_cgroup_v2_async_drop_alone_kills_the_members_and_logs_the_leftove
     } = common::spawn_echo_tree_async(true).await;
     assert_eq!(child.containment(), cosca::Containment::CgroupV2);
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
 
     // A member of the test's own, blocked on its stdin and placed in the leaf.
     let mut member = common::spawn_locked(
@@ -663,6 +682,7 @@ async fn assert_async_opted_out_tree_survives(kill_on_drop: bool, opt_out: impl 
         "a process group's disarm is a no-op, so only CgroupV2 tests the leaf's"
     );
     let leaf = common::cgroup::cgroup_of(grand_pid);
+    let _leaf_cleanup = common::cgroup::LeafGuard::new(leaf.clone());
     assert!(
         leaf.file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with("cosca-")),

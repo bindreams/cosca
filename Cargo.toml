@@ -50,10 +50,10 @@ shared_child = { version = "1", features = ["timeout"] }
 static_assertions = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
-# Every feature below except `Wdk_System_SystemServices` and `Win32_Security_Authorization` is
-# already enabled on the main `windows` dependency further down this file — integration tests
-# reach that dependency directly, they are not walled off from it. Those two are the genuine
-# additions:
+# Every feature below except `Wdk_System_SystemServices`, `Win32_Security_Authorization` and the Task
+# Scheduler ones is already enabled on the main `windows` dependency further down this file —
+# integration tests reach that dependency directly, they are not walled off from it. Those are the
+# genuine additions:
 # - `Wdk_System_SystemServices`: only `windows_path_resolution`'s `provenance.rs` needs it, for
 #   `RtlGetVersion` (stamps each measurement with its OS build).
 # - `Win32_Security_Authorization`: only `resolve_windows_tests.rs` needs it, for
@@ -61,8 +61,11 @@ static_assertions = "1"
 #   `TRUSTEE_W`, to build a real deny ACE on a real Windows host rather than simulate one. (Its
 #   thread-impersonation guard needs no feature beyond `Win32_Security`/`Win32_System_Threading`,
 #   both already enabled: `DuplicateTokenEx` lives in the former, `SetThreadToken` in the latter.)
+# - `Win32_System_TaskScheduler` (with `Win32_System_Ole` and `Win32_System_Variant`, which its `Connect` needs):
+#   only the `windows_elevation_routes` harness needs it, to ask the Task Scheduler COM API whether a probe's task
+#   is gone, rather than read a `schtasks` exit code.
 #
-# Declaring both here, in dev-dependencies, keeps them out of the published crate's own
+# Declaring them here, in dev-dependencies, keeps them out of the published crate's own
 # dependency footprint for downstream consumers who only pull in `[dependencies]`. The `windows_*`
 # probes (not specific to either feature above) call GetFullPathNameW, GetFileInformationByHandleEx,
 # ShellExecuteExW, the token APIs, the CreateProcess* family, SetHandleInformation, RtlGetVersion,
@@ -80,10 +83,13 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
+    "Win32_System_TaskScheduler",
     "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
