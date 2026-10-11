@@ -159,6 +159,7 @@ impl Child {
             }
             #[cfg(test)]
             fault::run_hook(fault::HookPoint::BeforeEscalation);
+            let _ = self.root_is_unpinned();
             // A root orphaned during the grace is no longer ours to kill. Read once: the gated send
             // does not read the state again.
             #[cfg(unix)]
