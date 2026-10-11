@@ -334,9 +334,6 @@ impl Child {
         let gate = self.kill_gate();
         // A front's refusal is permanent and says nothing of the pid, so it outranks a root launchd
         // holds, which the caller can do nothing about either way.
-        if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
-            self.refuse_unpinned("kill", None)?;
-        }
         self.kill_sent_gated(gate)
     }
 
