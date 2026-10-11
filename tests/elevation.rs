@@ -165,6 +165,37 @@ fn posix_stdin_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     );
 }
 
+/// A directory that holds a secret and is removed when dropped, a failing test included. A removal that fails fails
+/// the test, or is printed if the test is already panicking.
+#[cfg(unix)]
+struct SecretDir(Option<tempfile::TempDir>);
+
+#[cfg(unix)]
+impl SecretDir {
+    fn new() -> SecretDir {
+        let dir = tempfile::Builder::new()
+            .prefix("askpass-")
+            .tempdir()
+            .expect("a directory for the askpass script");
+        SecretDir(Some(dir))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.as_ref().expect("the directory is removed only on drop").path()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SecretDir {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.take() else { return };
+        let path = dir.path().to_path_buf();
+        if let Err(e) = dir.close() {
+            common::test_groups::fail_unless_panicking(format!("could not remove {}: {e}", path.display()));
+        }
+    }
+}
+
 // Auth::Askpass delivers the password via a trivial SUDO_ASKPASS helper script.
 #[cfg(unix)]
 #[skuld::test]
@@ -172,10 +203,10 @@ fn posix_askpass_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
     require_unelevated();
     let pw = std::env::var("COSCA_TEST_ELEVATION_PASSWORD")
         .expect("COSCA_TEST_ELEVATION_PASSWORD must hold the sudo password for the Auth::Askpass live test");
-    // A minimal askpass script that echoes the password.
-    let dir = std::env::temp_dir().join(format!("askpass-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("askpass.sh");
+    // A minimal askpass script that echoes the password. Its directory is removed on every exit: the script holds
+    // the password.
+    let dir = SecretDir::new();
+    let script = dir.path().join("askpass.sh");
     std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{pw}'\n")).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
@@ -192,7 +223,6 @@ fn posix_askpass_auth_reaches_root(#[fixture(elevation)] _group: &Group) {
         "root",
         "Auth::Askpass child was not root"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // (POSIX) kill() on a non-contained elevated long-lived child is the typed Unkillable, with

@@ -84,6 +84,11 @@ fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Grou
     let name = format!("cosca-{}-sweep", std::process::id());
     let sub = parent.join(&name).join("sub");
     let sub_in_thread = sub.clone();
+    // Removes the leaf and its child cgroup on every exit, a panic included.
+    let _cleanup = RemoveCgroups {
+        child: sub.clone(),
+        leaf: parent.join(&name),
+    };
 
     let swept = std::thread::spawn(move || {
         use std::ffi::CString;
@@ -141,14 +146,40 @@ fn cgroup_the_child_sweep_never_crosses_a_mount(#[fixture(cgroup)] _group: &Grou
         "the bind must not outlive its namespace; refusing to clean up"
     );
     let survived = victim.path().join("keep/me").is_dir();
-    std::fs::remove_dir(&sub).expect("remove the child cgroup");
-    std::fs::remove_dir(sub.parent().expect("the leaf")).expect("remove the leaf");
 
     swept.expect("the sweep");
     assert!(
         survived,
         "the sweep crossed the mount and deleted the victim's directories"
     );
+}
+
+/// Removes a child cgroup and its leaf by `rmdir` alone, unless the child is still a mount point in this namespace:
+/// nothing is removed through a mount. Mountinfo that cannot be read fails the test: it is not "no mount".
+struct RemoveCgroups {
+    child: std::path::PathBuf,
+    leaf: std::path::PathBuf,
+}
+
+impl Drop for RemoveCgroups {
+    fn drop(&mut self) {
+        match crate::test_groups::cgroup_leaf::is_mounted(&self.child) {
+            Ok(false) => {}
+            Ok(true) => return report(format!("{} is mounted; refusing to clean up", self.child.display())),
+            Err(why) => return report(format!("{why}; refusing to clean up {}", self.child.display())),
+        }
+        for path in [&self.child, &self.leaf] {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => report(format!("could not remove {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+fn report(message: String) {
+    crate::test_groups::fail_unless_panicking(message);
 }
 
 /// `rmdir` removes the leaf it holds.

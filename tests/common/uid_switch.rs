@@ -112,6 +112,13 @@ impl KillOnDrop {
         self.0.as_ref().expect("KillOnDrop used after its child was taken").id()
     }
 
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0
+            .as_mut()
+            .expect("KillOnDrop used after its child was taken")
+            .wait()
+    }
+
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.0
             .as_mut()

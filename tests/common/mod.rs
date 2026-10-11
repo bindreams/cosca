@@ -14,8 +14,9 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+// Shared with `test_groups` (its `StrayLeaves`), which owns the one compilation of the file.
 #[cfg(target_os = "linux")]
-pub mod cgroup;
+pub use test_groups::cgroup_leaf as cgroup;
 pub mod payload;
 
 #[cfg(target_os = "linux")]
