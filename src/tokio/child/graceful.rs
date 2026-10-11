@@ -406,7 +406,7 @@ impl Child {
             let sweep_result = self.kill_tree_after(Some("the SIGTERM"));
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
-                if root_exited && !self.root_is_unpinned() {
+                if root_exited {
                     // Best-effort reap so an observed-exited root isn't left a zombie; `sweep`
                     // (below) is already the error this call reports, so a failure here is
                     // secondary — but every other discarded error in this module is still logged,
