@@ -544,12 +544,19 @@ async fn a_closed_front_gate_outranks_an_unpinned_root() {
         } else {
             Front::Sudo
         }));
-        // The gate looks at the front twice, then (wrongly, if first) the state.
-        let _looks = force_peeks([
-            Ok(Peek::Running),
-            Ok(Peek::Running),
-            Ok(Peek::Foreign(Foreign::Orphaned)),
-        ]);
+        // The gate looks at the front (twice for a kill, once for a terminate), and the state, read
+        // wrongly first, would take the front's `Running` and let the gate see the `Orphaned`
+        // one: an exited front, which is signalled.
+        let looks = if op == "terminate" {
+            vec![Ok(Peek::Running), Ok(Peek::Foreign(Foreign::Orphaned))]
+        } else {
+            vec![
+                Ok(Peek::Running),
+                Ok(Peek::Running),
+                Ok(Peek::Foreign(Foreign::Orphaned)),
+            ]
+        };
+        let _looks = force_peeks(looks);
 
         let err = match op {
             "kill" => child.kill(),
@@ -568,9 +575,10 @@ async fn a_closed_front_gate_outranks_an_unpinned_root() {
             ),
             "{op}: {err:?}"
         );
-        assert!(
-            forced_peeks_left() >= 1,
-            "{op}: the root's state was read before the gate"
+        assert_eq!(
+            forced_peeks_left(),
+            1,
+            "{op}: the root's state was read before the gate, or the gate was not"
         );
         drop(writer);
     }
