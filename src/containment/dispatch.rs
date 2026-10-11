@@ -663,8 +663,8 @@ impl Attached {
         let except = matches!(root, crate::signal::RootState::Unpinned).then(|| m.root());
         log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
         let result = match signal {
-            TreeSignal::Kill => m.hard_kill_holders_only(except),
-            TreeSignal::Term => m.terminate_holders_only(except),
+            TreeSignal::Kill => m.hard_kill(),
+            TreeSignal::Term => m.terminate(),
         };
         if result.is_ok() && matches!(signal, TreeSignal::Kill) {
             killed.mark();
