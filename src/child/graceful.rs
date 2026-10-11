@@ -74,7 +74,6 @@ impl Child {
             if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
                 return Err(unkillable);
             }
-            self.refuse_unpinned("terminate", None)?;
         }
         crate::graceful::signal(self.graceful, self.id)
     }
