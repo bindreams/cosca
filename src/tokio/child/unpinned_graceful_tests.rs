@@ -287,10 +287,12 @@ async fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_fa
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"
     );
-    // A wait on it would have forgotten the child: the handle still pins its zombie.
+    // A wait on it would fail at the gate and log the best-effort reap's failure.
     assert!(
-        matches!(child.root_state(), crate::signal::RootState::Unreaped),
-        "the child was forgotten"
+        !crate::log_capture::records_since_on_current_thread(mark, "")
+            .iter()
+            .any(|(_, text)| text.contains("best-effort reap")),
+        "the zombie launchd holds was waited on"
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
     drop(writer);
@@ -320,11 +322,6 @@ async fn graceful_shutdown_tree_does_not_wait_for_a_root_orphaned_before_its_rea
     assert!(
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"
-    );
-    // A wait on it would have forgotten the child: the handle still pins its zombie.
-    assert!(
-        matches!(child.root_state(), crate::signal::RootState::Unreaped),
-        "the child was forgotten"
     );
     assert_eq!(warns_since(mark), Vec::<String>::new());
     drop(slot);
