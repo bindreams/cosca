@@ -206,16 +206,9 @@ impl LeafDir {
     /// still remove the leaf and make another under its name between the two, and have that
     /// removed instead. Such a party already controls the subtree.
     pub(crate) fn rmdir(&self) -> io::Result<()> {
-        use rustix::fs::ResolveFlags;
         use rustix::io::Errno;
 
-        let named = rustix::fs::openat2(
-            &self.parent,
-            &self.name,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
-        );
+        let named = open_beneath(self.parent.as_fd(), &self.name);
         let ours = match named {
             Ok(named) => {
                 let (named, held) = (rustix::fs::fstat(&named)?, rustix::fs::fstat(&self.dir)?);
@@ -252,17 +245,17 @@ impl LeafDir {
     }
 }
 
-/// The ids of the cgroups a leaf's sweep removed, shared by the leaf and its subtrees. Holds one
-/// id per cgroup the leaf's tree made, so as many as that tree made.
+/// The ids of the cgroups a leaf's sweep removed, shared by the leaf and its subtrees. Holds one id
+/// per cgroup the sweep removed.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Swept(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+pub(crate) struct Swept(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>);
 
 impl Swept {
     fn record(&self, id: u64) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(id);
+            .insert(id);
     }
 
     /// Whether the sweep removed the cgroup `id`.
@@ -280,8 +273,7 @@ pub(crate) enum Walked {
     /// A cgroup under the leaf has the id.
     Found,
     /// No cgroup the walk could list has it, and it could list every one that it found: none was
-    /// behind a mount. A cgroup removed during the walk is not listed, and is not one the walk
-    /// could list.
+    /// behind a mount.
     Absent,
     /// The walk could not list every cgroup, or its root is gone: why.
     Unknown(io::Error),
@@ -289,18 +281,17 @@ pub(crate) enum Walked {
 
 /// Whether a cgroup under `dir`, not `dir` itself, has the cgroup id `id` (see [`cgroup_id`]).
 ///
-/// Breadth first, each cgroup opened from `dir` by its path relative to it, with `openat2`
-/// (`RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS`), read, and closed before the next:
-/// the walk holds two descriptors at most, however large the tree. A cgroup removed during the walk
-/// (`ENOENT`, or `ENODEV` from a removed directory's files) has nothing under it to find, and is
-/// skipped; `dir` itself removed lists nothing, and answers [`Walked::Unknown`]. A cgroup behind a
-/// mount (`EXDEV`) cannot be listed, so a walk that meets one answers [`Walked::Unknown`] if it
-/// finds nothing, as it does for any other failure: a cgroup this process may not read (`EACCES`),
-/// or one whose path from the leaf is longer than `PATH_MAX` (`ENAMETOOLONG`).
+/// A [`traverse`] of the tree: the walk holds two descriptors at most, however large or deep the
+/// tree. A cgroup removed during the walk (`ENOENT`, or `ENODEV` from a removed directory's files)
+/// has nothing under it to find, and is skipped; `dir` itself removed lists nothing, and answers
+/// [`Walked::Unknown`]. A cgroup behind a mount (`EXDEV`) cannot be listed, so a walk that meets
+/// one answers [`Walked::Unknown`] if it finds nothing, as it does for any other failure: a cgroup
+/// this process may not read (`EACCES`), or any other refusal. A path from `dir` longer than
+/// `PATH_MAX` is no refusal: it is opened in pieces (see [`open_cgroup`]).
 ///
 /// One `openat2`, `name_to_handle_at`, `openat` and `getdents` per cgroup. Bounded: the tree is
-/// finite and each cgroup is visited once, since cgroup v2 refuses to rename or move one; it is
-/// sized by the cgroups the contained program made.
+/// finite and cgroup v2 refuses to rename or move a cgroup, so each is visited once; its size is
+/// the contained program's to choose.
 pub(crate) fn find_descendant(dir: BorrowedFd<'_>, id: u64) -> Walked {
     match walk(dir, id) {
         Ok(Some(())) => Walked::Found,
@@ -311,95 +302,223 @@ pub(crate) fn find_descendant(dir: BorrowedFd<'_>, id: u64) -> Walked {
 
 /// [`find_descendant`]'s walk: `Some` once found, `None` once every cgroup was listed.
 fn walk(dir: BorrowedFd<'_>, id: u64) -> io::Result<Option<()>> {
+    let traversed = traverse(&mut Tree::new(), dir, true, |tree, node, cgroup| {
+        match step_fault(tree, node, WalkStep::Id)
+            .map_err(io::Error::from)
+            .and_then(|()| cgroup_id(cgroup))
+        {
+            Ok(found) if found == id => Ok(Visit::Stop),
+            Ok(_) => Ok(Visit::Continue),
+            Err(e) if gone_io(&e) => Ok(Visit::Skip),
+            Err(e) => Err(at_cgroup(e, tree, node)),
+        }
+    })
+    .map_err(Failure::into_error)?;
+    match traversed {
+        Traversed::Stopped => Ok(Some(())),
+        Traversed::Listed { behind_a_mount: false } => Ok(None),
+        // `traverse` said where, at debug.
+        Traversed::Listed { behind_a_mount: true } => Err(io::Error::from_raw_os_error(libc::EXDEV)),
+    }
+}
+
+/// What a visitor of [`traverse`] decides of the cgroup it was shown.
+enum Visit {
+    /// List the cgroup, and visit what is under it.
+    Continue,
+    /// The cgroup is gone: nothing is under it to visit.
+    Skip,
+    /// End the traversal.
+    Stop,
+}
+
+/// How a [`traverse`] that did not fail ended.
+enum Traversed {
+    /// A visitor said [`Visit::Stop`].
+    Stopped,
+    /// Every cgroup that could be listed was; `behind_a_mount` says some could not be, being behind
+    /// a mount.
+    Listed { behind_a_mount: bool },
+}
+
+/// Why a [`traverse`] failed.
+enum Failure {
+    /// The root is gone, so nothing of what was under it was listed.
+    RootGone(io::Error),
+    /// Anything else, a visitor's error included.
+    Other(io::Error),
+}
+
+impl Failure {
+    fn into_error(self) -> io::Error {
+        match self {
+            Failure::RootGone(e) | Failure::Other(e) => e,
+        }
+    }
+}
+
+/// The cgroups a traversal found, each as its name and its parent: a name is stored once, however
+/// deep the cgroup under it, so the tree costs the bytes of its names and no more. A cgroup's path
+/// is rebuilt only where it is used, to open it. Node 0 is the root, the cgroup the traversal
+/// started at.
+struct Tree {
+    nodes: Vec<Node>,
+}
+
+struct Node {
+    parent: usize,
+    name: std::ffi::OsString,
+}
+
+impl Tree {
+    const ROOT: usize = 0;
+
+    fn new() -> Tree {
+        Tree {
+            nodes: vec![Node {
+                parent: Self::ROOT,
+                name: std::ffi::OsString::new(),
+            }],
+        }
+    }
+
+    /// Add the cgroup `name` under `parent`.
+    fn push(&mut self, parent: usize, name: &OsStr) -> usize {
+        self.nodes.push(Node {
+            parent,
+            name: name.to_owned(),
+        });
+        self.nodes.len() - 1
+    }
+
+    fn parent(&self, node: usize) -> usize {
+        self.nodes[node].parent
+    }
+
+    /// The name of a cgroup other than the root.
+    fn name(&self, node: usize) -> &OsStr {
+        debug_assert_ne!(node, Self::ROOT, "the root has no name");
+        &self.nodes[node].name
+    }
+
+    /// The names from the root down to `node`, the root's own left out.
+    fn names(&self, node: usize) -> Vec<&OsStr> {
+        let mut names = Vec::new();
+        let mut at = node;
+        while at != Self::ROOT {
+            names.push(self.name(at));
+            at = self.parent(at);
+        }
+        names.reverse();
+        names
+    }
+
+    /// `node`'s path from the root, `.` for the root itself: for messages and test seams, never
+    /// for an open (see [`open_cgroup`]).
+    fn path(&self, node: usize) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(".");
+        path.extend(self.names(node));
+        path
+    }
+}
+
+/// Visit each cgroup under `dir`, not `dir` itself, once, breadth first, so a cgroup comes before
+/// the ones under it. The one traversal of a leaf's tree: the walk and the sweep both run on it.
+/// The cgroups found are left in `tree`.
+///
+/// Each cgroup is opened from `dir` by its path relative to it, with [`open_cgroup`], shown to
+/// `visit` by its node and descriptor, listed, and closed before the next: two descriptors at most
+/// are held, however large or deep the tree, where holding the cgroups on the way down would hold
+/// one per level.
+///
+/// A cgroup gone (`ENOENT`, or `ENODEV` from a removed directory's files) is skipped, as is one
+/// behind a mount (`EXDEV`), which cannot be listed and is remembered. `dir` itself gone is
+/// [`Failure::RootGone`]. `confirm_root` reads a file of `dir` after listing it, which a removed
+/// directory answers `ENODEV` to: it lists as empty, which says nothing of the cgroups that were
+/// under it.
+fn traverse(
+    tree: &mut Tree,
+    dir: BorrowedFd<'_>,
+    confirm_root: bool,
+    mut visit: impl FnMut(&Tree, usize, BorrowedFd<'_>) -> io::Result<Visit>,
+) -> Result<Traversed, Failure> {
     use std::collections::VecDeque;
     use std::os::unix::ffi::OsStrExt as _;
 
-    let gone = |e: rustix::io::Errno| matches!(e, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV);
-    // Each cgroup still to look at, by its path relative to `dir`; `dir` itself first.
-    let mut pending: VecDeque<std::path::PathBuf> = VecDeque::from([std::path::PathBuf::from(".")]);
-    let mut behind_a_mount = None;
-    while let Some(path) = pending.pop_front() {
+    debug_assert_eq!(tree.nodes.len(), 1, "a traversal starts from a tree of its root alone");
+    let mut pending: VecDeque<usize> = VecDeque::from([Tree::ROOT]);
+    let mut behind_a_mount = false;
+    while let Some(node) = pending.pop_front() {
         #[cfg(test)]
-        super::fault::run_before_walk_open(&path);
-        // A cgroup under `dir` that is gone has nothing under it to find. `dir` itself gone lists
-        // nothing, which says nothing of the cgroups that were under it.
-        let is_root = path.as_os_str() == ".";
+        super::fault::run_before_walk_open(&tree.path(node));
+        let is_root = node == Tree::ROOT;
         let skippable = |e: rustix::io::Errno| gone(e) && !is_root;
-        let cgroup = match step_fault(&path, WalkStep::Open).and_then(|()| open_beneath(dir, &path)) {
+        let failed = |tree: &Tree, e: rustix::io::Errno| {
+            if is_root && gone(e) {
+                Failure::RootGone(named(e, tree, node))
+            } else {
+                Failure::Other(named(e, tree, node))
+            }
+        };
+        let cgroup = match step_fault(tree, node, WalkStep::Open).and_then(|()| open_cgroup(dir, &tree.names(node))) {
             Ok(cgroup) => cgroup,
             Err(e) if skippable(e) => continue,
             Err(rustix::io::Errno::XDEV) => {
-                behind_a_mount.get_or_insert(path);
+                log::debug!(
+                    "cgroup v2: {} is behind a mount, so the cgroups under it are not listed",
+                    tree.path(node).display()
+                );
+                behind_a_mount = true;
                 continue;
             }
-            Err(e) => return Err(named(e, &path)),
+            Err(e) => return Err(failed(tree, e)),
         };
         if !is_root {
-            match step_fault(&path, WalkStep::Id)
-                .map_err(io::Error::from)
-                .and_then(|()| cgroup_id(cgroup.as_fd()))
-            {
-                Ok(found) if found == id => return Ok(Some(())),
-                Ok(_) => {}
-                Err(e)
-                    if e.raw_os_error()
-                        .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno))) =>
-                {
-                    continue
-                }
-                Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            match visit(tree, node, cgroup.as_fd()).map_err(Failure::Other)? {
+                Visit::Continue => {}
+                Visit::Skip => continue,
+                Visit::Stop => return Ok(Traversed::Stopped),
             }
         }
         // Listing needs a readable descriptor; `cgroup` is `O_PATH`.
-        let entries = match step_fault(&path, WalkStep::List)
-            .and_then(|()| {
-                rustix::fs::openat(
-                    &cgroup,
-                    ".",
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-            })
-            .and_then(rustix::fs::Dir::new)
-        {
-            Ok(entries) => entries,
+        let listing = match step_fault(tree, node, WalkStep::List).and_then(|()| {
+            rustix::fs::openat(
+                &cgroup,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        }) {
+            Ok(listing) => listing,
             Err(e) if skippable(e) => continue,
-            Err(e) => return Err(named(e, &path)),
+            Err(e) => return Err(failed(tree, e)),
         };
-        let mut first = true;
-        for entry in entries {
-            let entry = if std::mem::take(&mut first) {
-                step_fault(&path, WalkStep::Entries).and(entry)
-            } else {
-                entry
-            };
-            let entry = match entry {
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); LISTING_BUFFER];
+        let mut entries = rustix::fs::RawDir::new(&listing, &mut buf);
+        while let Some(entry) = entries.next() {
+            let entry = match step_fault(tree, node, WalkStep::Entries).and(entry) {
                 Ok(entry) => entry,
                 Err(e) if skippable(e) => break,
-                Err(e) => return Err(named(e, &path)),
+                Err(e) => return Err(failed(tree, e)),
             };
             let name = entry.file_name();
-            if !matches!(name.to_bytes(), b"." | b"..") && is_dir(cgroup.as_fd(), &entry)? {
-                pending.push_back(path.join(std::ffi::OsStr::from_bytes(name.to_bytes())));
+            if !matches!(name.to_bytes(), b"." | b"..")
+                && is_dir(cgroup.as_fd(), entry.file_type(), name).map_err(Failure::Other)?
+            {
+                pending.push_back(tree.push(node, OsStr::from_bytes(name.to_bytes())));
             }
         }
-        // A removed `dir` still lists, as nothing: its files answer `ENODEV`, so read one, after the
-        // listing, which a removal during it then cannot have cut short unseen.
-        if is_root {
-            step_fault(&path, WalkStep::Alive)
+        // A removed `dir` still lists, as nothing: read one of its files, after the listing, which
+        // a removal during it then cannot have cut short unseen.
+        if is_root && confirm_root {
+            step_fault(tree, node, WalkStep::Alive)
                 .and_then(|()| {
                     rustix::fs::openat(&cgroup, "cgroup.events", OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
                 })
-                .map_err(|e| named(e, &path))?;
+                .map_err(|e| failed(tree, e))?;
         }
     }
-    match behind_a_mount {
-        Some(path) => Err(io::Error::other(format!(
-            "{} is behind a mount, so the cgroups under it cannot be listed",
-            path.display()
-        ))),
-        None => Ok(None),
-    }
+    Ok(Traversed::Listed { behind_a_mount })
 }
 
 /// A step of the walk at one cgroup, as a test makes it fail (see `fault::fail_walk_step`).
@@ -417,48 +536,117 @@ pub(crate) enum WalkStep {
     Alive,
 }
 
-/// What a test made `step` of the walk at `path` fail with, or `Ok`.
-fn step_fault(path: &std::path::Path, step: WalkStep) -> rustix::io::Result<()> {
+/// What a test made `step` of the walk at the cgroup `node` of `tree` fail with, or `Ok`.
+fn step_fault(tree: &Tree, node: usize, step: WalkStep) -> rustix::io::Result<()> {
     #[cfg(test)]
-    if let Some(errno) = super::fault::walk_step_failure(path, step) {
+    if let Some(errno) = super::fault::walk_step_failure(&tree.path(node), step) {
         return Err(rustix::io::Errno::from_raw_os_error(errno));
     }
-    let _ = (path, step);
+    let _ = (tree, node, step);
     Ok(())
 }
 
-/// `errno` from the walk at `path`, relative to the leaf.
-fn named(errno: rustix::io::Errno, path: &std::path::Path) -> io::Error {
-    let e = io::Error::from(errno);
-    let at = if path.as_os_str() == "." {
-        "the root of the walk".to_owned()
-    } else {
-        path.display().to_string()
-    };
-    io::Error::new(e.kind(), format!("{at}: {e}"))
+/// `errno` from the walk at the cgroup `node` of `tree`.
+fn named(errno: rustix::io::Errno, tree: &Tree, node: usize) -> io::Error {
+    at_cgroup(io::Error::from(errno), tree, node)
 }
 
-/// Open the directory at `path` under `dir`, never across a mount or a symlink, nor out of `dir`.
-fn open_beneath(dir: BorrowedFd<'_>, path: &std::path::Path) -> rustix::io::Result<OwnedFd> {
+/// `e`, as it is, so that its `errno` still classifies it; where it happened is said at debug.
+fn at_cgroup(e: io::Error, tree: &Tree, node: usize) -> io::Error {
+    log::debug!("cgroup v2: {}: {e}", tree.path(node).display());
+    e
+}
+
+/// The bytes a listing reads at once: at least one entry, the header and a name of `PATH_MAX - 1`
+/// bytes, which a program in the tree can make.
+const LISTING_BUFFER: usize = 8192;
+
+/// The longest path `openat2` takes, without its NUL.
+const PATH_MAX_BYTES: usize = libc::PATH_MAX as usize - 1;
+
+/// Split `names` into runs whose `/`-joined paths are each at most `max` bytes, as long as they
+/// can be: a name longer than `max` is a run of its own, which no open will take.
+fn pieces(names: &[&OsStr], max: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let (mut start, mut len) = (0, 0);
+    for (i, name) in names.iter().enumerate() {
+        let joined = len + usize::from(i > start) + name.len();
+        if i > start && joined > max {
+            runs.push(start..i);
+            (start, len) = (i, name.len());
+        } else {
+            len = joined;
+        }
+    }
+    if start < names.len() {
+        runs.push(start..names.len());
+    }
+    runs
+}
+
+/// Open the cgroup that `names` lead to under `dir`, however long their path: [`open_beneath`] in
+/// pieces (see [`pieces`]). Each piece is opened with [`open_beneath`] from the one before it, which
+/// is then closed. No names is `dir` itself.
+fn open_cgroup(dir: BorrowedFd<'_>, names: &[&OsStr]) -> rustix::io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    debug_assert!(
+        names.iter().all(|n| {
+            let mut parts = std::path::Path::new(n).components();
+            matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+        }),
+        "every name is one plain path component: {names:?}"
+    );
+    let mut held: Option<OwnedFd> = None;
+    for run in pieces(names, PATH_MAX_BYTES) {
+        let mut piece = names[run.start].as_bytes().to_vec();
+        for name in &names[run.start + 1..run.end] {
+            piece.push(b'/');
+            piece.extend_from_slice(name.as_bytes());
+        }
+        let opened = open_beneath(held.as_ref().map_or(dir, AsFd::as_fd), OsStr::from_bytes(&piece))?;
+        held = Some(opened);
+    }
+    match held {
+        Some(held) => Ok(held),
+        None => open_beneath(dir, "."),
+    }
+}
+
+/// Open the directory at `path` under `dir`, never across a mount or a symlink, nor out of `dir`,
+/// as an `O_PATH` descriptor above stdio.
+fn open_beneath(dir: BorrowedFd<'_>, path: impl rustix::path::Arg) -> rustix::io::Result<OwnedFd> {
     use rustix::fs::ResolveFlags;
 
-    rustix::fs::openat2(
+    let fd = rustix::fs::openat2(
         dir,
         path,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
-    )
+    )?;
+    above_stdio(fd).map_err(|e| rustix::io::Errno::from_io_error(&e).unwrap_or(rustix::io::Errno::IO))
 }
 
-/// Whether `entry`, listed in `at`, is a directory: a cgroup's own interface files are files, and
-/// its child cgroups are its directories. One gone since is not.
-fn is_dir(at: BorrowedFd<'_>, entry: &rustix::fs::DirEntry) -> io::Result<bool> {
-    Ok(match entry.file_type() {
+/// Whether `e` says a cgroup is gone: removed, or listed from a removed directory.
+fn gone(e: rustix::io::Errno) -> bool {
+    matches!(e, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV)
+}
+
+/// [`gone`], for an error that carries an `errno`.
+fn gone_io(e: &io::Error) -> bool {
+    e.raw_os_error()
+        .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno)))
+}
+
+/// Whether the entry `name` of type `file_type`, listed in `at`, is a directory, i.e. a child
+/// cgroup. One gone since is not.
+fn is_dir(at: BorrowedFd<'_>, file_type: rustix::fs::FileType, name: &std::ffi::CStr) -> io::Result<bool> {
+    Ok(match file_type {
         rustix::fs::FileType::Directory => true,
-        rustix::fs::FileType::Unknown => match rustix::fs::statat(at, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+        rustix::fs::FileType::Unknown => match rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory,
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NODEV) => false,
+            Err(e) if gone(e) => false,
             Err(e) => return Err(e.into()),
         },
         _ => false,
@@ -483,104 +671,76 @@ fn open_dir(at: impl AsFd, path: impl rustix::path::Arg) -> io::Result<OwnedFd> 
 
 pub(crate) use crate::above_stdio::above_stdio;
 
-/// Open `name` in `dir` as a directory, refusing to cross a mount or follow a symlink on the way.
-fn open_child_on_this_mount(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> rustix::io::Result<OwnedFd> {
-    use rustix::fs::ResolveFlags;
-
-    let fd = rustix::fs::openat2(
-        dir,
-        name,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
-    )?;
-    above_stdio(fd).map_err(|e| rustix::io::Errno::from_io_error(&e).unwrap_or(rustix::io::Errno::IO))
-}
-
+/// Remove every cgroup under `dir`, deepest first, and count those removed.
+///
+/// A [`traverse`] lists the tree and each cgroup's id; the cgroups are then removed in reverse visit
+/// order, so children go before parents.
 fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
-    let gone = |e: rustix::io::Errno| matches!(e, rustix::io::Errno::NOENT | rustix::io::Errno::NODEV);
-    // Listing needs a readable descriptor; the held one is `O_PATH`.
-    let listing = rustix::fs::openat(
-        dir,
-        ".",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .and_then(rustix::fs::Dir::new);
-    let entries = match listing {
-        Ok(entries) => entries,
-        Err(e) if gone(e) => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) if gone(e) => return Ok(removed),
-            Err(e) => return Err(e.into()),
-        };
-        let name = entry.file_name();
-        if matches!(name.to_bytes(), b"." | b"..") {
-            continue;
-        }
-        // A cgroup's own interface files are files; its child cgroups are its directories.
-        let is_dir = match entry.file_type() {
-            rustix::fs::FileType::Directory => true,
-            rustix::fs::FileType::Unknown => match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory,
-                Err(e) if gone(e) => false,
-                Err(e) => return Err(e.into()),
-            },
-            _ => false,
-        };
-        if !is_dir {
-            continue;
-        }
-        // Never across a mount: a mount on a child cgroup shows some other directory, whose
-        // contents are not the leaf's to remove. `EXDEV` says the name leads onto one.
-        let child = match open_child_on_this_mount(dir, name) {
-            Ok(child) => child,
-            Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
-            Err(e) => return Err(e.into()),
-        };
-        // The id is what the sweep records of a cgroup it removes. One that cannot be read leaves no
-        // record, and the cgroup is removed all the same: a leaf left behind for it would leak a
-        // cgroup (on a kernel without `CONFIG_FHANDLE`, every leaf), while a task in a cgroup
-        // removed unrecorded is still placed by its `/proc` path, or not at all, never wrongly.
-        // A cgroup gone since it was opened has nothing to record.
-        let child_id = match cgroup_id(child.as_fd()) {
+    // Each cgroup found, with the id the sweep records of it if it removes it. One whose id cannot
+    // be read leaves no record, and is removed all the same: a leaf left behind for it would leak a
+    // cgroup (on a kernel without `CONFIG_FHANDLE`, every leaf), while a task in a cgroup removed
+    // unrecorded is still placed by its `/proc` path, or not at all, never wrongly.
+    let mut found: Vec<(usize, Option<u64>)> = Vec::new();
+    let mut tree = Tree::new();
+    let traversed = traverse(&mut tree, dir, false, |tree, node, cgroup| {
+        let id = match cgroup_id(cgroup) {
             Ok(id) => Some(id),
-            Err(e)
-                if e.raw_os_error()
-                    .is_some_and(|errno| gone(rustix::io::Errno::from_raw_os_error(errno))) =>
-            {
-                continue
-            }
+            // A cgroup gone since it was opened has nothing to record.
+            Err(e) if gone_io(&e) => return Ok(Visit::Skip),
             Err(e) => {
                 log::debug!(
                     "cgroup v2: the id of child cgroup {} cannot be read ({e}); it is removed unrecorded",
-                    name.to_string_lossy()
+                    tree.name(node).to_string_lossy()
                 );
                 None
             }
         };
-        removed += remove_children(child.as_fd(), swept)?;
-        // `dir` was reached without crossing a mount, so this removes a directory entry of the
-        // leaf's own filesystem; one mounted on since is refused `EBUSY`, not followed.
-        match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
+        found.push((node, id));
+        Ok(Visit::Continue)
+    });
+    // What was found is removed even if the traversal failed part-way: the rest is left for the
+    // caller's next kill, as a cgroup `rmdir` refuses as busy is.
+    let mut removed = 0;
+    for &(node, id) in found.iter().rev() {
+        #[cfg(test)]
+        super::fault::run_before_sweep_remove(&tree.path(node));
+        // Never across a mount: a mount on a cgroup shows some other directory, whose contents are
+        // not the leaf's to remove. `EXDEV` says the path leads onto one.
+        let parent = match open_cgroup(dir, &tree.names(tree.parent(node))) {
+            Ok(parent) => parent,
+            Err(e) if gone(e) => continue,
+            Err(e @ rustix::io::Errno::XDEV) => {
+                log::debug!(
+                    "cgroup v2: {} is under a mount, so it is not removed ({e})",
+                    tree.path(node).display()
+                );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // One mounted on since is refused `EBUSY`, not followed.
+        match rustix::fs::unlinkat(&parent, tree.name(node), AtFlags::REMOVEDIR) {
             Ok(()) => {
                 removed += 1;
-                // The name may lead to another cgroup since `child` was opened, if someone removed
+                // The name may lead to another cgroup since the id was read, if someone removed
                 // that one and made this; both were under the leaf, so the id is of one that was.
-                if let Some(child_id) = child_id {
-                    swept.record(child_id);
+                if let Some(id) = id {
+                    swept.record(id);
                 }
             }
-            Err(e) if gone(e) || e == rustix::io::Errno::BUSY => {}
+            Err(e) if gone(e) => {}
+            Err(e @ rustix::io::Errno::BUSY) => {
+                log::debug!("cgroup v2: {} is busy, so it is left ({e})", tree.path(node).display());
+            }
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(removed)
+    match traversed {
+        Ok(_) => Ok(removed),
+        // A leaf already gone has nothing left to remove.
+        Err(Failure::RootGone(_)) => Ok(removed),
+        Err(Failure::Other(e)) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -590,3 +750,11 @@ mod dir_tests;
 #[cfg(test)]
 #[path = "dir_walk_tests.rs"]
 pub(crate) mod dir_walk_tests;
+
+#[cfg(test)]
+#[path = "dir_sweep_tests.rs"]
+mod dir_sweep_tests;
+
+#[cfg(test)]
+#[path = "dir_pieces_tests.rs"]
+mod dir_pieces_tests;

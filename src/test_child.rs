@@ -61,16 +61,27 @@ pub(crate) struct ClosedStdio {
 /// be made, until the guard drops. Process-wide, so it takes the witness that this test runs in a
 /// process of its own (`test_own_process::own_process`).
 #[cfg(unix)]
-pub(crate) fn exhaust_fds(_alone: &crate::test_own_process::Completion) -> RestoreNofile {
-    // SAFETY: `dup`, `close`, `getrlimit` and `setrlimit` on valid arguments.
-    unsafe {
+pub(crate) fn exhaust_fds(alone: &crate::test_own_process::Completion) -> RestoreNofile {
+    // SAFETY: `dup` and `close` on a valid descriptor.
+    let lowest_free = unsafe {
         let lowest_free = libc::dup(0);
         assert!(lowest_free >= 0, "dup(0)");
         libc::close(lowest_free);
+        lowest_free
+    };
+    lower_fd_limit(alone, lowest_free as libc::rlim_t)
+}
+
+/// Lowers the soft descriptor limit to `soft` until the guard drops. Process-wide, so takes the same
+/// witness as [`exhaust_fds`].
+#[cfg(unix)]
+pub(crate) fn lower_fd_limit(_alone: &crate::test_own_process::Completion, soft: libc::rlim_t) -> RestoreNofile {
+    // SAFETY: `getrlimit` and `setrlimit` on valid arguments.
+    unsafe {
         let mut limit: libc::rlimit = std::mem::zeroed();
         assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
         let before = limit;
-        limit.rlim_cur = lowest_free as libc::rlim_t;
+        limit.rlim_cur = soft;
         assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
         RestoreNofile(before)
     }

@@ -40,6 +40,7 @@ thread_local! {
     static CHILD_DIES: Cell<Option<ChildDeath>> = const { Cell::new(None) };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -896,13 +897,20 @@ pub(crate) fn run_before_walk_open(path: &std::path::Path) {
     }
 }
 
-type WalkFailure = (std::path::PathBuf, WalkStep, i32);
+/// The cgroup, the step, the errno, and how many times the step passes before it fails.
+type WalkFailure = (std::path::PathBuf, WalkStep, i32, usize);
 
 /// While the guard lives, `step` of the walk on this thread at the cgroup `path`, relative to the
 /// leaf (`.` is the leaf itself), fails with `errno`, as the OS answers a refusal that cannot be
-/// provoked on a real cgroup, such as a path past `PATH_MAX`.
+/// provoked on a real cgroup.
 pub(crate) fn fail_walk_step(path: &str, step: WalkStep, errno: i32) -> FailWalkStep {
-    WALK_FAILURE.with(|f| *f.borrow_mut() = Some((path.into(), step, errno)));
+    fail_walk_step_after(path, step, errno, 0)
+}
+
+/// [`fail_walk_step`], once the step has passed `passes` times at `path`: for [`WalkStep::Entries`],
+/// the failure comes at entry number `passes`, after the entries before it were read.
+pub(crate) fn fail_walk_step_after(path: &str, step: WalkStep, errno: i32, passes: usize) -> FailWalkStep {
+    WALK_FAILURE.with(|f| *f.borrow_mut() = Some((path.into(), step, errno, passes)));
     FailWalkStep(())
 }
 
@@ -916,10 +924,44 @@ impl Drop for FailWalkStep {
 }
 
 pub(crate) fn walk_step_failure(path: &std::path::Path, step: WalkStep) -> Option<i32> {
-    WALK_FAILURE.with(|f| match &*f.borrow() {
-        Some((at, failing, errno)) if at == path && *failing == step => Some(*errno),
+    WALK_FAILURE.with(|f| match &mut *f.borrow_mut() {
+        Some((at, failing, errno, passes)) if at == path && *failing == step => {
+            if *passes == 0 {
+                Some(*errno)
+            } else {
+                *passes -= 1;
+                None
+            }
+        }
         _ => None,
     })
+}
+
+/// While the guard lives, run `hook` with the path, relative to the leaf, of each cgroup the sweep
+/// on this thread (`dir::remove_children`) is about to remove, so a test can change the tree
+/// between the sweep's listing and its removals.
+pub(crate) fn set_before_sweep_remove(hook: impl FnMut(&std::path::Path) + 'static) -> BeforeSweepRemove {
+    BEFORE_SWEEP_REMOVE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    BeforeSweepRemove(())
+}
+
+#[must_use = "the hook is cleared as soon as the guard is dropped"]
+pub(crate) struct BeforeSweepRemove(());
+
+impl Drop for BeforeSweepRemove {
+    fn drop(&mut self) {
+        BEFORE_SWEEP_REMOVE.with(|h| h.borrow_mut().take());
+    }
+}
+
+pub(crate) fn run_before_sweep_remove(path: &std::path::Path) {
+    let hook = BEFORE_SWEEP_REMOVE.with(|h| h.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(path);
+        BEFORE_SWEEP_REMOVE.with(|h| {
+            h.borrow_mut().get_or_insert(hook);
+        });
+    }
 }
 
 /// While the guard lives, a leaf's cgroup id on this thread fails with `errno`, as

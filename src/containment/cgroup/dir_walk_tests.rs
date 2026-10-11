@@ -69,6 +69,64 @@ impl Drop for Scratch {
     }
 }
 
+/// A chain of cgroups, one inside the next, made level by level through held descriptors, as a
+/// path to its bottom may exceed `PATH_MAX`. Removes what is left of it, deepest first, when
+/// dropped.
+pub(crate) struct DeepTree {
+    root: OwnedFd,
+    names: Vec<String>,
+    /// `levels[0]` is the chain's first cgroup.
+    levels: Vec<OwnedFd>,
+}
+
+impl DeepTree {
+    /// `depth` levels, each named `name`.
+    pub(crate) fn new(root: &OwnedFd, name: &str, depth: usize) -> DeepTree {
+        DeepTree::with_names(root, vec![name.to_owned(); depth])
+    }
+
+    /// One level for each of `names`, outermost first.
+    pub(crate) fn with_names(root: &OwnedFd, names: Vec<String>) -> DeepTree {
+        use rustix::fs::{Mode, OFlags};
+        let mut tree = DeepTree {
+            root: rustix::io::fcntl_dupfd_cloexec(root, 3).expect("dup the root"),
+            names,
+            levels: Vec::new(),
+        };
+        for name in &tree.names.clone() {
+            let parent = tree.levels.last().unwrap_or(&tree.root);
+            rustix::fs::mkdirat(parent, name.as_str(), Mode::from_raw_mode(0o777)).expect("make a level");
+            let level = rustix::fs::openat(
+                parent,
+                name.as_str(),
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("hold a level");
+            tree.levels.push(level);
+        }
+        tree
+    }
+
+    /// The deepest cgroup of the chain.
+    pub(crate) fn bottom(&self) -> &OwnedFd {
+        self.levels.last().expect("a chain with a level")
+    }
+}
+
+impl Drop for DeepTree {
+    fn drop(&mut self) {
+        for i in (0..self.levels.len()).rev() {
+            let parent = if i == 0 { &self.root } else { &self.levels[i - 1] };
+            match rustix::fs::unlinkat(parent, self.names[i].as_str(), rustix::fs::AtFlags::REMOVEDIR) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(e) if std::thread::panicking() => eprintln!("remove a level of the chain: {e}"),
+                Err(e) => panic!("remove a level of the chain: {e}"),
+            }
+        }
+    }
+}
+
 pub(crate) fn open_path(path: &Path) -> OwnedFd {
     rustix::fs::open(
         path,
@@ -119,6 +177,35 @@ fn cgroup_the_walk_finds_a_cgroup_at_any_depth_and_only_under_its_root(#[fixture
         let walked = find_descendant(root.as_fd(), id_at(path));
         assert!(matches!(walked, Walked::Absent), "{}: {walked:?}", path.display());
     }
+}
+
+/// A tree whose path to the bottom is longer than `PATH_MAX` is walked whole: the walk finds the
+/// bottom, and answers `Absent` for a cgroup that is not there, never `Unknown`. It holds the
+/// descriptors it held before the walk each time it is about to open a cgroup. Mutant: "a path past
+/// `PATH_MAX` is opened in one piece".
+#[skuld::test]
+fn cgroup_the_walk_of_a_path_longer_than_path_max_finds_the_bottom(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-long");
+    let root = scratch.fd();
+    let chain = DeepTree::new(&root, &"n".repeat(200), 30);
+    let bottom = cgroup_id(chain.bottom().as_fd()).expect("the bottom's id");
+    let open_fds = || std::fs::read_dir("/proc/self/fd").expect("list fds").count();
+    let before = open_fds();
+    let counts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _hook = crate::containment::cgroup::fault::set_before_walk_open({
+        let counts = std::rc::Rc::clone(&counts);
+        move |_| counts.borrow_mut().push(open_fds())
+    });
+    let walked = find_descendant(root.as_fd(), bottom);
+    assert!(matches!(walked, Walked::Found), "{walked:?}");
+    let walked = find_descendant(root.as_fd(), 1);
+    assert!(matches!(walked, Walked::Absent), "{walked:?}");
+    let counts = counts.borrow();
+    assert_eq!(counts.len(), 31 + 31, "the walk visits every cgroup once");
+    assert!(
+        counts.iter().all(|&n| n == before),
+        "{before} before the walk, then {counts:?}"
+    );
 }
 
 /// A cgroup removed during the walk is skipped: what was under it is not found, and the rest is.
@@ -185,19 +272,22 @@ fn cgroup_a_walk_of_a_root_gone_at_any_step_cannot_tell(#[fixture(cgroup)] _grou
     }
 }
 
-/// A refusal the walk cannot get past is `Unknown`, never `Absent`: a path past `PATH_MAX`
-/// (`ENAMETOOLONG`) and a cgroup this process may not read (`EACCES`), at any step. Mutant: "the
-/// refusal is skipped like a removed cgroup".
+/// A refusal the walk cannot get past (`EACCES` from a cgroup this process may not read, or `EIO`)
+/// is `Unknown`, never `Absent`, at any step, and the error keeps its `errno`. Mutants: "the refusal
+/// is skipped like a removed cgroup"; "the error is rebuilt without its `errno`".
 #[skuld::test]
 fn cgroup_a_walk_that_is_refused_cannot_tell(#[fixture(cgroup)] _group: &Group) {
     let scratch = Scratch::new("walk-refused");
     scratch.make("a/b");
     let root = scratch.fd();
     for step in [WalkStep::Open, WalkStep::Id, WalkStep::List, WalkStep::Entries] {
-        for errno in [libc::ENAMETOOLONG, libc::EACCES] {
+        for errno in [libc::EIO, libc::EACCES] {
             let _failing = fail_walk_step("./a", step, errno);
             let walked = find_descendant(root.as_fd(), 1);
-            assert!(matches!(walked, Walked::Unknown(_)), "{step:?} {errno}: {walked:?}");
+            match walked {
+                Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(errno), "{step:?} {errno}: {e}"),
+                other => panic!("{step:?} {errno}: {other:?}"),
+            }
         }
     }
 }
@@ -248,6 +338,29 @@ fn cgroup_the_walk_holds_no_descriptor_between_cgroups(#[fixture(cgroup)] _group
     );
 }
 
+/// A walk that fails at a later entry of a listing than the first, after cgroups were queued from
+/// the entries before it, cannot tell: `Unknown`, not the target of a queued cgroup, and not
+/// `Absent`. Mutant: "the entries fault fires at the first entry only".
+#[skuld::test]
+fn cgroup_a_walk_that_fails_after_entries_were_queued_cannot_tell(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-late-entry");
+    let queued = id_at(&scratch.make("a/x"));
+    scratch.make("b");
+    let root = scratch.fd();
+    // Entries of the root: `.`, `..`, and what `read_dir` lists; the last of them is the one to fail.
+    let entries = std::fs::read_dir(scratch.path()).expect("list the root").count() + 2;
+    let failing =
+        crate::containment::cgroup::fault::fail_walk_step_after(".", WalkStep::Entries, libc::EIO, entries - 1);
+    match find_descendant(root.as_fd(), queued) {
+        Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    drop(failing);
+    let _past = crate::containment::cgroup::fault::fail_walk_step_after(".", WalkStep::Entries, libc::EIO, entries);
+    let walked = find_descendant(root.as_fd(), queued);
+    assert!(matches!(walked, Walked::Found), "no entry past the last: {walked:?}");
+}
+
 /// A cgroup behind a mount cannot be listed, so a walk that meets one cannot tell what is under
 /// it: it answers `Unknown`, never `Absent`, whether the cgroup sought is behind the mount or
 /// nowhere. The walking thread has its own mount namespace, the mount's, in which it holds the
@@ -270,7 +383,10 @@ fn cgroup_the_walk_cannot_tell_behind_a_mount(#[fixture(cgroup)] _group: &Group)
             .expect("the walking thread")
     });
     for walked in walked {
-        assert!(matches!(walked, Walked::Unknown(_)), "{walked:?}");
+        match walked {
+            Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(libc::EXDEV), "{e}"),
+            other => panic!("{other:?}"),
+        }
     }
     let root = scratch.fd();
     assert!(matches!(find_descendant(root.as_fd(), hidden), Walked::Found));
