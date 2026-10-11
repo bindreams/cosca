@@ -126,7 +126,7 @@ fn a_failed_delete_fails_the_test(#[fixture(shell_execute)] _group: &Group) {
     );
 }
 
-/// A parent that appears between the guard's levels, made by someone else, is not the guard's to delete. Mutant: the
+/// A parent chain that appears between the guard's levels, made by someone else, is not the guard's to delete. Mutant: the
 /// guard decides which levels are its own before creating any.
 #[skuld::test]
 fn the_guard_keeps_a_parent_created_by_someone_else_meanwhile(#[fixture(shell_execute)] _group: &Group) {
@@ -140,7 +140,7 @@ fn the_guard_keeps_a_parent_created_by_someone_else_meanwhile(#[fixture(shell_ex
         &key,
         Path::new(r"C:\x.exe"),
         &mut |level| {
-            if level == middle {
+            if level == top {
                 other = Some(register(&middle));
             }
         },
