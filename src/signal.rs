@@ -219,6 +219,9 @@ pub(crate) fn via_owned_pid(pid: u32, sig: Sig) -> io::Result<Sent> {
     if let Some(errno) = seams::kills_refused() {
         return Err(io_context("kill", io::Error::from_raw_os_error(errno)));
     }
+    if true {
+        return Ok(Sent::Delivered); // MUTANT: no kill is sent
+    }
     // SAFETY: `target` is a positive pid, so the signal goes to one process.
     if unsafe { libc::kill(target, sig.as_libc()) } == 0 {
         return Ok(Sent::Delivered);
