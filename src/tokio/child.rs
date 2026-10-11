@@ -758,7 +758,6 @@ impl Child {
     pub(crate) fn kill_tree_after(&mut self, earlier: Option<&str>) -> Result<(), Error> {
         #[cfg(not(target_os = "macos"))]
         let _ = earlier;
-        self.require_contained()?;
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. `None` for a child the backstop may signal; for a front
         // it must not, `Some(true)` when the front is in the cgroup, `Some(false)` when it exited.
@@ -778,6 +777,7 @@ impl Child {
         {
             return result;
         }
+        self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
         // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
         // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).

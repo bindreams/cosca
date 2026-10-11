@@ -618,7 +618,6 @@ impl Child {
     pub(crate) fn kill_tree_after(&self, earlier: Option<&str>) -> Result<(), Error> {
         #[cfg(not(target_os = "macos"))]
         let _ = earlier;
-        self.require_contained()?;
         // Decided once: the gate is not asked again after the kill, when a killed front may read as
         // neither exited nor in its cgroup. It comes before the root's state: a front
         // that may not be signalled is refused whatever the root's number names.
@@ -636,6 +635,7 @@ impl Child {
         {
             return result;
         }
+        self.require_contained()?;
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): if a pgid-based
         // mechanism's leader pid has been reaped AND RECYCLED onto a DIFFERENT, LIVE process
         // group, `killpg` would signal that unrelated group instead. `carries_recyclable_pgid`
