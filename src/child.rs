@@ -710,7 +710,7 @@ impl Child {
         // handle-based kill covers that, so its failure is contract-relevant.
         // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
         // launchd holds, so there is nothing left for the backstop to kill.
-        let backstop = if self.root_is_unpinned() {
+        let backstop = if crate::signal::untrusted_root(|| self.proc.state()).is_some() {
             log::debug!(
                 "kill_tree({}): launchd holds the root's zombie, so the handle backstop is skipped",
                 self.id.pid()

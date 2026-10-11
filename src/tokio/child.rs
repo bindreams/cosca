@@ -826,7 +826,7 @@ impl Child {
         // launchd holds, so there is nothing left for the backstop to kill. Read once: the send
         // below is the gated one, which does not read the state again.
         #[cfg(unix)]
-        let backstop = if self.root_is_unpinned() {
+        let backstop = if crate::signal::untrusted_root(|| self.root_state()).is_some() {
             log::debug!(
                 "kill_tree({}): launchd holds the root's zombie, so the handle backstop is skipped",
                 self.id.pid()
