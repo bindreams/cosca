@@ -265,17 +265,21 @@ jobs:
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features pty --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (pty feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} pty cargo nextest run --locked --features pty --target ${{ matrix.target }}
 
 
       - name: Build tests (tokio feature)
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --no-run --features tokio --target ${{ matrix.target }} --profile ci
 
       - name: Run tests (tokio feature)
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
