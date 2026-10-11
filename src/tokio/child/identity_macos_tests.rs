@@ -383,6 +383,9 @@ async fn macos_tokio_spawn_of_an_unreported_child_kills_and_reaps_it() {
     use crate::child::spawn::identity_macos_tests::assert_reaped_and_warned_once;
     crate::log_capture::install();
     let (mut cmd, writer) = tokio_blocker();
+    // As the sync twin: the child ends by itself, so a missing kill fails by assertion, not by hang.
+    drop(writer);
+    let sent = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
     let err = {
         let _unwritten = crate::child::spawn::unique_report::seams::find_the_report_unwritten();
@@ -397,14 +400,13 @@ async fn macos_tokio_spawn_of_an_unreported_child_kills_and_reaps_it() {
         crate::error::ChildFate::Reaped,
         "an unreported child is killed and reaped"
     );
-    assert_reaped_and_warned_once(id.pid(), mark);
-    drop(writer);
+    assert_reaped_and_warned_once(id.pid(), mark, &sent.entries());
 }
 
 /// Async twin of `macos_sync_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_running`.
 #[skuld::test]
 async fn macos_tokio_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_running() {
-    use crate::child::spawn::identity_macos_tests::assert_warned_once;
+    use crate::child::spawn::identity_macos_tests::{assert_warned_once, SAID_KILLED, SAID_REAPED, SAID_RUNNING};
     crate::log_capture::install();
     let (mut cmd, writer) = tokio_blocker();
     let mark = crate::log_capture::mark();
@@ -420,7 +422,7 @@ async fn macos_tokio_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_i
     let pid = id.pid();
     assert_eq!(fate, crate::error::ChildFate::Running { id: None });
     assert!(has_not_exited(pid), "nothing ended the child");
-    assert_warned_once(pid, mark);
+    assert_warned_once(pid, mark, SAID_RUNNING, &[SAID_REAPED, SAID_KILLED]);
     end_unsignalled_and_reap(pid);
     drop(writer);
 }
@@ -428,7 +430,7 @@ async fn macos_tokio_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_i
 /// Async twin of `macos_sync_spawn_of_an_unreported_child_whose_wait_fails_is_killed`.
 #[skuld::test]
 async fn macos_tokio_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
-    use crate::child::spawn::identity_macos_tests::assert_warned_once;
+    use crate::child::spawn::identity_macos_tests::{assert_warned_once, SAID_KILLED, SAID_REAPED, SAID_RUNNING};
     crate::log_capture::install();
     let (mut cmd, writer) = tokio_blocker();
     let mark = crate::log_capture::mark();
@@ -443,7 +445,7 @@ async fn macos_tokio_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
     };
     let pid = id.pid();
     assert_eq!(fate, crate::error::ChildFate::Killed);
-    assert_warned_once(pid, mark);
+    assert_warned_once(pid, mark, SAID_KILLED, &[SAID_REAPED, SAID_RUNNING]);
     let mut status = 0;
     // SAFETY: `pid` is this test's own unreaped child, killed by the spawn.
     let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
