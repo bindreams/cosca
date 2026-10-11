@@ -804,9 +804,15 @@ pub(crate) fn assert_reaped_and_warned_once(pid: u32, mark: usize) {
     let rc = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
     assert_eq!(rc, -1, "the child must be reaped already, waitpid gave {rc}");
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
-    let warns: Vec<String> = crate::log_capture::records_since(mark, &format!("child {pid} "))
+    assert_warned_once(pid, mark);
+}
+
+/// Asserts the teardown of `pid` produced exactly one `warn` naming it, and did not call it dead.
+pub(crate) fn assert_warned_once(pid: u32, mark: usize) {
+    let marker = format!("child {pid} ");
+    let warns: Vec<String> = crate::log_capture::records_since(mark, &marker)
         .into_iter()
-        .zip(crate::log_capture::levels_since(mark, &format!("child {pid} ")))
+        .zip(crate::log_capture::levels_since(mark, &marker))
         .filter(|(_, level)| *level == log::Level::Warn)
         .map(|(text, _)| text)
         .collect();
@@ -819,6 +825,67 @@ pub(crate) fn assert_reaped_and_warned_once(pid: u32, mark: usize) {
         !crate::log_capture::contains_since(mark, &format!("child {pid} died before exec")),
         "an unreported child is not reported dead"
     );
+}
+
+/// An unreported child whose kill the OS refuses (a setuid child answers `EPERM`) cannot be ended:
+/// it is still running and still unreaped, the fate says `Running` and not `Reaped`, and the one
+/// warn says so.
+///
+/// Mutants: the refused kill is reported `Reaped`, `Killed` or `Gone`; the refusal is not warned of
+/// (or warned of twice).
+#[skuld::test]
+fn macos_sync_spawn_of_an_unreported_child_whose_kill_is_refused_leaves_it_running() {
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = unique_report::seams::find_the_report_unwritten();
+        let _refused = crate::signal::seams::refuse_kills();
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let pid = id.pid();
+    assert_eq!(fate, crate::error::ChildFate::Running { id: None });
+    assert!(has_not_exited(pid), "nothing ended the child");
+    assert_warned_once(pid, mark);
+    end_unsignalled_and_reap(pid);
+    drop(writer);
+}
+
+/// An unreported child whose kill was delivered but whose wait failed is dead or dying and its
+/// status was not collected: `Killed`, not `Reaped`, and one warn.
+///
+/// Mutants: the failed wait is reported `Reaped` or `Running`; it is not warned of (or warned twice).
+#[skuld::test]
+fn macos_sync_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
+    crate::log_capture::install();
+    let (mut cmd, writer) = sync_blocker();
+    let mark = crate::log_capture::mark();
+    let err = {
+        let _unwritten = unique_report::seams::find_the_report_unwritten();
+        let _failed = force_peek_once(Err(std::io::Error::other("forced wait failure")));
+        cmd.spawn().expect_err("an unreported child is not adopted")
+    };
+    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
+        panic!("the spawn captured the child");
+    };
+    let pid = id.pid();
+    assert_eq!(fate, crate::error::ChildFate::Killed);
+    assert_warned_once(pid, mark);
+    // The wait failed, so the zombie is the test's to collect; its status shows the spawn's kill.
+    let mut status = 0;
+    // SAFETY: `pid` is this test's own unreaped child, killed by the spawn.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t);
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "{status:#x}"
+    );
+    drop(writer);
 }
 
 /// An elevation front whose report was not yet written is left as every front is: sent nothing and
