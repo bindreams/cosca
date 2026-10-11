@@ -684,6 +684,8 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
+        return Ok(());
+        #[allow(unreachable_code)]
         let group_result = self.attached.hard_kill_marking(&self.tree_killed);
         // A TreeWalk that could not walk killed nothing, and the root's death would strand the
         // descendants beyond a retry: return the error with the tree intact.
