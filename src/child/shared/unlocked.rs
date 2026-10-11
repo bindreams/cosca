@@ -16,6 +16,13 @@ pub(super) enum Unlocked {
     DeadlinePassed,
     /// Someone else reaped the child.
     Gone,
+    /// Launchd holds the child's zombie because its tracer died: exited, and not this process's to
+    /// reap. The holder reports it (see [`Orphaned`](super::waiting::Orphaned)).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS has a zombie launchd holds")
+    )]
+    Orphaned,
 }
 
 impl SharedChild {
@@ -175,14 +182,8 @@ impl SharedChild {
             Waited::Reapable => Unlocked::ExitSeen,
             Waited::DeadlinePassed => Unlocked::DeadlinePassed,
             Waited::Gone => Unlocked::Gone,
-            // Not ours to reap, and not shown reaped: the wait gives up on it, saying so.
-            Waited::Orphaned => {
-                log::warn!(
-                    "pid {}: not ours to reap (launchd holds its zombie, because its tracer died)",
-                    self.id.pid()
-                );
-                Unlocked::Gone
-            }
+            // Not ours to reap, and not shown reaped: the wait gives up on it.
+            Waited::Orphaned => Unlocked::Orphaned,
         })
     }
 
