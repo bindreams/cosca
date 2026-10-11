@@ -131,7 +131,7 @@ pub(crate) fn refuse_unpinned(
     state: impl FnOnce() -> RootState,
 ) -> Result<(), crate::error::Error> {
     #[cfg(target_os = "macos")]
-    if is_unpinned(state) {
+    if matches!(state(), RootState::Unpinned | RootState::Unknown(_)) {
         return Err(unpinned_refusal(pid, op, earlier));
     }
     #[cfg(not(target_os = "macos"))]
