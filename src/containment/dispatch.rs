@@ -660,7 +660,7 @@ impl Attached {
                 source: None,
             }));
         };
-        let except = matches!(root, crate::signal::RootState::Unpinned).then(|| m.root());
+        let except: Option<crate::identity::ProcessId> = None;
         log::debug!("{op}: {why}, so it does not {skipped}; it signals the marker holders");
         let result = match signal {
             TreeSignal::Kill => m.hard_kill_holders_only(except),
