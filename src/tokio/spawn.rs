@@ -512,7 +512,14 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
     #[cfg(target_os = "macos")]
     let (identity, not_adopted) = match crate::child::spawn::unique_report::adopted_id(unique, pid) {
         Ok(unique) => (Some(unique), None),
-        Err(not_adopted) => (None, Some(not_adopted)),
+        // A late id still names the child, for its teardown.
+        Err(not_adopted) => (
+            match not_adopted.why {
+                crate::child::spawn::unique_report::Unadoptable::Late(unique) => Some(unique),
+                _ => None,
+            },
+            Some(not_adopted),
+        ),
     };
     // Built first so failure arms tear the child down through its handle, not its pid. On macOS a
     // child with no adopted id is id-less, and the spawn fails below.
@@ -541,13 +548,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                 proc.forget_because("died before exec");
                 SpawnFailure::NotStarted(error)
             }
-            // It may yet report and `exec`: forgotten, as a corpse would be, but left running.
-            Unadoptable::Unreported => {
-                proc.forget_because(
-                    "had not reported its unique id when its spawn returned; it is not adopted, and may be running",
-                );
+            // An elevation front is sent nothing: forgotten and left unreaped, as for an unverified one.
+            Unadoptable::Late(_) if front.is_some() => {
+                proc.leave_late_front(pid);
                 SpawnFailure::started(left.note(error, front, Some(pid)), ChildFate::Running { id: None })
             }
+            // Its id came late: torn down through it, as the sync spawn does.
+            Unadoptable::Late(unique) => SpawnFailure::started(error, proc.reap_unreported(pid, unique)),
             // An elevation front is sent nothing and handed to no reaper: left unreaped, as the sync
             // spawn leaves it, and the error says so.
             Unadoptable::Unverified if front.is_some() => {
@@ -703,7 +710,13 @@ pub(super) fn spawn_uncommitted(cmd: &mut Command) -> Result<Child, SpawnFailure
                     identity.expect("a spawn that reached the attach adopted its unique id"),
                     Some(id),
                 );
-                proc.forget_because("is a child whose attach failed, killed through its verified unique id");
+                // A child its kill did not end is released to tokio's orphan reaper, not forgotten, which
+                // would leave a zombie nothing collects.
+                if matches!(fate, ChildFate::Running { .. }) {
+                    proc.release();
+                } else {
+                    proc.forget_because("is a child whose attach failed, killed through its verified unique id");
+                }
                 fate
             };
             // The child is spawned (on Windows possibly CREATE_SUSPENDED) - tear it down so a failed

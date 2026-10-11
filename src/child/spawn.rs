@@ -756,13 +756,124 @@ fn teardown_after_attach_failure(child: std::process::Child, unique: u64, id: Pr
 pub(crate) fn kill_and_reap_verified(pid: u32, unique: u64, id: Option<ProcessId>) -> ChildFate {
     let mut notes = Vec::new();
     let mut breach = None;
-    let fate = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
+    let (fate, kill) = kill_and_reap_noting(pid, unique, id, &mut notes, &mut breach);
+    if let KillOutcome::Refused(why) = kill {
+        // First, as the order of events: the kill, then the reap's notes.
+        notes.insert(0, format!("could not be killed: {why}"));
+    }
+    // The caller drops the `std` `Child`, which reaps nothing: a child still running stays a zombie.
+    if matches!(fate, ChildFate::Running { .. }) {
+        notes.push(ZOMBIE_NOTE.to_owned());
+    }
     if !notes.is_empty() {
         log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
     }
     // After the log: an assertion that fires first would take the warn with it.
     debug_assert!(breach.is_none(), "{}", breach.unwrap_or_default());
     fate
+}
+
+/// What a teardown that leaves its child running leaves behind, when nothing holds the child's handle.
+#[cfg(target_os = "macos")]
+const ZOMBIE_NOTE: &str = "is left unreaped: it stays a zombie once it exits";
+
+/// What became of the kill of a teardown.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// `SIGKILL` was sent.
+    Delivered,
+    /// The id check found the child gone or its pid another process's: nothing was sent.
+    NotSent,
+    /// The kill failed with this error; the child was not signalled.
+    Refused(String),
+}
+
+/// What [`kill_and_reap_unreported`] did, before the event's one `warn`.
+#[cfg(target_os = "macos")]
+pub(crate) struct Unreported {
+    pub(crate) fate: ChildFate,
+    kill: KillOutcome,
+    notes: Vec<String>,
+    breach: Option<String>,
+}
+
+/// Kills and reaps `pid`, a child whose unique id `unique` arrived only after its spawn returned. Its
+/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are.
+/// Warns nothing: [`Unreported::warn`] does, once.
+#[cfg(target_os = "macos")]
+pub(crate) fn kill_and_reap_unreported(pid: u32, unique: u64) -> Unreported {
+    let mut notes = Vec::new();
+    let mut breach = None;
+    let (fate, kill) = kill_and_reap_noting(pid, unique, None, &mut notes, &mut breach);
+    Unreported {
+        fate,
+        kill,
+        notes,
+        breach,
+    }
+}
+
+/// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
+#[cfg(target_os = "macos")]
+const LATE: &str = "had not reported its unique id when its spawn returned, so its exec cannot be confirmed and the \
+                    program may have started; it was not adopted";
+
+/// The sentence for what a teardown did, built from the kill and the fate, so that each is said only
+/// when it happened.
+#[cfg(target_os = "macos")]
+fn said(kill: &KillOutcome, fate: ChildFate) -> String {
+    let sent = match kill {
+        KillOutcome::Delivered => "was sent SIGKILL".to_owned(),
+        KillOutcome::NotSent => "was gone, or its pid names another process, so nothing was sent".to_owned(),
+        KillOutcome::Refused(why) => format!("could not be killed ({why})"),
+    };
+    let state = match fate {
+        ChildFate::Reaped => "it was reaped",
+        ChildFate::Killed => "its status was not collected",
+        ChildFate::Running { .. } => "it is still running",
+        ChildFate::Gone => "it is gone, or was reaped by someone else",
+        ChildFate::Unknown => "what became of it is unknown",
+    };
+    format!("{sent}; {state}")
+}
+
+#[cfg(target_os = "macos")]
+impl Unreported {
+    /// The event's one `warn`: what happened to child `pid`. `tail` is what the caller did with the
+    /// handle it holds, if that is worth saying (a forget's leak, a child left unreaped).
+    pub(crate) fn warn(self, pid: u32, tail: Option<&str>) -> ChildFate {
+        let mut line = format!("child {pid} {LATE}, and {}", said(&self.kill, self.fate));
+        // The sentence says it is still running.
+        for note in self.notes.iter().filter(|note| *note != "is still running") {
+            line.push_str("; ");
+            line.push_str(note);
+        }
+        if let Some(tail) = tail {
+            line.push_str("; ");
+            line.push_str(tail);
+        }
+        log::warn!("{line}");
+        // After the log: an assertion that fires first would take the warn with it.
+        debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
+        self.fate
+    }
+
+    /// What the sync spawn says of a child it leaves behind, when it is still running.
+    pub(crate) fn zombie_tail(&self) -> Option<&'static str> {
+        matches!(self.fate, ChildFate::Running { .. }).then_some(ZOMBIE_NOTE)
+    }
+}
+
+/// The one `warn` for an elevation front whose report came late: it is sent nothing and left unreaped
+/// (it stays a zombie once it exits), whatever the id says.
+#[cfg(target_os = "macos")]
+pub(crate) fn warn_late_front(pid: u32, tail: Option<&str>) {
+    let tail = tail.map_or_else(String::new, |tail| format!("; {tail}"));
+    log::warn!(
+        "child {pid} {LATE}; it is an elevation front, so nothing was sent to it and it is left unreaped: it stays a \
+         zombie once it exits{tail}"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -772,44 +883,52 @@ fn kill_and_reap_noting(
     id: Option<ProcessId>,
     notes: &mut Vec<String>,
     breach: &mut Option<String>,
-) -> ChildFate {
+) -> (ChildFate, KillOutcome) {
     use crate::signal::{via_verified_pid, Sent, Sig};
     use crate::wait::backend::{await_reapable, Waited};
     use crate::wait::exit_only::Foreign;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
     match via_verified_pid(pid, Some(unique), Sig::Kill) {
-        Ok(Sent::Delivered) => match await_reapable(pid, Some(unique), None) {
-            Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
-            Ok(Waited::Gone) => {
-                log::debug!("spawn teardown: pid {pid} was reaped by someone else");
-                Foreign::Gone.fate(true)
-            }
-            Ok(Waited::Orphaned) => {
-                notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
-                Foreign::Orphaned.fate(true)
-            }
-            Ok(Waited::DeadlinePassed) => {
-                notes.push("is still running after its kill".to_owned());
-                ChildFate::Running { id }
-            }
-            Err(e) => {
-                notes.push(format!("could not be waited for: {e}"));
-                ChildFate::Killed
-            }
-        },
+        Ok(Sent::Delivered) => {
+            // A fixture that only the kill would end is released here when no kill was sent.
+            #[cfg(test)]
+            fault::run_between_kill_and_wait();
+            let fate = match await_reapable(pid, Some(unique), None) {
+                Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, notes, breach),
+                Ok(Waited::Gone) => {
+                    log::debug!("spawn teardown: pid {pid} was reaped by someone else");
+                    Foreign::Gone.fate(true)
+                }
+                Ok(Waited::Orphaned) => {
+                    notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
+                    Foreign::Orphaned.fate(true)
+                }
+                // The wait has no deadline, so it cannot pass.
+                Ok(Waited::DeadlinePassed) => {
+                    debug_assert!(false, "an unbounded wait reported a passed deadline");
+                    notes.push("is still running after its kill".to_owned());
+                    ChildFate::Running { id }
+                }
+                Err(e) => {
+                    notes.push(format!("could not be waited for: {e}"));
+                    ChildFate::Killed
+                }
+            };
+            (fate, KillOutcome::Delivered)
+        }
         Ok(Sent::Gone) => {
             log::debug!("spawn teardown: pid {pid} is already gone");
-            Foreign::Gone.fate(false)
+            (Foreign::Gone.fate(false), KillOutcome::NotSent)
         }
         Ok(Sent::Unverified) => {
             debug_assert!(false, "`via_verified_pid` was given `Some(unique)`, so it verifies");
             notes.push("could not be verified, so it was not signalled".to_owned());
-            ChildFate::Running { id }
+            (ChildFate::Running { id }, KillOutcome::NotSent)
         }
         Err(kill) => {
-            notes.push(format!("could not be killed: {kill}"));
-            reap_verified(pid, &target, id, false, notes, breach)
+            let fate = reap_verified(pid, &target, id, false, notes, breach);
+            (fate, KillOutcome::Refused(kill.to_string()))
         }
     }
 }
@@ -880,9 +999,9 @@ fn reap_verified(
 
 /// macOS: `child` could not be adopted, so it is abandoned with nothing signalled or waited on by
 /// pid, and the spawn fails with `not_adopted.error`. A child that died before `exec` is only a
-/// corpse nothing collects, and the program did not start. A child that had not reported is left
-/// running and unreaped. Any other is left as `leave_unverified_child` leaves it. Either of those may
-/// have started the program, and the error notes that a `front` is left unreaped.
+/// corpse nothing collects, and the program did not start. A child whose id came late may have
+/// started the program, and is torn down through that id; a `front` is left running and unreaped
+/// instead, and the error notes it. Any other is left as `leave_unverified_child` leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
@@ -901,19 +1020,26 @@ fn abandon_unadopted(
             drop(child);
             SpawnFailure::NotStarted(error)
         }
-        Unadoptable::Unreported => {
+        Unadoptable::Late(unique) => {
             #[cfg(test)]
             fault::capture(ProcessId::of(pid));
-            log::warn!(
-                "child {pid} had not reported its unique id when its spawn returned; it is not adopted, nothing is \
-                 signalled or waited on by pid, and it may be running"
-            );
+            // A front is sent nothing: it is left running and unreaped, with its note.
+            if front.is_some() {
+                warn_late_front(pid, None);
+                drop(child);
+                return SpawnFailure::started(
+                    FrontFate::LeftUnreaped.note(error, front, Some(pid)),
+                    // The id was reported, but no `ProcessId` was read from it.
+                    ChildFate::Running { id: None },
+                );
+            }
+            // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
+            // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
+            let done = kill_and_reap_unreported(pid, unique);
+            let tail = done.zombie_tail();
+            let fate = done.warn(pid, tail);
             drop(child);
-            SpawnFailure::started(
-                FrontFate::LeftUnreaped.note(error, front, Some(pid)),
-                // No unique id was read, so there is no identity to give.
-                ChildFate::Running { id: None },
-            )
+            SpawnFailure::started(error, fate)
         }
         Unadoptable::Unverified => {
             // No unique id was read, so there is no identity to give.
@@ -2938,6 +3064,10 @@ mod identity_error_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "spawn/identity_macos_tests.rs"]
 pub(crate) mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "spawn/late_report_tests.rs"]
+pub(crate) mod late_report_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn/identity_peek_tests.rs"]
