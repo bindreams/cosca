@@ -78,11 +78,14 @@ pub(crate) fn group_blocker() -> (crate::Child, std::io::PipeWriter) {
     (child, writer)
 }
 
-/// A session child whose root `sh` holds one descendant `sleep` (a second marker holder), and that
-/// descendant's pid, read once the root has started it.
-pub(crate) fn session_tree() -> (crate::Child, u32) {
+/// A session child whose root `cat` (held on its stdin, so only a signal ends it) holds one
+/// descendant `sleep`, a second marker holder, and that descendant's pid, read once the root has
+/// started it. Neither exits on its own, so the holders do not change under a sweep.
+pub(crate) fn session_tree() -> (crate::Child, std::io::PipeWriter, u32) {
+    let (stdin, writer) = crate::test_child::held_writer_stdin();
     let mut cmd = Command::new();
-    cmd.args(["sh", "-c", "sleep 600 & echo $!; wait $!"]);
+    cmd.args(["sh", "-c", "sleep 600 & echo $!; exec cat"]);
+    cmd.stdin(stdin).expect("set stdin");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout");
     cmd.contain_with(ContainMode::Session);
     let mut child = cmd.spawn().expect("spawn");
@@ -90,7 +93,7 @@ pub(crate) fn session_tree() -> (crate::Child, u32) {
     BufReader::new(child.stdout().expect("piped stdout"))
         .read_line(&mut line)
         .expect("the descendant's pid");
-    (child, line.trim().parse().expect("a pid"))
+    (child, writer, line.trim().parse().expect("a pid"))
 }
 
 /// The two states the tree paths cannot send by number for.
@@ -342,7 +345,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         let groups = crate::containment::unix::fault::record_kill_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (child, descendant) = session_tree();
+        let (child, writer, descendant) = session_tree();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -362,6 +365,7 @@ fn kill_tree_of_an_untrusted_session_root_kills_its_holders_only() {
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        drop(writer);
     }
 }
 
@@ -462,7 +466,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         let groups = crate::containment::unix::fault::record_term_group();
         let walks = crate::containment::treewalk::fault::record_walks();
         let holders = crate::containment::fdmarker::fault::record_holder_kills();
-        let (child, descendant) = session_tree();
+        let (child, writer, descendant) = session_tree();
         let pid = child.id().pid();
         let sends = Capture::start();
         let mark = crate::log_capture::mark();
@@ -482,6 +486,7 @@ fn terminate_tree_of_an_untrusted_session_root_signals_its_holders_only() {
         };
         assert_eq!(sorted(holders.killed()), want, "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        drop(writer);
     }
 }
 

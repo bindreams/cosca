@@ -771,6 +771,12 @@ pub(crate) mod fault {
         }
     }
 
+    /// The holders signalled so far under a live [`record_holder_kills`], for a hook that cannot
+    /// borrow the recorder.
+    pub(crate) fn holder_kills_so_far() -> Vec<u32> {
+        HOLDER_KILLS.with(|k| k.borrow().clone().expect("a recorder is live"))
+    }
+
     pub(super) fn note_holder_kill(pid: u32) {
         HOLDER_KILLS.with(|k| {
             if let Some(killed) = k.borrow_mut().as_mut() {

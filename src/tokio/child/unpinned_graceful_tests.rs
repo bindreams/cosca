@@ -166,36 +166,58 @@ async fn graceful_shutdown_tree_of_an_untrusted_root_with_no_identity_channel_en
     }
 }
 
+/// An fd marker still has its holders: they get the `SIGTERM` by identity, and no `killpg`. A hook
+/// right after the terminate reads who was signalled, before the sweep: the descendant, and the
+/// root only when it is `Unknown`, not `Unpinned`. The grace is zero, so the sweep follows at
+/// once.
+///
 /// Mutants: the terminate fires `killpg`; it signals the `Unpinned` root; it spares the `Unknown`
 /// root; it signals no holder.
 #[skuld::test]
 async fn graceful_shutdown_tree_of_an_untrusted_session_root_signals_its_holders_only() {
-    use std::os::unix::process::ExitStatusExt as _;
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
     for state in BOTH {
         let groups = crate::containment::unix::fault::record_term_group();
-        let (mut child, _descendant) = session_tree().await;
+        let _holders = crate::containment::fdmarker::fault::record_holder_kills();
+        let (mut child, writer, descendant) = session_tree().await;
+        let pid = child.id().pid();
         let mark = crate::log_capture::mark();
+        let after_terminate: Arc<Mutex<Option<Vec<u32>>>> = Arc::default();
+        let hook = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, {
+            let seen = Arc::clone(&after_terminate);
+            move || {
+                *seen.lock().expect("the hook's slot") =
+                    Some(crate::containment::fdmarker::fault::holder_kills_so_far())
+            }
+        });
         let _looks = state.peek();
 
-        let status = child
-            .graceful_shutdown_tree(Duration::from_secs(3600))
+        child
+            .graceful_shutdown_tree(Duration::ZERO)
             .await
-            .expect("the tree drains and the root is reaped");
+            .expect("the tree is swept and the root reaped");
 
+        drop(hook);
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
-        match state {
-            Untrusted::Unpinned => {
-                assert_eq!(
-                    status.code(),
-                    Some(143),
-                    "{state:?}: the root ends when its descendant is signalled"
-                )
+        let mut signalled = after_terminate
+            .lock()
+            .expect("the hook's slot")
+            .clone()
+            .expect("the terminate ran");
+        signalled.sort_unstable();
+        signalled.dedup();
+        let want = match state {
+            Untrusted::Unpinned => vec![descendant],
+            Untrusted::Unknown => {
+                let mut both = vec![pid, descendant];
+                both.sort_unstable();
+                both
             }
-            Untrusted::Unknown => assert_eq!(status.signal(), Some(libc::SIGTERM), "{state:?}"),
-        }
+        };
+        assert_eq!(signalled, want, "{state:?}");
         assert_eq!(warns_since(mark), Vec::<String>::new(), "{state:?}");
+        drop(writer);
     }
 }
 
