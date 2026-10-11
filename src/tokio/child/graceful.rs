@@ -85,7 +85,6 @@ impl Child {
             if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
                 return Err(unkillable);
             }
-            self.refuse_unpinned("terminate", None)?;
         }
         let mechanism = self.graceful_mechanism();
         #[cfg(windows)]
