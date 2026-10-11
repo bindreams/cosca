@@ -400,10 +400,10 @@ impl Child {
             let sweep_result = if fault::take_force_kill_tree_error() {
                 Err(fault::forced_kill_tree_error())
             } else {
-                self.kill_tree_after(Some("the SIGTERM"))
+                self.kill_tree_after(None)
             };
             #[cfg(not(test))]
-            let sweep_result = self.kill_tree_after(Some("the SIGTERM"));
+            let sweep_result = self.kill_tree_after(None);
             if let Err(sweep) = sweep_result {
                 // A zombie launchd holds is not ours to reap: waiting on it only warns.
                 if root_exited && !self.root_is_unpinned() {
