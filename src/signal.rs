@@ -206,6 +206,10 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
 /// child that reported no unique id). A pid already gone is `Sent::Gone`.
 #[cfg(target_os = "macos")]
 pub(crate) fn via_owned_pid(pid: u32, sig: Sig) -> io::Result<Sent> {
+    // MUTANT: no kill is sent (a refused kill is still refused)
+    if seams::kills_refused().is_none() {
+        return Ok(Sent::Delivered);
+    }
     // `kill(0, sig)` signals the caller's whole process group.
     let Some(target) = crate::identity::probe::signal_target(pid) else {
         debug_assert!(false, "a child's pid {pid} is not a single-process signal target");
