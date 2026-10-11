@@ -772,12 +772,6 @@ impl Child {
             crate::elevation::front::Gate::CgroupOnly => Some(true),
         };
         // A root launchd holds, or one the handle cannot vouch for, is signalled by identity alone.
-        #[cfg(target_os = "macos")]
-        if let Some(result) =
-            self.tree_signal_untrusted(crate::containment::dispatch::TreeSignal::Kill, "kill_tree", earlier)
-        {
-            return result;
-        }
         // Precondition (a separate, unfixed gap — asserted, not fixed, here): see the sync
         // twin, `Child::kill_tree` in `src/child.rs`, for the full rationale (including which
         // mechanisms `carries_recyclable_pgid` covers, and why this is `#[cfg(unix)]`).
