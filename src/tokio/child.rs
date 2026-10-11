@@ -834,7 +834,7 @@ impl Child {
             Ok(())
         } else {
             // `front` was `None`, so the gate was open.
-            self.kill_sent_gated(crate::elevation::front::Gate::Open).map(|_| ())
+            self.kill()
         };
         #[cfg(not(unix))]
         let backstop = self.kill();
