@@ -433,6 +433,7 @@ async fn macos_tokio_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
     use crate::child::spawn::identity_macos_tests::{assert_warned_once, SAID_KILLED, SAID_REAPED, SAID_RUNNING};
     crate::log_capture::install();
     let (mut cmd, writer) = tokio_blocker();
+    let sent = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
     let err = {
         let _unwritten = crate::child::spawn::unique_report::seams::find_the_report_unwritten();
@@ -445,6 +446,7 @@ async fn macos_tokio_spawn_of_an_unreported_child_whose_wait_fails_is_killed() {
     };
     let pid = id.pid();
     assert_eq!(fate, crate::error::ChildFate::Killed);
+    crate::child::spawn::identity_macos_tests::assert_kill_sent(pid, &sent.entries());
     assert_warned_once(pid, mark, SAID_KILLED, &[SAID_REAPED, SAID_RUNNING]);
     let mut status = 0;
     // SAFETY: `pid` is this test's own unreaped child, killed by the spawn.
