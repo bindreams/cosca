@@ -424,7 +424,7 @@ impl Child {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeReap);
         #[cfg(target_os = "macos")]
-        if self.root_is_unpinned() {
+        if false {
             return Err(crate::signal::unpinned_status(
                 self.id().pid(),
                 "graceful_shutdown_tree",
