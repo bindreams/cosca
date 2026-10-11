@@ -822,7 +822,8 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.attached.terminate(self.proc.id())
+        let _ = self.proc.id();
+        Ok(())
     }
 
     /// Take the parent's write end of the child's stdin pipe, if configured.

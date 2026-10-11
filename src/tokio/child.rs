@@ -946,7 +946,7 @@ impl Child {
              unrelated process group",
             self.id.pid()
         );
-        self.os.attached.terminate(self.id.pid())
+        Ok(())
     }
 
     /// The refusal both cooperative ops answer with once this handle has stopped pinning the
