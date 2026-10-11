@@ -1719,3 +1719,7 @@ pub(crate) mod fault {
 #[cfg(all(test, target_os = "macos"))]
 #[path = "child/identity_macos_tests.rs"]
 mod identity_macos_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "child/late_report_tests.rs"]
+mod late_report_tests;
