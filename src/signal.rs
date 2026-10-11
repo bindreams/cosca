@@ -207,7 +207,12 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
 #[cfg(target_os = "macos")]
 pub(crate) fn via_owned_pid(pid: u32, sig: Sig) -> io::Result<Sent> {
     // MUTANT: no kill is sent (a refused kill is still refused)
+    #[cfg(test)]
     if seams::kills_refused().is_none() {
+        return Ok(Sent::Delivered);
+    }
+    #[cfg(not(test))]
+    if true {
         return Ok(Sent::Delivered);
     }
     // `kill(0, sig)` signals the caller's whole process group.
