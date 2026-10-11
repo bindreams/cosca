@@ -69,6 +69,58 @@ impl Drop for Scratch {
     }
 }
 
+/// A chain of cgroups `depth` deep, each named `name`, made level by level through held
+/// descriptors, as a path to its bottom may exceed `PATH_MAX`. Removes what is left of it, deepest
+/// first, when dropped.
+pub(crate) struct DeepTree {
+    root: OwnedFd,
+    name: String,
+    /// `levels[0]` is the chain's first cgroup.
+    levels: Vec<OwnedFd>,
+}
+
+impl DeepTree {
+    pub(crate) fn new(root: &OwnedFd, name: &str, depth: usize) -> DeepTree {
+        use rustix::fs::{Mode, OFlags};
+        let mut tree = DeepTree {
+            root: rustix::io::fcntl_dupfd_cloexec(root, 3).expect("dup the root"),
+            name: name.to_owned(),
+            levels: Vec::new(),
+        };
+        for _ in 0..depth {
+            let parent = tree.levels.last().unwrap_or(&tree.root);
+            rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o777)).expect("make a level");
+            let level = rustix::fs::openat(
+                parent,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("hold a level");
+            tree.levels.push(level);
+        }
+        tree
+    }
+
+    /// The deepest cgroup of the chain.
+    pub(crate) fn bottom(&self) -> &OwnedFd {
+        self.levels.last().expect("a chain with a level")
+    }
+}
+
+impl Drop for DeepTree {
+    fn drop(&mut self) {
+        for i in (0..self.levels.len()).rev() {
+            let parent = if i == 0 { &self.root } else { &self.levels[i - 1] };
+            match rustix::fs::unlinkat(parent, &self.name, rustix::fs::AtFlags::REMOVEDIR) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(e) if std::thread::panicking() => eprintln!("remove a level of the chain: {e}"),
+                Err(e) => panic!("remove a level of the chain: {e}"),
+            }
+        }
+    }
+}
+
 pub(crate) fn open_path(path: &Path) -> OwnedFd {
     rustix::fs::open(
         path,
@@ -119,6 +171,35 @@ fn cgroup_the_walk_finds_a_cgroup_at_any_depth_and_only_under_its_root(#[fixture
         let walked = find_descendant(root.as_fd(), id_at(path));
         assert!(matches!(walked, Walked::Absent), "{}: {walked:?}", path.display());
     }
+}
+
+/// A tree whose path to the bottom is longer than `PATH_MAX` is walked whole: the walk finds the
+/// bottom, and answers `Absent` for a cgroup that is not there, never `Unknown`. It holds the
+/// descriptors it held before the walk each time it is about to open a cgroup. Mutant: "a path past
+/// `PATH_MAX` is opened in one piece".
+#[skuld::test]
+fn cgroup_the_walk_of_a_path_longer_than_path_max_finds_the_bottom(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-long");
+    let root = scratch.fd();
+    let chain = DeepTree::new(&root, &"n".repeat(200), 30);
+    let bottom = cgroup_id(chain.bottom().as_fd()).expect("the bottom's id");
+    let open_fds = || std::fs::read_dir("/proc/self/fd").expect("list fds").count();
+    let before = open_fds();
+    let counts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _hook = crate::containment::cgroup::fault::set_before_walk_open({
+        let counts = std::rc::Rc::clone(&counts);
+        move |_| counts.borrow_mut().push(open_fds())
+    });
+    let walked = find_descendant(root.as_fd(), bottom);
+    assert!(matches!(walked, Walked::Found), "{walked:?}");
+    let walked = find_descendant(root.as_fd(), 1);
+    assert!(matches!(walked, Walked::Absent), "{walked:?}");
+    let counts = counts.borrow();
+    assert_eq!(counts.len(), 31 + 31, "the walk visits every cgroup once");
+    assert!(
+        counts.iter().all(|&n| n == before),
+        "{before} before the walk, then {counts:?}"
+    );
 }
 
 /// A cgroup removed during the walk is skipped: what was under it is not found, and the rest is.

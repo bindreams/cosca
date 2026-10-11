@@ -287,8 +287,8 @@ pub(crate) enum Walked {
 /// has nothing under it to find, and is skipped; `dir` itself removed lists nothing, and answers
 /// [`Walked::Unknown`]. A cgroup behind a mount (`EXDEV`) cannot be listed, so a walk that meets
 /// one answers [`Walked::Unknown`] if it finds nothing, as it does for any other failure: a cgroup
-/// this process may not read (`EACCES`), or one whose path from the leaf is longer than `PATH_MAX`
-/// (`ENAMETOOLONG`).
+/// this process may not read (`EACCES`), or any other refusal, `ENAMETOOLONG` included, though a
+/// path from `dir` longer than `PATH_MAX` is not one: it is opened in pieces (see [`open_cgroup`]).
 ///
 /// One `openat2`, `name_to_handle_at`, `openat` and `getdents` per cgroup. Bounded: the tree is
 /// finite and each cgroup is visited once, since cgroup v2 refuses to rename or move one; it is
@@ -399,7 +399,7 @@ fn traverse(
                 Failure::Other(named(e, &path))
             }
         };
-        let cgroup = match step_fault(&path, WalkStep::Open).and_then(|()| open_beneath(dir, &path)) {
+        let cgroup = match step_fault(&path, WalkStep::Open).and_then(|()| open_cgroup(dir, &path)) {
             Ok(cgroup) => cgroup,
             Err(e) if skippable(e) => continue,
             Err(rustix::io::Errno::XDEV) => {
@@ -495,6 +495,51 @@ fn named(errno: rustix::io::Errno, path: &std::path::Path) -> io::Error {
         path.display().to_string()
     };
     io::Error::new(e.kind(), format!("{at}: {e}"))
+}
+
+/// Open the cgroup at `path` under `dir`, however long `path` is: [`open_beneath`] in pieces, each
+/// at most `PATH_MAX - 1` bytes, from the one before it, so that no path the kernel is given is too
+/// long. Each piece is opened with every guard [`open_beneath`] has, and the one before it is closed
+/// as the next is opened: two descriptors at most are held, however long `path` is.
+fn open_cgroup(dir: BorrowedFd<'_>, path: &std::path::Path) -> rustix::io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// The longest path `openat2` takes, without its NUL.
+    const MAX: usize = libc::PATH_MAX as usize - 1;
+
+    let mut names = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    // `dir` itself.
+    if names.peek().is_none() {
+        return open_beneath(dir, ".");
+    }
+    let mut piece: Vec<u8> = Vec::new();
+    let mut held: Option<OwnedFd> = None;
+    loop {
+        let name = names.next();
+        // A name, `NAME_MAX` bytes at most, always fits an empty piece.
+        let fits = name.is_none_or(|n| piece.is_empty() || piece.len() + 1 + n.len() <= MAX);
+        if !fits || name.is_none() {
+            let opened = open_beneath(
+                held.as_ref().map_or(dir, AsFd::as_fd),
+                std::ffi::OsStr::from_bytes(&piece),
+            )?;
+            held = Some(opened);
+            piece.clear();
+        }
+        let Some(name) = name else {
+            return Ok(held.expect("a piece was opened"));
+        };
+        if !piece.is_empty() {
+            piece.push(b'/');
+        }
+        piece.extend_from_slice(name.as_bytes());
+    }
 }
 
 /// Open the directory at `path` under `dir`, never across a mount or a symlink, nor out of `dir`,
@@ -598,7 +643,7 @@ fn remove_children(dir: BorrowedFd<'_>, swept: &Swept) -> io::Result<usize> {
         };
         // Never across a mount: a mount on a cgroup shows some other directory, whose contents are
         // not the leaf's to remove. `EXDEV` says the path leads onto one.
-        let parent = match open_beneath(dir, parent) {
+        let parent = match open_cgroup(dir, parent) {
             Ok(parent) => parent,
             Err(e) if gone(e) || e == rustix::io::Errno::XDEV => continue,
             Err(e) => return Err(e.into()),

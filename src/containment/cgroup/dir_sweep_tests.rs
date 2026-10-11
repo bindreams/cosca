@@ -2,7 +2,7 @@
 //! root). Each test makes a scratch cgroup under the lane's own, which its guard removes.
 
 use super::LeafDir;
-use crate::containment::cgroup::dir_walk_tests::{id_at, Scratch};
+use crate::containment::cgroup::dir_walk_tests::{id_at, DeepTree, Scratch};
 use crate::test_groups::{cgroup, Group};
 
 /// The sweep holds no descriptor from one cgroup to the next, however wide or deep the tree: each
@@ -75,6 +75,35 @@ fn cgroup_a_sweep_of_a_tree_deeper_than_the_fd_limit_removes_every_cgroup(#[fixt
     assert_eq!(subdirs(scratch.path()), 0, "every cgroup is removed");
     let swept = leaf.swept();
     assert!(chain.iter().all(|&id| swept.holds(id)), "every id is recorded");
+}
+
+/// A tree whose path to the bottom is longer than `PATH_MAX` is swept whole: every cgroup removed,
+/// deepest first, every id recorded, and the sweep holds the descriptors it held before it each time
+/// it is about to open a cgroup. Mutant: "a path past `PATH_MAX` is opened in one piece".
+#[skuld::test]
+fn cgroup_a_sweep_of_a_path_longer_than_path_max_removes_every_cgroup(#[fixture(cgroup)] _group: &Group) {
+    const DEPTH: usize = 30;
+    let scratch = Scratch::new("sweep-long");
+    let root = scratch.fd();
+    let chain = DeepTree::new(&root, &"n".repeat(200), DEPTH);
+    let bottom = super::cgroup_id(std::os::fd::AsFd::as_fd(chain.bottom())).expect("the bottom's id");
+    let leaf = LeafDir::open_for_test(scratch.path());
+    let open_fds = || std::fs::read_dir("/proc/self/fd").expect("list fds").count();
+    let before = open_fds();
+    let counts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _hook = crate::containment::cgroup::fault::set_before_walk_open({
+        let counts = std::rc::Rc::clone(&counts);
+        move |_| counts.borrow_mut().push(open_fds())
+    });
+    assert_eq!(leaf.remove_children().expect("the sweep"), DEPTH);
+    assert_eq!(subdirs(scratch.path()), 0, "every cgroup is removed");
+    assert!(leaf.swept().holds(bottom), "the bottom's id is recorded");
+    let counts = counts.borrow();
+    assert_eq!(counts.len(), 1 + DEPTH, "the sweep visits every cgroup once");
+    assert!(
+        counts.iter().all(|&n| n == before),
+        "{before} before the sweep, then {counts:?}"
+    );
 }
 
 /// How many directories lie under `path`.
