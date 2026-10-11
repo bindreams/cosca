@@ -21,8 +21,11 @@
 //! Nor does it mean the child has reported yet. With two of this process's fds 0 to 2 closed, std's
 //! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
 //! hooks run (see `crate::containment::cgroup::channel::ReportChannel`). The pipe is then empty but
-//! open, [`Report::Unwritten`], and the child may report and `exec` afterwards. The spawn then kills
-//! and reaps it by pid: this process is its parent and has not reaped it, so the number is pinned.
+//! open. The report hook is registered first, so the child either writes its report or dies without
+//! one: [`Channel::run`] blocks on the pipe until one of the two happens, and answers
+//! [`Report::Late`] for a report that came after the spawn returned. The program may then have started
+//! and std's own spawn is not trusted (its error pipe was clobbered, so a failed `exec` is invisible
+//! to it): the spawn tears the child down through its unique id.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -50,8 +53,10 @@ pub(crate) enum Report {
     /// No report, or a short one, and every copy of the write end closed: the child died before it
     /// could write it (before `exec`).
     Missing,
-    /// No report, and the pipe still open: the child has not written it yet, or a copy of the write
-    /// end outlives it in another forked process. Nothing shows the child did not go on to `exec`.
+    /// The child's own unique id, which arrived only after the spawn returned (see the module doc).
+    Late(u64),
+    /// No report yet, and the pipe still open. Only [`read_report`] answers it; [`Channel::run`]
+    /// waits it out, so no caller sees it.
     Unwritten,
     /// This process's own read of the pipe failed.
     ReadFailed(io::Error),
@@ -130,7 +135,60 @@ impl Channel {
         shared.withdraw();
         // Closed before the read, so a child that never wrote leaves the pipe at EOF.
         drop(write_end);
-        (spawned, read_report(&read_end))
+        let report = match read_report(&read_end) {
+            Report::Unwritten => await_report(&read_end),
+            report => report,
+        };
+        debug_assert!(!matches!(report, Report::Unwritten), "the wait answers a report");
+        (spawned, report)
+    }
+}
+
+/// How long the wait runs before it says what it is waiting on.
+const SAY_WAITING_AFTER_MS: libc::c_int = 1000;
+
+/// Blocks on `read_end` until the child's report arrives or every copy of the write end closes, then
+/// answers what it holds: [`Report::Late`] for an id (it arrived after the spawn returned).
+///
+/// It waits on an event, the pipe becoming readable or hanging up, and never on a timer. The parent's
+/// own write end is closed by [`Channel::run`] before this, so EOF comes when the child's hooks
+/// finish, or the child dies. A copy of the write end inherited by another fork in this process
+/// delays the EOF of a child that dies without reporting until that fork `exec`s or exits: an
+/// external event, so the wait has no bound. Past one second it warns, once, naming that: a message
+/// only, never a decision.
+fn await_report(read_end: &OwnedFd) -> Report {
+    let mut warned = false;
+    loop {
+        let mut poll = libc::pollfd {
+            fd: read_end.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = if warned { -1 } else { SAY_WAITING_AFTER_MS };
+        // SAFETY: one valid `pollfd` for the whole call.
+        let n = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Report::ReadFailed(e);
+        }
+        if n == 0 {
+            warned = true;
+            log::warn!(
+                "the spawned child has not reported its unique id after 1 s; waiting for its report, or for \
+                 every copy of the pipe's write end to close (a copy held by another fork of this process \
+                 delays that until it execs or exits)"
+            );
+            continue;
+        }
+        return match read_report(read_end) {
+            Report::Id(id) => Report::Late(id),
+            // Readable, yet nothing to read: a spurious wake. Wait again.
+            Report::Unwritten => continue,
+            report => report,
+        };
     }
 }
 
@@ -179,17 +237,18 @@ pub(crate) struct NotAdopted {
 }
 
 /// Why a child cannot be adopted, which decides what the spawn does with it and what it answers.
-/// The caller signals and waits on none of them by pid.
+/// The caller signals and waits on none of them by pid: without a unique id nothing in cosca acts on
+/// a macOS pid, because nothing pins the number against a foreign reap (`SIGCHLD` ignored, or a
+/// `waitpid(-1)` reaper) and its reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unadoptable {
     /// It died before `exec`, so only a corpse is left, and the program did not start.
     DiedBeforeExec,
-    /// It had not reported when its spawn returned ([`Report::Unwritten`]): it may yet report, `exec`
-    /// and run the program, so the program may have started. It is this process's own unreaped child,
-    /// so the spawn kills and reaps it by pid (an elevation front is left unreaped instead).
-    Unreported,
-    /// Its report could not be read or is malformed: nothing shows what it is doing, and the program
-    /// may have started.
+    /// Its unique id arrived only after its spawn returned ([`Report::Late`]). The program may have
+    /// started, and std's own spawn is not trusted, so the child is torn down through this id.
+    Late(u64),
+    /// Its report could not be read or is malformed: it has no verified identity, so it cannot be
+    /// signalled and is left with a warning (leak and warn), and the program may have started.
     Unverified,
 }
 
@@ -208,13 +267,23 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
                 "the spawned child {pid} died before exec; the program did not start"
             ))),
         ),
-        Report::Unwritten => not(
-            Unadoptable::Unreported,
+        Report::Late(id) => not(
+            Unadoptable::Late(id),
             Error::Io(io::Error::other(format!(
-                "the spawned child {pid} had not reported its unique id when its spawn returned; the child was \
-                 not adopted"
+                "the spawned child {pid} had not reported its unique id when its spawn returned (a descriptor of \
+                 0 to 2 was closed), so its exec cannot be confirmed; the child was not adopted"
             ))),
         ),
+        Report::Unwritten => {
+            debug_assert!(false, "`Channel::run` waits out an unwritten report");
+            not(
+                Unadoptable::Unverified,
+                Error::Unassessable {
+                    detail: format!("pid {pid}: its unique-id report is still unwritten; the child was not adopted"),
+                    source: None,
+                },
+            )
+        }
         Report::ReadFailed(e) => not(
             Unadoptable::Unverified,
             Error::Unassessable {
@@ -244,7 +313,7 @@ pub(crate) fn adopted_id(report: Report, pid: u32) -> Result<u64, NotAdopted> {
 pub(crate) fn proves_no_exec(report: &Report) -> bool {
     match report {
         Report::ChildRefused(_) | Report::Missing => true,
-        Report::Id(_) | Report::Unwritten | Report::ReadFailed(_) | Report::BadTag(_) => false,
+        Report::Id(_) | Report::Late(_) | Report::Unwritten | Report::ReadFailed(_) | Report::BadTag(_) => false,
     }
 }
 
@@ -416,8 +485,9 @@ pub(crate) mod seams {
         PARENT_READ_ERRNO.with(Cell::get)
     }
 
-    /// While the guard lives, this thread's own read of a spawn's report finds it not yet written,
-    /// as when std's spawn returned before the child's hooks ran: the child runs on as it would.
+    /// This thread's next read of a spawn's report finds it not yet written, as when std's spawn
+    /// returned before the child's hooks ran: the child runs on as it would, and the wait that
+    /// follows reads the real pipe.
     pub(crate) fn find_the_report_unwritten() -> UnwrittenRead {
         PARENT_READ_UNWRITTEN.with(|f| f.set(true));
         UnwrittenRead(())
@@ -432,8 +502,9 @@ pub(crate) mod seams {
         }
     }
 
+    /// Whether the next read finds nothing; take-once, so the wait that follows reads the real pipe.
     pub(super) fn parent_read_finds_nothing() -> bool {
-        PARENT_READ_UNWRITTEN.with(Cell::get)
+        PARENT_READ_UNWRITTEN.with(|f| f.replace(false))
     }
 
     /// The next spawns on this thread have their child killed by `SIGKILL` before it reports, as
