@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::drop_fault;
-use crate::child::spawn::identity_macos_tests::{has_not_exited, is_reaped, other_unique_id, refuse_the_kill};
+use crate::child::spawn::identity_macos_tests::{has_not_exited, is_reaped, refuse_the_kill};
 use crate::child::spawn::late_report_tests::{
     assert_kill_sent, assert_one_warn, SAID_KILLED, SAID_NOT_SENT, SAID_REAPED, SAID_REFUSED_RUNNING,
     SAID_STILL_RUNNING, ZOMBIE,
@@ -145,43 +145,29 @@ async fn macos_tokio_spawn_of_a_late_child_whose_kill_is_refused_hands_it_to_the
     drop(writer);
 }
 
-/// A late child whose pid the id check shows is not its own is sent nothing: `Gone`, forgotten once.
+/// A late child whose pid the id check shows is gone is sent nothing: `Gone`, forgotten once.
 ///
 /// Mutant: the no-send is worded as a sent kill, or the child is released.
 #[skuld::test]
-async fn macos_tokio_spawn_of_a_late_child_whose_pid_is_not_its_own_sends_nothing_and_is_gone() {
-    // The pid is not known until the spawn: the other id is read once the child exists, by the hook.
-    crate::log_capture::install();
-    let (mut cmd, writer) = tokio_blocker();
-    let armed: Rc<std::cell::RefCell<Option<uniq_fault::Forced>>> = Rc::default();
-    let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeIdentity, {
-        let armed = Rc::clone(&armed);
-        move || {
-            let other = other_unique_id(crate::child::spawn::fault::spawn_pid());
-            *armed.borrow_mut() = Some(uniq_fault::force_uniq_read_once(ReadPurpose::Kill, other));
-        }
+async fn macos_tokio_spawn_of_a_late_child_whose_pid_is_gone_sends_nothing_and_is_gone() {
+    let sent = crate::send_log::Capture::start();
+    let (late, writer) = late_spawn(|| {
+        vec![Box::new(uniq_fault::force_uniq_read_once(
+            ReadPurpose::Kill,
+            UniqRead::Gone,
+        ))]
     });
-    let forgets = drop_fault::record();
-    let mark = crate::log_capture::mark();
-    let err = {
-        let _late = unique_report::seams::find_the_report_unwritten();
-        cmd.spawn().expect_err("a late child is not adopted")
-    };
-    let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
-    let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
-        panic!("the spawn captured the child");
-    };
-    let pid = id.pid();
-    assert_eq!(fate, ChildFate::Gone);
-    assert_eq!(forgets.forgets(), 1);
+    assert_eq!(late.fate, ChildFate::Gone);
+    assert_eq!(sent.entries(), [], "nothing is sent to a pid that is gone");
+    assert_eq!(late.forgets, 1);
     assert_one_warn(
-        pid,
-        mark,
+        late.pid,
+        late.mark,
         &[SAID_NOT_SENT, "it is gone", LEAKS],
         &["was sent SIGKILL", "signalled"],
     );
     // Nothing was sent: the test ends and reaps the child; the backend was forgotten.
-    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
+    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(late.pid);
     drop(writer);
 }
 
