@@ -198,39 +198,6 @@ pub(crate) fn via_verified_pid(pid: u32, identity: Option<u64>, sig: Sig) -> io:
     Err(io_context("kill", e))
 }
 
-/// Send `sig` to `pid` by number with no identity check, for a child that is this process's own and
-/// unreaped. An unreaped child's pid is held by its zombie, so it cannot name a stranger, provided
-/// nothing else reaps the child before the spawn returns: the contract of `Command::contain`
-/// (`command.rs`, "the child must stay this process's to reap"), which forbids `SIGCHLD` set to
-/// `SIG_IGN` and a `waitpid(-1)` reaper. Only a teardown whose caller owns the child may use this (a
-/// child that reported no unique id). A pid already gone is `Sent::Gone`.
-#[cfg(target_os = "macos")]
-pub(crate) fn via_owned_pid(pid: u32, sig: Sig) -> io::Result<Sent> {
-    // `kill(0, sig)` signals the caller's whole process group.
-    let Some(target) = crate::identity::probe::signal_target(pid) else {
-        debug_assert!(false, "a child's pid {pid} is not a single-process signal target");
-        return Err(io::Error::other(format!(
-            "pid {pid} is not a single-process signal target; {sig:?} not sent"
-        )));
-    };
-    #[cfg(test)]
-    crate::send_log::record(pid, sig, crate::send_log::Via::Pid);
-    #[cfg(test)]
-    if let Some(errno) = seams::kills_refused() {
-        return Err(io_context("kill", io::Error::from_raw_os_error(errno)));
-    }
-    // SAFETY: `target` is a positive pid, so the signal goes to one process.
-    if unsafe { libc::kill(target, sig.as_libc()) } == 0 {
-        return Ok(Sent::Delivered);
-    }
-    let e = io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::ESRCH) {
-        log::debug!("kill({pid}, {sig:?}): the child is already gone");
-        return Ok(Sent::Gone);
-    }
-    Err(io_context("kill", e))
-}
-
 /// Test seam: while the guard lives, every kill sent on this thread is refused with `EPERM` and
 /// not sent, as the kernel refuses a signal to another user's process. Thread-local, with an RAII
 /// reset. The refusal is real: an unprivileged kill of a root-owned zombie fails with `EPERM`
