@@ -70,11 +70,10 @@ impl Child {
     pub fn terminate(&self) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            // A front's refusal outranks a root launchd holds, as for `kill`.
+            self.refuse_unpinned("terminate", None)?;
             if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
                 return Err(unkillable);
             }
-            self.refuse_unpinned("terminate", None)?;
         }
         crate::graceful::signal(self.graceful, self.id)
     }
