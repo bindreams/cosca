@@ -49,7 +49,7 @@ jobs:
     # Measured: 164 s to 242 s in four runs. 25 min is 6x the slowest, a failure bound for a hang.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # setup-rust so the cargo-fmt / cargo-clippy prek hooks (language = "system")
       # find a toolchain.
@@ -216,7 +216,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: ./.github/actions/setup-rust
         with:
