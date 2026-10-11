@@ -272,19 +272,22 @@ fn cgroup_a_walk_of_a_root_gone_at_any_step_cannot_tell(#[fixture(cgroup)] _grou
     }
 }
 
-/// A refusal the walk cannot get past is `Unknown`, never `Absent`: a path past `PATH_MAX`
-/// (`ENAMETOOLONG`) and a cgroup this process may not read (`EACCES`), at any step. Mutant: "the
-/// refusal is skipped like a removed cgroup".
+/// A refusal the walk cannot get past (`EACCES` from a cgroup this process may not read, or `EIO`)
+/// is `Unknown`, never `Absent`, at any step, and the error keeps its `errno`. Mutants: "the refusal
+/// is skipped like a removed cgroup"; "the error is rebuilt without its `errno`".
 #[skuld::test]
 fn cgroup_a_walk_that_is_refused_cannot_tell(#[fixture(cgroup)] _group: &Group) {
     let scratch = Scratch::new("walk-refused");
     scratch.make("a/b");
     let root = scratch.fd();
     for step in [WalkStep::Open, WalkStep::Id, WalkStep::List, WalkStep::Entries] {
-        for errno in [libc::ENAMETOOLONG, libc::EACCES] {
+        for errno in [libc::EIO, libc::EACCES] {
             let _failing = fail_walk_step("./a", step, errno);
             let walked = find_descendant(root.as_fd(), 1);
-            assert!(matches!(walked, Walked::Unknown(_)), "{step:?} {errno}: {walked:?}");
+            match walked {
+                Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(errno), "{step:?} {errno}: {e}"),
+                other => panic!("{step:?} {errno}: {other:?}"),
+            }
         }
     }
 }
@@ -335,6 +338,29 @@ fn cgroup_the_walk_holds_no_descriptor_between_cgroups(#[fixture(cgroup)] _group
     );
 }
 
+/// A walk that fails at a later entry of a listing than the first, after cgroups were queued from
+/// the entries before it, cannot tell: `Unknown`, not the target of a queued cgroup, and not
+/// `Absent`. Mutant: "the entries fault fires at the first entry only".
+#[skuld::test]
+fn cgroup_a_walk_that_fails_after_entries_were_queued_cannot_tell(#[fixture(cgroup)] _group: &Group) {
+    let scratch = Scratch::new("walk-late-entry");
+    let queued = id_at(&scratch.make("a/x"));
+    scratch.make("b");
+    let root = scratch.fd();
+    // Entries of the root: `.`, `..`, and what `read_dir` lists; the last of them is the one to fail.
+    let entries = std::fs::read_dir(scratch.path()).expect("list the root").count() + 2;
+    let failing =
+        crate::containment::cgroup::fault::fail_walk_step_after(".", WalkStep::Entries, libc::EIO, entries - 1);
+    match find_descendant(root.as_fd(), queued) {
+        Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    drop(failing);
+    let _past = crate::containment::cgroup::fault::fail_walk_step_after(".", WalkStep::Entries, libc::EIO, entries);
+    let walked = find_descendant(root.as_fd(), queued);
+    assert!(matches!(walked, Walked::Found), "no entry past the last: {walked:?}");
+}
+
 /// A cgroup behind a mount cannot be listed, so a walk that meets one cannot tell what is under
 /// it: it answers `Unknown`, never `Absent`, whether the cgroup sought is behind the mount or
 /// nowhere. The walking thread has its own mount namespace, the mount's, in which it holds the
@@ -357,7 +383,10 @@ fn cgroup_the_walk_cannot_tell_behind_a_mount(#[fixture(cgroup)] _group: &Group)
             .expect("the walking thread")
     });
     for walked in walked {
-        assert!(matches!(walked, Walked::Unknown(_)), "{walked:?}");
+        match walked {
+            Walked::Unknown(e) => assert_eq!(e.raw_os_error(), Some(libc::EXDEV), "{e}"),
+            other => panic!("{other:?}"),
+        }
     }
     let root = scratch.fd();
     assert!(matches!(find_descendant(root.as_fd(), hidden), Walked::Found));

@@ -1,6 +1,5 @@
 //! The traversal of a tree whose path from the leaf is longer than `PATH_MAX`: how a path is split
-//! into pieces, what the pieces are opened with, and what the traversal stores of the tree. The
-//! cgroup lane (the `cgroup` group, as root) runs the tests on real cgroups; the others need none.
+//! into pieces, what the pieces are opened with, and what the traversal stores of the tree.
 
 use std::ffi::OsStr;
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -40,12 +39,20 @@ fn a_piece_of_path_max_bytes_is_split() {
     assert_eq!(runs(&lens), [0..15, 15..17]);
 }
 
-/// A name that is the whole of a piece stands alone between its neighbours'.
+/// A name that is nearly the whole of a piece stands alone between its neighbours'.
 #[skuld::test]
-fn a_name_that_fills_a_piece_stands_alone() {
+fn a_name_that_nearly_fills_a_piece_stands_alone() {
     assert_eq!(runs(&[300, 4000, 300]), [0..1, 1..2, 2..3]);
     assert_eq!(runs(&[100, 4000, 100, 100]), [0..1, 1..2, 2..4]);
     assert_eq!(runs(&[]), Vec::<std::ops::Range<usize>>::new());
+}
+
+/// A name longer than a piece can be is a run of its own, which no open will take, between its
+/// neighbours' runs.
+#[skuld::test]
+fn a_name_longer_than_a_piece_is_a_run_of_its_own() {
+    assert_eq!(runs(&[5000]), vec![0..1]);
+    assert_eq!(runs(&[100, 5000, 100]), [0..1, 1..2, 2..3]);
 }
 
 // guards =====
@@ -69,7 +76,7 @@ fn a_symlink_at_the_split_of_a_long_path_is_refused() {
         let real = tmp.path().join("real");
         std::fs::create_dir_all(real.join(&names[0])).expect("make the symlink's target");
         let chain = DeepTree::with_names(&root, names[..symlink_at].to_vec());
-        let parent = if symlink_at == 0 { &root } else { chain.bottom() };
+        let parent = chain.bottom();
         rustix::fs::symlinkat(&real, parent, names[symlink_at].as_str()).expect("make the symlink");
         let opened = open_cgroup(root.as_fd(), &names.iter().map(OsStr::new).collect::<Vec<_>>());
         rustix::fs::unlinkat(parent, names[symlink_at].as_str(), AtFlags::empty()).expect("remove the symlink");
@@ -87,6 +94,7 @@ fn a_symlink_at_the_split_of_a_long_path_is_refused() {
 /// `RESOLVE_NO_XDEV`.
 #[skuld::test]
 fn cgroup_a_mount_at_the_split_of_a_long_path_is_not_crossed(#[fixture(cgroup)] _group: &Group) {
+    crate::log_capture::install();
     for mounted in [20, 21] {
         let scratch = Scratch::new(&format!("split-mount-{mounted}"));
         let root = scratch.fd();
@@ -96,7 +104,7 @@ fn cgroup_a_mount_at_the_split_of_a_long_path_is_not_crossed(#[fixture(cgroup)] 
         let names: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
         let victim = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(victim.path().join("keep/me")).expect("make the victim's empty dirs");
-        let (walked, swept) = std::thread::scope(|scope| {
+        let (walked, swept, logs) = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     enter_private_mount_ns();
@@ -104,13 +112,22 @@ fn cgroup_a_mount_at_the_split_of_a_long_path_is_not_crossed(#[fixture(cgroup)] 
                     let root = scratch.fd();
                     let level = open_cgroup(root.as_fd(), &names[..mounted]).expect("open the level to mount over");
                     let _mounted = BindOver::new(victim.path(), &level);
+                    let mark = crate::log_capture::mark();
                     let walked = find_descendant(root.as_fd(), bottom);
-                    (walked, LeafDir::open_for_test(scratch.path()).remove_children())
+                    let swept = LeafDir::open_for_test(scratch.path()).remove_children();
+                    let logs = crate::log_capture::records_since_on_current_thread(mark, "is behind a mount");
+                    (walked, swept, logs)
                 })
                 .join()
                 .expect("the walking thread")
         });
         assert!(matches!(walked, Walked::Unknown(_)), "mount at {mounted}: {walked:?}");
+        // The walk and the sweep each say, at debug, which cgroup is behind the mount.
+        assert_eq!(
+            logs.iter().filter(|(level, _)| *level == log::Level::Debug).count(),
+            2,
+            "mount at {mounted}: {logs:?}"
+        );
         assert!(
             swept.is_ok(),
             "mount at {mounted}: the sweep failed: {}",
@@ -159,15 +176,26 @@ impl Drop for BindOver {
     }
 }
 
-/// `open_cgroup` takes names, not paths: one that is absolute, `..`, or holds a `/` would become a
-/// different path silently.
+/// `open_cgroup` takes names, not paths: one that is absolute, `.`, `..`, empty, or holds a `/`
+/// would become a different path silently. Mutant: the assert is dropped.
 #[cfg(debug_assertions)]
 #[skuld::test]
-#[should_panic(expected = "every name is one plain path component")]
 fn open_cgroup_refuses_a_name_that_is_not_one_component() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = open_path(tmp.path());
-    drop(open_cgroup(root.as_fd(), &[OsStr::new("..")]));
+    for name in ["..", ".", "a/b", "/abs", ""] {
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(open_cgroup(root.as_fd(), &[OsStr::new(name)]));
+        }));
+        let message = refused
+            .expect_err(&format!("{name:?} was taken"))
+            .downcast::<String>()
+            .map_or_else(|_| String::new(), |m| *m);
+        assert!(
+            message.contains("every name is one plain path component"),
+            "{name:?}: {message}"
+        );
+    }
 }
 
 // real trees =====
@@ -212,26 +240,99 @@ fn cgroup_pieces_at_the_edge_of_path_max_are_opened(#[fixture(cgroup)] _group: &
 fn cgroup_names_over_name_max_are_swept_and_walked(#[fixture(cgroup)] _group: &Group) {
     sweep_and_walk("names-300", &[300; 20]);
     sweep_and_walk("names-whole-piece", &[4000, 4000, 300, 4000]);
+    // The longest a name can be, which a listing's buffer must hold exactly.
+    sweep_and_walk("names-4095", &[100, 4095, 100]);
 }
 
 // storage =====
 
-/// The traversal stores each name once: the bytes it stores of a chain are the bytes of its names,
-/// however deep, where the paths of the chain's cgroups are quadratic in its depth. Mutant: a node
-/// stores its whole path from the root.
+/// The most bytes live at once on this thread, while armed: a global allocator that counts, so a
+/// test can bound the memory a call holds. Other threads' allocations are not counted.
+mod peak {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+
+    fn grow(bytes: usize) {
+        if ARMED.try_with(Cell::get) == Ok(true) {
+            let live = LIVE.with(Cell::get) + bytes as isize;
+            LIVE.with(|l| l.set(live));
+            PEAK.with(|p| p.set(p.get().max(live)));
+        }
+    }
+
+    fn shrink(bytes: usize) {
+        if ARMED.try_with(Cell::get) == Ok(true) {
+            LIVE.with(|l| l.set(l.get() - bytes as isize));
+        }
+    }
+
+    // SAFETY: every method forwards to `System` with the arguments it was given.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: as the caller's contract of `GlobalAlloc::alloc`.
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() {
+                grow(layout.size());
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            shrink(layout.size());
+            // SAFETY: as the caller's contract of `GlobalAlloc::dealloc`.
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: as the caller's contract of `GlobalAlloc::realloc`.
+            let p = unsafe { System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                shrink(layout.size());
+                grow(new_size);
+            }
+            p
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// Run `body`, and say the most bytes it held live at once.
+    pub(super) fn of<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        LIVE.with(|l| l.set(0));
+        PEAK.with(|p| p.set(0));
+        ARMED.with(|a| a.set(true));
+        let result = body();
+        ARMED.with(|a| a.set(false));
+        (result, PEAK.with(Cell::get).max(0) as usize)
+    }
+}
+
+/// The traversal of a chain holds memory linear in the bytes of its names, where the paths of the
+/// chain's cgroups are quadratic in its depth. Mutant: a node stores its whole path from the root.
 #[skuld::test]
-fn cgroup_the_traversal_stores_the_names_of_a_tree_once(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_the_traversal_holds_memory_linear_in_the_names_of_a_tree(#[fixture(cgroup)] _group: &Group) {
     const DEPTH: usize = 100;
+    const NAME: usize = 200;
     let scratch = Scratch::new("stored");
     let root = scratch.fd();
-    let _chain = DeepTree::new(&root, &"n".repeat(200), DEPTH);
+    let _chain = DeepTree::new(&root, &"n".repeat(NAME), DEPTH);
     let mut tree = Tree::new();
-    let visited = std::cell::Cell::new(0);
-    let traversed = traverse(&mut tree, root.as_fd(), true, |_, _, _| {
-        visited.set(visited.get() + 1);
-        Ok(Visit::Continue)
-    });
+    let (traversed, peak) = peak::of(|| traverse(&mut tree, root.as_fd(), true, |_, _, _| Ok(Visit::Continue)));
     assert!(traversed.is_ok(), "the traversal failed");
-    assert_eq!(visited.get(), DEPTH);
-    assert_eq!(tree.stored_bytes(), DEPTH * 200, "the names of the tree, once");
+    // The names, once; a few times that for what a visit builds and frees (a path, for a message).
+    // Full paths stored would be half the depth times as much again.
+    assert!(
+        peak < 10 * DEPTH * NAME,
+        "{peak} bytes held at once for {} bytes of names",
+        DEPTH * NAME
+    );
 }

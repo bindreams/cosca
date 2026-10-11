@@ -72,8 +72,8 @@ pub(crate) fn exhaust_fds(alone: &crate::test_own_process::Completion) -> Restor
     lower_fd_limit(alone, lowest_free as libc::rlim_t)
 }
 
-/// Lowers this process's soft descriptor limit to `soft`, until the guard drops: no descriptor
-/// numbered `soft` or above can be made. Process-wide; see [`exhaust_fds`].
+/// Lowers the soft descriptor limit to `soft` until the guard drops. Process-wide, so takes the same
+/// witness as [`exhaust_fds`].
 #[cfg(unix)]
 pub(crate) fn lower_fd_limit(_alone: &crate::test_own_process::Completion, soft: libc::rlim_t) -> RestoreNofile {
     // SAFETY: `getrlimit` and `setrlimit` on valid arguments.
