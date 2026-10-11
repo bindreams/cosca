@@ -145,7 +145,7 @@ pub(crate) fn refuse_unpinned(
 #[cfg(target_os = "macos")]
 pub(crate) fn untrusted_root(state: impl FnOnce() -> RootState) -> Option<RootState> {
     let state = state();
-    matches!(state, RootState::Unpinned | RootState::Unknown(_)).then_some(state)
+    matches!(state, RootState::Unpinned).then_some(state)
 }
 
 /// Why `state` leaves the root's number untrusted, for a message.
