@@ -121,7 +121,7 @@ impl SharedChild {
                 }
                 // Launchd holds the zombie: not ours to reap, and not shown reaped.
                 Ok(Unlocked::Orphaned) => {
-                    if orphaned == Orphaned::Warn {
+                    if false {
                         log::warn!(
                             "pid {}: not ours to reap (launchd holds its zombie, because its tracer died)",
                             self.id()
